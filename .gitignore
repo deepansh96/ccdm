@@ -1,0 +1,7 @@
+registry.json
+.claude/
+.env
+*.log
+.DS_Store
+node_modules/
+PUBLIC_REPO_PLAN.md
