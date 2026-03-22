@@ -143,7 +143,6 @@ This will:
 2. Configure the bot token and access control
 3. Add the project to the registry
 4. Start the Claude Code session in a new screen
-5. Generate start/stop scripts in the project directory
 
 Each project needs its own Discord bot — see [Creating Discord Bots](#creating-discord-bots).
 
@@ -215,6 +214,8 @@ ccdm/
   setup.sh                   # Interactive first-run setup
   scripts/
     claude-usage.sh          # Usage reporting script
+    start-session.sh         # Generic script to start any registered project
+    stop-session.sh          # Generic script to stop any registered project
 ```
 
 ## Troubleshooting

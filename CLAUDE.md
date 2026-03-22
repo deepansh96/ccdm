@@ -9,6 +9,8 @@ You are a coordinator bot. Users message you on Discord to start, stop, and mana
 ## Key files
 
 - `registry.json` — maps project names to their config (path, state dir, screen name)
+- `scripts/start-session.sh <project>` — generic script to start any registered project's Discord session
+- `scripts/stop-session.sh <project>` — generic script to stop any registered project's Discord session
 
 ## How to respond
 
@@ -80,39 +82,163 @@ This is for adding a brand new project that doesn't exist in the registry yet.
      "pending": {}
    }
    ```
-5. Create `start-discord-bot.sh` and `stop-discord-bot.sh` in the project directory:
+5. Add the project to `registry.json`.
+6. Start the session (follow the start steps above, including recording `session_id` and `pid`). You can also use the generic scripts: `scripts/start-session.sh <project_name>` and `scripts/stop-session.sh <project_name>` — these read from `registry.json` automatically.
+7. Tell the user the new bot is running.
 
-   **start-discord-bot.sh:**
-   ```sh
-   #!/bin/zsh
-   screen -dmS <screen_name> zsh -ic 'cd <path> && DISCORD_STATE_DIR=<state_dir> claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
-   echo "Started Discord bot in screen session '<screen_name>'"
-   echo "Attach with: screen -r <screen_name>"
-   ```
+**Auto-setup variant** — `setup <project_name> <project_path>` (no token):
 
-   **stop-discord-bot.sh:**
-   ```sh
-   #!/bin/zsh
-   screen -X -S <screen_name> quit 2>/dev/null && echo "Stopped Discord bot session '<screen_name>'" || echo "No active session '<screen_name>' found"
-   ```
-
-   Make both executable with `chmod +x`.
-
-6. If a `.gitignore` file exists in the project directory, append `start-discord-bot.sh` and `stop-discord-bot.sh` to it (if not already listed). This keeps bot scripts out of version control.
-
-7. Add the project to `registry.json`.
-8. Start the session (follow the start steps above, including recording `session_id` and `pid`).
-9. Tell the user the new bot is running. Remind them that the Discord bot must already be created in the Discord Developer Portal and invited to a shared server — that part can't be automated.
+If the user omits the bot token, run the automated bot creation flow (see "Automated bot creation" section above) to create the Discord application, get the token, and invite it to the server — then continue with steps 1–7 using the obtained token. Ask the user for their Discord credentials if not already known.
 
 #### 6. Remove a project (`remove <project>`)
 
 1. Stop the session if running.
 2. Remove the entry from `registry.json`.
-3. Do NOT delete the state directory or scripts — just inform the user they can manually clean up if desired.
+3. Do NOT delete the state directory — just inform the user they can manually clean up if desired.
+4. Optionally delete the Discord bot application (see below).
 
-### How to create a new Discord bot and get a token
+**Deleting the Discord bot application** (optional, via Playwright):
 
-Walk the user through these steps when they ask how to set up a new bot:
+Use the same browser automation flow as bot creation to delete the app from the Developer Portal:
+
+```python
+page.goto(f'https://discord.com/developers/applications/{app_id}/information')
+page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+page.locator('button:has-text("Delete App")').last.click()  # Bottom of page
+time.sleep(2)
+# Type app name in confirmation dialog
+page.locator('[role="dialog"] input[type="text"], dialog input[type="text"]').first.fill('<app_name>')
+time.sleep(1)
+# Click confirm Delete App (now enabled)
+page.locator('button:has-text("Delete App"):not([disabled])').last.click()
+time.sleep(3)
+# Handle MFA password prompt
+pw = page.locator('input[type="password"]')
+if pw.is_visible(timeout=3000):
+    pw.fill('<password>')
+    page.get_by_role('button', name='Submit').click()
+```
+
+Verify deletion by checking the bot token returns 401:
+```sh
+curl -s -H "Authorization: Bot <token>" https://discord.com/api/v10/users/@me
+```
+
+### Automated bot creation (`create bot <name>`)
+
+Create a new Discord bot entirely via automation — no manual portal steps needed. This uses Playwright with the user's Discord credentials to create the application, bypass hCaptcha, extract the bot token, and invite it to the server.
+
+**Prerequisites:** `playwright` Python package (`pip3 install playwright`).
+
+**Procedure:**
+
+```python
+from playwright.sync_api import sync_playwright
+import time
+```
+
+1. **Launch browser and log in:**
+   ```python
+   browser = p.chromium.launch(headless=False, args=['--disable-gpu'])
+   context = browser.new_context(viewport={'width': 1280, 'height': 720})
+   page = context.new_page()
+   page.goto('https://discord.com/developers/applications')
+   page.wait_for_load_state('networkidle')
+   page.get_by_role('button', name='Log In').click()
+   page.wait_for_load_state('networkidle')
+   page.get_by_label('Email or Phone Number').fill('<phone_or_email>')
+   page.get_by_label('Password').fill('<password>')
+   page.get_by_role('button', name='Log In').click()
+   ```
+   - Credentials: ask the user, or retrieve from a secure store.
+   - Wait ~6 seconds for login to complete.
+
+2. **Dismiss survey banner** (appears intermittently):
+   ```python
+   try:
+       page.get_by_role('button', name='Dismiss').click(timeout=2000)
+   except:
+       pass
+   ```
+
+3. **Create the application:**
+   ```python
+   page.get_by_role('button', name='New Application').click()
+   page.get_by_label('Name').fill('<bot_name>')
+   page.get_by_role('checkbox').check(force=True)  # ToS checkbox
+   page.get_by_role('button', name='Create').click()
+   ```
+   - Wait ~5 seconds for hCaptcha to appear.
+
+4. **Bypass hCaptcha** (the key trick):
+   ```python
+   iframe_el = page.query_selector('iframe[src*="hcaptcha"]')
+   box = iframe_el.bounding_box()
+   page.mouse.click(box['x'] + 38, box['y'] + 38)
+   ```
+   - This clicks the hCaptcha checkbox at its known position within the iframe.
+   - Playwright's `page.mouse.click()` sends a real browser mouse event at page coordinates, bypassing the iframe interaction limitation.
+   - Wait ~5 seconds. Check `page.url` — if it contains `/applications/<id>/information`, creation succeeded.
+
+5. **Extract bot token** — navigate to the bot page and reset the token:
+   ```python
+   page.goto(f'https://discord.com/developers/applications/{app_id}/bot')
+   page.get_by_text('Reset Token').click()
+   page.get_by_text('Yes, do it!').click()
+   # Enter password for MFA
+   page.locator('input[type="password"]').fill('<password>')
+   page.get_by_role('button', name='Submit').click()
+   ```
+   - Wait ~3 seconds, then extract the token from the page:
+   ```python
+   import re
+   page_text = page.evaluate('() => document.body.innerText')
+   matches = re.findall(r'[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}', page_text)
+   bot_token = matches[0]  # This may be truncated — see note below
+   ```
+   - **Token truncation fix:** The regex may miss the first few characters. Verify by base64-decoding the first segment (before the first `.`). It should decode to the bot's user/application ID. If it doesn't, prepend characters from the base64-encoded app ID until it does.
+
+6. **Intercept user auth token** (needed for API calls):
+   ```python
+   auth_tokens = []
+   def on_request(req):
+       auth = req.headers.get('authorization')
+       if auth and not auth.startswith('Bot '):
+           auth_tokens.append(auth)
+   page.on('request', on_request)
+   page.reload()  # triggers API calls that include the auth header
+   user_token = auth_tokens[0]
+   ```
+
+7. **Invite bot to the server** (via Discord API, no browser needed):
+   ```sh
+   curl -s -X POST "https://discord.com/api/v9/oauth2/authorize?client_id=<app_id>&scope=bot" \
+     -H "Authorization: <user_token>" \
+     -H "Content-Type: application/json" \
+     -d '{"guild_id": "<guild_id>", "permissions": "274878008384", "authorize": true}'
+   ```
+   - `guild_id`: read from `registry.json` or use `808438133526888469` (the "personal" server).
+   - Permissions `274878008384` = View Channels + Send Messages + Send in Threads + Read History + Attach Files + Add Reactions.
+
+8. **Message Content Intent** — the bot gets `GATEWAY_MESSAGE_CONTENT_LIMITED` (flag 524288) by default, which works for bots in < 100 servers. No manual toggle needed for personal use.
+
+9. **Clean up:**
+   ```python
+   browser.close()
+   ```
+
+After obtaining the bot token, proceed with the normal `setup` flow (create state dir, write `.env`, write `access.json`, add to registry, start session).
+
+**Important notes on this flow:**
+- The hCaptcha bypass works because `page.mouse.click()` sends a real browser event at page-level coordinates calculated from the iframe's bounding box. The checkbox is at approximately `(box.x + 38, box.y + 38)`.
+- `--disable-gpu` flag is recommended when launching the browser. It doesn't affect the captcha bypass but avoids GPU-rendering issues if screenshots are needed.
+- `headless=False` is required — hCaptcha blocks headless browsers.
+- The user's Discord credentials are only used in-memory during the Playwright session. Never store them.
+- If the flow fails at the captcha step, retry — hCaptcha may occasionally present an image challenge instead of a simple checkbox. In that case, fall back to manual creation.
+
+### Manual bot creation (fallback)
+
+If automated creation fails, walk the user through these steps:
 
 1. **Create a Discord application**: Go to https://discord.com/developers/applications and click **New Application**. Give it a name (e.g., the project name).
 
