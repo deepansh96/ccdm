@@ -180,6 +180,19 @@ The live data section uses the macOS Keychain to retrieve your Claude Code OAuth
 
 Ask the root agent for a usage report by messaging `usage`, `limits`, or `how much usage left`.
 
+## Preventing Sleep
+
+CCDM needs your machine to stay awake — if it sleeps, all screen sessions (and their Discord bots) go offline.
+
+**macOS:**
+- Install [Amphetamine](https://apps.apple.com/app/amphetamine/id937984704) (free) and set it to keep the Mac awake indefinitely
+- Or use the built-in command: `caffeinate -s` (keeps the system awake while the command runs)
+- Or disable sleep entirely: `sudo pmset -a disablesleep 1` (undo with `sudo pmset -a disablesleep 0`)
+
+**Linux:**
+- `systemd-inhibit --what=idle sleep infinity` (prevents idle sleep while running)
+- Or configure via `systemctl mask sleep.target suspend.target`
+
 ## Security Note
 
 CCDM uses the `--dangerously-skip-permissions` flag when starting Claude Code sessions. This is necessary because automated bot sessions cannot interactively confirm permission prompts.
