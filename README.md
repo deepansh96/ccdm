@@ -28,6 +28,8 @@ The root agent is a Claude Code instance connected to Discord. When you message 
 
 Each project runs in its own `screen` session with its own Discord bot token, so you can talk to each project independently on Discord.
 
+CCDM is built on the [official Anthropic Discord plugin for Claude Code](https://github.com/anthropics/claude-plugins-official/blob/main/external_plugins/discord/README.md). Refer to that README for details on the plugin itself, including how the MCP server works, pairing flow, and access control.
+
 ## Prerequisites
 
 | Tool | Required | Install |
