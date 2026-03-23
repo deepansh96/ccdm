@@ -62,12 +62,37 @@ Run `screen -ls` and cross-reference with the registry. Report which projects ha
 
 1. Look up the project in `registry.json`. Find its assigned bot in the pool via `bot_id` to get the `state_dir`.
 2. Check if a screen session with that name is already running (`screen -ls | grep <screen_name>`). If yes, say it's already running.
-3. Run:
+3. Pre-trust the workspace so the trust dialog is skipped (or auto-dismissed):
+   ```python
+   import json
+   path = os.path.expanduser('~/.claude/.claude.json')
+   d = json.load(open(path))
+   project_key = '<path>'  # must match the resolved/canonical path (capital D in Documents on macOS)
+   if project_key not in d.get('projects', {}):
+       d.setdefault('projects', {})[project_key] = {
+           'allowedTools': [], 'mcpContextUris': [], 'mcpServers': {},
+           'enabledMcpjsonServers': [], 'disabledMcpjsonServers': [],
+           'hasTrustDialogAccepted': True, 'projectOnboardingSeenCount': 1
+       }
+   else:
+       d['projects'][project_key]['hasTrustDialogAccepted'] = True
+   json.dump(d, open(path, 'w'), indent=2)
+   ```
+4. Run:
    ```sh
    screen -dmS <screen_name> zsh -ic 'cd <path> && DISCORD_STATE_DIR=<state_dir> claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
    ```
-4. Verify it started with `screen -ls`.
-5. Look up the Claude Code PID and session ID from `~/.claude/sessions/<pid>.json` (the PID is the `claude` process running inside the screen). Update `registry.json` with `session_id` and `pid`.
+5. **Dismiss the trust dialog** — the Ink TUI may still show it even with pre-trust. Wait ~8 seconds for the prompt to render, then send Enter:
+   ```sh
+   sleep 8 && screen -S <screen_name> -p 0 -X stuff "\r"
+   ```
+   The `-p 0` flag is critical — it targets screen window 0, which correctly routes the keypress through the raw-mode TUI. Without `-p 0`, the input is silently dropped.
+6. Verify it started by capturing the screen output:
+   ```sh
+   screen -S <screen_name> -X hardcopy /tmp/<screen_name>_verify.txt && cat /tmp/<screen_name>_verify.txt
+   ```
+   Look for "Listening for channel messages" to confirm the session is live. If the trust dialog is still showing, re-run the `stuff "\r"` command.
+7. Look up the Claude Code PID and session ID from `~/.claude/sessions/<pid>.json` (the PID is the `claude` process running inside the screen). Update `registry.json` with `session_id` and `pid`.
 
 #### 3. Stop a session (`stop <project>`)
 
