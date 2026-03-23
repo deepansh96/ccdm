@@ -8,13 +8,13 @@ You are a coordinator bot. Users message you on Discord to start, stop, and mana
 
 ## Key files
 
-- `registry.json` — maps project names to their config (path, state dir, screen name)
+- `registry.json` — contains the bot pool and project assignments
 - `scripts/start-session.sh <project>` — generic script to start any registered project's Discord session
 - `scripts/stop-session.sh <project>` — generic script to stop any registered project's Discord session
 
 ## How to respond
 
-When the user asks to start/stop/list/setup sessions, follow the session management instructions below. For anything else, respond normally — you're also a general-purpose assistant.
+When the user asks to start/stop/list/register/deregister sessions, follow the session management instructions below. For anything else, respond normally — you're also a general-purpose assistant.
 
 ## Current setup
 
@@ -26,12 +26,29 @@ Read `registry.json` to discover configured projects. This session is always the
 
 ### Registry
 
-Read the `registry.json` file in this project's root directory. It maps project names to their config:
-- `path`: project directory
+Read the `registry.json` file in this project's root directory. It has two main sections:
+
+**Pool** (`pool` array) — all available Discord bots:
+- `id`: bot identifier (e.g., `bot1`, `bot2`)
+- `app_id`: Discord application ID
+- `token`: bot token
 - `state_dir`: Discord state directory (`~/.claude/channels/discord{N}/`)
+- `assigned_to`: project name if assigned, `null` if available
+
+**Projects** (`projects` object) — registered projects:
+- `path`: project directory
+- `bot_id`: which pool bot is assigned to this project
 - `screen_name`: name of the screen session
+- `channel_id`: Discord channel ID the bot is scoped to
 - `session_id`: Claude Code session ID (updated on start, cleared on stop)
 - `pid`: Claude Code process ID (updated on start, cleared on stop)
+
+**Other fields:**
+- `discord_user_id`: the user's Discord ID (for access control)
+- `guild_id`: the Discord server ID (for bot invites)
+- `max_pool_size`: maximum number of bots in the pool (50)
+- `project_bot_role_id`: Discord role ID for the "project-bot" role (zero permissions, used to deny VIEW_CHANNEL on all categories)
+- `category_ids`: array of Discord category channel IDs where the project-bot role has VIEW_CHANNEL denied
 
 ### Commands
 
@@ -43,7 +60,7 @@ Run `screen -ls` and cross-reference with the registry. Report which projects ha
 
 #### 2. Start a session (`start <project>`)
 
-1. Look up the project in `registry.json`.
+1. Look up the project in `registry.json`. Find its assigned bot in the pool via `bot_id` to get the `state_dir`.
 2. Check if a screen session with that name is already running (`screen -ls | grep <screen_name>`). If yes, say it's already running.
 3. Run:
    ```sh
@@ -63,43 +80,121 @@ Run `screen -ls` and cross-reference with the registry. Report which projects ha
 
 Stop then start.
 
-#### 5. Set up a new project (`setup <project_name> <project_path> <bot_token>`)
+#### 5. Register a project (`register`, `setup`)
 
-This is for adding a brand new project that doesn't exist in the registry yet.
+This assigns an available bot from the pool to a new project and scopes it to a single Discord channel.
 
-1. Determine the next available state directory number. Look at existing directories matching `~/.claude/channels/discord*/` and pick the next number (e.g., if `discord2` exists, use `discord3`).
-2. Create the state directory: `mkdir -p ~/.claude/channels/discord{N}`
-3. Write the `.env` file:
+**Interactive flow:**
+1. Ask the user: "Which channel should the bot be registered to?" (user provides `#channel-name` or channel ID)
+2. Ask: "What is the project directory path?" (user provides absolute path)
+3. Derive `project_name` from the channel name (or let user specify). Derive `screen_name`: lowercase, underscores.
+
+**Registration steps:**
+1. Check the pool for an unassigned bot (`assigned_to` is `null`). If none available, tell the user: "No bots available in the pool. Add one with `pool add` or remove a project to free one up."
+2. Claim the first available bot: set its `assigned_to` to `<project_name>`.
+3. Add the project to `registry.json` with `bot_id`, `path`, `screen_name`, and `channel_id`.
+4. Rename the bot on Discord to `<bot_id>-<project_name>` (e.g., `bot2-my-project`):
+   ```sh
+   curl -s -X PATCH "https://discord.com/api/v10/users/@me" \
+     -H "Authorization: Bot <token>" \
+     -H "Content-Type: application/json" \
+     -d '{"username": "<bot_id>-<project_name>"}'
    ```
-   DISCORD_BOT_TOKEN=<bot_token>
+5. Assign the "project-bot" role to the bot (this role denies VIEW_CHANNEL on all categories):
+   ```sh
+   curl -s -X PUT "https://discord.com/api/v10/guilds/<guild_id>/members/<bot_app_id>/roles/<project_bot_role_id>" \
+     -H "Authorization: Bot <root_bot_token>"
    ```
-4. Write `access.json` with the user pre-approved (get `discord_user_id` from registry):
+   Use bot1's token as `<root_bot_token>` (it has admin permissions).
+6. Add a member-level permission override on the target channel to ALLOW the bot to see and use it:
+   ```sh
+   curl -s -X PUT "https://discord.com/api/v10/channels/<channel_id>/permissions/<bot_app_id>" \
+     -H "Authorization: Bot <root_bot_token>" \
+     -H "Content-Type: application/json" \
+     -d '{"allow": "274878008384", "deny": "0", "type": 1}'
+   ```
+   Permission bits: VIEW_CHANNEL + SEND_MESSAGES + READ_MESSAGE_HISTORY + ATTACH_FILES + ADD_REACTIONS + SEND_MESSAGES_IN_THREADS = `274878008384`. `type: 1` = member override.
+7. Write the `.env` file in the bot's state directory:
+   ```
+   DISCORD_BOT_TOKEN=<token>
+   ```
+8. Write `access.json` for the project bot — scoped to its one channel only:
    ```json
    {
      "dmPolicy": "allowlist",
      "allowFrom": ["<discord_user_id>"],
-     "groups": {},
+     "groups": {
+       "<channel_id>": {
+         "requireMention": false,
+         "allowFrom": ["<discord_user_id>"]
+       }
+     },
      "pending": {}
    }
    ```
-5. Add the project to `registry.json`.
-6. Start the session (follow the start steps above, including recording `session_id` and `pid`). You can also use the generic scripts: `scripts/start-session.sh <project_name>` and `scripts/stop-session.sh <project_name>` — these read from `registry.json` automatically.
-7. Tell the user the new bot is running.
+9. Update the ROOT bot's `access.json` (`~/.claude/channels/discord/access.json`) — add the project channel with `requireMention: true` so the user can @tag the root bot there:
+   ```json
+   "<channel_id>": {
+     "requireMention": true,
+     "allowFrom": ["<discord_user_id>"]
+   }
+   ```
+   Read the file, add the entry to `groups`, write it back.
+10. Start the session (follow the start steps above, including recording `session_id` and `pid`).
+11. Tell the user which bot was assigned, which channel it's scoped to, and that the session is running.
 
-**Auto-setup variant** — `setup <project_name> <project_path>` (no token):
+#### 6. Deregister a project (`deregister`, `remove`, `unregister`)
 
-If the user omits the bot token, run the automated bot creation flow (see "Automated bot creation" section above) to create the Discord application, get the token, and invite it to the server — then continue with steps 1–7 using the obtained token. Ask the user for their Discord credentials if not already known.
+1. Stop the session if running (`screen -X -S <screen_name> quit`).
+2. Find the project's assigned bot in the pool via `bot_id`. Get `token` and `app_id` from the pool entry, and `channel_id` from the project entry.
+3. Rename the bot back to its base name (e.g., `bot2`):
+   ```sh
+   curl -s -X PATCH "https://discord.com/api/v10/users/@me" \
+     -H "Authorization: Bot <token>" \
+     -H "Content-Type: application/json" \
+     -d '{"username": "<bot_id>"}'
+   ```
+4. Remove the channel permission override for the bot:
+   ```sh
+   curl -s -X DELETE "https://discord.com/api/v10/channels/<channel_id>/permissions/<bot_app_id>" \
+     -H "Authorization: Bot <root_bot_token>"
+   ```
+5. Remove the "project-bot" role from the bot:
+   ```sh
+   curl -s -X DELETE "https://discord.com/api/v10/guilds/<guild_id>/members/<bot_app_id>/roles/<project_bot_role_id>" \
+     -H "Authorization: Bot <root_bot_token>"
+   ```
+6. Remove the channel from the root bot's `access.json` (`~/.claude/channels/discord/access.json`) — delete the `<channel_id>` entry from `groups`.
+7. Set the bot's `assigned_to` to `null` in the pool (returns it to the pool).
+8. Clear `session_id` and `pid` (set to `null`).
+9. Remove the project entry from `registry.json`.
+10. Confirm the bot has been returned to the pool. The Discord channel still exists (not deleted).
 
-#### 6. Remove a project (`remove <project>`)
+#### 7. Pool status (`pool`, `pool status`)
 
-1. Stop the session if running.
-2. Remove the entry from `registry.json`.
-3. Do NOT delete the state directory — just inform the user they can manually clean up if desired.
-4. Optionally delete the Discord bot application (see below).
+Show all bots in the pool with their assignment status. For each bot, show:
+- Bot ID and username
+- Assigned project (or "available")
+- State directory
 
-**Deleting the Discord bot application** (optional, via Playwright):
+#### 8. Pool add (`pool add`)
 
-Use the same browser automation flow as bot creation to delete the app from the Developer Portal:
+Create a new bot and add it to the pool.
+
+1. Check `max_pool_size` — refuse if pool is already at capacity.
+2. Determine the next bot ID: find the highest `botN` in the pool and increment (e.g., if `bot4` is highest, next is `bot5`).
+3. Run the automated bot creation flow (see below) to create the Discord app, get the token, and invite it.
+4. Determine the next available state directory number from existing `~/.claude/channels/discord*/` directories.
+5. Create the state directory: `mkdir -p ~/.claude/channels/discord{N}`
+6. Add the bot to the pool array in `registry.json` with `assigned_to: null`.
+7. Confirm the new bot is in the pool and available.
+
+#### 9. Pool remove (`pool remove <bot_id>`)
+
+Remove a bot from the pool entirely.
+
+1. Check the bot is not assigned to any project (`assigned_to` must be `null`). If assigned, tell the user to `deregister` the project first.
+2. Optionally delete the Discord bot application via Playwright:
 
 ```python
 page.goto(f'https://discord.com/developers/applications/{app_id}/information')
@@ -123,6 +218,9 @@ Verify deletion by checking the bot token returns 401:
 ```sh
 curl -s -H "Authorization: Bot <token>" https://discord.com/api/v10/users/@me
 ```
+
+3. Remove the bot entry from the pool array in `registry.json`.
+4. Confirm removal.
 
 ### Automated bot creation (`create bot <name>`)
 
@@ -212,12 +310,12 @@ import time
 
 7. **Invite bot to the server** (via Discord API, no browser needed):
    ```sh
-   curl -s -X POST "https://discord.com/api/v9/oauth2/authorize?client_id=<app_id>&scope=bot" \
+   curl -s -X POST "https://discord.com/api/v10/oauth2/authorize?client_id=<app_id>&scope=bot" \
      -H "Authorization: <user_token>" \
      -H "Content-Type: application/json" \
      -d '{"guild_id": "<guild_id>", "permissions": "274878008384", "authorize": true}'
    ```
-   - `guild_id`: read from `registry.json` or use `808438133526888469` (the "personal" server).
+   - `guild_id`: read from `registry.json`.
    - Permissions `274878008384` = View Channels + Send Messages + Send in Threads + Read History + Attach Files + Add Reactions.
 
 8. **Message Content Intent** — the bot gets `GATEWAY_MESSAGE_CONTENT_LIMITED` (flag 524288) by default, which works for bots in < 100 servers. No manual toggle needed for personal use.
@@ -227,7 +325,7 @@ import time
    browser.close()
    ```
 
-After obtaining the bot token, proceed with the normal `setup` flow (create state dir, write `.env`, write `access.json`, add to registry, start session).
+After obtaining the bot token, add the bot to the pool in `registry.json` with `assigned_to: null`. If this was triggered by a `pool add` command, the bot is now available. If triggered by a `setup` command (no bots available), also assign it to the project and continue with the setup flow.
 
 **Important notes on this flow:**
 - The hCaptcha bypass works because `page.mouse.click()` sends a real browser event at page-level coordinates calculated from the iframe's bounding box. The checkbox is at approximately `(box.x + 38, box.y + 38)`.
@@ -244,7 +342,7 @@ If automated creation fails, walk the user through these steps:
 
 2. **Set up the bot user**: In the sidebar, go to **Bot**. Give the bot a username. Scroll down to **Privileged Gateway Intents** and enable **Message Content Intent** — without this the bot receives messages with empty content.
 
-3. **Copy the bot token**: Still on the **Bot** page, scroll up to **Token** and click **Reset Token**. Copy the token immediately — it's only shown once. This is the token needed for the `setup` command.
+3. **Copy the bot token**: Still on the **Bot** page, scroll up to **Token** and click **Reset Token**. Copy the token immediately — it's only shown once. This is the token needed for `pool add`.
 
 4. **Invite the bot to a server**: Go to **OAuth2** -> **URL Generator**. Select the `bot` scope. Under **Bot Permissions**, enable:
    - View Channels
@@ -256,9 +354,9 @@ If automated creation fails, walk the user through these steps:
 
    Set Integration type to **Guild Install**. Copy the **Generated URL**, open it in a browser, and add the bot to a server the user shares with their other bots.
 
-5. **Register with this agent**: Once the user has the token, they can run the `setup` command: `setup <project_name> <project_path> <bot_token>`
+5. **Add to pool**: Once the user has the token, they can provide it and the bot will be added to the pool via `pool add`.
 
-#### 7. Context report (`context report`, `context for all`)
+#### 10. Context report (`context report`, `context for all`)
 
 Get the context usage for all running sessions using `-p` mode with `--fork-session`:
 
@@ -271,7 +369,7 @@ cd <path> && claude -r <session_id> --fork-session -p "/context" --dangerously-s
 - Do NOT use `--session-id` (errors on active sessions) or `screen -X stuff` (sends it as a chat message, not a CLI command).
 - Report the key stats: tokens used / total, percentage, messages, free space.
 
-#### 8. Usage report (`usage`, `limits`, `how much usage left`, `check usage`)
+#### 11. Usage report (`usage`, `limits`, `how much usage left`, `check usage`)
 
 Run the usage report script to show live rate limits, account profile, and historical usage stats:
 
@@ -311,7 +409,7 @@ The user may ask things like "how much usage do I have left", "what are my limit
 🔥 Streaks (current and longest)
 ```
 
-#### 9. Self-restart (`restart yourself`, `restart root`, `restart self`)
+#### 12. Self-restart (`restart yourself`, `restart root`, `restart self`)
 
 You can restart yourself by running the restart script in the background with `nohup`, which survives your own process being killed:
 
@@ -331,10 +429,24 @@ When the user sends a voice message (`.ogg` audio attachment), transcribe it usi
 3. Read the resulting `.txt` file and respond to its content.
 4. Quote the transcription in your reply so the user can confirm accuracy.
 
+### Channel Routing Rules
+
+- **#root channels** (one per category): Messages go to the root bot WITHOUT @mention. These are configured in the root bot's `access.json` with `requireMention: false`.
+- **Project channels**: Messages go to the assigned project bot WITHOUT @mention. The root bot can only be reached in project channels via @mention (`requireMention: true` in root bot's `access.json`).
+- **Project bot isolation**: Each project bot has the "project-bot" role (which denies VIEW_CHANNEL on all categories) plus a member-level override that allows it on its one assigned channel. It cannot see any other channel.
+- **New categories**: When a new category is added to the server, apply the "project-bot" role deny on it:
+  ```sh
+  curl -s -X PUT "https://discord.com/api/v10/channels/<new_category_id>/permissions/<project_bot_role_id>" \
+    -H "Authorization: Bot <root_bot_token>" \
+    -H "Content-Type: application/json" \
+    -d '{"allow": "0", "deny": "1024", "type": 0}'
+  ```
+  And add the category ID to `category_ids` in `registry.json`.
+
 ### Important Notes
 
 - Always use `zsh -ic` (not `bash -c`) when launching screen sessions — tools like `bun` or `claude` may only be in PATH via `~/.zshrc`. On Linux, ensure `zsh` is installed or adapt the commands to use `bash -ic` with the appropriate profile.
-- Each project needs its own unique Discord bot token. Two sessions cannot share a token.
+- Each project gets its own bot from the pool. Two sessions cannot share a bot. The pool has a max size of 50.
 - Screen session names should be short, lowercase, use underscores (derived from project name).
 - Sessions do not persist across machine restarts. The user needs to start them again.
 - New sessions start with a fresh Claude Code conversation — no history from previous sessions is carried over.

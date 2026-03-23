@@ -1,32 +1,36 @@
 # CCDM — Claude Code Discord Manager
 
-Manage multiple [Claude Code](https://docs.anthropic.com/en/docs/claude-code) instances from Discord. Each project gets its own bot, its own screen session, and its own conversation — all orchestrated by a single root agent.
+Manage multiple [Claude Code](https://docs.anthropic.com/en/docs/claude-code) instances from Discord. A **pool of Discord bots** is managed centrally — assign one to a project when needed, return it when done.
 
 ```
 Discord Server
   │
-  ├── Root Agent Bot (this repo)
-  │     Manages all other bots via screen sessions
+  ├── #root (General)  ← Root Agent listens here (no @mention needed)
+  ├── #root (ADS)      ← Root Agent listens here too
+  ├── #root (AF)       ← ...and here
   │
-  ├── Project Bot 1 (screen session)
-  │     Claude Code running in ~/project-a/
+  ├── #my-app (ADS)    ← bot2-my-app ONLY sees this channel
+  │     Claude Code running in ~/my-app/
   │
-  └── Project Bot 2 (screen session)
-        Claude Code running in ~/project-b/
+  ├── #website (AF)    ← bot3-website ONLY sees this channel
+  │     Claude Code running in ~/website/
+  │
+  └── bot4, bot5, ...  (available in pool, not assigned)
 ```
 
 ## How It Works
 
-The root agent is a Claude Code instance connected to Discord. When you message it, it can:
+The root agent is a Claude Code instance connected to Discord. It manages a **pool of up to 50 Discord bots**. When you message it in any `#root` channel, it can:
 
-- **Start/stop/restart** Claude Code sessions for different projects
-- **Set up new projects** with their own Discord bots
+- **Register bots** to specific Discord channels (each bot is isolated to only see its assigned channel)
+- **Deregister bots** and return them to the pool (channel stays, bot goes back)
+- **Start/stop/restart** Claude Code sessions for assigned projects
 - **Report context usage** across all running sessions
 - **Show rate limits and usage stats** with visual progress bars
 - **Restart itself** without manual intervention
 - **Transcribe voice messages** using Whisper
 
-Each project runs in its own `screen` session with its own Discord bot token, so you can talk to each project independently on Discord.
+Each project gets its own Discord channel and bot. The bot is **locked to that one channel** via Discord permission overrides — it can't see anything else. You chat with each project in its own channel, no `@mention` needed. The root agent listens in all `#root` channels without `@mention`, and can be `@mentioned` in project channels for management tasks.
 
 CCDM is built on the [official Anthropic Discord plugin for Claude Code](https://github.com/anthropics/claude-plugins-official/blob/main/external_plugins/discord/README.md). Refer to that README for details on the plugin itself, including how the MCP server works, pairing flow, and access control.
 
@@ -78,14 +82,19 @@ If you prefer to set things up by hand:
    cp registry.example.json registry.json
    ```
 
-2. **Edit `registry.json`** — replace `YOUR_DISCORD_USER_ID` with your actual Discord user ID:
+2. **Edit `registry.json`** — fill in your Discord user ID and server ID:
    ```json
    {
      "discord_user_id": "123456789012345678",
+     "guild_id": "YOUR_DISCORD_SERVER_ID",
+     "max_pool_size": 50,
+     "project_bot_role_id": null,
+     "category_ids": [],
+     "pool": [],
      "projects": {}
    }
    ```
-   To find your Discord user ID: Settings > Advanced > enable Developer Mode, then right-click your name > Copy User ID.
+   To find your Discord user ID: Settings > Advanced > enable Developer Mode, then right-click your name > Copy User ID. For the server ID, right-click the server name > Copy Server ID.
 
 3. **Create the state directory:**
    ```bash
@@ -124,33 +133,59 @@ Message the root agent bot on Discord with any of these:
 | `start <project>` | Start a project's Claude Code Discord session |
 | `stop <project>` | Stop a project's session |
 | `restart <project>` | Restart a project's session |
-| `setup <name> <path> <token>` | Register and start a new project bot |
-| `remove <project>` | Unregister a project |
+| `register` / `setup` | Register a bot to a channel (interactive — asks for channel and path) |
+| `deregister` / `remove` / `unregister` | Deregister a project and return its bot to the pool |
+| `pool` / `pool status` | Show all bots and their assignment status |
+| `pool add` | Create a new bot and add it to the pool |
+| `pool remove <bot_id>` | Remove an unassigned bot from the pool |
 | `context report` | Get context window usage for all running sessions |
 | `usage` / `limits` | Show rate limits, usage stats, and account info |
 | `restart yourself` | Self-restart the root agent |
 
-### Adding a New Project
+### Registering a New Project
 
-Once the root agent is running, message it on Discord:
+Once the root agent is running and you have bots in the pool, message it in any `#root` channel:
 
 ```
-setup my_project ~/path/to/project BOT_TOKEN_HERE
+register
 ```
 
-This will:
-1. Create a new state directory for the project
-2. Configure the bot token and access control
-3. Add the project to the registry
-4. Start the Claude Code session in a new screen
+The root agent will ask you:
+1. **Which channel?** — provide a channel name or ID (it can also create one)
+2. **Project path?** — the local directory for the project
 
-Each project needs its own Discord bot — see [Creating Discord Bots](#creating-discord-bots).
+Then it automatically:
+1. Claims an available bot from the pool
+2. Renames it to `botN-project_name`
+3. **Isolates the bot** to only see the assigned channel (via Discord permission overrides)
+4. Configures the bot's state directory and access control
+5. Updates the root bot's config so you can `@mention` it in the project channel
+6. Starts the Claude Code session
 
-## Creating Discord Bots
+No need to provide a token — bots are managed in the pool. If the pool is empty, add more bots with `pool add`.
 
-Each project (including the root agent) needs its own Discord bot. Here's how to create one:
+### Channel Isolation
 
-1. **Create an application**: Go to the [Discord Developer Portal](https://discord.com/developers/applications) and click **New Application**. Name it after your project.
+Each project bot is locked to a single Discord channel using:
+- A **"project-bot" role** with zero permissions and VIEW_CHANNEL denied on all categories
+- A **member-level override** that allows the bot on its one assigned channel
+
+This means:
+- Project bots **cannot see** any other channel, `#root` channels, or other project channels
+- The root bot **can see everything** and responds in `#root` channels without `@mention`
+- You can `@mention` the root bot in any project channel for management tasks
+
+## Managing the Bot Pool
+
+CCDM uses a **bot pool** — a set of pre-created Discord bots that get assigned to projects on demand. The pool supports up to 50 bots.
+
+### Adding bots to the pool
+
+The easiest way is to message the root agent: `pool add`. This uses browser automation to create a bot, get its token, and invite it to your server automatically.
+
+Alternatively, create bots manually:
+
+1. **Create an application**: Go to the [Discord Developer Portal](https://discord.com/developers/applications) and click **New Application**.
 
 2. **Set up the bot**: In the sidebar, go to **Bot**. Scroll down to **Privileged Gateway Intents** and enable **Message Content Intent** — without this, the bot receives messages with empty content.
 
@@ -168,7 +203,14 @@ Each project (including the root agent) needs its own Discord bot. Here's how to
 
 5. **Invite the bot**: Open the URL in a browser and add the bot to your Discord server.
 
-6. **Register with CCDM**: Message the root agent: `setup <project_name> <project_path> <bot_token>`
+6. **Add to pool**: Provide the token to the root agent and it will add the bot to the pool.
+
+### How assignment works
+
+- `register` → interactive flow: picks a bot, locks it to a channel, starts the session
+- `deregister <project>` → stops the session, removes channel lock, renames the bot back, returns it to the pool
+- Bots are interchangeable — any available bot can be assigned to any project
+- The Discord channel is **not deleted** on deregister — only the bot assignment is removed
 
 ## Usage Report
 
@@ -247,8 +289,10 @@ ccdm/
 
 - Sessions do not persist across machine restarts
 - Live usage API data requires macOS Keychain (local stats work everywhere)
-- Each project needs its own Discord bot token — two sessions cannot share a token
+- Each project needs its own bot from the pool — two projects cannot share a bot (max 50 bots)
 - Voice message transcription requires `whisper` (optional)
+- Pool bots with admin managed roles bypass channel isolation — bot roles must have non-admin permissions for isolation to work
+- When new Discord categories are created, the "project-bot" role deny must be applied to them
 
 ## License
 

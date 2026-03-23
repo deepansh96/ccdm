@@ -1,4 +1,9 @@
 {
   "discord_user_id": "YOUR_DISCORD_USER_ID",
+  "guild_id": "YOUR_DISCORD_SERVER_ID",
+  "max_pool_size": 50,
+  "project_bot_role_id": null,
+  "category_ids": [],
+  "pool": [],
   "projects": {}
 }
