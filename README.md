@@ -242,6 +242,60 @@ CCDM uses the `--dangerously-skip-permissions` flag when starting Claude Code se
 
 This means Claude Code will have unrestricted access to the file system and shell within each project directory. Only run CCDM on machines you trust, and be mindful of what projects you connect.
 
+## Global Skills
+
+CCDM includes reusable skills (custom slash commands) that any Claude Code agent can use. Copy them to `~/.claude/commands/` on any machine to make them available globally.
+
+| Skill | File | Description |
+|-------|------|-------------|
+| `/restart-self` | `skills/restart-self.md` | Agent restarts its own session — detects its screen name, state dir, and project path automatically, then runs a `nohup` restart that survives its own process being killed |
+| `/context-usage` | `skills/context-usage.md` | Agent reports its own context window usage by reading the status bar from its screen session |
+| `/project-context` | `skills/project-context.md` | Generates or updates a comprehensive `project-context.md` document for the current project — serves as an entry point for AI agents and engineers |
+
+### Installing skills
+
+**On your local machine (all agents get them automatically):**
+```bash
+cp skills/*.md ~/.claude/commands/
+```
+
+**On a remote VM:**
+```bash
+mkdir -p ~/.claude/commands
+# Copy each .md file, or tell the running agent to save them
+```
+
+Or just send the files to the agent on Discord and ask it to save them to `~/.claude/commands/`.
+
+## Remote VM Setup
+
+You can run Claude Code sessions on remote Linux VMs connected to Discord channels. The root agent handles bot registration and Discord permissions locally — only the Claude Code runtime runs on the VM.
+
+### Prerequisites
+- Node.js/npm installed on the VM
+- Claude Code installed (`npm install -g @anthropic-ai/claude-code`) and logged in
+- `screen` installed
+- **`IS_SANDBOX=1`** is required when running as root (Claude Code blocks `--dangerously-skip-permissions` as root without it)
+
+### Steps
+
+1. **Install Bun** (required by Discord plugin): `npm install -g bun`
+2. **Install Discord plugin:**
+   ```bash
+   claude plugin marketplace add anthropics/claude-plugins-official
+   claude plugin install discord@claude-plugins-official
+   ```
+3. **Ask the root agent** to register a bot and create a channel — it will provide the bot token and channel ID
+4. **Create the state directory** on the VM with `.env` (bot token) and `access.json` (channel + user allowlist)
+5. **Start the session:**
+   ```bash
+   screen -dmS <name> bash -ic 'cd /project && IS_SANDBOX=1 DISCORD_STATE_DIR=~/.claude/channels/discord_<name> claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
+   sleep 8 && screen -S <name> -p 0 -X stuff "\r"
+   ```
+6. **Install skills** (optional): copy `skills/*.md` to `~/.claude/commands/` on the VM
+
+See `CLAUDE.md` for the full detailed instructions with all config file templates.
+
 ## File Structure
 
 ```
@@ -258,6 +312,10 @@ ccdm/
     claude-usage.sh          # Usage reporting script
     start-session.sh         # Generic script to start any registered project
     stop-session.sh          # Generic script to stop any registered project
+  skills/
+    restart-self.md          # /restart-self skill — agent self-restart
+    context-usage.md         # /context-usage skill — agent context reporting
+    project-context.md       # /project-context skill — generate project docs
 ```
 
 ## Troubleshooting
@@ -268,7 +326,8 @@ ccdm/
 - Verify your Discord user ID is in `access.json`
 
 **`screen` session dies immediately**
-- Attach to see errors: `screen -r root_agent`
+- Run the command directly without screen to see the actual error
+- If running as root: add `IS_SANDBOX=1` before `claude`
 - Check that `claude` is in your PATH (run `which claude` in zsh)
 - On Linux, ensure `zsh` is installed or adapt commands to use `bash -ic`
 

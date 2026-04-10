@@ -468,6 +468,95 @@ When the user sends a voice message (`.ogg` audio attachment), transcribe it usi
   ```
   And add the category ID to `category_ids` in `registry.json`.
 
+### Using Codex
+
+If the user asks you to use Codex (OpenAI's CLI agent), you can run it in non-interactive mode. Codex is installed at `/opt/homebrew/bin/codex` and uses `gpt-5.4`.
+
+**Non-interactive execution:**
+```sh
+codex exec "<prompt>" 2>&1
+```
+
+**With a specific working directory:**
+```sh
+cd <path> && codex exec "<prompt>" 2>&1
+```
+
+**Key flags:**
+- `--model <model>` — override the model (default: gpt-5.4)
+- `--approval never` — no approval needed (default in exec mode)
+- `--sandbox read-only` — read-only sandbox (default in exec mode)
+- `--full-auto` — allow file writes and command execution
+
+Use Codex when the user explicitly asks for it. For normal tasks, continue using Claude Code.
+
+### Remote VM Setup (`setup remote`, `setup vm`, `setup linux`)
+
+Set up a Claude Code session on a remote Linux VM connected to a Discord channel. The registration (bot assignment, channel creation, permissions) is done locally by the root agent. Only the Claude Code + Discord plugin runtime runs on the VM.
+
+**Prerequisites on the VM:**
+- Node.js/npm installed
+- Claude Code installed (`npm install -g @anthropic-ai/claude-code`) and logged in (`claude` → follow OAuth flow)
+- screen installed (`apt install screen` or similar)
+- **IMPORTANT:** `--dangerously-skip-permissions` cannot run as root/sudo. To bypass this, prefix the command with `IS_SANDBOX=1`. Alternatively, run as a regular user (`su - <username>`).
+
+**Step 1: Install Bun (required by Discord plugin)**
+```bash
+npm install -g bun
+```
+Note: `curl -fsSL https://bun.sh/install | bash` also works but requires `unzip`. On restricted VMs where apt repos are unreachable, `npm install -g bun` is the reliable fallback.
+
+**Step 2: Install the Discord plugin**
+```bash
+claude plugin marketplace add anthropics/claude-plugins-official
+claude plugin install discord@claude-plugins-official
+```
+
+**Step 3: Create the bot state directory**
+The root agent provides the bot token and channel ID after registration.
+```bash
+mkdir -p ~/.claude/channels/discord_<name>
+
+cat > ~/.claude/channels/discord_<name>/.env << 'EOF'
+DISCORD_BOT_TOKEN=<token>
+EOF
+
+cat > ~/.claude/channels/discord_<name>/access.json << 'EOF'
+{
+  "dmPolicy": "allowlist",
+  "allowFrom": ["<discord_user_id>"],
+  "groups": {
+    "<channel_id>": {
+      "requireMention": false,
+      "allowFrom": ["<discord_user_id>"]
+    }
+  },
+  "pending": {}
+}
+EOF
+```
+
+**Step 4: Start the session**
+```bash
+screen -dmS <screen_name> bash -ic 'cd /path/to/project && IS_SANDBOX=1 DISCORD_STATE_DIR=~/.claude/channels/discord_<name> claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
+sleep 8 && screen -S <screen_name> -p 0 -X stuff "\r"
+```
+`IS_SANDBOX=1` is required when running as root — without it, `--dangerously-skip-permissions` is blocked.
+Use `zsh -ic` if the VM has zsh, `bash -ic` otherwise. Use full paths instead of `~` if tilde expansion fails inside screen quotes.
+
+**Step 5: Verify**
+```bash
+screen -S <screen_name> -X hardcopy /tmp/verify.txt && cat /tmp/verify.txt
+```
+Look for "Listening for channel messages" and confirm "plugin not installed" does NOT appear.
+
+**Troubleshooting:** If the screen session dies immediately (shows "No screen session found" right after creation), run the command directly without screen to see the actual error:
+```bash
+IS_SANDBOX=1 DISCORD_STATE_DIR=~/.claude/channels/discord_<name> claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions
+```
+
+**Root agent registration:** Use the normal `register` flow to assign a bot, create the channel, and set permissions. Set the project path in `registry.json` to `"remote:<vm-name>"` to indicate it's not a local session. The root agent cannot start/stop/restart remote sessions — provide the user with the commands to run on the VM.
+
 ### Important Notes
 
 - Always use `zsh -ic` (not `bash -c`) when launching screen sessions — tools like `bun` or `claude` may only be in PATH via `~/.zshrc`. On Linux, ensure `zsh` is installed or adapt the commands to use `bash -ic` with the appropriate profile.
