@@ -19,17 +19,14 @@ missing=()
 if ! command -v claude &>/dev/null; then
     missing+=("claude (Claude Code CLI — install from https://docs.anthropic.com/en/docs/claude-code)")
 fi
-if ! command -v screen &>/dev/null; then
-    missing+=("screen (brew install screen / apt install screen)")
+if ! command -v tmux &>/dev/null; then
+    missing+=("tmux (brew install tmux / apt install tmux)")
 fi
 if ! command -v zsh &>/dev/null; then
     missing+=("zsh (brew install zsh / apt install zsh)")
 fi
 if ! command -v python3 &>/dev/null; then
     missing+=("python3 (brew install python3 / apt install python3)")
-fi
-if ! command -v expect &>/dev/null; then
-    missing+=("expect (brew install expect / apt install expect) — needed for self-restart feature")
 fi
 
 if [ ${#missing[@]} -gt 0 ]; then
@@ -150,12 +147,12 @@ echo "════════════════════════�
 echo ""
 echo "To start the root agent:"
 echo ""
-echo "  screen -dmS root_agent zsh -ic 'cd $SCRIPT_DIR && DISCORD_STATE_DIR=$STATE_DIR claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'"
+echo "  tmux new-session -d -s root_agent -- zsh -ic 'cd $SCRIPT_DIR && DISCORD_STATE_DIR=$STATE_DIR claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'"
 echo ""
 echo "Then message your bot on Discord to manage project sessions."
 echo ""
 echo "Useful commands:"
-echo "  screen -r root_agent        # Attach to the session"
-echo "  screen -ls                  # List active sessions"
-echo "  Ctrl+A, D                   # Detach from a session"
+echo "  tmux attach -t root_agent   # Attach to the session"
+echo "  tmux list-sessions          # List active sessions"
+echo "  Ctrl+B, D                   # Detach from a session"
 echo ""

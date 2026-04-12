@@ -1,6 +1,6 @@
 #!/bin/zsh
 # Usage: ./scripts/stop-session.sh <project_name>
-# Reads registry.json to get the screen session name and stops it.
+# Reads registry.json to get the tmux session name and stops it.
 
 set -euo pipefail
 
@@ -17,4 +17,4 @@ fi
 
 SCREEN_NAME=$(python3 -c "import json; r=json.load(open('$REGISTRY')); print(r['projects']['$PROJECT']['screen_name'])")
 
-screen -X -S "$SCREEN_NAME" quit 2>/dev/null && echo "Stopped Discord bot session '$SCREEN_NAME'" || echo "No active session '$SCREEN_NAME' found"
+tmux kill-session -t "$SCREEN_NAME" 2>/dev/null && echo "Stopped Discord bot session '$SCREEN_NAME'" || echo "No active session '$SCREEN_NAME' found"

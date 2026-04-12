@@ -25,11 +25,11 @@ bot = next(b for b in r['pool'] if b['id'] == p['bot_id'])
 print(os.path.expanduser(p['path']) + '\t' + os.path.expanduser(bot['state_dir']) + '\t' + p['screen_name'])
 ")"
 
-if screen -ls | grep -q "$SCREEN_NAME"; then
+if tmux has-session -t "$SCREEN_NAME" 2>/dev/null; then
   echo "Session '$SCREEN_NAME' is already running."
   exit 0
 fi
 
-screen -dmS "$SCREEN_NAME" zsh -ic "cd '$PATH_DIR' && DISCORD_STATE_DIR='$STATE_DIR' claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions"
-echo "Started Discord bot in screen session '$SCREEN_NAME'"
-echo "Attach with: screen -r $SCREEN_NAME"
+tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$PATH_DIR' && DISCORD_STATE_DIR='$STATE_DIR' claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions"
+echo "Started Discord bot in tmux session '$SCREEN_NAME'"
+echo "Attach with: tmux attach -t $SCREEN_NAME"

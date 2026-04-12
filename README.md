@@ -39,10 +39,9 @@ CCDM is built on the [official Anthropic Discord plugin for Claude Code](https:/
 | Tool | Required | Install |
 |------|----------|---------|
 | [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) | Yes | See docs |
-| `screen` | Yes | `brew install screen` / `apt install screen` |
+| `tmux` | Yes | `brew install tmux` / `apt install tmux` |
 | `zsh` | Yes | Default on macOS / `apt install zsh` on Linux |
 | `python3` | Yes | `brew install python3` / `apt install python3` |
-| `expect` | Yes | `brew install expect` / `apt install expect` |
 | `whisper` | Optional | `pip install openai-whisper` (for voice messages) |
 
 You also need:
@@ -61,7 +60,7 @@ cd ccdm
 ./setup.sh
 
 # 3. Start the root agent
-screen -dmS root_agent zsh -ic 'cd /path/to/ccdm && DISCORD_STATE_DIR=~/.claude/channels/discord claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
+tmux new-session -d -s root_agent -- zsh -ic 'cd /path/to/ccdm && DISCORD_STATE_DIR=~/.claude/channels/discord claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
 ```
 
 The setup script will:
@@ -120,7 +119,7 @@ If you prefer to set things up by hand:
 
 6. **Start the root agent:**
    ```bash
-   screen -dmS root_agent zsh -ic 'cd /path/to/ccdm && DISCORD_STATE_DIR=~/.claude/channels/discord claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
+   tmux new-session -d -s root_agent -- zsh -ic 'cd /path/to/ccdm && DISCORD_STATE_DIR=~/.claude/channels/discord claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
    ```
 
 ## Commands
@@ -225,7 +224,7 @@ Ask the root agent for a usage report by messaging `usage`, `limits`, or `how mu
 
 ## Preventing Sleep
 
-CCDM needs your machine to stay awake — if it sleeps, all screen sessions (and their Discord bots) go offline.
+CCDM needs your machine to stay awake — if it sleeps, all tmux sessions (and their Discord bots) go offline.
 
 **macOS:**
 - Install [Amphetamine](https://apps.apple.com/app/amphetamine/id937984704) (free) and set it to keep the Mac awake indefinitely
@@ -248,8 +247,7 @@ CCDM includes reusable skills (custom slash commands) that any Claude Code agent
 
 | Skill | File | Description |
 |-------|------|-------------|
-| `/restart-self` | `skills/restart-self.md` | Agent restarts its own session — detects its screen name, state dir, and project path automatically, then runs a `nohup` restart that survives its own process being killed |
-| `/context-usage` | `skills/context-usage.md` | Agent reports its own context window usage by reading the status bar from its screen session |
+| `/restart-self` | `skills/restart-self.md` | Agent restarts its own session — detects its tmux session name, state dir, and project path automatically, then runs a `nohup` restart that survives its own process being killed |
 | `/project-context` | `skills/project-context.md` | Generates or updates a comprehensive `project-context.md` document for the current project — serves as an entry point for AI agents and engineers |
 
 ### Installing skills
@@ -274,7 +272,7 @@ You can run Claude Code sessions on remote Linux VMs connected to Discord channe
 ### Prerequisites
 - Node.js/npm installed on the VM
 - Claude Code installed (`npm install -g @anthropic-ai/claude-code`) and logged in
-- `screen` installed
+- `tmux` installed
 - **`IS_SANDBOX=1`** is required when running as root (Claude Code blocks `--dangerously-skip-permissions` as root without it)
 
 ### Steps
@@ -289,8 +287,8 @@ You can run Claude Code sessions on remote Linux VMs connected to Discord channe
 4. **Create the state directory** on the VM with `.env` (bot token) and `access.json` (channel + user allowlist)
 5. **Start the session:**
    ```bash
-   screen -dmS <name> bash -ic 'cd /project && IS_SANDBOX=1 DISCORD_STATE_DIR=~/.claude/channels/discord_<name> claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
-   sleep 8 && screen -S <name> -p 0 -X stuff "\r"
+   tmux new-session -d -s <name> -- bash -ic 'cd /project && IS_SANDBOX=1 DISCORD_STATE_DIR=~/.claude/channels/discord_<name> claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
+   sleep 8 && tmux send-keys -t <name> Enter
    ```
 6. **Install skills** (optional): copy `skills/*.md` to `~/.claude/commands/` on the VM
 
@@ -314,7 +312,6 @@ ccdm/
     stop-session.sh          # Generic script to stop any registered project
   skills/
     restart-self.md          # /restart-self skill — agent self-restart
-    context-usage.md         # /context-usage skill — agent context reporting
     project-context.md       # /project-context skill — generate project docs
 ```
 
@@ -325,8 +322,8 @@ ccdm/
 - Check the bot is in the same server as you
 - Verify your Discord user ID is in `access.json`
 
-**`screen` session dies immediately**
-- Run the command directly without screen to see the actual error
+**`tmux` session dies immediately**
+- Run the command directly without tmux to see the actual error
 - If running as root: add `IS_SANDBOX=1` before `claude`
 - Check that `claude` is in your PATH (run `which claude` in zsh)
 - On Linux, ensure `zsh` is installed or adapt commands to use `bash -ic`
@@ -341,7 +338,7 @@ ccdm/
 - Local stats will still work without Keychain access
 
 **Sessions lost after reboot**
-- Screen sessions don't survive machine restarts
+- Tmux sessions don't survive machine restarts
 - Re-run `start <project>` for each project, or set up a launch agent / systemd service
 
 ## Limitations

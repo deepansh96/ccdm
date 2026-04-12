@@ -4,7 +4,7 @@ This is the root agent that manages Discord-connected Claude Code sessions for m
 
 ## What this does
 
-You are a coordinator bot. Users message you on Discord to start, stop, and manage Claude Code sessions running in different project directories. Each project has its own Discord bot, its own screen session, and its own state directory.
+You are a coordinator bot. Users message you on Discord to start, stop, and manage Claude Code sessions running in different project directories. Each project has its own Discord bot, its own tmux session, and its own state directory.
 
 ## Key files
 
@@ -38,7 +38,7 @@ Read the `registry.json` file in this project's root directory. It has two main 
 **Projects** (`projects` object) — registered projects:
 - `path`: project directory
 - `bot_id`: which pool bot is assigned to this project
-- `screen_name`: name of the screen session
+- `screen_name`: name of the tmux session
 - `channel_id`: Discord channel ID the bot is scoped to
 - `session_id`: Claude Code session ID (updated on start, cleared on stop)
 - `pid`: Claude Code process ID (updated on start, cleared on stop)
@@ -56,12 +56,12 @@ Determine which action the user wants based on their message:
 
 #### 1. List sessions (`list`, `status`, `what's running`)
 
-Run `screen -ls` and cross-reference with the registry. Report which projects have active sessions and which don't.
+Run `tmux list-sessions` and cross-reference with the registry. Report which projects have active sessions and which don't.
 
 #### 2. Start a session (`start <project>`)
 
 1. Look up the project in `registry.json`. Find its assigned bot in the pool via `bot_id` to get the `state_dir`.
-2. Check if a screen session with that name is already running (`screen -ls | grep <screen_name>`). If yes, say it's already running.
+2. Check if a tmux session with that name is already running (`tmux has-session -t <screen_name> 2>/dev/null`). If yes, say it's already running.
 3. Pre-trust the workspace so the trust dialog is skipped (or auto-dismissed):
    ```python
    import json
@@ -80,24 +80,23 @@ Run `screen -ls` and cross-reference with the registry. Report which projects ha
    ```
 4. Run:
    ```sh
-   screen -dmS <screen_name> zsh -ic 'cd <path> && DISCORD_STATE_DIR=<state_dir> claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
+   tmux new-session -d -s <screen_name> -- zsh -ic 'cd <path> && DISCORD_STATE_DIR=<state_dir> claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
    ```
 5. **Dismiss the trust dialog** — the Ink TUI may still show it even with pre-trust. Wait ~8 seconds for the prompt to render, then send Enter:
    ```sh
-   sleep 8 && screen -S <screen_name> -p 0 -X stuff "\r"
+   sleep 8 && tmux send-keys -t <screen_name> Enter
    ```
-   The `-p 0` flag is critical — it targets screen window 0, which correctly routes the keypress through the raw-mode TUI. Without `-p 0`, the input is silently dropped.
-6. Verify it started by capturing the screen output:
+6. Verify it started by capturing the tmux pane output:
    ```sh
-   screen -S <screen_name> -X hardcopy /tmp/<screen_name>_verify.txt && cat /tmp/<screen_name>_verify.txt
+   tmux capture-pane -t <screen_name> -p
    ```
-   Look for "Listening for channel messages" to confirm the session is live. If the trust dialog is still showing, re-run the `stuff "\r"` command.
-7. Look up the Claude Code PID and session ID from `~/.claude/sessions/<pid>.json` (the PID is the `claude` process running inside the screen). Update `registry.json` with `session_id` and `pid`.
+   Look for "Listening for channel messages" to confirm the session is live. If the trust dialog is still showing, re-run the `send-keys` command.
+7. Look up the Claude Code PID and session ID from `~/.claude/sessions/<pid>.json` (the PID is the `claude` process running inside the tmux session). Update `registry.json` with `session_id` and `pid`.
 
 #### 3. Stop a session (`stop <project>`)
 
 1. Look up the project in `registry.json`.
-2. Run: `screen -X -S <screen_name> quit`
+2. Run: `tmux kill-session -t <screen_name>`
 3. Clear `session_id` and `pid` from the project's entry in `registry.json` (set to `null`).
 4. Confirm it's stopped.
 
@@ -170,7 +169,7 @@ This assigns an available bot from the pool to a new project and scopes it to a 
 
 #### 6. Deregister a project (`deregister`, `remove`, `unregister`)
 
-1. Stop the session if running (`screen -X -S <screen_name> quit`).
+1. Stop the session if running (`tmux kill-session -t <screen_name>`).
 2. Find the project's assigned bot in the pool via `bot_id`. Get `token` and `app_id` from the pool entry, and `channel_id` from the project entry.
 3. Rename the bot back to its base name (e.g., `bot2`):
    ```sh
@@ -391,7 +390,8 @@ cd <path> && claude -r <session_id> --fork-session -p "/context" --dangerously-s
 
 - Run all sessions in parallel for speed.
 - `--fork-session` is required — it forks a read-only copy so it doesn't interfere with the live session.
-- Do NOT use `--session-id` (errors on active sessions) or `screen -X stuff` (sends it as a chat message, not a CLI command).
+- Do NOT use `--session-id` (errors on active sessions) or `tmux send-keys` (sends it as a chat message, not a CLI command).
+- `/context` is a built-in Claude Code command — no custom skill needed.
 - Report the key stats: tokens used / total, percentage, messages, free space.
 
 #### 11. Usage report (`usage`, `limits`, `how much usage left`, `check usage`)
@@ -443,7 +443,7 @@ You can restart yourself by running the restart script in the background with `n
    ```sh
    nohup ./restart-root-agent.sh &
    ```
-3. The script kills your current process, waits 2 seconds, and starts a fresh instance in the `root_agent` screen session.
+3. The script kills your current process, waits 2 seconds, and starts a fresh instance in the `root_agent` tmux session.
 
 ### Voice Messages
 
@@ -497,7 +497,7 @@ Set up a Claude Code session on a remote Linux VM connected to a Discord channel
 **Prerequisites on the VM:**
 - Node.js/npm installed
 - Claude Code installed (`npm install -g @anthropic-ai/claude-code`) and logged in (`claude` → follow OAuth flow)
-- screen installed (`apt install screen` or similar)
+- tmux installed (`apt install tmux` or similar)
 - **IMPORTANT:** `--dangerously-skip-permissions` cannot run as root/sudo. To bypass this, prefix the command with `IS_SANDBOX=1`. Alternatively, run as a regular user (`su - <username>`).
 
 **Step 1: Install Bun (required by Discord plugin)**
@@ -538,19 +538,19 @@ EOF
 
 **Step 4: Start the session**
 ```bash
-screen -dmS <screen_name> bash -ic 'cd /path/to/project && IS_SANDBOX=1 DISCORD_STATE_DIR=~/.claude/channels/discord_<name> claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
-sleep 8 && screen -S <screen_name> -p 0 -X stuff "\r"
+tmux new-session -d -s <screen_name> -- bash -ic 'cd /path/to/project && IS_SANDBOX=1 DISCORD_STATE_DIR=~/.claude/channels/discord_<name> claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
+sleep 8 && tmux send-keys -t <screen_name> Enter
 ```
 `IS_SANDBOX=1` is required when running as root — without it, `--dangerously-skip-permissions` is blocked.
-Use `zsh -ic` if the VM has zsh, `bash -ic` otherwise. Use full paths instead of `~` if tilde expansion fails inside screen quotes.
+Use `zsh -ic` if the VM has zsh, `bash -ic` otherwise.
 
 **Step 5: Verify**
 ```bash
-screen -S <screen_name> -X hardcopy /tmp/verify.txt && cat /tmp/verify.txt
+tmux capture-pane -t <screen_name> -p
 ```
 Look for "Listening for channel messages" and confirm "plugin not installed" does NOT appear.
 
-**Troubleshooting:** If the screen session dies immediately (shows "No screen session found" right after creation), run the command directly without screen to see the actual error:
+**Troubleshooting:** If the tmux session dies immediately (shows "no server running" right after creation), run the command directly without tmux to see the actual error:
 ```bash
 IS_SANDBOX=1 DISCORD_STATE_DIR=~/.claude/channels/discord_<name> claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions
 ```
@@ -559,10 +559,9 @@ IS_SANDBOX=1 DISCORD_STATE_DIR=~/.claude/channels/discord_<name> claude --channe
 
 ### Important Notes
 
-- Always use `zsh -ic` (not `bash -c`) when launching screen sessions — tools like `bun` or `claude` may only be in PATH via `~/.zshrc`. On Linux, ensure `zsh` is installed or adapt the commands to use `bash -ic` with the appropriate profile.
+- Always use `zsh -ic` (not `bash -c`) when launching tmux sessions — tools like `bun` or `claude` may only be in PATH via `~/.zshrc`. On Linux, ensure `zsh` is installed or adapt the commands to use `bash -ic` with the appropriate profile.
 - Each project gets its own bot from the pool. Two sessions cannot share a bot. The pool has a max size of 50.
-- Screen session names should be short, lowercase, use underscores (derived from project name).
+- Tmux session names should be short, lowercase, use underscores (derived from project name).
 - Sessions do not persist across machine restarts. The user needs to start them again.
 - New sessions start with a fresh Claude Code conversation — no history from previous sessions is carried over.
-- The self-restart feature requires `expect` to be installed (`brew install expect` on macOS, `apt install expect` on Linux).
 - Voice message transcription requires `whisper` (`pip install openai-whisper`). This is optional — if not installed, ask the user to type their message instead.

@@ -1,30 +1,26 @@
-Restart your own Claude Code session. This kills your current process and starts a fresh one in the same screen session.
+Restart your own Claude Code session. This kills your current process and starts a fresh one in the same tmux session.
 
 ## Steps
 
-1. **Detect your screen session name.** Run:
+1. **Detect your tmux session name.** Run:
    ```bash
-   # Find the screen session this process is running in
-   SCREEN_NAME=$(ps -o ppid= -p $PPID | xargs -I{} ps -o ppid= -p {} | xargs -I{} ps -o ppid= -p {} | xargs -I{} screen -ls | grep -oP '\d+\.\K[^\t]+(?=\t)' | head -1)
+   tmux list-sessions
    ```
-   If that doesn't work, use a simpler approach — check `screen -ls` and match against your current working directory or find the screen PID that is an ancestor of your process:
-   ```bash
-   screen -ls
-   ```
-   Then figure out which screen session you're in by checking the process tree:
+   Then figure out which tmux session you're in by checking the process tree:
    ```bash
    pstree -p $$ | head -5
    ```
+   Match the ancestor PID to a tmux session.
 
 2. **Detect your environment.** Run these commands and note the values:
    ```bash
    echo "CWD: $(pwd)"
    echo "STATE_DIR: $DISCORD_STATE_DIR"
-   echo "SCREEN: $(screen -ls | grep -i $(basename $(pwd)) | awk '{print $1}' | cut -d. -f2)"
+   tmux list-sessions
    ```
 
 3. **Determine the launch command.** Based on what you detected:
-   - `SCREEN_NAME`: the screen session name (e.g., `quiz`, `viz`, `plio`)
+   - `SESSION_NAME`: the tmux session name (e.g., `quiz`, `viz`, `plio`)
    - `STATE_DIR`: the DISCORD_STATE_DIR value (e.g., `~/.claude/channels/discord4`)
    - `PROJECT_DIR`: your current working directory
    - Use `bash -ic` on Linux, `zsh -ic` on macOS (check `uname`)
@@ -32,20 +28,20 @@ Restart your own Claude Code session. This kills your current process and starts
 4. **Tell the user you're restarting**, then run the restart:
    ```bash
    nohup bash -c '
-     SCREEN_NAME="<screen_name>"
+     SESSION_NAME="<session_name>"
      STATE_DIR="<state_dir>"
      PROJECT_DIR="<project_dir>"
      SHELL_CMD="bash -ic"  # use "zsh -ic" on macOS
 
-     # Kill current screen
-     screen -X -S "$SCREEN_NAME" quit
+     # Kill current tmux session
+     tmux kill-session -t "$SESSION_NAME"
      sleep 2
 
      # Start fresh
-     screen -dmS "$SCREEN_NAME" $SHELL_CMD "cd $PROJECT_DIR && DISCORD_STATE_DIR=$STATE_DIR claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions"
+     tmux new-session -d -s "$SESSION_NAME" -- $SHELL_CMD "cd $PROJECT_DIR && DISCORD_STATE_DIR=$STATE_DIR claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions"
 
      # Dismiss trust dialog
-     sleep 8 && screen -S "$SCREEN_NAME" -p 0 -X stuff "\r"
+     sleep 8 && tmux send-keys -t "$SESSION_NAME" Enter
    ' &>/dev/null &
    ```
 
