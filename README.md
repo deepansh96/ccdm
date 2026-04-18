@@ -137,9 +137,10 @@ Message the root agent bot on Discord with any of these:
 | `pool` / `pool status` | Show all bots and their assignment status |
 | `pool add` | Create a new bot and add it to the pool |
 | `pool remove <bot_id>` | Remove an unassigned bot from the pool |
-| `context report` | Get context window usage for all running sessions |
+| `context report` | Get context window usage for all running sessions (via tmux) |
 | `usage` / `limits` | Show rate limits, usage stats, and account info |
 | `restart yourself` | Self-restart the root agent |
+| `create a poll` | Create a native Discord poll in any channel |
 
 ### Registering a New Project
 
@@ -249,6 +250,7 @@ CCDM includes reusable skills (custom slash commands) that any Claude Code agent
 |-------|------|-------------|
 | `/restart-self` | `skills/restart-self.md` | Agent restarts its own session — detects its tmux session name, state dir, and project path automatically, then runs a `nohup` restart that survives its own process being killed |
 | `/project-context` | `skills/project-context.md` | Generates or updates a comprehensive `project-context.md` document for the current project — serves as an entry point for AI agents and engineers |
+| `/check-context` | `~/.claude/commands/check-context.md` | Agent checks its own context window usage — finds its tmux session, sends `/context`, and reports token usage breakdown |
 
 ### Installing skills
 

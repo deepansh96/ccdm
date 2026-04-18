@@ -382,17 +382,24 @@ If automated creation fails, walk the user through these steps:
 
 #### 10. Context report (`context report`, `context for all`)
 
-Get the context usage for all running sessions using `-p` mode with `--fork-session`:
+Get the context usage for all running sessions by sending `/context` to each tmux session and capturing the pane output:
 
-```sh
-cd <path> && claude -r <session_id> --fork-session -p "/context" --dangerously-skip-permissions
-```
+1. **Send `/context` to each session:**
+   ```sh
+   tmux send-keys -t <screen_name> '/context' Enter
+   ```
 
-- Run all sessions in parallel for speed.
-- `--fork-session` is required — it forks a read-only copy so it doesn't interfere with the live session.
-- Do NOT use `--session-id` (errors on active sessions) or `tmux send-keys` (sends it as a chat message, not a CLI command).
-- `/context` is a built-in Claude Code command — no custom skill needed.
-- Report the key stats: tokens used / total, percentage, messages, free space.
+2. **Wait ~1 second**, then capture the output:
+   ```sh
+   tmux capture-pane -t <screen_name> -p
+   ```
+
+3. **Parse the output** — look for the tokens line (e.g., `20k/1m tokens (2%)`) and the category breakdown.
+
+- Run all sessions in parallel for speed — send `/context` to all sessions first, wait, then capture all panes.
+- This approach works for ALL running sessions, including freshly started ones that haven't received any Discord messages yet. Unlike `claude -r --fork-session`, it does not depend on `.jsonl` conversation files existing on disk.
+- Skip remote sessions (path starts with `remote:`) — they can't be checked from here.
+- Report the key stats: tokens used / total, percentage, free space.
 
 #### 11. Usage report (`usage`, `limits`, `how much usage left`, `check usage`)
 
@@ -444,6 +451,35 @@ You can restart yourself by running the restart script in the background with `n
    nohup ./restart-root-agent.sh &
    ```
 3. The script kills your current process, waits 2 seconds, and starts a fresh instance in the `root_agent` tmux session.
+
+### Discord Polls
+
+Create native Discord polls using the API directly:
+
+```sh
+curl -s -X POST "https://discord.com/api/v10/channels/<channel_id>/messages" \
+  -H "Authorization: Bot <bot_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "content": "",
+    "poll": {
+      "question": {"text": "<question>"},
+      "answers": [
+        {"poll_media": {"text": "<option1>"}},
+        {"poll_media": {"text": "<option2>"}},
+        {"poll_media": {"text": "<option3>"}}
+      ],
+      "duration": 24,
+      "allow_multiselect": false
+    }
+  }'
+```
+
+- `duration`: poll duration in hours (1–168, default 24)
+- `allow_multiselect`: whether users can vote for multiple options
+- `answers`: up to 10 options, each with a `text` field
+- Use the root bot token (`bot1`) for polls in `#root` channels, or the project bot's token for project channels
+- The `poll_media` object can also include an `emoji` field: `{"id": null, "name": "🎉"}` for custom option emojis
 
 ### Voice Messages
 
