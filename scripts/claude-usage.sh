@@ -50,10 +50,12 @@ api_call() {
         echo ""
         return 1
     fi
+    local version
+    version=$(claude --version 2>/dev/null | head -1 || echo "unknown")
     curl -s "https://api.anthropic.com/api/oauth/${endpoint}" \
         -H "Authorization: Bearer $token" \
         -H "anthropic-beta: oauth-2025-04-20" \
-        -H "User-Agent: claude-code/2.0.32"
+        -H "User-Agent: claude-code/${version}"
 }
 
 # ══════════════════════════════════════════════════════════

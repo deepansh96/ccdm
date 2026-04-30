@@ -248,6 +248,8 @@ curl -s -H "Authorization: Bot <token>" https://discord.com/api/v10/users/@me
 
 ### Automated bot creation (`create bot <name>`)
 
+> **Note:** This flow is optional and relies on browser automation (Playwright + hCaptcha bypass) which can be flaky. For most users, the [manual bot creation](#manual-bot-creation-fallback) flow below is simpler and more reliable. Use this only if you want fully hands-off bot creation.
+
 Create a new Discord bot entirely via automation — no manual portal steps needed. This uses Playwright with the user's Discord credentials to create the application, bypass hCaptcha, extract the bot token, and invite it to the server.
 
 **Prerequisites:** `playwright` Python package (`pip3 install playwright`).

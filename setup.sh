@@ -28,6 +28,9 @@ fi
 if ! command -v python3 &>/dev/null; then
     missing+=("python3 (brew install python3 / apt install python3)")
 fi
+if ! command -v jq &>/dev/null; then
+    missing+=("jq (brew install jq / apt install jq)")
+fi
 
 if [ ${#missing[@]} -gt 0 ]; then
     echo ""
