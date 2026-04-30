@@ -1,4 +1,6 @@
 registry.json
+CLAUDE.md
+scripts/usage-report-loop.sh
 .claude/
 .env
 *.log

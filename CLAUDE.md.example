@@ -623,6 +623,35 @@ The Launch Agent runs `restart-root-agent.sh` on login, which starts the root ag
 
 To unload: `launchctl unload ~/Library/LaunchAgents/com.claude.root-agent.plist`
 
+### Usage Report Loop
+
+A standalone bash script (`scripts/usage-report-loop.sh`) posts usage stats to a designated Discord channel every 2 hours. It runs in its own tmux session, independent of any Claude Code session. Configure `CHANNEL_ID` and `BOT_TOKEN` in the script before running.
+
+**Start it:**
+```sh
+tmux new-session -d -s usage_report -- zsh -ic '/path/to/ccdm/scripts/usage-report-loop.sh'
+```
+
+**Check it:**
+```sh
+tmux capture-pane -t usage_report -p
+```
+
+**Stop it:**
+```sh
+tmux kill-session -t usage_report
+```
+
+**What it does:**
+1. Fetches OAuth token from macOS Keychain
+2. Calls `api.anthropic.com/api/oauth/{usage,profile}`
+3. Formats a report with emoji progress bars (🟩 used, ⬜ free)
+4. Posts to Discord via bot1's token
+
+**To change the interval:** edit `INTERVAL=7200` in the script (value in seconds).
+
+This needs to be started manually after a reboot, like project sessions.
+
 ### Important Notes
 
 - Always use `zsh -ic` (not `bash -c`) when launching tmux sessions — tools like `bun` or `claude` may only be in PATH via `~/.zshrc`. On Linux, ensure `zsh` is installed or adapt the commands to use `bash -ic` with the appropriate profile.

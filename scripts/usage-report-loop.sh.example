@@ -1,0 +1,123 @@
+#!/bin/bash
+# Standalone usage report loop — runs in its own tmux session, posts to #usage-stats every 2 hours
+# Configure these before running:
+
+CHANNEL_ID="YOUR_USAGE_STATS_CHANNEL_ID"
+BOT_TOKEN="YOUR_BOT_TOKEN"
+INTERVAL=7200  # 2 hours in seconds
+
+post_to_discord() {
+    local msg_file="$1"
+    python3 -c "
+import json, sys
+with open('$msg_file') as f:
+    content = f.read()
+payload = json.dumps({'content': content})
+sys.stdout.write(payload)
+" | curl -s -X POST "https://discord.com/api/v10/channels/${CHANNEL_ID}/messages" \
+        -H "Authorization: Bot ${BOT_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d @-
+}
+
+build_report() {
+    local token
+    token=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null | \
+        python3 -c "import sys,json; print(json.loads(sys.stdin.read().strip())['claudeAiOauth']['accessToken'])" 2>/dev/null)
+
+    if [ -z "$token" ]; then
+        echo "⚠️ Could not get OAuth token from Keychain"
+        return 1
+    fi
+
+    local version
+    version=$(claude --version 2>/dev/null | head -1 || echo "unknown")
+
+    local usage_file="/tmp/usage_report_usage.json"
+    local profile_file="/tmp/usage_report_profile.json"
+
+    curl -s "https://api.anthropic.com/api/oauth/usage" \
+        -H "Authorization: Bearer $token" \
+        -H "anthropic-beta: oauth-2025-04-20" \
+        -H "User-Agent: claude-code/${version}" > "$usage_file"
+
+    curl -s "https://api.anthropic.com/api/oauth/profile" \
+        -H "Authorization: Bearer $token" \
+        -H "anthropic-beta: oauth-2025-04-20" \
+        -H "User-Agent: claude-code/${version}" > "$profile_file"
+
+    python3 << 'PYEOF'
+import json
+from datetime import datetime, timezone
+
+with open("/tmp/usage_report_usage.json") as f:
+    usage = json.load(f)
+with open("/tmp/usage_report_profile.json") as f:
+    profile = json.load(f)
+
+now = datetime.now(timezone.utc)
+
+def time_until(reset_str):
+    reset = datetime.fromisoformat(reset_str)
+    delta = reset - now
+    if delta.total_seconds() <= 0:
+        return "resetting now"
+    hours = int(delta.total_seconds() // 3600)
+    mins = int((delta.total_seconds() % 3600) // 60)
+    if hours > 0:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
+
+def bar(pct):
+    filled = int(pct / 100 * 20)
+    empty = 20 - filled
+    return "\U0001f7e9" * filled + "⬜" * empty
+
+acct = profile.get("account", {})
+org = profile.get("organization", {})
+name = acct.get("display_name", "N/A")
+plan = org.get("organization_type", "N/A").replace("_", " ").title()
+
+lines = []
+lines.append(f"\U0001f4ca **Usage Report** — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+lines.append(f"\U0001f464 {name} | {plan}")
+lines.append("━" * 35)
+
+for key, label in [("five_hour", "⏱️ 5-Hour"), ("seven_day", "\U0001f4c5 7-Day (All)"), ("seven_day_opus", "\U0001f7e3 7-Day (Opus)"), ("seven_day_sonnet", "\U0001f535 7-Day (Sonnet)")]:
+    if key in usage and usage[key] is not None:
+        u = usage[key]
+        pct = u.get("utilization", 0)
+        lines.append(f"{label}: {bar(pct)} {pct:.0f}%")
+        reset = u.get("resets_at")
+        if reset:
+            lines.append(f'  Resets in {time_until(reset)}')
+
+if "extra_usage" in usage and usage["extra_usage"] is not None:
+    u = usage["extra_usage"]
+    pct = u.get("utilization")
+    if pct is not None:
+        limit = (u.get("monthly_limit") or 0) / 100
+        used = (u.get("used_credits") or 0) / 100
+        lines.append(f"\U0001f4b0 Extra Usage: {bar(pct)} {pct:.0f}%")
+        lines.append(f"  ${used:.2f} / ${limit:.2f}")
+    elif u.get("is_enabled") is False:
+        lines.append("\U0001f4b0 Extra Usage: Disabled")
+
+print("\n".join(lines))
+PYEOF
+}
+
+echo "$(date): Usage report loop started (interval: ${INTERVAL}s)"
+
+while true; do
+    report=$(build_report)
+    if [ -n "$report" ] && [ "$report" != "⚠️ Could not get OAuth token from Keychain" ]; then
+        report_file="/tmp/usage_report_msg.txt"
+        echo "$report" > "$report_file"
+        result=$(post_to_discord "$report_file")
+        echo "$(date): Posted report"
+    else
+        echo "$(date): Failed to build report — $report"
+    fi
+    sleep $INTERVAL
+done
