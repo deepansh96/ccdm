@@ -1,7 +1,8 @@
 #!/bin/bash
-# Wraps ccstatusline to also update bot nickname with context % periodically.
+# Updates bot Discord nicknames with context window usage (e.g. "bot4-quiz · 42%").
 # Set as the statusLine command in ~/.claude/settings.json.
 # Requires: DISCORD_STATE_DIR env var (set automatically for Discord sessions).
+# Use cc-statusline-wrapper.sh instead if you also want the ccstatusline terminal UI.
 
 INTERVAL="${CONTEXT_DISCORD_INTERVAL:-60}"
 
@@ -43,4 +44,4 @@ if [ -n "$DISCORD_STATE_DIR" ] && [ "${DISABLE_DISCORD_MESSAGE:-false}" != "true
   ) &
 fi
 
-echo "$INPUT" | npx -y ccstatusline@latest
+echo "$INPUT"

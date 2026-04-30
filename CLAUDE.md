@@ -504,28 +504,6 @@ When the user sends a voice message (`.ogg` audio attachment), transcribe it usi
   ```
   And add the category ID to `category_ids` in `registry.json`.
 
-### Using Codex
-
-If the user asks you to use Codex (OpenAI's CLI agent), you can run it in non-interactive mode. Codex is installed at `/opt/homebrew/bin/codex` and uses `gpt-5.4`.
-
-**Non-interactive execution:**
-```sh
-codex exec "<prompt>" 2>&1
-```
-
-**With a specific working directory:**
-```sh
-cd <path> && codex exec "<prompt>" 2>&1
-```
-
-**Key flags:**
-- `--model <model>` — override the model (default: gpt-5.4)
-- `--approval never` — no approval needed (default in exec mode)
-- `--sandbox read-only` — read-only sandbox (default in exec mode)
-- `--full-auto` — allow file writes and command execution
-
-Use Codex when the user explicitly asks for it. For normal tasks, continue using Claude Code.
-
 ### Remote VM Setup (`setup remote`, `setup vm`, `setup linux`)
 
 Set up a Claude Code session on a remote Linux VM connected to a Discord channel. The registration (bot assignment, channel creation, permissions) is done locally by the root agent. Only the Claude Code + Discord plugin runtime runs on the VM.
@@ -592,6 +570,56 @@ IS_SANDBOX=1 DISCORD_STATE_DIR=~/.claude/channels/discord_<name> claude --channe
 ```
 
 **Root agent registration:** Use the normal `register` flow to assign a bot, create the channel, and set permissions. Set the project path in `registry.json` to `"remote:<vm-name>"` to indicate it's not a local session. The root agent cannot start/stop/restart remote sessions — provide the user with the commands to run on the VM.
+
+### Auto-Start on Reboot (macOS)
+
+Set up a macOS Launch Agent so the root agent starts automatically on login:
+
+1. **Create the plist:**
+   ```bash
+   cat > ~/Library/LaunchAgents/com.claude.root-agent.plist << 'EOF'
+   <?xml version="1.0" encoding="UTF-8"?>
+   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+   <plist version="1.0">
+   <dict>
+       <key>Label</key>
+       <string>com.claude.root-agent</string>
+       <key>ProgramArguments</key>
+       <array>
+           <string>/path/to/ccdm/restart-root-agent.sh</string>
+       </array>
+       <key>RunAtLoad</key>
+       <true/>
+       <key>StandardOutPath</key>
+       <string>/tmp/claude-root-agent.log</string>
+       <key>StandardErrorPath</key>
+       <string>/tmp/claude-root-agent.err</string>
+       <key>EnvironmentVariables</key>
+       <dict>
+           <key>PATH</key>
+           <string>/Users/YOU/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+           <key>HOME</key>
+           <string>/Users/YOU</string>
+       </dict>
+   </dict>
+   </plist>
+   EOF
+   ```
+   Replace `/path/to/ccdm` and `/Users/YOU` with your actual paths.
+
+2. **Load the agent:**
+   ```bash
+   launchctl load ~/Library/LaunchAgents/com.claude.root-agent.plist
+   ```
+
+3. **Verify:**
+   ```bash
+   launchctl list | grep claude
+   ```
+
+The Launch Agent runs `restart-root-agent.sh` on login, which starts the root agent in a `root_agent` tmux session. Project sessions still need to be started manually — message the root agent with `start <project>` after reboot.
+
+To unload: `launchctl unload ~/Library/LaunchAgents/com.claude.root-agent.plist`
 
 ### Important Notes
 

@@ -5,22 +5,20 @@ Manage multiple [Claude Code](https://docs.anthropic.com/en/docs/claude-code) in
 ```
 Discord Server
   │
-  ├── #root (General)  ← Root Agent listens here (no @mention needed)
-  ├── #root (ADS)      ← Root Agent listens here too
-  ├── #root (AF)       ← ...and here
+  ├── #root              ← Root Agent listens here (no @mention needed)
   │
-  ├── #my-app (ADS)    ← bot2-my-app ONLY sees this channel
+  ├── #my-app            ← bot2-my-app ONLY sees this channel
   │     Claude Code running in ~/my-app/
   │
-  ├── #website (AF)    ← bot3-website ONLY sees this channel
+  ├── #website           ← bot3-website ONLY sees this channel
   │     Claude Code running in ~/website/
   │
-  └── bot4, bot5, ...  (available in pool, not assigned)
+  └── bot4, bot5, ...    (available in pool, not assigned)
 ```
 
 ## How It Works
 
-The root agent is a Claude Code instance connected to Discord. It manages a **pool of up to 50 Discord bots**. When you message it in any `#root` channel, it can:
+The root agent is a Claude Code instance connected to Discord. It manages a **pool of Discord bots** (default limit: 50, configurable in `registry.json`). When you message it in `#root`, it can:
 
 - **Register bots** to specific Discord channels (each bot is isolated to only see its assigned channel)
 - **Deregister bots** and return them to the pool (channel stays, bot goes back)
@@ -28,9 +26,10 @@ The root agent is a Claude Code instance connected to Discord. It manages a **po
 - **Report context usage** across all running sessions
 - **Show rate limits and usage stats** with visual progress bars
 - **Restart itself** without manual intervention
+- **Show live context usage** in bot Discord nicknames (e.g. `bot4-my-app · 42%`)
 - **Transcribe voice messages** using Whisper
 
-Each project gets its own Discord channel and bot. The bot is **locked to that one channel** via Discord permission overrides — it can't see anything else. You chat with each project in its own channel, no `@mention` needed. The root agent listens in all `#root` channels without `@mention`, and can be `@mentioned` in project channels for management tasks.
+Each project gets its own Discord channel and bot. The bot is **locked to that one channel** via Discord permission overrides — it can't see anything else. You chat with each project in its own channel, no `@mention` needed. The root agent listens in `#root` without `@mention`, and can be `@mentioned` in project channels for management tasks.
 
 CCDM is built on the [official Anthropic Discord plugin for Claude Code](https://github.com/anthropics/claude-plugins-official/blob/main/external_plugins/discord/README.md). Refer to that README for details on the plugin itself, including how the MCP server works, pairing flow, and access control.
 
@@ -47,13 +46,13 @@ CCDM is built on the [official Anthropic Discord plugin for Claude Code](https:/
 You also need:
 - A Discord account
 - A Discord server where you can add bots
-- At least one Discord bot (for the root agent) — see [Creating Discord Bots](#creating-discord-bots)
+- At least one Discord bot (for the root agent) — see [Adding bots to the pool](#adding-bots-to-the-pool)
 
 ## Quick Start
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/deepanshmathur/ccdm.git
+git clone https://github.com/deepansh96/ccdm.git
 cd ccdm
 
 # 2. Run the setup script
@@ -65,8 +64,8 @@ tmux new-session -d -s root_agent -- zsh -ic 'cd /path/to/ccdm && DISCORD_STATE_
 
 The setup script will:
 1. Check that all prerequisites are installed
-2. Ask for your Discord user ID
-3. Create `registry.json` from the template
+2. Ask for your Discord user ID and server ID
+3. Create `registry.json` with all required fields
 4. Ask for your root agent's bot token
 5. Set up the state directory with credentials and access control
 
@@ -144,7 +143,7 @@ Message the root agent bot on Discord with any of these:
 
 ### Registering a New Project
 
-Once the root agent is running and you have bots in the pool, message it in any `#root` channel:
+Once the root agent is running and you have bots in the pool, message it in `#root`:
 
 ```
 register
@@ -171,17 +170,17 @@ Each project bot is locked to a single Discord channel using:
 - A **member-level override** that allows the bot on its one assigned channel
 
 This means:
-- Project bots **cannot see** any other channel, `#root` channels, or other project channels
-- The root bot **can see everything** and responds in `#root` channels without `@mention`
+- Project bots **cannot see** any other channel, `#root`, or other project channels
+- The root bot **can see everything** and responds in `#root` without `@mention`
 - You can `@mention` the root bot in any project channel for management tasks
 
 ## Managing the Bot Pool
 
-CCDM uses a **bot pool** — a set of pre-created Discord bots that get assigned to projects on demand. The pool supports up to 50 bots.
+CCDM uses a **bot pool** — a set of pre-created Discord bots that get assigned to projects on demand. The default pool limit is 50 bots (configurable via `max_pool_size` in `registry.json`).
 
 ### Adding bots to the pool
 
-The easiest way is to message the root agent: `pool add`. This uses browser automation to create a bot, get its token, and invite it to your server automatically.
+The easiest way is to message the root agent: `pool add`. This uses browser automation to create a bot, get its token, and invite it to your server automatically. Note: the automation relies on bypassing Discord's hCaptcha, which is flaky — it may pass through sometimes and fail others. If it fails, fall back to manual creation below.
 
 Alternatively, create bots manually:
 
@@ -223,6 +222,42 @@ The live data section uses the macOS Keychain to retrieve your Claude Code OAuth
 
 Ask the root agent for a usage report by messaging `usage`, `limits`, or `how much usage left`.
 
+## Context Nicknames
+
+CCDM can update each bot's Discord nickname to show its current context window usage — for example, `bot4-my-app · 42%`. This lets you see at a glance how much context each session has used, right from the Discord member list or channel messages.
+
+This works via Claude Code's `statusLine` setting. Claude Code pipes status JSON to a command on every update; the script extracts the context percentage and PATCHes the bot's server nickname via the Discord API.
+
+### Setup
+
+Add this to `~/.claude/settings.json`:
+
+```json
+"statusLine": {
+  "type": "command",
+  "command": "/path/to/ccdm/scripts/cc-discord-nicknames.sh",
+  "padding": 0
+}
+```
+
+Two scripts are available:
+
+| Script | What it does |
+|--------|-------------|
+| `scripts/cc-discord-nicknames.sh` | Updates Discord nicknames only — no terminal UI dependency |
+| `scripts/cc-statusline-wrapper.sh` | Updates Discord nicknames AND pipes through [ccstatusline](https://github.com/sirmalloc/ccstatusline) for a terminal status bar |
+
+Use the wrapper if you also use Claude Code in the terminal and want the status bar. Use the nicknames-only script if you only interact via Discord.
+
+### Configuration
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `CONTEXT_DISCORD_INTERVAL` | `60` | Minimum seconds between nickname updates (avoids Discord rate limits) |
+| `DISABLE_DISCORD_MESSAGE` | `false` | Set to `true` to disable nickname updates entirely |
+
+Both env vars are optional. The scripts also require `DISCORD_STATE_DIR` to be set, which happens automatically when Claude Code starts with the Discord plugin.
+
 ## Preventing Sleep
 
 CCDM needs your machine to stay awake — if it sleeps, all tmux sessions (and their Discord bots) go offline.
@@ -235,6 +270,51 @@ CCDM needs your machine to stay awake — if it sleeps, all tmux sessions (and t
 **Linux:**
 - `systemd-inhibit --what=idle sleep infinity` (prevents idle sleep while running)
 - Or configure via `systemctl mask sleep.target suspend.target`
+
+## Auto-Start on Reboot (macOS)
+
+By default, tmux sessions don't survive reboots. Set up a macOS Launch Agent so the root agent starts automatically on login:
+
+```bash
+# Create the Launch Agent plist
+cat > ~/Library/LaunchAgents/com.claude.root-agent.plist << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude.root-agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/ccdm/restart-root-agent.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/claude-root-agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/claude-root-agent.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/YOU/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/YOU</string>
+    </dict>
+</dict>
+</plist>
+EOF
+
+# Load it
+launchctl load ~/Library/LaunchAgents/com.claude.root-agent.plist
+
+# Verify
+launchctl list | grep claude
+```
+
+Replace `/path/to/ccdm` and `/Users/YOU` with your actual paths. The Launch Agent runs `restart-root-agent.sh` on login, which starts the root agent in a `root_agent` tmux session. Project sessions still need to be started manually after reboot — message the root agent with `start <project>`.
+
+To unload: `launchctl unload ~/Library/LaunchAgents/com.claude.root-agent.plist`
 
 ## Security Note
 
@@ -249,8 +329,7 @@ CCDM includes reusable skills (custom slash commands) that any Claude Code agent
 | Skill | File | Description |
 |-------|------|-------------|
 | `/restart-self` | `skills/restart-self.md` | Agent restarts its own session — detects its tmux session name, state dir, and project path automatically, then runs a `nohup` restart that survives its own process being killed |
-| `/project-context` | `skills/project-context.md` | Generates or updates a comprehensive `project-context.md` document for the current project — serves as an entry point for AI agents and engineers |
-| `/check-context` | `~/.claude/commands/check-context.md` | Agent checks its own context window usage — finds its tmux session, sends `/context`, and reports token usage breakdown |
+| `/check-context` | `skills/check-context.md` | Agent checks its own context window usage — finds its tmux session, sends `/context`, and reports token usage breakdown |
 
 ### Installing skills
 
@@ -309,12 +388,14 @@ ccdm/
   restart-root-agent.sh      # Self-restart script
   setup.sh                   # Interactive first-run setup
   scripts/
+    cc-discord-nicknames.sh  # StatusLine script — updates bot nicknames with context %
+    cc-statusline-wrapper.sh # StatusLine script — nicknames + ccstatusline terminal UI
     claude-usage.sh          # Usage reporting script
     start-session.sh         # Generic script to start any registered project
     stop-session.sh          # Generic script to stop any registered project
   skills/
     restart-self.md          # /restart-self skill — agent self-restart
-    project-context.md       # /project-context skill — generate project docs
+    check-context.md         # /check-context skill — context window usage check
 ```
 
 ## Troubleshooting
@@ -341,13 +422,13 @@ ccdm/
 
 **Sessions lost after reboot**
 - Tmux sessions don't survive machine restarts
-- Re-run `start <project>` for each project, or set up a launch agent / systemd service
+- Set up the [Launch Agent](#auto-start-on-reboot-macos) so the root agent starts automatically, then `start <project>` for each project
 
 ## Limitations
 
-- Sessions do not persist across machine restarts
+- Sessions do not persist across machine restarts (root agent can [auto-start](#auto-start-on-reboot-macos), project sessions must be started manually)
 - Live usage API data requires macOS Keychain (local stats work everywhere)
-- Each project needs its own bot from the pool — two projects cannot share a bot (max 50 bots)
+- Each project needs its own bot from the pool — two projects cannot share a bot (default limit: 50, configurable)
 - Voice message transcription requires `whisper` (optional)
 - Pool bots with admin managed roles bypass channel isolation — bot roles must have non-admin permissions for isolation to work
 - When new Discord categories are created, the "project-bot" role deny must be applied to them

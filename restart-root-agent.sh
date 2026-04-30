@@ -4,18 +4,30 @@
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Stop any existing root_agent tmux session
-tmux kill-session -t root_agent 2>/dev/null
-
-# Kill only root agent processes (state dir is "channels/discord " with no number suffix)
-# Other bots use discord2, discord3, etc. — the pattern matches "discord " followed by "claude"
-# but NOT "discord2", "discord3", etc.
-pgrep -f 'channels/discord claude' | xargs kill 2>/dev/null
-
-sleep 2
+# Kill the claude process inside the root_agent tmux pane (if running)
+if tmux has-session -t root_agent 2>/dev/null; then
+    PANE_PID=$(tmux display-message -t root_agent -p '#{pane_pid}' 2>/dev/null)
+    if [ -n "$PANE_PID" ]; then
+        # Kill the process tree rooted at the pane's shell
+        pkill -TERM -P "$PANE_PID" 2>/dev/null
+        sleep 1
+    fi
+    tmux kill-session -t root_agent 2>/dev/null
+    sleep 2
+    # Retry if still alive
+    if tmux has-session -t root_agent 2>/dev/null; then
+        tmux kill-session -t root_agent 2>/dev/null
+        sleep 1
+    fi
+fi
 
 # Start fresh in a detached tmux session
 tmux new-session -d -s root_agent -- zsh -ic "cd $SCRIPT_DIR && DISCORD_STATE_DIR=~/.claude/channels/discord claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions"
+
+if [ $? -ne 0 ]; then
+    echo "Failed to create tmux session 'root_agent'" >&2
+    exit 1
+fi
 
 # Dismiss the trust dialog
 sleep 8 && tmux send-keys -t root_agent Enter

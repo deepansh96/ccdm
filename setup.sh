@@ -62,7 +62,29 @@ if [ -z "$discord_id" ]; then
     exit 1
 fi
 
+# ── Get Discord server (guild) ID ──
+echo "To find your Discord server ID:"
+echo "  1. Make sure Developer Mode is enabled (Settings > Advanced)"
+echo "  2. Right-click the server name > Copy Server ID"
+echo ""
+read "guild_id?Enter your Discord server ID: "
+
+if [ -z "$guild_id" ]; then
+    echo "Error: Discord server ID is required."
+    exit 1
+fi
+
 # ── Create registry.json ──
+REGISTRY_CONTENT="{
+  \"discord_user_id\": \"$discord_id\",
+  \"guild_id\": \"$guild_id\",
+  \"max_pool_size\": 50,
+  \"project_bot_role_id\": null,
+  \"category_ids\": [],
+  \"pool\": [],
+  \"projects\": {}
+}"
+
 if [ -f "$SCRIPT_DIR/registry.json" ]; then
     echo ""
     echo "registry.json already exists. Overwrite? (y/N)"
@@ -70,18 +92,12 @@ if [ -f "$SCRIPT_DIR/registry.json" ]; then
     if [[ "$overwrite" != [yY] ]]; then
         echo "Keeping existing registry.json."
     else
-        echo "{
-  \"discord_user_id\": \"$discord_id\",
-  \"projects\": {}
-}" > "$SCRIPT_DIR/registry.json"
-        echo "Created registry.json with your Discord user ID."
+        echo "$REGISTRY_CONTENT" > "$SCRIPT_DIR/registry.json"
+        echo "Created registry.json."
     fi
 else
-    echo "{
-  \"discord_user_id\": \"$discord_id\",
-  \"projects\": {}
-}" > "$SCRIPT_DIR/registry.json"
-    echo "Created registry.json with your Discord user ID."
+    echo "$REGISTRY_CONTENT" > "$SCRIPT_DIR/registry.json"
+    echo "Created registry.json."
 fi
 
 # ── Get bot token ──
