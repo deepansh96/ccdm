@@ -6,6 +6,8 @@ const { writeFile, mkdir } = require("fs/promises");
 const path = require("path");
 const WebSocket = require("ws");
 
+const MCP_SERVER_SCRIPT = path.resolve(__dirname, "discord-mcp-server.js");
+
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const PROJECT_DIR = process.env.PROJECT_DIR;
@@ -235,6 +237,9 @@ function handleNotification(msg) {
       break;
 
     case "item/completed":
+      if (msg.params?.item?.type === "contextCompaction") {
+        sendToDiscord("Compaction complete.");
+      }
       flushDeltaBuffer();
       break;
 
@@ -405,12 +410,39 @@ async function buildInput(msg) {
   return input;
 }
 
+async function registerDiscordMcp() {
+  const mcpName = `discord-${CHANNEL_ID}`;
+  await sendRequest("config/value/write", {
+    keyPath: `mcp_servers.${mcpName}`,
+    mergeStrategy: "replace",
+    value: {
+      command: "node",
+      args: [MCP_SERVER_SCRIPT],
+      env: { BOT_TOKEN, CHANNEL_ID },
+    },
+  });
+  console.log(`MCP server config written: ${mcpName}`);
+
+  await sendRequest("config/mcpServer/reload", null);
+  console.log("MCP servers reloaded");
+
+  await new Promise((r) => setTimeout(r, 2000));
+  const status = await sendRequest("mcpServerStatus/list", { detail: "full" });
+  const servers = status?.servers || status?.items || [];
+  const found = Array.isArray(servers)
+    ? servers.find((s) => s.name === mcpName || s.id === mcpName)
+    : null;
+  console.log(`MCP server status: ${found ? JSON.stringify(found.status || "found") : "checking..."}`);
+}
+
 async function initializeCodex() {
   await sendRequest("initialize", {
     clientInfo: { name: "codex-discord-bridge", version: "1.0.0" },
   });
 
   ws.send(JSON.stringify({ jsonrpc: "2.0", method: "initialized" }));
+
+  await registerDiscordMcp();
 
   await sendRequest("thread/start", {
     cwd: PROJECT_DIR,
@@ -430,7 +462,7 @@ async function initializeCodex() {
   turnActive = true;
   await sendRequest("turn/start", {
     threadId,
-    input: [{ type: "text", text: "You are communicating with the user via Discord. Format responses for Discord markdown." }],
+    input: [{ type: "text", text: "You are communicating with the user via Discord. Format responses for Discord markdown. You have access to Discord MCP tools (reply, edit_message, react, fetch_messages, download_attachment) — use them when you need to send files, react to messages, edit previous messages, or fetch channel history." }],
     approvalPolicy: "never",
   });
   for (let i = 0; i < 150 && turnActive; i++) {
@@ -469,10 +501,24 @@ function startDiscordBot() {
     if (msg.channel.id !== CHANNEL_ID) return;
     if (ALLOWED_USER_ID && msg.author.id !== ALLOWED_USER_ID) return;
 
+    const text = msg.content.trim();
+
+    if (text === "/compact") {
+      console.log("[discord] /compact requested");
+      await msg.react("🔄");
+      try {
+        await sendRequest("thread/compact/start", { threadId });
+        await sendToDiscord("Compaction started.");
+      } catch (err) {
+        await sendToDiscord(`**Error:** Failed to compact — ${err.message || err}`);
+      }
+      return;
+    }
+
     const input = await buildInput(msg);
     if (input.length === 0) return;
 
-    console.log(`[discord] ${msg.author.username}: ${msg.content.trim() || "(attachment)"} [${input.length} part(s)]`);
+    console.log(`[discord] ${msg.author.username}: ${text || "(attachment)"} [${input.length} part(s)]`);
 
     if (turnActive) {
       messageQueue.push(input);
@@ -484,21 +530,16 @@ function startDiscordBot() {
 
   client.login(BOT_TOKEN);
 
-  process.on("SIGTERM", () => {
+  function cleanup() {
     console.log("Shutting down...");
     client.destroy();
     if (ws) ws.close();
     if (codexProcess) codexProcess.kill();
     process.exit(0);
-  });
+  }
 
-  process.on("SIGINT", () => {
-    console.log("Shutting down...");
-    client.destroy();
-    if (ws) ws.close();
-    if (codexProcess) codexProcess.kill();
-    process.exit(0);
-  });
+  process.on("SIGTERM", cleanup);
+  process.on("SIGINT", cleanup);
 }
 
 async function main() {

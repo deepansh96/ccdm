@@ -100,13 +100,9 @@ Run `tmux list-sessions` and cross-reference with the registry. Report which pro
 
 **If type is `"codex"`:**
 
-3. Run the Codex bridge script:
+3. Run the Codex bridge script (do NOT run the bridge manually — the script sets all required env vars including GUILD_ID, ROOT_BOT_TOKEN, BOT_APP_ID, and BOT_DISPLAY_NAME):
    ```sh
    scripts/start-codex-session.sh <project_name>
-   ```
-   Or equivalently:
-   ```sh
-   tmux new-session -d -s <screen_name> -- zsh -ic 'cd <ccdm_root> && BOT_TOKEN=<token> CHANNEL_ID=<channel_id> PROJECT_DIR=<path> WS_PORT=<ws_port> ALLOWED_USER_ID=<discord_user_id> node scripts/codex-bridge.js'
    ```
 4. Verify it started by capturing the tmux pane output:
    ```sh
@@ -114,6 +110,8 @@ Run `tmux list-sessions` and cross-reference with the registry. Report which pro
    ```
    Look for "Codex-Discord bridge running" and "Listening in #channel-name" to confirm. The bridge spawns `codex app-server` internally.
 5. Update `registry.json` with the PID of the node process.
+
+The bridge automatically registers a `discord-<channel_id>` MCP server with the Codex app-server on startup, giving Codex access to Discord tools: `reply` (with file attachments), `edit_message`, `react`, `fetch_messages`, and `download_attachment`. No manual MCP configuration is needed — it's handled transparently by `codex-bridge.js`.
 
 #### 3. Stop a session (`stop <project>`)
 
