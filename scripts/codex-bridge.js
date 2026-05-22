@@ -236,10 +236,13 @@ function handleNotification(msg) {
       }
       break;
 
+    case "item/completed":
+      flushDeltaBuffer();
+      break;
+
     case "thread/status/changed":
     case "turn/started":
     case "item/started":
-    case "item/completed":
     case "turn/diff/updated":
     case "item/commandExecution/outputDelta":
     case "item/fileChange/outputDelta":
@@ -301,16 +304,18 @@ function handleServerRequest(msg) {
   }
 }
 
+function flushDeltaBuffer() {
+  const text = deltaBuffer.trim();
+  deltaBuffer = "";
+  if (text) {
+    sendToDiscord(text);
+  }
+}
+
 async function onTurnCompleted() {
   stopTyping();
-  const response = deltaBuffer.trim();
-  deltaBuffer = "";
+  flushDeltaBuffer();
   turnActive = false;
-
-  if (response) {
-    await sendToDiscord(response);
-  }
-
   processQueue();
 }
 
