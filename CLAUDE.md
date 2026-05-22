@@ -140,12 +140,12 @@ This assigns an available bot from the pool to a new project and scopes it to a 
 1. Check the pool for an unassigned bot (`assigned_to` is `null`). If none available, tell the user: "No bots available in the pool. Add one with `pool add` or remove a project to free one up."
 2. Claim the first available bot: set its `assigned_to` to `<project_name>`.
 3. Add the project to `registry.json` with `bot_id`, `path`, `screen_name`, `channel_id`, and `type`. If `type` is `"codex"`, also assign a `ws_port` (base 18300 + next available offset — check existing codex projects for used ports).
-4. Rename the bot on Discord to `<bot_id>-<project_name>` (e.g., `bot2-my-project`):
+4. Rename the bot on Discord to `<bot_id>-<project_name>-<type>` (e.g., `bot2-my-project-claude` or `bot2-my-project-codex`):
    ```sh
    curl -s -X PATCH "https://discord.com/api/v10/users/@me" \
      -H "Authorization: Bot <token>" \
      -H "Content-Type: application/json" \
-     -d '{"username": "<bot_id>-<project_name>"}'
+     -d '{"username": "<bot_id>-<project_name>-<type>"}'
    ```
 5. Assign the "project-bot" role to the bot (this role denies VIEW_CHANNEL on all categories):
    ```sh

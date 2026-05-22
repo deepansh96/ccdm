@@ -41,7 +41,7 @@ if tmux has-session -t "$SCREEN_NAME" 2>/dev/null; then
   exit 0
 fi
 
-BOT_DISPLAY_NAME="${BOT_ID}-${PROJECT}"
+BOT_DISPLAY_NAME="${BOT_ID}-${PROJECT}-codex"
 
 tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$ROOT_DIR' && BOT_TOKEN='$BOT_TOKEN' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_ID='$DISCORD_USER_ID' GUILD_ID='$GUILD_ID' ROOT_BOT_TOKEN='$ROOT_TOKEN' BOT_APP_ID='$BOT_APP_ID' BOT_DISPLAY_NAME='$BOT_DISPLAY_NAME' node scripts/codex-bridge.js"
 echo "Started Codex bridge in tmux session '$SCREEN_NAME'"

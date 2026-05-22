@@ -22,9 +22,10 @@ update_discord_nickname() {
           BOT_APP_ID=$(jq -r ".pool[] | select(.state_dir | endswith(\"$STATE_NAME\")) | .app_id" "$REGISTRY")
           BOT_ID=$(jq -r ".pool[] | select(.state_dir | endswith(\"$STATE_NAME\")) | .id" "$REGISTRY")
           PROJECT=$(jq -r ".pool[] | select(.state_dir | endswith(\"$STATE_NAME\")) | .assigned_to" "$REGISTRY")
+          SESSION_TYPE=$(jq -r ".projects[\"$PROJECT\"].type // \"claude\"" "$REGISTRY")
 
           if [ -n "$BOT_APP_ID" ] && [ "$BOT_APP_ID" != "null" ]; then
-            NICK="${BOT_ID}-${PROJECT} · ${CONTEXT_PCT}%"
+            NICK="${BOT_ID}-${PROJECT}-${SESSION_TYPE} · ${CONTEXT_PCT}%"
             curl -s -X PATCH "https://discord.com/api/v10/guilds/$GUILD_ID/members/$BOT_APP_ID" \
               -H "Authorization: Bot $ROOT_TOKEN" \
               -H "Content-Type: application/json" \

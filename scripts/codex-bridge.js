@@ -123,8 +123,6 @@ function startCodexServer() {
       "app-server",
       "--listen",
       `ws://127.0.0.1:${WS_PORT}`,
-      "-c",
-      `sandbox="danger-full-access"`,
     ],
     {
       cwd: PROJECT_DIR,
@@ -428,6 +426,19 @@ async function initializeCodex() {
     process.exit(1);
   }
   console.log(`Codex thread started: ${threadId}`);
+
+  turnActive = true;
+  await sendRequest("turn/start", {
+    threadId,
+    input: [{ type: "text", text: "You are communicating with the user via Discord. Format responses for Discord markdown." }],
+    approvalPolicy: "never",
+  });
+  for (let i = 0; i < 150 && turnActive; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  deltaBuffer = "";
+  turnActive = false;
+  console.log("System instruction sent");
 }
 
 function startDiscordBot() {
