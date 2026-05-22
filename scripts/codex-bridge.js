@@ -39,7 +39,7 @@ let codexProcess = null;
 let typingInterval = null;
 let lastNicknameUpdate = 0;
 const NICKNAME_INTERVAL = 60000;
-const SYSTEM_INSTRUCTION = "You are communicating with the user via Discord. Use the Discord MCP tools to interact — call the `reply` tool to send messages to the user. Do NOT output responses as regular text; always use the `reply` tool so the user sees your response on Discord. Other available tools: edit_message, react, fetch_messages, download_attachment. Use `reply` with the `files` parameter to send file attachments.";
+const SYSTEM_INSTRUCTION = `You are communicating with the user via Discord. Use ONLY the MCP server named "discord-${CHANNEL_ID}" to interact — call its \`reply\` tool to send messages to the user. Do NOT use any other discord MCP server. Do NOT output responses as regular text; always use the \`reply\` tool so the user sees your response on Discord. Other available tools on this same server: edit_message, react, fetch_messages, download_attachment. Use \`reply\` with the \`files\` parameter to send file attachments.`;
 
 function nextId() {
   return requestId++;
@@ -439,6 +439,22 @@ async function buildInput(msg) {
 
 async function registerDiscordMcp() {
   const mcpName = `discord-${CHANNEL_ID}`;
+
+  // Remove any other discord MCP servers to prevent cross-session replies
+  try {
+    const status = await sendRequest("mcpServerStatus/list", { detail: "full" });
+    const servers = status?.servers || status?.items || [];
+    for (const s of servers) {
+      const name = s.name || s.id;
+      if (name && name.startsWith("discord-") && name !== mcpName) {
+        await sendRequest("config/value/delete", { keyPath: `mcp_servers.${name}` });
+        console.log(`Removed stale MCP server: ${name}`);
+      }
+    }
+  } catch (err) {
+    console.log(`Warning: could not clean stale MCP servers: ${err.message || err}`);
+  }
+
   await sendRequest("config/value/write", {
     keyPath: `mcp_servers.${mcpName}`,
     mergeStrategy: "replace",

@@ -36,10 +36,39 @@ print('\t'.join([
 ]))
 ")"
 
-if tmux has-session -t "$SCREEN_NAME" 2>/dev/null; then
+if tmux has-session -t "=$SCREEN_NAME" 2>/dev/null; then
   echo "Session '$SCREEN_NAME' is already running."
   exit 0
 fi
+
+# Remove stale discord MCP entries from global codex config (they get re-registered per session)
+python3 -c "
+import os
+config_path = os.path.expanduser('~/.codex/config.toml')
+if os.path.exists(config_path):
+    with open(config_path) as f:
+        lines = f.readlines()
+    filtered, skip = [], False
+    for line in lines:
+        if line.startswith('[mcp_servers.discord-'):
+            skip = True
+            continue
+        if skip and line.startswith('['):
+            skip = False
+        if skip:
+            continue
+        filtered.append(line)
+    # Remove consecutive blank lines
+    result, prev_blank = [], False
+    for line in filtered:
+        blank = line.strip() == ''
+        if blank and prev_blank:
+            continue
+        result.append(line)
+        prev_blank = blank
+    with open(config_path, 'w') as f:
+        f.writelines(result)
+" 2>/dev/null || true
 
 BOT_DISPLAY_NAME="${BOT_ID}-${PROJECT}-codex"
 
