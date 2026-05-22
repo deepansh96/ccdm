@@ -1,5 +1,5 @@
 registry.json
-CLAUDE.md
+CLAUDE.local.md
 scripts/usage-report-loop.sh
 .claude/
 .env
