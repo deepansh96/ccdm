@@ -1,4 +1,4 @@
-Check your own context usage by sending the `/context` command to your tmux session and reporting the results.
+Check your own context usage. The method depends on whether you're a Claude Code session or a Codex bridge session.
 
 ## Steps
 
@@ -6,20 +6,28 @@ Check your own context usage by sending the `/context` command to your tmux sess
    ```bash
    tmux list-panes -a -F '#{session_name} #{pane_pid}'
    ```
-   Then find which session owns your process. Your Claude Code process runs inside a tmux pane — match by checking which `pane_pid` is an ancestor of your `claude` process. You can cross-reference with `pgrep -P <pane_pid>` to find the session that has your process tree.
+   Then find which session owns your process. Your process runs inside a tmux pane — match by checking which `pane_pid` is an ancestor of your process. You can cross-reference with `pgrep -P <pane_pid>` to find the session that has your process tree.
 
-2. **Send the `/context` command to your tmux session** using:
+2. **Determine your session type.** Look up your project in registry.json (at the CCDM root directory) and check the `type` field. If `type` is `"codex"`, you're a Codex session. Otherwise you're Claude Code.
+
+3. **Get context usage.**
+
+   **If Claude Code session:**
+   Send the `/context` command to your tmux session:
    ```bash
    tmux send-keys -t <your_session_name> '/context' Enter
    ```
-   This queues the command — it will execute after your current turn ends.
+   This queues the command — it will execute after your current turn ends. Inform the user they need to send one more message so you get a new turn and can read the output. When they do, read the `/context` output from the conversation history.
 
-3. **Inform the user** that the command has been queued and they need to send you one more message (anything — even just "ok") so you get a new turn and can read the output.
+   **If Codex session:**
+   The Codex bridge logs context % updates to the tmux pane whenever `thread/tokenUsage/updated` notifications arrive. Capture the pane output:
+   ```bash
+   tmux capture-pane -t <your_session_name> -p | grep -i "nickname\|context\|token"
+   ```
+   The most recent "Nickname updated: <name> · X%" line shows the current context usage. If no nickname updates have been logged yet, the session hasn't processed enough messages to have meaningful token usage — report it as near 0%.
 
-4. **When the user messages you back**, read the `/context` output that appeared in the conversation history (it will show up as a `<local-command-stdout>` block from the `/context` command).
-
-5. **Report the results** back to the user with a clean summary:
-   - Total tokens used vs available
+4. **Report the results** back to the user with a clean summary:
+   - Total tokens used vs available (if known)
    - Percentage used
-   - Breakdown by category (system prompt, tools, messages, etc.)
+   - Breakdown by category (Claude Code only — system prompt, tools, messages, etc.)
    - How much free space remains

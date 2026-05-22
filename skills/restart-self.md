@@ -1,4 +1,4 @@
-Restart your own Claude Code session. This kills your current process and starts a fresh one in the same tmux session.
+Restart your own session (Claude Code or Codex). This kills your current process and starts a fresh one in the same tmux session.
 
 ## Steps
 
@@ -12,20 +12,30 @@ Restart your own Claude Code session. This kills your current process and starts
    ```
    Match the ancestor PID to a tmux session.
 
-2. **Detect your environment.** Run these commands and note the values:
+2. **Detect your environment and session type.** Run these commands and note the values:
    ```bash
    echo "CWD: $(pwd)"
    echo "STATE_DIR: $DISCORD_STATE_DIR"
    tmux list-sessions
    ```
+   Then determine your session type: check if you're a Claude Code session or a Codex bridge session. Look up your project in registry.json (at the CCDM root directory) and check the `type` field. If `type` is `"codex"`, you're a Codex session. Otherwise you're Claude Code.
 
 3. **Determine the launch command.** Based on what you detected:
    - `SESSION_NAME`: the tmux session name (e.g., `quiz`, `viz`, `plio`)
-   - `STATE_DIR`: the DISCORD_STATE_DIR value (e.g., `~/.claude/channels/discord4`)
    - `PROJECT_DIR`: your current working directory
    - Use `bash -ic` on Linux, `zsh -ic` on macOS (check `uname`)
 
+   **If Claude Code session:**
+   - `STATE_DIR`: the DISCORD_STATE_DIR value (e.g., `~/.claude/channels/discord4`)
+   - Launch command: `cd $PROJECT_DIR && DISCORD_STATE_DIR=$STATE_DIR claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions`
+
+   **If Codex session:**
+   - Use the `start-codex-session.sh` script from the CCDM root directory
+   - The script reads all config from registry.json automatically
+
 4. **Tell the user you're restarting**, then run the restart:
+
+   **For Claude Code:**
    ```bash
    nohup bash -c '
      SESSION_NAME="<session_name>"
@@ -42,6 +52,22 @@ Restart your own Claude Code session. This kills your current process and starts
 
      # Dismiss trust dialog
      sleep 8 && tmux send-keys -t "$SESSION_NAME" Enter
+   ' &>/dev/null &
+   ```
+
+   **For Codex:**
+   ```bash
+   nohup bash -c '
+     SESSION_NAME="<session_name>"
+     PROJECT_NAME="<project_name>"
+     CCDM_ROOT="<ccdm_root_dir>"
+
+     # Kill current tmux session
+     tmux kill-session -t "$SESSION_NAME"
+     sleep 2
+
+     # Start fresh via the codex session script
+     "$CCDM_ROOT/scripts/start-codex-session.sh" "$PROJECT_NAME"
    ' &>/dev/null &
    ```
 
