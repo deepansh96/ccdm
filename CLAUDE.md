@@ -113,6 +113,13 @@ Run `tmux list-sessions` and cross-reference with the registry. Report which pro
 
 The bridge automatically registers a `discord-<channel_id>` MCP server with the Codex app-server on startup, giving Codex access to Discord tools: `reply` (with file attachments), `edit_message`, `react`, `fetch_messages`, and `download_attachment`. No manual MCP configuration is needed — it's handled transparently by `codex-bridge.js`.
 
+**Codex bridge behavior:**
+- **MCP-only replies:** Codex does NOT auto-stream text to Discord. It works silently and sends messages only when it calls the `reply` MCP tool (matching Claude Code's Discord plugin behavior). If Codex fails to call `reply` during a turn, the bridge flushes buffered text as a fallback.
+- **Mid-turn messages (turn/steer):** When the user sends a message while Codex is working, the bridge injects it into the active turn via `turn/steer` so the model sees it immediately. If steering fails (race condition), the message is queued with ⏳ and processed when the turn completes.
+- **Discord commands:** Users can send these in Codex channels:
+  - `/compact` — triggers context compaction, confirms when complete
+  - `/clear` — archives the current thread and starts a fresh conversation
+
 #### 3. Stop a session (`stop <project>`)
 
 1. Look up the project in `registry.json`.

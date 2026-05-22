@@ -31,12 +31,15 @@ let requestId = 1;
 let pendingRequests = new Map();
 let deltaBuffer = "";
 let turnActive = false;
+let activeTurnId = null;
+let mcpReplyCalled = false;
 let messageQueue = [];
 let discordChannel = null;
 let codexProcess = null;
 let typingInterval = null;
 let lastNicknameUpdate = 0;
 const NICKNAME_INTERVAL = 60000;
+const SYSTEM_INSTRUCTION = "You are communicating with the user via Discord. Use the Discord MCP tools to interact — call the `reply` tool to send messages to the user. Do NOT output responses as regular text; always use the `reply` tool so the user sees your response on Discord. Other available tools: edit_message, react, fetch_messages, download_attachment. Use `reply` with the `files` parameter to send file attachments.";
 
 function nextId() {
   return requestId++;
@@ -240,12 +243,24 @@ function handleNotification(msg) {
       if (msg.params?.item?.type === "contextCompaction") {
         sendToDiscord("Compaction complete.");
       }
-      flushDeltaBuffer();
+      deltaBuffer = "";
+      break;
+
+    case "turn/started":
+      if (msg.params?.turn?.id) {
+        activeTurnId = msg.params.turn.id;
+      }
+      break;
+
+    case "item/started":
+      if (msg.params?.item?.type === "mcpToolCall" &&
+          msg.params.item.server?.startsWith("discord-") &&
+          msg.params.item.tool === "reply") {
+        mcpReplyCalled = true;
+      }
       break;
 
     case "thread/status/changed":
-    case "turn/started":
-    case "item/started":
     case "turn/diff/updated":
     case "item/commandExecution/outputDelta":
     case "item/fileChange/outputDelta":
@@ -267,6 +282,8 @@ function handleNotification(msg) {
     case "item/autoApprovalReview/started":
     case "item/autoApprovalReview/completed":
     case "item/mcpToolCall/progress":
+      break;
+
     case "item/plan/delta":
     case "turn/plan/updated":
       break;
@@ -317,20 +334,30 @@ function flushDeltaBuffer() {
 
 async function onTurnCompleted() {
   stopTyping();
-  flushDeltaBuffer();
+  if (!mcpReplyCalled) {
+    flushDeltaBuffer();
+  } else {
+    deltaBuffer = "";
+  }
   turnActive = false;
+  activeTurnId = null;
+  mcpReplyCalled = false;
   processQueue();
 }
 
 async function processQueue() {
   if (turnActive || messageQueue.length === 0) return;
-  const nextInput = messageQueue.shift();
-  await sendTurn(nextInput);
+  const { input, msg: queuedMsg } = messageQueue.shift();
+  if (queuedMsg) {
+    queuedMsg.reactions.cache.get("⏳")?.users.remove(queuedMsg.client.user.id).catch(() => {});
+  }
+  await sendTurn(input);
 }
 
 async function sendTurn(input) {
   turnActive = true;
   deltaBuffer = "";
+  mcpReplyCalled = false;
   startTyping();
   try {
     await sendRequest("turn/start", {
@@ -462,7 +489,7 @@ async function initializeCodex() {
   turnActive = true;
   await sendRequest("turn/start", {
     threadId,
-    input: [{ type: "text", text: "You are communicating with the user via Discord. Format responses for Discord markdown. You have access to Discord MCP tools (reply, edit_message, react, fetch_messages, download_attachment) — use them when you need to send files, react to messages, edit previous messages, or fetch channel history." }],
+    input: [{ type: "text", text: SYSTEM_INSTRUCTION }],
     approvalPolicy: "never",
   });
   for (let i = 0; i < 150 && turnActive; i++) {
@@ -515,13 +542,72 @@ function startDiscordBot() {
       return;
     }
 
+    if (text === "/clear") {
+      console.log("[discord] /clear requested");
+      await msg.react("🔄");
+      try {
+        await sendRequest("thread/archive", { threadId });
+        threadId = null;
+        turnActive = false;
+        activeTurnId = null;
+        mcpReplyCalled = false;
+        deltaBuffer = "";
+        messageQueue = [];
+
+        await sendRequest("thread/start", {
+          cwd: PROJECT_DIR,
+          sandbox: "danger-full-access",
+          approvalPolicy: "never",
+        });
+        for (let i = 0; i < 50 && !threadId; i++) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        if (!threadId) {
+          await sendToDiscord("**Error:** Failed to start new thread after clear.");
+          return;
+        }
+
+        turnActive = true;
+        mcpReplyCalled = false;
+        await sendRequest("turn/start", {
+          threadId,
+          input: [{ type: "text", text: SYSTEM_INSTRUCTION }],
+          approvalPolicy: "never",
+        });
+        for (let i = 0; i < 150 && turnActive; i++) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        deltaBuffer = "";
+        turnActive = false;
+
+        await sendToDiscord("Conversation cleared — fresh thread started.");
+        console.log(`New thread after /clear: ${threadId}`);
+      } catch (err) {
+        await sendToDiscord(`**Error:** Failed to clear — ${err.message || err}`);
+      }
+      return;
+    }
+
     const input = await buildInput(msg);
     if (input.length === 0) return;
 
     console.log(`[discord] ${msg.author.username}: ${text || "(attachment)"} [${input.length} part(s)]`);
 
-    if (turnActive) {
-      messageQueue.push(input);
+    if (turnActive && activeTurnId) {
+      try {
+        await sendRequest("turn/steer", {
+          threadId,
+          input,
+          expectedTurnId: activeTurnId,
+        });
+        console.log(`[steer] Injected into active turn ${activeTurnId}`);
+      } catch (err) {
+        console.log(`[steer] Failed (${err.message || err}), queuing instead`);
+        messageQueue.push({ input, msg });
+        await msg.react("⏳");
+      }
+    } else if (turnActive) {
+      messageQueue.push({ input, msg });
       await msg.react("⏳");
     } else {
       await sendTurn(input);
