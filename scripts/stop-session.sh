@@ -110,6 +110,9 @@ import subprocess
 import sys
 
 channel_id, ws_port, bot_app_id = sys.argv[1:4]
+if not channel_id or not ws_port or not bot_app_id:
+    sys.exit(0)
+
 try:
     ps = subprocess.check_output(
         ["ps", "axeww", "-o", "pid=,command="],
@@ -144,13 +147,15 @@ p = r['projects']['$PROJECT']
 bot = next(b for b in r['pool'] if b['id'] == p['bot_id'])
 def field(value):
     return '__NONE__' if value in (None, '') else str(value)
+session_type = p.get('type', 'claude')
+ws_port = p.get('ws_port', 18300) if session_type == 'codex' else p.get('ws_port')
 print('\t'.join([
     field(p['screen_name']),
-    field(p.get('type', 'claude')),
+    field(session_type),
     field(os.path.expanduser(bot['state_dir'])),
     field(p.get('pid')),
     field(p.get('channel_id')),
-    field(p.get('ws_port')),
+    field(ws_port),
     field(bot.get('app_id')),
 ]))
 ")"
@@ -160,18 +165,31 @@ print('\t'.join([
 [[ "$WS_PORT" == "__NONE__" ]] && WS_PORT=""
 [[ "$BOT_APP_ID" == "__NONE__" ]] && BOT_APP_ID=""
 
+find_owned_listener_pids() {
+  if [[ "$SESSION_TYPE" == "codex" ]]; then
+    if [[ -z "$CHANNEL_ID" || -z "$WS_PORT" || -z "$BOT_APP_ID" ]]; then
+      echo "Skipping Codex listener sweep for '$PROJECT': missing channel_id, ws_port, or bot_app_id" >&2
+      return 0
+    fi
+    find_codex_listener_pids "$CHANNEL_ID" "$WS_PORT" "$BOT_APP_ID"
+  else
+    find_claude_listener_pids "$STATE_DIR"
+  fi
+}
+
 if [[ -n "$REGISTRY_PID" ]]; then
-  echo "Stopping recorded process tree for '$PROJECT' (pid $REGISTRY_PID)"
-  terminate_pids "$REGISTRY_PID"
+  OWNED_PIDS="$(find_owned_listener_pids)"
+  if printf '%s\n' "${(@f)OWNED_PIDS}" | grep -Fxq "$REGISTRY_PID"; then
+    echo "Stopping recorded process tree for '$PROJECT' (pid $REGISTRY_PID)"
+    terminate_pids "$REGISTRY_PID"
+  else
+    echo "Skipping recorded pid $REGISTRY_PID: it no longer belongs to '$PROJECT'"
+  fi
 fi
 
 tmux kill-session -t "=$SCREEN_NAME" 2>/dev/null && echo "Stopped tmux session '$SCREEN_NAME'" || echo "No active tmux session '$SCREEN_NAME' found"
 
-if [[ "$SESSION_TYPE" == "codex" ]]; then
-  ORPHAN_PIDS="$(find_codex_listener_pids "$CHANNEL_ID" "$WS_PORT" "$BOT_APP_ID")"
-else
-  ORPHAN_PIDS="$(find_claude_listener_pids "$STATE_DIR")"
-fi
+ORPHAN_PIDS="$(find_owned_listener_pids)"
 
 if [[ -n "$ORPHAN_PIDS" ]]; then
   echo "Cleaning remaining listener process(es):"
