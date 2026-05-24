@@ -54,6 +54,7 @@ find_claude_listener_pids() {
   python3 - "$state_dir" <<'PY'
 import os
 import re
+import shlex
 import subprocess
 import sys
 
@@ -76,14 +77,47 @@ def has_target_state(command: str) -> bool:
             return True
     return False
 
+def command_argv(command: str) -> list[str]:
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return []
+
+def is_discord_plugin_path(value: str) -> bool:
+    return "claude-plugins-official/discord/" in os.path.normpath(os.path.expanduser(value))
+
+def has_claude_discord_plugin_root(command: str) -> bool:
+    root_re = re.compile(r"""CLAUDE_PLUGIN_ROOT=(?:"([^"]+)"|'([^']+)'|([^\s]+))""")
+    for match in root_re.finditer(command):
+        value = next(group for group in match.groups() if group is not None)
+        if is_discord_plugin_path(value):
+            return True
+    return False
+
+def has_claude_discord_cwd(argv: list[str]) -> bool:
+    for index, arg in enumerate(argv[:-1]):
+        if arg == "--cwd" and is_discord_plugin_path(argv[index + 1]):
+            return True
+    return False
+
 def is_listener(command: str) -> bool:
-    if "--channels plugin:discord" in command:
+    argv = command_argv(command)
+    if not argv:
+        return False
+
+    exe = os.path.basename(argv[0])
+    if exe in {"tmux", "zsh", "bash", "sh", "fish", "login"}:
+        return False
+
+    if exe == "claude" and "--channels" in argv and any(
+        arg.startswith("plugin:discord") for arg in argv
+    ):
         return True
-    if "claude-channel-discord" in command:
+    if exe == "claude-channel-discord":
         return True
-    if "bun run --cwd" in command and "/discord" in command:
+    if exe == "bun" and "run" in argv and has_claude_discord_cwd(argv):
         return True
-    if "server.ts" in command and "/discord" in command and "bun" in command:
+    if exe == "bun" and any(os.path.basename(arg) == "server.ts" for arg in argv[1:]) and has_claude_discord_plugin_root(command):
         return True
     return False
 
@@ -106,6 +140,8 @@ find_codex_listener_pids() {
   local ws_port="$2"
   local bot_app_id="$3"
   python3 - "$channel_id" "$ws_port" "$bot_app_id" <<'PY'
+import os
+import shlex
 import subprocess
 import sys
 
@@ -122,6 +158,36 @@ try:
 except Exception:
     sys.exit(0)
 
+def command_argv(command: str) -> list[str]:
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return []
+
+def has_env(command: str, name: str, value: str) -> bool:
+    return f"{name}={value}" in command
+
+def is_codex_bridge(command: str) -> bool:
+    argv = command_argv(command)
+    if len(argv) < 2:
+        return False
+    exe = os.path.basename(argv[0])
+    script = os.path.normpath(argv[1])
+    return (
+        exe == "node"
+        and script.endswith("scripts/codex-bridge.js")
+        and (has_env(command, "CHANNEL_ID", channel_id) or has_env(command, "BOT_APP_ID", bot_app_id))
+    )
+
+def is_codex_app_server(command: str) -> bool:
+    argv = command_argv(command)
+    if not argv:
+        return False
+    exe = os.path.basename(argv[0])
+    if exe not in {"node", "codex"}:
+        return False
+    return "app-server" in argv and f"ws://127.0.0.1:{ws_port}" in argv
+
 for line in ps.splitlines():
     line = line.strip()
     if not line:
@@ -131,11 +197,7 @@ for line in ps.splitlines():
         continue
     if "ps axeww" in command or "python3 -" in command:
         continue
-    is_bridge = "node scripts/codex-bridge.js" in command and (
-        f"CHANNEL_ID={channel_id}" in command or f"BOT_APP_ID={bot_app_id}" in command
-    )
-    is_app_server = f"app-server --listen ws://127.0.0.1:{ws_port}" in command
-    if is_bridge or is_app_server:
+    if is_codex_bridge(command) or is_codex_app_server(command):
         print(pid_text)
 PY
 }

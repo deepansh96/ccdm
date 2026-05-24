@@ -20,6 +20,8 @@ find_codex_listener_pids() {
   local ws_port="$2"
   local bot_app_id="$3"
   python3 - "$channel_id" "$ws_port" "$bot_app_id" <<'PY'
+import os
+import shlex
 import subprocess
 import sys
 
@@ -33,6 +35,36 @@ try:
 except Exception:
     sys.exit(0)
 
+def command_argv(command: str) -> list[str]:
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return []
+
+def has_env(command: str, name: str, value: str) -> bool:
+    return f"{name}={value}" in command
+
+def is_codex_bridge(command: str) -> bool:
+    argv = command_argv(command)
+    if len(argv) < 2:
+        return False
+    exe = os.path.basename(argv[0])
+    script = os.path.normpath(argv[1])
+    return (
+        exe == "node"
+        and script.endswith("scripts/codex-bridge.js")
+        and (has_env(command, "CHANNEL_ID", channel_id) or has_env(command, "BOT_APP_ID", bot_app_id))
+    )
+
+def is_codex_app_server(command: str) -> bool:
+    argv = command_argv(command)
+    if not argv:
+        return False
+    exe = os.path.basename(argv[0])
+    if exe not in {"node", "codex"}:
+        return False
+    return "app-server" in argv and f"ws://127.0.0.1:{ws_port}" in argv
+
 for line in ps.splitlines():
     line = line.strip()
     if not line:
@@ -42,11 +74,7 @@ for line in ps.splitlines():
         continue
     if "ps axeww" in command or "python3 -" in command:
         continue
-    is_bridge = "node scripts/codex-bridge.js" in command and (
-        f"CHANNEL_ID={channel_id}" in command or f"BOT_APP_ID={bot_app_id}" in command
-    )
-    is_app_server = f"app-server --listen ws://127.0.0.1:{ws_port}" in command
-    if is_bridge or is_app_server:
+    if is_codex_bridge(command) or is_codex_app_server(command):
         print(pid_text)
 PY
 }
@@ -56,11 +84,31 @@ record_codex_pid() {
   local bot_app_id="$2"
   python3 - "$REGISTRY" "$PROJECT" "$channel_id" "$bot_app_id" <<'PY'
 import json
+import os
+import shlex
 import subprocess
 import sys
 import time
 
 registry_path, project, channel_id, bot_app_id = sys.argv[1:5]
+
+def command_argv(command: str) -> list[str]:
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return []
+
+def is_codex_bridge(command: str) -> bool:
+    argv = command_argv(command)
+    if len(argv) < 2:
+        return False
+    exe = os.path.basename(argv[0])
+    script = os.path.normpath(argv[1])
+    return (
+        exe == "node"
+        and script.endswith("scripts/codex-bridge.js")
+        and (f"CHANNEL_ID={channel_id}" in command or f"BOT_APP_ID={bot_app_id}" in command)
+    )
 
 def find_pid() -> int | None:
     try:
@@ -80,9 +128,7 @@ def find_pid() -> int | None:
             continue
         if "ps axeww" in command or "python3 -" in command:
             continue
-        if "node scripts/codex-bridge.js" in command and (
-            f"CHANNEL_ID={channel_id}" in command or f"BOT_APP_ID={bot_app_id}" in command
-        ):
+        if is_codex_bridge(command):
             return int(pid_text)
     return None
 
