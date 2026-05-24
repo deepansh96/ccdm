@@ -63,11 +63,14 @@ Run `tmux list-sessions` and cross-reference with the registry. Report which pro
 #### 2. Start a session (`start <project>`)
 
 1. Look up the project in `registry.json`. Check the `type` field (defaults to `"claude"` if absent). Find its assigned bot in the pool via `bot_id` to get the `state_dir`.
-2. Check if a tmux session with that name is already running (`tmux has-session -t <screen_name> 2>/dev/null`). If yes, say it's already running.
+2. Check if a tmux session with that exact name is already running (`tmux has-session -t =<screen_name> 2>/dev/null`). If yes, say it's already running.
+3. Before starting anything, check for an existing listener process for the same bot:
+   - Claude sessions: scan running processes for the exact `DISCORD_STATE_DIR` and Claude Discord listener commands (`--channels plugin:discord`, the Discord plugin `bun run --cwd`/`bun server.ts`, or `claude-channel-discord`). If any exist, do not start a new session; run the stop flow first.
+   - Codex sessions: scan running processes for `node scripts/codex-bridge.js` with the same `CHANNEL_ID`/`BOT_APP_ID`, or `codex app-server` with the same `ws_port`. If any exist, do not start a new session; run the stop flow first.
 
 **If type is `"claude"` (default):**
 
-3. Pre-trust the workspace so the trust dialog is skipped (or auto-dismissed):
+4. Pre-trust the workspace so the trust dialog is skipped (or auto-dismissed):
    ```python
    import json
    path = os.path.expanduser('~/.claude/.claude.json')
@@ -83,33 +86,33 @@ Run `tmux list-sessions` and cross-reference with the registry. Report which pro
        d['projects'][project_key]['hasTrustDialogAccepted'] = True
    json.dump(d, open(path, 'w'), indent=2)
    ```
-4. Run:
+5. Run:
    ```sh
    tmux new-session -d -s <screen_name> -- zsh -ic 'cd <path> && DISCORD_STATE_DIR=<state_dir> claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
    ```
-5. **Dismiss the trust dialog** — the Ink TUI may still show it even with pre-trust. Wait ~8 seconds for the prompt to render, then send Enter:
+6. **Dismiss the trust dialog** — the Ink TUI may still show it even with pre-trust. Wait ~8 seconds for the prompt to render, then send Enter:
    ```sh
    sleep 8 && tmux send-keys -t <screen_name> Enter
    ```
-6. Verify it started by capturing the tmux pane output:
+7. Verify it started by capturing the tmux pane output:
    ```sh
    tmux capture-pane -t <screen_name> -p
    ```
    Look for "Listening for channel messages" to confirm the session is live. If the trust dialog is still showing, re-run the `send-keys` command.
-7. Look up the Claude Code PID and session ID from `~/.claude/sessions/<pid>.json` (the PID is the `claude` process running inside the tmux session). Update `registry.json` with `session_id` and `pid`.
+8. Look up the Claude Code PID and session ID from `~/.claude/sessions/<pid>.json` (the PID is the `claude` process running inside the tmux session). Update `registry.json` with `session_id` and `pid`. The `scripts/start-session.sh` helper does this automatically after starting.
 
 **If type is `"codex"`:**
 
-3. Run the Codex bridge script (do NOT run the bridge manually — the script sets all required env vars including GUILD_ID, ROOT_BOT_TOKEN, BOT_APP_ID, and BOT_DISPLAY_NAME):
+4. Run the Codex bridge script (do NOT run the bridge manually — the script sets all required env vars including GUILD_ID, ROOT_BOT_TOKEN, BOT_APP_ID, and BOT_DISPLAY_NAME):
    ```sh
    scripts/start-codex-session.sh <project_name>
    ```
-4. Verify it started by capturing the tmux pane output:
+5. Verify it started by capturing the tmux pane output:
    ```sh
    tmux capture-pane -t <screen_name> -p
    ```
    Look for "Codex-Discord bridge running" and "Listening in #channel-name" to confirm. The bridge spawns `codex app-server` internally.
-5. Update `registry.json` with the PID of the node process.
+6. Update `registry.json` with the PID of the node process. The `scripts/start-codex-session.sh` helper does this automatically after starting.
 
 The bridge automatically registers a `discord-<channel_id>` MCP server with the Codex app-server on startup, giving Codex access to Discord tools: `reply` (with file attachments), `edit_message`, `react`, `fetch_messages`, and `download_attachment`. No manual MCP configuration is needed — it's handled transparently by `codex-bridge.js`.
 
@@ -123,9 +126,14 @@ The bridge automatically registers a `discord-<channel_id>` MCP server with the 
 #### 3. Stop a session (`stop <project>`)
 
 1. Look up the project in `registry.json`.
-2. Run: `tmux kill-session -t <screen_name>`
-3. Clear `session_id` and `pid` from the project's entry in `registry.json` (set to `null`).
-4. Confirm it's stopped.
+2. Kill the recorded process tree first using the `pid` from `registry.json`, if it is present and still running. Kill descendants before the parent, send `TERM`, wait briefly, then send `KILL` to anything that remains.
+3. Run: `tmux kill-session -t =<screen_name>`
+4. Sweep for remaining listener processes:
+   - Claude sessions: find processes whose exact `DISCORD_STATE_DIR` matches the assigned bot state dir and whose command is part of the Claude Discord listener stack.
+   - Codex sessions: find `node scripts/codex-bridge.js` for the same channel/app or `codex app-server` for the same `ws_port`.
+   Kill any remaining listener process trees.
+5. Clear `session_id` and `pid` from the project's entry in `registry.json` (set to `null`).
+6. Confirm it's stopped.
 
 #### 4. Restart a session (`restart <project>`)
 
@@ -197,7 +205,7 @@ This assigns an available bot from the pool to a new project and scopes it to a 
 
 #### 6. Deregister a project (`deregister`, `remove`, `unregister`)
 
-1. Stop the session if running (`tmux kill-session -t <screen_name>`).
+1. Stop the session if running using the full stop flow above, including PID kill, tmux kill, listener sweep, and registry cleanup.
 2. Find the project's assigned bot in the pool via `bot_id`. Get `token` and `app_id` from the pool entry, and `channel_id` from the project entry.
 3. Rename the bot back to its base name (e.g., `bot2`):
    ```sh
