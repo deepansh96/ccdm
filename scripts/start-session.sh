@@ -50,7 +50,12 @@ def command_argv(command: str) -> list[str]:
         return []
 
 def is_discord_plugin_path(value: str) -> bool:
-    return "claude-plugins-official/discord/" in os.path.normpath(os.path.expanduser(value))
+    path = os.path.normpath(os.path.expanduser(value))
+    plugin_roots = (
+        "claude-plugins-official/discord",
+        "claude-plugins-official/external_plugins/discord",
+    )
+    return any(path.endswith(f"/{root}") or f"/{root}/" in path for root in plugin_roots)
 
 def has_claude_discord_plugin_root(command: str) -> bool:
     root_re = re.compile(r"""CLAUDE_PLUGIN_ROOT=(?:"([^"]+)"|'([^']+)'|([^\s]+))""")

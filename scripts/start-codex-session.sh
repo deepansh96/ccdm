@@ -21,6 +21,7 @@ find_codex_listener_pids() {
   local bot_app_id="$3"
   python3 - "$channel_id" "$ws_port" "$bot_app_id" <<'PY'
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -42,7 +43,12 @@ def command_argv(command: str) -> list[str]:
         return []
 
 def has_env(command: str, name: str, value: str) -> bool:
-    return f"{name}={value}" in command
+    env_re = re.compile(rf"""(?:^|\s){re.escape(name)}=(?:"([^"]*)"|'([^']*)'|([^\s]+))""")
+    for match in env_re.finditer(command):
+        found = next(group for group in match.groups() if group is not None)
+        if found == value:
+            return True
+    return False
 
 def is_codex_bridge(command: str) -> bool:
     argv = command_argv(command)
@@ -85,12 +91,21 @@ record_codex_pid() {
   python3 - "$REGISTRY" "$PROJECT" "$channel_id" "$bot_app_id" <<'PY'
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
 import time
 
 registry_path, project, channel_id, bot_app_id = sys.argv[1:5]
+
+def has_env(command: str, name: str, value: str) -> bool:
+    env_re = re.compile(rf"""(?:^|\s){re.escape(name)}=(?:"([^"]*)"|'([^']*)'|([^\s]+))""")
+    for match in env_re.finditer(command):
+        found = next(group for group in match.groups() if group is not None)
+        if found == value:
+            return True
+    return False
 
 def command_argv(command: str) -> list[str]:
     try:
@@ -107,7 +122,7 @@ def is_codex_bridge(command: str) -> bool:
     return (
         exe == "node"
         and script.endswith("scripts/codex-bridge.js")
-        and (f"CHANNEL_ID={channel_id}" in command or f"BOT_APP_ID={bot_app_id}" in command)
+        and (has_env(command, "CHANNEL_ID", channel_id) or has_env(command, "BOT_APP_ID", bot_app_id))
     )
 
 def find_pid() -> int | None:

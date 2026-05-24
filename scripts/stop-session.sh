@@ -84,7 +84,12 @@ def command_argv(command: str) -> list[str]:
         return []
 
 def is_discord_plugin_path(value: str) -> bool:
-    return "claude-plugins-official/discord/" in os.path.normpath(os.path.expanduser(value))
+    path = os.path.normpath(os.path.expanduser(value))
+    plugin_roots = (
+        "claude-plugins-official/discord",
+        "claude-plugins-official/external_plugins/discord",
+    )
+    return any(path.endswith(f"/{root}") or f"/{root}/" in path for root in plugin_roots)
 
 def has_claude_discord_plugin_root(command: str) -> bool:
     root_re = re.compile(r"""CLAUDE_PLUGIN_ROOT=(?:"([^"]+)"|'([^']+)'|([^\s]+))""")
@@ -141,6 +146,7 @@ find_codex_listener_pids() {
   local bot_app_id="$3"
   python3 - "$channel_id" "$ws_port" "$bot_app_id" <<'PY'
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -165,7 +171,12 @@ def command_argv(command: str) -> list[str]:
         return []
 
 def has_env(command: str, name: str, value: str) -> bool:
-    return f"{name}={value}" in command
+    env_re = re.compile(rf"""(?:^|\s){re.escape(name)}=(?:"([^"]*)"|'([^']*)'|([^\s]+))""")
+    for match in env_re.finditer(command):
+        found = next(group for group in match.groups() if group is not None)
+        if found == value:
+            return True
+    return False
 
 def is_codex_bridge(command: str) -> bool:
     argv = command_argv(command)
