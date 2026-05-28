@@ -106,3 +106,25 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Nickname/statusline | Rate-limit skip/send | Covered | First context update sends, immediate repeated update with the same unique state basename is skipped by the production rate-limit file. |
 | Nickname/statusline | Hardcoded `/tmp` context files | Covered | Tests use unique `DISCORD_STATE_DIR` basenames, assert the current `/tmp/cc-context-<state>` boundary, and clean those files explicitly. |
 | Nickname/statusline | Shell curl vs JS Discord interception | Covered | README documents that nickname scripts use the shell-level fake `curl`, while bridge/MCP Discord behavior uses child-scoped JS preload/shims. |
+
+## Phase-One Workflow Audit
+
+This audit maps the PRD workflow bullets from issue #4 to automated scenarios or explicit deferrals. It is intentionally separate from the scenario rows above so maintainers can check the comprehensive boundary without reading every test file.
+
+| Area | PRD workflow bullet | Status | Scenario or deferral |
+| --- | --- | --- | --- |
+| Default CI Suite | Local-fake default execution without real Discord, Claude, Codex, tmux, Keychain, OAuth, or npm network | Covered | Package, CI, harness safety, PATH no-fallthrough, network guard, and fixture contract rows above. |
+| Root setup | Setup prerequisites, registry creation, state directories, overwrite guards, and chmod behavior | Covered | Setup scenario rows above drive `setup.sh` through fixture binaries. |
+| Claude start | Registry lookup, state-dir resolution, tmux launch construction, duplicate listener guards, PID/session recording | Covered | Claude start rows above drive `scripts/start-session.sh`. |
+| Stop session | Recorded PID ownership, process-tree termination, tmux cleanup, orphan sweeps, registry cleanup for Claude and Codex | Covered | Stop session and process safety rows above drive `scripts/stop-session.sh`. |
+| Codex start | Stale MCP cleanup, duplicate bridge detection, environment construction, root-bot token lookup, bridge PID recording | Covered | Codex start rows above drive `scripts/start-codex-session.sh`. |
+| Codex bridge | Filtering, attachments, queueing, steering, slash commands, fallback replies, MCP registration, diagnostics | Covered | Codex bridge and JS interception rows above drive `scripts/codex-bridge.js` with fake Discord and fake Codex app-server. |
+| Discord MCP | Reply, edit, react, fetch, attachment download, JSON-RPC lifecycle, and API error propagation | Covered | Discord MCP rows above drive `scripts/discord-mcp-server.js`. |
+| Claude usage | OAuth/keychain fallback, local stats parsing, malformed data tolerance, version reporting | Covered | Claude usage rows above drive `scripts/claude-usage.sh`. |
+| Nickname/statusline | Rate limiting, disable behavior, fixture root `.env`, PATCH construction, npx no-network statusline pipeline | Covered | Nickname/statusline and fixture contract rows above drive the nickname/statusline scripts. |
+| Root restart | Fixture tmux/process restart behavior without touching the real `root_agent` session | Covered | Root restart rows above drive `restart-root-agent.sh`. |
+| Usage loop template | Tracked usage-loop template/static boundary | Covered | Static template row above checks placeholders, fakeable commands, and fixed `/tmp/usage_report_*` paths. |
+| Usage loop execution | Ignored live usage-loop execution | Deferred | The ignored `scripts/usage-report-loop.sh` is absent from fresh clones and intended for live posting; extract a safe tracked executable before deterministic E2E execution. |
+| Live smoke | Live real-service checks | Covered | Default skip row verifies the Live Gate; issue #4 does not require a live-smoke scenario matrix. |
+| Diagnostics | Commands, streams, fixture state, file diffs, and redaction | Covered | Harness diagnostics rows above assert actionable failure context with secret redaction. |
+| Instruction-only root-agent workflows | Register, deregister, pool management, polls, context report, and other conversational workflows | Deferred | These remain Extraction Follow-Ups until implemented as executable surfaces. |

@@ -1,5 +1,7 @@
 # CCDM Local-Fake E2E Harness
 
+## Run Commands
+
 Run the default suite with:
 
 ```sh
@@ -19,7 +21,7 @@ The harness uses Node's built-in `node:test` runner. Each scenario creates an is
 
 Test Workspaces are assembled from tracked files only. The workspace builder refuses tracked local-only artifacts and asserts that `registry.json`, `.env`, `CLAUDE.local.md`, `.claude`, `.codex`, and ignored usage-loop content are absent from the copied repo.
 
-## Helper Contracts
+## Public Helper APIs
 
 `createWorkspace()` returns frozen paths and an injected environment containing `cwd`, `HOME`, allowlisted `PATH`, `TMPDIR`, `NODE_OPTIONS`, `NODE_PATH`, and `$CCDM_TEST_STATE`.
 
@@ -93,7 +95,7 @@ The teardown manager exposes `registerTeardownCallback(fn)` and `cleanup()`. Cal
 
 State helpers reload from disk on every read and write updates through atomic write-then-rename. Public helpers are `readState`, `writeState`, `seedRegistry`, `seedFixtureProcess`, `seedTmuxSession`, `recordCommandInvocation`, `snapshotFiles`, and `cleanup`.
 
-## Fixture Ownership
+## Fixture Contracts and Local Fakes
 
 Scenario `PATH` contains only harness-owned fixture binaries and approved host wrappers. Missing required tools fail fast rather than falling through to the developer's original `PATH`.
 
@@ -114,7 +116,15 @@ The same tmux/process contract covers the Codex startup surface:
 - The fixture records only the bridge command construction. App-server spawning and WebSocket protocol behavior belong to later Codex bridge scenarios.
 - The `npm` fixture fails closed and records invocations so startup scenarios can prove Test Workspaces do not run package installation or contact npm.
 
-The Codex bridge/basic-turn scenarios add child-scoped JavaScript interception:
+## Approved Dependency Resolution
+
+Dependencies are installed only in the source checkout before the suite runs. Test Workspaces do not run `npm ci`, do not contact the npm registry, and do not use the developer's original `PATH`.
+
+Child processes resolve approved real dependencies such as `ws` through the injected `NODE_PATH`. Workspace-local module overlays provide fake `discord.js` and `form-data` packages for the executable surfaces under test. This keeps real package resolution explicit while preserving Local Fakes for Discord gateway, REST, CDN, upload, Codex app-server, tmux, process, Keychain, curl, npm, and npx boundaries.
+
+## Child-Scoped JavaScript Interception
+
+The Codex bridge/basic-turn scenarios add child-scoped JavaScript interception. This extends ADR-0002's fixture-binary strategy for Node-only boundaries that cannot be reached through `PATH`:
 
 - `createBridgeWorkspace()` installs a temp-workspace `discord.js` overlay and `bridgeChildEnv()` injects `NODE_OPTIONS=--require <workspace>/tests/e2e/support/preload.cjs` only into child processes under test. The harness process keeps `NODE_OPTIONS` empty.
 - The preload replaces `globalThis.fetch`, fails closed for unexpected `http`, `https`, and `net` egress, allows only the local WebSocket upgrade for the scenario `WS_PORT`, and routes Discord member nickname PATCHes plus Discord CDN attachment fetches into fixture state.
@@ -159,9 +169,9 @@ The stop/restart surfaces add these process-safety assumptions:
 
 ## Diagnostics
 
-Command results include command metadata, cwd, redacted environment, stdout, stderr, exit code, signal, fixture state, and file snapshots. Diagnostics redact token-shaped strings, OAuth tokens, Discord bot tokens, registry token fields, `.env` values, command lines, request bodies, and `Authorization` headers.
+Command results include command metadata, cwd, redacted environment, stdout, stderr, exit code, signal, fixture state, and file snapshots. Diagnostics redact env values, headers, registry values, `.env` files, command lines, request bodies, OAuth tokens, Discord bot tokens, token-shaped strings, and `Authorization` headers before attaching failure context.
 
-## Isolation
+## Test Workspace Isolation
 
 Runtime guards fail on attempted access to the developer checkout registry, real `~/.claude`, real `~/.codex`, real tmux, real Keychain (`security`), and unapproved global temp files. Bridge scenarios also fail closed on unexpected Discord, CDN, `fetch`, `http`, `https`, and `net` egress. Usage-report scenarios additionally fail closed on unapproved `curl` targets, including missed OAuth routes.
 
@@ -175,3 +185,25 @@ Live smoke tests are skipped unless all of the following are true:
 - `CCDM_LIVE_DISCORD_USER_ID` is set
 
 The default CI suite never requires live credentials.
+
+All documented live secrets must be non-empty before a live smoke test may run. Issue #4 does not require a live-smoke scenario matrix; live coverage remains a narrow opt-in drift check for real boundaries.
+
+## CI Behavior
+
+GitHub Actions runs the Default CI Suite on `push` and `pull_request` with Node 22, `npm ci`, zsh, python3, jq, and `npm test`. CI executes the same local-fake command shown above and does not require live Discord, Claude, Codex, tmux, Keychain, OAuth, or npm-network credentials during scenario execution.
+
+## Hardcoded-Boundary Inventory
+
+- `/tmp/cc-context-<state>` nickname files are created by the production nickname helper outside fixture `TMPDIR`. Tests use unique state directory basenames, assert the boundary, and clean the files explicitly.
+- `/tmp/usage_report_*` files are present in `scripts/usage-report-loop.sh.example`. The tracked template is checked statically for placeholder credentials and fakeable commands; ignored live-loop execution stays deferred until a safe tracked executable exists.
+- Shell builtin `kill` is not intercepted. Stop/restart tests constrain fake process discovery to harness-owned placeholder PIDs and assert observable process cleanup instead of command-order internals.
+
+## Extraction Follow-Ups
+
+Instruction-only root-agent workflows are outside issue #4 until they are extracted into deterministic executable surfaces. Follow-up extraction work should cover register, deregister, pool management, polls, context report, and ignored usage-loop execution. Those workflows remain documented root-agent conversation behavior, not Default CI Suite coverage.
+
+## Adding Scenarios
+
+Add scenarios through public executable surfaces and harness helpers. Start with one behavior in `node:test`, use a fresh Test Workspace by default, seed fixture state through public helpers, and assert observable outputs such as exit status, stdout/stderr, registry changes, fixture state, fake Discord requests, or diagnostics.
+
+When adding coverage, update `tests/e2e/SCENARIO_MATRIX.md` with either a `Covered` row naming the scenario or a `Deferred` row with the reason and follow-up. Keep Local Fakes as the default boundary, use child-scoped `NODE_OPTIONS` only for child processes under test, and document any new hardcoded boundary that cannot be redirected safely.
