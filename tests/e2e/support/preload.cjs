@@ -8,6 +8,7 @@ const originalHttpRequest = http.request.bind(http);
 const originalHttpGet = http.get.bind(http);
 const originalHttpsRequest = https.request.bind(https);
 const originalHttpsGet = https.get.bind(https);
+const originalSetInterval = globalThis.setInterval.bind(globalThis);
 
 const stateDir = process.env.CCDM_TEST_STATE;
 const stateFile = stateDir ? path.join(stateDir, "state.json") : null;
@@ -204,6 +205,10 @@ function installNetGuard() {
 
 function install() {
   globalThis.fetch = guardedFetch;
+  if (process.env.CCDM_TEST_ACCELERATE_TYPING === "1") {
+    globalThis.setInterval = (callback, delay, ...args) =>
+      originalSetInterval(callback, delay === 8000 ? 50 : delay, ...args);
+  }
   http.request = blockRequest("http", originalHttpRequest);
   http.get = blockRequest("http", originalHttpGet);
   https.request = blockRequest("https", originalHttpsRequest);

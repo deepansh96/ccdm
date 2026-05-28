@@ -30,6 +30,14 @@ function fixtureChannel(id) {
     id,
     name: `channel-${id}`,
     async send(content) {
+      const failure = readState().fixtures?.discord?.failures?.send;
+      if (failure) {
+        updateState((state) => {
+          state.fixtures.discord.sendFailures ||= [];
+          state.fixtures.discord.sendFailures.push({ channelId: id, content });
+        });
+        throw new Error(failure);
+      }
       updateState((state) => {
         state.fixtures.discord.sends ||= [];
         state.fixtures.discord.sends.push({ channelId: id, content });

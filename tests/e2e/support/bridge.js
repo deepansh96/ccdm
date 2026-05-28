@@ -26,6 +26,7 @@ export function bridgeChildEnv(workspace, extraEnv = {}) {
   const nodePath = [overlayRoot, workspace.env.NODE_PATH].filter(Boolean).join(path.delimiter);
   return {
     ...workspace.env,
+    CCDM_TEST_ACCELERATE_TYPING: "1",
     NODE_OPTIONS: `--require ${path.join(workspace.repoDir, "tests/e2e/support/preload.cjs")}`,
     NODE_PATH: nodePath,
     ...extraEnv,
@@ -133,6 +134,8 @@ export async function startFakeCodexServer(workspace, options = {}) {
   await new Promise((resolve) => server.once("listening", resolve));
   const port = server.address().port;
   const turnPlans = [...(options.turns ?? [])];
+  const steerPlans = [...(options.steer ?? [])];
+  let serverRequestId = 10000;
   markCodexServer(workspace, port, { ready: true, ...(options.fixture ?? {}) });
 
   server.on("connection", (socket) => {
@@ -140,13 +143,20 @@ export async function startFakeCodexServer(workspace, options = {}) {
     socket.on("message", (data) => {
       const message = JSON.parse(data.toString());
       recordCodexEvent(workspace, { event: "client-message", message });
+      if (!message.method) return;
       if (message.method === "initialized") return;
 
       const reply = (result) => {
         socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
       };
+      const replyError = (error) => {
+        socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, error }));
+      };
       const notify = (method, params) => {
         socket.send(JSON.stringify({ jsonrpc: "2.0", method, params }));
+      };
+      const serverRequest = (method, params = {}) => {
+        socket.send(JSON.stringify({ jsonrpc: "2.0", id: serverRequestId++, method, params }));
       };
 
       switch (message.method) {
@@ -155,6 +165,10 @@ export async function startFakeCodexServer(workspace, options = {}) {
           if (options.closeAfterInitialize) socket.close();
           break;
         case "mcpServerStatus/list":
+          if (options.failMcpStatus) {
+            replyError({ code: -32000, message: options.failMcpStatus });
+            break;
+          }
           reply({
             servers: [
               ...(options.staleMcpName ? [{ name: options.staleMcpName, status: "running" }] : []),
@@ -163,7 +177,19 @@ export async function startFakeCodexServer(workspace, options = {}) {
           });
           break;
         case "config/value/delete":
+          if (options.failStaleMcpRemoval && String(message.params?.keyPath ?? "").includes(options.staleMcpName ?? "discord-")) {
+            replyError({ code: -32000, message: options.failStaleMcpRemoval });
+            break;
+          }
+          reply({});
+          break;
         case "config/value/write":
+          if (options.failMcpRegistration) {
+            replyError({ code: -32000, message: options.failMcpRegistration });
+            break;
+          }
+          reply({});
+          break;
         case "config/mcpServer/reload":
           reply({});
           break;
@@ -177,13 +203,28 @@ export async function startFakeCodexServer(workspace, options = {}) {
           reply({ turnId: `turn-${Date.now()}` });
           const isSystem = message.params?.input?.[0]?.text?.startsWith("You are communicating with the user via Discord");
           const plan = isSystem ? { delta: "", complete: true } : (turnPlans.shift() ?? { delta: "Codex response", complete: true });
+          const turnId = plan.turnId ?? `turn-${Date.now()}`;
           setTimeout(() => {
-            notify("turn/started", { turn: { id: plan.turnId ?? `turn-${Date.now()}` } });
+            notify("turn/started", { turn: { id: turnId } });
+            if (plan.approvals || options.approvals) {
+              serverRequest("fileChangeRequestApproval", { turnId });
+              serverRequest("execCommandApproval", { turnId });
+              serverRequest("permissionsRequestApproval", { turnId });
+              serverRequest("toolRequestUserInput", { turnId });
+            }
+          }, plan.startDelayMs ?? plan.delayMs ?? 10);
+          setTimeout(() => {
             if (plan.mcpReply) {
               notify("item/started", { item: { type: "mcpToolCall", server: `discord-${options.channelId ?? "channel-id"}`, tool: "reply" } });
             }
             if (plan.delta) {
               notify("item/agentMessage/delta", { delta: plan.delta });
+            }
+            if (plan.error) {
+              notify("error", {
+                error: { message: plan.error },
+                willRetry: plan.willRetry ?? false,
+              });
             }
             if (plan.tokenUsage) {
               notify("thread/tokenUsage/updated", { tokenUsage: plan.tokenUsage });
@@ -194,6 +235,27 @@ export async function startFakeCodexServer(workspace, options = {}) {
           }, plan.delayMs ?? 10);
           break;
         }
+        case "turn/steer": {
+          const plan = steerPlans.shift() ?? "success";
+          if (plan === "failure" || plan?.error) {
+            replyError({ code: -32000, message: plan?.error ?? "stale turn" });
+          } else {
+            reply({});
+          }
+          break;
+        }
+        case "thread/compact/start":
+          reply({});
+          if (options.compactComplete) {
+            setTimeout(() => {
+              notify("thread/compacted", { threadId: message.params?.threadId ?? options.threadId ?? "thread-1" });
+              notify("item/completed", { item: { type: "contextCompaction" } });
+            }, 5);
+          }
+          break;
+        case "thread/archive":
+          reply({});
+          break;
         default:
           reply({});
       }

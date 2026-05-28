@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
 import WebSocket from "ws";
 
@@ -133,6 +135,54 @@ test("fake Codex app-server speaks the startup, MCP, thread, turn, delta, MCP-re
   ]);
 });
 
+test("fake Codex app-server supports active-turn controls and approval requests", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    approvals: true,
+    compactComplete: true,
+    steer: ["success", "failure"],
+  });
+  const ws = new WebSocket(`ws://127.0.0.1:${codex.port}`);
+  await once(ws, "open");
+  const received = [];
+  ws.on("message", (data) => received.push(JSON.parse(data.toString())));
+
+  const request = async (id, method, params) => {
+    ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+    return await waitFor(() => received.find((message) => message.id === id));
+  };
+
+  await request(1, "initialize", {});
+  await request(2, "thread/start", { cwd: workspace.repoDir });
+  await waitFor(() => received.find((message) => message.method === "thread/started"));
+  await request(3, "turn/start", { input: [{ type: "text", text: "user" }] });
+  const approvalMethods = [
+    "fileChangeRequestApproval",
+    "execCommandApproval",
+    "permissionsRequestApproval",
+    "toolRequestUserInput",
+  ];
+  for (const method of approvalMethods) {
+    const message = await waitFor(() => received.find((entry) => entry.method === method));
+    ws.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: method === "toolRequestUserInput" ? { cancelled: true } : { approved: true } }));
+  }
+  const steerOk = await request(4, "turn/steer", { expectedTurnId: "active-turn" });
+  const steerFailed = await request(5, "turn/steer", { expectedTurnId: "stale-turn" });
+  await request(6, "thread/compact/start", { threadId: "thread-1" });
+  await request(7, "thread/archive", { threadId: "thread-1" });
+
+  ws.close();
+  assert.deepEqual(steerOk.result, {});
+  assert.equal(steerFailed.error.message, "stale turn");
+  assert.ok(received.some((message) => message.method === "item/completed" && message.params?.item?.type === "contextCompaction"));
+  const clientMethods = readState(workspace.stateDir).fixtures.codex.protocolEvents
+    .filter((event) => event.event === "client-message")
+    .map((event) => event.message.method);
+  assert.ok(clientMethods.includes("thread/compact/start"));
+  assert.ok(clientMethods.includes("thread/archive"));
+  assert.ok(clientMethods.includes("turn/steer"));
+});
+
 test("bridge boots, registers Discord MCP, removes stale MCP, and completes one allowed text turn", async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, {
@@ -142,7 +192,7 @@ test("bridge boots, registers Discord MCP, removes stale MCP, and completes one 
   });
   const bridge = startBridge(workspace, { port: codex.port });
 
-  await bridge.waitForOutput(/Codex-Discord bridge running/, 7000);
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
   injectDiscordMessage(workspace, { content: "hello codex" });
   const state = await waitForState(workspace, (nextState) => nextState.fixtures.discord.sends.length === 1, 5000);
 
@@ -189,15 +239,30 @@ test("bridge covers channel fetch, filtering, fallback splitting, MCP reply supp
   const bridge = startBridge(workspace, { port: codex.port });
 
   await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
-  injectDiscordMessage(workspace, { author: { id: "other-user" }, content: "ignore me" });
-  injectDiscordMessage(workspace, { channelId: "other-channel", content: "ignore channel" });
-  injectDiscordMessage(workspace, { author: { bot: true }, content: "ignore bot" });
-  injectDiscordMessage(workspace, { content: "split this" });
+  injectDiscordMessage(workspace, { author: { id: "other-user" }, content: "ignore me", id: "ignore-user" });
+  await waitForState(
+    workspace,
+    (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === "ignore-user"),
+    5000,
+  );
+  injectDiscordMessage(workspace, { channelId: "other-channel", content: "ignore channel", id: "ignore-channel" });
+  await waitForState(
+    workspace,
+    (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === "ignore-channel"),
+    5000,
+  );
+  injectDiscordMessage(workspace, { author: { bot: true }, content: "ignore bot", id: "ignore-bot" });
+  await waitForState(
+    workspace,
+    (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === "ignore-bot"),
+    5000,
+  );
+  injectDiscordMessage(workspace, { content: "split this", id: "split-message" });
   await waitForState(workspace, (nextState) => nextState.fixtures.discord.sends.length === 2, 5000);
-  injectDiscordMessage(workspace, { content: "mcp will reply" });
+  injectDiscordMessage(workspace, { content: "mcp will reply", id: "mcp-message" });
   await waitForState(workspace, (nextState) => nextState.fixtures.discord.deliveredMessages.length >= 5, 5000);
   await new Promise((resolve) => setTimeout(resolve, 150));
-  injectDiscordMessage(workspace, { content: "usage" });
+  injectDiscordMessage(workspace, { content: "usage", id: "usage-message" });
   const state = await waitForState(
     workspace,
     (nextState) => nextState.fixtures.discord.sends.length === 3 && nextState.fixtures.discord.nicknamePatches.length === 1,
@@ -209,6 +274,264 @@ test("bridge covers channel fetch, filtering, fallback splitting, MCP reply supp
   assert.equal(state.fixtures.discord.sends[1].content.length, 1);
   assert.equal(state.fixtures.discord.sends[2].content, "usage done");
   assert.match(state.fixtures.discord.nicknamePatches[0].nick, /42%/);
+  await bridge.stop();
+});
+
+test("bridge handles approvals, active-turn steer, and stale-turn queue fallback", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    steer: ["success", "failure"],
+    turns: [
+      { approvals: true, delta: "first done", delayMs: 600, startDelayMs: 10, turnId: "turn-active" },
+      { delta: "queued done" },
+    ],
+  });
+  const bridge = startBridge(workspace, { port: codex.port });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  injectDiscordMessage(workspace, { content: "first" });
+  await bridge.waitForOutput(/\[discord\] Allowed User: first/, 5000);
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  injectDiscordMessage(workspace, { content: "steer succeeds" });
+  await bridge.waitForOutput(/\[steer\] Injected into active turn turn-active/, 5000);
+  injectDiscordMessage(workspace, { content: "steer queues" });
+  await bridge.waitForOutput(/\[steer\] Failed \(stale turn\), queuing instead/, 5000);
+  const state = await waitForState(
+    workspace,
+    (nextState) => nextState.fixtures.discord.sends.map((send) => send.content).includes("queued done"),
+    5000,
+  );
+  const typingCountAfterCompletion = state.fixtures.discord.typing.length;
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const afterDelay = readState(workspace.stateDir);
+
+  assert.deepEqual(state.fixtures.discord.sends.map((send) => send.content), ["first done", "queued done"]);
+  assert.deepEqual(state.fixtures.discord.reactions.map((reaction) => reaction.emoji), ["\u23f3"]);
+  assert.equal(state.fixtures.discord.reactionRemovals.length, 1);
+  assert.ok(state.fixtures.discord.typing.length >= 2);
+  assert.equal(afterDelay.fixtures.discord.typing.length, typingCountAfterCompletion);
+  const clientMessages = state.fixtures.codex.protocolEvents
+    .filter((event) => event.event === "client-message")
+    .map((event) => event.message);
+  assert.equal(clientMessages.filter((message) => message.method === "turn/steer").length, 2);
+  assert.equal(
+    clientMessages.filter((message) => message.method === "turn/start" && message.params?.input?.[0]?.text !== undefined).length,
+    3,
+  );
+  assert.equal(clientMessages.filter((message) => message.result?.approved === true).length, 3);
+  assert.equal(clientMessages.filter((message) => message.result?.cancelled === true).length, 1);
+  await bridge.stop();
+});
+
+test("bridge handles compact and clear slash commands during an active turn", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    compactComplete: true,
+    turns: [{ delta: "busy done", delayMs: 1000, startDelayMs: 10, turnId: "busy-turn" }],
+  });
+  const bridge = startBridge(workspace, { port: codex.port });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  injectDiscordMessage(workspace, { content: "busy" });
+  await bridge.waitForOutput(/\[discord\] Allowed User: busy/, 5000);
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  injectDiscordMessage(workspace, { content: "/compact" });
+  await waitForState(
+    workspace,
+    (nextState) =>
+      nextState.fixtures.discord.sends.some((send) => send.content === "Compaction started.") &&
+      nextState.fixtures.discord.sends.some((send) => send.content === "Compaction complete."),
+    5000,
+  );
+  injectDiscordMessage(workspace, { content: "/clear" });
+  const state = await waitForState(
+    workspace,
+    (nextState) => nextState.fixtures.discord.sends.some((send) => send.content.startsWith("Conversation cleared")),
+    5000,
+  );
+
+  assert.deepEqual(state.fixtures.discord.reactions.map((reaction) => reaction.emoji), ["\ud83d\udd04", "\ud83d\udd04"]);
+  const clientMessages = state.fixtures.codex.protocolEvents
+    .filter((event) => event.event === "client-message")
+    .map((event) => event.message);
+  assert.ok(clientMessages.some((message) => message.method === "thread/compact/start"));
+  assert.ok(clientMessages.some((message) => message.method === "thread/archive"));
+  assert.equal(clientMessages.filter((message) => message.method === "thread/start").length, 2);
+  const mcpWrite = clientMessages.find((message) => message.method === "config/value/write");
+  assert.equal(mcpWrite.params.keyPath, "mcp_servers.discord-channel-id");
+  assert.equal(mcpWrite.params.value.env.CHANNEL_ID, "channel-id");
+  const systemTurns = clientMessages.filter((message) =>
+    message.method === "turn/start" &&
+    message.params?.input?.[0]?.text?.includes("Use ONLY the MCP server named \"discord-channel-id\""),
+  );
+  assert.equal(systemTurns.length, 2);
+  await bridge.stop();
+});
+
+test("bridge stops typing after a non-retryable Codex error", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    turns: [{ error: "model unavailable", complete: false }],
+  });
+  const bridge = startBridge(workspace, { port: codex.port });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  injectDiscordMessage(workspace, { content: "fail this turn" });
+  const failed = await waitForState(
+    workspace,
+    (nextState) => nextState.fixtures.discord.sends.some((send) => send.content === "**Error:** model unavailable"),
+    5000,
+  );
+  const typingCountAfterFailure = failed.fixtures.discord.typing.length;
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const afterDelay = readState(workspace.stateDir);
+
+  assert.ok(typingCountAfterFailure >= 1);
+  assert.equal(afterDelay.fixtures.discord.typing.length, typingCountAfterFailure);
+  await bridge.stop();
+});
+
+test("bridge warns on stale MCP removal failure and records diagnostics for MCP registration failure", async () => {
+  const staleWorkspace = createBridgeWorkspace();
+  const staleCodex = await startFakeCodexServer(staleWorkspace, {
+    failStaleMcpRemoval: "delete failed",
+    staleMcpName: "discord-stale",
+  });
+  const staleBridge = startBridge(staleWorkspace, { port: staleCodex.port });
+
+  await staleBridge.waitForOutput(/Warning: could not clean stale MCP servers: delete failed/, 7000);
+  await staleBridge.waitForOutput(/Codex-Discord bridge running/, 7000);
+  const staleState = readState(staleWorkspace.stateDir);
+  assert.ok(
+    staleState.fixtures.codex.protocolEvents.some(
+      (event) => event.message?.method === "config/value/delete" && event.message.params?.keyPath === "mcp_servers.discord-stale",
+    ),
+  );
+  assert.ok(
+    staleState.fixtures.codex.protocolEvents.some(
+      (event) => event.message?.method === "config/value/write" && event.message.params?.keyPath === "mcp_servers.discord-channel-id",
+    ),
+  );
+  await staleBridge.stop();
+
+  const registrationWorkspace = createBridgeWorkspace();
+  const registrationCodex = await startFakeCodexServer(registrationWorkspace, {
+    failMcpRegistration: "write failed",
+  });
+  const registrationBridge = startBridge(registrationWorkspace, { port: registrationCodex.port });
+  const registrationResult = await registrationBridge.closed;
+
+  assert.notEqual(registrationResult.exitCode, 0);
+  assert.match(registrationResult.stderr, /Fatal:/);
+  assert.match(registrationResult.stderr, /write failed/);
+  const command = readState(registrationWorkspace.stateDir).commands.at(-1);
+  assert.equal(command.exitCode, registrationResult.exitCode);
+  assert.match(command.stderr, /write failed/);
+});
+
+test("bridge records diagnostics when Discord send fails", async () => {
+  const workspace = createBridgeWorkspace();
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.failures.send = "send failed";
+  writeState(seed, workspace.stateDir);
+  const codex = await startFakeCodexServer(workspace, {
+    turns: [{ delta: "cannot send" }],
+  });
+  const bridge = startBridge(workspace, { port: codex.port });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  injectDiscordMessage(workspace, { content: "trigger send failure" });
+  const result = await bridge.closed;
+
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /send failed/);
+  const state = readState(workspace.stateDir);
+  assert.equal(state.fixtures.discord.sendFailures[0].channelId, "channel-id");
+  assert.equal(state.fixtures.discord.sendFailures[0].content, "cannot send");
+  assert.match(state.commands.at(-1).stderr, /send failed/);
+});
+
+test("bridge builds Codex input for empty messages and image, text, binary, and failed attachments", async () => {
+  const workspace = createBridgeWorkspace();
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.attachments["https://cdn.discordapp.com/attachments/channel/message/notes.txt"] = {
+    body: "line one\nline two",
+    contentType: "text/plain",
+  };
+  seed.fixtures.discord.attachments["https://cdn.discordapp.com/attachments/channel/message/archive.bin"] = {
+    body: "binary body",
+    contentType: "application/octet-stream",
+  };
+  writeState(seed, workspace.stateDir);
+  const codex = await startFakeCodexServer(workspace, {
+    turns: [{ delta: "attachments done" }],
+  });
+  const bridge = startBridge(workspace, { port: codex.port });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  injectDiscordMessage(workspace, { content: "   ", id: "empty-message" });
+  await waitForState(
+    workspace,
+    (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === "empty-message"),
+    5000,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  injectDiscordMessage(workspace, {
+    content: "",
+    attachments: [
+      {
+        contentType: "image/png",
+        name: "diagram.png",
+        size: 123,
+        url: "https://cdn.discordapp.com/attachments/channel/message/diagram.png",
+      },
+      {
+        contentType: "text/plain",
+        name: "notes.txt",
+        size: 17,
+        url: "https://cdn.discordapp.com/attachments/channel/message/notes.txt",
+      },
+      {
+        contentType: "application/octet-stream",
+        name: "archive.bin",
+        size: 11,
+        url: "https://cdn.discordapp.com/attachments/channel/message/archive.bin",
+      },
+      {
+        contentType: "text/plain",
+        name: "missing.txt",
+        size: 7,
+        url: "https://cdn.discordapp.com/attachments/channel/message/missing.txt",
+      },
+    ],
+  });
+  const state = await waitForState(
+    workspace,
+    (nextState) => nextState.fixtures.discord.sends.some((send) => send.content === "attachments done"),
+    5000,
+  );
+
+  const userTurns = state.fixtures.codex.protocolEvents
+    .filter((event) => event.event === "client-message" && event.message.method === "turn/start")
+    .map((event) => event.message.params.input)
+    .filter((input) => !input[0]?.text?.startsWith("You are communicating with the user via Discord"));
+  assert.equal(userTurns.length, 1);
+  assert.equal(userTurns[0][0].type, "image");
+  assert.equal(userTurns[0][0].url, "https://cdn.discordapp.com/attachments/channel/message/diagram.png");
+  assert.match(userTurns[0][1].text, /--- File: notes\.txt ---\nline one\nline two/);
+  assert.match(userTurns[0][2].text, /\.discord-attachments/);
+  assert.match(userTurns[0][2].text, /archive\.bin/);
+  assert.deepEqual(
+    state.fixtures.discord.attachmentFetches.map((entry) => entry.url).sort(),
+    [
+      "https://cdn.discordapp.com/attachments/channel/message/archive.bin",
+      "https://cdn.discordapp.com/attachments/channel/message/missing.txt",
+      "https://cdn.discordapp.com/attachments/channel/message/notes.txt",
+    ],
+  );
+  const attachmentDir = path.join(workspace.repoDir, ".discord-attachments");
+  assert.equal(fs.existsSync(attachmentDir), true);
+  assert.ok(fs.readdirSync(attachmentDir).some((file) => file.endsWith("-archive.bin")));
   await bridge.stop();
 });
 

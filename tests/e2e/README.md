@@ -100,8 +100,10 @@ The Codex bridge/basic-turn scenarios add child-scoped JavaScript interception:
 - `createBridgeWorkspace()` installs a temp-workspace `discord.js` overlay and `bridgeChildEnv()` injects `NODE_OPTIONS=--require <workspace>/tests/e2e/support/preload.cjs` only into child processes under test. The harness process keeps `NODE_OPTIONS` empty.
 - The preload replaces `globalThis.fetch`, fails closed for unexpected `http`, `https`, and `net` egress, allows only the local WebSocket upgrade for the scenario `WS_PORT`, and routes Discord member nickname PATCHes plus Discord CDN attachment fetches into fixture state.
 - The `discord.js` shim exports `Client`, `GatewayIntentBits`, and `Partials`, records login/ready/channel fetch/typing/send behavior, and consumes test-injected gateway messages from `$CCDM_TEST_STATE`.
-- `startFakeCodexServer()` owns the fake Codex WebSocket protocol. It covers `initialize`/`initialized`, MCP status/delete/write/reload, `thread/start`, system and user `turn/start`, agent deltas, MCP reply detection, token-usage notifications, WebSocket close, and startup no-thread-id failure.
+- `startFakeCodexServer()` owns the fake Codex WebSocket protocol. It covers `initialize`/`initialized`, MCP status/delete/write/reload, `thread/start`, system and user `turn/start`, active-turn `turn/steer`, `thread/compact/start`, `thread/archive`, approval requests, agent deltas, MCP reply detection, context-compaction completion, token-usage notifications, WebSocket close, and startup no-thread-id failure.
 - The `codex` fixture validates `app-server --listen ws://127.0.0.1:<port>`, requires a harness-owned fake server for that port, records the invocation, and stays alive until the bridge exits.
+- Bridge control-flow scenarios cover successful steer, stale-turn queue fallback, queued reaction cleanup, `/compact`, `/clear`, compact/clear during an active turn, non-retryable Codex errors, MCP cleanup/registration failures, and command diagnostics.
+- Attachment scenarios cover empty messages, image URLs, fetched text attachments, binary downloads into `.discord-attachments`, attachment fetch failures, and Discord send failures. The Discord shim can reject `channel.send()` through fixture state so tests can assert the bridge's current failure diagnostics.
 
 The stop/restart surfaces add these process-safety assumptions:
 
