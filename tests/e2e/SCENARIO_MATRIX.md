@@ -86,3 +86,14 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Discord MCP | Fake REST API failures | Covered | Scripted fake Discord REST failures propagate 400, 401, 403, 404, 429 including rate-limit body, and 5xx as MCP error content. |
 | Fixture contracts | FormData upload shim | Covered | Preload installs a workspace-local `form-data` shim whose `FormData.prototype.submit()` routes uploads through fake Discord and blocks missed non-Discord egress. |
 | Discord MCP | Advertised file count/size limits | Covered | Current executable behavior advertises 10 files and 25MB each but does not enforce those limits locally; tests document that uploads still proceed before Discord/fake enforcement. |
+| Fixture contracts | Keychain fixture | Covered | `security find-generic-password -s "Claude Code-credentials" -w` records invocations and returns seeded OAuth keychain JSON without touching real Keychain. |
+| Fixture contracts | Route-based curl fixture | Covered | Records method, URL path, headers, body, JSON/raw response modes, Anthropic OAuth route guards, and blocked unapproved network targets. |
+| Claude usage | Live profile and usage success | Covered | Drives `scripts/claude-usage.sh` with fake OAuth profile/usage responses and fake `claude --version`. |
+| Claude usage | Missing auth | Covered | Missing Keychain credential gracefully skips profile/usage and records no curl requests. |
+| Claude usage | Malformed API responses | Covered | Invalid profile/usage JSON keeps current warning behavior without failing the report. |
+| Claude usage | Missing local stats | Covered | Missing `stats-cache.json` exits successfully after the documented historical-data skip warning. |
+| Claude usage | Local stats summaries | Covered | Fixture `stats-cache.json` covers lifetime totals, daily averages, this-week, this-month, monthly breakdown, busiest days, day-of-week distribution, and streaks. |
+| Claude usage | History and sessions | Covered | Fixture `history.jsonl` and session JSON files cover project counts, session listing, and corrupt session JSON tolerance. |
+| Claude usage | Relative date logic | Covered | Stats fixture around the current test date asserts last-seven-days inclusion and current/longest streak behavior. |
+| Usage loop template | Static safety boundary | Covered | `scripts/usage-report-loop.sh.example` uses placeholder channel/token values, fakeable `security`/`claude`/`curl`/`sleep` commands, and documented fixed `/tmp/usage_report_*` files. |
+| Usage loop template | Ignored live-loop execution | Deferred | The ignored `scripts/usage-report-loop.sh` is not copied into Test Workspaces and remains out of scope until a safe tracked executable exists. |

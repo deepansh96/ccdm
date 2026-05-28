@@ -47,6 +47,10 @@ The teardown manager exposes `registerTeardownCallback(fn)` and `cleanup()`. Cal
       "protocolEvents": [],
       "servers": {}
     },
+    "curl": {
+      "requests": [],
+      "routes": []
+    },
     "discord": {
       "attachmentFetches": [],
       "attachments": {},
@@ -75,6 +79,10 @@ The teardown manager exposes `registerTeardownCallback(fn)` and `cleanup()`. Cal
     "network": { "blocked": [] },
     "npm": { "invocations": [] },
     "processes": [],
+    "security": {
+      "credentials": {},
+      "invocations": []
+    },
     "registry": null,
     "tmux": { "sessions": {} }
   },
@@ -123,6 +131,14 @@ The Discord MCP JSON-RPC scenarios drive `scripts/discord-mcp-server.js` directl
 - Reply coverage includes empty text, missing files, reply references, upload success/failure, and the current behavior that advertised 10-file and 25MB limits are not locally enforced before upload.
 - Fetch/download coverage includes limit capping and bad negative limits, attachment default index, out-of-range and negative indexes, missing attachments, absolute save directories, filesystem writes, CDN failures, and blocked network egress.
 
+The Claude usage-report scenarios drive `scripts/claude-usage.sh` with fixture home data and local-fake external boundaries:
+
+- Fixture home data covers `~/.claude/stats-cache.json`, `history.jsonl`, and session JSON files. Scenarios assert lifetime totals, last-seven-days date logic, current/longest streaks, project history parsing, session listing, and corrupt session JSON tolerance.
+- The `security` fixture supports `find-generic-password -s "Claude Code-credentials" -w`, records invocations, and returns test-seeded OAuth keychain JSON. Missing credentials make the script exercise its current graceful no-auth path.
+- The `curl` fixture records method, URL, path, query, headers, and body under `$CCDM_TEST_STATE`, matches extensible route entries by method/hostname/path/url, supports JSON and raw-body response modes, and blocks unapproved targets as network egress.
+- OAuth profile and usage routes are faked through `https://api.anthropic.com/api/oauth/{profile,usage}`. Malformed API responses are covered as current graceful warning behavior.
+- The usage loop remains a static/template boundary: `scripts/usage-report-loop.sh.example` is checked for placeholder channel/token values, fakeable external commands, and hardcoded `/tmp/usage_report_*` files. Executing the ignored local live loop is deferred because it is not tracked in fresh clones and is intended for live posting.
+
 The stop/restart surfaces add these process-safety assumptions:
 
 - `scripts/stop-session.sh` is driven as a black-box script. Tests do not intercept shell builtin `kill`; safety comes from fake `ps` and `pgrep` exposing only real harness-owned placeholder PIDs.
@@ -136,7 +152,7 @@ Command results include command metadata, cwd, redacted environment, stdout, std
 
 ## Isolation
 
-Runtime guards fail on attempted access to the developer checkout registry, real `~/.claude`, real `~/.codex`, real tmux, real Keychain (`security`), and unapproved global temp files. Bridge scenarios also fail closed on unexpected Discord, CDN, `fetch`, `http`, `https`, and `net` egress. OAuth and richer upload routes are added by later slices when those fakes are introduced.
+Runtime guards fail on attempted access to the developer checkout registry, real `~/.claude`, real `~/.codex`, real tmux, real Keychain (`security`), and unapproved global temp files. Bridge scenarios also fail closed on unexpected Discord, CDN, `fetch`, `http`, `https`, and `net` egress. Usage-report scenarios additionally fail closed on unapproved `curl` targets, including missed OAuth routes.
 
 ## Live Gate
 

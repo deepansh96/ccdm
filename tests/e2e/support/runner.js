@@ -16,15 +16,34 @@ const FORBIDDEN_WORKSPACE_ARTIFACTS = [
   ".codex",
 ];
 
-const FIXTURE_TOOLS = new Set(["claude", "codex", "jq", "npm", "pgrep", "pkill", "ps", "sleep", "tmux", "whisper", "zsh"]);
+const FIXTURE_TOOLS = new Set([
+  "claude",
+  "codex",
+  "curl",
+  "jq",
+  "npm",
+  "pgrep",
+  "pkill",
+  "ps",
+  "security",
+  "sleep",
+  "tmux",
+  "whisper",
+  "zsh",
+]);
 const HOST_WRAPPERS = new Map([
   ["cat", "/bin/cat"],
   ["chmod", "/bin/chmod"],
+  ["date", "/bin/date"],
   ["dirname", "/usr/bin/dirname"],
   ["grep", null],
+  ["head", "/usr/bin/head"],
+  ["ls", "/bin/ls"],
   ["mkdir", "/bin/mkdir"],
   ["python3", null],
   ["sed", null],
+  ["tr", "/usr/bin/tr"],
+  ["wc", "/usr/bin/wc"],
 ]);
 
 function sourceRoot() {
@@ -121,6 +140,7 @@ function initialState() {
     diagnostics: { cleanupFailures: [], logs: [], protectedPathViolations: [] },
     fixtures: {
       claude: { invocations: [] },
+      curl: { requests: [], routes: [] },
       codex: { appServerInvocations: [], bridgeInvocations: [], protocolEvents: [], servers: {} },
       discord: {
         attachmentFetches: [],
@@ -151,6 +171,7 @@ function initialState() {
       npm: { invocations: [] },
       processes: [],
       registry: null,
+      security: { credentials: {}, invocations: [] },
       tmux: { sessions: {} },
     },
     snapshots: [],
@@ -168,6 +189,10 @@ function normalizeState(value) {
       ...base.fixtures,
       ...(value?.fixtures || {}),
       claude: { invocations: value?.fixtures?.claude?.invocations || [] },
+      curl: {
+        requests: value?.fixtures?.curl?.requests || [],
+        routes: value?.fixtures?.curl?.routes || [],
+      },
       codex: {
         appServerInvocations: value?.fixtures?.codex?.appServerInvocations || [],
         bridgeInvocations: value?.fixtures?.codex?.bridgeInvocations || [],
@@ -203,6 +228,10 @@ function normalizeState(value) {
       npm: { invocations: value?.fixtures?.npm?.invocations || [] },
       network: { blocked: value?.fixtures?.network?.blocked || [] },
       processes: value?.fixtures?.processes || [],
+      security: {
+        credentials: value?.fixtures?.security?.credentials || {},
+        invocations: value?.fixtures?.security?.invocations || [],
+      },
       tmux: { ...(value?.fixtures?.tmux || {}), sessions: value?.fixtures?.tmux?.sessions || {} },
     },
     snapshots: value?.snapshots || [],
@@ -594,6 +623,127 @@ function runNpm() {
   process.exit(42);
 }
 
+function parseCurlArgs() {
+  let method = "GET";
+  let explicitMethod = false;
+  let url = null;
+  const headers = {};
+  let body = "";
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "-s" || arg === "-S" || arg === "-f" || arg === "-L") {
+      continue;
+    }
+    if (arg === "-X" || arg === "--request") {
+      method = String(args[++index] || "").toUpperCase();
+      explicitMethod = true;
+      continue;
+    }
+    if (arg === "-H" || arg === "--header") {
+      const header = String(args[++index] || "");
+      const colon = header.indexOf(":");
+      if (colon !== -1) {
+        headers[header.slice(0, colon)] = header.slice(colon + 1).trimStart();
+      }
+      continue;
+    }
+    if (arg === "-d" || arg === "--data" || arg === "--data-raw" || arg === "--data-binary") {
+      const value = String(args[++index] || "");
+      if (value === "@-") {
+        body += fs.readFileSync(0, "utf8");
+      } else if (value.startsWith("@")) {
+        body += fs.readFileSync(value.slice(1), "utf8");
+      } else {
+        body += value;
+      }
+      if (!explicitMethod) {
+        method = "POST";
+      }
+      continue;
+    }
+    if (arg.startsWith("http://") || arg.startsWith("https://")) {
+      url = arg;
+      continue;
+    }
+    console.error("unsupported curl argument: " + arg);
+    process.exit(2);
+  }
+
+  if (!url) {
+    console.error("curl fixture requires an HTTP(S) URL");
+    process.exit(2);
+  }
+  const parsedUrl = new URL(url);
+  return { body, headers, method, parsedUrl };
+}
+
+function routeMatches(route, request) {
+  if (route.method && String(route.method).toUpperCase() !== request.method) return false;
+  if (route.hostname && route.hostname !== request.parsedUrl.hostname) return false;
+  if (route.path && route.path !== request.parsedUrl.pathname) return false;
+  if (route.url && route.url !== request.parsedUrl.href) return false;
+  return true;
+}
+
+function runCurl() {
+  const request = parseCurlArgs();
+  const state = readState();
+  const route = (state.fixtures.curl.routes || []).find((candidate) => routeMatches(candidate, request));
+  updateState((nextState) => {
+    nextState.fixtures.curl.requests.push({
+      body: request.body,
+      headers: request.headers,
+      hostname: request.parsedUrl.hostname,
+      method: request.method,
+      path: request.parsedUrl.pathname,
+      query: request.parsedUrl.search,
+      url: request.parsedUrl.href,
+    });
+    return nextState;
+  });
+
+  if (!route) {
+    updateState((nextState) => {
+      nextState.fixtures.network.blocked.push({
+        kind: "curl",
+        target: request.parsedUrl.href,
+      });
+      return nextState;
+    });
+    console.error("blocked unapproved curl target: " + request.parsedUrl.href);
+    process.exit(43);
+  }
+
+  if (route.stderr) {
+    process.stderr.write(String(route.stderr));
+  }
+  if (route.json !== undefined) {
+    process.stdout.write(JSON.stringify(route.json));
+  } else if (route.body !== undefined) {
+    process.stdout.write(String(route.body));
+  }
+  process.exit(route.exitCode ?? 0);
+}
+
+function runSecurity() {
+  if (args[0] !== "find-generic-password" || args[1] !== "-s" || !args[2] || args[3] !== "-w" || args.length !== 4) {
+    console.error("unsupported security invocation");
+    process.exit(2);
+  }
+  const service = args[2];
+  const state = readState();
+  updateState((nextState) => {
+    nextState.fixtures.security.invocations.push({ args, service });
+    return nextState;
+  });
+  const credential = state.fixtures.security.credentials?.[service];
+  if (!credential) {
+    process.exit(44);
+  }
+  process.stdout.write(JSON.stringify(credential));
+}
+
 function runCodex() {
   const listenIndex = args.indexOf("--listen");
   if (args[0] !== "app-server" || listenIndex === -1 || !args[listenIndex + 1]) {
@@ -650,8 +800,14 @@ switch (tool) {
   case "codex":
     runCodex();
     break;
+  case "curl":
+    runCurl();
+    break;
   case "npm":
     runNpm();
+    break;
+  case "security":
+    runSecurity();
     break;
   case "jq":
   case "whisper":
