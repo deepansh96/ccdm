@@ -78,6 +78,7 @@ The teardown manager exposes `registerTeardownCallback(fn)` and `cleanup()`. Cal
     },
     "network": { "blocked": [] },
     "npm": { "invocations": [] },
+    "npx": { "invocations": [] },
     "processes": [],
     "security": {
       "credentials": {},
@@ -139,12 +140,22 @@ The Claude usage-report scenarios drive `scripts/claude-usage.sh` with fixture h
 - OAuth profile and usage routes are faked through `https://api.anthropic.com/api/oauth/{profile,usage}`. Malformed API responses are covered as current graceful warning behavior.
 - The usage loop remains a static/template boundary: `scripts/usage-report-loop.sh.example` is checked for placeholder channel/token values, fakeable external commands, and hardcoded `/tmp/usage_report_*` files. Executing the ignored local live loop is deferred because it is not tracked in fresh clones and is intended for live posting.
 
+The nickname/statusline scenarios drive `scripts/cc-discord-nicknames.sh`, `scripts/cc-statusline-wrapper.sh`, and their shared `_update-nickname.sh` helper:
+
+- Project sessions read the fixture root bot token from fixture `HOME/.claude/channels/discord/.env`, resolve the project bot app id through the fixture registry, and send `PATCH /api/v10/guilds/:guild/members/:appId` through the shell-level fake `curl`.
+- Root-like sessions whose state dir has no registry app id send `PATCH /api/v10/guilds/:guild/members/@me` with the session bot token. Scripted fake-curl failures are recorded without making the wrapper fail, matching the current background-subshell behavior.
+- Skip scenarios cover `DISABLE_DISCORD_MESSAGE=true`, missing `DISCORD_STATE_DIR`, and missing `context_window.used_percentage`.
+- Rate-limit scenarios use unique fixture Discord state directory basenames so the production hardcoded `/tmp/cc-context-<state>` files do not collide across tests. The files are cleaned up explicitly after each scenario because this path is not redirected by fixture `TMPDIR`.
+- `cc-statusline-wrapper.sh` pipes stdin JSON to the `npx` fixture as `npx -y ccstatusline@latest`; the fixture returns deterministic output and blocks unapproved package execution without npm network access.
+- Shell-level fake `curl` routing is separate from JS-level Discord interception: these shell scripts use the fixture binary on `PATH`, while bridge and MCP tests route Discord REST and gateway behavior through the child-scoped preload and JavaScript shims.
+
 The stop/restart surfaces add these process-safety assumptions:
 
 - `scripts/stop-session.sh` is driven as a black-box script. Tests do not intercept shell builtin `kill`; safety comes from fake `ps` and `pgrep` exposing only real harness-owned placeholder PIDs.
 - Stop scenarios cover Claude and Codex happy paths, recorded-PID ownership skips, already-stopped projects, orphan listener sweeps, SIGTERM-resistant child fallback to SIGKILL, missing Codex sweep fields, and registry cleanup.
 - `restart-root-agent.sh` is exercised against fixture `root_agent` tmux state, including pane PID lookup, `pkill`, retry after a failed `kill-session`, fresh launch, fast background sleep, trust-dialog `send-keys`, launch failure diagnostics, and teardown failure diagnostics.
 - Signal ordering is asserted by observable outcomes: owned processes are gone after stop/restart. Exact shell builtin `kill -TERM` versus `kill -KILL` call ordering is intentionally not intercepted in the black-box harness.
+- General command teardown also sweeps detached process groups created by `runScript()` and waits up to 5 seconds after SIGTERM before SIGKILL, which covers background shell/curl/sleep/npx work left by statusline and restart-style scripts.
 
 ## Diagnostics
 

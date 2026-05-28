@@ -70,6 +70,9 @@ function initialState() {
       npm: {
         invocations: [],
       },
+      npx: {
+        invocations: [],
+      },
       processes: [],
       registry: null,
       security: {
@@ -138,6 +141,9 @@ function normalizeState(value) {
       },
       npm: {
         invocations: value?.fixtures?.npm?.invocations ?? [],
+      },
+      npx: {
+        invocations: value?.fixtures?.npx?.invocations ?? [],
       },
       security: {
         credentials: value?.fixtures?.security?.credentials ?? {},

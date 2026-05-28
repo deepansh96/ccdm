@@ -22,6 +22,7 @@ const FIXTURE_TOOLS = new Set([
   "curl",
   "jq",
   "npm",
+  "npx",
   "pgrep",
   "pkill",
   "ps",
@@ -32,8 +33,10 @@ const FIXTURE_TOOLS = new Set([
   "zsh",
 ]);
 const HOST_WRAPPERS = new Map([
+  ["basename", "/usr/bin/basename"],
   ["cat", "/bin/cat"],
   ["chmod", "/bin/chmod"],
+  ["cut", "/usr/bin/cut"],
   ["date", "/bin/date"],
   ["dirname", "/usr/bin/dirname"],
   ["grep", null],
@@ -169,6 +172,7 @@ function initialState() {
       },
       network: { blocked: [] },
       npm: { invocations: [] },
+      npx: { invocations: [] },
       processes: [],
       registry: null,
       security: { credentials: {}, invocations: [] },
@@ -226,6 +230,7 @@ function normalizeState(value) {
         uploads: value?.fixtures?.discord?.uploads || [],
       },
       npm: { invocations: value?.fixtures?.npm?.invocations || [] },
+      npx: { invocations: value?.fixtures?.npx?.invocations || [] },
       network: { blocked: value?.fixtures?.network?.blocked || [] },
       processes: value?.fixtures?.processes || [],
       security: {
@@ -623,6 +628,74 @@ function runNpm() {
   process.exit(42);
 }
 
+function runNpx() {
+  updateState((state) => {
+    state.fixtures.npx.invocations.push({
+      args,
+      cwd: process.cwd(),
+      input: fs.readFileSync(0, "utf8"),
+    });
+    return state;
+  });
+  if (args.length === 2 && args[0] === "-y" && args[1] === "ccstatusline@latest") {
+    console.log("ccstatusline fixture output");
+    return;
+  }
+  console.error("npx fixture blocks unapproved package execution during E2E scenarios");
+  process.exit(42);
+}
+
+function readJsonForJq() {
+  const expression = args.includes("-r") ? args[args.indexOf("-r") + 1] : args[0];
+  const file = args.at(-1) !== expression && !String(args.at(-1)).startsWith("-") ? args.at(-1) : null;
+  const input = file ? fs.readFileSync(file, "utf8") : fs.readFileSync(0, "utf8");
+  return { expression, json: JSON.parse(input) };
+}
+
+function printJqValue(value) {
+  if (value === undefined || value === null) return;
+  if (typeof value === "object") {
+    process.stdout.write(JSON.stringify(value) + "\\n");
+  } else {
+    process.stdout.write(String(value) + "\\n");
+  }
+}
+
+function runJq() {
+  let expression;
+  let json;
+  try {
+    ({ expression, json } = readJsonForJq());
+  } catch (error) {
+    console.error(error.message);
+    process.exit(4);
+  }
+
+  if (expression === ".context_window.used_percentage // empty") {
+    printJqValue(json.context_window?.used_percentage);
+    return;
+  }
+  if (expression === ".guild_id") {
+    printJqValue(json.guild_id);
+    return;
+  }
+  const poolMatch = /^\\.pool\\[\\] \\| select\\(\\.state_dir \\| endswith\\("([^"]+)"\\)\\) \\| \\.(app_id|id|assigned_to)$/.exec(
+    expression,
+  );
+  if (poolMatch) {
+    const [, suffix, field] = poolMatch;
+    printJqValue(json.pool?.find((entry) => String(entry.state_dir || "").endsWith(suffix))?.[field]);
+    return;
+  }
+  const projectTypeMatch = /^\\.projects\\["([^"]+)"\\]\\.type \\/\\/ "claude"$/.exec(expression);
+  if (projectTypeMatch) {
+    printJqValue(json.projects?.[projectTypeMatch[1]]?.type ?? "claude");
+    return;
+  }
+  console.error("unsupported jq expression: " + expression);
+  process.exit(2);
+}
+
 function parseCurlArgs() {
   let method = "GET";
   let explicitMethod = false;
@@ -690,8 +763,12 @@ function runCurl() {
   const request = parseCurlArgs();
   const state = readState();
   const route = (state.fixtures.curl.routes || []).find((candidate) => routeMatches(candidate, request));
+  const isDiscordNicknamePatch =
+    request.method === "PATCH" &&
+    request.parsedUrl.hostname === "discord.com" &&
+    /^\\/api\\/v10\\/guilds\\/[^/]+\\/members\\/[^/]+$/.test(request.parsedUrl.pathname);
   updateState((nextState) => {
-    nextState.fixtures.curl.requests.push({
+    const recordedRequest = {
       body: request.body,
       headers: request.headers,
       hostname: request.parsedUrl.hostname,
@@ -699,7 +776,14 @@ function runCurl() {
       path: request.parsedUrl.pathname,
       query: request.parsedUrl.search,
       url: request.parsedUrl.href,
-    });
+    };
+    nextState.fixtures.curl.requests.push(recordedRequest);
+    if (isDiscordNicknamePatch) {
+      nextState.fixtures.discord.nicknamePatches.push({
+        ...recordedRequest,
+        exitCode: route?.exitCode ?? 0,
+      });
+    }
     return nextState;
   });
 
@@ -806,10 +890,15 @@ switch (tool) {
   case "npm":
     runNpm();
     break;
+  case "npx":
+    runNpx();
+    break;
+  case "jq":
+    runJq();
+    break;
   case "security":
     runSecurity();
     break;
-  case "jq":
   case "whisper":
   case "zsh":
     process.exit(0);
@@ -873,6 +962,56 @@ function nodePath(root) {
   return path.join(root, "node_modules");
 }
 
+function processGroupExists(pid) {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForProcessGroupExit(pid, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!processGroupExists(pid)) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return !processGroupExists(pid);
+}
+
+async function terminateProcessGroup(pid, timeoutMs = 5000) {
+  if (!Number.isInteger(pid)) {
+    return;
+  }
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    // The process group may already be gone.
+  }
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    // The process may already be gone.
+  }
+  if (await waitForProcessGroupExit(pid, timeoutMs)) {
+    return;
+  }
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    // The process group may already be gone.
+  }
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // The process may already be gone.
+  }
+  await waitForProcessGroupExit(pid, 1000);
+}
+
 export const createWorkspace = Object.freeze(function createWorkspace(options = {}) {
   const root = sourceRoot();
   const files = gitTrackedFiles(root);
@@ -912,21 +1051,12 @@ export const createWorkspace = Object.freeze(function createWorkspace(options = 
     tmpRoot,
   });
 
-  registerTeardownCallback(() => {
+  registerTeardownCallback(async () => {
     try {
       const state = readState(stateDir);
       for (const row of state.fixtures.processes ?? []) {
         if (row?.owned === true && row.ownerStateDir === stateDir && Number.isInteger(row.pid)) {
-          try {
-            process.kill(-row.pid, "SIGTERM");
-          } catch {
-            // The process group may already be gone.
-          }
-          try {
-            process.kill(row.pid, "SIGTERM");
-          } catch {
-            // The process may already be gone.
-          }
+          await terminateProcessGroup(row.pid, 5000);
         }
       }
     } catch {
@@ -955,6 +1085,9 @@ function runProcess(workspace, command, args, options = {}) {
     detached: true,
     env,
     stdio: ["pipe", "pipe", "pipe"],
+  });
+  registerTeardownCallback(async () => {
+    await terminateProcessGroup(child.pid, 5000);
   });
   if (options.input) {
     child.stdin.end(options.input);
