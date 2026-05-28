@@ -29,6 +29,13 @@ function initialState() {
       claude: {
         invocations: [],
       },
+      codex: {
+        appServerInvocations: [],
+        bridgeInvocations: [],
+      },
+      npm: {
+        invocations: [],
+      },
       processes: [],
       registry: null,
       tmux: {
@@ -54,6 +61,13 @@ function normalizeState(value) {
       ...(value?.fixtures ?? {}),
       claude: {
         invocations: value?.fixtures?.claude?.invocations ?? [],
+      },
+      codex: {
+        appServerInvocations: value?.fixtures?.codex?.appServerInvocations ?? [],
+        bridgeInvocations: value?.fixtures?.codex?.bridgeInvocations ?? [],
+      },
+      npm: {
+        invocations: value?.fixtures?.npm?.invocations ?? [],
       },
       tmux: {
         sessions: value?.fixtures?.tmux?.sessions ?? {},

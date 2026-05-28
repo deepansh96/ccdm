@@ -41,6 +41,11 @@ The teardown manager exposes `registerTeardownCallback(fn)` and `cleanup()`. Cal
     "protectedPathViolations": []
   },
   "fixtures": {
+    "codex": {
+      "appServerInvocations": [],
+      "bridgeInvocations": []
+    },
+    "npm": { "invocations": [] },
     "processes": [],
     "registry": null,
     "tmux": { "sessions": {} }
@@ -62,6 +67,13 @@ The tmux/process fixture contract covers the Claude start surface:
 - `tmux capture-pane` returns recorded pane output, and `tmux send-keys` is recorded so tests can assert the current start surface does not send trust-dialog keys.
 - `ps axeww -o pid=,command=` and `pgrep -P <pid>` expose only rows owned by the current `$CCDM_TEST_STATE`; fabricated or foreign PID rows in fixture state are omitted.
 - The Claude fixture supports `claude --version`, validates `--channels plugin:discord...` listener invocations, records the invocation, and writes fixture session metadata under fixture `HOME/.claude/sessions`.
+
+The same tmux/process contract covers the Codex startup surface:
+
+- `tmux new-session -d -s <name> -- zsh -ic <command>` validates the bridge launch shape and records `BOT_TOKEN`, `CHANNEL_ID`, `PROJECT_DIR`, `WS_PORT`, `ALLOWED_USER_ID`, `GUILD_ID`, `ROOT_BOT_TOKEN`, `BOT_APP_ID`, and `BOT_DISPLAY_NAME`.
+- Codex startup tests seed registries with `type: "codex"`, `ws_port`, placeholder bot tokens, app IDs, channel IDs, Discord user/guild values, and the current `bot1` root-token invariant.
+- The fixture records only the bridge command construction. App-server spawning and WebSocket protocol behavior belong to later Codex bridge scenarios.
+- The `npm` fixture fails closed and records invocations so startup scenarios can prove Test Workspaces do not run package installation or contact npm.
 
 ## Diagnostics
 

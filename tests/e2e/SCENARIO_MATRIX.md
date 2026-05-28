@@ -33,5 +33,18 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Claude start | Missing bot | Covered | Documents current executable `StopIteration` failure behavior. |
 | Claude start | Multiple-project non-interference | Covered | Starting one project leaves other project PID/session fields and tmux sessions untouched. |
 | Claude start | CLAUDE.md pre-trust/send-key boundary | Covered | `start-session.sh` does not write `.claude.json` or send trust-dialog Enter; that remains manual documented workflow. |
+| Codex start | Registry fixture schema | Covered | Codex registries include Discord user/guild values, placeholder bot tokens, app IDs, channel IDs, `type: "codex"`, screen names, `ws_port`, and the current `bot1` root-token invariant. |
+| Codex start | Successful bridge launch | Covered | Drives `scripts/start-codex-session.sh`, builds the bridge tmux command, records the bridge PID, and leaves app-server spawning to bridge slices. |
+| Codex start | Stale MCP cleanup | Covered | Removes stale `~/.codex/config.toml` `discord-*` MCP blocks while preserving unrelated MCP config. |
+| Codex start | Bridge environment construction | Covered | Asserts `BOT_TOKEN`, `CHANNEL_ID`, `PROJECT_DIR`, `WS_PORT`, `ALLOWED_USER_ID`, `GUILD_ID`, `ROOT_BOT_TOKEN`, `BOT_APP_ID`, and `BOT_DISPLAY_NAME` from registry fields. |
+| Codex start | Paths with spaces/quotes | Covered | Project paths with spaces and double quotes are captured through `PROJECT_DIR`. |
+| Codex start | Already-running tmux guard | Covered | Existing target tmux session exits successfully without launching another bridge. |
+| Codex start | Duplicate bridge/app-server guard | Covered | Fixture `ps` rows for matching bridge channel/app ID or app-server port fail before creating the target tmux session. |
+| Codex start | Missing project | Covered | Documents current executable `KeyError` failure behavior. |
+| Codex start | Malformed registry | Covered | Documents current executable JSON parse failure behavior. |
+| Codex start | Missing bot | Covered | Documents current executable `StopIteration` failure behavior. |
+| Codex start | Missing `bot1` | Covered | Documents current hardcoded root-token invariant as `StopIteration` failure behavior. |
+| Codex start | Duplicate channels/ports | Covered | Documents current behavior: duplicate registry channel/port rows do not block startup unless a matching process exists. |
+| Codex start | No package install in Test Workspace | Covered | A fail-closed `npm` fixture plus pre/post workspace inventory proves startup does not run `npm ci` or contact npm. |
 | Live smoke | Default skip | Covered | Skips unless `CCDM_LIVE_E2E=1` and documented secrets are set. |
 | Discord/Codex/curl/npx fakes | Full behavior | Deferred | Later issue #4 slices introduce those executable-surface fakes. |

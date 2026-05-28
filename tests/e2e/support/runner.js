@@ -16,7 +16,7 @@ const FORBIDDEN_WORKSPACE_ARTIFACTS = [
   ".codex",
 ];
 
-const FIXTURE_TOOLS = new Set(["claude", "jq", "pgrep", "ps", "tmux", "whisper", "zsh"]);
+const FIXTURE_TOOLS = new Set(["claude", "jq", "npm", "pgrep", "ps", "tmux", "whisper", "zsh"]);
 const HOST_WRAPPERS = new Map([
   ["cat", "/bin/cat"],
   ["chmod", "/bin/chmod"],
@@ -120,6 +120,8 @@ function initialState() {
     diagnostics: { cleanupFailures: [], logs: [], protectedPathViolations: [] },
     fixtures: {
       claude: { invocations: [] },
+      codex: { appServerInvocations: [], bridgeInvocations: [] },
+      npm: { invocations: [] },
       processes: [],
       registry: null,
       tmux: { sessions: {} },
@@ -139,6 +141,11 @@ function normalizeState(value) {
       ...base.fixtures,
       ...(value?.fixtures || {}),
       claude: { invocations: value?.fixtures?.claude?.invocations || [] },
+      codex: {
+        appServerInvocations: value?.fixtures?.codex?.appServerInvocations || [],
+        bridgeInvocations: value?.fixtures?.codex?.bridgeInvocations || [],
+      },
+      npm: { invocations: value?.fixtures?.npm?.invocations || [] },
       processes: value?.fixtures?.processes || [],
       tmux: { sessions: value?.fixtures?.tmux?.sessions || {} },
     },
@@ -215,6 +222,47 @@ function parseClaudeLaunch(shellCommand) {
   };
 }
 
+function parseCodexBridgeLaunch(shellCommand) {
+  const match = /^cd '([^']*)' && ([\\s\\S]+) node scripts\\/codex-bridge\\.js$/.exec(shellCommand);
+  if (!match) {
+    throw new Error(\`unsupported tmux launch command: \${shellCommand}\`);
+  }
+  const env = {};
+  const envText = match[2];
+  const envRe = /([A-Z_]+)='([^']*)'/g;
+  for (const envMatch of envText.matchAll(envRe)) {
+    env[envMatch[1]] = envMatch[2];
+  }
+  const required = [
+    "BOT_TOKEN",
+    "CHANNEL_ID",
+    "PROJECT_DIR",
+    "WS_PORT",
+    "ALLOWED_USER_ID",
+    "GUILD_ID",
+    "ROOT_BOT_TOKEN",
+    "BOT_APP_ID",
+    "BOT_DISPLAY_NAME",
+  ];
+  for (const name of required) {
+    if (!env[name]) {
+      throw new Error(\`\${name} is required for Codex bridge launch\`);
+    }
+  }
+  return {
+    cwd: match[1],
+    env,
+    bridgeCommand: "node scripts/codex-bridge.js",
+  };
+}
+
+function parseTmuxLaunch(shellCommand) {
+  if (shellCommand.endsWith(" node scripts/codex-bridge.js")) {
+    return { kind: "codex-bridge", ...parseCodexBridgeLaunch(shellCommand) };
+  }
+  return { kind: "claude-listener", ...parseClaudeLaunch(shellCommand) };
+}
+
 function validateClaudeInvocation(claudeArgs, env) {
   const channelsIndex = claudeArgs.indexOf("--channels");
   if (channelsIndex === -1 || !claudeArgs[channelsIndex + 1]?.startsWith("plugin:discord")) {
@@ -231,6 +279,13 @@ function validateClaudeInvocation(claudeArgs, env) {
 function recordClaudeInvocation(invocation) {
   updateState((state) => {
     state.fixtures.claude.invocations.push(invocation);
+    return state;
+  });
+}
+
+function recordCodexBridgeInvocation(invocation) {
+  updateState((state) => {
+    state.fixtures.codex.bridgeInvocations.push(invocation);
     return state;
   });
 }
@@ -263,10 +318,17 @@ function runTmux() {
       process.exit(2);
     }
     const shellCommand = command[2];
-    const launch = parseClaudeLaunch(shellCommand);
+    const launch = parseTmuxLaunch(shellCommand);
     const pid = spawnPlaceholder();
     const sessionId = \`fixture-session-\${pid}\`;
-    const processCommand = \`claude \${launch.claudeArgs.join(" ")} DISCORD_STATE_DIR='\${launch.env.DISCORD_STATE_DIR}'\`;
+    const processCommand =
+      launch.kind === "codex-bridge"
+        ? \`node scripts/codex-bridge.js CHANNEL_ID='\${launch.env.CHANNEL_ID}' BOT_APP_ID='\${launch.env.BOT_APP_ID}' WS_PORT='\${launch.env.WS_PORT}'\`
+        : \`claude \${launch.claudeArgs.join(" ")} DISCORD_STATE_DIR='\${launch.env.DISCORD_STATE_DIR}'\`;
+    const paneOutput =
+      launch.kind === "codex-bridge"
+        ? "Codex-Discord bridge running\\nListening in #channel-id\\n"
+        : "Listening for channel messages\\n";
 
     updateState((state) => {
       if (state.fixtures.tmux.sessions[name]) {
@@ -277,13 +339,14 @@ function runTmux() {
         command,
         cwd: launch.cwd,
         env: launch.env,
-        paneOutput: "Listening for channel messages\\n",
+        bridgeCommand: launch.bridgeCommand,
+        paneOutput,
         pid,
         shellCommand,
       };
       state.fixtures.processes.push({
         command: processCommand,
-        kind: "claude-listener",
+        kind: launch.kind,
         owned: true,
         ownerStateDir: stateDir,
         pid,
@@ -291,14 +354,23 @@ function runTmux() {
       });
       return state;
     });
-    recordClaudeInvocation({
-      args: launch.claudeArgs,
-      cwd: launch.cwd,
-      env: launch.env,
-      pid,
-      sessionId,
-    });
-    writeClaudeSession(pid, sessionId);
+    if (launch.kind === "codex-bridge") {
+      recordCodexBridgeInvocation({
+        command: launch.bridgeCommand,
+        cwd: launch.cwd,
+        env: launch.env,
+        pid,
+      });
+    } else {
+      recordClaudeInvocation({
+        args: launch.claudeArgs,
+        cwd: launch.cwd,
+        env: launch.env,
+        pid,
+        sessionId,
+      });
+      writeClaudeSession(pid, sessionId);
+    }
     process.exit(0);
   }
 
@@ -375,6 +447,18 @@ function runClaude() {
   writeClaudeSession(process.pid, sessionId);
 }
 
+function runNpm() {
+  updateState((state) => {
+    state.fixtures.npm.invocations.push({
+      args,
+      cwd: process.cwd(),
+    });
+    return state;
+  });
+  console.error("npm fixture blocks package-manager execution during E2E scenarios");
+  process.exit(42);
+}
+
 switch (tool) {
   case "tmux":
     runTmux();
@@ -387,6 +471,9 @@ switch (tool) {
     break;
   case "claude":
     runClaude();
+    break;
+  case "npm":
+    runNpm();
     break;
   case "jq":
   case "whisper":
