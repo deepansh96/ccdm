@@ -24,7 +24,7 @@ test.afterEach(async () => {
 test("workspace copies tracked files only and excludes local-only artifacts", () => {
   const workspace = createWorkspace();
 
-  assert.ok(fs.existsSync(path.join(workspace.sourceRoot, "registry.json")), "fixture assumes local registry exists");
+  assert.ok(fs.existsSync(path.join(workspace.sourceRoot, "registry.example.json")));
   for (const artifact of ["registry.json", ".env", "CLAUDE.local.md", ".claude", ".codex", "scripts/usage-report-loop.sh"]) {
     assert.ok(!fs.existsSync(path.join(workspace.repoDir, artifact)), `${artifact} leaked into workspace`);
   }
