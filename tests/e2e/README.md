@@ -66,6 +66,8 @@ The tmux/process fixture contract covers the Claude start surface:
 - `tmux new-session -d -s <name> -- zsh -ic <command>` validates the Claude Discord launch shape, records the session command, cwd, environment, pane output, and a harness-owned placeholder PID.
 - `tmux capture-pane` returns recorded pane output, and `tmux send-keys` is recorded so tests can assert the current start surface does not send trust-dialog keys.
 - `ps axeww -o pid=,command=` and `pgrep -P <pid>` expose only rows owned by the current `$CCDM_TEST_STATE`; fabricated or foreign PID rows in fixture state are omitted.
+- `pkill -TERM -P <pid>` sends SIGTERM only to harness-owned child rows exposed by the same process model.
+- `sleep` is a fixture-mode no-op linked to the host `true` binary so background restart paths such as `sleep 8 && tmux send-keys` complete without waiting.
 - The Claude fixture supports `claude --version`, validates `--channels plugin:discord...` listener invocations, records the invocation, and writes fixture session metadata under fixture `HOME/.claude/sessions`.
 
 The same tmux/process contract covers the Codex startup surface:
@@ -74,6 +76,13 @@ The same tmux/process contract covers the Codex startup surface:
 - Codex startup tests seed registries with `type: "codex"`, `ws_port`, placeholder bot tokens, app IDs, channel IDs, Discord user/guild values, and the current `bot1` root-token invariant.
 - The fixture records only the bridge command construction. App-server spawning and WebSocket protocol behavior belong to later Codex bridge scenarios.
 - The `npm` fixture fails closed and records invocations so startup scenarios can prove Test Workspaces do not run package installation or contact npm.
+
+The stop/restart surfaces add these process-safety assumptions:
+
+- `scripts/stop-session.sh` is driven as a black-box script. Tests do not intercept shell builtin `kill`; safety comes from fake `ps` and `pgrep` exposing only real harness-owned placeholder PIDs.
+- Stop scenarios cover Claude and Codex happy paths, recorded-PID ownership skips, already-stopped projects, orphan listener sweeps, SIGTERM-resistant child fallback to SIGKILL, missing Codex sweep fields, and registry cleanup.
+- `restart-root-agent.sh` is exercised against fixture `root_agent` tmux state, including pane PID lookup, `pkill`, retry after a failed `kill-session`, fresh launch, fast background sleep, trust-dialog `send-keys`, launch failure diagnostics, and teardown failure diagnostics.
+- Signal ordering is asserted by observable outcomes: owned processes are gone after stop/restart. Exact shell builtin `kill -TERM` versus `kill -KILL` call ordering is intentionally not intercepted in the black-box harness.
 
 ## Diagnostics
 

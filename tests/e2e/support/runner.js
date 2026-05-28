@@ -16,11 +16,12 @@ const FORBIDDEN_WORKSPACE_ARTIFACTS = [
   ".codex",
 ];
 
-const FIXTURE_TOOLS = new Set(["claude", "jq", "npm", "pgrep", "ps", "tmux", "whisper", "zsh"]);
+const FIXTURE_TOOLS = new Set(["claude", "jq", "npm", "pgrep", "pkill", "ps", "sleep", "tmux", "whisper", "zsh"]);
 const HOST_WRAPPERS = new Map([
   ["cat", "/bin/cat"],
   ["chmod", "/bin/chmod"],
   ["dirname", "/usr/bin/dirname"],
+  ["grep", null],
   ["mkdir", "/bin/mkdir"],
   ["python3", null],
   ["sed", null],
@@ -147,7 +148,7 @@ function normalizeState(value) {
       },
       npm: { invocations: value?.fixtures?.npm?.invocations || [] },
       processes: value?.fixtures?.processes || [],
-      tmux: { sessions: value?.fixtures?.tmux?.sessions || {} },
+      tmux: { ...(value?.fixtures?.tmux || {}), sessions: value?.fixtures?.tmux?.sessions || {} },
     },
     snapshots: value?.snapshots || [],
   };
@@ -209,7 +210,9 @@ function spawnPlaceholder() {
 }
 
 function parseClaudeLaunch(shellCommand) {
-  const match = /^cd '([\\s\\S]*)' && DISCORD_STATE_DIR='([\\s\\S]*)' claude ([\\s\\S]+)$/.exec(shellCommand);
+  const match =
+    /^cd '([\\s\\S]*)' && DISCORD_STATE_DIR='([\\s\\S]*)' claude ([\\s\\S]+)$/.exec(shellCommand) ||
+    /^cd ([^&]+) && DISCORD_STATE_DIR=([^\\s]+) claude ([\\s\\S]+)$/.exec(shellCommand);
   if (!match) {
     throw new Error(\`unsupported tmux launch command: \${shellCommand}\`);
   }
@@ -318,6 +321,22 @@ function runTmux() {
       process.exit(2);
     }
     const shellCommand = command[2];
+    const tmuxState = readState().fixtures.tmux;
+    const preexistingSession = tmuxState.sessions[name];
+    if (tmuxState.newSessionFailures?.[name]) {
+      updateState((state) => {
+        state.fixtures.tmux.newSessionFailures[name] -= 1;
+        return state;
+      });
+      console.error("fixture tmux new-session failure");
+      process.exit(1);
+    }
+    if (preexistingSession?.newSessionStatus) {
+      console.error("fixture tmux new-session failure");
+      process.exit(preexistingSession.newSessionStatus);
+    }
+    const priorKillAttempts =
+      tmuxState.lastKilledSessions?.[name]?.killAttempts ?? preexistingSession?.killAttempts ?? 0;
     const launch = parseTmuxLaunch(shellCommand);
     const pid = spawnPlaceholder();
     const sessionId = \`fixture-session-\${pid}\`;
@@ -332,7 +351,10 @@ function runTmux() {
 
     updateState((state) => {
       if (state.fixtures.tmux.sessions[name]) {
-        throw new Error(\`duplicate tmux session: \${name}\`);
+        const existing = state.fixtures.tmux.sessions[name];
+        if (existing.killFailuresRemaining || existing.newSessionStatus) {
+          throw new Error(\`duplicate tmux session: \${name}\`);
+        }
       }
       state.fixtures.tmux.sessions[name] = {
         name,
@@ -342,6 +364,7 @@ function runTmux() {
         bridgeCommand: launch.bridgeCommand,
         paneOutput,
         pid,
+        killAttempts: priorKillAttempts,
         shellCommand,
       };
       state.fixtures.processes.push({
@@ -372,6 +395,46 @@ function runTmux() {
       writeClaudeSession(pid, sessionId);
     }
     process.exit(0);
+  }
+
+  if (subcommand === "kill-session") {
+    const targetIndex = args.indexOf("-t");
+    const name = normalizeSessionTarget(args[targetIndex + 1]);
+    const state = readState();
+    const session = state.fixtures.tmux.sessions[name];
+    if (!session) {
+      process.exit(1);
+    }
+    updateState((nextState) => {
+      const nextSession = nextState.fixtures.tmux.sessions[name];
+      nextSession.killAttempts = (nextSession.killAttempts || 0) + 1;
+      if (nextSession.killFailuresRemaining > 0) {
+        nextSession.killFailuresRemaining -= 1;
+      } else {
+        nextState.fixtures.tmux.lastKilledSessions = {
+          ...(nextState.fixtures.tmux.lastKilledSessions || {}),
+          [name]: { killAttempts: nextSession.killAttempts },
+        };
+        delete nextState.fixtures.tmux.sessions[name];
+      }
+      return nextState;
+    });
+    process.exit(session.killFailuresRemaining > 0 ? 1 : 0);
+  }
+
+  if (subcommand === "display-message") {
+    const targetIndex = args.indexOf("-t");
+    const name = normalizeSessionTarget(args[targetIndex + 1]);
+    const session = readState().fixtures.tmux.sessions[name];
+    if (!session) {
+      process.exit(1);
+    }
+    if (args.includes("#{pane_pid}")) {
+      process.stdout.write(session.panePid ? \`\${session.panePid}\\n\` : "");
+      process.exit(0);
+    }
+    console.error(\`unsupported tmux display-message format: \${args.join(" ")}\`);
+    process.exit(2);
   }
 
   if (subcommand === "capture-pane") {
@@ -425,6 +488,23 @@ function runPgrep() {
   process.exit(rows.length > 0 ? 0 : 1);
 }
 
+function runPkill() {
+  if (args[0] !== "-TERM" || args[1] !== "-P" || !args[2] || args.length !== 3) {
+    console.error("unsupported pkill invocation");
+    process.exit(2);
+  }
+  const parentPid = Number(args[2]);
+  const rows = activeOwnedProcesses(readState()).filter((row) => row.ppid === parentPid);
+  for (const row of rows) {
+    try {
+      process.kill(row.pid, "SIGTERM");
+    } catch {
+      // The process may have already exited.
+    }
+  }
+  process.exit(rows.length > 0 ? 0 : 1);
+}
+
 function runClaude() {
   if (args.length === 1 && args[0] === "--version") {
     console.log("Claude Code fixture 1.0.0");
@@ -468,6 +548,9 @@ switch (tool) {
     break;
   case "pgrep":
     runPgrep();
+    break;
+  case "pkill":
+    runPkill();
     break;
   case "claude":
     runClaude();
@@ -517,7 +600,15 @@ function createFixtures(fixtureDir, options = {}) {
   const exclude = new Set(options.excludeFixtures ?? []);
   for (const tool of FIXTURE_TOOLS) {
     if (!exclude.has(tool)) {
-      createFixtureBin(fixtureDir, runtime, tool);
+      if (tool === "sleep") {
+        const truePath = ["/usr/bin/true", "/bin/true"].find((candidate) => fs.existsSync(candidate));
+        if (!truePath) {
+          throw new Error("Unable to create sleep fixture: true binary not found");
+        }
+        fs.symlinkSync(truePath, path.join(fixtureDir, tool));
+      } else {
+        createFixtureBin(fixtureDir, runtime, tool);
+      }
     }
   }
   for (const [name, target] of HOST_WRAPPERS) {

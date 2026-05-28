@@ -46,5 +46,19 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Codex start | Missing `bot1` | Covered | Documents current hardcoded root-token invariant as `StopIteration` failure behavior. |
 | Codex start | Duplicate channels/ports | Covered | Documents current behavior: duplicate registry channel/port rows do not block startup unless a matching process exists. |
 | Codex start | No package install in Test Workspace | Covered | A fail-closed `npm` fixture plus pre/post workspace inventory proves startup does not run `npm ci` or contact npm. |
+| Fixture contracts | stop/restart tmux contracts | Covered | `kill-session`, `display-message '#{pane_pid}'`, retryable root-agent kill attempts, new-session launch failure injection, and trust-dialog `send-keys` recording. |
+| Fixture contracts | stop/restart process contracts | Covered | `pgrep -P`, `pkill -TERM -P`, fast fixture `sleep`, and fixture `ps` extend the shared harness-owned process model. |
+| Process safety | Shell builtin `kill` boundary | Covered | Tests do not replace shell builtin `kill`; only real harness-owned placeholder PIDs are exposed through fake `ps`/`pgrep`, so production `kill -TERM`/`kill -KILL` cannot receive fabricated or host PIDs. |
+| Process safety | Signal ordering limit | Covered | SIGTERM-resistant child coverage proves fallback to SIGKILL by observable process death; exact shell builtin `kill` call ordering is not intercepted and remains a documented black-box limit. |
+| Stop session | Claude happy path | Covered | Drives `scripts/stop-session.sh`, stops the recorded process tree, kills the tmux session, and clears PID/session registry metadata. |
+| Stop session | Codex happy path | Covered | Drives `scripts/stop-session.sh` with seeded Codex registry and bridge process state, then clears registry metadata. |
+| Stop session | Recorded-PID ownership skip | Covered | A host/unowned recorded PID is skipped while registry cleanup still occurs. |
+| Stop session | Already stopped project | Covered | Missing tmux and listener state exits successfully and clears registry metadata. |
+| Stop session | Orphan listener sweep | Covered | Remaining Claude listeners, Codex bridge processes, and Codex app-server processes are found through fixture process state and terminated. |
+| Stop session | SIGTERM-resistant child fallback | Covered | A harness-owned child that ignores SIGTERM is removed by the stop script's SIGKILL fallback. |
+| Stop session | Missing Codex sweep fields | Covered | Missing channel, port, or app id skips the Codex listener sweep and documents the stderr warning. |
+| Root restart | Existing root cleanup and retry | Covered | Simulates `root_agent`, pane PID lookup, child `pkill`, first kill failure, retry, fresh launch, fast background sleep, and `send-keys Enter`. |
+| Root restart | Launch failure diagnostics | Covered | Injected tmux `new-session` failure returns non-zero with command diagnostics and fixture state. |
+| Root restart | Teardown failure diagnostics | Covered | Cleanup failure after restart is recorded under fixture diagnostics. |
 | Live smoke | Default skip | Covered | Skips unless `CCDM_LIVE_E2E=1` and documented secrets are set. |
 | Discord/Codex/curl/npx fakes | Full behavior | Deferred | Later issue #4 slices introduce those executable-surface fakes. |

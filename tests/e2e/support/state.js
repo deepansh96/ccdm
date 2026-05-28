@@ -70,6 +70,7 @@ function normalizeState(value) {
         invocations: value?.fixtures?.npm?.invocations ?? [],
       },
       tmux: {
+        ...(value?.fixtures?.tmux ?? {}),
         sessions: value?.fixtures?.tmux?.sessions ?? {},
       },
     },
