@@ -46,6 +46,20 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Codex start | Missing `bot1` | Covered | Documents current hardcoded root-token invariant as `StopIteration` failure behavior. |
 | Codex start | Duplicate channels/ports | Covered | Documents current behavior: duplicate registry channel/port rows do not block startup unless a matching process exists. |
 | Codex start | No package install in Test Workspace | Covered | A fail-closed `npm` fixture plus pre/post workspace inventory proves startup does not run `npm ci` or contact npm. |
+| JS interception | Child-scoped preload | Covered | Bridge tests inject `NODE_OPTIONS=--require <preload.cjs>` only into child processes and keep harness `NODE_OPTIONS` empty. |
+| JS interception | Closed egress guard | Covered | Preload blocks unexpected `fetch`, `http`, `https`, and `net` egress while allowing only the scenario-local WebSocket upgrade. |
+| Fixture contracts | Discord shim exports and gateway injection | Covered | Temp overlay provides `discord.js` `Client`, `GatewayIntentBits`, and `Partials`, records login/ready, and emits injected gateway messages. |
+| Fixture contracts | Unified fake Discord store | Covered | Records login, ready, channel cache/fetches, typing, sends, injected/delivered gateway messages, attachment CDN fetches, nickname PATCHes, malformed requests, and configured failures. |
+| Fixture contracts | Fake Codex app-server protocol | Covered | Covers startup ordering, `initialize`/`initialized`, MCP status/delete/write/reload, thread start, system/user turns, deltas, MCP reply detection, token usage, WebSocket close, and no-thread-id timeout. |
+| Fixture contracts | `ws` dependency resolution | Covered | Bridge fixture self-test proves `ws` resolves from harness `NODE_PATH` before launching the bridge. |
+| Codex bridge | Boot and MCP registration | Covered | Drives `scripts/codex-bridge.js` with fake Codex app-server, writes/reloads `discord-channel-id`, and removes stale `discord-*` MCP config. |
+| Codex bridge | Login success/failure | Covered | Successful boot records Discord login/ready; configured login rejection exits the bridge. |
+| Codex bridge | Channel cache/fetch paths | Covered | Covers cache-hit boot and cache-miss fetch with recorded channel fetch state. |
+| Codex bridge | Filtering | Covered | Bot-authored, wrong-channel, and wrong-user injected messages do not start user turns or send replies. |
+| Codex bridge | One allowed text turn | Covered | Injected user text starts a Codex turn, records typing, and sends fallback Discord text from agent deltas. |
+| Codex bridge | Fallback splitting and MCP suppression | Covered | 2001-character fallback output splits into 2000/1 chunks; a detected Discord MCP reply suppresses fallback text. |
+| Codex bridge | Process exit paths | Covered | App-server exit, WebSocket close, and startup without thread id terminate the bridge with observable diagnostics. |
+| Codex bridge | Token-usage nickname PATCH | Covered | Token usage notifications route to fake Discord member PATCH and record the computed nickname. |
 | Fixture contracts | stop/restart tmux contracts | Covered | `kill-session`, `display-message '#{pane_pid}'`, retryable root-agent kill attempts, new-session launch failure injection, and trust-dialog `send-keys` recording. |
 | Fixture contracts | stop/restart process contracts | Covered | `pgrep -P`, `pkill -TERM -P`, fast fixture `sleep`, and fixture `ps` extend the shared harness-owned process model. |
 | Process safety | Shell builtin `kill` boundary | Covered | Tests do not replace shell builtin `kill`; only real harness-owned placeholder PIDs are exposed through fake `ps`/`pgrep`, so production `kill -TERM`/`kill -KILL` cannot receive fabricated or host PIDs. |
@@ -61,4 +75,4 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Root restart | Launch failure diagnostics | Covered | Injected tmux `new-session` failure returns non-zero with command diagnostics and fixture state. |
 | Root restart | Teardown failure diagnostics | Covered | Cleanup failure after restart is recorded under fixture diagnostics. |
 | Live smoke | Default skip | Covered | Skips unless `CCDM_LIVE_E2E=1` and documented secrets are set. |
-| Discord/Codex/curl/npx fakes | Full behavior | Deferred | Later issue #4 slices introduce those executable-surface fakes. |
+| Discord MCP/FormData/richer bridge flows | Full behavior | Deferred | Later issue #4 slices cover active-turn queueing, slash commands, richer attachments, FormData upload interception, and Discord MCP JSON-RPC tools. |

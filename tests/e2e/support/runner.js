@@ -16,7 +16,7 @@ const FORBIDDEN_WORKSPACE_ARTIFACTS = [
   ".codex",
 ];
 
-const FIXTURE_TOOLS = new Set(["claude", "jq", "npm", "pgrep", "pkill", "ps", "sleep", "tmux", "whisper", "zsh"]);
+const FIXTURE_TOOLS = new Set(["claude", "codex", "jq", "npm", "pgrep", "pkill", "ps", "sleep", "tmux", "whisper", "zsh"]);
 const HOST_WRAPPERS = new Map([
   ["cat", "/bin/cat"],
   ["chmod", "/bin/chmod"],
@@ -121,7 +121,23 @@ function initialState() {
     diagnostics: { cleanupFailures: [], logs: [], protectedPathViolations: [] },
     fixtures: {
       claude: { invocations: [] },
-      codex: { appServerInvocations: [], bridgeInvocations: [] },
+      codex: { appServerInvocations: [], bridgeInvocations: [], protocolEvents: [], servers: {} },
+      discord: {
+        attachmentFetches: [],
+        attachments: {},
+        channelCacheGets: [],
+        channelFetches: [],
+        deliveredMessages: [],
+        failures: {},
+        injectedMessages: [],
+        logins: [],
+        malformedRequests: [],
+        nicknamePatches: [],
+        ready: [],
+        sends: [],
+        typing: [],
+      },
+      network: { blocked: [] },
       npm: { invocations: [] },
       processes: [],
       registry: null,
@@ -145,8 +161,27 @@ function normalizeState(value) {
       codex: {
         appServerInvocations: value?.fixtures?.codex?.appServerInvocations || [],
         bridgeInvocations: value?.fixtures?.codex?.bridgeInvocations || [],
+        protocolEvents: value?.fixtures?.codex?.protocolEvents || [],
+        servers: value?.fixtures?.codex?.servers || {},
+      },
+      discord: {
+        ...base.fixtures.discord,
+        ...(value?.fixtures?.discord || {}),
+        attachmentFetches: value?.fixtures?.discord?.attachmentFetches || [],
+        attachments: value?.fixtures?.discord?.attachments || {},
+        channelCacheGets: value?.fixtures?.discord?.channelCacheGets || [],
+        channelFetches: value?.fixtures?.discord?.channelFetches || [],
+        deliveredMessages: value?.fixtures?.discord?.deliveredMessages || [],
+        injectedMessages: value?.fixtures?.discord?.injectedMessages || [],
+        logins: value?.fixtures?.discord?.logins || [],
+        malformedRequests: value?.fixtures?.discord?.malformedRequests || [],
+        nicknamePatches: value?.fixtures?.discord?.nicknamePatches || [],
+        ready: value?.fixtures?.discord?.ready || [],
+        sends: value?.fixtures?.discord?.sends || [],
+        typing: value?.fixtures?.discord?.typing || [],
       },
       npm: { invocations: value?.fixtures?.npm?.invocations || [] },
+      network: { blocked: value?.fixtures?.network?.blocked || [] },
       processes: value?.fixtures?.processes || [],
       tmux: { ...(value?.fixtures?.tmux || {}), sessions: value?.fixtures?.tmux?.sessions || {} },
     },
@@ -539,6 +574,43 @@ function runNpm() {
   process.exit(42);
 }
 
+function runCodex() {
+  const listenIndex = args.indexOf("--listen");
+  if (args[0] !== "app-server" || listenIndex === -1 || !args[listenIndex + 1]) {
+    console.error("unsupported codex invocation");
+    process.exit(2);
+  }
+  const listen = args[listenIndex + 1];
+  const prefix = "ws://127.0.0.1:";
+  if (!listen.startsWith(prefix) || !/^[0-9]+$/.test(listen.slice(prefix.length))) {
+    console.error(\`unsupported codex app-server listen URL: \${listen}\`);
+    process.exit(2);
+  }
+  const port = listen.slice(prefix.length);
+  const state = readState();
+  updateState((nextState) => {
+    nextState.fixtures.codex.appServerInvocations.push({
+      args,
+      cwd: process.cwd(),
+      env: { WS_PORT: process.env.WS_PORT },
+      pid: process.pid,
+      port,
+    });
+    return nextState;
+  });
+  const server = state.fixtures.codex.servers?.[port];
+  if (!server?.ready) {
+    console.error(\`no fake Codex app-server registered for port \${port}\`);
+    process.exit(43);
+  }
+  if (server.exitImmediately) {
+    process.exit(server.exitCode ?? 1);
+  }
+  process.on("SIGTERM", () => process.exit(0));
+  process.on("SIGINT", () => process.exit(0));
+  setInterval(() => {}, 1000);
+}
+
 switch (tool) {
   case "tmux":
     runTmux();
@@ -554,6 +626,9 @@ switch (tool) {
     break;
   case "claude":
     runClaude();
+    break;
+  case "codex":
+    runCodex();
     break;
   case "npm":
     runNpm();

@@ -32,6 +32,26 @@ function initialState() {
       codex: {
         appServerInvocations: [],
         bridgeInvocations: [],
+        protocolEvents: [],
+        servers: {},
+      },
+      discord: {
+        attachmentFetches: [],
+        attachments: {},
+        channelCacheGets: [],
+        channelFetches: [],
+        deliveredMessages: [],
+        failures: {},
+        injectedMessages: [],
+        logins: [],
+        malformedRequests: [],
+        nicknamePatches: [],
+        ready: [],
+        sends: [],
+        typing: [],
+      },
+      network: {
+        blocked: [],
       },
       npm: {
         invocations: [],
@@ -65,9 +85,30 @@ function normalizeState(value) {
       codex: {
         appServerInvocations: value?.fixtures?.codex?.appServerInvocations ?? [],
         bridgeInvocations: value?.fixtures?.codex?.bridgeInvocations ?? [],
+        protocolEvents: value?.fixtures?.codex?.protocolEvents ?? [],
+        servers: value?.fixtures?.codex?.servers ?? {},
+      },
+      discord: {
+        ...initialState().fixtures.discord,
+        ...(value?.fixtures?.discord ?? {}),
+        attachmentFetches: value?.fixtures?.discord?.attachmentFetches ?? [],
+        attachments: value?.fixtures?.discord?.attachments ?? {},
+        channelCacheGets: value?.fixtures?.discord?.channelCacheGets ?? [],
+        channelFetches: value?.fixtures?.discord?.channelFetches ?? [],
+        deliveredMessages: value?.fixtures?.discord?.deliveredMessages ?? [],
+        injectedMessages: value?.fixtures?.discord?.injectedMessages ?? [],
+        logins: value?.fixtures?.discord?.logins ?? [],
+        malformedRequests: value?.fixtures?.discord?.malformedRequests ?? [],
+        nicknamePatches: value?.fixtures?.discord?.nicknamePatches ?? [],
+        ready: value?.fixtures?.discord?.ready ?? [],
+        sends: value?.fixtures?.discord?.sends ?? [],
+        typing: value?.fixtures?.discord?.typing ?? [],
       },
       npm: {
         invocations: value?.fixtures?.npm?.invocations ?? [],
+      },
+      network: {
+        blocked: value?.fixtures?.network?.blocked ?? [],
       },
       tmux: {
         ...(value?.fixtures?.tmux ?? {}),

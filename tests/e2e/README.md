@@ -43,8 +43,26 @@ The teardown manager exposes `registerTeardownCallback(fn)` and `cleanup()`. Cal
   "fixtures": {
     "codex": {
       "appServerInvocations": [],
-      "bridgeInvocations": []
+      "bridgeInvocations": [],
+      "protocolEvents": [],
+      "servers": {}
     },
+    "discord": {
+      "attachmentFetches": [],
+      "attachments": {},
+      "channelCacheGets": [],
+      "channelFetches": [],
+      "deliveredMessages": [],
+      "failures": {},
+      "injectedMessages": [],
+      "logins": [],
+      "malformedRequests": [],
+      "nicknamePatches": [],
+      "ready": [],
+      "sends": [],
+      "typing": []
+    },
+    "network": { "blocked": [] },
     "npm": { "invocations": [] },
     "processes": [],
     "registry": null,
@@ -77,6 +95,14 @@ The same tmux/process contract covers the Codex startup surface:
 - The fixture records only the bridge command construction. App-server spawning and WebSocket protocol behavior belong to later Codex bridge scenarios.
 - The `npm` fixture fails closed and records invocations so startup scenarios can prove Test Workspaces do not run package installation or contact npm.
 
+The Codex bridge/basic-turn scenarios add child-scoped JavaScript interception:
+
+- `createBridgeWorkspace()` installs a temp-workspace `discord.js` overlay and `bridgeChildEnv()` injects `NODE_OPTIONS=--require <workspace>/tests/e2e/support/preload.cjs` only into child processes under test. The harness process keeps `NODE_OPTIONS` empty.
+- The preload replaces `globalThis.fetch`, fails closed for unexpected `http`, `https`, and `net` egress, allows only the local WebSocket upgrade for the scenario `WS_PORT`, and routes Discord member nickname PATCHes plus Discord CDN attachment fetches into fixture state.
+- The `discord.js` shim exports `Client`, `GatewayIntentBits`, and `Partials`, records login/ready/channel fetch/typing/send behavior, and consumes test-injected gateway messages from `$CCDM_TEST_STATE`.
+- `startFakeCodexServer()` owns the fake Codex WebSocket protocol. It covers `initialize`/`initialized`, MCP status/delete/write/reload, `thread/start`, system and user `turn/start`, agent deltas, MCP reply detection, token-usage notifications, WebSocket close, and startup no-thread-id failure.
+- The `codex` fixture validates `app-server --listen ws://127.0.0.1:<port>`, requires a harness-owned fake server for that port, records the invocation, and stays alive until the bridge exits.
+
 The stop/restart surfaces add these process-safety assumptions:
 
 - `scripts/stop-session.sh` is driven as a black-box script. Tests do not intercept shell builtin `kill`; safety comes from fake `ps` and `pgrep` exposing only real harness-owned placeholder PIDs.
@@ -90,7 +116,7 @@ Command results include command metadata, cwd, redacted environment, stdout, std
 
 ## Isolation
 
-Runtime guards fail on attempted access to the developer checkout registry, real `~/.claude`, real `~/.codex`, real tmux, real Keychain (`security`), and unapproved global temp files. Concrete Discord, npm, OAuth, and network egress guards are added by later slices when those fakes are introduced.
+Runtime guards fail on attempted access to the developer checkout registry, real `~/.claude`, real `~/.codex`, real tmux, real Keychain (`security`), and unapproved global temp files. Bridge scenarios also fail closed on unexpected Discord, CDN, `fetch`, `http`, `https`, and `net` egress. OAuth and richer upload routes are added by later slices when those fakes are introduced.
 
 ## Live Gate
 
