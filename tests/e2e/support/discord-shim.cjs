@@ -158,17 +158,19 @@ class Client extends EventEmitter {
   _startPolling() {
     if (this._poller) return;
     this._poller = setInterval(() => {
-      const state = readState();
-      const messages = state.fixtures?.discord?.injectedMessages ?? [];
-      const next = messages.find((message) => !message.delivered);
-      if (!next) return;
-      next.delivered = true;
-      writeState(state);
-      updateState((updated) => {
-        updated.fixtures.discord.deliveredMessages ||= [];
-        updated.fixtures.discord.deliveredMessages.push({ id: next.id });
+      let delivered = null;
+      updateState((state) => {
+        const messages = state.fixtures?.discord?.injectedMessages ?? [];
+        const next = messages.find((message) => !message.delivered);
+        if (!next) return;
+        next.delivered = true;
+        state.fixtures.discord.deliveredMessages ||= [];
+        state.fixtures.discord.deliveredMessages.push({ id: next.id });
+        delivered = { ...next };
       });
-      this.emit("messageCreate", fixtureMessage(this, next));
+      if (delivered) {
+        this.emit("messageCreate", fixtureMessage(this, delivered));
+      }
     }, 25);
     this._poller.unref();
   }

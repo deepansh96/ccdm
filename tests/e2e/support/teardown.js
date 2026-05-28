@@ -40,17 +40,32 @@ export async function cleanup(options = {}) {
   cleanupRunning = false;
 }
 
+function syncCleanup() {
+  if (cleanupRunning) return;
+  cleanupRunning = true;
+  while (callbacks.length > 0) {
+    const callback = callbacks.pop();
+    try {
+      callback();
+    } catch {
+      // Best-effort synchronous cleanup — swallow errors.
+    }
+  }
+}
+
 function installHandlers() {
   if (handlersInstalled) {
     return;
   }
   handlersInstalled = true;
-  process.once("uncaughtException", async (error) => {
-    await cleanup();
+  process.once("uncaughtException", (error) => {
+    syncCleanup();
+    process.exitCode = 1;
     throw error;
   });
-  process.once("unhandledRejection", async (error) => {
-    await cleanup();
+  process.once("unhandledRejection", (error) => {
+    syncCleanup();
+    process.exitCode = 1;
     throw error;
   });
   for (const signal of ["SIGINT", "SIGTERM"]) {
@@ -60,13 +75,7 @@ function installHandlers() {
     });
   }
   process.once("exit", () => {
-    if (!cleanupRunning) {
-      cleanupRunning = true;
-      while (callbacks.length > 0) {
-        const callback = callbacks.pop();
-        callback();
-      }
-    }
+    syncCleanup();
   });
 }
 

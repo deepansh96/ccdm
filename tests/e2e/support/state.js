@@ -152,6 +152,8 @@ function normalizeState(value) {
       network: {
         blocked: value?.fixtures?.network?.blocked ?? [],
       },
+      processes: value?.fixtures?.processes ?? [],
+      registry: value?.fixtures?.registry ?? null,
       tmux: {
         ...(value?.fixtures?.tmux ?? {}),
         sessions: value?.fixtures?.tmux?.sessions ?? {},

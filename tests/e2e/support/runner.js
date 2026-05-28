@@ -83,6 +83,7 @@ function rejectForbiddenTrackedArtifacts(files) {
 function copyTrackedFiles(root, repoDir, files) {
   for (const file of files) {
     const source = path.join(root, file);
+    if (!fs.existsSync(source)) continue;
     const destination = path.join(repoDir, file);
     fs.mkdirSync(path.dirname(destination), { recursive: true });
     fs.copyFileSync(source, destination);
@@ -767,23 +768,17 @@ function runCurl() {
     request.method === "PATCH" &&
     request.parsedUrl.hostname === "discord.com" &&
     /^\\/api\\/v10\\/guilds\\/[^/]+\\/members\\/[^/]+$/.test(request.parsedUrl.pathname);
+  const recordedRequest = {
+    body: request.body,
+    headers: request.headers,
+    hostname: request.parsedUrl.hostname,
+    method: request.method,
+    path: request.parsedUrl.pathname,
+    query: request.parsedUrl.search,
+    url: request.parsedUrl.href,
+  };
   updateState((nextState) => {
-    const recordedRequest = {
-      body: request.body,
-      headers: request.headers,
-      hostname: request.parsedUrl.hostname,
-      method: request.method,
-      path: request.parsedUrl.pathname,
-      query: request.parsedUrl.search,
-      url: request.parsedUrl.href,
-    };
     nextState.fixtures.curl.requests.push(recordedRequest);
-    if (isDiscordNicknamePatch) {
-      nextState.fixtures.discord.nicknamePatches.push({
-        ...recordedRequest,
-        exitCode: route?.exitCode ?? 0,
-      });
-    }
     return nextState;
   });
 
@@ -797,6 +792,16 @@ function runCurl() {
     });
     console.error("blocked unapproved curl target: " + request.parsedUrl.href);
     process.exit(43);
+  }
+
+  if (isDiscordNicknamePatch) {
+    updateState((nextState) => {
+      nextState.fixtures.discord.nicknamePatches.push({
+        ...recordedRequest,
+        exitCode: route.exitCode ?? 0,
+      });
+      return nextState;
+    });
   }
 
   if (route.stderr) {
