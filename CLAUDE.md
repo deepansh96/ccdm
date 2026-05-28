@@ -12,6 +12,10 @@ You are a coordinator bot. Users message you on Discord to start, stop, and mana
 - `scripts/start-session.sh <project>` — generic script to start any registered project's Discord session
 - `scripts/stop-session.sh <project>` — generic script to stop any registered project's Discord session
 
+## Testing
+
+Run the local-fake E2E suite with `npm test` (or `npm run test:e2e`). Requires Node 22+. Tests execute serialized with `--test-concurrency=1` and use fixture binaries and JS shims — no real Discord, Claude, Codex, tmux, Keychain, or network access. Live smoke tests are gated behind `CCDM_LIVE_E2E=1`.
+
 ## How to respond
 
 When the user asks to start/stop/list/register/deregister sessions, follow the session management instructions below. For anything else, respond normally — you're also a general-purpose assistant.
