@@ -26,6 +26,9 @@ function initialState() {
       protectedPathViolations: [],
     },
     fixtures: {
+      claude: {
+        invocations: [],
+      },
       processes: [],
       registry: null,
       tmux: {
@@ -49,6 +52,9 @@ function normalizeState(value) {
     fixtures: {
       ...initialState().fixtures,
       ...(value?.fixtures ?? {}),
+      claude: {
+        invocations: value?.fixtures?.claude?.invocations ?? [],
+      },
       tmux: {
         sessions: value?.fixtures?.tmux?.sessions ?? {},
       },

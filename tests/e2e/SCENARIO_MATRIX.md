@@ -21,5 +21,17 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Harness | Allowlisted PATH/no fallthrough | Covered | Missing fixture tools fail without host PATH fallback. |
 | Harness | Runtime isolation guards | Covered | Developer registry, real Claude/Codex state, real tmux, Keychain, and global temp paths. |
 | Harness | Failure diagnostics/redaction | Covered | Commands, streams, exit code, fixture state, file snapshots, and secret redaction. |
+| Fixture contracts | tmux session tracking | Covered | `has-session`, `new-session`, command/env capture, pane output, send-key recording, and current exit-code behavior. |
+| Fixture contracts | process ownership | Covered | `ps axeww -o pid=,command=` and `pgrep -P` expose harness-owned rows and omit fabricated or foreign PID state. |
+| Fixture contracts | Claude listener | Covered | `--version`, Discord channel argument validation, listener invocation recording, and fixture session metadata. |
+| Claude start | Successful Claude launch | Covered | Drives `scripts/start-session.sh`, resolves bot state dir, constructs tmux launch, records PID/session, and emits expected stdout. |
+| Claude start | Paths with spaces/quotes | Covered | Project paths with spaces and double quotes are captured through the tmux launch contract. |
+| Claude start | Already-running tmux guard | Covered | Existing target tmux session exits successfully without launching another listener. |
+| Claude start | Duplicate listener guard | Covered | Existing Claude Discord listener using the same state dir fails before creating the target tmux session. |
+| Claude start | Missing project | Covered | Documents current executable `KeyError` failure behavior. |
+| Claude start | Malformed registry | Covered | Documents current executable JSON parse failure behavior. |
+| Claude start | Missing bot | Covered | Documents current executable `StopIteration` failure behavior. |
+| Claude start | Multiple-project non-interference | Covered | Starting one project leaves other project PID/session fields and tmux sessions untouched. |
+| Claude start | CLAUDE.md pre-trust/send-key boundary | Covered | `start-session.sh` does not write `.claude.json` or send trust-dialog Enter; that remains manual documented workflow. |
 | Live smoke | Default skip | Covered | Skips unless `CCDM_LIVE_E2E=1` and documented secrets are set. |
 | Discord/Codex/curl/npx fakes | Full behavior | Deferred | Later issue #4 slices introduce those executable-surface fakes. |
