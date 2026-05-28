@@ -53,14 +53,24 @@ The teardown manager exposes `registerTeardownCallback(fn)` and `cleanup()`. Cal
       "channelCacheGets": [],
       "channelFetches": [],
       "deliveredMessages": [],
+      "edits": [],
       "failures": {},
+      "fetches": [],
       "injectedMessages": [],
       "logins": [],
       "malformedRequests": [],
+      "messageFetches": [],
+      "messages": [],
       "nicknamePatches": [],
+      "reactions": [],
       "ready": [],
+      "restFailureUses": [],
+      "restFailures": [],
+      "restMessages": [],
       "sends": [],
-      "typing": []
+      "typing": [],
+      "uploadFailures": [],
+      "uploads": []
     },
     "network": { "blocked": [] },
     "npm": { "invocations": [] },
@@ -104,6 +114,14 @@ The Codex bridge/basic-turn scenarios add child-scoped JavaScript interception:
 - The `codex` fixture validates `app-server --listen ws://127.0.0.1:<port>`, requires a harness-owned fake server for that port, records the invocation, and stays alive until the bridge exits.
 - Bridge control-flow scenarios cover successful steer, stale-turn queue fallback, queued reaction cleanup, `/compact`, `/clear`, compact/clear during an active turn, non-retryable Codex errors, MCP cleanup/registration failures, and command diagnostics.
 - Attachment scenarios cover empty messages, image URLs, fetched text attachments, binary downloads into `.discord-attachments`, attachment fetch failures, and Discord send failures. The Discord shim can reject `channel.send()` through fixture state so tests can assert the bridge's current failure diagnostics.
+
+The Discord MCP JSON-RPC scenarios drive `scripts/discord-mcp-server.js` directly through stdin/stdout with the same child-scoped preload:
+
+- The fake Discord REST store covers `POST/PATCH/GET /channels/:channel/messages`, `PUT /reactions/:emoji/@me`, single-message attachment lookup, scripted 400/401/403/404/429/5xx API failures, and CDN attachment downloads.
+- `tests/e2e/support/form-data-shim.cjs` is installed by the preload as the workspace-local `form-data` package so dynamic `import("form-data")` resolves without the real dependency. Its `FormData.prototype.submit()` implementation routes Discord uploads into fixture state and blocks non-Discord submit targets as `form-data` egress.
+- MCP tests cover `initialize`, `notifications/initialized`, `tools/list`, unknown methods, malformed JSON input, missing env, and each public tool: `reply`, `edit_message`, `react`, `fetch_messages`, and `download_attachment`.
+- Reply coverage includes empty text, missing files, reply references, upload success/failure, and the current behavior that advertised 10-file and 25MB limits are not locally enforced before upload.
+- Fetch/download coverage includes limit capping and bad negative limits, attachment default index, out-of-range and negative indexes, missing attachments, absolute save directories, filesystem writes, CDN failures, and blocked network egress.
 
 The stop/restart surfaces add these process-safety assumptions:
 

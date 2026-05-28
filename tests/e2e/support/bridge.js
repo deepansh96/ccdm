@@ -98,8 +98,8 @@ function collectProcess(child, metadata, workspace) {
   };
 }
 
-export function runPreloadProbe(workspace, code) {
-  const env = bridgeChildEnv(workspace);
+export function runPreloadProbe(workspace, code, extraEnv = {}) {
+  const env = bridgeChildEnv(workspace, extraEnv);
   const child = spawn(process.execPath, ["-e", code], {
     cwd: workspace.repoDir,
     detached: true,

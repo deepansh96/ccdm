@@ -57,9 +57,10 @@ function recordBlocked(kind, target) {
 }
 
 function response(body, options = {}) {
-  return new Response(body, {
+  const status = options.status ?? 200;
+  return new Response(status === 204 ? null : body, {
     headers: options.headers,
-    status: options.status ?? 200,
+    status,
   });
 }
 
@@ -69,8 +70,130 @@ function headerValue(headers, name) {
   return headers[name] ?? headers[name.toLowerCase()];
 }
 
+function takeRestFailure(method, url) {
+  const state = readState();
+  const failures = state.fixtures?.discord?.restFailures;
+  if (!Array.isArray(failures) || failures.length === 0) return null;
+  const [failure, ...remaining] = failures;
+  updateState((nextState) => {
+    nextState.fixtures.discord.restFailures = remaining;
+    nextState.fixtures.discord.restFailureUses ||= [];
+    nextState.fixtures.discord.restFailureUses.push({
+      method,
+      path: url.pathname,
+      status: failure.status ?? 500,
+    });
+  });
+  return response(JSON.stringify(failure.body ?? { message: `status ${failure.status ?? 500}` }), {
+    headers: { "content-type": "application/json" },
+    status: failure.status ?? 500,
+  });
+}
+
 function routeDiscordApi(url, init = {}) {
   const method = (init.method || "GET").toUpperCase();
+  if (url.hostname === "discord.com") {
+    const failure = takeRestFailure(method, url);
+    if (failure) return failure;
+  }
+
+  const listMessagesMatch = /^\/api\/v10\/channels\/([^/]+)\/messages$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && listMessagesMatch && method === "GET") {
+    const limit = Number(url.searchParams.get("limit") || "20");
+    const state = readState();
+    updateState((nextState) => {
+      nextState.fixtures.discord.fetches ||= [];
+      nextState.fixtures.discord.fetches.push({
+        authorization: headerValue(init.headers, "Authorization"),
+        channelId: listMessagesMatch[1],
+        limit,
+      });
+    });
+    if (!Number.isInteger(limit) || limit < 1) {
+      return response(JSON.stringify({ message: `Invalid message limit: ${url.searchParams.get("limit")}` }), {
+        headers: { "content-type": "application/json" },
+        status: 400,
+      });
+    }
+    return response(JSON.stringify((state.fixtures?.discord?.restMessages ?? []).slice(0, limit)), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const createMessageMatch = /^\/api\/v10\/channels\/([^/]+)\/messages$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && createMessageMatch && method === "POST") {
+    const parsedBody = init.body ? JSON.parse(String(init.body)) : {};
+    let created;
+    updateState((state) => {
+      state.fixtures.discord.messages ||= [];
+      created = {
+        authorization: headerValue(init.headers, "Authorization"),
+        channelId: createMessageMatch[1],
+        content: parsedBody.content ?? "",
+        id: `fake-message-${state.fixtures.discord.messages.length + 1}`,
+        messageReference: parsedBody.message_reference,
+      };
+      state.fixtures.discord.messages.push(created);
+    });
+    return response(JSON.stringify({ id: created.id, content: created.content }), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const getMessageMatch = /^\/api\/v10\/channels\/([^/]+)\/messages\/([^/]+)$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && getMessageMatch && method === "GET") {
+    const state = readState();
+    const message = (state.fixtures?.discord?.restMessages ?? []).find((entry) => entry.id === getMessageMatch[2]);
+    updateState((nextState) => {
+      nextState.fixtures.discord.messageFetches ||= [];
+      nextState.fixtures.discord.messageFetches.push({
+        authorization: headerValue(init.headers, "Authorization"),
+        channelId: getMessageMatch[1],
+        messageId: getMessageMatch[2],
+      });
+    });
+    if (!message) {
+      return response(JSON.stringify({ message: "Unknown Message" }), {
+        headers: { "content-type": "application/json" },
+        status: 404,
+      });
+    }
+    return response(JSON.stringify(message), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const editMessageMatch = /^\/api\/v10\/channels\/([^/]+)\/messages\/([^/]+)$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && editMessageMatch && method === "PATCH") {
+    const parsedBody = init.body ? JSON.parse(String(init.body)) : {};
+    updateState((state) => {
+      state.fixtures.discord.edits ||= [];
+      state.fixtures.discord.edits.push({
+        authorization: headerValue(init.headers, "Authorization"),
+        channelId: editMessageMatch[1],
+        content: parsedBody.content ?? "",
+        messageId: editMessageMatch[2],
+      });
+    });
+    return response(JSON.stringify({ id: editMessageMatch[2], content: parsedBody.content ?? "" }), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const reactionMatch = /^\/api\/v10\/channels\/([^/]+)\/messages\/([^/]+)\/reactions\/([^/]+)\/@me$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && reactionMatch && method === "PUT") {
+    updateState((state) => {
+      state.fixtures.discord.reactions ||= [];
+      state.fixtures.discord.reactions.push({
+        authorization: headerValue(init.headers, "Authorization"),
+        channelId: reactionMatch[1],
+        emoji: reactionMatch[3],
+        messageId: reactionMatch[2],
+      });
+    });
+    return response("", { status: 204 });
+  }
+
   const nicknameMatch = /^\/api\/v10\/guilds\/([^/]+)\/members\/([^/]+)$/.exec(url.pathname);
   if (url.hostname === "discord.com" && nicknameMatch && method === "PATCH") {
     const parsedBody = init.body ? JSON.parse(String(init.body)) : {};
@@ -203,7 +326,26 @@ function installNetGuard() {
   };
 }
 
+function installFormDataShim() {
+  const repoNodeModules = path.join(process.cwd(), "node_modules", "form-data");
+  const shimPath = path.join(__dirname, "form-data-shim.cjs");
+  try {
+    fs.mkdirSync(repoNodeModules, { recursive: true });
+    fs.writeFileSync(
+      path.join(repoNodeModules, "package.json"),
+      `${JSON.stringify({ name: "form-data", main: "index.cjs" }, null, 2)}\n`,
+    );
+    fs.writeFileSync(path.join(repoNodeModules, "index.cjs"), `module.exports = require(${JSON.stringify(shimPath)});\n`);
+  } catch (error) {
+    recordBlocked("form-data-shim-install", error.message);
+    throw error;
+  }
+}
+
 function install() {
+  if (process.env.CCDM_TEST_FORM_DATA_SHIM === "1") {
+    installFormDataShim();
+  }
   globalThis.fetch = guardedFetch;
   if (process.env.CCDM_TEST_ACCELERATE_TYPING === "1") {
     globalThis.setInterval = (callback, delay, ...args) =>
