@@ -1,0 +1,28 @@
+name: E2E
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  local-fake-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Verify host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zsh python3 jq
+          command -v zsh
+          command -v python3
+          command -v jq
+
+      - run: npm test
