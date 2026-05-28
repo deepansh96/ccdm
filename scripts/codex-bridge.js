@@ -226,6 +226,7 @@ function handleNotification(msg) {
       console.error("Codex error:", JSON.stringify(msg.params));
       if (msg.params.willRetry === false) {
         const errorText = msg.params.error?.message || "Codex encountered an error";
+        stopTyping();
         sendToDiscord(`**Error:** ${errorText}`);
         turnActive = false;
         processQueue();

@@ -5,5 +5,12 @@
     "discord.js": "^14.16.0",
     "form-data": "^4.0.5",
     "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 tests/e2e/**/*.test.js",
+    "test:e2e": "node --test --test-concurrency=1 tests/e2e/**/*.test.js"
   }
 }
