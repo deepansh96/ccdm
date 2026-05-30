@@ -37,6 +37,7 @@ let messageQueue = [];
 let discordChannel = null;
 let codexProcess = null;
 let typingInterval = null;
+let threadResetting = false;
 let lastNicknameUpdate = 0;
 const NICKNAME_INTERVAL = 60000;
 const SYSTEM_INSTRUCTION = `You are communicating with the user via Discord. Use ONLY the MCP server named "discord-${CHANNEL_ID}" to interact — call its \`reply\` tool to send messages to the user. Do NOT use any other discord MCP server. Do NOT output responses as regular text; always use the \`reply\` tool so the user sees your response on Discord. Other available tools on this same server: edit_message, react, fetch_messages, download_attachment. Use \`reply\` with the \`files\` parameter to send file attachments.`;
@@ -52,6 +53,25 @@ function sendRequest(method, params) {
     pendingRequests.set(id, { resolve, reject });
     ws.send(msg);
   });
+}
+
+function notificationThreadId(msg) {
+  return msg.params?.threadId || msg.params?.thread?.id || null;
+}
+
+function notificationTurnId(msg) {
+  return msg.params?.turnId || msg.params?.turn?.id || null;
+}
+
+function isCurrentThreadNotification(msg) {
+  const notifiedThreadId = notificationThreadId(msg);
+  return !notifiedThreadId || !threadId || notifiedThreadId === threadId;
+}
+
+function isCurrentTurnNotification(msg) {
+  if (!isCurrentThreadNotification(msg)) return false;
+  const notifiedTurnId = notificationTurnId(msg);
+  return !notifiedTurnId || !activeTurnId || notifiedTurnId === activeTurnId;
 }
 
 function splitMessage(text, limit = 2000) {
@@ -215,14 +235,17 @@ function setupWebSocketHandlers() {
 function handleNotification(msg) {
   switch (msg.method) {
     case "item/agentMessage/delta":
+      if (!isCurrentTurnNotification(msg)) break;
       deltaBuffer += msg.params.delta;
       break;
 
     case "turn/completed":
+      if (!isCurrentTurnNotification(msg)) break;
       onTurnCompleted();
       break;
 
     case "error":
+      if (!isCurrentTurnNotification(msg)) break;
       console.error("Codex error:", JSON.stringify(msg.params));
       if (msg.params.willRetry === false) {
         const errorText = msg.params.error?.message || "Codex encountered an error";
@@ -241,6 +264,7 @@ function handleNotification(msg) {
       break;
 
     case "item/completed":
+      if (!isCurrentTurnNotification(msg)) break;
       if (msg.params?.item?.type === "contextCompaction") {
         sendToDiscord("Compaction complete.");
       }
@@ -248,12 +272,14 @@ function handleNotification(msg) {
       break;
 
     case "turn/started":
+      if (!isCurrentThreadNotification(msg)) break;
       if (msg.params?.turn?.id) {
         activeTurnId = msg.params.turn.id;
       }
       break;
 
     case "item/started":
+      if (!isCurrentTurnNotification(msg)) break;
       if (msg.params?.item?.type === "mcpToolCall" &&
           msg.params.item.server?.startsWith("discord-") &&
           msg.params.item.tool === "reply") {
@@ -347,7 +373,7 @@ async function onTurnCompleted() {
 }
 
 async function processQueue() {
-  if (turnActive || messageQueue.length === 0) return;
+  if (threadResetting || turnActive || !threadId || messageQueue.length === 0) return;
   const { input, msg: queuedMsg } = messageQueue.shift();
   if (queuedMsg) {
     queuedMsg.reactions.cache.get("⏳")?.users.remove(queuedMsg.client.user.id).catch(() => {});
@@ -356,16 +382,26 @@ async function processQueue() {
 }
 
 async function sendTurn(input) {
+  if (!threadId) {
+    messageQueue.push({ input, msg: null });
+    return;
+  }
   turnActive = true;
   deltaBuffer = "";
   mcpReplyCalled = false;
+  activeTurnId = null;
   startTyping();
   try {
-    await sendRequest("turn/start", {
+    const result = await sendRequest("turn/start", {
       threadId,
       input,
       approvalPolicy: "never",
     });
+    if (result?.turn?.id) {
+      activeTurnId = result.turn.id;
+    } else if (result?.turnId) {
+      activeTurnId = result.turnId;
+    }
   } catch (err) {
     console.error("turn/start failed:", err);
     stopTyping();
@@ -479,6 +515,25 @@ async function registerDiscordMcp() {
   console.log(`MCP server status: ${found ? JSON.stringify(found.status || "found") : "checking..."}`);
 }
 
+async function startCodexThread() {
+  const result = await sendRequest("thread/start", {
+    cwd: PROJECT_DIR,
+    sandbox: "danger-full-access",
+    approvalPolicy: "never",
+    developerInstructions: SYSTEM_INSTRUCTION,
+  });
+  if (result?.thread?.id) {
+    threadId = result.thread.id;
+  }
+
+  for (let i = 0; i < 50 && !threadId; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  if (!threadId) {
+    throw new Error("Failed to get thread ID from server");
+  }
+}
+
 async function initializeCodex() {
   await sendRequest("initialize", {
     clientInfo: { name: "codex-discord-bridge", version: "1.0.0" },
@@ -488,33 +543,8 @@ async function initializeCodex() {
 
   await registerDiscordMcp();
 
-  await sendRequest("thread/start", {
-    cwd: PROJECT_DIR,
-    sandbox: "danger-full-access",
-    approvalPolicy: "never",
-  });
-
-  for (let i = 0; i < 50 && !threadId; i++) {
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  if (!threadId) {
-    console.error("Failed to get thread ID from server");
-    process.exit(1);
-  }
+  await startCodexThread();
   console.log(`Codex thread started: ${threadId}`);
-
-  turnActive = true;
-  await sendRequest("turn/start", {
-    threadId,
-    input: [{ type: "text", text: SYSTEM_INSTRUCTION }],
-    approvalPolicy: "never",
-  });
-  for (let i = 0; i < 150 && turnActive; i++) {
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  deltaBuffer = "";
-  turnActive = false;
-  console.log("System instruction sent");
 }
 
 function startDiscordBot() {
@@ -562,45 +592,42 @@ function startDiscordBot() {
     if (text === "/clear") {
       console.log("[discord] /clear requested");
       await msg.react("🔄");
+      threadResetting = true;
+      const previousThreadId = threadId;
+      const previousTurnId = activeTurnId;
       try {
-        await sendRequest("thread/archive", { threadId });
+        messageQueue = [];
+        if (previousThreadId && previousTurnId) {
+          try {
+            await sendRequest("turn/interrupt", {
+              threadId: previousThreadId,
+              turnId: previousTurnId,
+            });
+          } catch (err) {
+            console.log(`Warning: failed to interrupt active turn before clear: ${err.message || err}`);
+          }
+        }
+        if (previousThreadId) {
+          await sendRequest("thread/archive", { threadId: previousThreadId });
+        }
         threadId = null;
         turnActive = false;
         activeTurnId = null;
         mcpReplyCalled = false;
         deltaBuffer = "";
-        messageQueue = [];
+        stopTyping();
 
-        await sendRequest("thread/start", {
-          cwd: PROJECT_DIR,
-          sandbox: "danger-full-access",
-          approvalPolicy: "never",
-        });
-        for (let i = 0; i < 50 && !threadId; i++) {
-          await new Promise((r) => setTimeout(r, 100));
-        }
-        if (!threadId) {
-          await sendToDiscord("**Error:** Failed to start new thread after clear.");
-          return;
-        }
-
-        turnActive = true;
-        mcpReplyCalled = false;
-        await sendRequest("turn/start", {
-          threadId,
-          input: [{ type: "text", text: SYSTEM_INSTRUCTION }],
-          approvalPolicy: "never",
-        });
-        for (let i = 0; i < 150 && turnActive; i++) {
-          await new Promise((r) => setTimeout(r, 100));
-        }
-        deltaBuffer = "";
-        turnActive = false;
+        await startCodexThread();
 
         await sendToDiscord("Conversation cleared — fresh thread started.");
         console.log(`New thread after /clear: ${threadId}`);
+        threadResetting = false;
+        processQueue();
       } catch (err) {
+        threadResetting = false;
+        turnActive = false;
         await sendToDiscord(`**Error:** Failed to clear — ${err.message || err}`);
+        processQueue();
       }
       return;
     }
@@ -610,7 +637,10 @@ function startDiscordBot() {
 
     console.log(`[discord] ${msg.author.username}: ${text || "(attachment)"} [${input.length} part(s)]`);
 
-    if (turnActive && activeTurnId) {
+    if (threadResetting) {
+      messageQueue.push({ input, msg });
+      await msg.react("⏳");
+    } else if (turnActive && activeTurnId) {
       try {
         await sendRequest("turn/steer", {
           threadId,

@@ -136,6 +136,8 @@ export async function startFakeCodexServer(workspace, options = {}) {
   const turnPlans = [...(options.turns ?? [])];
   const steerPlans = [...(options.steer ?? [])];
   let serverRequestId = 10000;
+  let threadStartCount = 0;
+  const interruptedTurnIds = new Set();
   markCodexServer(workspace, port, { ready: true, ...(options.fixture ?? {}) });
 
   server.on("connection", (socket) => {
@@ -194,18 +196,26 @@ export async function startFakeCodexServer(workspace, options = {}) {
           reply({});
           break;
         case "thread/start":
-          reply({});
-          if (!options.omitThreadStarted) {
-            setTimeout(() => notify("thread/started", { thread: { id: options.threadId ?? "thread-1" } }), 5);
+          threadStartCount += 1;
+          {
+            const configuredThreadIds = options.threadIds ?? (options.threadId ? [options.threadId] : null);
+            const startedThreadId = configuredThreadIds?.[threadStartCount - 1] ?? configuredThreadIds?.[configuredThreadIds.length - 1] ?? `thread-${threadStartCount}`;
+            if (options.omitThreadStarted) {
+              reply({});
+              break;
+            }
+            reply({ thread: { id: startedThreadId } });
+            setTimeout(() => notify("thread/started", { thread: { id: startedThreadId } }), 5);
           }
           break;
         case "turn/start": {
           const isSystem = message.params?.input?.[0]?.text?.startsWith("You are communicating with the user via Discord");
           const plan = isSystem ? { delta: "", complete: true } : (turnPlans.shift() ?? { delta: "Codex response", complete: true });
           const turnId = plan.turnId ?? `turn-${Date.now()}`;
-          reply({ turnId });
-          setTimeout(() => {
-            notify("turn/started", { turn: { id: turnId } });
+          const turnThreadId = message.params?.threadId;
+          reply({ turn: { id: turnId } });
+          const startTimer = setTimeout(() => {
+            notify("turn/started", { threadId: turnThreadId, turn: { id: turnId } });
             if (plan.approvals || options.approvals) {
               serverRequest("fileChangeRequestApproval", { turnId });
               serverRequest("execCommandApproval", { turnId });
@@ -213,28 +223,41 @@ export async function startFakeCodexServer(workspace, options = {}) {
               serverRequest("toolRequestUserInput", { turnId });
             }
           }, plan.startDelayMs ?? plan.delayMs ?? 10);
-          setTimeout(() => {
+          startTimer.unref?.();
+          const completionTimer = setTimeout(() => {
+            if (interruptedTurnIds.has(turnId)) return;
             if (plan.mcpReply) {
-              notify("item/started", { item: { type: "mcpToolCall", server: `discord-${options.channelId ?? "channel-id"}`, tool: "reply" } });
+              notify("item/started", {
+                threadId: turnThreadId,
+                turnId,
+                item: { type: "mcpToolCall", server: `discord-${options.channelId ?? "channel-id"}`, tool: "reply" },
+              });
             }
             if (plan.delta) {
-              notify("item/agentMessage/delta", { delta: plan.delta });
+              notify("item/agentMessage/delta", { threadId: turnThreadId, turnId, delta: plan.delta });
             }
             if (plan.error) {
               notify("error", {
                 error: { message: plan.error },
                 willRetry: plan.willRetry ?? false,
+                threadId: turnThreadId,
+                turnId,
               });
             }
             if (plan.tokenUsage) {
               notify("thread/tokenUsage/updated", { tokenUsage: plan.tokenUsage });
             }
             if (plan.complete !== false) {
-              notify("turn/completed", {});
+              notify("turn/completed", { threadId: turnThreadId, turn: { id: turnId } });
             }
           }, plan.delayMs ?? 10);
+          completionTimer.unref?.();
           break;
         }
+        case "turn/interrupt":
+          if (message.params?.turnId) interruptedTurnIds.add(message.params.turnId);
+          reply({});
+          break;
         case "turn/steer": {
           const plan = steerPlans.shift() ?? "success";
           if (plan === "failure" || plan?.error) {
@@ -249,7 +272,7 @@ export async function startFakeCodexServer(workspace, options = {}) {
           if (options.compactComplete) {
             setTimeout(() => {
               notify("thread/compacted", { threadId: message.params?.threadId ?? options.threadId ?? "thread-1" });
-              notify("item/completed", { item: { type: "contextCompaction" } });
+              notify("item/completed", { threadId: message.params?.threadId ?? options.threadId ?? "thread-1", item: { type: "contextCompaction" } });
             }, 5);
           }
           break;
