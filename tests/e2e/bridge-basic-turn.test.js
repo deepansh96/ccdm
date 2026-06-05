@@ -193,8 +193,12 @@ test("bridge boots, registers Discord MCP, removes stale MCP, and completes one 
   const bridge = startBridge(workspace, { port: codex.port });
 
   await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
-  injectDiscordMessage(workspace, { content: "hello codex" });
-  const state = await waitForState(workspace, (nextState) => nextState.fixtures.discord.sends.length === 1, 5000);
+  const state = await injectMessageUntil(
+    workspace,
+    { content: "hello codex", id: "hello-codex" },
+    (nextState) => nextState.fixtures.discord.sends.length === 1,
+    5000,
+  );
 
   assert.equal(state.fixtures.discord.sends[0].content, "Codex response");
   assert.equal(state.fixtures.discord.logins[0].token, "bot-token");
@@ -216,6 +220,7 @@ test("bridge boots, registers Discord MCP, removes stale MCP, and completes one 
       "mcpServerStatus/list",
       "thread/start",
       "turn/start",
+      "turn/start",
     ],
   );
   const threadStart = state.fixtures.codex.protocolEvents
@@ -223,6 +228,14 @@ test("bridge boots, registers Discord MCP, removes stale MCP, and completes one 
     .map((event) => event.message)
     .find((message) => message.method === "thread/start");
   assert.match(threadStart.params.developerInstructions, /Use ONLY the MCP server named "discord-channel-id"/);
+  const bootstrapTurn = state.fixtures.codex.protocolEvents
+    .filter((event) => event.event === "client-message")
+    .map((event) => event.message)
+    .find((message) =>
+      message.method === "turn/start" &&
+      message.params?.input?.[0]?.text?.includes("Use ONLY the MCP server named \"discord-channel-id\""),
+    );
+  assert.ok(bootstrapTurn);
   await bridge.stop();
 });
 
@@ -419,10 +432,37 @@ test("bridge handles compact and clear slash commands during an active turn", as
     ).length,
     2,
   );
-  assert.ok(!clientMessages.some((message) =>
+  assert.equal(clientMessages.filter((message) =>
     message.method === "turn/start" &&
     message.params?.input?.[0]?.text?.includes("Use ONLY the MCP server named \"discord-channel-id\""),
-  ));
+  ).length, 2);
+  await bridge.stop();
+});
+
+test("bridge sends the bootstrap instruction turn after idle compact completion", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    compactComplete: true,
+  });
+  const bridge = startBridge(workspace, { port: codex.port });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await injectMessageUntil(
+    workspace,
+    { content: "/compact", id: "idle-compact-message" },
+    (nextState) => nextState.fixtures.discord.sends.some((send) => send.content === "Compaction complete."),
+    15000,
+  );
+  const state = readState(workspace.stateDir);
+  const bootstrapTurns = state.fixtures.codex.protocolEvents
+    .filter((event) => event.event === "client-message")
+    .map((event) => event.message)
+    .filter((message) =>
+      message.method === "turn/start" &&
+      message.params?.input?.[0]?.text?.includes("Use ONLY the MCP server named \"discord-channel-id\""),
+    );
+
+  assert.equal(bootstrapTurns.length, 2);
   await bridge.stop();
 });
 
@@ -567,7 +607,13 @@ test("bridge builds Codex input for empty messages and image, text, binary, and 
   const state = await injectMessageUntil(
     workspace,
     attachmentMessage,
-    (nextState) => nextState.fixtures.discord.sends.some((send) => send.content === "attachments done"),
+    (nextState) =>
+      nextState.fixtures.discord.sends.some((send) => send.content === "attachments done") &&
+      nextState.fixtures.codex.protocolEvents.some((event) =>
+        event.event === "client-message" &&
+        event.message.method === "turn/start" &&
+        event.message.params?.input?.[0]?.type === "image",
+      ),
     15000,
   );
 

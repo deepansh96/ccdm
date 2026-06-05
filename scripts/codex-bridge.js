@@ -33,6 +33,8 @@ let deltaBuffer = "";
 let turnActive = false;
 let activeTurnId = null;
 let mcpReplyCalled = false;
+let suppressTurnOutput = false;
+let pendingBootstrapInstructionReason = null;
 let messageQueue = [];
 let discordChannel = null;
 let codexProcess = null;
@@ -92,7 +94,7 @@ function splitMessage(text, limit = 2000) {
 }
 
 async function updateNickname(totalTokens, contextWindow) {
-  if (!GUILD_ID || !ROOT_BOT_TOKEN || !BOT_APP_ID || !contextWindow) return;
+  if (!GUILD_ID || !BOT_TOKEN || !contextWindow) return;
   const now = Date.now();
   if (now - lastNicknameUpdate < NICKNAME_INTERVAL) return;
   lastNicknameUpdate = now;
@@ -101,11 +103,11 @@ async function updateNickname(totalTokens, contextWindow) {
   const nick = `${BOT_DISPLAY_NAME} · ${pct}%`;
   try {
     const res = await fetch(
-      `https://discord.com/api/v10/guilds/${GUILD_ID}/members/${BOT_APP_ID}`,
+      `https://discord.com/api/v10/guilds/${GUILD_ID}/members/@me`,
       {
         method: "PATCH",
         headers: {
-          Authorization: `Bot ${ROOT_BOT_TOKEN}`,
+          Authorization: `Bot ${BOT_TOKEN}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ nick }),
@@ -250,9 +252,20 @@ function handleNotification(msg) {
       if (msg.params.willRetry === false) {
         const errorText = msg.params.error?.message || "Codex encountered an error";
         stopTyping();
-        sendToDiscord(`**Error:** ${errorText}`);
+        if (!suppressTurnOutput) {
+          sendToDiscord(`**Error:** ${errorText}`);
+        }
+        const bootstrapReason = pendingBootstrapInstructionReason;
+        pendingBootstrapInstructionReason = null;
         turnActive = false;
-        processQueue();
+        activeTurnId = null;
+        mcpReplyCalled = false;
+        suppressTurnOutput = false;
+        if (bootstrapReason) {
+          sendBootstrapInstructionTurn(bootstrapReason);
+        } else {
+          processQueue();
+        }
       }
       break;
 
@@ -266,7 +279,7 @@ function handleNotification(msg) {
     case "item/completed":
       if (!isCurrentTurnNotification(msg)) break;
       if (msg.params?.item?.type === "contextCompaction") {
-        sendToDiscord("Compaction complete.");
+        onContextCompactionCompleted();
       }
       deltaBuffer = "";
       break;
@@ -361,7 +374,9 @@ function flushDeltaBuffer() {
 
 async function onTurnCompleted() {
   stopTyping();
-  if (!mcpReplyCalled) {
+  if (suppressTurnOutput) {
+    deltaBuffer = "";
+  } else if (!mcpReplyCalled) {
     flushDeltaBuffer();
   } else {
     deltaBuffer = "";
@@ -369,7 +384,14 @@ async function onTurnCompleted() {
   turnActive = false;
   activeTurnId = null;
   mcpReplyCalled = false;
-  processQueue();
+  suppressTurnOutput = false;
+  const bootstrapReason = pendingBootstrapInstructionReason;
+  pendingBootstrapInstructionReason = null;
+  if (bootstrapReason) {
+    sendBootstrapInstructionTurn(bootstrapReason);
+  } else {
+    processQueue();
+  }
 }
 
 async function processQueue() {
@@ -409,6 +431,59 @@ async function sendTurn(input) {
     await sendToDiscord("**Error:** Failed to send message to Codex");
     processQueue();
   }
+}
+
+async function sendBootstrapInstructionTurn(reason) {
+  if (!threadId) return;
+  if (turnActive) {
+    pendingBootstrapInstructionReason = reason || "pending";
+    return;
+  }
+  turnActive = true;
+  deltaBuffer = "";
+  mcpReplyCalled = false;
+  suppressTurnOutput = true;
+  activeTurnId = null;
+  try {
+    const result = await sendRequest("turn/start", {
+      threadId,
+      input: [{ type: "text", text: SYSTEM_INSTRUCTION }],
+      approvalPolicy: "never",
+    });
+    if (result?.turn?.id) {
+      activeTurnId = result.turn.id;
+    } else if (result?.turnId) {
+      activeTurnId = result.turnId;
+    }
+    for (let i = 0; i < 150 && turnActive; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    deltaBuffer = "";
+    if (turnActive) {
+      turnActive = false;
+      activeTurnId = null;
+      mcpReplyCalled = false;
+      suppressTurnOutput = false;
+      processQueue();
+    }
+    console.log(`Bootstrap instruction sent${reason ? ` (${reason})` : ""}`);
+  } catch (err) {
+    console.error(`Bootstrap instruction failed${reason ? ` (${reason})` : ""}:`, err);
+    turnActive = false;
+    activeTurnId = null;
+    mcpReplyCalled = false;
+    suppressTurnOutput = false;
+    processQueue();
+  }
+}
+
+async function onContextCompactionCompleted() {
+  if (turnActive) {
+    pendingBootstrapInstructionReason = "compact";
+  } else {
+    await sendBootstrapInstructionTurn("compact");
+  }
+  await sendToDiscord("Compaction complete.");
 }
 
 const TEXT_EXTENSIONS = new Set([
@@ -544,6 +619,7 @@ async function initializeCodex() {
   await registerDiscordMcp();
 
   await startCodexThread();
+  await sendBootstrapInstructionTurn("startup");
   console.log(`Codex thread started: ${threadId}`);
 }
 
@@ -614,10 +690,14 @@ function startDiscordBot() {
         turnActive = false;
         activeTurnId = null;
         mcpReplyCalled = false;
+        suppressTurnOutput = false;
+        pendingBootstrapInstructionReason = null;
         deltaBuffer = "";
         stopTyping();
 
+        await registerDiscordMcp();
         await startCodexThread();
+        await sendBootstrapInstructionTurn("clear");
 
         await sendToDiscord("Conversation cleared — fresh thread started.");
         console.log(`New thread after /clear: ${threadId}`);
@@ -640,7 +720,7 @@ function startDiscordBot() {
     if (threadResetting) {
       messageQueue.push({ input, msg });
       await msg.react("⏳");
-    } else if (turnActive && activeTurnId) {
+    } else if (turnActive && activeTurnId && !suppressTurnOutput) {
       try {
         await sendRequest("turn/steer", {
           threadId,
