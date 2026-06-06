@@ -15,6 +15,7 @@ const WS_PORT = parseInt(process.env.WS_PORT || "18300", 10);
 const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID;
 const GUILD_ID = process.env.GUILD_ID;
 const ROOT_BOT_TOKEN = process.env.ROOT_BOT_TOKEN;
+const ROOT_BOT_APP_ID = process.env.ROOT_BOT_APP_ID;
 const BOT_APP_ID = process.env.BOT_APP_ID;
 const BOT_DISPLAY_NAME = process.env.BOT_DISPLAY_NAME || "codex";
 
@@ -74,6 +75,17 @@ function isCurrentTurnNotification(msg) {
   if (!isCurrentThreadNotification(msg)) return false;
   const notifiedTurnId = notificationTurnId(msg);
   return !notifiedTurnId || !activeTurnId || notifiedTurnId === activeTurnId;
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function mentionsRootBot(msg) {
+  if (!ROOT_BOT_APP_ID) return false;
+  if (msg.mentions?.users?.has?.(ROOT_BOT_APP_ID)) return true;
+  const mentionPattern = new RegExp(`<@!?${escapeRegExp(ROOT_BOT_APP_ID)}>`);
+  return mentionPattern.test(msg.content || "");
 }
 
 function splitMessage(text, limit = 2000) {
@@ -659,6 +671,7 @@ function startDiscordBot() {
     if (msg.author.bot) return;
     if (msg.channel.id !== CHANNEL_ID) return;
     if (ALLOWED_USER_ID && msg.author.id !== ALLOWED_USER_ID) return;
+    if (mentionsRootBot(msg)) return;
 
     const text = msg.content.trim();
 

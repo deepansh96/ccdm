@@ -334,6 +334,7 @@ function parseCodexBridgeLaunch(shellCommand) {
     "ALLOWED_USER_ID",
     "GUILD_ID",
     "ROOT_BOT_TOKEN",
+    "ROOT_BOT_APP_ID",
     "BOT_APP_ID",
     "BOT_DISPLAY_NAME",
   ];

@@ -309,6 +309,7 @@ export function startBridge(workspace, options = {}) {
     GUILD_ID: options.guildId ?? "guild-id",
     PROJECT_DIR: options.projectDir ?? workspace.repoDir,
     ROOT_BOT_TOKEN: options.rootBotToken ?? "root-token",
+    ROOT_BOT_APP_ID: options.rootBotAppId ?? "root-bot-app-id",
     WS_PORT: String(options.port),
   });
   const command = [process.execPath, path.join(workspace.repoDir, "scripts/codex-bridge.js")];

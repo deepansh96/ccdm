@@ -11,6 +11,16 @@ test.afterEach(async () => {
   await cleanup();
 });
 
+function localDateOffset(days) {
+  const date = new Date();
+  date.setHours(0, 0, 0, 0);
+  date.setDate(date.getDate() + days);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
 function seedClaudeUsageHome(workspace) {
   const claudeDir = path.join(workspace.homeDir, ".claude");
   fs.mkdirSync(path.join(claudeDir, "sessions"), { recursive: true });
@@ -19,11 +29,11 @@ function seedClaudeUsageHome(workspace) {
     `${JSON.stringify(
       {
         dailyActivity: [
-          { date: "2026-05-21", messageCount: 10, sessionCount: 1, toolCallCount: 5 },
-          { date: "2026-05-27", messageCount: 20, sessionCount: 2, toolCallCount: 8 },
-          { date: "2026-05-28", messageCount: 30, sessionCount: 3, toolCallCount: 13 },
+          { date: localDateOffset(-8), messageCount: 10, sessionCount: 1, toolCallCount: 5 },
+          { date: localDateOffset(-1), messageCount: 20, sessionCount: 2, toolCallCount: 8 },
+          { date: localDateOffset(0), messageCount: 30, sessionCount: 3, toolCallCount: 13 },
         ],
-        lastComputedDate: "2026-05-28",
+        lastComputedDate: localDateOffset(0),
       },
       null,
       2,

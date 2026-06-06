@@ -302,6 +302,39 @@ test("bridge covers channel fetch, filtering, fallback splitting, MCP reply supp
   await bridge.stop();
 });
 
+test("bridge ignores project-channel messages that mention the root bot", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    channelId: "channel-id",
+    turns: [{ delta: "should not respond" }],
+  });
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    rootBotAppId: "root-bot-app-id",
+  });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await injectMessageUntil(
+    workspace,
+    { content: "<@root-bot-app-id> list sessions", id: "root-mention" },
+    (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === "root-mention"),
+    5000,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 150));
+
+  const state = readState(workspace.stateDir);
+  const userTurns = state.fixtures.codex.protocolEvents
+    .filter((event) => event.event === "client-message")
+    .map((event) => event.message)
+    .filter((message) =>
+      message.method === "turn/start" &&
+      !message.params?.input?.[0]?.text?.startsWith("You are communicating with the user via Discord")
+    );
+  assert.equal(userTurns.length, 0);
+  assert.equal(state.fixtures.discord.sends.length, 0);
+  await bridge.stop();
+});
+
 test("bridge logs failed nickname PATCH responses", async () => {
   const workspace = createBridgeWorkspace();
   const seed = readState(workspace.stateDir);

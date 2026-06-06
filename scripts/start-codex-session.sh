@@ -170,7 +170,7 @@ print(f"Recorded PID {pid}")
 PY
 }
 
-IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME BOT_TOKEN CHANNEL_ID WS_PORT DISCORD_USER_ID GUILD_ID ROOT_TOKEN BOT_APP_ID BOT_ID <<< "$(python3 -c "
+IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME BOT_TOKEN CHANNEL_ID WS_PORT DISCORD_USER_ID GUILD_ID ROOT_TOKEN ROOT_BOT_APP_ID BOT_APP_ID BOT_ID <<< "$(python3 -c "
 import json, os
 r = json.load(open('$REGISTRY'))
 p = r['projects']['$PROJECT']
@@ -186,6 +186,7 @@ print('\t'.join([
     r['discord_user_id'],
     r['guild_id'],
     root_bot['token'],
+    root_bot['app_id'],
     bot['app_id'],
     bot['id']
 ]))
@@ -235,7 +236,7 @@ if os.path.exists(config_path):
 
 BOT_DISPLAY_NAME="${BOT_ID}-${PROJECT}-codex"
 
-tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$ROOT_DIR' && BOT_TOKEN='$BOT_TOKEN' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_ID='$DISCORD_USER_ID' GUILD_ID='$GUILD_ID' ROOT_BOT_TOKEN='$ROOT_TOKEN' BOT_APP_ID='$BOT_APP_ID' BOT_DISPLAY_NAME='$BOT_DISPLAY_NAME' node scripts/codex-bridge.js"
+tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$ROOT_DIR' && BOT_TOKEN='$BOT_TOKEN' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_ID='$DISCORD_USER_ID' GUILD_ID='$GUILD_ID' ROOT_BOT_TOKEN='$ROOT_TOKEN' ROOT_BOT_APP_ID='$ROOT_BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' BOT_DISPLAY_NAME='$BOT_DISPLAY_NAME' node scripts/codex-bridge.js"
 echo "Started Codex bridge in tmux session '$SCREEN_NAME'"
 echo "Attach with: tmux attach -t $SCREEN_NAME"
 record_codex_pid "$CHANNEL_ID" "$BOT_APP_ID"
