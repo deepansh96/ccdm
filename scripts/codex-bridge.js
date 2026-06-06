@@ -113,8 +113,17 @@ async function updateNickname(totalTokens, contextWindow) {
         body: JSON.stringify({ nick }),
       }
     );
-    if (res.ok) console.log(`Nickname updated: ${nick}`);
-  } catch {}
+    if (res.ok) {
+      console.log(`Nickname updated: ${nick}`);
+    } else {
+      const body = await res.text().catch(() => "");
+      console.error(
+        `Nickname update failed: Discord API ${res.status}${res.statusText ? ` ${res.statusText}` : ""}${body ? `: ${body}` : ""}`
+      );
+    }
+  } catch (err) {
+    console.error(`Nickname update failed: ${err.message || err}`);
+  }
 }
 
 function startTyping() {

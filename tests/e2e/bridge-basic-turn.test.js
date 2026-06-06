@@ -302,6 +302,33 @@ test("bridge covers channel fetch, filtering, fallback splitting, MCP reply supp
   await bridge.stop();
 });
 
+test("bridge logs failed nickname PATCH responses", async () => {
+  const workspace = createBridgeWorkspace();
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.restFailures = [
+    { status: 403, body: { message: "missing permissions" } },
+  ];
+  writeState(seed, workspace.stateDir);
+  const codex = await startFakeCodexServer(workspace, {
+    turns: [
+      { delta: "usage done", tokenUsage: { last: { inputTokens: 42 }, modelContextWindow: 100 } },
+    ],
+  });
+  const bridge = startBridge(workspace, { port: codex.port });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await injectMessageUntil(
+    workspace,
+    { content: "usage", id: "failed-nickname-usage-message" },
+    (nextState) => nextState.fixtures.discord.sends.some((send) => send.content === "usage done"),
+    5000,
+  );
+  await bridge.waitForOutput(/Nickname update failed: Discord API 403.*missing permissions/, 5000);
+  const state = readState(workspace.stateDir);
+  assert.equal(state.fixtures.discord.restFailureUses[0].path, "/api/v10/guilds/guild-id/members/@me");
+  await bridge.stop();
+});
+
 test("bridge handles approvals, active-turn steer, and stale-turn queue fallback", async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, {
