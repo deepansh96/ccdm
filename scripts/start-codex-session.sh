@@ -171,11 +171,23 @@ PY
 }
 
 IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME BOT_TOKEN CHANNEL_ID WS_PORT DISCORD_USER_ID GUILD_ID ROOT_TOKEN ROOT_BOT_APP_ID BOT_APP_ID BOT_ID <<< "$(python3 -c "
-import json, os
+import base64, json, os, re
 r = json.load(open('$REGISTRY'))
 p = r['projects']['$PROJECT']
 bot = next(b for b in r['pool'] if b['id'] == p['bot_id'])
 root_bot = next(b for b in r['pool'] if b['id'] == 'bot1')
+root_bot_app_id = root_bot['app_id']
+root_env = os.path.expanduser('~/.claude/channels/discord/.env')
+if os.path.exists(root_env):
+    text = open(root_env).read()
+    match = re.search(r'DISCORD_BOT_TOKEN=(\S+)', text)
+    if match:
+        token_id = match.group(1).split('.')[0]
+        try:
+            token_id += '=' * ((4 - len(token_id) % 4) % 4)
+            root_bot_app_id = base64.urlsafe_b64decode(token_id).decode()
+        except Exception:
+            pass
 print('\t'.join([
     os.path.expanduser(p['path']),
     os.path.expanduser(bot['state_dir']),
@@ -186,7 +198,7 @@ print('\t'.join([
     r['discord_user_id'],
     r['guild_id'],
     root_bot['token'],
-    root_bot['app_id'],
+    root_bot_app_id,
     bot['app_id'],
     bot['id']
 ]))

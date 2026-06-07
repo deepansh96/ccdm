@@ -129,6 +129,11 @@ test("start-codex-session constructs a bridge tmux launch, removes stale MCP con
   const workspace = createWorkspace();
   const registrySeed = buildCodexRegistry(workspace);
   seedRegistry(workspace, registrySeed);
+  fs.mkdirSync(path.join(workspace.homeDir, ".claude", "channels", "discord"), { recursive: true });
+  fs.writeFileSync(
+    path.join(workspace.homeDir, ".claude", "channels", "discord", ".env"),
+    "DISCORD_BOT_TOKEN=cm9vdC1saXN0ZW5lci1pZA.fixture.token\n",
+  );
   const codexDir = path.join(workspace.homeDir, ".codex");
   fs.mkdirSync(codexDir, { recursive: true });
   fs.writeFileSync(
@@ -176,7 +181,7 @@ test("start-codex-session constructs a bridge tmux launch, removes stale MCP con
     CHANNEL_ID: registrySeed.projects.alpha.channel_id,
     GUILD_ID: registrySeed.guild_id,
     PROJECT_DIR: registrySeed.projects.alpha.path,
-    ROOT_BOT_APP_ID: registrySeed.pool[0].app_id,
+    ROOT_BOT_APP_ID: "root-listener-id",
     ROOT_BOT_TOKEN: registrySeed.pool[0].token,
     WS_PORT: String(registrySeed.projects.alpha.ws_port),
   });
