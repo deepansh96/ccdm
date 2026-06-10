@@ -170,7 +170,7 @@ print(f"Recorded PID {pid}")
 PY
 }
 
-IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME BOT_TOKEN CHANNEL_ID WS_PORT DISCORD_USER_ID GUILD_ID ROOT_TOKEN ROOT_BOT_APP_ID BOT_APP_ID BOT_ID <<< "$(python3 -c "
+IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME BOT_TOKEN CHANNEL_ID WS_PORT DISCORD_USER_ID GUILD_ID ROOT_TOKEN ROOT_BOT_APP_ID BOT_APP_ID BOT_ID CODEX_HOME_DIR <<< "$(python3 -c "
 import base64, json, os, re
 r = json.load(open('$REGISTRY'))
 p = r['projects']['$PROJECT']
@@ -200,7 +200,8 @@ print('\t'.join([
     root_bot['token'],
     root_bot_app_id,
     bot['app_id'],
-    bot['id']
+    bot['id'],
+    os.path.expanduser(p.get('codex_home', '~/.codex')),
 ]))
 ")"
 
@@ -217,10 +218,13 @@ if [[ -n "$EXISTING_PIDS" ]]; then
   exit 1
 fi
 
-# Remove stale discord MCP entries from global codex config (they get re-registered per session)
-python3 -c "
+# Remove stale discord MCP entries from the selected Codex home config
+# (they get re-registered per session)
+python3 - "$CODEX_HOME_DIR" <<'PY' 2>/dev/null || true
 import os
-config_path = os.path.expanduser('~/.codex/config.toml')
+import sys
+codex_home = os.path.expanduser(sys.argv[1])
+config_path = os.path.join(codex_home, 'config.toml')
 if os.path.exists(config_path):
     with open(config_path) as f:
         lines = f.readlines()
@@ -244,11 +248,16 @@ if os.path.exists(config_path):
         prev_blank = blank
     with open(config_path, 'w') as f:
         f.writelines(result)
-" 2>/dev/null || true
+PY
 
 BOT_DISPLAY_NAME="${BOT_ID}-${PROJECT}-codex"
+AUDIO_TRANSCRIPTION_ENV=""
+TRANSCRIBE_AUDIO_FLAG="${CODEX_BRIDGE_TRANSCRIBE_AUDIO:-${USE_AUDIO_TRANSCRIPTION_IN_BRIDGE:-}}"
+if [[ -n "$TRANSCRIBE_AUDIO_FLAG" ]]; then
+  AUDIO_TRANSCRIPTION_ENV=" CODEX_BRIDGE_TRANSCRIBE_AUDIO='${TRANSCRIBE_AUDIO_FLAG}'"
+fi
 
-tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$ROOT_DIR' && BOT_TOKEN='$BOT_TOKEN' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_ID='$DISCORD_USER_ID' GUILD_ID='$GUILD_ID' ROOT_BOT_TOKEN='$ROOT_TOKEN' ROOT_BOT_APP_ID='$ROOT_BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' BOT_DISPLAY_NAME='$BOT_DISPLAY_NAME' node scripts/codex-bridge.js"
+tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' BOT_TOKEN='$BOT_TOKEN' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_ID='$DISCORD_USER_ID' GUILD_ID='$GUILD_ID' ROOT_BOT_TOKEN='$ROOT_TOKEN' ROOT_BOT_APP_ID='$ROOT_BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' BOT_DISPLAY_NAME='$BOT_DISPLAY_NAME'$AUDIO_TRANSCRIPTION_ENV node scripts/codex-bridge.js"
 echo "Started Codex bridge in tmux session '$SCREEN_NAME'"
 echo "Attach with: tmux attach -t $SCREEN_NAME"
 record_codex_pid "$CHANNEL_ID" "$BOT_APP_ID"

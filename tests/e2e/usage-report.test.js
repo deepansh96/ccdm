@@ -317,23 +317,3 @@ test("usage report tolerates corrupt session JSON while preserving stats and pro
   assert.match(result.stdout, /Active session files: 2/);
   assert.match(result.stdout, /~\/alpha\s+2/);
 });
-
-test("usage loop template remains a static placeholder boundary", () => {
-  const workspace = createWorkspace();
-  const templatePath = path.join(workspace.repoDir, "scripts", "usage-report-loop.sh.example");
-  const livePath = path.join(workspace.repoDir, "scripts", "usage-report-loop.sh");
-  const template = fs.readFileSync(templatePath, "utf8");
-
-  assert.ok(fs.existsSync(templatePath));
-  assert.ok(!fs.existsSync(livePath), "ignored live usage-report loop must not enter Test Workspaces");
-  assert.match(template, /CHANNEL_ID="YOUR_USAGE_STATS_CHANNEL_ID"/);
-  assert.match(template, /BOT_TOKEN="YOUR_BOT_TOKEN"/);
-  assert.match(template, /\/tmp\/usage_report_usage\.json/);
-  assert.match(template, /\/tmp\/usage_report_profile\.json/);
-  assert.match(template, /\/tmp\/usage_report_msg\.txt/);
-  assert.match(template, /security find-generic-password/);
-  assert.match(template, /claude --version/);
-  assert.match(template, /curl -s "https:\/\/api\.anthropic\.com\/api\/oauth\/usage"/);
-  assert.match(template, /curl -s -X POST "https:\/\/discord\.com\/api\/v10\/channels\/\$\{CHANNEL_ID\}\/messages"/);
-  assert.match(template, /sleep \$INTERVAL/);
-});

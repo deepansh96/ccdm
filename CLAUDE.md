@@ -46,6 +46,7 @@ Read the `registry.json` file in this project's root directory. It has two main 
 - `channel_id`: Discord channel ID the bot is scoped to
 - `type`: session type — `"claude"` (default) or `"codex"`. Omitted entries default to `"claude"`.
 - `ws_port`: (codex only) WebSocket port for the codex app-server (e.g., `18301`)
+- `codex_home`: (codex only, optional) Codex home directory for this project. Defaults to `~/.codex`. Use this to run selected Codex sessions under a secondary login/account, e.g. `~/.codex-api`.
 - `session_id`: Claude Code session ID (updated on start, cleared on stop)
 - `pid`: Claude Code process ID (updated on start, cleared on stop)
 
@@ -107,22 +108,32 @@ Run `tmux list-sessions` and cross-reference with the registry. Report which pro
 
 **If type is `"codex"`:**
 
-4. Run the Codex bridge script (do NOT run the bridge manually — the script sets all required env vars including GUILD_ID, ROOT_BOT_TOKEN, BOT_APP_ID, and BOT_DISPLAY_NAME):
+4. Choose the Codex account from `codex_home` if set, otherwise `~/.codex`. The start script exports `CODEX_HOME` to the bridge, and the bridge passes it through to `codex app-server`.
+   - Default subscription/ChatGPT account: keep using `~/.codex`.
+   - Secondary API-key account: create a separate home and login there:
+     ```sh
+     mkdir -p ~/.codex-api
+     printf '%s' "$OPENAI_API_KEY" | CODEX_HOME=$HOME/.codex-api codex login --with-api-key
+     ```
+     For the cleanest separation, put `cli_auth_credentials_store = "file"` in `~/.codex-api/config.toml` before login. Treat `auth.json` in each Codex home like a password.
+5. Run the Codex bridge script (do NOT run the bridge manually — the script sets all required env vars including CODEX_HOME, GUILD_ID, ROOT_BOT_TOKEN, BOT_APP_ID, and BOT_DISPLAY_NAME):
    ```sh
    scripts/start-codex-session.sh <project_name>
    ```
-5. Verify it started by capturing the tmux pane output:
+6. Verify it started by capturing the tmux pane output:
    ```sh
    tmux capture-pane -t <screen_name> -p
    ```
    Look for "Codex-Discord bridge running" and "Listening in #channel-name" to confirm. The bridge spawns `codex app-server` internally.
-6. Update `registry.json` with the PID of the node process. The `scripts/start-codex-session.sh` helper does this automatically after starting.
+7. Update `registry.json` with the PID of the node process. The `scripts/start-codex-session.sh` helper does this automatically after starting.
 
 The bridge automatically registers a `discord-<channel_id>` MCP server with the Codex app-server on startup, giving Codex access to Discord tools: `reply` (with file attachments), `edit_message`, `react`, `fetch_messages`, and `download_attachment`. No manual MCP configuration is needed — it's handled transparently by `codex-bridge.js`.
 
 **Codex bridge behavior:**
 - **MCP-only replies:** Codex does NOT auto-stream text to Discord. It works silently and sends messages only when it calls the `reply` MCP tool (matching Claude Code's Discord plugin behavior). If Codex fails to call `reply` during a turn, the bridge flushes buffered text as a fallback.
 - **Mid-turn messages (turn/steer):** When the user sends a message while Codex is working, the bridge injects it into the active turn via `turn/steer` so the model sees it immediately. If steering fails (race condition), the message is queued with ⏳ and processed when the turn completes.
+- **Voice transcription:** Codex bridge audio transcription is on by default. Audio attachments such as Discord voice messages are downloaded to a temp directory, transcribed with local `whisper`, and sent to Codex as transcript text. The audio attachment itself is not sent to the model. Other non-audio attachments still flow normally. Set `CODEX_BRIDGE_TRANSCRIBE_AUDIO=0` (or `USE_AUDIO_TRANSCRIPTION_IN_BRIDGE=0` via `scripts/start-codex-session.sh`) to disable it for a bridge process.
+- **Account selection:** Codex bridge sessions use `CODEX_HOME` from the project's `codex_home` registry field. This allows different projects to run under different Codex accounts without changing the system default login.
 - **Discord commands:** Users can send these in Codex channels:
   - `/compact` — triggers context compaction, confirms when complete
   - `/clear` — archives the current thread and starts a fresh conversation
@@ -156,7 +167,7 @@ This assigns an available bot from the pool to a new project and scopes it to a 
 **Registration steps:**
 1. Check the pool for an unassigned bot (`assigned_to` is `null`). If none available, tell the user: "No bots available in the pool. Add one with `pool add` or remove a project to free one up."
 2. Claim the first available bot: set its `assigned_to` to `<project_name>`.
-3. Add the project to `registry.json` with `bot_id`, `path`, `screen_name`, `channel_id`, and `type`. If `type` is `"codex"`, also assign a `ws_port` (base 18300 + next available offset — check existing codex projects for used ports).
+3. Add the project to `registry.json` with `bot_id`, `path`, `screen_name`, `channel_id`, and `type`. If `type` is `"codex"`, also assign a `ws_port` (base 18300 + next available offset — check existing codex projects for used ports). For Codex projects that should use a secondary account, add `codex_home`, e.g. `"codex_home": "~/.codex-api"`.
 4. Rename the bot on Discord to `<bot_id>-<project_name>-<type>` (e.g., `bot2-my-project-claude` or `bot2-my-project-codex`):
    ```sh
    curl -s -X PATCH "https://discord.com/api/v10/users/@me" \
@@ -529,9 +540,21 @@ The Launch Agent runs `restart-root-agent.sh` on login, which starts the root ag
 
 To unload: `launchctl unload ~/Library/LaunchAgents/com.claude.root-agent.plist`
 
-### Usage Report Loop
+### Usage Stats Poster
 
-See CLAUDE.local.md for details (contains channel IDs and token references). Runs `scripts/usage-report-loop.sh` in its own tmux session (`usage_report`), posting stats every 2 hours.
+See CLAUDE.local.md for environment-specific details (contains channel IDs, bot token references, and the local script path). The real scheduled report is a macOS LaunchAgent named `com.discord.usage-stats-poster`, not a tmux loop. It posts Claude Code plus ChatGPT/Codex usage stats every 30 minutes.
+
+The poster reads:
+- Claude Code live limits from Anthropic OAuth APIs via the macOS Keychain credential.
+- Codex rate-limit data from local Codex session files under `~/.codex/sessions`.
+- Codex API-key account token data from `~/.codex-api/sessions` after sessions are started with `"codex_home": "~/.codex-api"`. Codex API-key session files currently include token counts but not ChatGPT-style rate-limit percentages. OpenAI Platform usage/cost API data requires an API key with usage-read permissions.
+
+Useful checks:
+```sh
+launchctl list | grep usage-stats-poster
+tail -120 /tmp/usage-stats-poster.log
+tail -120 /tmp/usage-stats-poster.err
+```
 
 ### Important Notes
 

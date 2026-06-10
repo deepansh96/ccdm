@@ -46,6 +46,7 @@ function buildCodexRegistry(workspace, options = {}) {
         channel_id: "channel-id",
         type: "codex",
         ws_port: 18342,
+        ...(options.codexHome ? { codex_home: options.codexHome } : {}),
         session_id: null,
         pid: null,
       },
@@ -127,17 +128,18 @@ test("npm fixture fails closed when a scenario tries to run package installation
 
 test("start-codex-session constructs a bridge tmux launch, removes stale MCP config, and records PID", async () => {
   const workspace = createWorkspace();
-  const registrySeed = buildCodexRegistry(workspace);
+  const codexHome = path.join(workspace.homeDir, ".codex-api");
+  const defaultCodexHome = path.join(workspace.homeDir, ".codex");
+  const registrySeed = buildCodexRegistry(workspace, { codexHome });
   seedRegistry(workspace, registrySeed);
   fs.mkdirSync(path.join(workspace.homeDir, ".claude", "channels", "discord"), { recursive: true });
   fs.writeFileSync(
     path.join(workspace.homeDir, ".claude", "channels", "discord", ".env"),
     "DISCORD_BOT_TOKEN=cm9vdC1saXN0ZW5lci1pZA.fixture.token\n",
   );
-  const codexDir = path.join(workspace.homeDir, ".codex");
-  fs.mkdirSync(codexDir, { recursive: true });
+  fs.mkdirSync(codexHome, { recursive: true });
   fs.writeFileSync(
-    path.join(codexDir, "config.toml"),
+    path.join(codexHome, "config.toml"),
     [
       'model = "gpt-5"',
       "",
@@ -147,6 +149,15 @@ test("start-codex-session constructs a bridge tmux launch, removes stale MCP con
       "",
       "[mcp_servers.keep]",
       'command = "keep"',
+      "",
+    ].join("\n"),
+  );
+  fs.mkdirSync(defaultCodexHome, { recursive: true });
+  fs.writeFileSync(
+    path.join(defaultCodexHome, "config.toml"),
+    [
+      "[mcp_servers.discord-default-home]",
+      'command = "default"',
       "",
     ].join("\n"),
   );
@@ -162,9 +173,10 @@ test("start-codex-session constructs a bridge tmux launch, removes stale MCP con
   assert.match(result.stdout, /Recorded PID \d+/);
   assert.deepEqual(afterInventory, beforeInventory);
 
-  const config = fs.readFileSync(path.join(codexDir, "config.toml"), "utf8");
+  const config = fs.readFileSync(path.join(codexHome, "config.toml"), "utf8");
   assert.match(config, /\[mcp_servers\.keep\]/);
   assert.doesNotMatch(config, /discord-channel-id/);
+  assert.match(fs.readFileSync(path.join(defaultCodexHome, "config.toml"), "utf8"), /discord-default-home/);
 
   const registry = readRegistry(workspace);
   assert.equal(typeof registry.projects.alpha.pid, "number");
@@ -179,6 +191,7 @@ test("start-codex-session constructs a bridge tmux launch, removes stale MCP con
     BOT_DISPLAY_NAME: "bot2-alpha-codex",
     BOT_TOKEN: registrySeed.pool[1].token,
     CHANNEL_ID: registrySeed.projects.alpha.channel_id,
+    CODEX_HOME: codexHome,
     GUILD_ID: registrySeed.guild_id,
     PROJECT_DIR: registrySeed.projects.alpha.path,
     ROOT_BOT_APP_ID: "root-listener-id",

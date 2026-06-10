@@ -82,6 +82,11 @@ function initialState() {
       tmux: {
         sessions: {},
       },
+      whisper: {
+        failures: {},
+        invocations: [],
+        transcriptions: {},
+      },
     },
     snapshots: [],
   };
@@ -157,6 +162,11 @@ function normalizeState(value) {
       tmux: {
         ...(value?.fixtures?.tmux ?? {}),
         sessions: value?.fixtures?.tmux?.sessions ?? {},
+      },
+      whisper: {
+        failures: value?.fixtures?.whisper?.failures ?? {},
+        invocations: value?.fixtures?.whisper?.invocations ?? [],
+        transcriptions: value?.fixtures?.whisper?.transcriptions ?? {},
       },
     },
     snapshots: value?.snapshots ?? [],

@@ -207,13 +207,19 @@ PY
 
 # Read project config and resolve bot's state_dir from the pool
 # Uses tab delimiter to handle paths with spaces
-IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME <<< "$(python3 -c "
+IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME MODEL <<< "$(python3 -c "
 import json, os
 r = json.load(open('$REGISTRY'))
 p = r['projects']['$PROJECT']
 bot = next(b for b in r['pool'] if b['id'] == p['bot_id'])
-print(os.path.expanduser(p['path']) + '\t' + os.path.expanduser(bot['state_dir']) + '\t' + p['screen_name'])
+print(os.path.expanduser(p['path']) + '\t' + os.path.expanduser(bot['state_dir']) + '\t' + p['screen_name'] + '\t' + (p.get('model') or ''))
 ")"
+
+# Optional model override (e.g. "claude-opus-4-8[1m]"). Empty -> account default.
+MODEL_FLAG=""
+if [[ -n "$MODEL" ]]; then
+  MODEL_FLAG=" --model '$MODEL'"
+fi
 
 if tmux has-session -t "=$SCREEN_NAME" 2>/dev/null; then
   echo "Session '$SCREEN_NAME' is already running."
@@ -228,7 +234,7 @@ if [[ -n "$EXISTING_PIDS" ]]; then
   exit 1
 fi
 
-tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$PATH_DIR' && DISCORD_STATE_DIR='$STATE_DIR' claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions"
+tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$PATH_DIR' && DISCORD_STATE_DIR='$STATE_DIR' claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions$MODEL_FLAG"
 echo "Started Discord bot in tmux session '$SCREEN_NAME'"
 echo "Attach with: tmux attach -t $SCREEN_NAME"
 record_claude_pid "$STATE_DIR"

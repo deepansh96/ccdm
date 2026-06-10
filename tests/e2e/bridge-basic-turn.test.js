@@ -701,6 +701,72 @@ test("bridge builds Codex input for empty messages and image, text, binary, and 
   await bridge.stop();
 });
 
+test("bridge transcribes audio attachments by default", async () => {
+  const workspace = createBridgeWorkspace();
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.attachments["https://cdn.discordapp.com/attachments/channel/message/voice-message.ogg"] = {
+    body: "fixture audio body",
+    contentType: "audio/ogg",
+  };
+  seed.fixtures.discord.attachments["https://cdn.discordapp.com/attachments/channel/message/notes.txt"] = {
+    body: "text attachment",
+    contentType: "text/plain",
+  };
+  seed.fixtures.whisper.transcriptions["voice-message.ogg"] = "please add audio support";
+  writeState(seed, workspace.stateDir);
+
+  const codex = await startFakeCodexServer(workspace, {
+    turns: [{ delta: "transcription done" }],
+  });
+  const bridge = startBridge(workspace, { port: codex.port });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const state = await injectMessageUntil(
+    workspace,
+    {
+      id: "voice-message",
+      content: "some context",
+      attachments: [
+        {
+          contentType: "audio/ogg",
+          name: "voice-message.ogg",
+          size: 399925,
+          url: "https://cdn.discordapp.com/attachments/channel/message/voice-message.ogg",
+        },
+        {
+          contentType: "text/plain",
+          name: "notes.txt",
+          size: 15,
+          url: "https://cdn.discordapp.com/attachments/channel/message/notes.txt",
+        },
+      ],
+    },
+    (nextState) =>
+      nextState.fixtures.discord.sends.some((send) => send.content === "transcription done") &&
+      nextState.fixtures.whisper.invocations.length === 1,
+    15000,
+  );
+
+  const userTurns = state.fixtures.codex.protocolEvents
+    .filter((event) => event.event === "client-message" && event.message.method === "turn/start")
+    .map((event) => event.message.params.input)
+    .filter((input) => !input[0]?.text?.startsWith("You are communicating with the user via Discord"));
+  assert.equal(userTurns.length, 1);
+  assert.equal(userTurns[0][0].text, "some context");
+  assert.match(userTurns[0][1].text, /--- Audio transcription: voice-message\.ogg ---\nplease add audio support/);
+  assert.match(userTurns[0][2].text, /--- File: notes\.txt ---\ntext attachment/);
+  assert.equal(userTurns[0].some((part) => part.text?.includes(".discord-attachments")), false);
+  assert.equal(state.fixtures.whisper.invocations[0].inputExists, true);
+  assert.deepEqual(
+    state.fixtures.discord.attachmentFetches.map((entry) => entry.url).sort(),
+    [
+      "https://cdn.discordapp.com/attachments/channel/message/notes.txt",
+      "https://cdn.discordapp.com/attachments/channel/message/voice-message.ogg",
+    ],
+  );
+  await bridge.stop();
+});
+
 test("bridge exits on login failure, app-server exit, websocket close, and startup without a thread id", async () => {
   const loginWorkspace = createBridgeWorkspace();
   let state = readState(loginWorkspace.stateDir);

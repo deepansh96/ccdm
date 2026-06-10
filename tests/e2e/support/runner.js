@@ -11,7 +11,6 @@ const FORBIDDEN_WORKSPACE_ARTIFACTS = [
   "registry.json",
   ".env",
   "CLAUDE.local.md",
-  "scripts/usage-report-loop.sh",
   ".claude",
   ".codex",
 ];
@@ -178,6 +177,7 @@ function initialState() {
       registry: null,
       security: { credentials: {}, invocations: [] },
       tmux: { sessions: {} },
+      whisper: { failures: {}, invocations: [], transcriptions: {} },
     },
     snapshots: [],
   };
@@ -239,6 +239,11 @@ function normalizeState(value) {
         invocations: value?.fixtures?.security?.invocations || [],
       },
       tmux: { ...(value?.fixtures?.tmux || {}), sessions: value?.fixtures?.tmux?.sessions || {} },
+      whisper: {
+        failures: value?.fixtures?.whisper?.failures || {},
+        invocations: value?.fixtures?.whisper?.invocations || [],
+        transcriptions: value?.fixtures?.whisper?.transcriptions || {},
+      },
     },
     snapshots: value?.snapshots || [],
   };
@@ -337,6 +342,7 @@ function parseCodexBridgeLaunch(shellCommand) {
     "ROOT_BOT_APP_ID",
     "BOT_APP_ID",
     "BOT_DISPLAY_NAME",
+    "CODEX_HOME",
   ];
   for (const name of required) {
     if (!env[name]) {
@@ -647,6 +653,36 @@ function runNpx() {
   process.exit(42);
 }
 
+function runWhisper() {
+  const inputPath = args[0];
+  const outputDirIndex = args.indexOf("--output_dir");
+  const outputDir = outputDirIndex === -1 ? process.cwd() : args[outputDirIndex + 1];
+  const inputName = path.basename(inputPath || "audio");
+  const state = updateState((nextState) => {
+    nextState.fixtures.whisper ||= { failures: {}, invocations: [], transcriptions: {} };
+    nextState.fixtures.whisper.invocations.push({
+      args,
+      cwd: process.cwd(),
+      inputExists: Boolean(inputPath && fs.existsSync(inputPath)),
+    });
+  });
+
+  if (state.fixtures.whisper.failures?.transcribe) {
+    console.error(state.fixtures.whisper.failures.transcribe);
+    process.exit(3);
+  }
+
+  fs.mkdirSync(outputDir, { recursive: true });
+  const transcript =
+    state.fixtures.whisper.transcriptions?.[inputName] ||
+    state.fixtures.whisper.transcriptions?.default ||
+    "fixture transcript";
+  fs.writeFileSync(
+    path.join(outputDir, \`\${path.parse(inputName).name}.txt\`),
+    \`\${transcript}\\n\`
+  );
+}
+
 function readJsonForJq() {
   const expression = args.includes("-r") ? args[args.indexOf("-r") + 1] : args[0];
   const file = args.at(-1) !== expression && !String(args.at(-1)).startsWith("-") ? args.at(-1) : null;
@@ -906,6 +942,8 @@ switch (tool) {
     runSecurity();
     break;
   case "whisper":
+    runWhisper();
+    break;
   case "zsh":
     process.exit(0);
     break;

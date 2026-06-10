@@ -19,7 +19,7 @@ node --test --test-concurrency=1 tests/e2e/**/*.test.js
 
 The harness uses Node's built-in `node:test` runner. Each scenario creates an isolated Test Workspace with `createWorkspace()`, runs executable CCDM surfaces with `runScript()` or `runNodeEntrypoint()`, and coordinates fixture state through `$CCDM_TEST_STATE`.
 
-Test Workspaces are assembled from tracked files only. The workspace builder refuses tracked local-only artifacts and asserts that `registry.json`, `.env`, `CLAUDE.local.md`, `.claude`, `.codex`, and ignored usage-loop content are absent from the copied repo.
+Test Workspaces are assembled from tracked files only. The workspace builder refuses tracked local-only artifacts and asserts that `registry.json`, `.env`, `CLAUDE.local.md`, `.claude`, and `.codex` are absent from the copied repo.
 
 ## Public Helper APIs
 
@@ -111,8 +111,8 @@ The tmux/process fixture contract covers the Claude start surface:
 
 The same tmux/process contract covers the Codex startup surface:
 
-- `tmux new-session -d -s <name> -- zsh -ic <command>` validates the bridge launch shape and records `BOT_TOKEN`, `CHANNEL_ID`, `PROJECT_DIR`, `WS_PORT`, `ALLOWED_USER_ID`, `GUILD_ID`, `ROOT_BOT_TOKEN`, `BOT_APP_ID`, and `BOT_DISPLAY_NAME`.
-- Codex startup tests seed registries with `type: "codex"`, `ws_port`, placeholder bot tokens, app IDs, channel IDs, Discord user/guild values, and the current `bot1` root-token invariant.
+- `tmux new-session -d -s <name> -- zsh -ic <command>` validates the bridge launch shape and records `CODEX_HOME`, `BOT_TOKEN`, `CHANNEL_ID`, `PROJECT_DIR`, `WS_PORT`, `ALLOWED_USER_ID`, `GUILD_ID`, `ROOT_BOT_TOKEN`, `BOT_APP_ID`, and `BOT_DISPLAY_NAME`.
+- Codex startup tests seed registries with `type: "codex"`, `ws_port`, optional `codex_home`, placeholder bot tokens, app IDs, channel IDs, Discord user/guild values, and the current `bot1` root-token invariant.
 - The fixture records only the bridge command construction. App-server spawning and WebSocket protocol behavior belong to later Codex bridge scenarios.
 - The `npm` fixture fails closed and records invocations so startup scenarios can prove Test Workspaces do not run package installation or contact npm.
 
@@ -148,7 +148,7 @@ The Claude usage-report scenarios drive `scripts/claude-usage.sh` with fixture h
 - The `security` fixture supports `find-generic-password -s "Claude Code-credentials" -w`, records invocations, and returns test-seeded OAuth keychain JSON. Missing credentials make the script exercise its current graceful no-auth path.
 - The `curl` fixture records method, URL, path, query, headers, and body under `$CCDM_TEST_STATE`, matches extensible route entries by method/hostname/path/url, supports JSON and raw-body response modes, and blocks unapproved targets as network egress.
 - OAuth profile and usage routes are faked through `https://api.anthropic.com/api/oauth/{profile,usage}`. Malformed API responses are covered as current graceful warning behavior.
-- The usage loop remains a static/template boundary: `scripts/usage-report-loop.sh.example` is checked for placeholder channel/token values, fakeable external commands, and hardcoded `/tmp/usage_report_*` files. Executing the ignored local live loop is deferred because it is not tracked in fresh clones and is intended for live posting.
+- Scheduled Discord usage posting is handled outside the default E2E suite by a local LaunchAgent documented in `CLAUDE.local.md`. The removed tmux usage-loop scripts are no longer part of the tracked executable surface.
 
 The nickname/statusline scenarios drive `scripts/cc-discord-nicknames.sh`, `scripts/cc-statusline-wrapper.sh`, and their shared `_update-nickname.sh` helper:
 
@@ -195,12 +195,11 @@ GitHub Actions runs the Default CI Suite on `push` and `pull_request` with Node 
 ## Hardcoded-Boundary Inventory
 
 - `/tmp/cc-context-<state>` nickname files are created by the production nickname helper outside fixture `TMPDIR`. Tests use unique state directory basenames, assert the boundary, and clean the files explicitly.
-- `/tmp/usage_report_*` files are present in `scripts/usage-report-loop.sh.example`. The tracked template is checked statically for placeholder credentials and fakeable commands; ignored live-loop execution stays deferred until a safe tracked executable exists.
 - Shell builtin `kill` is not intercepted. Stop/restart tests constrain fake process discovery to harness-owned placeholder PIDs and assert observable process cleanup instead of command-order internals.
 
 ## Extraction Follow-Ups
 
-Instruction-only root-agent workflows are outside issue #4 until they are extracted into deterministic executable surfaces. Follow-up extraction work should cover register, deregister, pool management, polls, context report, and ignored usage-loop execution. Those workflows remain documented root-agent conversation behavior, not Default CI Suite coverage.
+Instruction-only root-agent workflows are outside issue #4 until they are extracted into deterministic executable surfaces. Follow-up extraction work should cover register, deregister, pool management, polls, and context report. Those workflows remain documented root-agent conversation behavior, not Default CI Suite coverage.
 
 ## Adding Scenarios
 

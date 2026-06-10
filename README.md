@@ -44,6 +44,47 @@ CCDM is built on the [official Anthropic Discord plugin for Claude Code](https:/
 | `jq` | Yes | `brew install jq` / `apt install jq` |
 | `whisper` | Optional | `pip install openai-whisper` (for voice messages) |
 
+For Codex bridge sessions, voice-message transcription is on by default. The
+bridge transcribes `audio/*` attachments with local `whisper` and sends Codex
+the transcript instead of the audio file. Set `CODEX_BRIDGE_TRANSCRIBE_AUDIO=0`
+to disable it for a bridge process.
+
+### Codex Accounts
+
+Codex bridge sessions use `CODEX_HOME` to choose which Codex login/profile to
+run under. By default, CCDM uses `~/.codex`, so existing Codex projects keep
+using your normal ChatGPT/subscription login.
+
+To run selected projects with a secondary API-key account, create a separate
+Codex home and log in there:
+
+```bash
+mkdir -p ~/.codex-api
+printf '%s' "$OPENAI_API_KEY" | CODEX_HOME=$HOME/.codex-api codex login --with-api-key
+CODEX_HOME=$HOME/.codex-api codex login status
+```
+
+For the most predictable account separation, add this to
+`~/.codex-api/config.toml` before logging in:
+
+```toml
+cli_auth_credentials_store = "file"
+```
+
+Then add `codex_home` to any Codex project in `registry.json` that should use
+that account:
+
+```json
+{
+  "type": "codex",
+  "ws_port": 18342,
+  "codex_home": "~/.codex-api"
+}
+```
+
+Projects without `codex_home` continue to use `~/.codex`. Treat each
+`auth.json` under a Codex home like a password.
+
 You also need:
 - A Discord account
 - A Discord server where you can add bots
@@ -222,6 +263,40 @@ CCDM includes a usage reporting script (`scripts/claude-usage.sh`) that shows:
 The live data section uses the macOS Keychain to retrieve your Claude Code OAuth token. On Linux, this section gracefully skips and local stats still work.
 
 Ask the root agent for a usage report by messaging `usage`, `limits`, or `how much usage left`.
+
+## Scheduled Usage Stats Poster
+
+A separate macOS LaunchAgent can post usage stats to Discord on a schedule. This is the current live setup for automated usage reporting; it is not the old tmux-based `usage-report-loop.sh` flow.
+
+The LaunchAgent runs a Python poster script every 30 minutes:
+
+```bash
+~/Library/LaunchAgents/com.discord.usage-stats-poster.plist
+```
+
+The poster reports:
+- Claude Code limits from Anthropic OAuth APIs via the macOS Keychain credential
+- ChatGPT/Codex limits from local Codex session files under `~/.codex/sessions`
+- API-key Codex account token usage from `~/.codex-api/sessions`, once a project runs with `"codex_home": "~/.codex-api"`
+
+Codex API-key session files currently expose token counts, not ChatGPT-style
+rate-limit percentages. OpenAI Platform usage/cost API reporting requires an API
+key with usage-read permissions.
+
+Useful commands:
+
+```bash
+launchctl list | grep usage-stats-poster
+tail -120 /tmp/usage-stats-poster.log
+tail -120 /tmp/usage-stats-poster.err
+```
+
+After changing the plist interval or script path, reload it:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.discord.usage-stats-poster.plist
+launchctl load ~/Library/LaunchAgents/com.discord.usage-stats-poster.plist
+```
 
 ## Context Nicknames
 

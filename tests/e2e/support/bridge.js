@@ -311,6 +311,7 @@ export function startBridge(workspace, options = {}) {
     ROOT_BOT_TOKEN: options.rootBotToken ?? "root-token",
     ROOT_BOT_APP_ID: options.rootBotAppId ?? "root-bot-app-id",
     WS_PORT: String(options.port),
+    ...(options.env ?? {}),
   });
   const command = [process.execPath, path.join(workspace.repoDir, "scripts/codex-bridge.js")];
   const child = spawn(command[0], [command[1]], {

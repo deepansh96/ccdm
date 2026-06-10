@@ -35,8 +35,8 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Claude start | CLAUDE.md pre-trust/send-key boundary | Covered | `start-session.sh` does not write `.claude.json` or send trust-dialog Enter; that remains manual documented workflow. |
 | Codex start | Registry fixture schema | Covered | Codex registries include Discord user/guild values, placeholder bot tokens, app IDs, channel IDs, `type: "codex"`, screen names, `ws_port`, and the current `bot1` root-token invariant. |
 | Codex start | Successful bridge launch | Covered | Drives `scripts/start-codex-session.sh`, builds the bridge tmux command, records the bridge PID, and leaves app-server spawning to bridge slices. |
-| Codex start | Stale MCP cleanup | Covered | Removes stale `~/.codex/config.toml` `discord-*` MCP blocks while preserving unrelated MCP config. |
-| Codex start | Bridge environment construction | Covered | Asserts `BOT_TOKEN`, `CHANNEL_ID`, `PROJECT_DIR`, `WS_PORT`, `ALLOWED_USER_ID`, `GUILD_ID`, `ROOT_BOT_TOKEN`, `BOT_APP_ID`, and `BOT_DISPLAY_NAME` from registry fields. |
+| Codex start | Stale MCP cleanup | Covered | Removes stale `discord-*` MCP blocks from the selected `CODEX_HOME/config.toml` while preserving unrelated MCP config and leaving the default Codex home untouched when `codex_home` is set. |
+| Codex start | Bridge environment construction | Covered | Asserts `CODEX_HOME`, `BOT_TOKEN`, `CHANNEL_ID`, `PROJECT_DIR`, `WS_PORT`, `ALLOWED_USER_ID`, `GUILD_ID`, `ROOT_BOT_TOKEN`, `BOT_APP_ID`, and `BOT_DISPLAY_NAME` from registry fields. |
 | Codex start | Paths with spaces/quotes | Covered | Project paths with spaces and double quotes are captured through `PROJECT_DIR`. |
 | Codex start | Already-running tmux guard | Covered | Existing target tmux session exits successfully without launching another bridge. |
 | Codex start | Duplicate bridge/app-server guard | Covered | Fixture `ps` rows for matching bridge channel/app ID or app-server port fail before creating the target tmux session. |
@@ -95,8 +95,7 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Claude usage | Local stats summaries | Covered | Fixture `stats-cache.json` covers lifetime totals, daily averages, this-week, this-month, monthly breakdown, busiest days, day-of-week distribution, and streaks. |
 | Claude usage | History and sessions | Covered | Fixture `history.jsonl` and session JSON files cover project counts, session listing, and corrupt session JSON tolerance. |
 | Claude usage | Relative date logic | Covered | Stats fixture around the current test date asserts last-seven-days inclusion and current/longest streak behavior. |
-| Usage loop template | Static safety boundary | Covered | `scripts/usage-report-loop.sh.example` uses placeholder channel/token values, fakeable `security`/`claude`/`curl`/`sleep` commands, and documented fixed `/tmp/usage_report_*` files. |
-| Usage loop template | Ignored live-loop execution | Deferred | The ignored `scripts/usage-report-loop.sh` is not copied into Test Workspaces and remains out of scope until a safe tracked executable exists. |
+| Usage stats poster | LaunchAgent boundary | Documented | The real scheduled Discord poster is local LaunchAgent-driven and documented in CLAUDE.local.md, README.md, and CLAUDE.md rather than tracked as the removed tmux loop. |
 | Fixture contracts | `npx` no-network guard | Covered | Fake `npx -y ccstatusline@latest` returns deterministic statusline output, records stdin/args, and blocks unapproved package execution without network access. |
 | Fixture contracts | Discord nickname curl PATCH | Covered | Fake `curl` parses shell-level `PATCH /api/v10/guilds/:guild/members/:member`, records method, URL, headers, and body, and mirrors entries into the unified fake Discord nickname store. |
 | Nickname/statusline | Project app-id PATCH path | Covered | `cc-statusline-wrapper.sh` reads fixture root `.env`, resolves the project app id from registry state, records the app-id member PATCH, and returns deterministic `ccstatusline` output. |
@@ -117,14 +116,13 @@ This audit maps the PRD workflow bullets from issue #4 to automated scenarios or
 | Root setup | Setup prerequisites, registry creation, state directories, overwrite guards, and chmod behavior | Covered | Setup scenario rows above drive `setup.sh` through fixture binaries. |
 | Claude start | Registry lookup, state-dir resolution, tmux launch construction, duplicate listener guards, PID/session recording | Covered | Claude start rows above drive `scripts/start-session.sh`. |
 | Stop session | Recorded PID ownership, process-tree termination, tmux cleanup, orphan sweeps, registry cleanup for Claude and Codex | Covered | Stop session and process safety rows above drive `scripts/stop-session.sh`. |
-| Codex start | Stale MCP cleanup, duplicate bridge detection, environment construction, root-bot token lookup, bridge PID recording | Covered | Codex start rows above drive `scripts/start-codex-session.sh`. |
+| Codex start | `CODEX_HOME` account selection, stale MCP cleanup, duplicate bridge detection, environment construction, root-bot token lookup, bridge PID recording | Covered | Codex start rows above drive `scripts/start-codex-session.sh`. |
 | Codex bridge | Filtering, attachments, queueing, steering, slash commands, fallback replies, MCP registration, diagnostics | Covered | Codex bridge and JS interception rows above drive `scripts/codex-bridge.js` with fake Discord and fake Codex app-server. |
 | Discord MCP | Reply, edit, react, fetch, attachment download, JSON-RPC lifecycle, and API error propagation | Covered | Discord MCP rows above drive `scripts/discord-mcp-server.js`. |
 | Claude usage | OAuth/keychain fallback, local stats parsing, malformed data tolerance, version reporting | Covered | Claude usage rows above drive `scripts/claude-usage.sh`. |
 | Nickname/statusline | Rate limiting, disable behavior, fixture root `.env`, PATCH construction, npx no-network statusline pipeline | Covered | Nickname/statusline and fixture contract rows above drive the nickname/statusline scripts. |
 | Root restart | Fixture tmux/process restart behavior without touching the real `root_agent` session | Covered | Root restart rows above drive `restart-root-agent.sh`. |
-| Usage loop template | Tracked usage-loop template/static boundary | Covered | Static template row above checks placeholders, fakeable commands, and fixed `/tmp/usage_report_*` paths. |
-| Usage loop execution | Ignored live usage-loop execution | Deferred | The ignored `scripts/usage-report-loop.sh` is absent from fresh clones and intended for live posting; extract a safe tracked executable before deterministic E2E execution. |
+| Usage stats poster | Local LaunchAgent execution | Deferred | The poster depends on local macOS LaunchAgent state, live Discord posting, Keychain auth, and local Codex session files, so default E2E covers the reusable `claude-usage.sh` report but not the scheduler. |
 | Live smoke | Live real-service checks | Covered | Default skip row verifies the Live Gate; issue #4 does not require a live-smoke scenario matrix. |
 | Diagnostics | Commands, streams, fixture state, file diffs, and redaction | Covered | Harness diagnostics rows above assert actionable failure context with secret redaction. |
 | Instruction-only root-agent workflows | Register, deregister, pool management, polls, context report, and other conversational workflows | Deferred | These remain Extraction Follow-Ups until implemented as executable surfaces. |

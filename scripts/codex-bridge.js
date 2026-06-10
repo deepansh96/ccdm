@@ -2,7 +2,8 @@
 
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const { spawn } = require("child_process");
-const { writeFile, mkdir } = require("fs/promises");
+const { writeFile, mkdir, mkdtemp, readFile, rm } = require("fs/promises");
+const os = require("os");
 const path = require("path");
 const WebSocket = require("ws");
 
@@ -18,6 +19,17 @@ const ROOT_BOT_TOKEN = process.env.ROOT_BOT_TOKEN;
 const ROOT_BOT_APP_ID = process.env.ROOT_BOT_APP_ID;
 const BOT_APP_ID = process.env.BOT_APP_ID;
 const BOT_DISPLAY_NAME = process.env.BOT_DISPLAY_NAME || "codex";
+const AUDIO_TRANSCRIPTION_ENABLED = envFlag(
+  true,
+  "CODEX_BRIDGE_TRANSCRIBE_AUDIO",
+  "USE_AUDIO_TRANSCRIPTION_IN_BRIDGE"
+);
+const AUDIO_TRANSCRIPTION_COMMAND =
+  process.env.CODEX_BRIDGE_AUDIO_TRANSCRIPTION_COMMAND || "whisper";
+const AUDIO_TRANSCRIPTION_MODEL =
+  process.env.CODEX_BRIDGE_AUDIO_TRANSCRIPTION_MODEL || "turbo";
+const AUDIO_TRANSCRIPTION_LANGUAGE =
+  process.env.CODEX_BRIDGE_AUDIO_TRANSCRIPTION_LANGUAGE || "en";
 
 if (!BOT_TOKEN || !CHANNEL_ID || !PROJECT_DIR) {
   console.error(
@@ -47,6 +59,17 @@ const SYSTEM_INSTRUCTION = `You are communicating with the user via Discord. Use
 
 function nextId() {
   return requestId++;
+}
+
+function envFlag(defaultValue, ...names) {
+  for (const name of names) {
+    const value = process.env[name];
+    if (!value) continue;
+    const normalized = value.toLowerCase();
+    if (["1", "true", "yes", "on"].includes(normalized)) return true;
+    if (["0", "false", "no", "off"].includes(normalized)) return false;
+  }
+  return defaultValue;
 }
 
 function sendRequest(method, params) {
@@ -514,13 +537,24 @@ const TEXT_EXTENSIONS = new Set([
   ".kt", ".scala", ".r", ".lua", ".pl", ".ex", ".exs", ".hs", ".ml",
   ".env", ".log", ".diff", ".patch", ".jsx", ".tsx", ".vue", ".svelte",
 ]);
+const AUDIO_EXTENSIONS = new Set([
+  ".aac", ".flac", ".m4a", ".mp3", ".oga", ".ogg", ".opus", ".wav", ".weba",
+]);
+
+function attachmentExtension(att) {
+  const name = att.name || "";
+  return name.includes(".") ? "." + name.split(".").pop().toLowerCase() : "";
+}
 
 function isTextFile(att) {
   if (att.contentType && att.contentType.startsWith("text/")) return true;
   if (att.contentType === "application/json") return true;
-  const name = att.name || "";
-  const ext = name.includes(".") ? "." + name.split(".").pop().toLowerCase() : "";
-  return TEXT_EXTENSIONS.has(ext);
+  return TEXT_EXTENSIONS.has(attachmentExtension(att));
+}
+
+function isAudioFile(att) {
+  if (att.contentType && att.contentType.startsWith("audio/")) return true;
+  return AUDIO_EXTENSIONS.has(attachmentExtension(att));
 }
 
 async function fetchAttachmentText(url) {
@@ -542,6 +576,77 @@ async function downloadAttachment(url, filename) {
   return filePath;
 }
 
+async function downloadTempAttachment(url, filename) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "codex-bridge-audio-"));
+  const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_") || "audio";
+  const filePath = path.join(dir, safeName);
+  const res = await fetch(url);
+  if (!res.ok) {
+    await rm(dir, { recursive: true, force: true });
+    return null;
+  }
+  const buf = Buffer.from(await res.arrayBuffer());
+  await writeFile(filePath, buf);
+  return { dir, filePath };
+}
+
+function runCommand(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        reject(
+          new Error(
+            `${command} exited with code ${code}${stderr.trim() ? `: ${stderr.trim()}` : ""}`
+          )
+        );
+      }
+    });
+  });
+}
+
+async function transcribeAudioAttachment(att) {
+  const downloaded = await downloadTempAttachment(att.url, att.name || "audio");
+  if (!downloaded) return null;
+  const outputDir = path.join(downloaded.dir, "out");
+  await mkdir(outputDir, { recursive: true });
+  try {
+    const args = [
+      downloaded.filePath,
+      "--model",
+      AUDIO_TRANSCRIPTION_MODEL,
+      "--output_format",
+      "txt",
+      "--output_dir",
+      outputDir,
+    ];
+    if (AUDIO_TRANSCRIPTION_LANGUAGE) {
+      args.push("--language", AUDIO_TRANSCRIPTION_LANGUAGE);
+    }
+    await runCommand(AUDIO_TRANSCRIPTION_COMMAND, args);
+    const transcriptPath = path.join(
+      outputDir,
+      `${path.parse(downloaded.filePath).name}.txt`
+    );
+    return (await readFile(transcriptPath, "utf8")).trim();
+  } finally {
+    await rm(downloaded.dir, { recursive: true, force: true });
+  }
+}
+
 async function buildInput(msg) {
   const input = [];
   const text = msg.content.trim();
@@ -549,6 +654,26 @@ async function buildInput(msg) {
   for (const att of msg.attachments.values()) {
     if (att.contentType && att.contentType.startsWith("image/")) {
       input.push({ type: "image", url: att.url });
+    } else if (AUDIO_TRANSCRIPTION_ENABLED && isAudioFile(att)) {
+      try {
+        const transcript = await transcribeAudioAttachment(att);
+        if (transcript) {
+          input.push({
+            type: "text",
+            text: `--- Audio transcription: ${att.name} ---\n${transcript}\n--- End audio transcription ---`,
+          });
+        } else {
+          input.push({
+            type: "text",
+            text: `[Audio attachment could not be transcribed: ${att.name}]`,
+          });
+        }
+      } catch (err) {
+        input.push({
+          type: "text",
+          text: `[Audio attachment could not be transcribed: ${att.name} (${err.message || err})]`,
+        });
+      }
     } else if (isTextFile(att)) {
       const content = await fetchAttachmentText(att.url);
       if (content) {

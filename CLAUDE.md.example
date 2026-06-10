@@ -623,34 +623,17 @@ The Launch Agent runs `restart-root-agent.sh` on login, which starts the root ag
 
 To unload: `launchctl unload ~/Library/LaunchAgents/com.claude.root-agent.plist`
 
-### Usage Report Loop
+### Usage Stats Poster
 
-A standalone bash script (`scripts/usage-report-loop.sh`) posts usage stats to a designated Discord channel every 2 hours. It runs in its own tmux session, independent of any Claude Code session. Configure `CHANNEL_ID` and `BOT_TOKEN` in the script before running.
+Automated Discord usage reports should run through a scheduler such as a macOS LaunchAgent, not the removed tmux usage loop. The poster should run independently of project sessions and can report both Claude Code and Codex usage.
 
-**Start it:**
-```sh
-tmux new-session -d -s usage_report -- zsh -ic '/path/to/ccdm/scripts/usage-report-loop.sh'
-```
+Recommended behavior:
+1. Fetch Claude Code live limits from Anthropic OAuth APIs via the macOS Keychain credential.
+2. Read Codex rate-limit data from local Codex session files under `~/.codex/sessions`.
+3. Read secondary Codex API-key account data from `~/.codex-api/sessions` when projects use `"codex_home": "~/.codex-api"`.
+4. Post to Discord through the root bot token.
 
-**Check it:**
-```sh
-tmux capture-pane -t usage_report -p
-```
-
-**Stop it:**
-```sh
-tmux kill-session -t usage_report
-```
-
-**What it does:**
-1. Fetches OAuth token from macOS Keychain
-2. Calls `api.anthropic.com/api/oauth/{usage,profile}`
-3. Formats a report with emoji progress bars (🟩 used, ⬜ free)
-4. Posts to Discord via bot1's token
-
-**To change the interval:** edit `INTERVAL=7200` in the script (value in seconds).
-
-This needs to be started manually after a reboot, like project sessions.
+For local operational paths, channel IDs, and LaunchAgent details, keep sensitive setup notes in `CLAUDE.local.md`.
 
 ### Important Notes
 

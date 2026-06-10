@@ -1,7 +1,7 @@
 registry.json
 CLAUDE.local.md
-scripts/usage-report-loop.sh
 .claude/
+.discord-attachments/
 .env
 *.log
 .DS_Store
