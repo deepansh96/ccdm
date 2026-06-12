@@ -305,17 +305,22 @@ function spawnPlaceholder() {
 }
 
 function parseClaudeLaunch(shellCommand) {
-  const match =
-    /^cd '([\\s\\S]*)' && DISCORD_STATE_DIR='([\\s\\S]*)' claude ([\\s\\S]+)$/.exec(shellCommand) ||
-    /^cd ([^&]+) && DISCORD_STATE_DIR=([^\\s]+) claude ([\\s\\S]+)$/.exec(shellCommand);
-  if (!match) {
+  const quoted =
+    /^cd '([\\s\\S]*)' && DISCORD_STATE_DIR='([\\s\\S]*?)'(?: CLAUDE_CONFIG_DIR='([\\s\\S]*?)')? claude ([\\s\\S]+)$/.exec(shellCommand);
+  const unquoted = quoted ? null : /^cd ([^&]+) && DISCORD_STATE_DIR=([^\\s]+) claude ([\\s\\S]+)$/.exec(shellCommand);
+  if (!quoted && !unquoted) {
     throw new Error(\`unsupported tmux launch command: \${shellCommand}\`);
   }
-  const claudeArgs = match[3].trim().split(/\\s+/);
-  validateClaudeInvocation(claudeArgs, { DISCORD_STATE_DIR: match[2] });
+  const configDir = quoted ? quoted[3] : undefined;
+  const env = { DISCORD_STATE_DIR: quoted ? quoted[2] : unquoted[2] };
+  if (configDir) {
+    env.CLAUDE_CONFIG_DIR = configDir;
+  }
+  const claudeArgs = (quoted ? quoted[4] : unquoted[3]).trim().split(/\\s+/);
+  validateClaudeInvocation(claudeArgs, env);
   return {
-    cwd: match[1],
-    env: { DISCORD_STATE_DIR: match[2] },
+    cwd: quoted ? quoted[1] : unquoted[1],
+    env,
     claudeArgs,
   };
 }
@@ -390,12 +395,13 @@ function recordCodexBridgeInvocation(invocation) {
   });
 }
 
-function writeClaudeSession(pid, sessionId) {
+function writeClaudeSession(pid, sessionId, configDir) {
   const home = process.env.HOME;
-  if (!home) {
+  const baseDir = configDir || (home ? path.join(home, ".claude") : null);
+  if (!baseDir) {
     return;
   }
-  const sessionsDir = path.join(home, ".claude", "sessions");
+  const sessionsDir = path.join(baseDir, "sessions");
   fs.mkdirSync(sessionsDir, { recursive: true });
   fs.writeFileSync(path.join(sessionsDir, \`\${pid}.json\`), \`\${JSON.stringify({ sessionId }, null, 2)}\\n\`);
 }
@@ -440,7 +446,7 @@ function runTmux() {
     const processCommand =
       launch.kind === "codex-bridge"
         ? \`node scripts/codex-bridge.js CHANNEL_ID='\${launch.env.CHANNEL_ID}' BOT_APP_ID='\${launch.env.BOT_APP_ID}' WS_PORT='\${launch.env.WS_PORT}'\`
-        : \`claude \${launch.claudeArgs.join(" ")} DISCORD_STATE_DIR='\${launch.env.DISCORD_STATE_DIR}'\`;
+        : \`claude \${launch.claudeArgs.join(" ")} DISCORD_STATE_DIR='\${launch.env.DISCORD_STATE_DIR}'\${launch.env.CLAUDE_CONFIG_DIR ? \` CLAUDE_CONFIG_DIR='\${launch.env.CLAUDE_CONFIG_DIR}'\` : ""}\`;
     const paneOutput =
       launch.kind === "codex-bridge"
         ? "Codex-Discord bridge running\\nListening in #channel-id\\n"
@@ -489,7 +495,7 @@ function runTmux() {
         pid,
         sessionId,
       });
-      writeClaudeSession(pid, sessionId);
+      writeClaudeSession(pid, sessionId, launch.env.CLAUDE_CONFIG_DIR);
     }
     process.exit(0);
   }
@@ -614,14 +620,18 @@ function runClaude() {
     process.exit(2);
   }
   const sessionId = \`fixture-session-\${process.pid}\`;
+  const invocationEnv = { DISCORD_STATE_DIR: process.env.DISCORD_STATE_DIR };
+  if (process.env.CLAUDE_CONFIG_DIR) {
+    invocationEnv.CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR;
+  }
   recordClaudeInvocation({
     args,
     cwd: process.cwd(),
-    env: { DISCORD_STATE_DIR: process.env.DISCORD_STATE_DIR },
+    env: invocationEnv,
     pid: process.pid,
     sessionId,
   });
-  writeClaudeSession(process.pid, sessionId);
+  writeClaudeSession(process.pid, sessionId, process.env.CLAUDE_CONFIG_DIR);
 }
 
 function runNpm() {

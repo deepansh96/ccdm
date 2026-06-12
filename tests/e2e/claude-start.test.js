@@ -154,6 +154,33 @@ test("start-session starts a Claude project through tmux and records PID/session
   assert.equal(fs.existsSync(path.join(workspace.homeDir, ".claude", ".claude.json")), false);
 });
 
+test("start-session honors claude_home: launches with CLAUDE_CONFIG_DIR and records session metadata from the alternate Claude home", async () => {
+  const workspace = createWorkspace();
+  const claudeHome = path.join(workspace.homeDir, ".claude-work");
+  const registrySeed = buildClaudeRegistry(workspace);
+  registrySeed.projects.alpha.claude_home = "~/.claude-work";
+  seedRegistry(workspace, registrySeed);
+
+  const result = await runScript(workspace, "scripts/start-session.sh", {
+    args: ["alpha"],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /Started Discord bot in tmux session 'alpha_session'/);
+  assert.match(result.stdout, /Recorded PID \d+ and session fixture-session-\d+/);
+
+  const registry = readRegistry(workspace);
+  const pid = registry.projects.alpha.pid;
+  assert.equal(typeof pid, "number");
+  assert.equal(registry.projects.alpha.session_id, `fixture-session-${pid}`);
+
+  const state = readState(workspace.stateDir);
+  assert.equal(state.fixtures.tmux.sessions.alpha_session.env.CLAUDE_CONFIG_DIR, claudeHome);
+  assert.equal(state.fixtures.tmux.sessions.alpha_session.env.DISCORD_STATE_DIR, registrySeed.pool[0].state_dir);
+  assert.ok(fs.existsSync(path.join(claudeHome, "sessions", `${pid}.json`)));
+  assert.equal(fs.existsSync(path.join(workspace.homeDir, ".claude", "sessions", `${pid}.json`)), false);
+});
+
 test("start-session exits successfully when the target tmux session is already running", async () => {
   const workspace = createWorkspace();
   seedRegistry(workspace, buildClaudeRegistry(workspace));

@@ -179,6 +179,77 @@ else
     echo -e "  ${YELLOW}Could not fetch live usage (keychain auth may be missing)${RESET}"
 fi
 
+# ── Additional Claude Accounts (extra CLAUDE_CONFIG_DIR logins) ──
+# Each extra config dir (~/.claude-<name>) keeps its OAuth creds in its own
+# Keychain item: "Claude Code-credentials-<first 8 hex of sha256(dir path)>".
+EXTRA_ACCOUNTS=$(python3 - 2>/dev/null <<'PYEOF'
+import glob, hashlib, json, os, subprocess, urllib.request
+from datetime import datetime, timezone
+
+home = os.path.expanduser("~")
+blocks = []
+for config_dir in sorted(glob.glob(os.path.join(home, ".claude-*"))):
+    cfg = os.path.join(config_dir, ".claude.json")
+    if not os.path.isdir(config_dir) or not os.path.exists(cfg):
+        continue
+    try:
+        oauth_acct = json.load(open(cfg)).get("oauthAccount") or {}
+    except Exception:
+        continue
+    label = oauth_acct.get("organizationName") or oauth_acct.get("emailAddress")
+    if not label:
+        continue
+    short_dir = "~" + config_dir[len(home):]
+    service = "Claude Code-credentials-" + hashlib.sha256(config_dir.encode()).hexdigest()[:8]
+    lines = [f"  {label}  ({short_dir})"]
+    try:
+        raw = subprocess.run(["security", "find-generic-password", "-s", service, "-w"],
+                             capture_output=True, text=True, timeout=10)
+        if raw.returncode != 0:
+            raise RuntimeError("no keychain entry")
+        oauth = json.loads(raw.stdout.strip())["claudeAiOauth"]
+    except Exception:
+        lines.append("    No Keychain credential found for this account")
+        blocks.append("\n".join(lines))
+        continue
+    expires_at = oauth.get("expiresAt")
+    if expires_at and expires_at / 1000 < datetime.now(timezone.utc).timestamp():
+        if oauth.get("refreshToken"):
+            lines.append("    OAuth token expired — start a session on this account to refresh")
+        else:
+            lines.append(f"    Needs re-login: CLAUDE_CONFIG_DIR={short_dir} claude /login")
+        blocks.append("\n".join(lines))
+        continue
+    req = urllib.request.Request("https://api.anthropic.com/api/oauth/usage", headers={
+        "Authorization": "Bearer " + oauth["accessToken"],
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-code/2.0.32"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            usage = json.load(resp)
+    except Exception as e:
+        lines.append(f"    API error: {e}")
+        blocks.append("\n".join(lines))
+        continue
+    def bar(pct, width=20):
+        filled = int(pct / 100 * width)
+        return "[" + "#" * filled + "." * (width - filled) + "]"
+    for key, lbl in [("five_hour", "5-Hour Session"), ("seven_day", "7-Day (All)"),
+                     ("seven_day_opus", "7-Day (Opus)"), ("seven_day_sonnet", "7-Day (Sonnet)")]:
+        u = usage.get(key)
+        if not u:
+            continue
+        pct = u.get("utilization", 0) or 0
+        lines.append(f"    {lbl + ':':<17} {bar(pct)} {pct:.0f}% used  |  {100 - pct:.0f}% left")
+    blocks.append("\n".join(lines))
+print("\n\n".join(blocks))
+PYEOF
+)
+if [ -n "$EXTRA_ACCOUNTS" ]; then
+    header "ADDITIONAL CLAUDE ACCOUNTS"
+    echo "$EXTRA_ACCOUNTS"
+fi
+
 # ══════════════════════════════════════════════════════════
 # SECTION 2: LOCAL HISTORICAL DATA
 # ══════════════════════════════════════════════════════════
