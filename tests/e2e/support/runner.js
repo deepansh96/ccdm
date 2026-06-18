@@ -59,27 +59,27 @@ function sourceRoot() {
   return result.stdout.trim();
 }
 
-function gitTrackedFiles(root) {
-  const result = spawnSync("git", ["ls-files", "-z"], {
+function gitSourceFiles(root) {
+  const result = spawnSync("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], {
     cwd: root,
     encoding: "buffer",
   });
   if (result.status !== 0) {
-    throw new Error(result.stderr.toString("utf8") || "Unable to list tracked files");
+    throw new Error(result.stderr.toString("utf8") || "Unable to list source files");
   }
   return result.stdout.toString("utf8").split("\0").filter(Boolean);
 }
 
-function rejectForbiddenTrackedArtifacts(files) {
+function rejectForbiddenSourceArtifacts(files) {
   const forbidden = files.filter((file) =>
     FORBIDDEN_WORKSPACE_ARTIFACTS.some((artifact) => file === artifact || file.startsWith(`${artifact}/`)),
   );
   if (forbidden.length > 0) {
-    throw new Error(`Tracked local-only artifacts are not allowed in E2E workspaces: ${forbidden.join(", ")}`);
+    throw new Error(`Local-only artifacts are not allowed in E2E workspaces: ${forbidden.join(", ")}`);
   }
 }
 
-function copyTrackedFiles(root, repoDir, files) {
+function copySourceFiles(root, repoDir, files) {
   for (const file of files) {
     const source = path.join(root, file);
     if (!fs.existsSync(source)) continue;
@@ -1068,8 +1068,8 @@ async function terminateProcessGroup(pid, timeoutMs = 5000) {
 
 export const createWorkspace = Object.freeze(function createWorkspace(options = {}) {
   const root = sourceRoot();
-  const files = gitTrackedFiles(root);
-  rejectForbiddenTrackedArtifacts(files);
+  const files = gitSourceFiles(root);
+  rejectForbiddenSourceArtifacts(files);
 
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-e2e-"));
   const repoDir = path.join(tmpRoot, "repo");
@@ -1082,7 +1082,7 @@ export const createWorkspace = Object.freeze(function createWorkspace(options = 
   fs.mkdirSync(tmpDir, { recursive: true });
   fs.mkdirSync(stateDir, { recursive: true });
 
-  copyTrackedFiles(root, repoDir, files);
+  copySourceFiles(root, repoDir, files);
   assertWorkspaceClean(repoDir);
   createFixtures(fixtureDir, options);
   writeState(undefined, stateDir);

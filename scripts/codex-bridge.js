@@ -8,6 +8,8 @@ const path = require("path");
 const WebSocket = require("ws");
 
 const MCP_SERVER_SCRIPT = path.resolve(__dirname, "discord-mcp-server.js");
+const ROOT_DIR = path.resolve(__dirname, "..");
+const REGISTRY_PATH = path.join(ROOT_DIR, "registry.json");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
@@ -30,6 +32,8 @@ const AUDIO_TRANSCRIPTION_MODEL =
   process.env.CODEX_BRIDGE_AUDIO_TRANSCRIPTION_MODEL || "turbo";
 const AUDIO_TRANSCRIPTION_LANGUAGE =
   process.env.CODEX_BRIDGE_AUDIO_TRANSCRIPTION_LANGUAGE || "en";
+const TEXT_REPLY_FALLBACK =
+  process.env.CODEX_BRIDGE_TEXT_REPLY_FALLBACK === "1";
 
 if (!BOT_TOKEN || !CHANNEL_ID || !PROJECT_DIR) {
   console.error(
@@ -43,6 +47,7 @@ let threadId = null;
 let requestId = 1;
 let pendingRequests = new Map();
 let deltaBuffer = "";
+let fallbackText = "";
 let turnActive = false;
 let activeTurnId = null;
 let mcpReplyCalled = false;
@@ -54,6 +59,7 @@ let codexProcess = null;
 let typingInterval = null;
 let threadResetting = false;
 let lastNicknameUpdate = 0;
+let fallbackLoggedCompletedItemTypes = new Set();
 const NICKNAME_INTERVAL = 60000;
 const SYSTEM_INSTRUCTION = `You are communicating with the user via Discord. Use ONLY the MCP server named "discord-${CHANNEL_ID}" to interact — call its \`reply\` tool to send messages to the user. Do NOT use any other discord MCP server. Do NOT output responses as regular text; always use the \`reply\` tool so the user sees your response on Discord. Other available tools on this same server: edit_message, react, fetch_messages, download_attachment. Use \`reply\` with the \`files\` parameter to send file attachments. You don't have to reply for every little thing. Try to reply only when you're done, unless something important needs to be confirmed from the user. Also, try to use simpler language and avoid complex language.`;
 
@@ -70,6 +76,39 @@ function envFlag(defaultValue, ...names) {
     if (["0", "false", "no", "off"].includes(normalized)) return false;
   }
   return defaultValue;
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", "'\"'\"'")}'`;
+}
+
+async function findCurrentProject() {
+  const registry = JSON.parse(await readFile(REGISTRY_PATH, "utf8"));
+  for (const [projectName, project] of Object.entries(registry.projects || {})) {
+    if ((project.type || "claude") !== "codex") continue;
+    const bot = (registry.pool || []).find((entry) => entry.id === project.bot_id);
+    if (project.channel_id === CHANNEL_ID && (!BOT_APP_ID || bot?.app_id === BOT_APP_ID)) {
+      return { projectName, screenName: project.screen_name };
+    }
+  }
+  throw new Error(`No codex project in registry.json matches channel ${CHANNEL_ID}`);
+}
+
+function scheduleRestart(projectName, screenName) {
+  const safeName = projectName.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const logPath = path.join(os.tmpdir(), `ccdm-restart-${safeName}.log`);
+  const command = [
+    `while kill -0 ${process.pid} 2>/dev/null; do sleep 1; done`,
+    `tmux kill-session -t ${shellQuote(`=${screenName}`)} 2>/dev/null || true`,
+    `cd ${shellQuote(ROOT_DIR)} && ./scripts/start-codex-session.sh ${shellQuote(projectName)} >> ${shellQuote(logPath)} 2>&1`,
+  ].join("; ");
+  const child = spawn("/bin/sh", ["-c", command], {
+    detached: true,
+    env: process.env,
+    stdio: "ignore",
+  });
+  child.unref();
+  return logPath;
 }
 
 function sendRequest(method, params) {
@@ -128,6 +167,56 @@ function splitMessage(text, limit = 2000) {
   return chunks;
 }
 
+function completedItemType(item) {
+  return item?.type || "(missing)";
+}
+
+function logCompletedItemType(item) {
+  if (!TEXT_REPLY_FALLBACK) return;
+  const type = completedItemType(item);
+  if (fallbackLoggedCompletedItemTypes.has(type)) return;
+  fallbackLoggedCompletedItemTypes.add(type);
+  console.log(`[text-reply-fallback] completed item.type=${type}`);
+}
+
+function isFallbackMessageItem(item) {
+  if (!item || typeof item !== "object") return false;
+  const type = item.type;
+  if (type === "agentMessage" || type === "assistantMessage") return true;
+  if (type === "message") {
+    return item.role === "assistant" || item.message?.role === "assistant";
+  }
+  return false;
+}
+
+function extractTextFromValue(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    return value.map(extractTextFromValue).filter(Boolean).join("");
+  }
+  if (typeof value !== "object") return "";
+  return extractTextFromValue(value.text) ||
+    extractTextFromValue(value.message) ||
+    extractTextFromValue(value.content);
+}
+
+function appendFallbackText(text) {
+  const trimmed = (text || "").trim();
+  if (!trimmed) return;
+  fallbackText = fallbackText ? `${fallbackText}\n${trimmed}` : trimmed;
+}
+
+function captureTextReplyFallback(item) {
+  if (!TEXT_REPLY_FALLBACK || !isFallbackMessageItem(item)) return;
+  appendFallbackText(deltaBuffer);
+  appendFallbackText(
+    extractTextFromValue(item.text) ||
+    extractTextFromValue(item.message) ||
+    extractTextFromValue(item.content)
+  );
+}
+
 async function updateNickname(totalTokens, contextWindow) {
   if (!GUILD_ID || !BOT_TOKEN || !contextWindow) return;
   const now = Date.now();
@@ -135,7 +224,11 @@ async function updateNickname(totalTokens, contextWindow) {
   lastNicknameUpdate = now;
 
   const pct = Math.round((totalTokens / contextWindow) * 100);
-  const nick = `${BOT_DISPLAY_NAME} · ${pct}%`;
+  // Discord caps guild nicknames at 32 chars. Trim the base name to fit so the
+  // % suffix always survives (otherwise long bot names make every update 400).
+  const suffix = ` · ${pct}%`;
+  const base = BOT_DISPLAY_NAME.slice(0, Math.max(0, 32 - suffix.length)).replace(/[\s·_-]+$/, "");
+  const nick = `${base}${suffix}`;
   try {
     const res = await fetch(
       `https://discord.com/api/v10/guilds/${GUILD_ID}/members/@me`,
@@ -303,6 +396,7 @@ function handleNotification(msg) {
         pendingBootstrapInstructionReason = null;
         turnActive = false;
         activeTurnId = null;
+        fallbackText = "";
         mcpReplyCalled = false;
         suppressTurnOutput = false;
         if (bootstrapReason) {
@@ -322,9 +416,12 @@ function handleNotification(msg) {
 
     case "item/completed":
       if (!isCurrentTurnNotification(msg)) break;
+      logCompletedItemType(msg.params?.item);
       if (msg.params?.item?.type === "contextCompaction") {
         onContextCompactionCompleted();
       }
+      captureTextReplyFallback(msg.params?.item);
+      if (TEXT_REPLY_FALLBACK) break;
       deltaBuffer = "";
       break;
 
@@ -416,14 +513,29 @@ function flushDeltaBuffer() {
   }
 }
 
+function flushTextReplyFallback() {
+  const text = deltaBuffer.trim() || fallbackText.trim();
+  deltaBuffer = "";
+  fallbackText = "";
+  if (text) {
+    sendToDiscord(text);
+  }
+}
+
 async function onTurnCompleted() {
   stopTyping();
   if (suppressTurnOutput) {
     deltaBuffer = "";
+    fallbackText = "";
   } else if (!mcpReplyCalled) {
-    flushDeltaBuffer();
+    if (TEXT_REPLY_FALLBACK) {
+      flushTextReplyFallback();
+    } else {
+      flushDeltaBuffer();
+    }
   } else {
     deltaBuffer = "";
+    fallbackText = "";
   }
   turnActive = false;
   activeTurnId = null;
@@ -454,6 +566,7 @@ async function sendTurn(input) {
   }
   turnActive = true;
   deltaBuffer = "";
+  fallbackText = "";
   mcpReplyCalled = false;
   activeTurnId = null;
   startTyping();
@@ -472,6 +585,8 @@ async function sendTurn(input) {
     console.error("turn/start failed:", err);
     stopTyping();
     turnActive = false;
+    activeTurnId = null;
+    fallbackText = "";
     await sendToDiscord("**Error:** Failed to send message to Codex");
     processQueue();
   }
@@ -485,6 +600,7 @@ async function sendBootstrapInstructionTurn(reason) {
   }
   turnActive = true;
   deltaBuffer = "";
+  fallbackText = "";
   mcpReplyCalled = false;
   suppressTurnOutput = true;
   activeTurnId = null;
@@ -503,9 +619,11 @@ async function sendBootstrapInstructionTurn(reason) {
       await new Promise((r) => setTimeout(r, 100));
     }
     deltaBuffer = "";
+    fallbackText = "";
     if (turnActive) {
       turnActive = false;
       activeTurnId = null;
+      fallbackText = "";
       mcpReplyCalled = false;
       suppressTurnOutput = false;
       processQueue();
@@ -515,6 +633,7 @@ async function sendBootstrapInstructionTurn(reason) {
     console.error(`Bootstrap instruction failed${reason ? ` (${reason})` : ""}:`, err);
     turnActive = false;
     activeTurnId = null;
+    fallbackText = "";
     mcpReplyCalled = false;
     suppressTurnOutput = false;
     processQueue();
@@ -820,12 +939,11 @@ function startDiscordBot() {
       const previousTurnId = activeTurnId;
       try {
         messageQueue = [];
-        if (previousThreadId && previousTurnId) {
+        if (previousThreadId && (previousTurnId || turnActive)) {
           try {
-            await sendRequest("turn/interrupt", {
-              threadId: previousThreadId,
-              turnId: previousTurnId,
-            });
+            const interruptParams = { threadId: previousThreadId };
+            if (previousTurnId) interruptParams.turnId = previousTurnId;
+            await sendRequest("turn/interrupt", interruptParams);
           } catch (err) {
             console.log(`Warning: failed to interrupt active turn before clear: ${err.message || err}`);
           }
@@ -840,6 +958,7 @@ function startDiscordBot() {
         suppressTurnOutput = false;
         pendingBootstrapInstructionReason = null;
         deltaBuffer = "";
+        fallbackText = "";
         stopTyping();
 
         await registerDiscordMcp();
@@ -853,8 +972,25 @@ function startDiscordBot() {
       } catch (err) {
         threadResetting = false;
         turnActive = false;
+        activeTurnId = null;
+        fallbackText = "";
         await sendToDiscord(`**Error:** Failed to clear — ${err.message || err}`);
         processQueue();
+      }
+      return;
+    }
+
+    if (text === "/restart") {
+      console.log("[discord] /restart requested");
+      await msg.react("🔄");
+      try {
+        const { projectName, screenName } = await findCurrentProject();
+        const logPath = scheduleRestart(projectName, screenName);
+        await sendToDiscord("Restarting session — fresh thread coming up.");
+        console.log(`Restart scheduled for '${projectName}' (${screenName}); log: ${logPath}`);
+        cleanup();
+      } catch (err) {
+        await sendToDiscord(`**Error:** Failed to restart — ${err.message || err}`);
       }
       return;
     }
@@ -900,6 +1036,7 @@ function startDiscordBot() {
 
   process.on("SIGTERM", cleanup);
   process.on("SIGINT", cleanup);
+  process.on("SIGHUP", cleanup);
 }
 
 async function main() {

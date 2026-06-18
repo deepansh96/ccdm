@@ -247,6 +247,15 @@ export async function startFakeCodexServer(workspace, options = {}) {
             if (plan.tokenUsage) {
               notify("thread/tokenUsage/updated", { tokenUsage: plan.tokenUsage });
             }
+            if (plan.completedItem) {
+              notify("item/completed", {
+                threadId: turnThreadId,
+                turnId,
+                item: plan.completedItem === true
+                  ? { type: "agentMessage", text: plan.delta ?? "" }
+                  : plan.completedItem,
+              });
+            }
             if (plan.complete !== false) {
               notify("turn/completed", { threadId: turnThreadId, turn: { id: turnId } });
             }

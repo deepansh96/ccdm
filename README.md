@@ -94,7 +94,7 @@ You also need:
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/deepansh96/ccdm.git
+git clone https://github.com/<owner>/ccdm.git
 cd ccdm
 
 # 2. Run the setup script
@@ -182,6 +182,8 @@ Message the root agent bot on Discord with any of these:
 | `usage` / `limits` | Show rate limits, usage stats, and account info |
 | `restart yourself` | Self-restart the root agent |
 | `create a poll` | Create a native Discord poll in any channel |
+| `/compact` / `/clear` / `/restart` | From a Codex project channel, manage that Codex session directly |
+| `@root /compact` / `@root /clear` | From a Claude project channel, relay the slash command into that project's tmux session |
 
 ### Registering a New Project
 
@@ -468,6 +470,7 @@ ccdm/
     cc-discord-nicknames.sh  # StatusLine script — updates bot nicknames with context %
     cc-statusline-wrapper.sh # StatusLine script — nicknames + ccstatusline terminal UI
     claude-usage.sh          # Usage reporting script
+    send-claude-command.sh   # Root relay helper — sends /compact or /clear into a Claude tmux session
     start-session.sh         # Generic script to start any registered project
     stop-session.sh          # Generic script to stop any registered project
   skills/

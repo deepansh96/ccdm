@@ -13,7 +13,7 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Setup | Required prompt validation | Covered | Discord user id, guild id, and bot token are required. |
 | Setup | Rerun/idempotency | Covered | A second run can keep registry and use an alternate state dir. |
 | Setup | Current chmod behavior | Covered | `restart-root-agent.sh` and `scripts/claude-usage.sh`. |
-| Harness | Tracked-file Test Workspace | Covered | Local-only artifacts are excluded. |
+| Harness | Git-visible Test Workspace | Covered | Copies tracked plus untracked non-ignored source files while excluding local-only artifacts. |
 | Harness | `$CCDM_TEST_STATE` schema and helpers | Covered | Versioned store, reload-on-read, atomic write-rename. |
 | Harness | Command runner environment | Covered | `cwd`, `HOME`, `PATH`, `TMPDIR`, `NODE_OPTIONS`, `NODE_PATH`, and state are injected. |
 | Harness | Detached shell subprocesses | Covered | `runScript` uses `child_process.spawn({ detached: true })`. |
@@ -34,6 +34,7 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Claude start | Missing bot | Covered | Documents current executable `StopIteration` failure behavior. |
 | Claude start | Multiple-project non-interference | Covered | Starting one project leaves other project PID/session fields and tmux sessions untouched. |
 | Claude start | CLAUDE.md pre-trust/send-key boundary | Covered | `start-session.sh` does not write `.claude.json` or send trust-dialog Enter; that remains manual documented workflow. |
+| Claude command relay | Root-triggered slash commands | Covered | Drives `scripts/send-claude-command.sh`, resolves by project or channel id, sends `/compact` and `/clear` with `tmux send-keys`, and refuses Codex, remote, invalid, or stopped targets. |
 | Codex start | Registry fixture schema | Covered | Codex registries include Discord user/guild values, placeholder bot tokens, app IDs, channel IDs, `type: "codex"`, screen names, `ws_port`, and the current `bot1` root-token invariant. |
 | Codex start | Successful bridge launch | Covered | Drives `scripts/start-codex-session.sh`, builds the bridge tmux command, records the bridge PID, and leaves app-server spawning to bridge slices. |
 | Codex start | Stale MCP cleanup | Covered | Removes stale `discord-*` MCP blocks from the selected `CODEX_HOME/config.toml` while preserving unrelated MCP config and leaving the default Codex home untouched when `codex_home` is set. |
@@ -63,7 +64,7 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Codex bridge | Process exit paths | Covered | App-server exit, WebSocket close, and startup without thread id terminate the bridge with observable diagnostics. |
 | Codex bridge | Token-usage nickname PATCH | Covered | Token usage notifications route to fake Discord member PATCH and record the computed nickname. |
 | Codex bridge | Active-turn controls | Covered | Covers approval responses, successful steer, stale-turn failed steer fallback, queued hourglass reaction cleanup, and typing shutdown after completion. |
-| Codex bridge | Slash controls | Covered | Covers `/compact`, `/clear`, context-compaction completion, archive/new-thread flow, and compact/clear while a turn is active. |
+| Codex bridge | Slash controls | Covered | Covers `/compact`, `/clear`, `/restart`, context-compaction completion, archive/new-thread flow, and compact/clear while a turn is active. |
 | Codex bridge | Error and MCP diagnostics | Covered | Covers non-retryable Codex errors, typing shutdown after failure, stale MCP removal warning/continue behavior, MCP registration fatal diagnostics, and Discord send failure diagnostics. |
 | Codex bridge | Attachment input construction | Covered | Covers empty messages, image URLs, fetched text attachments, binary downloads into `.discord-attachments`, failed attachment fetches, and fallback Discord response behavior. |
 | Fixture contracts | stop/restart tmux contracts | Covered | `kill-session`, `display-message '#{pane_pid}'`, retryable root-agent kill attempts, new-session launch failure injection, and trust-dialog `send-keys` recording. |

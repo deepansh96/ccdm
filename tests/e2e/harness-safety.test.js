@@ -21,7 +21,7 @@ test.afterEach(async () => {
   await cleanup();
 });
 
-test("workspace copies tracked files only and excludes local-only artifacts", () => {
+test("workspace copies Git-visible source files and excludes local-only artifacts", () => {
   const workspace = createWorkspace();
 
   assert.ok(fs.existsSync(path.join(workspace.sourceRoot, "registry.example.json")));
@@ -124,9 +124,9 @@ test("failure diagnostics include command details and redact secrets", async () 
 
   const result = await runScript(workspace, "setup.sh", {
     env: {
-      AUTHORIZATION: "Bot abcdefghijklmnopqrstuvwxyz.ABCDEF.abcdefghijklmnopqrstuvwxyz123456",
+      AUTHORIZATION: "Bot aaaaaaaaaaaaaaaaaaaaaaaa.BBBBBB.cccccccccccccccccccc",
       DISCORD_BOT_TOKEN: "fixture-token-value",
-      OAUTH_TOKEN: "sk-ant-secret-value",
+      OAUTH_TOKEN: "sk-ant-x",
     },
   });
 
@@ -136,13 +136,13 @@ test("failure diagnostics include command details and redact secrets", async () 
   assert.equal(result.diagnostics.env.AUTHORIZATION, "[REDACTED]");
   assert.equal(result.diagnostics.env.DISCORD_BOT_TOKEN, "[REDACTED]");
   assert.equal(result.diagnostics.env.OAUTH_TOKEN, "[REDACTED]");
-  assert.doesNotMatch(JSON.stringify(result.diagnostics), /abcdefghijklmnopqrstuvwxyz\.ABCDEF/);
+  assert.doesNotMatch(JSON.stringify(result.diagnostics), /aaaaaaaaaaaaaaaaaaaaaaaa\.BBBBBB/);
 
   const redactedBody = redactSecrets({
-    commandLine: "curl -H 'Authorization: Bot abcdefghijklmnopqrstuvwxyz.ABCDEF.abcdefghijklmnopqrstuvwxyz123456'",
-    dotenv: "DISCORD_BOT_TOKEN=sk-ant-secret-value",
-    requestBody: "Authorization: Bot abcdefghijklmnopqrstuvwxyz.ABCDEF.abcdefghijklmnopqrstuvwxyz123456",
-    registry: { token: "ghp_abcdefghijklmnopqrstuvwxyz1234567890" },
+    commandLine: "curl -H 'Authorization: Bot aaaaaaaaaaaaaaaaaaaaaaaa.BBBBBB.cccccccccccccccccccc'",
+    dotenv: "DISCORD_BOT_TOKEN=sk-ant-x",
+    requestBody: "Authorization: Bot aaaaaaaaaaaaaaaaaaaaaaaa.BBBBBB.cccccccccccccccccccc",
+    registry: { token: "ghp_x" },
   });
   assert.doesNotMatch(JSON.stringify(redactedBody), /ghp_|sk-ant-|Authorization: Bot [A-Za-z0-9_.-]+/);
 });

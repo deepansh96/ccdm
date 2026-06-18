@@ -47,7 +47,7 @@ Read the `registry.json` file in this project's root directory. It has two main 
 - `type`: session type — `"claude"` (default) or `"codex"`. Omitted entries default to `"claude"`.
 - `ws_port`: (codex only) WebSocket port for the codex app-server (e.g., `18301`)
 - `codex_home`: (codex only, optional) Codex home directory for this project. Defaults to `~/.codex`. Use this to run selected Codex sessions under a secondary login/account, e.g. `~/.codex-api`.
-- `claude_home`: (claude only, optional) Claude config directory (`CLAUDE_CONFIG_DIR`) for this project. Defaults to `~/.claude`. Use this to run selected Claude sessions under a secondary login/account, e.g. `~/.claude-af` for the Avanti Fellows account. The directory must have its own login and the Discord plugin installed (see "Claude account selection" below).
+- `claude_home`: (claude only, optional) Claude config directory (`CLAUDE_CONFIG_DIR`) for this project. Defaults to `~/.claude`. Use this to run selected Claude sessions under a secondary login/account, e.g. `~/.claude-work`. The directory must have its own login and the Discord plugin installed (see "Claude account selection" below).
 - `session_id`: Claude Code session ID (updated on start, cleared on stop)
 - `pid`: Claude Code process ID (updated on start, cleared on stop)
 
@@ -110,7 +110,7 @@ Run `tmux list-sessions` and cross-reference with the registry. Report which pro
 
 **Claude account selection (multiple Claude accounts):**
 
-Claude sessions can run under different Claude accounts via the `claude_home` registry field, mirroring `codex_home` for Codex. Each account lives in its own config directory selected with the `CLAUDE_CONFIG_DIR` env var. Credentials are isolated automatically: on macOS each config dir gets its own Keychain item, `Claude Code-credentials` for the default `~/.claude` and `Claude Code-credentials-<first 8 hex of sha256(config dir path)>` for the others (e.g. `~/.claude-af` → `Claude Code-credentials-5bd6d86d`).
+Claude sessions can run under different Claude accounts via the `claude_home` registry field, mirroring `codex_home` for Codex. Each account lives in its own config directory selected with the `CLAUDE_CONFIG_DIR` env var. Credentials are isolated automatically: on macOS each config dir gets its own Keychain item, `Claude Code-credentials` for the default `~/.claude` and `Claude Code-credentials-<first 8 hex of sha256(config dir path)>` for the others (e.g. `~/.claude-work`).
 
 One-time setup for a new account directory:
 ```sh
@@ -119,7 +119,7 @@ CLAUDE_CONFIG_DIR=$HOME/.claude-<name> claude   # run /login inside, then exit
 CLAUDE_CONFIG_DIR=$HOME/.claude-<name> claude plugin marketplace add anthropics/claude-plugins-official
 CLAUDE_CONFIG_DIR=$HOME/.claude-<name> claude plugin install discord@claude-plugins-official
 ```
-Then set `"claude_home": "~/.claude-<name>"` on the project entry and restart its session. Existing accounts: `~/.claude` (personal, default) and `~/.claude-af` (Avanti Fellows work account, Discord plugin already installed).
+Then set `"claude_home": "~/.claude-<name>"` on the project entry and restart its session. Existing accounts can stay isolated by keeping each one in its own `~/.claude-<name>` directory.
 
 Notes:
 - Rate limits are per-account — sessions on a secondary account draw from that account's 5-hour/7-day pools, not the personal one.
@@ -156,6 +156,36 @@ The bridge automatically registers a `discord-<channel_id>` MCP server with the 
 - **Discord commands:** Users can send these in Codex channels:
   - `/compact` — triggers context compaction, confirms when complete
   - `/clear` — archives the current thread and starts a fresh conversation
+  - `/restart` — restarts that Codex project session
+
+**Claude slash-command relay via root bot:**
+
+Claude sessions use the official Discord plugin, so project bots do not intercept `/compact` or `/clear` themselves. To run these from Discord, the user can mention the root bot in a Claude project channel:
+- `@root /compact`
+- `@root /clear`
+- `@root compact`
+- `@root clear`
+
+When this happens, do not forward the text as a normal request to the project agent. Instead, run the helper script from this root repo:
+```sh
+scripts/send-claude-command.sh --channel <chat_id> /compact
+scripts/send-claude-command.sh --channel <chat_id> /clear
+```
+Use the inbound Discord channel ID (`chat_id`) from the root bot message metadata. The script resolves the project from `registry.json`, verifies it is a local Claude session, verifies the tmux session is running, and sends the slash command with:
+```sh
+tmux send-keys -t <screen_name> -l '/compact'
+tmux send-keys -t <screen_name> Enter
+```
+
+If the user asks from a root channel instead of a project channel, require or infer the project name and run:
+```sh
+scripts/send-claude-command.sh <project_name> /compact
+scripts/send-claude-command.sh <project_name> /clear
+```
+
+This relay is a tmux/TUI command, not a Claude protocol call. If the target Claude session is mid-turn, the slash command may only take effect when the TUI is ready for input.
+
+If the target is a Codex session, tell the user to send `/compact`, `/clear`, or `/restart` directly in that Codex project channel; the Codex bridge already supports it. If the target is remote (`path` starts with `remote:`), tell the user to run the slash command in the remote tmux session because local tmux cannot reach it.
 
 #### 3. Stop a session (`stop <project>`)
 
@@ -186,7 +216,7 @@ This assigns an available bot from the pool to a new project and scopes it to a 
 **Registration steps:**
 1. Check the pool for an unassigned bot (`assigned_to` is `null`). If none available, tell the user: "No bots available in the pool. Add one with `pool add` or remove a project to free one up."
 2. Claim the first available bot: set its `assigned_to` to `<project_name>`.
-3. Add the project to `registry.json` with `bot_id`, `path`, `screen_name`, `channel_id`, and `type`. If `type` is `"codex"`, also assign a `ws_port` (base 18300 + next available offset — check existing codex projects for used ports). For Codex projects that should use a secondary account, add `codex_home`, e.g. `"codex_home": "~/.codex-api"`. For Claude projects that should use a secondary account, add `claude_home`, e.g. `"claude_home": "~/.claude-af"`.
+3. Add the project to `registry.json` with `bot_id`, `path`, `screen_name`, `channel_id`, and `type`. If `type` is `"codex"`, also assign a `ws_port` (base 18300 + next available offset — check existing codex projects for used ports). For Codex projects that should use a secondary account, add `codex_home`, e.g. `"codex_home": "~/.codex-api"`. For Claude projects that should use a secondary account, add `claude_home`, e.g. `"claude_home": "~/.claude-work"`.
 4. Rename the bot on Discord to `<bot_id>-<project_name>-<type>` (e.g., `bot2-my-project-claude` or `bot2-my-project-codex`):
    ```sh
    curl -s -X PATCH "https://discord.com/api/v10/users/@me" \
@@ -564,7 +594,7 @@ To unload: `launchctl unload ~/Library/LaunchAgents/com.claude.root-agent.plist`
 See CLAUDE.local.md for environment-specific details (contains channel IDs, bot token references, and the local script path). The real scheduled report is a macOS LaunchAgent named `com.discord.usage-stats-poster`, not a tmux loop. It posts Claude Code plus ChatGPT/Codex usage stats every 30 minutes.
 
 The poster reads:
-- Claude Code live limits from Anthropic OAuth APIs via the macOS Keychain credential. It auto-discovers additional Claude accounts: any `~/.claude-*` directory containing a logged-in `.claude.json` is shown as its own block (e.g. the Avanti Fellows account in `~/.claude-af`), using that config dir's Keychain item `Claude Code-credentials-<sha256 prefix>`. If an account's OAuth token has expired (account unused for a while), the poster notes that instead of showing bars; running any session on that account refreshes it.
+- Claude Code live limits from Anthropic OAuth APIs via the macOS Keychain credential. It auto-discovers additional Claude accounts: any `~/.claude-*` directory containing a logged-in `.claude.json` is shown as its own block (e.g. `~/.claude-work`), using that config dir's Keychain item `Claude Code-credentials-<sha256 prefix>`. If an account's OAuth token has expired (account unused for a while), the poster notes that instead of showing bars; running any session on that account refreshes it.
 - Codex rate-limit data from local Codex session files under `~/.codex/sessions`.
 - Codex API-key account token data from `~/.codex-api/sessions` after sessions are started with `"codex_home": "~/.codex-api"`. Codex API-key session files currently include token counts but not ChatGPT-style rate-limit percentages. OpenAI Platform usage/cost API data requires an API key with usage-read permissions.
 
