@@ -19,7 +19,7 @@ node --test --test-concurrency=1 tests/e2e/**/*.test.js
 
 The harness uses Node's built-in `node:test` runner. Each scenario creates an isolated Test Workspace with `createWorkspace()`, runs executable CCDM surfaces with `runScript()` or `runNodeEntrypoint()`, and coordinates fixture state through `$CCDM_TEST_STATE`.
 
-Test Workspaces are assembled from tracked files only. The workspace builder refuses tracked local-only artifacts and asserts that `registry.json`, `.env`, `CLAUDE.local.md`, `.claude`, and `.codex` are absent from the copied repo.
+Test Workspaces are assembled from Git-visible source files: tracked files plus untracked files that are not ignored. This lets new scripts and tests run before they are committed. The workspace builder refuses local-only artifacts and asserts that `registry.json`, `.env`, `CLAUDE.local.md`, `.claude`, and `.codex` are absent from the copied repo.
 
 ## Public Helper APIs
 
@@ -131,7 +131,7 @@ The Codex bridge/basic-turn scenarios add child-scoped JavaScript interception. 
 - The `discord.js` shim exports `Client`, `GatewayIntentBits`, and `Partials`, records login/ready/channel fetch/typing/send behavior, and consumes test-injected gateway messages from `$CCDM_TEST_STATE`.
 - `startFakeCodexServer()` owns the fake Codex WebSocket protocol. It covers `initialize`/`initialized`, MCP status/delete/write/reload, `thread/start`, system and user `turn/start`, active-turn `turn/steer`, `thread/compact/start`, `thread/archive`, approval requests, agent deltas, MCP reply detection, context-compaction completion, token-usage notifications, WebSocket close, and startup no-thread-id failure.
 - The `codex` fixture validates `app-server --listen ws://127.0.0.1:<port>`, requires a harness-owned fake server for that port, records the invocation, and stays alive until the bridge exits.
-- Bridge control-flow scenarios cover successful steer, stale-turn queue fallback, queued reaction cleanup, `/compact`, `/clear`, compact/clear during an active turn, non-retryable Codex errors, MCP cleanup/registration failures, and command diagnostics.
+- Bridge control-flow scenarios cover successful steer, stale-turn queue fallback, queued reaction cleanup, `/compact`, `/clear`, `/restart`, compact/clear during an active turn, non-retryable Codex errors, MCP cleanup/registration failures, and command diagnostics.
 - Attachment scenarios cover empty messages, image URLs, fetched text attachments, binary downloads into `.discord-attachments`, attachment fetch failures, and Discord send failures. The Discord shim can reject `channel.send()` through fixture state so tests can assert the bridge's current failure diagnostics.
 
 The Discord MCP JSON-RPC scenarios drive `scripts/discord-mcp-server.js` directly through stdin/stdout with the same child-scoped preload:

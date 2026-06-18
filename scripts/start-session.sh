@@ -228,7 +228,7 @@ if [[ -n "$MODEL" ]]; then
   MODEL_FLAG=" --model '$MODEL'"
 fi
 
-# Optional account override (e.g. "~/.claude-af"). Empty -> default ~/.claude login.
+# Optional account override (e.g. "~/.claude-work"). Empty -> default ~/.claude login.
 CONFIG_DIR_ENV=""
 if [[ -n "$CLAUDE_HOME" ]]; then
   CONFIG_DIR_ENV=" CLAUDE_CONFIG_DIR='$CLAUDE_HOME'"

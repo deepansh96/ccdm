@@ -302,6 +302,86 @@ test("bridge covers channel fetch, filtering, fallback splitting, MCP reply supp
   await bridge.stop();
 });
 
+test("bridge text fallback is opt-in for completed assistant items without MCP reply", async () => {
+  const flagged = createBridgeWorkspace();
+  const flaggedCodex = await startFakeCodexServer(flagged, {
+    channelId: "channel-id",
+    turns: [
+      {
+        completedItem: { type: "agentMessage", content: [{ text: "completed GLM response" }] },
+      },
+      {
+        delta: "streamed GLM response",
+        completedItem: { type: "agentMessage", text: "completed stream copy" },
+      },
+      {
+        completedItem: {
+          type: "message",
+          message: {
+            role: "assistant",
+            content: [{ text: "message field GLM response" }],
+          },
+        },
+      },
+    ],
+  });
+  const flaggedBridge = startBridge(flagged, {
+    port: flaggedCodex.port,
+    env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
+
+  await flaggedBridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await injectMessageUntil(
+    flagged,
+    { content: "no deltas", id: "no-deltas" },
+    (nextState) => nextState.fixtures.discord.sends.length === 1,
+    5000,
+  );
+  await injectMessageUntil(
+    flagged,
+    { content: "completed before turn", id: "completed-before-turn" },
+    (nextState) => nextState.fixtures.discord.sends.length === 2,
+    5000,
+  );
+  await injectMessageUntil(
+    flagged,
+    { content: "message field", id: "message-field" },
+    (nextState) => nextState.fixtures.discord.sends.length === 3,
+    5000,
+  );
+  await flaggedBridge.waitForOutput(/\[text-reply-fallback\] completed item.type=agentMessage/, 5000);
+
+  const flaggedState = readState(flagged.stateDir);
+  assert.equal(flaggedState.fixtures.discord.sends[0].content, "completed GLM response");
+  assert.equal(flaggedState.fixtures.discord.sends[1].content, "streamed GLM response");
+  assert.equal(flaggedState.fixtures.discord.sends[2].content, "message field GLM response");
+  await flaggedBridge.stop();
+
+  const unflagged = createBridgeWorkspace();
+  const unflaggedCodex = await startFakeCodexServer(unflagged, {
+    channelId: "channel-id",
+    turns: [
+      {
+        delta: "old path stays silent",
+        completedItem: { type: "agentMessage", text: "old path completed" },
+      },
+    ],
+  });
+  const unflaggedBridge = startBridge(unflagged, { port: unflaggedCodex.port });
+
+  await unflaggedBridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await injectMessageUntil(
+    unflagged,
+    { content: "old path", id: "old-path" },
+    (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === "old-path"),
+    5000,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 150));
+
+  assert.equal(readState(unflagged.stateDir).fixtures.discord.sends.length, 0);
+  await unflaggedBridge.stop();
+});
+
 test("bridge ignores project-channel messages that mention the root bot", async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, {
@@ -450,7 +530,7 @@ test("bridge handles compact and clear slash commands during an active turn", as
   }
   assert.match(bridge.stdout, /\[discord\] Allowed User: busy/);
   await new Promise((resolve) => setTimeout(resolve, 80));
-  await injectMessageUntil(
+  const compactState = await injectMessageUntil(
     workspace,
     { content: "/compact", id: "compact-message" },
     (nextState) =>
@@ -458,10 +538,11 @@ test("bridge handles compact and clear slash commands during an active turn", as
       nextState.fixtures.discord.sends.some((send) => send.content === "Compaction complete."),
     15000,
   );
-  await injectMessageUntil(
+  const clearState = await injectMessageUntil(
     workspace,
     { content: "/clear", id: "clear-message" },
-    (nextState) => nextState.fixtures.discord.sends.some((send) => send.content.startsWith("Conversation cleared")),
+    (nextState) =>
+      nextState.fixtures.discord.sends.some((send) => send.content.startsWith("Conversation cleared")),
     15000,
   );
   await injectMessageUntil(
@@ -475,10 +556,15 @@ test("bridge handles compact and clear slash commands during an active turn", as
 
   assert.deepEqual(state.fixtures.discord.reactions.map((reaction) => reaction.emoji), ["\ud83d\udd04", "\ud83d\udd04"]);
   assert.ok(!state.fixtures.discord.sends.some((send) => send.content === "busy done"));
-  const clientMessages = state.fixtures.codex.protocolEvents
-    .filter((event) => event.event === "client-message")
-    .map((event) => event.message);
-  assert.ok(clientMessages.some((message) => message.method === "thread/compact/start"));
+  const clientMessageMap = new Map();
+  for (const sourceState of [compactState, clearState, state]) {
+    for (const event of sourceState.fixtures.codex.protocolEvents) {
+      if (event.event === "client-message") {
+        clientMessageMap.set(JSON.stringify(event.message), event.message);
+      }
+    }
+  }
+  const clientMessages = [...clientMessageMap.values()];
   assert.ok(clientMessages.some((message) => message.method === "turn/interrupt"));
   assert.ok(clientMessages.some((message) => message.method === "thread/archive"));
   assert.equal(clientMessages.filter((message) => message.method === "thread/start").length, 2);
@@ -526,6 +612,55 @@ test("bridge sends the bootstrap instruction turn after idle compact completion"
   await bridge.stop();
 });
 
+test("bridge restarts its own Codex session from slash command", async () => {
+  const workspace = createBridgeWorkspace();
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    `${JSON.stringify({
+      discord_user_id: "allowed-user-id",
+      guild_id: "guild-id",
+      pool: [
+        { id: "bot1", app_id: "root-bot-app-id", token: "root-token", state_dir: "~/.claude/channels/discord", assigned_to: null },
+        { id: "bot2", app_id: "bot-app-id", token: "bot-token", state_dir: "~/.claude/channels/discord2", assigned_to: "alpha" },
+      ],
+      projects: {
+        alpha: {
+          path: workspace.repoDir,
+          bot_id: "bot2",
+          screen_name: "alpha",
+          channel_id: "channel-id",
+          type: "codex",
+          ws_port: 18342,
+          pid: process.pid,
+          session_id: null,
+        },
+      },
+    }, null, 2)}\n`,
+  );
+  const codex = await startFakeCodexServer(workspace);
+  const bridge = startBridge(workspace, { port: codex.port });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await injectMessageUntil(
+    workspace,
+    { content: "/restart", id: "restart-message" },
+    (nextState) =>
+      nextState.fixtures.discord.sends.some((send) => send.content.startsWith("Restarting session")) &&
+      nextState.fixtures.discord.reactions.some((reaction) => reaction.emoji === "🔄"),
+    5000,
+  );
+  const result = await bridge.closed;
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const state = await waitForState(
+    workspace,
+    (nextState) => Boolean(nextState.fixtures.tmux.sessions.alpha),
+    5000,
+  );
+
+  assert.equal(state.fixtures.tmux.sessions.alpha.bridgeCommand, "node scripts/codex-bridge.js");
+  assert.equal(state.fixtures.tmux.sessions.alpha.env.CHANNEL_ID, "channel-id");
+});
+
 test("bridge stops typing after a non-retryable Codex error", async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, {
@@ -534,12 +669,21 @@ test("bridge stops typing after a non-retryable Codex error", async () => {
   const bridge = startBridge(workspace, { port: codex.port });
 
   await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
-  injectDiscordMessage(workspace, { content: "fail this turn" });
-  const failed = await waitForState(
-    workspace,
-    (nextState) => nextState.fixtures.discord.sends.some((send) => send.content === "**Error:** model unavailable"),
-    5000,
-  );
+  let failed;
+  let lastError;
+  for (let attempt = 0; attempt < 3 && !failed; attempt++) {
+    injectDiscordMessage(workspace, { content: "fail this turn", id: `fail-this-turn-${attempt}` });
+    try {
+      failed = await waitForState(
+        workspace,
+        (nextState) => nextState.fixtures.discord.sends.some((send) => send.content === "**Error:** model unavailable"),
+        5000,
+      );
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  if (!failed) throw lastError;
   const typingCountAfterFailure = failed.fixtures.discord.typing.length;
   await new Promise((resolve) => setTimeout(resolve, 150));
   const afterDelay = readState(workspace.stateDir);
@@ -627,9 +771,9 @@ test("bridge builds Codex input for empty messages and image, text, binary, and 
   const bridge = startBridge(workspace, { port: codex.port });
 
   await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
-  injectDiscordMessage(workspace, { content: "   ", id: "empty-message" });
-  await waitForState(
+  await injectMessageUntil(
     workspace,
+    { content: "   ", id: "empty-message" },
     (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === "empty-message"),
     5000,
   );
@@ -824,7 +968,14 @@ async function waitFor(predicate, timeoutMs = 1000) {
 async function injectMessageUntil(workspace, message, predicate, timeoutMs = 5000) {
   let lastError;
   for (let attempt = 0; attempt < 3; attempt++) {
-    injectDiscordMessage(workspace, { ...message, id: message.id ?? `message-${attempt}` });
+    const id = message.id ?? `message-${attempt}`;
+    const state = readState(workspace.stateDir);
+    const alreadyKnown =
+      state.fixtures.discord.injectedMessages.some((entry) => entry.id === id) ||
+      state.fixtures.discord.deliveredMessages.some((entry) => entry.id === id);
+    if (!alreadyKnown) {
+      injectDiscordMessage(workspace, { ...message, id });
+    }
     try {
       return await waitForState(workspace, predicate, timeoutMs);
     } catch (error) {

@@ -170,7 +170,7 @@ print(f"Recorded PID {pid}")
 PY
 }
 
-IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME BOT_TOKEN CHANNEL_ID WS_PORT DISCORD_USER_ID GUILD_ID ROOT_TOKEN ROOT_BOT_APP_ID BOT_APP_ID BOT_ID CODEX_HOME_DIR <<< "$(python3 -c "
+IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME BOT_TOKEN CHANNEL_ID WS_PORT DISCORD_USER_ID GUILD_ID ROOT_TOKEN ROOT_BOT_APP_ID BOT_APP_ID BOT_ID CODEX_HOME_DIR BOT_DISPLAY_OVERRIDE TEXT_REPLY_FALLBACK_FLAG <<< "$(python3 -c "
 import base64, json, os, re
 r = json.load(open('$REGISTRY'))
 p = r['projects']['$PROJECT']
@@ -202,6 +202,8 @@ print('\t'.join([
     bot['app_id'],
     bot['id'],
     os.path.expanduser(p.get('codex_home', '~/.codex')),
+    (p.get('bot_display_name') or '__NONE__'),
+    '1' if p.get('text_reply_fallback') is True else '__NONE__',
 ]))
 ")"
 
@@ -250,14 +252,22 @@ if os.path.exists(config_path):
         f.writelines(result)
 PY
 
-BOT_DISPLAY_NAME="${BOT_ID}-${PROJECT}-codex"
+# Optional per-project display name override (registry "bot_display_name").
+# Empty/absent -> default "<bot_id>-<project>-codex".
+[[ "$BOT_DISPLAY_OVERRIDE" == "__NONE__" ]] && BOT_DISPLAY_OVERRIDE=""
+[[ "$TEXT_REPLY_FALLBACK_FLAG" == "__NONE__" ]] && TEXT_REPLY_FALLBACK_FLAG=""
+BOT_DISPLAY_NAME="${BOT_DISPLAY_OVERRIDE:-${BOT_ID}-${PROJECT}-codex}"
 AUDIO_TRANSCRIPTION_ENV=""
 TRANSCRIBE_AUDIO_FLAG="${CODEX_BRIDGE_TRANSCRIBE_AUDIO:-${USE_AUDIO_TRANSCRIPTION_IN_BRIDGE:-}}"
 if [[ -n "$TRANSCRIBE_AUDIO_FLAG" ]]; then
   AUDIO_TRANSCRIPTION_ENV=" CODEX_BRIDGE_TRANSCRIBE_AUDIO='${TRANSCRIBE_AUDIO_FLAG}'"
 fi
+TEXT_REPLY_FALLBACK_ENV=""
+if [[ "$TEXT_REPLY_FALLBACK_FLAG" == "1" ]]; then
+  TEXT_REPLY_FALLBACK_ENV=" CODEX_BRIDGE_TEXT_REPLY_FALLBACK='1'"
+fi
 
-tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' BOT_TOKEN='$BOT_TOKEN' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_ID='$DISCORD_USER_ID' GUILD_ID='$GUILD_ID' ROOT_BOT_TOKEN='$ROOT_TOKEN' ROOT_BOT_APP_ID='$ROOT_BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' BOT_DISPLAY_NAME='$BOT_DISPLAY_NAME'$AUDIO_TRANSCRIPTION_ENV node scripts/codex-bridge.js"
+tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' BOT_TOKEN='$BOT_TOKEN' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_ID='$DISCORD_USER_ID' GUILD_ID='$GUILD_ID' ROOT_BOT_TOKEN='$ROOT_TOKEN' ROOT_BOT_APP_ID='$ROOT_BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' BOT_DISPLAY_NAME='$BOT_DISPLAY_NAME'$AUDIO_TRANSCRIPTION_ENV$TEXT_REPLY_FALLBACK_ENV node scripts/codex-bridge.js"
 echo "Started Codex bridge in tmux session '$SCREEN_NAME'"
 echo "Attach with: tmux attach -t $SCREEN_NAME"
 record_codex_pid "$CHANNEL_ID" "$BOT_APP_ID"

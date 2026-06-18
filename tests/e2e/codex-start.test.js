@@ -47,6 +47,7 @@ function buildCodexRegistry(workspace, options = {}) {
         type: "codex",
         ws_port: 18342,
         ...(options.codexHome ? { codex_home: options.codexHome } : {}),
+        ...(options.textReplyFallback ? { text_reply_fallback: true } : {}),
         session_id: null,
         pid: null,
       },
@@ -202,6 +203,19 @@ test("start-codex-session constructs a bridge tmux launch, removes stale MCP con
   assert.equal(state.fixtures.codex.bridgeInvocations.length, 1);
   assert.equal(state.fixtures.codex.appServerInvocations.length, 0);
   assert.equal(state.fixtures.npm.invocations.length, 0);
+});
+
+test("start-codex-session passes text reply fallback only for flagged Codex projects", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, buildCodexRegistry(workspace, { textReplyFallback: true }));
+
+  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
+    args: ["alpha"],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex;
+  assert.equal(session.env.CODEX_BRIDGE_TEXT_REPLY_FALLBACK, "1");
 });
 
 test("start-codex-session exits successfully when the target tmux session is already running", async () => {
