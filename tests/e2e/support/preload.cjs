@@ -19,8 +19,15 @@ function initialState() {
       discord: {
         attachmentFetches: [],
         attachments: {},
+        channels: [],
+        invites: [],
         malformedRequests: [],
+        memberRoleDeletes: [],
+        memberRolePuts: [],
         nicknamePatches: [],
+        permissionOverwrites: [],
+        roleCreates: [],
+        roles: [],
       },
       network: { blocked: [] },
     },
@@ -70,6 +77,18 @@ function headerValue(headers, name) {
   return headers[name] ?? headers[name.toLowerCase()];
 }
 
+function formBodyFields(body) {
+  if (!body || typeof body.entries !== "function") return null;
+  const fields = {};
+  for (const [key, value] of body.entries()) {
+    fields[key] =
+      typeof value === "string"
+        ? value
+        : { name: value.name, size: value.size, type: value.type };
+  }
+  return fields;
+}
+
 function takeRestFailure(method, url) {
   const state = readState();
   const failures = state.fixtures?.discord?.restFailures;
@@ -95,6 +114,107 @@ function routeDiscordApi(url, init = {}) {
   if (url.hostname === "discord.com") {
     const failure = takeRestFailure(method, url);
     if (failure) return failure;
+  }
+
+  const guildRolesMatch = /^\/api\/v10\/guilds\/([^/]+)\/roles$/.exec(url.pathname);
+  const guildChannelsMatch = /^\/api\/v10\/guilds\/([^/]+)\/channels$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && guildChannelsMatch && method === "GET") {
+    const state = readState();
+    return response(JSON.stringify(state.fixtures?.discord?.channels ?? []), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  if (url.hostname === "discord.com" && guildRolesMatch && method === "GET") {
+    const state = readState();
+    return response(JSON.stringify(state.fixtures?.discord?.roles ?? []), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  if (url.hostname === "discord.com" && guildRolesMatch && method === "POST") {
+    const parsedBody = init.body ? JSON.parse(String(init.body)) : {};
+    let created;
+    updateState((state) => {
+      state.fixtures.discord.roles ||= [];
+      state.fixtures.discord.roleCreates ||= [];
+      created = {
+        id: `fake-role-${state.fixtures.discord.roles.length + 1}`,
+        name: parsedBody.name,
+        permissions: parsedBody.permissions ?? "0",
+      };
+      state.fixtures.discord.roles.push(created);
+      state.fixtures.discord.roleCreates.push({
+        authorization: headerValue(init.headers, "Authorization"),
+        guildId: guildRolesMatch[1],
+        ...parsedBody,
+      });
+    });
+    return response(JSON.stringify(created), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const channelPermissionMatch = /^\/api\/v10\/channels\/([^/]+)\/permissions\/([^/]+)$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && channelPermissionMatch && method === "PUT") {
+    const parsedBody = init.body ? JSON.parse(String(init.body)) : {};
+    updateState((state) => {
+      state.fixtures.discord.permissionOverwrites ||= [];
+      state.fixtures.discord.permissionOverwrites.push({
+        allow: parsedBody.allow,
+        authorization: headerValue(init.headers, "Authorization"),
+        channelId: channelPermissionMatch[1],
+        deny: parsedBody.deny,
+        overwriteId: channelPermissionMatch[2],
+        type: parsedBody.type,
+      });
+    });
+    return response("", { status: 204 });
+  }
+
+  const memberRoleMatch = /^\/api\/v10\/guilds\/([^/]+)\/members\/([^/]+)\/roles\/([^/]+)$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && memberRoleMatch && method === "PUT") {
+    updateState((state) => {
+      state.fixtures.discord.memberRolePuts ||= [];
+      state.fixtures.discord.memberRolePuts.push({
+        authorization: headerValue(init.headers, "Authorization"),
+        guildId: memberRoleMatch[1],
+        roleId: memberRoleMatch[3],
+        userId: memberRoleMatch[2],
+      });
+    });
+    return response("", { status: 204 });
+  }
+
+  if (url.hostname === "discord.com" && memberRoleMatch && method === "DELETE") {
+    updateState((state) => {
+      state.fixtures.discord.memberRoleDeletes ||= [];
+      state.fixtures.discord.memberRoleDeletes.push({
+        authorization: headerValue(init.headers, "Authorization"),
+        guildId: memberRoleMatch[1],
+        roleId: memberRoleMatch[3],
+        userId: memberRoleMatch[2],
+      });
+    });
+    return response("", { status: 204 });
+  }
+
+  const createInviteMatch = /^\/api\/v10\/channels\/([^/]+)\/invites$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && createInviteMatch && method === "POST") {
+    let invite;
+    updateState((state) => {
+      state.fixtures.discord.invites ||= [];
+      invite = {
+        authorization: headerValue(init.headers, "Authorization"),
+        channelId: createInviteMatch[1],
+        code: `fake-invite-${state.fixtures.discord.invites.length + 1}`,
+        fields: formBodyFields(init.body),
+      };
+      state.fixtures.discord.invites.push(invite);
+    });
+    return response(JSON.stringify({ code: invite.code, url: `https://discord.gg/${invite.code}` }), {
+      headers: { "content-type": "application/json" },
+    });
   }
 
   const listMessagesMatch = /^\/api\/v10\/channels\/([^/]+)\/messages$/.exec(url.pathname);

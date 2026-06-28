@@ -15,7 +15,12 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const PROJECT_DIR = process.env.PROJECT_DIR;
 const WS_PORT = parseInt(process.env.WS_PORT || "18300", 10);
-const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID;
+const ALLOWED_USER_IDS = new Set(
+  (process.env.ALLOWED_USER_IDS || process.env.ALLOWED_USER_ID || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean)
+);
 const GUILD_ID = process.env.GUILD_ID;
 const ROOT_BOT_TOKEN = process.env.ROOT_BOT_TOKEN;
 const ROOT_BOT_APP_ID = process.env.ROOT_BOT_APP_ID;
@@ -914,7 +919,7 @@ function startDiscordBot() {
   client.on("messageCreate", async (msg) => {
     if (msg.author.bot) return;
     if (msg.channel.id !== CHANNEL_ID) return;
-    if (ALLOWED_USER_ID && msg.author.id !== ALLOWED_USER_ID) return;
+    if (ALLOWED_USER_IDS.size > 0 && !ALLOWED_USER_IDS.has(msg.author.id)) return;
     if (mentionsRootBot(msg)) return;
 
     const text = msg.content.trim();

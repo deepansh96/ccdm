@@ -239,6 +239,39 @@ test("bridge boots, registers Discord MCP, removes stale MCP, and completes one 
   await bridge.stop();
 });
 
+test("bridge accepts project guests from a comma-separated allowlist", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    channelId: "channel-id",
+    turns: [{ delta: "Guest response" }],
+  });
+  const bridge = startBridge(workspace, {
+    allowedUserIds: ["allowed-user-id", "222222222222222222"],
+    port: codex.port,
+  });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await injectMessageUntil(
+    workspace,
+    { author: { id: "333333333333333333" }, content: "ignore outsider", id: "outsider" },
+    (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === "outsider"),
+    5000,
+  );
+  const state = await injectMessageUntil(
+    workspace,
+    { author: { id: "222222222222222222" }, content: "guest hello", id: "guest" },
+    (nextState) => nextState.fixtures.discord.sends.length === 1,
+    5000,
+  );
+
+  assert.equal(state.fixtures.discord.sends[0].content, "Guest response");
+  assert.equal(
+    state.fixtures.codex.protocolEvents.filter((event) => event.event === "client-message" && event.message.method === "turn/start").length,
+    2,
+  );
+  await bridge.stop();
+});
+
 test("bridge covers channel fetch, filtering, fallback splitting, MCP reply suppression, and token-usage nickname PATCH", async () => {
   const workspace = createBridgeWorkspace();
   const longText = "x".repeat(2001);

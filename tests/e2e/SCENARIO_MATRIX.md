@@ -38,7 +38,9 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Codex start | Registry fixture schema | Covered | Codex registries include Discord user/guild values, placeholder bot tokens, app IDs, channel IDs, `type: "codex"`, screen names, `ws_port`, and the current `bot1` root-token invariant. |
 | Codex start | Successful bridge launch | Covered | Drives `scripts/start-codex-session.sh`, builds the bridge tmux command, records the bridge PID, and leaves app-server spawning to bridge slices. |
 | Codex start | Stale MCP cleanup | Covered | Removes stale `discord-*` MCP blocks from the selected `CODEX_HOME/config.toml` while preserving unrelated MCP config and leaving the default Codex home untouched when `codex_home` is set. |
-| Codex start | Bridge environment construction | Covered | Asserts `CODEX_HOME`, `BOT_TOKEN`, `CHANNEL_ID`, `PROJECT_DIR`, `WS_PORT`, `ALLOWED_USER_ID`, `GUILD_ID`, `ROOT_BOT_TOKEN`, `BOT_APP_ID`, and `BOT_DISPLAY_NAME` from registry fields. |
+| Codex start | Bridge environment construction | Covered | Asserts `CODEX_HOME`, `BOT_TOKEN`, `CHANNEL_ID`, `PROJECT_DIR`, `WS_PORT`, `ALLOWED_USER_IDS`, `GUILD_ID`, `ROOT_BOT_TOKEN`, `BOT_APP_ID`, and `BOT_DISPLAY_NAME` from registry fields. |
+| Guest access | Project-scoped invite setup | Covered | Creates a project guest role, denies it on managed categories and sibling project channels, allows the target channel, updates bot allowlists, assigns the role when possible, and returns a one-use invite. |
+| Guest access | Revoke | Covered | Removes the user from project config, bot allowlists, and the project guest role. |
 | Codex start | Paths with spaces/quotes | Covered | Project paths with spaces and double quotes are captured through `PROJECT_DIR`. |
 | Codex start | Already-running tmux guard | Covered | Existing target tmux session exits successfully without launching another bridge. |
 | Codex start | Duplicate bridge/app-server guard | Covered | Fixture `ps` rows for matching bridge channel/app ID or app-server port fail before creating the target tmux session. |

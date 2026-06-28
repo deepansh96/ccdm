@@ -48,6 +48,8 @@ Read the `registry.json` file in this project's root directory. It has two main 
 - `ws_port`: (codex only) WebSocket port for the codex app-server (e.g., `18301`)
 - `codex_home`: (codex only, optional) Codex home directory for this project. Defaults to `~/.codex`. Use this to run selected Codex sessions under a secondary login/account, e.g. `~/.codex-api`.
 - `claude_home`: (claude only, optional) Claude config directory (`CLAUDE_CONFIG_DIR`) for this project. Defaults to `~/.claude`. Use this to run selected Claude sessions under a secondary login/account, e.g. `~/.claude-work`. The directory must have its own login and the Discord plugin installed (see "Claude account selection" below).
+- `guest_user_ids`: (optional) Discord user IDs allowed to use this project's bot in addition to `discord_user_id`
+- `guest_role_id`: (optional) Discord role ID created by `scripts/guest-access.js` for project-scoped guest invites
 - `session_id`: Claude Code session ID (updated on start, cleared on stop)
 - `pid`: Claude Code process ID (updated on start, cleared on stop)
 
@@ -57,6 +59,7 @@ Read the `registry.json` file in this project's root directory. It has two main 
 - `max_pool_size`: maximum number of bots in the pool (50)
 - `project_bot_role_id`: Discord role ID for the "project-bot" role (zero permissions, used to deny VIEW_CHANNEL on all categories)
 - `category_ids`: array of Discord category channel IDs where the project-bot role has VIEW_CHANNEL denied
+- `guest_deny_channel_ids`: optional extra channel/category IDs where project guest roles should be denied VIEW_CHANNEL
 
 ### Commands
 
@@ -202,6 +205,31 @@ If the target is a Codex session, tell the user to send `/compact`, `/clear`, or
 #### 4. Restart a session (`restart <project>`)
 
 Stop then start.
+
+#### 4a. Guest access (`guest invite`, `guest grant`, `guest revoke`, `guest sync`)
+
+Use `scripts/guest-access.js` to allow a friend into exactly one project channel:
+
+```sh
+scripts/guest-access.js invite <project|channel_id> <user_id>
+scripts/guest-access.js grant <project|channel_id> <user_id>
+scripts/guest-access.js revoke <project|channel_id> <user_id>
+scripts/guest-access.js sync [project|channel_id]
+scripts/guest-access.js list [project|channel_id]
+```
+
+`invite` creates or reuses a per-project `ccdm-guest-<project>` role, denies that role on CCDM-managed categories and other project channels, allows text + attachments on the target channel, adds the user ID to project bot allowlists, and creates a one-use target-channel invite for that user. `grant` does the same setup without creating an invite, for users already in the server. `revoke` removes the user from `guest_user_ids`, bot allowlists, and the project guest role.
+
+Codex project starts pass `discord_user_id` plus `guest_user_ids` through `ALLOWED_USER_IDS`. Claude project access is written into that bot's `access.json`.
+
+SOP for inviting a new guest:
+1. Do not send a generic server invite. Run `scripts/guest-access.js invite <project|channel_id> <user_id>` first.
+2. Send the printed one-use invite link to the guest.
+3. Restart the project session so the running bot picks up the new allowlist.
+4. If the guest joins but cannot see or use the target channel, run `scripts/guest-access.js sync <project|channel_id>`.
+5. To remove access, run `scripts/guest-access.js revoke <project|channel_id> <user_id>` and restart the project session.
+
+Guests are intended for text and attachments only. Voice access is not granted.
 
 #### 5. Register a project (`register`, `setup`)
 
