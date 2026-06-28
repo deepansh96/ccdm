@@ -170,7 +170,7 @@ print(f"Recorded PID {pid}")
 PY
 }
 
-IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME BOT_TOKEN CHANNEL_ID WS_PORT DISCORD_USER_ID GUILD_ID ROOT_TOKEN ROOT_BOT_APP_ID BOT_APP_ID BOT_ID CODEX_HOME_DIR BOT_DISPLAY_OVERRIDE TEXT_REPLY_FALLBACK_FLAG <<< "$(python3 -c "
+IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME BOT_TOKEN CHANNEL_ID WS_PORT DISCORD_USER_IDS GUILD_ID ROOT_TOKEN ROOT_BOT_APP_ID BOT_APP_ID BOT_ID CODEX_HOME_DIR BOT_DISPLAY_OVERRIDE TEXT_REPLY_FALLBACK_FLAG <<< "$(python3 -c "
 import base64, json, os, re
 r = json.load(open('$REGISTRY'))
 p = r['projects']['$PROJECT']
@@ -188,6 +188,7 @@ if os.path.exists(root_env):
             root_bot_app_id = base64.urlsafe_b64decode(token_id).decode()
         except Exception:
             pass
+allowed_user_ids = [r['discord_user_id']] + list(p.get('guest_user_ids') or [])
 print('\t'.join([
     os.path.expanduser(p['path']),
     os.path.expanduser(bot['state_dir']),
@@ -195,7 +196,7 @@ print('\t'.join([
     bot['token'],
     p['channel_id'],
     str(p.get('ws_port', 18300)),
-    r['discord_user_id'],
+    ','.join(dict.fromkeys(str(user_id) for user_id in allowed_user_ids if str(user_id))),
     r['guild_id'],
     root_bot['token'],
     root_bot_app_id,
@@ -267,7 +268,7 @@ if [[ "$TEXT_REPLY_FALLBACK_FLAG" == "1" ]]; then
   TEXT_REPLY_FALLBACK_ENV=" CODEX_BRIDGE_TEXT_REPLY_FALLBACK='1'"
 fi
 
-tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' BOT_TOKEN='$BOT_TOKEN' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_ID='$DISCORD_USER_ID' GUILD_ID='$GUILD_ID' ROOT_BOT_TOKEN='$ROOT_TOKEN' ROOT_BOT_APP_ID='$ROOT_BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' BOT_DISPLAY_NAME='$BOT_DISPLAY_NAME'$AUDIO_TRANSCRIPTION_ENV$TEXT_REPLY_FALLBACK_ENV node scripts/codex-bridge.js"
+tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' BOT_TOKEN='$BOT_TOKEN' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$DISCORD_USER_IDS' GUILD_ID='$GUILD_ID' ROOT_BOT_TOKEN='$ROOT_TOKEN' ROOT_BOT_APP_ID='$ROOT_BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' BOT_DISPLAY_NAME='$BOT_DISPLAY_NAME'$AUDIO_TRANSCRIPTION_ENV$TEXT_REPLY_FALLBACK_ENV node scripts/codex-bridge.js"
 echo "Started Codex bridge in tmux session '$SCREEN_NAME'"
 echo "Attach with: tmux attach -t $SCREEN_NAME"
 record_codex_pid "$CHANNEL_ID" "$BOT_APP_ID"
