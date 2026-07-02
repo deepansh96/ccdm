@@ -7,6 +7,7 @@ const { createReadStream } = require("fs");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
+const DISCORD_REPLY_TOKEN = process.env.DISCORD_REPLY_TOKEN;
 
 if (!BOT_TOKEN || !CHANNEL_ID) {
   process.stderr.write("Missing BOT_TOKEN or CHANNEL_ID\n");
@@ -125,6 +126,27 @@ async function sendMessageWithFiles(channelId, content, files, replyTo) {
   return res;
 }
 
+const replyProperties = {
+  text: { type: "string", description: "Message text to send" },
+  files: {
+    type: "array",
+    items: { type: "string" },
+    description:
+      "Absolute file paths to attach (images, logs, etc). Max 10 files, 25MB each.",
+  },
+  reply_to: {
+    type: "string",
+    description: "Message ID to thread under (for quote-replies).",
+  },
+};
+
+if (DISCORD_REPLY_TOKEN) {
+  replyProperties.scope_token = {
+    type: "string",
+    description: "Required bridge scope token from the current top-level Discord instructions.",
+  };
+}
+
 const TOOLS = [
   {
     name: "reply",
@@ -132,20 +154,8 @@ const TOOLS = [
       "Send a message to the Discord channel. Optionally attach files and/or reply to a specific message.",
     inputSchema: {
       type: "object",
-      properties: {
-        text: { type: "string", description: "Message text to send" },
-        files: {
-          type: "array",
-          items: { type: "string" },
-          description:
-            "Absolute file paths to attach (images, logs, etc). Max 10 files, 25MB each.",
-        },
-        reply_to: {
-          type: "string",
-          description: "Message ID to thread under (for quote-replies).",
-        },
-      },
-      required: ["text"],
+      properties: replyProperties,
+      required: DISCORD_REPLY_TOKEN ? ["text", "scope_token"] : ["text"],
     },
   },
   {
@@ -214,7 +224,10 @@ const TOOLS = [
 async function handleToolCall(name, args) {
   switch (name) {
     case "reply": {
-      const { text, files, reply_to } = args;
+      const { text, files, reply_to, scope_token } = args;
+      if (DISCORD_REPLY_TOKEN && scope_token !== DISCORD_REPLY_TOKEN) {
+        throw new Error("Discord reply denied: missing or invalid scope token");
+      }
       let result;
       if (files && files.length > 0) {
         result = await sendMessageWithFiles(CHANNEL_ID, text, files, reply_to);

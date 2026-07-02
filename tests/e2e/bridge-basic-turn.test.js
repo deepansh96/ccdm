@@ -183,14 +183,17 @@ test("fake Codex app-server supports active-turn controls and approval requests"
   assert.ok(clientMethods.includes("turn/steer"));
 });
 
-test("bridge boots, registers Discord MCP, removes stale MCP, and completes one allowed text turn", async () => {
+test("bridge boots, registers Discord MCP, removes stale MCP, and completes one allowed text turn with opt-in text fallback", async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, {
     channelId: "channel-id",
     staleMcpName: "discord-stale",
     turns: [{ delta: "Codex response" }],
   });
-  const bridge = startBridge(workspace, { port: codex.port });
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
 
   await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
   const state = await injectMessageUntil(
@@ -227,7 +230,8 @@ test("bridge boots, registers Discord MCP, removes stale MCP, and completes one 
     .filter((event) => event.event === "client-message")
     .map((event) => event.message)
     .find((message) => message.method === "thread/start");
-  assert.match(threadStart.params.developerInstructions, /Use ONLY the MCP server named "discord-channel-id"/);
+  assert.match(threadStart.params.developerInstructions, /Subagents and delegated tasks must return results to their parent agent/);
+  assert.doesNotMatch(threadStart.params.developerInstructions, /scope_token/);
   const bootstrapTurn = state.fixtures.codex.protocolEvents
     .filter((event) => event.event === "client-message")
     .map((event) => event.message)
@@ -236,6 +240,28 @@ test("bridge boots, registers Discord MCP, removes stale MCP, and completes one 
       message.params?.input?.[0]?.text?.includes("Use ONLY the MCP server named \"discord-channel-id\""),
     );
   assert.ok(bootstrapTurn);
+  assert.match(bootstrapTurn.params.input[0].text, /scope_token: "[a-f0-9]{32}"/);
+  await bridge.stop();
+});
+
+test("bridge keeps regular agent deltas private by default", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    channelId: "channel-id",
+    turns: [{ delta: "sub-agent progress should stay private" }],
+  });
+  const bridge = startBridge(workspace, { port: codex.port });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await injectMessageUntil(
+    workspace,
+    { content: "use a sub agent", id: "private-sub-agent" },
+    (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === "private-sub-agent"),
+    5000,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 150));
+
+  assert.equal(readState(workspace.stateDir).fixtures.discord.sends.length, 0);
   await bridge.stop();
 });
 
@@ -247,6 +273,7 @@ test("bridge accepts project guests from a comma-separated allowlist", async () 
   });
   const bridge = startBridge(workspace, {
     allowedUserIds: ["allowed-user-id", "222222222222222222"],
+    env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
     port: codex.port,
   });
 
@@ -286,7 +313,10 @@ test("bridge covers channel fetch, filtering, fallback splitting, MCP reply supp
       { delta: "usage done", tokenUsage: { last: { inputTokens: 42 }, modelContextWindow: 100 } },
     ],
   });
-  const bridge = startBridge(workspace, { port: codex.port });
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
 
   await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
   await injectMessageUntil(
@@ -466,7 +496,7 @@ test("bridge logs failed nickname PATCH responses", async () => {
   await injectMessageUntil(
     workspace,
     { content: "usage", id: "failed-nickname-usage-message" },
-    (nextState) => nextState.fixtures.discord.sends.some((send) => send.content === "usage done"),
+    (nextState) => nextState.fixtures.discord.restFailureUses.length === 1,
     5000,
   );
   await bridge.waitForOutput(/Nickname update failed: Discord API 403.*missing permissions/, 5000);
@@ -484,7 +514,10 @@ test("bridge handles approvals, active-turn steer, and stale-turn queue fallback
       { delta: "queued done" },
     ],
   });
-  const bridge = startBridge(workspace, { port: codex.port });
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
   const injectAndWait = async (message, pattern) => {
     let lastError;
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -550,7 +583,10 @@ test("bridge handles compact and clear slash commands during an active turn", as
       { delta: "after clear done", turnId: "after-clear-turn" },
     ],
   });
-  const bridge = startBridge(workspace, { port: codex.port });
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
 
   await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
   for (let attempt = 0; attempt < 3 && !/\[discord\] Allowed User: busy/.test(bridge.stdout); attempt++) {
@@ -604,16 +640,18 @@ test("bridge handles compact and clear slash commands during an active turn", as
   const mcpWrite = clientMessages.find((message) => message.method === "config/value/write");
   assert.equal(mcpWrite.params.keyPath, "mcp_servers.discord-channel-id");
   assert.equal(mcpWrite.params.value.env.CHANNEL_ID, "channel-id");
+  assert.match(mcpWrite.params.value.env.DISCORD_REPLY_TOKEN, /^[a-f0-9]{32}$/);
   const threadStarts = clientMessages.filter((message) => message.method === "thread/start");
   assert.equal(
     threadStarts.filter((message) =>
-      message.params?.developerInstructions?.includes("Use ONLY the MCP server named \"discord-channel-id\""),
+      message.params?.developerInstructions?.includes("Subagents and delegated tasks must return results to their parent agent"),
     ).length,
     2,
   );
   assert.equal(clientMessages.filter((message) =>
     message.method === "turn/start" &&
-    message.params?.input?.[0]?.text?.includes("Use ONLY the MCP server named \"discord-channel-id\""),
+    message.params?.input?.[0]?.text?.includes("Use ONLY the MCP server named \"discord-channel-id\"") &&
+    /scope_token: "[a-f0-9]{32}"/.test(message.params.input[0].text),
   ).length, 2);
   await bridge.stop();
 });
@@ -638,7 +676,8 @@ test("bridge sends the bootstrap instruction turn after idle compact completion"
     .map((event) => event.message)
     .filter((message) =>
       message.method === "turn/start" &&
-      message.params?.input?.[0]?.text?.includes("Use ONLY the MCP server named \"discord-channel-id\""),
+      message.params?.input?.[0]?.text?.includes("Use ONLY the MCP server named \"discord-channel-id\"") &&
+      /scope_token: "[a-f0-9]{32}"/.test(message.params.input[0].text),
     );
 
   assert.equal(bootstrapTurns.length, 2);
@@ -772,7 +811,10 @@ test("bridge records diagnostics when Discord send fails", async () => {
   const codex = await startFakeCodexServer(workspace, {
     turns: [{ delta: "cannot send" }],
   });
-  const bridge = startBridge(workspace, { port: codex.port });
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
 
   await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
   injectDiscordMessage(workspace, { content: "trigger send failure" });
@@ -801,7 +843,10 @@ test("bridge builds Codex input for empty messages and image, text, binary, and 
   const codex = await startFakeCodexServer(workspace, {
     turns: [{ delta: "attachments done" }],
   });
-  const bridge = startBridge(workspace, { port: codex.port });
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
 
   await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
   await injectMessageUntil(
@@ -895,7 +940,10 @@ test("bridge transcribes audio attachments by default", async () => {
   const codex = await startFakeCodexServer(workspace, {
     turns: [{ delta: "transcription done" }],
   });
-  const bridge = startBridge(workspace, { port: codex.port });
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
 
   await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
   const state = await injectMessageUntil(

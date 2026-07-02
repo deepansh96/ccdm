@@ -61,14 +61,14 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Codex bridge | Login success/failure | Covered | Successful boot records Discord login/ready; configured login rejection exits the bridge. |
 | Codex bridge | Channel cache/fetch paths | Covered | Covers cache-hit boot and cache-miss fetch with recorded channel fetch state. |
 | Codex bridge | Filtering | Covered | Bot-authored, wrong-channel, and wrong-user injected messages do not start user turns or send replies. |
-| Codex bridge | One allowed text turn | Covered | Injected user text starts a Codex turn, records typing, and sends fallback Discord text from agent deltas. |
-| Codex bridge | Fallback splitting and MCP suppression | Covered | 2001-character fallback output splits into 2000/1 chunks; a detected Discord MCP reply suppresses fallback text. |
+| Codex bridge | One allowed text turn | Covered | Injected user text starts a Codex turn, records typing, gives only the top-level agent the reply scope token, keeps default agent deltas private, and covers opt-in fallback text. |
+| Codex bridge | Fallback splitting and MCP suppression | Covered | With `CODEX_BRIDGE_TEXT_REPLY_FALLBACK=1`, 2001-character fallback output splits into 2000/1 chunks; a detected Discord MCP reply suppresses fallback text. |
 | Codex bridge | Process exit paths | Covered | App-server exit, WebSocket close, and startup without thread id terminate the bridge with observable diagnostics. |
 | Codex bridge | Token-usage nickname PATCH | Covered | Token usage notifications route to fake Discord member PATCH and record the computed nickname. |
 | Codex bridge | Active-turn controls | Covered | Covers approval responses, successful steer, stale-turn failed steer fallback, queued hourglass reaction cleanup, and typing shutdown after completion. |
 | Codex bridge | Slash controls | Covered | Covers `/compact`, `/clear`, `/restart`, context-compaction completion, archive/new-thread flow, and compact/clear while a turn is active. |
 | Codex bridge | Error and MCP diagnostics | Covered | Covers non-retryable Codex errors, typing shutdown after failure, stale MCP removal warning/continue behavior, MCP registration fatal diagnostics, and Discord send failure diagnostics. |
-| Codex bridge | Attachment input construction | Covered | Covers empty messages, image URLs, fetched text attachments, binary downloads into `.discord-attachments`, failed attachment fetches, and fallback Discord response behavior. |
+| Codex bridge | Attachment input construction | Covered | Covers empty messages, image URLs, fetched text attachments, binary downloads into `.discord-attachments`, failed attachment fetches, and opt-in fallback Discord response behavior. |
 | Fixture contracts | stop/restart tmux contracts | Covered | `kill-session`, `display-message '#{pane_pid}'`, retryable root-agent kill attempts, new-session launch failure injection, and trust-dialog `send-keys` recording. |
 | Fixture contracts | stop/restart process contracts | Covered | `pgrep -P`, `pkill -TERM -P`, fast fixture `sleep`, and fixture `ps` extend the shared harness-owned process model. |
 | Process safety | Shell builtin `kill` boundary | Covered | Tests do not replace shell builtin `kill`; only real harness-owned placeholder PIDs are exposed through fake `ps`/`pgrep`, so production `kill -TERM`/`kill -KILL` cannot receive fabricated or host PIDs. |
@@ -121,8 +121,8 @@ This audit maps the PRD workflow bullets from issue #4 to automated scenarios or
 | Claude start | Registry lookup, state-dir resolution, tmux launch construction, duplicate listener guards, PID/session recording | Covered | Claude start rows above drive `scripts/start-session.sh`. |
 | Stop session | Recorded PID ownership, process-tree termination, tmux cleanup, orphan sweeps, registry cleanup for Claude and Codex | Covered | Stop session and process safety rows above drive `scripts/stop-session.sh`. |
 | Codex start | `CODEX_HOME` account selection, stale MCP cleanup, duplicate bridge detection, environment construction, root-bot token lookup, bridge PID recording | Covered | Codex start rows above drive `scripts/start-codex-session.sh`. |
-| Codex bridge | Filtering, attachments, queueing, steering, slash commands, fallback replies, MCP registration, diagnostics | Covered | Codex bridge and JS interception rows above drive `scripts/codex-bridge.js` with fake Discord and fake Codex app-server. |
-| Discord MCP | Reply, edit, react, fetch, attachment download, JSON-RPC lifecycle, and API error propagation | Covered | Discord MCP rows above drive `scripts/discord-mcp-server.js`. |
+| Codex bridge | Filtering, attachments, queueing, steering, slash commands, private deltas, opt-in fallback replies, MCP registration, diagnostics | Covered | Codex bridge and JS interception rows above drive `scripts/codex-bridge.js` with fake Discord and fake Codex app-server. |
+| Discord MCP | Scoped reply, edit, react, fetch, attachment download, JSON-RPC lifecycle, and API error propagation | Covered | Discord MCP rows above drive `scripts/discord-mcp-server.js`. |
 | Claude usage | OAuth/keychain fallback, local stats parsing, malformed data tolerance, version reporting | Covered | Claude usage rows above drive `scripts/claude-usage.sh`. |
 | Nickname/statusline | Rate limiting, disable behavior, fixture root `.env`, PATCH construction, npx no-network statusline pipeline | Covered | Nickname/statusline and fixture contract rows above drive the nickname/statusline scripts. |
 | Root restart | Fixture tmux/process restart behavior without touching the real `root_agent` session | Covered | Root restart rows above drive `restart-root-agent.sh`. |

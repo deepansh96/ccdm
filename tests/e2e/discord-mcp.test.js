@@ -76,6 +76,35 @@ test("Discord MCP initializes, lists tools, accepts initialized notifications, a
   });
 });
 
+test("Discord MCP reply requires the bridge scope token when configured", async () => {
+  const workspace = createBridgeWorkspace();
+
+  const result = await runMcp(
+    workspace,
+    [
+      rpc(1, "initialize", {}),
+      rpc(2, "tools/list", {}),
+      toolCall(3, "reply", { text: "missing token" }),
+      toolCall(4, "reply", { text: "wrong token", scope_token: "wrong" }),
+      toolCall(5, "reply", { text: "right token", scope_token: "secret-token" }),
+    ],
+    { env: { DISCORD_REPLY_TOKEN: "secret-token" } },
+  );
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const output = responseById(result);
+  const replyTool = output.get(2).result.tools.find((tool) => tool.name === "reply");
+  assert.deepEqual(replyTool.inputSchema.required, ["text", "scope_token"]);
+  assert.equal(output.get(3).result.isError, true);
+  assert.match(output.get(3).result.content[0].text, /missing or invalid scope token/);
+  assert.equal(output.get(4).result.isError, true);
+  assert.match(output.get(4).result.content[0].text, /missing or invalid scope token/);
+  assert.deepEqual(output.get(5).result.content, [{ type: "text", text: "sent (id: fake-message-1)" }]);
+
+  const discord = readState(workspace.stateDir).fixtures.discord;
+  assert.deepEqual(discord.messages.map((message) => message.content), ["right token"]);
+});
+
 test("Discord MCP reports JSON-RPC errors and drives edit, react, and fetch tools", async () => {
   const workspace = createBridgeWorkspace();
   const seed = readState(workspace.stateDir);
