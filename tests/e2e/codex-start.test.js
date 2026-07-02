@@ -46,6 +46,7 @@ function buildCodexRegistry(workspace, options = {}) {
         channel_id: "channel-id",
         type: "codex",
         ws_port: 18342,
+        ...(options.guestUserIds ? { guest_user_ids: options.guestUserIds } : {}),
         ...(options.codexHome ? { codex_home: options.codexHome } : {}),
         ...(options.textReplyFallback ? { text_reply_fallback: true } : {}),
         session_id: null,
@@ -187,7 +188,7 @@ test("start-codex-session constructs a bridge tmux launch, removes stale MCP con
   const session = state.fixtures.tmux.sessions.alpha_codex;
   assert.equal(session.cwd, workspace.repoDir);
   assert.deepEqual(session.env, {
-    ALLOWED_USER_ID: registrySeed.discord_user_id,
+    ALLOWED_USER_IDS: registrySeed.discord_user_id,
     BOT_APP_ID: registrySeed.pool[1].app_id,
     BOT_DISPLAY_NAME: "bot2-alpha-codex",
     BOT_TOKEN: registrySeed.pool[1].token,
@@ -216,6 +217,19 @@ test("start-codex-session passes text reply fallback only for flagged Codex proj
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex;
   assert.equal(session.env.CODEX_BRIDGE_TEXT_REPLY_FALLBACK, "1");
+});
+
+test("start-codex-session allows owner plus project guests", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, buildCodexRegistry(workspace, { guestUserIds: ["222222222222222222"] }));
+
+  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
+    args: ["alpha"],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex;
+  assert.equal(session.env.ALLOWED_USER_IDS, "allowed-user-id,222222222222222222");
 });
 
 test("start-codex-session exits successfully when the target tmux session is already running", async () => {

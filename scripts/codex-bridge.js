@@ -2,6 +2,7 @@
 
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const { spawn } = require("child_process");
+const { randomBytes } = require("crypto");
 const { writeFile, mkdir, mkdtemp, readFile, rm } = require("fs/promises");
 const os = require("os");
 const path = require("path");
@@ -15,7 +16,12 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const PROJECT_DIR = process.env.PROJECT_DIR;
 const WS_PORT = parseInt(process.env.WS_PORT || "18300", 10);
-const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID;
+const ALLOWED_USER_IDS = new Set(
+  (process.env.ALLOWED_USER_IDS || process.env.ALLOWED_USER_ID || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean)
+);
 const GUILD_ID = process.env.GUILD_ID;
 const ROOT_BOT_TOKEN = process.env.ROOT_BOT_TOKEN;
 const ROOT_BOT_APP_ID = process.env.ROOT_BOT_APP_ID;
@@ -34,6 +40,7 @@ const AUDIO_TRANSCRIPTION_LANGUAGE =
   process.env.CODEX_BRIDGE_AUDIO_TRANSCRIPTION_LANGUAGE || "en";
 const TEXT_REPLY_FALLBACK =
   process.env.CODEX_BRIDGE_TEXT_REPLY_FALLBACK === "1";
+const DISCORD_REPLY_TOKEN = randomBytes(16).toString("hex");
 
 if (!BOT_TOKEN || !CHANNEL_ID || !PROJECT_DIR) {
   console.error(
@@ -61,7 +68,8 @@ let threadResetting = false;
 let lastNicknameUpdate = 0;
 let fallbackLoggedCompletedItemTypes = new Set();
 const NICKNAME_INTERVAL = 60000;
-const SYSTEM_INSTRUCTION = `You are communicating with the user via Discord. Use ONLY the MCP server named "discord-${CHANNEL_ID}" to interact — call its \`reply\` tool to send messages to the user. Do NOT use any other discord MCP server. Do NOT output responses as regular text; always use the \`reply\` tool so the user sees your response on Discord. Other available tools on this same server: edit_message, react, fetch_messages, download_attachment. Use \`reply\` with the \`files\` parameter to send file attachments. You don't have to reply for every little thing. Try to reply only when you're done, unless something important needs to be confirmed from the user. Also, try to use simpler language and avoid complex language.`;
+const THREAD_INSTRUCTION = `This thread is connected to Discord through the discord-${CHANNEL_ID} MCP server. Do not call Discord MCP tools unless the current task includes an explicit Discord reply scope token. Subagents and delegated tasks must return results to their parent agent, not to Discord.`;
+const SYSTEM_INSTRUCTION = `You are communicating with the user via Discord. Use ONLY the MCP server named "discord-${CHANNEL_ID}" to interact — call its \`reply\` tool to send messages to the user. Every Discord write call (\`reply\`, \`edit_message\`, or \`react\`) must include \`scope_token: "${DISCORD_REPLY_TOKEN}"\`. Do NOT share this scope token with subagents. When spawning subagents, explicitly tell them not to use Discord MCP/tools and to return only to the parent agent. Do NOT use any other discord MCP server. Do NOT output responses as regular text; always use the \`reply\` tool so the user sees your response on Discord. Other available tools on this same server: edit_message, react, fetch_messages, download_attachment. Use \`reply\` with the \`files\` parameter to send file attachments. You don't have to reply for every little thing. Try to reply only when you're done, unless something important needs to be confirmed from the user. Also, try to use simpler language and avoid complex language.`;
 
 function nextId() {
   return requestId++;
@@ -436,7 +444,7 @@ function handleNotification(msg) {
       if (!isCurrentTurnNotification(msg)) break;
       if (msg.params?.item?.type === "mcpToolCall" &&
           msg.params.item.server?.startsWith("discord-") &&
-          msg.params.item.tool === "reply") {
+          ["reply", "edit_message", "react"].includes(msg.params.item.tool)) {
         mcpReplyCalled = true;
       }
       break;
@@ -527,12 +535,8 @@ async function onTurnCompleted() {
   if (suppressTurnOutput) {
     deltaBuffer = "";
     fallbackText = "";
-  } else if (!mcpReplyCalled) {
-    if (TEXT_REPLY_FALLBACK) {
-      flushTextReplyFallback();
-    } else {
-      flushDeltaBuffer();
-    }
+  } else if (!mcpReplyCalled && TEXT_REPLY_FALLBACK) {
+    flushTextReplyFallback();
   } else {
     deltaBuffer = "";
     fallbackText = "";
@@ -838,7 +842,7 @@ async function registerDiscordMcp() {
     value: {
       command: "node",
       args: [MCP_SERVER_SCRIPT],
-      env: { BOT_TOKEN, CHANNEL_ID },
+      env: { BOT_TOKEN, CHANNEL_ID, DISCORD_REPLY_TOKEN },
     },
   });
   console.log(`MCP server config written: ${mcpName}`);
@@ -860,7 +864,7 @@ async function startCodexThread() {
     cwd: PROJECT_DIR,
     sandbox: "danger-full-access",
     approvalPolicy: "never",
-    developerInstructions: SYSTEM_INSTRUCTION,
+    developerInstructions: THREAD_INSTRUCTION,
   });
   if (result?.thread?.id) {
     threadId = result.thread.id;
@@ -914,7 +918,7 @@ function startDiscordBot() {
   client.on("messageCreate", async (msg) => {
     if (msg.author.bot) return;
     if (msg.channel.id !== CHANNEL_ID) return;
-    if (ALLOWED_USER_ID && msg.author.id !== ALLOWED_USER_ID) return;
+    if (ALLOWED_USER_IDS.size > 0 && !ALLOWED_USER_IDS.has(msg.author.id)) return;
     if (mentionsRootBot(msg)) return;
 
     const text = msg.content.trim();

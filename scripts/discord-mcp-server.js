@@ -7,6 +7,7 @@ const { createReadStream } = require("fs");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
+const DISCORD_REPLY_TOKEN = process.env.DISCORD_REPLY_TOKEN;
 
 if (!BOT_TOKEN || !CHANNEL_ID) {
   process.stderr.write("Missing BOT_TOKEN or CHANNEL_ID\n");
@@ -125,6 +126,41 @@ async function sendMessageWithFiles(channelId, content, files, replyTo) {
   return res;
 }
 
+const scopeTokenProperty = {
+  scope_token: {
+    type: "string",
+    description: "Required bridge scope token from the current top-level Discord instructions.",
+  },
+};
+
+function withScopeToken(properties) {
+  return DISCORD_REPLY_TOKEN ? { ...properties, ...scopeTokenProperty } : properties;
+}
+
+function requiredWithScope(fields) {
+  return DISCORD_REPLY_TOKEN ? [...fields, "scope_token"] : fields;
+}
+
+function requireScopeToken(scopeToken) {
+  if (DISCORD_REPLY_TOKEN && scopeToken !== DISCORD_REPLY_TOKEN) {
+    throw new Error("Discord write denied: missing or invalid scope token");
+  }
+}
+
+const replyProperties = {
+  text: { type: "string", description: "Message text to send" },
+  files: {
+    type: "array",
+    items: { type: "string" },
+    description:
+      "Absolute file paths to attach (images, logs, etc). Max 10 files, 25MB each.",
+  },
+  reply_to: {
+    type: "string",
+    description: "Message ID to thread under (for quote-replies).",
+  },
+};
+
 const TOOLS = [
   {
     name: "reply",
@@ -132,20 +168,8 @@ const TOOLS = [
       "Send a message to the Discord channel. Optionally attach files and/or reply to a specific message.",
     inputSchema: {
       type: "object",
-      properties: {
-        text: { type: "string", description: "Message text to send" },
-        files: {
-          type: "array",
-          items: { type: "string" },
-          description:
-            "Absolute file paths to attach (images, logs, etc). Max 10 files, 25MB each.",
-        },
-        reply_to: {
-          type: "string",
-          description: "Message ID to thread under (for quote-replies).",
-        },
-      },
-      required: ["text"],
+      properties: withScopeToken(replyProperties),
+      required: requiredWithScope(["text"]),
     },
   },
   {
@@ -153,11 +177,11 @@ const TOOLS = [
     description: "Edit a previously sent message by ID.",
     inputSchema: {
       type: "object",
-      properties: {
+      properties: withScopeToken({
         message_id: { type: "string", description: "ID of the message to edit" },
         text: { type: "string", description: "New message content" },
-      },
-      required: ["message_id", "text"],
+      }),
+      required: requiredWithScope(["message_id", "text"]),
     },
   },
   {
@@ -165,11 +189,11 @@ const TOOLS = [
     description: "Add an emoji reaction to a message.",
     inputSchema: {
       type: "object",
-      properties: {
+      properties: withScopeToken({
         message_id: { type: "string", description: "ID of the message to react to" },
         emoji: { type: "string", description: "Emoji to react with (e.g. '👍' or 'custom_name:123456')" },
-      },
-      required: ["message_id", "emoji"],
+      }),
+      required: requiredWithScope(["message_id", "emoji"]),
     },
   },
   {
@@ -214,7 +238,8 @@ const TOOLS = [
 async function handleToolCall(name, args) {
   switch (name) {
     case "reply": {
-      const { text, files, reply_to } = args;
+      const { text, files, reply_to, scope_token } = args;
+      requireScopeToken(scope_token);
       let result;
       if (files && files.length > 0) {
         result = await sendMessageWithFiles(CHANNEL_ID, text, files, reply_to);
@@ -229,7 +254,8 @@ async function handleToolCall(name, args) {
     }
 
     case "edit_message": {
-      const { message_id, text } = args;
+      const { message_id, text, scope_token } = args;
+      requireScopeToken(scope_token);
       await discordPatch(`/channels/${CHANNEL_ID}/messages/${message_id}`, {
         content: text,
       });
@@ -237,7 +263,8 @@ async function handleToolCall(name, args) {
     }
 
     case "react": {
-      const { message_id, emoji } = args;
+      const { message_id, emoji, scope_token } = args;
+      requireScopeToken(scope_token);
       const encoded = encodeURIComponent(emoji);
       await discordPut(
         `/channels/${CHANNEL_ID}/messages/${message_id}/reactions/${encoded}/@me`

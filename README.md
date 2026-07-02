@@ -178,6 +178,8 @@ Message the root agent bot on Discord with any of these:
 | `pool` / `pool status` | Show all bots and their assignment status |
 | `pool add` | Create a new bot and add it to the pool |
 | `pool remove <bot_id>` | Remove an unassigned bot from the pool |
+| `guest invite <project> <user_id>` | Create a project-scoped guest invite |
+| `guest revoke <project> <user_id>` | Remove project guest access |
 | `context report` | Get context window usage for all running sessions (via tmux) |
 | `usage` / `limits` | Show rate limits, usage stats, and account info |
 | `restart yourself` | Self-restart the root agent |
@@ -217,6 +219,18 @@ This means:
 - Project bots **cannot see** any other channel, `#root`, or other project channels
 - The root bot **can see everything** and responds in `#root` without `@mention`
 - You can `@mention` the root bot in any project channel for management tasks
+
+### Project Guests
+
+To invite someone into one project channel only, run:
+
+```sh
+scripts/guest-access.js invite <project-or-channel-id> <discord-user-id>
+```
+
+This creates a one-use invite and a per-project `ccdm-guest-<project>` role. The role is denied on CCDM-managed categories and other project channels, then allowed on the target channel with text, message history, attachments, reactions, and thread replies. The guest user ID is also added to the project bot allowlist so Claude/Codex can read their messages.
+
+For users already in the server, use `grant` instead of `invite`. Use `revoke` to remove their project guest role and bot access.
 
 ## Managing the Bot Pool
 

@@ -111,7 +111,7 @@ The tmux/process fixture contract covers the Claude start surface:
 
 The same tmux/process contract covers the Codex startup surface:
 
-- `tmux new-session -d -s <name> -- zsh -ic <command>` validates the bridge launch shape and records `CODEX_HOME`, `BOT_TOKEN`, `CHANNEL_ID`, `PROJECT_DIR`, `WS_PORT`, `ALLOWED_USER_ID`, `GUILD_ID`, `ROOT_BOT_TOKEN`, `BOT_APP_ID`, and `BOT_DISPLAY_NAME`.
+- `tmux new-session -d -s <name> -- zsh -ic <command>` validates the bridge launch shape and records `CODEX_HOME`, `BOT_TOKEN`, `CHANNEL_ID`, `PROJECT_DIR`, `WS_PORT`, `ALLOWED_USER_IDS`, `GUILD_ID`, `ROOT_BOT_TOKEN`, `BOT_APP_ID`, and `BOT_DISPLAY_NAME`.
 - Codex startup tests seed registries with `type: "codex"`, `ws_port`, optional `codex_home`, placeholder bot tokens, app IDs, channel IDs, Discord user/guild values, and the current `bot1` root-token invariant.
 - The fixture records only the bridge command construction. App-server spawning and WebSocket protocol behavior belong to later Codex bridge scenarios.
 - The `npm` fixture fails closed and records invocations so startup scenarios can prove Test Workspaces do not run package installation or contact npm.

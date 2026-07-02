@@ -226,11 +226,11 @@ export async function startFakeCodexServer(workspace, options = {}) {
           startTimer.unref?.();
           const completionTimer = setTimeout(() => {
             if (interruptedTurnIds.has(turnId)) return;
-            if (plan.mcpReply) {
+            if (plan.mcpReply || plan.mcpTool) {
               notify("item/started", {
                 threadId: turnThreadId,
                 turnId,
-                item: { type: "mcpToolCall", server: `discord-${options.channelId ?? "channel-id"}`, tool: "reply" },
+                item: { type: "mcpToolCall", server: `discord-${options.channelId ?? "channel-id"}`, tool: plan.mcpTool ?? "reply" },
               });
             }
             if (plan.delta) {
@@ -310,7 +310,9 @@ export async function startFakeCodexServer(workspace, options = {}) {
 
 export function startBridge(workspace, options = {}) {
   const env = bridgeChildEnv(workspace, {
-    ALLOWED_USER_ID: options.allowedUserId ?? "allowed-user-id",
+    ...(options.allowedUserIds
+      ? { ALLOWED_USER_IDS: options.allowedUserIds.join(",") }
+      : { ALLOWED_USER_ID: options.allowedUserId ?? "allowed-user-id" }),
     BOT_APP_ID: options.botAppId ?? "bot-app-id",
     BOT_DISPLAY_NAME: options.botDisplayName ?? "bot2-alpha-codex",
     BOT_TOKEN: options.botToken ?? "bot-token",
