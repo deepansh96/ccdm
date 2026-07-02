@@ -78,8 +78,12 @@ function resolveProjects(registry, target) {
   return match;
 }
 
-function roleName(projectName) {
-  return `ccdm-guest-${projectName.replace(/[^a-zA-Z0-9._-]/g, "-")}`.slice(0, 100);
+function safeName(value) {
+  return String(value || "").replace(/[^a-zA-Z0-9._-]/g, "-");
+}
+
+function roleName(projectName, project) {
+  return `ccdm-guest-${safeName(projectName)}-${safeName(project.channel_id)}`.slice(0, 100);
 }
 
 function effectiveUsers(registry, project) {
@@ -98,7 +102,7 @@ function updateAccessJson(registry, project) {
   });
   const users = effectiveUsers(registry, project);
   access.dmPolicy = access.dmPolicy || "allowlist";
-  access.allowFrom = users;
+  access.allowFrom = unique([registry.discord_user_id]);
   access.groups = access.groups || {};
   access.groups[project.channel_id] = {
     ...(access.groups[project.channel_id] || {}),
@@ -132,10 +136,7 @@ async function discordApi(token, route, options = {}) {
 
 async function ensureGuestRole(registry, projectName, project, token) {
   if (project.guest_role_id) return project.guest_role_id;
-  const name = roleName(projectName);
-  const roles = await discordApi(token, `/guilds/${registry.guild_id}/roles`);
-  const existing = roles.find((role) => role.name === name);
-  if (existing) return existing.id;
+  const name = roleName(projectName, project);
   const role = await discordApi(token, `/guilds/${registry.guild_id}/roles`, {
     method: "POST",
     json: { name, permissions: "0", mentionable: false, hoist: false },
@@ -181,10 +182,10 @@ async function syncDiscordPermissions(registry, project, roleId, token) {
   await putOverwrite(token, project.channel_id, roleId, 0, GUEST_ALLOW, 0n);
 }
 
-async function tryPutMemberRole(registry, userId, roleId, token) {
+async function putMemberRole(registry, userId, roleId, token, allow404 = false) {
   return discordApi(token, `/guilds/${registry.guild_id}/members/${userId}/roles/${roleId}`, {
     method: "PUT",
-    allow404: true,
+    allow404,
   });
 }
 
@@ -195,7 +196,7 @@ async function tryDeleteMemberRole(registry, userId, roleId, token) {
   });
 }
 
-async function grant(registry, target, userId) {
+async function grant(registry, target, userId, options = {}) {
   const token = rootToken(registry);
   const [[projectName, project]] = resolveProjects(registry, target);
   const roleId = await ensureGuestRole(registry, projectName, project, token);
@@ -204,7 +205,7 @@ async function grant(registry, target, userId) {
   saveRegistry(registry);
   updateAccessJson(registry, project);
   await syncDiscordPermissions(registry, project, roleId, token);
-  await tryPutMemberRole(registry, userId, roleId, token);
+  await putMemberRole(registry, userId, roleId, token, Boolean(options.allowMissingMember));
   console.log(`Granted ${userId} guest access to ${projectName}.`);
   return { projectName, project, roleId, token };
 }
@@ -226,13 +227,23 @@ async function createInvite(registry, project, userId, roleId, token) {
     method: "POST",
     body: form,
   });
-  return invite.url || `https://discord.gg/${invite.code}`;
+  return { code: invite.code, url: invite.url || `https://discord.gg/${invite.code}` };
 }
 
 async function invite(registry, target, userId) {
-  const result = await grant(registry, target, userId);
-  const url = await createInvite(registry, result.project, userId, result.roleId, result.token);
-  console.log(`Invite: ${url}`);
+  const result = await grant(registry, target, userId, { allowMissingMember: true });
+  const inviteResult = await createInvite(registry, result.project, userId, result.roleId, result.token);
+  result.project.guest_invites = result.project.guest_invites || {};
+  result.project.guest_invites[userId] = unique([
+    ...(result.project.guest_invites[userId] || []),
+    inviteResult.code,
+  ]);
+  saveRegistry(registry);
+  console.log(`Invite: ${inviteResult.url}`);
+}
+
+async function deleteInvite(token, code) {
+  await discordApi(token, `/invites/${code}`, { method: "DELETE", allow404: true });
 }
 
 async function revoke(registry, target, userId) {
@@ -243,6 +254,14 @@ async function revoke(registry, target, userId) {
   updateAccessJson(registry, project);
   if (project.guest_role_id) {
     await tryDeleteMemberRole(registry, userId, project.guest_role_id, token);
+  }
+  for (const code of project.guest_invites?.[userId] || []) {
+    await deleteInvite(token, code);
+  }
+  if (project.guest_invites?.[userId]) {
+    delete project.guest_invites[userId];
+    if (Object.keys(project.guest_invites).length === 0) delete project.guest_invites;
+    saveRegistry(registry);
   }
   console.log(`Revoked ${userId} guest access from ${projectName}.`);
 }
@@ -259,7 +278,7 @@ async function sync(registry, target) {
     if (project.guest_role_id) {
       await syncDiscordPermissions(registry, project, project.guest_role_id, token);
       for (const userId of project.guest_user_ids || []) {
-        await tryPutMemberRole(registry, userId, project.guest_role_id, token);
+        await putMemberRole(registry, userId, project.guest_role_id, token, true);
       }
     }
     console.log(`Synced ${projectName}.`);

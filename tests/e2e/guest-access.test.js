@@ -78,6 +78,7 @@ test("guest invite configures role-gated channel access before returning the lin
     { id: "unregistered-child", type: 0, name: "quiz", parent_id: "category-a" },
     { id: "channel-alpha", type: 0, name: "alpha", parent_id: "category-a" },
   ];
+  seededState.fixtures.discord.roles = [{ id: "stale-role", name: "ccdm-guest-alpha-channel-alpha" }];
   writeState(seededState, workspace.stateDir);
 
   const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
@@ -90,13 +91,14 @@ test("guest invite configures role-gated channel access before returning the lin
   assert.match(result.stdout, /Invite: https:\/\/discord\.gg\/fake-invite-1/);
 
   const registry = readRegistry(workspace);
-  assert.equal(registry.projects.alpha.guest_role_id, "fake-role-1");
+  assert.equal(registry.projects.alpha.guest_role_id, "fake-role-2");
   assert.deepEqual(registry.projects.alpha.guest_user_ids, [GUEST_ID]);
+  assert.deepEqual(registry.projects.alpha.guest_invites, { [GUEST_ID]: ["fake-invite-1"] });
 
   const access = JSON.parse(
     fs.readFileSync(path.join(workspace.homeDir, ".claude", "channels", "discord2", "access.json"), "utf8"),
   );
-  assert.deepEqual(access.allowFrom, [OWNER_ID, GUEST_ID]);
+  assert.deepEqual(access.allowFrom, [OWNER_ID]);
   assert.deepEqual(access.groups["channel-alpha"].allowFrom, [OWNER_ID, GUEST_ID]);
 
   const discord = readState(workspace.stateDir).fixtures.discord;
@@ -106,7 +108,7 @@ test("guest invite configures role-gated channel access before returning the lin
       guildId: "guild-id",
       hoist: false,
       mentionable: false,
-      name: "ccdm-guest-alpha",
+      name: "ccdm-guest-alpha-channel-alpha",
       permissions: "0",
     },
   ]);
@@ -116,7 +118,7 @@ test("guest invite configures role-gated channel access before returning the lin
       authorization: "Bot root-token",
       channelId: "category-a",
       deny: VIEW_CHANNEL,
-      overwriteId: "fake-role-1",
+      overwriteId: "fake-role-2",
       type: 0,
     },
     {
@@ -124,7 +126,7 @@ test("guest invite configures role-gated channel access before returning the lin
       authorization: "Bot root-token",
       channelId: "unregistered-child",
       deny: VIEW_CHANNEL,
-      overwriteId: "fake-role-1",
+      overwriteId: "fake-role-2",
       type: 0,
     },
     {
@@ -132,7 +134,7 @@ test("guest invite configures role-gated channel access before returning the lin
       authorization: "Bot root-token",
       channelId: "channel-beta",
       deny: VIEW_CHANNEL,
-      overwriteId: "fake-role-1",
+      overwriteId: "fake-role-2",
       type: 0,
     },
     {
@@ -140,7 +142,7 @@ test("guest invite configures role-gated channel access before returning the lin
       authorization: "Bot root-token",
       channelId: "channel-alpha",
       deny: "0",
-      overwriteId: "fake-role-1",
+      overwriteId: "fake-role-2",
       type: 0,
     },
   ]);
@@ -148,12 +150,12 @@ test("guest invite configures role-gated channel access before returning the lin
     {
       authorization: "Bot root-token",
       guildId: "guild-id",
-      roleId: "fake-role-1",
+      roleId: "fake-role-2",
       userId: GUEST_ID,
     },
   ]);
   assert.equal(discord.invites[0].channelId, "channel-alpha");
-  assert.equal(JSON.parse(discord.invites[0].fields.payload_json).role_ids[0], "fake-role-1");
+  assert.equal(JSON.parse(discord.invites[0].fields.payload_json).role_ids[0], "fake-role-2");
   assert.equal(discord.invites[0].fields.target_users_file.name, "target_users.csv");
 });
 
@@ -162,6 +164,7 @@ test("guest revoke removes the user from config and their project role", async (
   const registry = buildRegistry(workspace);
   registry.projects.alpha.guest_role_id = "existing-role";
   registry.projects.alpha.guest_user_ids = [GUEST_ID];
+  registry.projects.alpha.guest_invites = { [GUEST_ID]: ["fake-invite-1", "fake-invite-2"] };
   seedRegistry(workspace, registry);
 
   const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
@@ -174,6 +177,7 @@ test("guest revoke removes the user from config and their project role", async (
 
   const updated = readRegistry(workspace);
   assert.deepEqual(updated.projects.alpha.guest_user_ids, []);
+  assert.equal(updated.projects.alpha.guest_invites, undefined);
   const access = JSON.parse(
     fs.readFileSync(path.join(workspace.homeDir, ".claude", "channels", "discord2", "access.json"), "utf8"),
   );
@@ -187,4 +191,24 @@ test("guest revoke removes the user from config and their project role", async (
       userId: GUEST_ID,
     },
   ]);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.inviteDeletes, [
+    { authorization: "Bot root-token", code: "fake-invite-1" },
+    { authorization: "Bot root-token", code: "fake-invite-2" },
+  ]);
+});
+
+test("guest grant fails when the user is not in the guild", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, buildRegistry(workspace));
+  const state = readState(workspace.stateDir);
+  state.fixtures.discord.memberRolePut404UserIds = [GUEST_ID];
+  writeState(state, workspace.stateDir);
+
+  const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
+    args: ["grant", "alpha", GUEST_ID],
+    env: preloadEnv(workspace),
+  });
+
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /Unknown Member/);
 });

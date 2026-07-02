@@ -20,6 +20,7 @@ function initialState() {
         attachmentFetches: [],
         attachments: {},
         channels: [],
+        inviteDeletes: [],
         invites: [],
         malformedRequests: [],
         memberRoleDeletes: [],
@@ -174,6 +175,13 @@ function routeDiscordApi(url, init = {}) {
 
   const memberRoleMatch = /^\/api\/v10\/guilds\/([^/]+)\/members\/([^/]+)\/roles\/([^/]+)$/.exec(url.pathname);
   if (url.hostname === "discord.com" && memberRoleMatch && method === "PUT") {
+    const state = readState();
+    if ((state.fixtures?.discord?.memberRolePut404UserIds || []).includes(memberRoleMatch[2])) {
+      return response(JSON.stringify({ message: "Unknown Member" }), {
+        headers: { "content-type": "application/json" },
+        status: 404,
+      });
+    }
     updateState((state) => {
       state.fixtures.discord.memberRolePuts ||= [];
       state.fixtures.discord.memberRolePuts.push({
@@ -215,6 +223,18 @@ function routeDiscordApi(url, init = {}) {
     return response(JSON.stringify({ code: invite.code, url: `https://discord.gg/${invite.code}` }), {
       headers: { "content-type": "application/json" },
     });
+  }
+
+  const deleteInviteMatch = /^\/api\/v10\/invites\/([^/]+)$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && deleteInviteMatch && method === "DELETE") {
+    updateState((state) => {
+      state.fixtures.discord.inviteDeletes ||= [];
+      state.fixtures.discord.inviteDeletes.push({
+        authorization: headerValue(init.headers, "Authorization"),
+        code: deleteInviteMatch[1],
+      });
+    });
+    return response("", { status: 204 });
   }
 
   const listMessagesMatch = /^\/api\/v10\/channels\/([^/]+)\/messages$/.exec(url.pathname);

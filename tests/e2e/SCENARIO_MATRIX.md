@@ -39,8 +39,9 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Codex start | Successful bridge launch | Covered | Drives `scripts/start-codex-session.sh`, builds the bridge tmux command, records the bridge PID, and leaves app-server spawning to bridge slices. |
 | Codex start | Stale MCP cleanup | Covered | Removes stale `discord-*` MCP blocks from the selected `CODEX_HOME/config.toml` while preserving unrelated MCP config and leaving the default Codex home untouched when `codex_home` is set. |
 | Codex start | Bridge environment construction | Covered | Asserts `CODEX_HOME`, `BOT_TOKEN`, `CHANNEL_ID`, `PROJECT_DIR`, `WS_PORT`, `ALLOWED_USER_IDS`, `GUILD_ID`, `ROOT_BOT_TOKEN`, `BOT_APP_ID`, and `BOT_DISPLAY_NAME` from registry fields. |
-| Guest access | Project-scoped invite setup | Covered | Creates a project guest role, denies it on managed categories and sibling project channels, allows the target channel, updates bot allowlists, assigns the role when possible, and returns a one-use invite. |
-| Guest access | Revoke | Covered | Removes the user from project config, bot allowlists, and the project guest role. |
+| Guest access | Project-scoped invite setup | Covered | Creates a project guest role keyed by channel, denies it on managed categories and sibling project channels, allows the target channel, updates bot allowlists, assigns the role when possible, records the invite code, and returns a one-use invite. |
+| Guest access | Revoke | Covered | Removes the user from project config, bot allowlists, the project guest role, and any recorded outstanding invite codes. |
+| Guest access | Grant failures | Covered | `grant` fails when the user is not already in the guild, while invite/sync can still tolerate not-yet-joined users. |
 | Codex start | Paths with spaces/quotes | Covered | Project paths with spaces and double quotes are captured through `PROJECT_DIR`. |
 | Codex start | Already-running tmux guard | Covered | Existing target tmux session exits successfully without launching another bridge. |
 | Codex start | Duplicate bridge/app-server guard | Covered | Fixture `ps` rows for matching bridge channel/app ID or app-server port fail before creating the target tmux session. |
@@ -122,7 +123,7 @@ This audit maps the PRD workflow bullets from issue #4 to automated scenarios or
 | Stop session | Recorded PID ownership, process-tree termination, tmux cleanup, orphan sweeps, registry cleanup for Claude and Codex | Covered | Stop session and process safety rows above drive `scripts/stop-session.sh`. |
 | Codex start | `CODEX_HOME` account selection, stale MCP cleanup, duplicate bridge detection, environment construction, root-bot token lookup, bridge PID recording | Covered | Codex start rows above drive `scripts/start-codex-session.sh`. |
 | Codex bridge | Filtering, attachments, queueing, steering, slash commands, private deltas, opt-in fallback replies, MCP registration, diagnostics | Covered | Codex bridge and JS interception rows above drive `scripts/codex-bridge.js` with fake Discord and fake Codex app-server. |
-| Discord MCP | Scoped reply, edit, react, fetch, attachment download, JSON-RPC lifecycle, and API error propagation | Covered | Discord MCP rows above drive `scripts/discord-mcp-server.js`. |
+| Discord MCP | Scoped write tools, fetch, attachment download, JSON-RPC lifecycle, and API error propagation | Covered | Discord MCP rows above drive `scripts/discord-mcp-server.js`. |
 | Claude usage | OAuth/keychain fallback, local stats parsing, malformed data tolerance, version reporting | Covered | Claude usage rows above drive `scripts/claude-usage.sh`. |
 | Nickname/statusline | Rate limiting, disable behavior, fixture root `.env`, PATCH construction, npx no-network statusline pipeline | Covered | Nickname/statusline and fixture contract rows above drive the nickname/statusline scripts. |
 | Root restart | Fixture tmux/process restart behavior without touching the real `root_agent` session | Covered | Root restart rows above drive `restart-root-agent.sh`. |

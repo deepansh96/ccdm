@@ -76,7 +76,7 @@ test("Discord MCP initializes, lists tools, accepts initialized notifications, a
   });
 });
 
-test("Discord MCP reply requires the bridge scope token when configured", async () => {
+test("Discord MCP writes require the bridge scope token when configured", async () => {
   const workspace = createBridgeWorkspace();
 
   const result = await runMcp(
@@ -86,7 +86,11 @@ test("Discord MCP reply requires the bridge scope token when configured", async 
       rpc(2, "tools/list", {}),
       toolCall(3, "reply", { text: "missing token" }),
       toolCall(4, "reply", { text: "wrong token", scope_token: "wrong" }),
-      toolCall(5, "reply", { text: "right token", scope_token: "secret-token" }),
+      toolCall(5, "edit_message", { message_id: "message-1", text: "missing token" }),
+      toolCall(6, "react", { message_id: "message-1", emoji: "👍", scope_token: "wrong" }),
+      toolCall(7, "reply", { text: "right token", scope_token: "secret-token" }),
+      toolCall(8, "edit_message", { message_id: "message-1", text: "right token", scope_token: "secret-token" }),
+      toolCall(9, "react", { message_id: "message-1", emoji: "👍", scope_token: "secret-token" }),
     ],
     { env: { DISCORD_REPLY_TOKEN: "secret-token" } },
   );
@@ -94,15 +98,27 @@ test("Discord MCP reply requires the bridge scope token when configured", async 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const output = responseById(result);
   const replyTool = output.get(2).result.tools.find((tool) => tool.name === "reply");
+  const editTool = output.get(2).result.tools.find((tool) => tool.name === "edit_message");
+  const reactTool = output.get(2).result.tools.find((tool) => tool.name === "react");
   assert.deepEqual(replyTool.inputSchema.required, ["text", "scope_token"]);
+  assert.deepEqual(editTool.inputSchema.required, ["message_id", "text", "scope_token"]);
+  assert.deepEqual(reactTool.inputSchema.required, ["message_id", "emoji", "scope_token"]);
   assert.equal(output.get(3).result.isError, true);
   assert.match(output.get(3).result.content[0].text, /missing or invalid scope token/);
   assert.equal(output.get(4).result.isError, true);
   assert.match(output.get(4).result.content[0].text, /missing or invalid scope token/);
-  assert.deepEqual(output.get(5).result.content, [{ type: "text", text: "sent (id: fake-message-1)" }]);
+  assert.equal(output.get(5).result.isError, true);
+  assert.match(output.get(5).result.content[0].text, /missing or invalid scope token/);
+  assert.equal(output.get(6).result.isError, true);
+  assert.match(output.get(6).result.content[0].text, /missing or invalid scope token/);
+  assert.deepEqual(output.get(7).result.content, [{ type: "text", text: "sent (id: fake-message-1)" }]);
+  assert.deepEqual(output.get(8).result.content, [{ type: "text", text: "edited (id: message-1)" }]);
+  assert.deepEqual(output.get(9).result.content, [{ type: "text", text: "reacted with 👍" }]);
 
   const discord = readState(workspace.stateDir).fixtures.discord;
   assert.deepEqual(discord.messages.map((message) => message.content), ["right token"]);
+  assert.deepEqual(discord.edits.map((edit) => edit.content), ["right token"]);
+  assert.equal(discord.reactions.length, 1);
 });
 
 test("Discord MCP reports JSON-RPC errors and drives edit, react, and fetch tools", async () => {
