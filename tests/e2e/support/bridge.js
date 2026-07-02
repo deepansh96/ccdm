@@ -226,11 +226,11 @@ export async function startFakeCodexServer(workspace, options = {}) {
           startTimer.unref?.();
           const completionTimer = setTimeout(() => {
             if (interruptedTurnIds.has(turnId)) return;
-            if (plan.mcpReply) {
+            if (plan.mcpReply || plan.mcpTool) {
               notify("item/started", {
                 threadId: turnThreadId,
                 turnId,
-                item: { type: "mcpToolCall", server: `discord-${options.channelId ?? "channel-id"}`, tool: "reply" },
+                item: { type: "mcpToolCall", server: `discord-${options.channelId ?? "channel-id"}`, tool: plan.mcpTool ?? "reply" },
               });
             }
             if (plan.delta) {

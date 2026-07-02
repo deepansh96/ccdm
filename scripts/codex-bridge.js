@@ -444,7 +444,7 @@ function handleNotification(msg) {
       if (!isCurrentTurnNotification(msg)) break;
       if (msg.params?.item?.type === "mcpToolCall" &&
           msg.params.item.server?.startsWith("discord-") &&
-          msg.params.item.tool === "reply") {
+          ["reply", "edit_message", "react"].includes(msg.params.item.tool)) {
         mcpReplyCalled = true;
       }
       break;

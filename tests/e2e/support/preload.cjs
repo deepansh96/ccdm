@@ -20,7 +20,10 @@ function initialState() {
         attachmentFetches: [],
         attachments: {},
         channels: [],
+        channelListFailures: 0,
         inviteDeletes: [],
+        inviteTargetJobFetches: [],
+        inviteTargetJobStatus: 2,
         invites: [],
         malformedRequests: [],
         memberRoleDeletes: [],
@@ -121,6 +124,15 @@ function routeDiscordApi(url, init = {}) {
   const guildChannelsMatch = /^\/api\/v10\/guilds\/([^/]+)\/channels$/.exec(url.pathname);
   if (url.hostname === "discord.com" && guildChannelsMatch && method === "GET") {
     const state = readState();
+    if (state.fixtures?.discord?.channelListFailures > 0) {
+      updateState((nextState) => {
+        nextState.fixtures.discord.channelListFailures -= 1;
+      });
+      return response(JSON.stringify({ message: "channel list failed" }), {
+        headers: { "content-type": "application/json" },
+        status: 500,
+      });
+    }
     return response(JSON.stringify(state.fixtures?.discord?.channels ?? []), {
       headers: { "content-type": "application/json" },
     });
@@ -227,6 +239,13 @@ function routeDiscordApi(url, init = {}) {
 
   const deleteInviteMatch = /^\/api\/v10\/invites\/([^/]+)$/.exec(url.pathname);
   if (url.hostname === "discord.com" && deleteInviteMatch && method === "DELETE") {
+    const state = readState();
+    if ((state.fixtures?.discord?.inviteDeleteFailures || []).includes(deleteInviteMatch[1])) {
+      return response(JSON.stringify({ message: "delete invite failed" }), {
+        headers: { "content-type": "application/json" },
+        status: 500,
+      });
+    }
     updateState((state) => {
       state.fixtures.discord.inviteDeletes ||= [];
       state.fixtures.discord.inviteDeletes.push({
@@ -235,6 +254,22 @@ function routeDiscordApi(url, init = {}) {
       });
     });
     return response("", { status: 204 });
+  }
+
+  const inviteJobMatch = /^\/api\/v10\/invites\/([^/]+)\/target-users\/job-status$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && inviteJobMatch && method === "GET") {
+    const state = readState();
+    const status = state.fixtures?.discord?.inviteTargetJobStatus ?? 2;
+    updateState((nextState) => {
+      nextState.fixtures.discord.inviteTargetJobFetches ||= [];
+      nextState.fixtures.discord.inviteTargetJobFetches.push({
+        authorization: headerValue(init.headers, "Authorization"),
+        code: inviteJobMatch[1],
+      });
+    });
+    return response(JSON.stringify({ status }), {
+      headers: { "content-type": "application/json" },
+    });
   }
 
   const listMessagesMatch = /^\/api\/v10\/channels\/([^/]+)\/messages$/.exec(url.pathname);

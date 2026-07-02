@@ -124,10 +124,26 @@ test("guest invite configures role-gated channel access before returning the lin
     {
       allow: "0",
       authorization: "Bot root-token",
+      channelId: "category-a",
+      deny: VIEW_CHANNEL,
+      overwriteId: GUEST_ID,
+      type: 1,
+    },
+    {
+      allow: "0",
+      authorization: "Bot root-token",
       channelId: "unregistered-child",
       deny: VIEW_CHANNEL,
       overwriteId: "fake-role-2",
       type: 0,
+    },
+    {
+      allow: "0",
+      authorization: "Bot root-token",
+      channelId: "unregistered-child",
+      deny: VIEW_CHANNEL,
+      overwriteId: GUEST_ID,
+      type: 1,
     },
     {
       allow: "0",
@@ -138,12 +154,28 @@ test("guest invite configures role-gated channel access before returning the lin
       type: 0,
     },
     {
+      allow: "0",
+      authorization: "Bot root-token",
+      channelId: "channel-beta",
+      deny: VIEW_CHANNEL,
+      overwriteId: GUEST_ID,
+      type: 1,
+    },
+    {
       allow: GUEST_ALLOW,
       authorization: "Bot root-token",
       channelId: "channel-alpha",
       deny: "0",
       overwriteId: "fake-role-2",
       type: 0,
+    },
+    {
+      allow: GUEST_ALLOW,
+      authorization: "Bot root-token",
+      channelId: "channel-alpha",
+      deny: "0",
+      overwriteId: GUEST_ID,
+      type: 1,
     },
   ]);
   assert.deepEqual(discord.memberRolePuts, [
@@ -157,6 +189,9 @@ test("guest invite configures role-gated channel access before returning the lin
   assert.equal(discord.invites[0].channelId, "channel-alpha");
   assert.equal(JSON.parse(discord.invites[0].fields.payload_json).role_ids[0], "fake-role-2");
   assert.equal(discord.invites[0].fields.target_users_file.name, "target_users.csv");
+  assert.deepEqual(discord.inviteTargetJobFetches, [
+    { authorization: "Bot root-token", code: "fake-invite-1" },
+  ]);
 });
 
 test("guest revoke removes the user from config and their project role", async () => {
@@ -211,4 +246,49 @@ test("guest grant fails when the user is not in the guild", async () => {
 
   assert.notEqual(result.exitCode, 0);
   assert.match(result.stderr, /Unknown Member/);
+  assert.equal(readRegistry(workspace).projects.alpha.guest_user_ids, undefined);
+  assert.equal(
+    fs.existsSync(path.join(workspace.homeDir, ".claude", "channels", "discord2", "access.json")),
+    false,
+  );
+});
+
+test("guest invite fails closed when managed channel discovery fails", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, buildRegistry(workspace));
+  const state = readState(workspace.stateDir);
+  state.fixtures.discord.channelListFailures = 1;
+  writeState(state, workspace.stateDir);
+
+  const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
+    args: ["invite", "alpha", GUEST_ID],
+    env: preloadEnv(workspace),
+  });
+
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /channel list failed/);
+  assert.equal(readRegistry(workspace).projects.alpha.guest_user_ids, undefined);
+});
+
+test("guest revoke keeps local access when Discord cleanup fails", async () => {
+  const workspace = createWorkspace();
+  const registry = buildRegistry(workspace);
+  registry.projects.alpha.guest_role_id = "existing-role";
+  registry.projects.alpha.guest_user_ids = [GUEST_ID];
+  registry.projects.alpha.guest_invites = { [GUEST_ID]: ["fake-invite-1"] };
+  seedRegistry(workspace, registry);
+  const state = readState(workspace.stateDir);
+  state.fixtures.discord.inviteDeleteFailures = ["fake-invite-1"];
+  writeState(state, workspace.stateDir);
+
+  const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
+    args: ["revoke", "alpha", GUEST_ID],
+    env: preloadEnv(workspace),
+  });
+
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /delete invite failed/);
+  const updated = readRegistry(workspace);
+  assert.deepEqual(updated.projects.alpha.guest_user_ids, [GUEST_ID]);
+  assert.deepEqual(updated.projects.alpha.guest_invites, { [GUEST_ID]: ["fake-invite-1"] });
 });
