@@ -27,6 +27,9 @@ const ROOT_BOT_TOKEN = process.env.ROOT_BOT_TOKEN;
 const ROOT_BOT_APP_ID = process.env.ROOT_BOT_APP_ID;
 const BOT_APP_ID = process.env.BOT_APP_ID;
 const BOT_DISPLAY_NAME = process.env.BOT_DISPLAY_NAME || "codex";
+const CODEX_MODEL = process.env.CODEX_MODEL || "";
+const CODEX_REASONING_EFFORT = process.env.CODEX_REASONING_EFFORT || "";
+const CODEX_SERVICE_TIER = process.env.CODEX_SERVICE_TIER || "";
 const AUDIO_TRANSCRIPTION_ENABLED = envFlag(
   true,
   "CODEX_BRIDGE_TRANSCRIBE_AUDIO",
@@ -286,13 +289,28 @@ async function sendToDiscord(text) {
 }
 
 function startCodexServer() {
+  const configArgs = [];
+  if (CODEX_MODEL) configArgs.push("-c", `model=${JSON.stringify(CODEX_MODEL)}`);
+  if (CODEX_REASONING_EFFORT) {
+    configArgs.push(
+      "-c",
+      `model_reasoning_effort=${JSON.stringify(CODEX_REASONING_EFFORT)}`
+    );
+  }
+  if (CODEX_SERVICE_TIER) {
+    configArgs.push("-c", `service_tier=${JSON.stringify(CODEX_SERVICE_TIER)}`);
+  }
   console.log(
-    `Starting codex app-server on ws://127.0.0.1:${WS_PORT} in ${PROJECT_DIR}`
+    `Starting codex app-server on ws://127.0.0.1:${WS_PORT} in ${PROJECT_DIR}` +
+      (CODEX_MODEL ? ` model=${CODEX_MODEL}` : "") +
+      (CODEX_REASONING_EFFORT ? ` reasoning=${CODEX_REASONING_EFFORT}` : "") +
+      (CODEX_SERVICE_TIER ? ` service_tier=${CODEX_SERVICE_TIER}` : "")
   );
   codexProcess = spawn(
     "codex",
     [
       "app-server",
+      ...configArgs,
       "--listen",
       `ws://127.0.0.1:${WS_PORT}`,
     ],

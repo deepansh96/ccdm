@@ -80,6 +80,39 @@ test("discord.js overlay exports the bridge surface and emits injected gateway m
   assert.equal(discord.deliveredMessages.length, 1);
 });
 
+test("bridge passes Codex config overrides to app-server", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace);
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    env: {
+      CODEX_MODEL: "gpt-5.6",
+      CODEX_REASONING_EFFORT: "high",
+      CODEX_SERVICE_TIER: "sol",
+    },
+  });
+
+  await bridge.waitForOutput(/Starting codex app-server .* model=gpt-5\.6 reasoning=high service_tier=sol/, 7000);
+  const state = await waitForState(
+    workspace,
+    (nextState) => nextState.fixtures.codex.appServerInvocations.length === 1,
+    5000,
+  );
+
+  assert.deepEqual(state.fixtures.codex.appServerInvocations[0].args, [
+    "app-server",
+    "-c",
+    'model="gpt-5.6"',
+    "-c",
+    'model_reasoning_effort="high"',
+    "-c",
+    'service_tier="sol"',
+    "--listen",
+    `ws://127.0.0.1:${codex.port}`,
+  ]);
+  await bridge.stop();
+});
+
 test("fake Codex app-server speaks the startup, MCP, thread, turn, delta, MCP-reply, and token-usage protocol", async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, {

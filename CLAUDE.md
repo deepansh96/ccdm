@@ -47,6 +47,7 @@ Read the `registry.json` file in this project's root directory. It has two main 
 - `type`: session type — `"claude"` (default) or `"codex"`. Omitted entries default to `"claude"`.
 - `ws_port`: (codex only) WebSocket port for the codex app-server (e.g., `18301`)
 - `codex_home`: (codex only, optional) Codex home directory for this project. Defaults to `~/.codex`. Use this to run selected Codex sessions under a secondary login/account, e.g. `~/.codex-api`.
+- `codex_model`, `codex_reasoning_effort`, `codex_service_tier`: (codex only, optional) Per-session Codex app-server overrides. These map to Codex config keys `model`, `model_reasoning_effort`, and `service_tier`. Legacy aliases `model`, `model_reasoning_effort`, and `service_tier` are also accepted.
 - `claude_home`: (claude only, optional) Claude config directory (`CLAUDE_CONFIG_DIR`) for this project. Defaults to `~/.claude`. Use this to run selected Claude sessions under a secondary login/account, e.g. `~/.claude-work`. The directory must have its own login and the Discord plugin installed (see "Claude account selection" below).
 - `guest_user_ids`: (optional) Discord user IDs allowed to use this project's bot in addition to `discord_user_id`
 - `guest_role_id`: (optional) Discord role ID created by `scripts/guest-access.js` for project-scoped guest invites

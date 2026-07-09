@@ -85,6 +85,19 @@ that account:
 Projects without `codex_home` continue to use `~/.codex`. Treat each
 `auth.json` under a Codex home like a password.
 
+Codex projects can also pin runtime settings per session:
+
+```json
+{
+  "codex_model": "gpt-5.6",
+  "codex_reasoning_effort": "high",
+  "codex_service_tier": "sol"
+}
+```
+
+These registry values are passed through to `codex app-server` as config
+overrides when `scripts/start-codex-session.sh` launches the bridge.
+
 You also need:
 - A Discord account
 - A Discord server where you can add bots

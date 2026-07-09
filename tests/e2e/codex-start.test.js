@@ -49,6 +49,9 @@ function buildCodexRegistry(workspace, options = {}) {
         ...(options.guestUserIds ? { guest_user_ids: options.guestUserIds } : {}),
         ...(options.codexHome ? { codex_home: options.codexHome } : {}),
         ...(options.textReplyFallback ? { text_reply_fallback: true } : {}),
+        ...(options.codexModel ? { codex_model: options.codexModel } : {}),
+        ...(options.codexReasoningEffort ? { codex_reasoning_effort: options.codexReasoningEffort } : {}),
+        ...(options.codexServiceTier ? { codex_service_tier: options.codexServiceTier } : {}),
         session_id: null,
         pid: null,
       },
@@ -217,6 +220,28 @@ test("start-codex-session passes text reply fallback only for flagged Codex proj
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex;
   assert.equal(session.env.CODEX_BRIDGE_TEXT_REPLY_FALLBACK, "1");
+});
+
+test("start-codex-session passes per-project Codex config overrides to the bridge", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(
+    workspace,
+    buildCodexRegistry(workspace, {
+      codexModel: "gpt-5.6",
+      codexReasoningEffort: "high",
+      codexServiceTier: "sol",
+    }),
+  );
+
+  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
+    args: ["alpha"],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex;
+  assert.equal(session.env.CODEX_MODEL, "gpt-5.6");
+  assert.equal(session.env.CODEX_REASONING_EFFORT, "high");
+  assert.equal(session.env.CODEX_SERVICE_TIER, "sol");
 });
 
 test("start-codex-session allows owner plus project guests", async () => {
