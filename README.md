@@ -89,14 +89,15 @@ Codex projects can also pin runtime settings per session:
 
 ```json
 {
-  "codex_model": "gpt-5.6",
-  "codex_reasoning_effort": "high",
-  "codex_service_tier": "sol"
+  "codex_model": "gpt-5.6-sol",
+  "codex_reasoning_effort": "high"
 }
 ```
 
 These registry values are passed through to `codex app-server` as config
-overrides when `scripts/start-codex-session.sh` launches the bridge.
+overrides when `scripts/start-codex-session.sh` launches the bridge. Use
+`codex_service_tier` only for Codex service tiers such as `"priority"`;
+Sol/Terra/Luna are model slugs.
 
 You also need:
 - A Discord account

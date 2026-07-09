@@ -227,9 +227,9 @@ test("start-codex-session passes per-project Codex config overrides to the bridg
   seedRegistry(
     workspace,
     buildCodexRegistry(workspace, {
-      codexModel: "gpt-5.6",
+      codexModel: "gpt-5.6-sol",
       codexReasoningEffort: "high",
-      codexServiceTier: "sol",
+      codexServiceTier: "priority",
     }),
   );
 
@@ -239,9 +239,9 @@ test("start-codex-session passes per-project Codex config overrides to the bridg
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex;
-  assert.equal(session.env.CODEX_MODEL, "gpt-5.6");
+  assert.equal(session.env.CODEX_MODEL, "gpt-5.6-sol");
   assert.equal(session.env.CODEX_REASONING_EFFORT, "high");
-  assert.equal(session.env.CODEX_SERVICE_TIER, "sol");
+  assert.equal(session.env.CODEX_SERVICE_TIER, "priority");
 });
 
 test("start-codex-session allows owner plus project guests", async () => {

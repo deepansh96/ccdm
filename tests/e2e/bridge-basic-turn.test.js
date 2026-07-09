@@ -86,13 +86,13 @@ test("bridge passes Codex config overrides to app-server", async () => {
   const bridge = startBridge(workspace, {
     port: codex.port,
     env: {
-      CODEX_MODEL: "gpt-5.6",
+      CODEX_MODEL: "gpt-5.6-sol",
       CODEX_REASONING_EFFORT: "high",
-      CODEX_SERVICE_TIER: "sol",
+      CODEX_SERVICE_TIER: "priority",
     },
   });
 
-  await bridge.waitForOutput(/Starting codex app-server .* model=gpt-5\.6 reasoning=high service_tier=sol/, 7000);
+  await bridge.waitForOutput(/Starting codex app-server .* model=gpt-5\.6-sol reasoning=high service_tier=priority/, 7000);
   const state = await waitForState(
     workspace,
     (nextState) => nextState.fixtures.codex.appServerInvocations.length === 1,
@@ -102,11 +102,11 @@ test("bridge passes Codex config overrides to app-server", async () => {
   assert.deepEqual(state.fixtures.codex.appServerInvocations[0].args, [
     "app-server",
     "-c",
-    'model="gpt-5.6"',
+    'model="gpt-5.6-sol"',
     "-c",
     'model_reasoning_effort="high"',
     "-c",
-    'service_tier="sol"',
+    'service_tier="priority"',
     "--listen",
     `ws://127.0.0.1:${codex.port}`,
   ]);
