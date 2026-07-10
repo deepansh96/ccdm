@@ -287,6 +287,48 @@ test("restart-root-agent simulates root_agent cleanup, retry, fresh launch, and 
   assert.equal(session.killAttempts, 2);
 });
 
+test("restart-root-codex-agent starts the root bot through the Codex bridge", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, buildRegistry(workspace));
+  const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
+  fs.mkdirSync(rootStateDir, { recursive: true });
+  fs.writeFileSync(path.join(rootStateDir, ".env"), "DISCORD_BOT_TOKEN=cm9vdC1hcHA.fixture.token\n");
+  const panePid = spawnOwnedProcess(workspace, "zsh root pane");
+  const childPid = spawnOwnedProcess(workspace, "claude root child", { ppid: panePid });
+  seedTmuxSession(
+    "root_agent",
+    { panePid, killFailuresRemaining: 1, paneOutput: "old root\n" },
+    { stateDir: workspace.stateDir },
+  );
+
+  const result = await runScript(workspace, "restart-root-codex-agent.sh", {
+    args: ["root-channel-id"],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /Restarted root Codex agent in tmux session 'root_agent'/);
+  assert.equal(isAlive(childPid), false);
+  const session = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
+  assert.equal(session.cwd, workspace.repoDir);
+  assert.deepEqual(session.env, {
+    ALLOWED_USER_IDS: "allowed-user-id",
+    BOT_APP_ID: "root-app",
+    BOT_DISPLAY_NAME: "root-codex",
+    BOT_TOKEN: "cm9vdC1hcHA.fixture.token",
+    CHANNEL_ID: "root-channel-id",
+    CODEX_HOME: path.join(workspace.homeDir, ".codex"),
+    GUILD_ID: "guild-id",
+    PROJECT_DIR: workspace.repoDir,
+    ROOT_ACCESS_FILE: path.join(rootStateDir, "access.json"),
+    ROOT_BOT_APP_ID: "root-app",
+    ROOT_BOT_TOKEN: "cm9vdC1hcHA.fixture.token",
+    ROOT_MULTI_CHANNEL: "1",
+    WS_PORT: "18399",
+  });
+  assert.equal(session.bridgeCommand, "node scripts/codex-bridge.js");
+  assert.equal(session.killAttempts, 2);
+});
+
 test("restart-root-agent launch failures include command diagnostics", async () => {
   const workspace = createWorkspace();
   const state = readState(workspace.stateDir);

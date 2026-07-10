@@ -212,10 +212,13 @@ export async function startFakeCodexServer(workspace, options = {}) {
           const isSystem = message.params?.input?.[0]?.text?.startsWith("You are communicating with the user via Discord");
           const plan = isSystem ? { delta: "", complete: true } : (turnPlans.shift() ?? { delta: "Codex response", complete: true });
           const turnId = plan.turnId ?? `turn-${Date.now()}`;
+          const notificationTurnId = plan.notificationTurnId ?? turnId;
           const turnThreadId = message.params?.threadId;
           reply({ turn: { id: turnId } });
           const startTimer = setTimeout(() => {
-            notify("turn/started", { threadId: turnThreadId, turn: { id: turnId } });
+            if (!plan.omitTurnStarted) {
+              notify("turn/started", { threadId: turnThreadId, turn: { id: notificationTurnId } });
+            }
             if (plan.approvals || options.approvals) {
               serverRequest("fileChangeRequestApproval", { turnId });
               serverRequest("execCommandApproval", { turnId });
@@ -229,19 +232,19 @@ export async function startFakeCodexServer(workspace, options = {}) {
             if (plan.mcpReply || plan.mcpTool) {
               notify("item/started", {
                 threadId: turnThreadId,
-                turnId,
+                turnId: notificationTurnId,
                 item: { type: "mcpToolCall", server: `discord-${options.channelId ?? "channel-id"}`, tool: plan.mcpTool ?? "reply" },
               });
             }
             if (plan.delta) {
-              notify("item/agentMessage/delta", { threadId: turnThreadId, turnId, delta: plan.delta });
+              notify("item/agentMessage/delta", { threadId: turnThreadId, turnId: notificationTurnId, delta: plan.delta });
             }
             if (plan.error) {
               notify("error", {
                 error: { message: plan.error },
                 willRetry: plan.willRetry ?? false,
                 threadId: turnThreadId,
-                turnId,
+                turnId: notificationTurnId,
               });
             }
             if (plan.tokenUsage) {
@@ -250,14 +253,14 @@ export async function startFakeCodexServer(workspace, options = {}) {
             if (plan.completedItem) {
               notify("item/completed", {
                 threadId: turnThreadId,
-                turnId,
+                turnId: notificationTurnId,
                 item: plan.completedItem === true
                   ? { type: "agentMessage", text: plan.delta ?? "" }
                   : plan.completedItem,
               });
             }
             if (plan.complete !== false) {
-              notify("turn/completed", { threadId: turnThreadId, turn: { id: turnId } });
+              notify("turn/completed", { threadId: turnThreadId, turn: { id: notificationTurnId } });
             }
           }, plan.delayMs ?? 10);
           completionTimer.unref?.();

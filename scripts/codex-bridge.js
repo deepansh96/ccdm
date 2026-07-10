@@ -43,6 +43,14 @@ const AUDIO_TRANSCRIPTION_LANGUAGE =
   process.env.CODEX_BRIDGE_AUDIO_TRANSCRIPTION_LANGUAGE || "en";
 const TEXT_REPLY_FALLBACK =
   process.env.CODEX_BRIDGE_TEXT_REPLY_FALLBACK === "1";
+const ROOT_MULTI_CHANNEL = envFlag(
+  false,
+  "ROOT_MULTI_CHANNEL",
+  "CODEX_BRIDGE_ROOT_MULTI_CHANNEL"
+);
+const ROOT_ACCESS_FILE =
+  process.env.ROOT_ACCESS_FILE ||
+  path.join(os.homedir(), ".claude", "channels", "discord", "access.json");
 const DISCORD_REPLY_TOKEN = randomBytes(16).toString("hex");
 
 if (!BOT_TOKEN || !CHANNEL_ID || !PROJECT_DIR) {
@@ -64,15 +72,25 @@ let mcpReplyCalled = false;
 let suppressTurnOutput = false;
 let pendingBootstrapInstructionReason = null;
 let messageQueue = [];
+let discordClient = null;
 let discordChannel = null;
 let codexProcess = null;
 let typingInterval = null;
+let activeOutputChannelId = null;
+let activeTypingChannel = null;
 let threadResetting = false;
 let lastNicknameUpdate = 0;
 let fallbackLoggedCompletedItemTypes = new Set();
+let rootAccess = null;
+let rootChannelAccess = new Map();
 const NICKNAME_INTERVAL = 60000;
-const THREAD_INSTRUCTION = `This thread is connected to Discord through the discord-${CHANNEL_ID} MCP server. Do not call Discord MCP tools unless the current task includes an explicit Discord reply scope token. Subagents and delegated tasks must return results to their parent agent, not to Discord.`;
-const SYSTEM_INSTRUCTION = `You are communicating with the user via Discord. Use ONLY the MCP server named "discord-${CHANNEL_ID}" to interact — call its \`reply\` tool to send messages to the user. Every Discord write call (\`reply\`, \`edit_message\`, or \`react\`) must include \`scope_token: "${DISCORD_REPLY_TOKEN}"\`. Do NOT share this scope token with subagents. When spawning subagents, explicitly tell them not to use Discord MCP/tools and to return only to the parent agent. Do NOT use any other discord MCP server. Do NOT output responses as regular text; always use the \`reply\` tool so the user sees your response on Discord. Other available tools on this same server: edit_message, react, fetch_messages, download_attachment. Use \`reply\` with the \`files\` parameter to send file attachments. You don't have to reply for every little thing. Try to reply only when you're done, unless something important needs to be confirmed from the user. Also, try to use simpler language and avoid complex language.`;
+const DISCORD_MCP_NAME = ROOT_MULTI_CHANNEL ? "discord-root" : `discord-${CHANNEL_ID}`;
+const THREAD_INSTRUCTION = ROOT_MULTI_CHANNEL
+  ? `This root thread is connected to Discord through the ${DISCORD_MCP_NAME} MCP server. Incoming messages include Discord routing metadata. Do not call Discord MCP tools unless the current task includes an explicit Discord reply scope token. Subagents and delegated tasks must return results to their parent agent, not to Discord.`
+  : `This thread is connected to Discord through the ${DISCORD_MCP_NAME} MCP server. Do not call Discord MCP tools unless the current task includes an explicit Discord reply scope token. Subagents and delegated tasks must return results to their parent agent, not to Discord.`;
+const SYSTEM_INSTRUCTION = ROOT_MULTI_CHANNEL
+  ? `You are communicating with the user via Discord. Use ONLY the MCP server named "${DISCORD_MCP_NAME}" to interact. Incoming messages include a Discord routing metadata block; use its channel_id for every Discord MCP call. Every Discord write call (\`reply\`, \`edit_message\`, or \`react\`) must include \`scope_token: "${DISCORD_REPLY_TOKEN}"\` and \`channel_id\`. Do NOT share this scope token with subagents. When spawning subagents, explicitly tell them not to use Discord MCP/tools and to return only to the parent agent. Do NOT use any other discord MCP server. Do NOT output responses as regular text; always use the \`reply\` tool so the user sees your response on Discord. Other available tools on this same server: edit_message, react, fetch_messages, download_attachment; in this root multi-channel mode, pass \`channel_id\` to them too. Use \`reply\` with the \`files\` parameter to send file attachments. You don't have to reply for every little thing. Try to reply only when you're done, unless something important needs to be confirmed from the user. Also, try to use simpler language and avoid complex language.`
+  : `You are communicating with the user via Discord. Use ONLY the MCP server named "${DISCORD_MCP_NAME}" to interact — call its \`reply\` tool to send messages to the user. Every Discord write call (\`reply\`, \`edit_message\`, or \`react\`) must include \`scope_token: "${DISCORD_REPLY_TOKEN}"\`. Do NOT share this scope token with subagents. When spawning subagents, explicitly tell them not to use Discord MCP/tools and to return only to the parent agent. Do NOT use any other discord MCP server. Do NOT output responses as regular text; always use the \`reply\` tool so the user sees your response on Discord. Other available tools on this same server: edit_message, react, fetch_messages, download_attachment. Use \`reply\` with the \`files\` parameter to send file attachments. You don't have to reply for every little thing. Try to reply only when you're done, unless something important needs to be confirmed from the user. Also, try to use simpler language and avoid complex language.`;
 
 function nextId() {
   return requestId++;
@@ -147,18 +165,78 @@ function isCurrentThreadNotification(msg) {
 function isCurrentTurnNotification(msg) {
   if (!isCurrentThreadNotification(msg)) return false;
   const notifiedTurnId = notificationTurnId(msg);
-  return !notifiedTurnId || !activeTurnId || notifiedTurnId === activeTurnId;
+  if (!notifiedTurnId || !activeTurnId || notifiedTurnId === activeTurnId) {
+    return true;
+  }
+  if (turnActive) {
+    console.log(
+      `[turn] accepting active turn id ${notifiedTurnId} for ${msg.method}; previous expected id was ${activeTurnId}`
+    );
+    activeTurnId = notifiedTurnId;
+    return true;
+  }
+  return false;
 }
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function mentionsRootBot(msg) {
-  if (!ROOT_BOT_APP_ID) return false;
-  if (msg.mentions?.users?.has?.(ROOT_BOT_APP_ID)) return true;
-  const mentionPattern = new RegExp(`<@!?${escapeRegExp(ROOT_BOT_APP_ID)}>`);
+function mentionsApp(msg, appId) {
+  if (!appId) return false;
+  if (msg.mentions?.users?.has?.(appId)) return true;
+  const mentionPattern = new RegExp(`<@!?${escapeRegExp(appId)}>`);
   return mentionPattern.test(msg.content || "");
+}
+
+function mentionsRootBot(msg) {
+  return mentionsApp(msg, ROOT_BOT_APP_ID);
+}
+
+function mentionsThisBot(msg) {
+  return mentionsApp(msg, BOT_APP_ID);
+}
+
+function stripThisBotMention(text) {
+  if (!ROOT_MULTI_CHANNEL || !BOT_APP_ID) return text;
+  return text.replace(new RegExp(`<@!?${escapeRegExp(BOT_APP_ID)}>`, "g"), "").trim();
+}
+
+async function loadRootAccess() {
+  if (!ROOT_MULTI_CHANNEL) return;
+  const access = JSON.parse(await readFile(ROOT_ACCESS_FILE, "utf8"));
+  rootAccess = access;
+  rootChannelAccess = new Map(Object.entries(access.groups || {}));
+  if (!rootChannelAccess.has(CHANNEL_ID)) {
+    console.log(`Warning: primary root channel ${CHANNEL_ID} is not in ${ROOT_ACCESS_FILE}`);
+  }
+  console.log(`Root multi-channel routing enabled for ${rootChannelAccess.size} channel(s)`);
+}
+
+function allowedRootUsersFor(channelConfig) {
+  const ids = [
+    ...ALLOWED_USER_IDS,
+    ...(rootAccess?.allowFrom || []),
+    ...(channelConfig?.allowFrom || []),
+  ].map((id) => String(id).trim()).filter(Boolean);
+  return new Set(ids);
+}
+
+function shouldHandleDiscordMessage(msg) {
+  if (msg.author.bot) return false;
+  if (!ROOT_MULTI_CHANNEL) {
+    if (msg.channel.id !== CHANNEL_ID) return false;
+    if (ALLOWED_USER_IDS.size > 0 && !ALLOWED_USER_IDS.has(msg.author.id)) return false;
+    if (mentionsRootBot(msg)) return false;
+    return true;
+  }
+
+  const channelConfig = rootChannelAccess.get(msg.channel.id);
+  if (!channelConfig) return false;
+  const allowed = allowedRootUsersFor(channelConfig);
+  if (allowed.size > 0 && !allowed.has(msg.author.id)) return false;
+  if (channelConfig.requireMention !== false && !mentionsThisBot(msg)) return false;
+  return true;
 }
 
 function splitMessage(text, limit = 2000) {
@@ -265,11 +343,20 @@ async function updateNickname(totalTokens, contextWindow) {
   }
 }
 
-function startTyping() {
-  if (!discordChannel) return;
-  discordChannel.sendTyping().catch(() => {});
+async function channelById(channelId) {
+  if (!channelId || !discordClient) return discordChannel;
+  if (discordChannel?.id === channelId) return discordChannel;
+  const cached = discordClient.channels.cache.get(channelId);
+  if (cached) return cached;
+  return await discordClient.channels.fetch(channelId);
+}
+
+async function startTyping(channelId = CHANNEL_ID) {
+  activeTypingChannel = await channelById(channelId);
+  if (!activeTypingChannel) return;
+  activeTypingChannel.sendTyping().catch(() => {});
   typingInterval = setInterval(() => {
-    if (discordChannel) discordChannel.sendTyping().catch(() => {});
+    if (activeTypingChannel) activeTypingChannel.sendTyping().catch(() => {});
   }, 8000);
 }
 
@@ -278,13 +365,15 @@ function stopTyping() {
     clearInterval(typingInterval);
     typingInterval = null;
   }
+  activeTypingChannel = null;
 }
 
-async function sendToDiscord(text) {
-  if (!discordChannel || !text.trim()) return;
+async function sendToDiscord(text, channelId = activeOutputChannelId || CHANNEL_ID) {
+  const channel = await channelById(channelId);
+  if (!channel || !text.trim()) return;
   const chunks = splitMessage(text);
   for (const chunk of chunks) {
-    await discordChannel.send(chunk);
+    await channel.send(chunk);
   }
 }
 
@@ -425,6 +514,7 @@ function handleNotification(msg) {
         fallbackText = "";
         mcpReplyCalled = false;
         suppressTurnOutput = false;
+        activeOutputChannelId = null;
         if (bootstrapReason) {
           sendBootstrapInstructionTurn(bootstrapReason);
         } else {
@@ -563,6 +653,7 @@ async function onTurnCompleted() {
   activeTurnId = null;
   mcpReplyCalled = false;
   suppressTurnOutput = false;
+  activeOutputChannelId = null;
   const bootstrapReason = pendingBootstrapInstructionReason;
   pendingBootstrapInstructionReason = null;
   if (bootstrapReason) {
@@ -574,24 +665,25 @@ async function onTurnCompleted() {
 
 async function processQueue() {
   if (threadResetting || turnActive || !threadId || messageQueue.length === 0) return;
-  const { input, msg: queuedMsg } = messageQueue.shift();
+  const { input, msg: queuedMsg, channelId } = messageQueue.shift();
   if (queuedMsg) {
     queuedMsg.reactions.cache.get("⏳")?.users.remove(queuedMsg.client.user.id).catch(() => {});
   }
-  await sendTurn(input);
+  await sendTurn(input, channelId);
 }
 
-async function sendTurn(input) {
+async function sendTurn(input, channelId = CHANNEL_ID) {
   if (!threadId) {
-    messageQueue.push({ input, msg: null });
+    messageQueue.push({ input, msg: null, channelId });
     return;
   }
   turnActive = true;
+  activeOutputChannelId = channelId;
   deltaBuffer = "";
   fallbackText = "";
   mcpReplyCalled = false;
   activeTurnId = null;
-  startTyping();
+  await startTyping(channelId);
   try {
     const result = await sendRequest("turn/start", {
       threadId,
@@ -610,6 +702,7 @@ async function sendTurn(input) {
     activeTurnId = null;
     fallbackText = "";
     await sendToDiscord("**Error:** Failed to send message to Codex");
+    activeOutputChannelId = null;
     processQueue();
   }
 }
@@ -669,6 +762,7 @@ async function onContextCompactionCompleted() {
     await sendBootstrapInstructionTurn("compact");
   }
   await sendToDiscord("Compaction complete.");
+  activeOutputChannelId = null;
 }
 
 const TEXT_EXTENSIONS = new Set([
@@ -788,10 +882,33 @@ async function transcribeAudioAttachment(att) {
   }
 }
 
-async function buildInput(msg) {
+function rootRoutingContext(msg, text) {
+  const channelName = msg.channel?.name || msg.channel?.id || "unknown";
+  return [
+    "Discord routing metadata:",
+    `channel_id: ${msg.channel.id}`,
+    `channel_name: ${channelName}`,
+    `message_id: ${msg.id}`,
+    `author_id: ${msg.author.id}`,
+    `author_name: ${msg.author.username}`,
+    `reply_mcp_server: ${DISCORD_MCP_NAME}`,
+    `reply_channel_id: ${msg.channel.id}`,
+    "",
+    "Use the reply_mcp_server with reply_channel_id for any Discord MCP call that responds to this message.",
+    "",
+    "Message:",
+    text || "(no text)",
+  ].join("\n");
+}
+
+async function buildInput(msg, textOverride = null) {
   const input = [];
-  const text = msg.content.trim();
-  if (text) input.push({ type: "text", text });
+  const text = textOverride ?? msg.content.trim();
+  if (ROOT_MULTI_CHANNEL) {
+    input.push({ type: "text", text: rootRoutingContext(msg, text) });
+  } else if (text) {
+    input.push({ type: "text", text });
+  }
   for (const att of msg.attachments.values()) {
     if (att.contentType && att.contentType.startsWith("image/")) {
       input.push({ type: "image", url: att.url });
@@ -837,7 +954,7 @@ async function buildInput(msg) {
 }
 
 async function registerDiscordMcp() {
-  const mcpName = `discord-${CHANNEL_ID}`;
+  const mcpName = DISCORD_MCP_NAME;
 
   // Remove any other discord MCP servers to prevent cross-session replies
   try {
@@ -860,7 +977,12 @@ async function registerDiscordMcp() {
     value: {
       command: "node",
       args: [MCP_SERVER_SCRIPT],
-      env: { BOT_TOKEN, CHANNEL_ID, DISCORD_REPLY_TOKEN },
+      env: {
+        BOT_TOKEN,
+        CHANNEL_ID,
+        DISCORD_REPLY_TOKEN,
+        ...(ROOT_MULTI_CHANNEL ? { DISCORD_CHANNEL_OVERRIDE: "1" } : {}),
+      },
     },
   });
   console.log(`MCP server config written: ${mcpName}`);
@@ -919,6 +1041,7 @@ function startDiscordBot() {
     ],
     partials: [Partials.Message],
   });
+  discordClient = client;
 
   client.on("ready", () => {
     console.log(`Discord bot logged in as ${client.user.tag}`);
@@ -931,32 +1054,36 @@ function startDiscordBot() {
     } else {
       console.log(`Listening in #${discordChannel.name}`);
     }
+    if (ROOT_MULTI_CHANNEL) {
+      console.log(`Root routing active for ${rootChannelAccess.size} configured channel(s)`);
+    }
   });
 
   client.on("messageCreate", async (msg) => {
-    if (msg.author.bot) return;
-    if (msg.channel.id !== CHANNEL_ID) return;
-    if (ALLOWED_USER_IDS.size > 0 && !ALLOWED_USER_IDS.has(msg.author.id)) return;
-    if (mentionsRootBot(msg)) return;
+    if (!shouldHandleDiscordMessage(msg)) return;
 
-    const text = msg.content.trim();
+    const channelId = msg.channel.id;
+    const text = stripThisBotMention(msg.content.trim());
+    const bridgeSlashCommand = !ROOT_MULTI_CHANNEL || channelId === CHANNEL_ID;
 
-    if (text === "/compact") {
+    if (bridgeSlashCommand && text === "/compact") {
       console.log("[discord] /compact requested");
       await msg.react("🔄");
+      activeOutputChannelId = channelId;
       try {
         await sendRequest("thread/compact/start", { threadId });
-        await sendToDiscord("Compaction started.");
+        await sendToDiscord("Compaction started.", channelId);
       } catch (err) {
-        await sendToDiscord(`**Error:** Failed to compact — ${err.message || err}`);
+        await sendToDiscord(`**Error:** Failed to compact — ${err.message || err}`, channelId);
       }
       return;
     }
 
-    if (text === "/clear") {
+    if (bridgeSlashCommand && text === "/clear") {
       console.log("[discord] /clear requested");
       await msg.react("🔄");
       threadResetting = true;
+      activeOutputChannelId = channelId;
       const previousThreadId = threadId;
       const previousTurnId = activeTurnId;
       try {
@@ -987,43 +1114,45 @@ function startDiscordBot() {
         await startCodexThread();
         await sendBootstrapInstructionTurn("clear");
 
-        await sendToDiscord("Conversation cleared — fresh thread started.");
+        await sendToDiscord("Conversation cleared — fresh thread started.", channelId);
         console.log(`New thread after /clear: ${threadId}`);
         threadResetting = false;
+        activeOutputChannelId = null;
         processQueue();
       } catch (err) {
         threadResetting = false;
         turnActive = false;
         activeTurnId = null;
         fallbackText = "";
-        await sendToDiscord(`**Error:** Failed to clear — ${err.message || err}`);
+        await sendToDiscord(`**Error:** Failed to clear — ${err.message || err}`, channelId);
+        activeOutputChannelId = null;
         processQueue();
       }
       return;
     }
 
-    if (text === "/restart") {
+    if (bridgeSlashCommand && text === "/restart") {
       console.log("[discord] /restart requested");
       await msg.react("🔄");
       try {
         const { projectName, screenName } = await findCurrentProject();
         const logPath = scheduleRestart(projectName, screenName);
-        await sendToDiscord("Restarting session — fresh thread coming up.");
+        await sendToDiscord("Restarting session — fresh thread coming up.", channelId);
         console.log(`Restart scheduled for '${projectName}' (${screenName}); log: ${logPath}`);
         cleanup();
       } catch (err) {
-        await sendToDiscord(`**Error:** Failed to restart — ${err.message || err}`);
+        await sendToDiscord(`**Error:** Failed to restart — ${err.message || err}`, channelId);
       }
       return;
     }
 
-    const input = await buildInput(msg);
+    const input = await buildInput(msg, text);
     if (input.length === 0) return;
 
     console.log(`[discord] ${msg.author.username}: ${text || "(attachment)"} [${input.length} part(s)]`);
 
     if (threadResetting) {
-      messageQueue.push({ input, msg });
+      messageQueue.push({ input, msg, channelId });
       await msg.react("⏳");
     } else if (turnActive && activeTurnId && !suppressTurnOutput) {
       try {
@@ -1035,14 +1164,14 @@ function startDiscordBot() {
         console.log(`[steer] Injected into active turn ${activeTurnId}`);
       } catch (err) {
         console.log(`[steer] Failed (${err.message || err}), queuing instead`);
-        messageQueue.push({ input, msg });
+        messageQueue.push({ input, msg, channelId });
         await msg.react("⏳");
       }
     } else if (turnActive) {
-      messageQueue.push({ input, msg });
+      messageQueue.push({ input, msg, channelId });
       await msg.react("⏳");
     } else {
-      await sendTurn(input);
+      await sendTurn(input, channelId);
     }
   });
 
@@ -1062,6 +1191,7 @@ function startDiscordBot() {
 }
 
 async function main() {
+  await loadRootAccess();
   startCodexServer();
   await connectWebSocket();
   await initializeCodex();

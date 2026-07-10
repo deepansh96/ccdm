@@ -177,6 +177,12 @@ If you prefer to set things up by hand:
    tmux new-session -d -s root_agent -- zsh -ic 'cd /path/to/ccdm && DISCORD_STATE_DIR=~/.claude/channels/discord claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
    ```
 
+   To run the root bot through Codex instead:
+   ```bash
+   ./restart-root-codex-agent.sh [channel_id]
+   ```
+   This reads the same root `access.json` channel rules and keeps `restart-root-agent.sh` as the Claude rollback path.
+
 ## Commands
 
 Message the root agent bot on Discord with any of these:

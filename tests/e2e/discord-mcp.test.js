@@ -121,6 +121,45 @@ test("Discord MCP writes require the bridge scope token when configured", async 
   assert.equal(discord.reactions.length, 1);
 });
 
+test("Discord MCP root override routes calls to the requested channel", async () => {
+  const workspace = createBridgeWorkspace();
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.restMessages = [
+    {
+      id: "message-1",
+      timestamp: "2026-05-28T10:00:00.000Z",
+      content: "hello",
+      author: { username: "Alice", bot: false },
+      attachments: [],
+    },
+  ];
+  writeState(seed, workspace.stateDir);
+
+  const result = await runMcp(
+    workspace,
+    [
+      rpc(1, "tools/list", {}),
+      toolCall(2, "reply", { text: "missing channel", scope_token: "secret-token" }),
+      toolCall(3, "reply", { text: "to project", channel_id: "project-channel", scope_token: "secret-token" }),
+      toolCall(4, "fetch_messages", { channel_id: "project-channel", limit: 1 }),
+    ],
+    { env: { DISCORD_CHANNEL_OVERRIDE: "1", DISCORD_REPLY_TOKEN: "secret-token" } },
+  );
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const output = responseById(result);
+  const replyTool = output.get(1).result.tools.find((tool) => tool.name === "reply");
+  assert.deepEqual(replyTool.inputSchema.required, ["text", "channel_id", "scope_token"]);
+  assert.equal(output.get(2).result.isError, true);
+  assert.match(output.get(2).result.content[0].text, /channel_id is required/);
+  assert.deepEqual(output.get(3).result.content, [{ type: "text", text: "sent (id: fake-message-1)" }]);
+  assert.match(output.get(4).result.content[0].text, /Alice: hello/);
+
+  const discord = readState(workspace.stateDir).fixtures.discord;
+  assert.equal(discord.messages[0].channelId, "project-channel");
+  assert.equal(discord.fetches[0].channelId, "project-channel");
+});
+
 test("Discord MCP reports JSON-RPC errors and drives edit, react, and fetch tools", async () => {
   const workspace = createBridgeWorkspace();
   const seed = readState(workspace.stateDir);

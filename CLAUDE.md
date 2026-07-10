@@ -443,11 +443,25 @@ The user may ask things like "how much usage do I have left", "what are my limit
 You can restart yourself by running the restart script in the background with `nohup`, which survives your own process being killed:
 
 1. Tell the user you're restarting.
-2. Run:
+2. For the default Claude root agent, run:
    ```sh
    nohup ./restart-root-agent.sh &
    ```
-3. The script kills your current process, waits 2 seconds, and starts a fresh instance in the `root_agent` tmux session.
+3. For the Codex root-agent, run the Codex script. Passing a channel ID sets the primary `#root` channel; if omitted, the script uses the only `requireMention: false` root channel from `access.json`:
+   ```sh
+   nohup ./restart-root-codex-agent.sh [channel_id] &
+   ```
+4. The script kills your current process, waits briefly, and starts a fresh instance in the `root_agent` tmux session.
+
+### Codex Root Agent
+
+Start the root bot with Codex using:
+
+```sh
+./restart-root-codex-agent.sh [channel_id]
+```
+
+This uses the root bot token from `~/.claude/channels/discord/.env`, reads root channel rules from `~/.claude/channels/discord/access.json`, runs `scripts/codex-bridge.js` in `root_agent`, and keeps `restart-root-agent.sh` available as the Claude rollback. Root channels with `requireMention: false` are accepted directly; project channels with `requireMention: true` are accepted only when the root bot is mentioned.
 
 ### Discord Polls
 

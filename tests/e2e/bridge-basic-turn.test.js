@@ -519,6 +519,88 @@ test("bridge ignores project-channel messages that mention the root bot", async 
   await bridge.stop();
 });
 
+test("root bridge accepts root channels and mentioned project channels with routing metadata", async () => {
+  const workspace = createBridgeWorkspace();
+  const accessFile = path.join(workspace.tmpDir, "root-access.json");
+  fs.writeFileSync(
+    accessFile,
+    `${JSON.stringify({
+      allowFrom: ["allowed-user-id"],
+      groups: {
+        "root-channel": { requireMention: false, allowFrom: ["allowed-user-id"] },
+        "project-channel": { requireMention: true, allowFrom: ["allowed-user-id"] },
+      },
+    }, null, 2)}\n`,
+  );
+  const codex = await startFakeCodexServer(workspace, {
+    channelId: "root-channel",
+    turns: [{ complete: true }, { complete: true }],
+  });
+  const bridge = startBridge(workspace, {
+    botAppId: "root-bot-id",
+    channelId: "root-channel",
+    port: codex.port,
+    rootBotAppId: "root-bot-id",
+    env: {
+      ROOT_ACCESS_FILE: accessFile,
+      ROOT_MULTI_CHANNEL: "1",
+    },
+  });
+
+  await bridge.waitForOutput(/Root routing active for 2 configured channel\(s\)/, 7000);
+  await injectMessageUntil(
+    workspace,
+    { channelId: "root-channel", content: "status", id: "root-status" },
+    (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === "root-status"),
+    5000,
+  );
+  await injectMessageUntil(
+    workspace,
+    { channelId: "project-channel", content: "status without mention", id: "project-no-mention" },
+    (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === "project-no-mention"),
+    5000,
+  );
+  await injectMessageUntil(
+    workspace,
+    { channelId: "project-channel", content: "<@root-bot-id> codex restart this session with codex", id: "project-mentioned" },
+    (nextState) => {
+      const userTurns = nextState.fixtures.codex.protocolEvents
+        .filter((event) => event.event === "client-message")
+        .map((event) => event.message)
+        .filter((message) =>
+          message.method === "turn/start" &&
+          !message.params?.input?.[0]?.text?.startsWith("You are communicating with the user via Discord")
+        );
+      return userTurns.length === 2;
+    },
+    5000,
+  );
+
+  const state = readState(workspace.stateDir);
+  const writes = state.fixtures.codex.protocolEvents
+    .filter((event) => event.message?.method === "config/value/write")
+    .map((event) => event.message);
+  assert.ok(writes.some((message) => message.params.keyPath === "mcp_servers.discord-root"));
+  assert.equal(
+    writes.find((message) => message.params.keyPath === "mcp_servers.discord-root").params.value.env.DISCORD_CHANNEL_OVERRIDE,
+    "1",
+  );
+
+  const userTurns = state.fixtures.codex.protocolEvents
+    .filter((event) => event.event === "client-message")
+    .map((event) => event.message)
+    .filter((message) =>
+      message.method === "turn/start" &&
+      !message.params?.input?.[0]?.text?.startsWith("You are communicating with the user via Discord")
+    );
+  assert.equal(userTurns.length, 2);
+  assert.match(userTurns[0].params.input[0].text, /channel_id: root-channel/);
+  assert.match(userTurns[1].params.input[0].text, /channel_id: project-channel/);
+  assert.match(userTurns[1].params.input[0].text, /codex restart this session with codex/);
+  assert.doesNotMatch(userTurns[1].params.input[0].text, /<@root-bot-id>/);
+  await bridge.stop();
+});
+
 test("bridge logs failed nickname PATCH responses", async () => {
   const workspace = createBridgeWorkspace();
   const seed = readState(workspace.stateDir);
@@ -611,6 +693,47 @@ test("bridge handles approvals, active-turn steer, and stale-turn queue fallback
     clientMessages.filter((message) => message.method === "turn/start" && message.params?.input?.[0]?.text !== undefined).length >= 2,
   );
   assert.ok(clientMessages.filter((message) => message.result?.approved === true).length >= 2);
+  await bridge.stop();
+});
+
+test("bridge drains queued messages after Codex reports a different active turn id", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    steer: ["failure"],
+    turns: [
+      {
+        delta: "first done",
+        delayMs: 1000,
+        startDelayMs: 10,
+        turnId: "returned-turn",
+        notificationTurnId: "actual-turn",
+        omitTurnStarted: true,
+      },
+      { delta: "queued done" },
+    ],
+  });
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  injectDiscordMessage(workspace, { content: "first", id: "first-mismatch" });
+  await bridge.waitForOutput(/\[discord\] Allowed User: first/, 5000);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  injectDiscordMessage(workspace, { content: "queued after mismatch", id: "queued-after-mismatch" });
+  await bridge.waitForOutput(/\[steer\] Failed \(stale turn\), queuing instead/, 5000);
+
+  const state = await waitForState(
+    workspace,
+    (nextState) => nextState.fixtures.discord.sends.map((send) => send.content).includes("queued done"),
+    10000,
+  );
+  const sends = state.fixtures.discord.sends.map((send) => send.content);
+
+  assert.ok(sends.includes("first done"));
+  assert.ok(sends.includes("queued done"));
+  assert.match(bridge.stdout, /\[turn\] accepting active turn id actual-turn/);
   await bridge.stop();
 });
 
