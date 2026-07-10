@@ -187,6 +187,11 @@ function isCurrentThreadNotification(msg) {
   return !notifiedThreadId || !threadId || notifiedThreadId === threadId;
 }
 
+function canReconcileTurnId(msg) {
+  return TURN_ID_RECONCILIATION_METHODS.has(msg.method) ||
+    (msg.method === "item/completed" && isFallbackMessageItem(msg.params?.item));
+}
+
 function isCurrentTurnNotification(msg) {
   if (!isCurrentThreadNotification(msg)) return false;
   const notifiedTurnId = notificationTurnId(msg);
@@ -198,7 +203,7 @@ function isCurrentTurnNotification(msg) {
     return false;
   }
   if (!activeTurnId) {
-    if (!TURN_ID_RECONCILIATION_METHODS.has(msg.method)) {
+    if (!canReconcileTurnId(msg)) {
       console.log(`[turn] ignoring unconfirmed turn id ${notifiedTurnId} for ${msg.method}`);
       return false;
     }
@@ -210,7 +215,7 @@ function isCurrentTurnNotification(msg) {
     activeTurnIdConfirmed = true;
     return true;
   }
-  if (!activeTurnIdConfirmed && TURN_ID_RECONCILIATION_METHODS.has(msg.method)) {
+  if (!activeTurnIdConfirmed && canReconcileTurnId(msg)) {
     console.log(
       `[turn] accepting active turn id ${notifiedTurnId} for ${msg.method}; previous expected id was ${activeTurnId}`
     );
@@ -985,10 +990,9 @@ function rootRoutingContext(msg, text, channelScopeToken) {
     `author_id: ${msg.author.id}`,
     `author_name: ${msg.author.username}`,
     `reply_mcp_server: ${DISCORD_MCP_NAME}`,
-    `reply_channel_id: ${msg.channel.id}`,
     `channel_scope_token: ${channelScopeToken}`,
     "",
-    "Use the reply_mcp_server with reply_channel_id and channel_scope_token for every Discord MCP call for this message.",
+    "Use the reply_mcp_server with channel_id and channel_scope_token for every Discord MCP call for this message.",
     "",
     "Message:",
     text || "(no text)",

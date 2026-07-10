@@ -603,6 +603,8 @@ test("root bridge accepts root channels and mentioned project channels with rout
   assert.equal(userTurns.length, 2);
   assert.match(userTurns[0].params.input[0].text, /channel_id: root-channel/);
   assert.match(userTurns[0].params.input[0].text, /channel_scope_token: [A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/);
+  assert.match(userTurns[0].params.input[0].text, /with channel_id and channel_scope_token/);
+  assert.doesNotMatch(userTurns[0].params.input[0].text, /reply_channel_id/);
   assert.match(userTurns[1].params.input[0].text, /channel_id: project-channel/);
   assert.match(userTurns[1].params.input[0].text, /codex restart this session with codex/);
   assert.doesNotMatch(userTurns[1].params.input[0].text, /<@root-bot-id>/);
@@ -779,6 +781,49 @@ test("bridge drains queued messages after Codex reports a different active turn 
   assert.ok(sends.includes("first done"));
   assert.ok(sends.includes("queued done"));
   assert.match(bridge.stdout, /\[turn\] accepting active turn id actual-turn/);
+  await bridge.stop();
+});
+
+test("bridge finishes a mismatched turn that only completes an assistant item", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    turns: [
+      {
+        completedItem: { type: "agentMessage", text: "completed-only reply" },
+        notificationTurnId: "actual-turn",
+        omitTurnStarted: true,
+        turnId: "returned-turn",
+      },
+      { delta: "queued reply" },
+    ],
+  });
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await injectMessageUntil(
+    workspace,
+    { content: "first", id: "completed-only-mismatch" },
+    (nextState) => nextState.fixtures.discord.sends.some(
+      (send) => send.content === "completed-only reply",
+    ),
+    5000,
+  );
+  const state = await injectMessageUntil(
+    workspace,
+    { content: "second", id: "after-completed-only" },
+    (nextState) => nextState.fixtures.discord.sends.some(
+      (send) => send.content === "queued reply",
+    ),
+    5000,
+  );
+  assert.deepEqual(
+    state.fixtures.discord.sends.map((send) => send.content),
+    ["completed-only reply", "queued reply"],
+  );
+  assert.match(bridge.stdout, /accepting active turn id actual-turn for item\/completed/);
   await bridge.stop();
 });
 
