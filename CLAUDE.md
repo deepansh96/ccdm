@@ -47,6 +47,7 @@ Read the `registry.json` file in this project's root directory. It has two main 
 - `type`: session type — `"claude"` (default) or `"codex"`. Omitted entries default to `"claude"`.
 - `ws_port`: (codex only) WebSocket port for the codex app-server (e.g., `18301`)
 - `codex_home`: (codex only, optional) Codex home directory for this project. Defaults to `~/.codex`. Use this to run selected Codex sessions under a secondary login/account, e.g. `~/.codex-api`.
+- `codex_model`, `codex_reasoning_effort`, `codex_service_tier`: (codex only, optional) Per-session Codex app-server overrides. These map to Codex config keys `model`, `model_reasoning_effort`, and `service_tier`. Legacy aliases `model`, `model_reasoning_effort`, and `service_tier` are also accepted.
 - `claude_home`: (claude only, optional) Claude config directory (`CLAUDE_CONFIG_DIR`) for this project. Defaults to `~/.claude`. Use this to run selected Claude sessions under a secondary login/account, e.g. `~/.claude-work`. The directory must have its own login and the Discord plugin installed (see "Claude account selection" below).
 - `guest_user_ids`: (optional) Discord user IDs allowed to use this project's bot in addition to `discord_user_id`
 - `guest_role_id`: (optional) Discord role ID created by `scripts/guest-access.js` for project-scoped guest invites
@@ -442,11 +443,26 @@ The user may ask things like "how much usage do I have left", "what are my limit
 You can restart yourself by running the restart script in the background with `nohup`, which survives your own process being killed:
 
 1. Tell the user you're restarting.
-2. Run:
+2. For the default Claude root agent, run:
    ```sh
    nohup ./restart-root-agent.sh &
    ```
-3. The script kills your current process, waits 2 seconds, and starts a fresh instance in the `root_agent` tmux session.
+3. For the Codex root-agent, run the Codex script. Passing a channel ID sets the primary `#root` channel; if omitted, the script uses the only `requireMention: false` root channel from `access.json`:
+   ```sh
+   nohup ./restart-root-codex-agent.sh [channel_id] &
+   ```
+   The selected channel must already exist in the root `access.json` `groups` map; validation happens before the current root session is stopped.
+4. The script kills your current process, waits briefly, and starts a fresh instance in the `root_agent` tmux session.
+
+### Codex Root Agent
+
+Start the root bot with Codex using:
+
+```sh
+./restart-root-codex-agent.sh [channel_id]
+```
+
+This uses the root bot token from `~/.claude/channels/discord/.env`, reads root channel rules from `~/.claude/channels/discord/access.json`, runs `scripts/codex-bridge.js` in `root_agent`, and keeps `restart-root-agent.sh` available as the Claude rollback. Root channels with `requireMention: false` are accepted directly; project channels with `requireMention: true` are accepted only when the root bot is mentioned.
 
 ### Discord Polls
 

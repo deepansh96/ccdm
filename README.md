@@ -85,6 +85,20 @@ that account:
 Projects without `codex_home` continue to use `~/.codex`. Treat each
 `auth.json` under a Codex home like a password.
 
+Codex projects can also pin runtime settings per session:
+
+```json
+{
+  "codex_model": "gpt-5.6-sol",
+  "codex_reasoning_effort": "high"
+}
+```
+
+These registry values are passed through to `codex app-server` as config
+overrides when `scripts/start-codex-session.sh` launches the bridge. Use
+`codex_service_tier` only for Codex service tiers such as `"priority"`;
+Sol/Terra/Luna are model slugs.
+
 You also need:
 - A Discord account
 - A Discord server where you can add bots
@@ -152,7 +166,12 @@ If you prefer to set things up by hand:
    {
      "dmPolicy": "allowlist",
      "allowFrom": ["YOUR_DISCORD_USER_ID"],
-     "groups": {},
+     "groups": {
+       "YOUR_ROOT_CHANNEL_ID": {
+         "requireMention": false,
+         "allowFrom": ["YOUR_DISCORD_USER_ID"]
+       }
+     },
      "pending": {}
    }
    EOF
@@ -162,6 +181,12 @@ If you prefer to set things up by hand:
    ```bash
    tmux new-session -d -s root_agent -- zsh -ic 'cd /path/to/ccdm && DISCORD_STATE_DIR=~/.claude/channels/discord claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
    ```
+
+   To run the root bot through Codex instead:
+   ```bash
+   ./restart-root-codex-agent.sh [channel_id]
+   ```
+   The selected channel must already be in the root `access.json` `groups` map. The script checks this before stopping the current root agent. It keeps `restart-root-agent.sh` as the Claude rollback path.
 
 ## Commands
 
