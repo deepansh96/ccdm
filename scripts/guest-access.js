@@ -144,10 +144,11 @@ async function ensureGuestRole(registry, projectName, project, token) {
   return role.id;
 }
 
-async function putOverwrite(token, channelId, overwriteId, type, allow, deny) {
+async function putOverwrite(token, channelId, overwriteId, type, allow, deny, allow404 = false) {
   await discordApi(token, `/channels/${channelId}/permissions/${overwriteId}`, {
     method: "PUT",
     json: { allow: String(allow), deny: String(deny), type },
+    allow404,
   });
 }
 
@@ -170,18 +171,18 @@ async function deniedChannelIds(registry, targetProject, token) {
   ]).filter((channelId) => channelId !== targetProject.channel_id);
 }
 
-async function syncDiscordPermissions(registry, project, roleId, token, userIds = project.guest_user_ids || []) {
+async function syncDiscordPermissions(registry, project, roleId, token, userIds = project.guest_user_ids || [], options = {}) {
   const guests = unique(userIds);
   const denied = await deniedChannelIds(registry, project, token);
   for (const channelId of denied) {
     await putOverwrite(token, channelId, roleId, 0, 0n, VIEW_CHANNEL);
     for (const userId of guests) {
-      await putOverwrite(token, channelId, userId, 1, 0n, VIEW_CHANNEL);
+      await putOverwrite(token, channelId, userId, 1, 0n, VIEW_CHANNEL, Boolean(options.allowMissingMember));
     }
   }
   await putOverwrite(token, project.channel_id, roleId, 0, GUEST_ALLOW, 0n);
   for (const userId of guests) {
-    await putOverwrite(token, project.channel_id, userId, 1, GUEST_ALLOW, 0n);
+    await putOverwrite(token, project.channel_id, userId, 1, GUEST_ALLOW, 0n, Boolean(options.allowMissingMember));
   }
 }
 
@@ -211,7 +212,7 @@ async function prepareGuestAccess(registry, target, userId, options = {}) {
   const [[projectName, project]] = resolveProjects(registry, target);
   const roleId = await ensureGuestRole(registry, projectName, project, token);
   const guestUserIds = unique([...(project.guest_user_ids || []), userId]);
-  await syncDiscordPermissions(registry, project, roleId, token, guestUserIds);
+  await syncDiscordPermissions(registry, project, roleId, token, guestUserIds, options);
   await putMemberRole(registry, userId, roleId, token, Boolean(options.allowMissingMember));
   return { projectName, project, roleId, token, guestUserIds };
 }

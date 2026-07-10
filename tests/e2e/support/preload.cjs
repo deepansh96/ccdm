@@ -171,6 +171,16 @@ function routeDiscordApi(url, init = {}) {
   const channelPermissionMatch = /^\/api\/v10\/channels\/([^/]+)\/permissions\/([^/]+)$/.exec(url.pathname);
   if (url.hostname === "discord.com" && channelPermissionMatch && method === "PUT") {
     const parsedBody = init.body ? JSON.parse(String(init.body)) : {};
+    const state = readState();
+    if (
+      parsedBody.type === 1 &&
+      (state.fixtures?.discord?.memberRolePut404UserIds || []).includes(channelPermissionMatch[2])
+    ) {
+      return response(JSON.stringify({ message: "Unknown Member" }), {
+        headers: { "content-type": "application/json" },
+        status: 404,
+      });
+    }
     updateState((state) => {
       state.fixtures.discord.permissionOverwrites ||= [];
       state.fixtures.discord.permissionOverwrites.push({

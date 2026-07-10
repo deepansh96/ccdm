@@ -232,6 +232,28 @@ test("guest revoke removes the user from config and their project role", async (
   ]);
 });
 
+test("guest invite tolerates permission setup before the user joins the guild", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, buildRegistry(workspace));
+  const state = readState(workspace.stateDir);
+  state.fixtures.discord.memberRolePut404UserIds = [GUEST_ID];
+  writeState(state, workspace.stateDir);
+
+  const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
+    args: ["invite", "alpha", GUEST_ID],
+    env: preloadEnv(workspace),
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const registry = readRegistry(workspace);
+  assert.equal(registry.projects.alpha.guest_role_id, "fake-role-1");
+  assert.deepEqual(registry.projects.alpha.guest_user_ids, [GUEST_ID]);
+  assert.deepEqual(registry.projects.alpha.guest_invites, { [GUEST_ID]: ["fake-invite-1"] });
+  const discord = readState(workspace.stateDir).fixtures.discord;
+  assert.equal(discord.permissionOverwrites.some((entry) => entry.overwriteId === GUEST_ID), false);
+  assert.deepEqual(discord.memberRolePuts, []);
+});
+
 test("guest grant fails when the user is not in the guild", async () => {
   const workspace = createWorkspace();
   seedRegistry(workspace, buildRegistry(workspace));
