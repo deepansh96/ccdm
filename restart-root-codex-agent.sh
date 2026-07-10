@@ -44,15 +44,16 @@ terminate_pids() {
   done
 }
 
-find_root_codex_listener_pids() {
-  python3 - "$WS_PORT" "$BOT_APP_ID" <<'PY'
+find_root_listener_pids() {
+  python3 - "$ROOT_STATE_DIR" "$WS_PORT" "$BOT_APP_ID" <<'PY'
 import os
 import re
 import shlex
 import subprocess
 import sys
 
-ws_port, bot_app_id = sys.argv[1:3]
+state_dir, ws_port, bot_app_id = sys.argv[1:4]
+target_state_dir = os.path.normpath(os.path.expanduser(state_dir))
 try:
     ps = subprocess.check_output(
         ["ps", "axeww", "-o", "pid=,command="],
@@ -75,6 +76,47 @@ def has_env(command: str, name: str, value: str) -> bool:
         if found == value:
             return True
     return False
+
+def has_target_state(command: str) -> bool:
+    env_re = re.compile(r'''(?:^|\s)DISCORD_STATE_DIR=(?:"([^"]*)"|'([^']*)'|([^\s]+))''')
+    for match in env_re.finditer(command):
+        found = next(group for group in match.groups() if group is not None)
+        if os.path.normpath(os.path.expanduser(found)) == target_state_dir:
+            return True
+    return False
+
+def is_discord_plugin_path(value: str) -> bool:
+    plugin_path = os.path.normpath(os.path.expanduser(value))
+    roots = (
+        "claude-plugins-official/discord",
+        "claude-plugins-official/external_plugins/discord",
+    )
+    return any(plugin_path.endswith(f"/{root}") or f"/{root}/" in plugin_path for root in roots)
+
+def is_claude_listener(command: str) -> bool:
+    if not has_target_state(command):
+        return False
+    argv = command_argv(command)
+    if not argv:
+        return False
+    exe = os.path.basename(argv[0])
+    if exe == "claude" and "--channels" in argv and any(
+        arg.startswith("plugin:discord") for arg in argv
+    ):
+        return True
+    if exe == "claude-channel-discord":
+        return True
+    if exe != "bun":
+        return False
+    for index, arg in enumerate(argv[:-1]):
+        if arg == "--cwd" and is_discord_plugin_path(argv[index + 1]):
+            return True
+    plugin_root = re.search(r'''(?:^|\s)CLAUDE_PLUGIN_ROOT=(?:"([^"]*)"|'([^']*)'|([^\s]+))''', command)
+    return (
+        any(os.path.basename(arg) == "server.ts" for arg in argv[1:])
+        and plugin_root is not None
+        and is_discord_plugin_path(next(group for group in plugin_root.groups() if group is not None))
+    )
 
 def is_root_bridge(command: str) -> bool:
     argv = command_argv(command)
@@ -101,7 +143,7 @@ for line in ps.splitlines():
     pid_text, _, command = line.partition(" ")
     if not pid_text.isdigit() or "ps axeww" in command or "python3 -" in command:
         continue
-    if is_root_bridge(command) or is_app_server(command):
+    if is_claude_listener(command) or is_root_bridge(command) or is_app_server(command):
         print(pid_text)
 PY
 }
@@ -246,9 +288,9 @@ if tmux has-session -t root_agent 2>/dev/null; then
   fi
 fi
 
-ORPHAN_PIDS="$(find_root_codex_listener_pids)"
+ORPHAN_PIDS="$(find_root_listener_pids)"
 if [[ -n "$ORPHAN_PIDS" ]]; then
-  echo "Cleaning remaining root Codex listener process(es):"
+  echo "Cleaning remaining root listener process(es):"
   echo "$ORPHAN_PIDS" | sed 's/^/  /'
   terminate_pids "${(@f)ORPHAN_PIDS}"
 fi

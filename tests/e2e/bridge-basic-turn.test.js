@@ -589,6 +589,9 @@ test("root bridge accepts root channels and mentioned project channels with rout
     writes.find((message) => message.params.keyPath === "mcp_servers.discord-root").params.value.env.DISCORD_ACCESS_FILE,
     accessFile,
   );
+  const rootMcpEnv = writes.find((message) => message.params.keyPath === "mcp_servers.discord-root").params.value.env;
+  assert.match(rootMcpEnv.DISCORD_CHANNEL_SCOPE_SECRET, /^[a-f0-9]{64}$/);
+  assert.match(rootMcpEnv.DISCORD_CHANNEL_SCOPE_FILE, /codex-discord-scope-/);
 
   const userTurns = state.fixtures.codex.protocolEvents
     .filter((event) => event.event === "client-message")
@@ -599,6 +602,7 @@ test("root bridge accepts root channels and mentioned project channels with rout
     );
   assert.equal(userTurns.length, 2);
   assert.match(userTurns[0].params.input[0].text, /channel_id: root-channel/);
+  assert.match(userTurns[0].params.input[0].text, /channel_scope_token: [A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/);
   assert.match(userTurns[1].params.input[0].text, /channel_id: project-channel/);
   assert.match(userTurns[1].params.input[0].text, /codex restart this session with codex/);
   assert.doesNotMatch(userTurns[1].params.input[0].text, /<@root-bot-id>/);
@@ -778,7 +782,7 @@ test("bridge drains queued messages after Codex reports a different active turn 
   await bridge.stop();
 });
 
-test("bridge ignores stale turn notifications after the current turn is confirmed", async () => {
+test("bridge ignores stale turn notifications before and after the current turn is confirmed", async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, {
     turns: [
@@ -788,6 +792,9 @@ test("bridge ignores stale turn notifications after the current turn is confirme
         delayMs: 100,
         startDelayMs: 5,
         turnId: "turn-b",
+        notificationsBeforeStart: [
+          { method: "turn/completed", params: { turn: { id: "turn-a" } } },
+        ],
         notificationsBeforeComplete: [
           { method: "turn/completed", params: { turn: { id: "turn-a" } } },
         ],
@@ -878,7 +885,7 @@ test("bridge handles compact and clear slash commands during an active turn", as
     }
   }
   const clientMessages = [...clientMessageMap.values()];
-  assert.ok(clientMessages.some((message) => message.method === "turn/interrupt"));
+  assert.match(bridge.stdout, /\[clear\] Interrupted turn/);
   assert.ok(clientMessages.some((message) => message.method === "thread/archive"));
   assert.equal(clientMessages.filter((message) => message.method === "thread/start").length, 2);
   const mcpWrite = clientMessages.find((message) => message.method === "config/value/write");
@@ -978,6 +985,54 @@ test("bridge restarts its own Codex session from slash command", async () => {
   assert.equal(state.fixtures.tmux.sessions.alpha.env.CHANNEL_ID, "channel-id");
 });
 
+test("root bridge restarts through the root Codex restart script", async () => {
+  const workspace = createBridgeWorkspace();
+  const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
+  fs.mkdirSync(rootStateDir, { recursive: true });
+  fs.writeFileSync(path.join(rootStateDir, ".env"), "DISCORD_BOT_TOKEN=cm9vdC1hcHA.fixture.token\n");
+  fs.writeFileSync(path.join(rootStateDir, "access.json"), `${JSON.stringify({
+    allowFrom: ["allowed-user-id"],
+    groups: { "root-channel": { requireMention: false, allowFrom: ["allowed-user-id"] } },
+  })}\n`);
+  fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), `${JSON.stringify({
+    discord_user_id: "allowed-user-id",
+    guild_id: "guild-id",
+    pool: [
+      { id: "bot1", app_id: "root-app", token: "root-token", state_dir: rootStateDir, assigned_to: null },
+    ],
+    projects: {},
+  })}\n`);
+  const codex = await startFakeCodexServer(workspace, { channelId: "root-channel" });
+  const bridge = startBridge(workspace, {
+    botAppId: "root-app",
+    botToken: "cm9vdC1hcHA.fixture.token",
+    channelId: "root-channel",
+    port: codex.port,
+    rootBotAppId: "root-app",
+    env: {
+      ROOT_ACCESS_FILE: path.join(rootStateDir, "access.json"),
+      ROOT_MULTI_CHANNEL: "1",
+    },
+  });
+
+  await bridge.waitForOutput(/Listening in #channel-root-channel/, 7000);
+  await injectMessageUntil(
+    workspace,
+    { channelId: "root-channel", content: "/restart", id: "root-restart-message" },
+    (state) => state.fixtures.discord.sends.some((send) => send.content.startsWith("Restarting root session")),
+    5000,
+  );
+  const result = await bridge.closed;
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const state = await waitForState(
+    workspace,
+    (nextState) => Boolean(nextState.fixtures.tmux.sessions.root_agent),
+    5000,
+  );
+  assert.equal(state.fixtures.tmux.sessions.root_agent.env.CHANNEL_ID, "root-channel");
+  assert.equal(state.fixtures.tmux.sessions.root_agent.bridgeCommand, "node scripts/codex-bridge.js");
+});
+
 test("bridge stops typing after a non-retryable Codex error", async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, {
@@ -1062,7 +1117,12 @@ test("bridge records diagnostics when Discord send fails", async () => {
   });
 
   await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
-  injectDiscordMessage(workspace, { content: "trigger send failure" });
+  await injectMessageUntil(
+    workspace,
+    { content: "trigger send failure", id: "trigger-send-failure" },
+    (state) => state.fixtures.discord.deliveredMessages.some((message) => message.id === "trigger-send-failure"),
+    5000,
+  );
   const result = await bridge.closed;
 
   assert.notEqual(result.exitCode, 0);

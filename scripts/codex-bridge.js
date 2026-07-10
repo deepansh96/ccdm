@@ -2,8 +2,9 @@
 
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const { spawn } = require("child_process");
-const { randomBytes } = require("crypto");
+const { createHmac, randomBytes } = require("crypto");
 const { writeFile, mkdir, mkdtemp, readFile, rm } = require("fs/promises");
+const { rmSync } = require("fs");
 const os = require("os");
 const path = require("path");
 const WebSocket = require("ws");
@@ -52,6 +53,12 @@ const ROOT_ACCESS_FILE =
   process.env.ROOT_ACCESS_FILE ||
   path.join(os.homedir(), ".claude", "channels", "discord", "access.json");
 const DISCORD_REPLY_TOKEN = randomBytes(16).toString("hex");
+const DISCORD_CHANNEL_SCOPE_SECRET = randomBytes(32).toString("hex");
+const TURN_ID_RECONCILIATION_METHODS = new Set([
+  "turn/started",
+  "item/started",
+  "item/agentMessage/delta",
+]);
 
 if (!BOT_TOKEN || !CHANNEL_ID || !PROJECT_DIR) {
   console.error(
@@ -84,13 +91,15 @@ let lastNicknameUpdate = 0;
 let fallbackLoggedCompletedItemTypes = new Set();
 let rootAccess = null;
 let rootChannelAccess = new Map();
+let discordChannelScopeDir = null;
+let discordChannelScopeFile = null;
 const NICKNAME_INTERVAL = 60000;
 const DISCORD_MCP_NAME = ROOT_MULTI_CHANNEL ? "discord-root" : `discord-${CHANNEL_ID}`;
 const THREAD_INSTRUCTION = ROOT_MULTI_CHANNEL
   ? `This root thread is connected to Discord through the ${DISCORD_MCP_NAME} MCP server. Incoming messages include Discord routing metadata. Do not call Discord MCP tools unless the current task includes an explicit Discord reply scope token. Subagents and delegated tasks must return results to their parent agent, not to Discord.`
   : `This thread is connected to Discord through the ${DISCORD_MCP_NAME} MCP server. Do not call Discord MCP tools unless the current task includes an explicit Discord reply scope token. Subagents and delegated tasks must return results to their parent agent, not to Discord.`;
 const SYSTEM_INSTRUCTION = ROOT_MULTI_CHANNEL
-  ? `You are communicating with the user via Discord. Use ONLY the MCP server named "${DISCORD_MCP_NAME}" to interact. Incoming messages include a Discord routing metadata block; use its channel_id for every Discord MCP call. Every Discord write call (\`reply\`, \`edit_message\`, or \`react\`) must include \`scope_token: "${DISCORD_REPLY_TOKEN}"\` and \`channel_id\`. Do NOT share this scope token with subagents. When spawning subagents, explicitly tell them not to use Discord MCP/tools and to return only to the parent agent. Do NOT use any other discord MCP server. Do NOT output responses as regular text; always use the \`reply\` tool so the user sees your response on Discord. Other available tools on this same server: edit_message, react, fetch_messages, download_attachment; in this root multi-channel mode, pass \`channel_id\` to them too. Use \`reply\` with the \`files\` parameter to send file attachments. You don't have to reply for every little thing. Try to reply only when you're done, unless something important needs to be confirmed from the user. Also, try to use simpler language and avoid complex language.`
+  ? `You are communicating with the user via Discord. Use ONLY the MCP server named "${DISCORD_MCP_NAME}" to interact. Incoming messages include a Discord routing metadata block; use its channel_id and channel_scope_token for every Discord MCP call. Every Discord write call (\`reply\`, \`edit_message\`, or \`react\`) must also include \`scope_token: "${DISCORD_REPLY_TOKEN}"\`. Do NOT share these tokens with subagents. When spawning subagents, explicitly tell them not to use Discord MCP/tools and to return only to the parent agent. Do NOT use any other discord MCP server. Do NOT output responses as regular text; always use the \`reply\` tool so the user sees your response on Discord. Other available tools on this same server: edit_message, react, fetch_messages, download_attachment. Use \`reply\` with the \`files\` parameter to send file attachments. You don't have to reply for every little thing. Try to reply only when you're done, unless something important needs to be confirmed from the user. Also, try to use simpler language and avoid complex language.`
   : `You are communicating with the user via Discord. Use ONLY the MCP server named "${DISCORD_MCP_NAME}" to interact — call its \`reply\` tool to send messages to the user. Every Discord write call (\`reply\`, \`edit_message\`, or \`react\`) must include \`scope_token: "${DISCORD_REPLY_TOKEN}"\`. Do NOT share this scope token with subagents. When spawning subagents, explicitly tell them not to use Discord MCP/tools and to return only to the parent agent. Do NOT use any other discord MCP server. Do NOT output responses as regular text; always use the \`reply\` tool so the user sees your response on Discord. Other available tools on this same server: edit_message, react, fetch_messages, download_attachment. Use \`reply\` with the \`files\` parameter to send file attachments. You don't have to reply for every little thing. Try to reply only when you're done, unless something important needs to be confirmed from the user. Also, try to use simpler language and avoid complex language.`;
 
 function nextId() {
@@ -141,6 +150,21 @@ function scheduleRestart(projectName, screenName) {
   return logPath;
 }
 
+function scheduleRootRestart() {
+  const logPath = path.join(os.tmpdir(), "ccdm-restart-root-codex.log");
+  const command = [
+    `while kill -0 ${process.pid} 2>/dev/null; do sleep 1; done`,
+    `cd ${shellQuote(ROOT_DIR)} && ./restart-root-codex-agent.sh ${shellQuote(CHANNEL_ID)} >> ${shellQuote(logPath)} 2>&1`,
+  ].join("; ");
+  const child = spawn("/bin/sh", ["-c", command], {
+    detached: true,
+    env: process.env,
+    stdio: "ignore",
+  });
+  child.unref();
+  return logPath;
+}
+
 function sendRequest(method, params) {
   return new Promise((resolve, reject) => {
     const id = nextId();
@@ -169,7 +193,15 @@ function isCurrentTurnNotification(msg) {
   if (!notifiedTurnId) {
     return true;
   }
+  if (!turnActive) {
+    console.log(`[turn] ignoring turn id ${notifiedTurnId} for ${msg.method}; no turn is active`);
+    return false;
+  }
   if (!activeTurnId) {
+    if (!TURN_ID_RECONCILIATION_METHODS.has(msg.method)) {
+      console.log(`[turn] ignoring unconfirmed turn id ${notifiedTurnId} for ${msg.method}`);
+      return false;
+    }
     activeTurnId = notifiedTurnId;
     activeTurnIdConfirmed = true;
     return true;
@@ -178,7 +210,7 @@ function isCurrentTurnNotification(msg) {
     activeTurnIdConfirmed = true;
     return true;
   }
-  if (turnActive && !activeTurnIdConfirmed) {
+  if (!activeTurnIdConfirmed && TURN_ID_RECONCILIATION_METHODS.has(msg.method)) {
     console.log(
       `[turn] accepting active turn id ${notifiedTurnId} for ${msg.method}; previous expected id was ${activeTurnId}`
     );
@@ -188,6 +220,39 @@ function isCurrentTurnNotification(msg) {
   }
   console.log(`[turn] ignoring stale turn id ${notifiedTurnId} for ${msg.method}; active id is ${activeTurnId}`);
   return false;
+}
+
+async function initializeDiscordChannelScope() {
+  if (!ROOT_MULTI_CHANNEL) return;
+  discordChannelScopeDir = await mkdtemp(path.join(os.tmpdir(), "codex-discord-scope-"));
+  discordChannelScopeFile = path.join(discordChannelScopeDir, "active");
+  await writeFile(discordChannelScopeFile, "", { mode: 0o600 });
+}
+
+function createDiscordChannelScopeToken(msg) {
+  const encoded = Buffer.from(JSON.stringify({
+    author_id: msg.author.id,
+    channel_id: msg.channel.id,
+    nonce: randomBytes(16).toString("hex"),
+  })).toString("base64url");
+  const signature = createHmac("sha256", DISCORD_CHANNEL_SCOPE_SECRET)
+    .update(encoded)
+    .digest("base64url");
+  return `${encoded}.${signature}`;
+}
+
+async function activateDiscordChannelScope(token) {
+  if (!ROOT_MULTI_CHANNEL) return;
+  if (!discordChannelScopeFile || !token) {
+    throw new Error("Missing Discord channel scope for root turn");
+  }
+  await writeFile(discordChannelScopeFile, token, { mode: 0o600 });
+}
+
+async function clearDiscordChannelScope() {
+  if (ROOT_MULTI_CHANNEL && discordChannelScopeFile) {
+    await writeFile(discordChannelScopeFile, "", { mode: 0o600 });
+  }
 }
 
 function resetActiveTurnId() {
@@ -541,17 +606,21 @@ function handleNotification(msg) {
         }
         const bootstrapReason = pendingBootstrapInstructionReason;
         pendingBootstrapInstructionReason = null;
-        turnActive = false;
         resetActiveTurnId();
         fallbackText = "";
         mcpReplyCalled = false;
         suppressTurnOutput = false;
         activeOutputChannelId = null;
-        if (bootstrapReason) {
-          sendBootstrapInstructionTurn(bootstrapReason);
-        } else {
-          processQueue();
-        }
+        clearDiscordChannelScope().catch((err) => {
+          console.error(`Discord channel scope cleanup failed: ${err.message || err}`);
+        }).then(() => {
+          turnActive = false;
+          if (bootstrapReason) {
+            sendBootstrapInstructionTurn(bootstrapReason);
+          } else {
+            processQueue();
+          }
+        });
       }
       break;
 
@@ -678,11 +747,12 @@ async function onTurnCompleted() {
     deltaBuffer = "";
     fallbackText = "";
   }
-  turnActive = false;
   resetActiveTurnId();
   mcpReplyCalled = false;
   suppressTurnOutput = false;
   activeOutputChannelId = null;
+  await clearDiscordChannelScope();
+  turnActive = false;
   const bootstrapReason = pendingBootstrapInstructionReason;
   pendingBootstrapInstructionReason = null;
   if (bootstrapReason) {
@@ -694,16 +764,16 @@ async function onTurnCompleted() {
 
 async function processQueue() {
   if (threadResetting || turnActive || !threadId || messageQueue.length === 0) return;
-  const { input, msg: queuedMsg, channelId } = messageQueue.shift();
+  const { input, msg: queuedMsg, channelId, channelScopeToken } = messageQueue.shift();
   if (queuedMsg) {
     queuedMsg.reactions.cache.get("⏳")?.users.remove(queuedMsg.client.user.id).catch(() => {});
   }
-  await sendTurn(input, channelId);
+  await sendTurn(input, channelId, channelScopeToken);
 }
 
-async function sendTurn(input, channelId = CHANNEL_ID) {
+async function sendTurn(input, channelId = CHANNEL_ID, channelScopeToken = null) {
   if (!threadId) {
-    messageQueue.push({ input, msg: null, channelId });
+    messageQueue.push({ input, msg: null, channelId, channelScopeToken });
     return;
   }
   turnActive = true;
@@ -712,8 +782,9 @@ async function sendTurn(input, channelId = CHANNEL_ID) {
   fallbackText = "";
   mcpReplyCalled = false;
   resetActiveTurnId();
-  await startTyping(channelId);
   try {
+    await activateDiscordChannelScope(channelScopeToken);
+    await startTyping(channelId);
     const result = await sendRequest("turn/start", {
       threadId,
       input,
@@ -723,9 +794,10 @@ async function sendTurn(input, channelId = CHANNEL_ID) {
   } catch (err) {
     console.error("turn/start failed:", err);
     stopTyping();
-    turnActive = false;
     resetActiveTurnId();
     fallbackText = "";
+    await clearDiscordChannelScope();
+    turnActive = false;
     await sendToDiscord("**Error:** Failed to send message to Codex");
     activeOutputChannelId = null;
     processQueue();
@@ -903,7 +975,7 @@ async function transcribeAudioAttachment(att) {
   }
 }
 
-function rootRoutingContext(msg, text) {
+function rootRoutingContext(msg, text, channelScopeToken) {
   const channelName = msg.channel?.name || msg.channel?.id || "unknown";
   return [
     "Discord routing metadata:",
@@ -914,8 +986,9 @@ function rootRoutingContext(msg, text) {
     `author_name: ${msg.author.username}`,
     `reply_mcp_server: ${DISCORD_MCP_NAME}`,
     `reply_channel_id: ${msg.channel.id}`,
+    `channel_scope_token: ${channelScopeToken}`,
     "",
-    "Use the reply_mcp_server with reply_channel_id for any Discord MCP call that responds to this message.",
+    "Use the reply_mcp_server with reply_channel_id and channel_scope_token for every Discord MCP call for this message.",
     "",
     "Message:",
     text || "(no text)",
@@ -925,8 +998,11 @@ function rootRoutingContext(msg, text) {
 async function buildInput(msg, textOverride = null) {
   const input = [];
   const text = textOverride ?? msg.content.trim();
+  const channelScopeToken = ROOT_MULTI_CHANNEL
+    ? createDiscordChannelScopeToken(msg)
+    : null;
   if (ROOT_MULTI_CHANNEL) {
-    input.push({ type: "text", text: rootRoutingContext(msg, text) });
+    input.push({ type: "text", text: rootRoutingContext(msg, text, channelScopeToken) });
   } else if (text) {
     input.push({ type: "text", text });
   }
@@ -971,7 +1047,7 @@ async function buildInput(msg, textOverride = null) {
       }
     }
   }
-  return input;
+  return { input, channelScopeToken };
 }
 
 async function registerDiscordMcp() {
@@ -1005,6 +1081,9 @@ async function registerDiscordMcp() {
         ...(ROOT_MULTI_CHANNEL ? {
           DISCORD_CHANNEL_OVERRIDE: "1",
           DISCORD_ACCESS_FILE: ROOT_ACCESS_FILE,
+          DISCORD_CHANNEL_SCOPE_FILE: discordChannelScopeFile,
+          DISCORD_CHANNEL_SCOPE_SECRET,
+          DISCORD_GLOBAL_USER_IDS: [...ALLOWED_USER_IDS].join(","),
         } : {}),
       },
     },
@@ -1117,6 +1196,7 @@ function startDiscordBot() {
             const interruptParams = { threadId: previousThreadId };
             if (previousTurnId) interruptParams.turnId = previousTurnId;
             await sendRequest("turn/interrupt", interruptParams);
+            console.log(`[clear] Interrupted turn ${previousTurnId || "(active)"}`);
           } catch (err) {
             console.log(`Warning: failed to interrupt active turn before clear: ${err.message || err}`);
           }
@@ -1133,6 +1213,7 @@ function startDiscordBot() {
         deltaBuffer = "";
         fallbackText = "";
         stopTyping();
+        await clearDiscordChannelScope();
 
         await registerDiscordMcp();
         await startCodexThread();
@@ -1148,6 +1229,7 @@ function startDiscordBot() {
         turnActive = false;
         resetActiveTurnId();
         fallbackText = "";
+        await clearDiscordChannelScope();
         await sendToDiscord(`**Error:** Failed to clear — ${err.message || err}`, channelId);
         activeOutputChannelId = null;
         processQueue();
@@ -1159,6 +1241,13 @@ function startDiscordBot() {
       console.log("[discord] /restart requested");
       await msg.react("🔄");
       try {
+        if (ROOT_MULTI_CHANNEL) {
+          const logPath = scheduleRootRestart();
+          await sendToDiscord("Restarting root session — fresh thread coming up.", channelId);
+          console.log(`Root restart scheduled; log: ${logPath}`);
+          cleanup();
+          return;
+        }
         const { projectName, screenName } = await findCurrentProject();
         const logPath = scheduleRestart(projectName, screenName);
         await sendToDiscord("Restarting session — fresh thread coming up.", channelId);
@@ -1170,13 +1259,16 @@ function startDiscordBot() {
       return;
     }
 
-    const input = await buildInput(msg, text);
+    const { input, channelScopeToken } = await buildInput(msg, text);
     if (input.length === 0) return;
 
     console.log(`[discord] ${msg.author.username}: ${text || "(attachment)"} [${input.length} part(s)]`);
 
     if (threadResetting) {
-      messageQueue.push({ input, msg, channelId });
+      messageQueue.push({ input, msg, channelId, channelScopeToken });
+      await msg.react("⏳");
+    } else if (ROOT_MULTI_CHANNEL && turnActive) {
+      messageQueue.push({ input, msg, channelId, channelScopeToken });
       await msg.react("⏳");
     } else if (turnActive && activeTurnId && !suppressTurnOutput) {
       try {
@@ -1188,14 +1280,14 @@ function startDiscordBot() {
         console.log(`[steer] Injected into active turn ${activeTurnId}`);
       } catch (err) {
         console.log(`[steer] Failed (${err.message || err}), queuing instead`);
-        messageQueue.push({ input, msg, channelId });
+        messageQueue.push({ input, msg, channelId, channelScopeToken });
         await msg.react("⏳");
       }
     } else if (turnActive) {
-      messageQueue.push({ input, msg, channelId });
+      messageQueue.push({ input, msg, channelId, channelScopeToken });
       await msg.react("⏳");
     } else {
-      await sendTurn(input, channelId);
+      await sendTurn(input, channelId, channelScopeToken);
     }
   });
 
@@ -1206,6 +1298,9 @@ function startDiscordBot() {
     client.destroy();
     if (ws) ws.close();
     if (codexProcess) codexProcess.kill();
+    if (discordChannelScopeDir) {
+      rmSync(discordChannelScopeDir, { recursive: true, force: true });
+    }
     process.exit(0);
   }
 
@@ -1216,6 +1311,7 @@ function startDiscordBot() {
 
 async function main() {
   await loadRootAccess();
+  await initializeDiscordChannelScope();
   startCodexServer();
   await connectWebSocket();
   await initializeCodex();

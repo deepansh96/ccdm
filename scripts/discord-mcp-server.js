@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const { createInterface } = require("readline");
+const { createHmac, timingSafeEqual } = require("crypto");
 const path = require("path");
 const { writeFile, mkdir, stat, readFile } = require("fs/promises");
 const { createReadStream } = require("fs");
@@ -12,6 +13,14 @@ const DISCORD_CHANNEL_OVERRIDE = ["1", "true", "yes", "on"].includes(
   (process.env.DISCORD_CHANNEL_OVERRIDE || "").toLowerCase()
 );
 const DISCORD_ACCESS_FILE = process.env.DISCORD_ACCESS_FILE;
+const DISCORD_CHANNEL_SCOPE_FILE = process.env.DISCORD_CHANNEL_SCOPE_FILE;
+const DISCORD_CHANNEL_SCOPE_SECRET = process.env.DISCORD_CHANNEL_SCOPE_SECRET;
+const DISCORD_GLOBAL_USER_IDS = new Set(
+  (process.env.DISCORD_GLOBAL_USER_IDS || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean)
+);
 
 if (!BOT_TOKEN || !CHANNEL_ID) {
   process.stderr.write("Missing BOT_TOKEN or CHANNEL_ID\n");
@@ -142,13 +151,21 @@ const channelIdProperty = {
     description: "Target Discord channel ID. Required when this MCP server is in root multi-channel mode.",
   },
 };
+const channelScopeProperty = {
+  channel_scope_token: {
+    type: "string",
+    description: "Signed capability from the incoming Discord routing metadata.",
+  },
+};
 
 function withScopeToken(properties) {
   return DISCORD_REPLY_TOKEN ? { ...properties, ...scopeTokenProperty } : properties;
 }
 
 function withChannelOverride(properties) {
-  return DISCORD_CHANNEL_OVERRIDE ? { ...properties, ...channelIdProperty } : properties;
+  return DISCORD_CHANNEL_OVERRIDE
+    ? { ...properties, ...channelIdProperty, ...channelScopeProperty }
+    : properties;
 }
 
 function requiredWithScope(fields) {
@@ -156,7 +173,9 @@ function requiredWithScope(fields) {
 }
 
 function requiredWithChannel(fields) {
-  return DISCORD_CHANNEL_OVERRIDE ? [...fields, "channel_id"] : fields;
+  return DISCORD_CHANNEL_OVERRIDE
+    ? [...fields, "channel_id", "channel_scope_token"]
+    : fields;
 }
 
 function requireScopeToken(scopeToken) {
@@ -173,9 +192,44 @@ async function targetChannelId(args) {
   if (!DISCORD_ACCESS_FILE) {
     throw new Error("Discord access file is required in root multi-channel mode");
   }
+  if (!DISCORD_CHANNEL_SCOPE_FILE || !DISCORD_CHANNEL_SCOPE_SECRET) {
+    throw new Error("Discord channel scope is required in root multi-channel mode");
+  }
+  const activeToken = (await readFile(DISCORD_CHANNEL_SCOPE_FILE, "utf8")).trim();
+  if (!args.channel_scope_token || args.channel_scope_token !== activeToken) {
+    throw new Error("Discord channel scope is missing, expired, or invalid");
+  }
+  const [encoded, signature, extra] = args.channel_scope_token.split(".");
+  if (!encoded || !signature || extra) {
+    throw new Error("Discord channel scope is missing, expired, or invalid");
+  }
+  const expected = Buffer.from(
+    createHmac("sha256", DISCORD_CHANNEL_SCOPE_SECRET).update(encoded).digest("base64url")
+  );
+  const received = Buffer.from(signature);
+  if (expected.length !== received.length || !timingSafeEqual(expected, received)) {
+    throw new Error("Discord channel scope is missing, expired, or invalid");
+  }
+  let scope;
+  try {
+    scope = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+  } catch {
+    throw new Error("Discord channel scope is missing, expired, or invalid");
+  }
   const access = JSON.parse(await readFile(DISCORD_ACCESS_FILE, "utf8"));
   if (!Object.hasOwn(access.groups || {}, args.channel_id)) {
     throw new Error(`Discord channel ${args.channel_id} is not allowed`);
+  }
+  const globalUsers = new Set([
+    ...DISCORD_GLOBAL_USER_IDS,
+    ...(access.allowFrom || []).map(String),
+  ]);
+  if (!globalUsers.has(String(scope.author_id))) {
+    const sourceConfig = access.groups?.[scope.channel_id];
+    const sourceUsers = new Set((sourceConfig?.allowFrom || []).map(String));
+    if (!sourceUsers.has(String(scope.author_id)) || args.channel_id !== scope.channel_id) {
+      throw new Error(`Discord channel ${args.channel_id} is not allowed for this message`);
+    }
   }
   return args.channel_id;
 }

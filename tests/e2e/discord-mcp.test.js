@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -18,6 +19,16 @@ function rpc(id, method, params) {
 
 function toolCall(id, name, args = {}) {
   return rpc(id, "tools/call", { name, arguments: args });
+}
+
+function channelScopeToken(secret, authorId, channelId) {
+  const encoded = Buffer.from(JSON.stringify({
+    author_id: authorId,
+    channel_id: channelId,
+    nonce: "test-nonce",
+  })).toString("base64url");
+  const signature = createHmac("sha256", secret).update(encoded).digest("base64url");
+  return `${encoded}.${signature}`;
 }
 
 async function runMcp(workspace, lines, options = {}) {
@@ -124,9 +135,18 @@ test("Discord MCP writes require the bridge scope token when configured", async 
 test("Discord MCP root override routes calls to the requested channel", async () => {
   const workspace = createBridgeWorkspace();
   const accessFile = path.join(workspace.tmpDir, "root-access.json");
+  const scopeFile = path.join(workspace.tmpDir, "active-scope");
+  const scopeSecret = "scope-secret";
+  const guestScope = channelScopeToken(scopeSecret, "guest-user", "project-channel");
+  const globalScope = channelScopeToken(scopeSecret, "global-user", "project-channel");
   fs.writeFileSync(accessFile, `${JSON.stringify({
-    groups: { "project-channel": { requireMention: true } },
+    allowFrom: ["global-user"],
+    groups: {
+      "project-channel": { requireMention: true, allowFrom: ["guest-user"] },
+      "other-channel": { requireMention: true, allowFrom: ["other-user"] },
+    },
   })}\n`);
+  fs.writeFileSync(scopeFile, guestScope);
   const seed = readState(workspace.stateDir);
   seed.fixtures.discord.restMessages = [
     {
@@ -144,15 +164,19 @@ test("Discord MCP root override routes calls to the requested channel", async ()
     [
       rpc(1, "tools/list", {}),
       toolCall(2, "reply", { text: "missing channel", scope_token: "secret-token" }),
-      toolCall(3, "reply", { text: "to project", channel_id: "project-channel", scope_token: "secret-token" }),
-      toolCall(4, "fetch_messages", { channel_id: "project-channel", limit: 1 }),
-      toolCall(5, "reply", { text: "denied", channel_id: "other-channel", scope_token: "secret-token" }),
-      toolCall(6, "fetch_messages", { channel_id: "other-channel", limit: 1 }),
+      toolCall(3, "reply", { text: "to project", channel_id: "project-channel", channel_scope_token: guestScope, scope_token: "secret-token" }),
+      toolCall(4, "fetch_messages", { channel_id: "project-channel", channel_scope_token: guestScope, limit: 1 }),
+      toolCall(5, "reply", { text: "denied", channel_id: "other-channel", channel_scope_token: guestScope, scope_token: "secret-token" }),
+      toolCall(6, "fetch_messages", { channel_id: "other-channel", channel_scope_token: guestScope, limit: 1 }),
+      toolCall(9, "fetch_messages", { channel_id: "other-channel", channel_scope_token: globalScope, limit: 1 }),
     ],
     {
       env: {
         DISCORD_ACCESS_FILE: accessFile,
         DISCORD_CHANNEL_OVERRIDE: "1",
+        DISCORD_CHANNEL_SCOPE_FILE: scopeFile,
+        DISCORD_CHANNEL_SCOPE_SECRET: scopeSecret,
+        DISCORD_GLOBAL_USER_IDS: "global-user",
         DISCORD_REPLY_TOKEN: "secret-token",
       },
     },
@@ -161,19 +185,43 @@ test("Discord MCP root override routes calls to the requested channel", async ()
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const output = responseById(result);
   const replyTool = output.get(1).result.tools.find((tool) => tool.name === "reply");
-  assert.deepEqual(replyTool.inputSchema.required, ["text", "channel_id", "scope_token"]);
+  assert.deepEqual(replyTool.inputSchema.required, ["text", "channel_id", "channel_scope_token", "scope_token"]);
   assert.equal(output.get(2).result.isError, true);
   assert.match(output.get(2).result.content[0].text, /channel_id is required/);
   assert.deepEqual(output.get(3).result.content, [{ type: "text", text: "sent (id: fake-message-1)" }]);
   assert.match(output.get(4).result.content[0].text, /Alice: hello/);
   assert.equal(output.get(5).result.isError, true);
-  assert.match(output.get(5).result.content[0].text, /other-channel is not allowed/);
+  assert.match(output.get(5).result.content[0].text, /other-channel is not allowed for this message/);
   assert.equal(output.get(6).result.isError, true);
-  assert.match(output.get(6).result.content[0].text, /other-channel is not allowed/);
+  assert.match(output.get(6).result.content[0].text, /other-channel is not allowed for this message/);
+  assert.equal(output.get(9).result.isError, true);
+  assert.match(output.get(9).result.content[0].text, /scope is missing, expired, or invalid/);
 
   const discord = readState(workspace.stateDir).fixtures.discord;
   assert.equal(discord.messages[0].channelId, "project-channel");
   assert.equal(discord.fetches[0].channelId, "project-channel");
+
+  fs.writeFileSync(scopeFile, globalScope);
+  const globalResult = await runMcp(
+    workspace,
+    [
+      toolCall(7, "reply", { text: "global target", channel_id: "other-channel", channel_scope_token: globalScope, scope_token: "secret-token" }),
+      toolCall(8, "fetch_messages", { channel_id: "other-channel", channel_scope_token: globalScope, limit: 1 }),
+    ],
+    {
+      env: {
+        DISCORD_ACCESS_FILE: accessFile,
+        DISCORD_CHANNEL_OVERRIDE: "1",
+        DISCORD_CHANNEL_SCOPE_FILE: scopeFile,
+        DISCORD_CHANNEL_SCOPE_SECRET: scopeSecret,
+        DISCORD_GLOBAL_USER_IDS: "global-user",
+        DISCORD_REPLY_TOKEN: "secret-token",
+      },
+    },
+  );
+  const globalOutput = responseById(globalResult);
+  assert.equal(globalOutput.get(7).result.isError, undefined);
+  assert.equal(globalOutput.get(8).result.isError, undefined);
 });
 
 test("Discord MCP reports JSON-RPC errors and drives edit, react, and fetch tools", async () => {

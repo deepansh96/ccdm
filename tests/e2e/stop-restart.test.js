@@ -309,6 +309,10 @@ test("restart-root-codex-agent starts the root bot through the Codex bridge", as
     workspace,
     "codex app-server --listen ws://127.0.0.1:18399",
   );
+  const orphanClaudePid = spawnOwnedProcess(
+    workspace,
+    `bun server.ts DISCORD_STATE_DIR='${rootStateDir}' CLAUDE_PLUGIN_ROOT='/tmp/claude-plugins-official/discord/0.0.4'`,
+  );
   seedTmuxSession(
     "root_agent",
     { panePid, killFailuresRemaining: 1, paneOutput: "old root\n" },
@@ -321,10 +325,11 @@ test("restart-root-codex-agent starts the root bot through the Codex bridge", as
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.match(result.stdout, /Restarted root Codex agent in tmux session 'root_agent'/);
-  assert.match(result.stdout, /Cleaning remaining root Codex listener process\(es\):/);
+  assert.match(result.stdout, /Cleaning remaining root listener process\(es\):/);
   assert.equal(isAlive(childPid), false);
   assert.equal(isAlive(orphanBridgePid), false);
   assert.equal(isAlive(orphanAppServerPid), false);
+  assert.equal(isAlive(orphanClaudePid), false);
   const session = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
   assert.equal(session.cwd, workspace.repoDir);
   assert.deepEqual(session.env, {

@@ -216,6 +216,12 @@ export async function startFakeCodexServer(workspace, options = {}) {
           const turnThreadId = message.params?.threadId;
           reply({ turn: { id: turnId } });
           const startTimer = setTimeout(() => {
+            for (const notification of plan.notificationsBeforeStart ?? []) {
+              notify(notification.method, {
+                threadId: turnThreadId,
+                ...notification.params,
+              });
+            }
             if (!plan.omitTurnStarted) {
               notify("turn/started", { threadId: turnThreadId, turn: { id: notificationTurnId } });
             }
