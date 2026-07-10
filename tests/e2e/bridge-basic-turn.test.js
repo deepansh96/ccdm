@@ -585,6 +585,10 @@ test("root bridge accepts root channels and mentioned project channels with rout
     writes.find((message) => message.params.keyPath === "mcp_servers.discord-root").params.value.env.DISCORD_CHANNEL_OVERRIDE,
     "1",
   );
+  assert.equal(
+    writes.find((message) => message.params.keyPath === "mcp_servers.discord-root").params.value.env.DISCORD_ACCESS_FILE,
+    accessFile,
+  );
 
   const userTurns = state.fixtures.codex.protocolEvents
     .filter((event) => event.event === "client-message")
@@ -598,6 +602,43 @@ test("root bridge accepts root channels and mentioned project channels with rout
   assert.match(userTurns[1].params.input[0].text, /channel_id: project-channel/);
   assert.match(userTurns[1].params.input[0].text, /codex restart this session with codex/);
   assert.doesNotMatch(userTurns[1].params.input[0].text, /<@root-bot-id>/);
+
+  const updatedAccess = JSON.parse(fs.readFileSync(accessFile, "utf8"));
+  updatedAccess.groups["new-project-channel"] = {
+    requireMention: true,
+    allowFrom: ["allowed-user-id"],
+  };
+  fs.writeFileSync(accessFile, `${JSON.stringify(updatedAccess, null, 2)}\n`);
+  await injectMessageUntil(
+    workspace,
+    { channelId: "new-project-channel", content: "<@root-bot-id> new channel", id: "new-project-mentioned" },
+    (nextState) => nextState.fixtures.codex.protocolEvents
+      .filter((event) => event.event === "client-message")
+      .map((event) => event.message)
+      .filter((message) =>
+        message.method === "turn/start" &&
+        !message.params?.input?.[0]?.text?.startsWith("You are communicating with the user via Discord")
+      ).length === 3,
+    5000,
+  );
+
+  delete updatedAccess.groups["project-channel"];
+  fs.writeFileSync(accessFile, `${JSON.stringify(updatedAccess, null, 2)}\n`);
+  await injectMessageUntil(
+    workspace,
+    { channelId: "project-channel", content: "<@root-bot-id> removed channel", id: "removed-project-mentioned" },
+    (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === "removed-project-mentioned"),
+    5000,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const finalUserTurns = readState(workspace.stateDir).fixtures.codex.protocolEvents
+    .filter((event) => event.event === "client-message")
+    .map((event) => event.message)
+    .filter((message) =>
+      message.method === "turn/start" &&
+      !message.params?.input?.[0]?.text?.startsWith("You are communicating with the user via Discord")
+    );
+  assert.equal(finalUserTurns.length, 3);
   await bridge.stop();
 });
 
@@ -734,6 +775,45 @@ test("bridge drains queued messages after Codex reports a different active turn 
   assert.ok(sends.includes("first done"));
   assert.ok(sends.includes("queued done"));
   assert.match(bridge.stdout, /\[turn\] accepting active turn id actual-turn/);
+  await bridge.stop();
+});
+
+test("bridge ignores stale turn notifications after the current turn is confirmed", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    turns: [
+      { delta: "first done", turnId: "turn-a" },
+      {
+        delta: "second done",
+        delayMs: 100,
+        startDelayMs: 5,
+        turnId: "turn-b",
+        notificationsBeforeComplete: [
+          { method: "turn/completed", params: { turn: { id: "turn-a" } } },
+        ],
+      },
+    ],
+  });
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await injectMessageUntil(
+    workspace,
+    { content: "first", id: "first-turn" },
+    (state) => state.fixtures.discord.sends.some((send) => send.content === "first done"),
+    5000,
+  );
+  await injectMessageUntil(
+    workspace,
+    { content: "second", id: "second-turn" },
+    (state) => state.fixtures.discord.sends.some((send) => send.content === "second done"),
+    5000,
+  );
+
+  assert.match(bridge.stdout, /ignoring stale turn id turn-a.*active id is turn-b/);
   await bridge.stop();
 });
 

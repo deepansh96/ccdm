@@ -123,6 +123,10 @@ test("Discord MCP writes require the bridge scope token when configured", async 
 
 test("Discord MCP root override routes calls to the requested channel", async () => {
   const workspace = createBridgeWorkspace();
+  const accessFile = path.join(workspace.tmpDir, "root-access.json");
+  fs.writeFileSync(accessFile, `${JSON.stringify({
+    groups: { "project-channel": { requireMention: true } },
+  })}\n`);
   const seed = readState(workspace.stateDir);
   seed.fixtures.discord.restMessages = [
     {
@@ -142,8 +146,16 @@ test("Discord MCP root override routes calls to the requested channel", async ()
       toolCall(2, "reply", { text: "missing channel", scope_token: "secret-token" }),
       toolCall(3, "reply", { text: "to project", channel_id: "project-channel", scope_token: "secret-token" }),
       toolCall(4, "fetch_messages", { channel_id: "project-channel", limit: 1 }),
+      toolCall(5, "reply", { text: "denied", channel_id: "other-channel", scope_token: "secret-token" }),
+      toolCall(6, "fetch_messages", { channel_id: "other-channel", limit: 1 }),
     ],
-    { env: { DISCORD_CHANNEL_OVERRIDE: "1", DISCORD_REPLY_TOKEN: "secret-token" } },
+    {
+      env: {
+        DISCORD_ACCESS_FILE: accessFile,
+        DISCORD_CHANNEL_OVERRIDE: "1",
+        DISCORD_REPLY_TOKEN: "secret-token",
+      },
+    },
   );
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
@@ -154,6 +166,10 @@ test("Discord MCP root override routes calls to the requested channel", async ()
   assert.match(output.get(2).result.content[0].text, /channel_id is required/);
   assert.deepEqual(output.get(3).result.content, [{ type: "text", text: "sent (id: fake-message-1)" }]);
   assert.match(output.get(4).result.content[0].text, /Alice: hello/);
+  assert.equal(output.get(5).result.isError, true);
+  assert.match(output.get(5).result.content[0].text, /other-channel is not allowed/);
+  assert.equal(output.get(6).result.isError, true);
+  assert.match(output.get(6).result.content[0].text, /other-channel is not allowed/);
 
   const discord = readState(workspace.stateDir).fixtures.discord;
   assert.equal(discord.messages[0].channelId, "project-channel");

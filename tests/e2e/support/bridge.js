@@ -229,6 +229,12 @@ export async function startFakeCodexServer(workspace, options = {}) {
           startTimer.unref?.();
           const completionTimer = setTimeout(() => {
             if (interruptedTurnIds.has(turnId)) return;
+            for (const notification of plan.notificationsBeforeComplete ?? []) {
+              notify(notification.method, {
+                threadId: turnThreadId,
+                ...notification.params,
+              });
+            }
             if (plan.mcpReply || plan.mcpTool) {
               notify("item/started", {
                 threadId: turnThreadId,

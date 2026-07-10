@@ -166,7 +166,12 @@ If you prefer to set things up by hand:
    {
      "dmPolicy": "allowlist",
      "allowFrom": ["YOUR_DISCORD_USER_ID"],
-     "groups": {},
+     "groups": {
+       "YOUR_ROOT_CHANNEL_ID": {
+         "requireMention": false,
+         "allowFrom": ["YOUR_DISCORD_USER_ID"]
+       }
+     },
      "pending": {}
    }
    EOF
@@ -181,7 +186,7 @@ If you prefer to set things up by hand:
    ```bash
    ./restart-root-codex-agent.sh [channel_id]
    ```
-   This reads the same root `access.json` channel rules and keeps `restart-root-agent.sh` as the Claude rollback path.
+   The selected channel must already be in the root `access.json` `groups` map. The script checks this before stopping the current root agent. It keeps `restart-root-agent.sh` as the Claude rollback path.
 
 ## Commands
 

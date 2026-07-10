@@ -2,7 +2,7 @@
 
 const { createInterface } = require("readline");
 const path = require("path");
-const { writeFile, mkdir, stat } = require("fs/promises");
+const { writeFile, mkdir, stat, readFile } = require("fs/promises");
 const { createReadStream } = require("fs");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -11,6 +11,7 @@ const DISCORD_REPLY_TOKEN = process.env.DISCORD_REPLY_TOKEN;
 const DISCORD_CHANNEL_OVERRIDE = ["1", "true", "yes", "on"].includes(
   (process.env.DISCORD_CHANNEL_OVERRIDE || "").toLowerCase()
 );
+const DISCORD_ACCESS_FILE = process.env.DISCORD_ACCESS_FILE;
 
 if (!BOT_TOKEN || !CHANNEL_ID) {
   process.stderr.write("Missing BOT_TOKEN or CHANNEL_ID\n");
@@ -164,10 +165,17 @@ function requireScopeToken(scopeToken) {
   }
 }
 
-function targetChannelId(args) {
+async function targetChannelId(args) {
   if (!DISCORD_CHANNEL_OVERRIDE) return CHANNEL_ID;
   if (!args.channel_id) {
     throw new Error("channel_id is required in root multi-channel mode");
+  }
+  if (!DISCORD_ACCESS_FILE) {
+    throw new Error("Discord access file is required in root multi-channel mode");
+  }
+  const access = JSON.parse(await readFile(DISCORD_ACCESS_FILE, "utf8"));
+  if (!Object.hasOwn(access.groups || {}, args.channel_id)) {
+    throw new Error(`Discord channel ${args.channel_id} is not allowed`);
   }
   return args.channel_id;
 }
@@ -266,7 +274,7 @@ async function handleToolCall(name, args) {
     case "reply": {
       const { text, files, reply_to, scope_token } = args;
       requireScopeToken(scope_token);
-      const channelId = targetChannelId(args);
+      const channelId = await targetChannelId(args);
       let result;
       if (files && files.length > 0) {
         result = await sendMessageWithFiles(channelId, text, files, reply_to);
@@ -283,7 +291,7 @@ async function handleToolCall(name, args) {
     case "edit_message": {
       const { message_id, text, scope_token } = args;
       requireScopeToken(scope_token);
-      const channelId = targetChannelId(args);
+      const channelId = await targetChannelId(args);
       await discordPatch(`/channels/${channelId}/messages/${message_id}`, {
         content: text,
       });
@@ -293,7 +301,7 @@ async function handleToolCall(name, args) {
     case "react": {
       const { message_id, emoji, scope_token } = args;
       requireScopeToken(scope_token);
-      const channelId = targetChannelId(args);
+      const channelId = await targetChannelId(args);
       const encoded = encodeURIComponent(emoji);
       await discordPut(
         `/channels/${channelId}/messages/${message_id}/reactions/${encoded}/@me`
@@ -302,7 +310,7 @@ async function handleToolCall(name, args) {
     }
 
     case "fetch_messages": {
-      const channelId = targetChannelId(args);
+      const channelId = await targetChannelId(args);
       const limit = Math.min(args.limit || 20, 100);
       const messages = await discordGet(
         `/channels/${channelId}/messages?limit=${limit}`
@@ -321,7 +329,7 @@ async function handleToolCall(name, args) {
 
     case "download_attachment": {
       const { message_id, attachment_index = 0, save_dir } = args;
-      const channelId = targetChannelId(args);
+      const channelId = await targetChannelId(args);
       const msg = await discordGet(
         `/channels/${channelId}/messages/${message_id}`
       );

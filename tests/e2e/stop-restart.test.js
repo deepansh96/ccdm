@@ -293,8 +293,22 @@ test("restart-root-codex-agent starts the root bot through the Codex bridge", as
   const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
   fs.mkdirSync(rootStateDir, { recursive: true });
   fs.writeFileSync(path.join(rootStateDir, ".env"), "DISCORD_BOT_TOKEN=cm9vdC1hcHA.fixture.token\n");
+  fs.writeFileSync(path.join(rootStateDir, "access.json"), `${JSON.stringify({
+    allowFrom: ["global-user-id"],
+    groups: {
+      "root-channel-id": { requireMention: false, allowFrom: ["channel-only-user-id"] },
+    },
+  })}\n`);
   const panePid = spawnOwnedProcess(workspace, "zsh root pane");
   const childPid = spawnOwnedProcess(workspace, "claude root child", { ppid: panePid });
+  const orphanBridgePid = spawnOwnedProcess(
+    workspace,
+    "node scripts/codex-bridge.js BOT_APP_ID='root-app' WS_PORT='18399'",
+  );
+  const orphanAppServerPid = spawnOwnedProcess(
+    workspace,
+    "codex app-server --listen ws://127.0.0.1:18399",
+  );
   seedTmuxSession(
     "root_agent",
     { panePid, killFailuresRemaining: 1, paneOutput: "old root\n" },
@@ -307,11 +321,14 @@ test("restart-root-codex-agent starts the root bot through the Codex bridge", as
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.match(result.stdout, /Restarted root Codex agent in tmux session 'root_agent'/);
+  assert.match(result.stdout, /Cleaning remaining root Codex listener process\(es\):/);
   assert.equal(isAlive(childPid), false);
+  assert.equal(isAlive(orphanBridgePid), false);
+  assert.equal(isAlive(orphanAppServerPid), false);
   const session = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
   assert.equal(session.cwd, workspace.repoDir);
   assert.deepEqual(session.env, {
-    ALLOWED_USER_IDS: "allowed-user-id",
+    ALLOWED_USER_IDS: "allowed-user-id,global-user-id",
     BOT_APP_ID: "root-app",
     BOT_DISPLAY_NAME: "root-codex",
     BOT_TOKEN: "cm9vdC1hcHA.fixture.token",
@@ -327,6 +344,39 @@ test("restart-root-codex-agent starts the root bot through the Codex bridge", as
   });
   assert.equal(session.bridgeCommand, "node scripts/codex-bridge.js");
   assert.equal(session.killAttempts, 2);
+});
+
+test("restart-root-codex-agent rejects an unconfigured channel before stopping the current root", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, buildRegistry(workspace));
+  const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
+  fs.mkdirSync(rootStateDir, { recursive: true });
+  fs.writeFileSync(path.join(rootStateDir, "access.json"), `${JSON.stringify({
+    groups: { "configured-channel": { requireMention: false } },
+  })}\n`);
+  const panePid = spawnOwnedProcess(workspace, "zsh root pane");
+  const childPid = spawnOwnedProcess(workspace, "claude root child", { ppid: panePid });
+  seedTmuxSession("root_agent", { panePid, paneOutput: "old root\n" }, { stateDir: workspace.stateDir });
+
+  const result = await runScript(workspace, "restart-root-codex-agent.sh", {
+    args: ["missing-channel"],
+  });
+
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /Root channel missing-channel is not configured as a no-mention channel/);
+  assert.ok(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent);
+  assert.equal(isAlive(childPid), true);
+
+  fs.writeFileSync(path.join(rootStateDir, "access.json"), `${JSON.stringify({
+    groups: { "missing-channel": { requireMention: true } },
+  })}\n`);
+  const mentionedResult = await runScript(workspace, "restart-root-codex-agent.sh", {
+    args: ["missing-channel"],
+  });
+  assert.notEqual(mentionedResult.exitCode, 0);
+  assert.match(mentionedResult.stderr, /requireMention set to false/);
+  assert.ok(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent);
+  assert.equal(isAlive(childPid), true);
 });
 
 test("restart-root-agent launch failures include command diagnostics", async () => {

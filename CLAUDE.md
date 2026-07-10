@@ -451,6 +451,7 @@ You can restart yourself by running the restart script in the background with `n
    ```sh
    nohup ./restart-root-codex-agent.sh [channel_id] &
    ```
+   The selected channel must already exist in the root `access.json` `groups` map; validation happens before the current root session is stopped.
 4. The script kills your current process, waits briefly, and starts a fresh instance in the `root_agent` tmux session.
 
 ### Codex Root Agent

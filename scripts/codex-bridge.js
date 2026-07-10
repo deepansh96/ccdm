@@ -68,6 +68,7 @@ let deltaBuffer = "";
 let fallbackText = "";
 let turnActive = false;
 let activeTurnId = null;
+let activeTurnIdConfirmed = false;
 let mcpReplyCalled = false;
 let suppressTurnOutput = false;
 let pendingBootstrapInstructionReason = null;
@@ -165,17 +166,38 @@ function isCurrentThreadNotification(msg) {
 function isCurrentTurnNotification(msg) {
   if (!isCurrentThreadNotification(msg)) return false;
   const notifiedTurnId = notificationTurnId(msg);
-  if (!notifiedTurnId || !activeTurnId || notifiedTurnId === activeTurnId) {
+  if (!notifiedTurnId) {
     return true;
   }
-  if (turnActive) {
+  if (!activeTurnId) {
+    activeTurnId = notifiedTurnId;
+    activeTurnIdConfirmed = true;
+    return true;
+  }
+  if (notifiedTurnId === activeTurnId) {
+    activeTurnIdConfirmed = true;
+    return true;
+  }
+  if (turnActive && !activeTurnIdConfirmed) {
     console.log(
       `[turn] accepting active turn id ${notifiedTurnId} for ${msg.method}; previous expected id was ${activeTurnId}`
     );
     activeTurnId = notifiedTurnId;
+    activeTurnIdConfirmed = true;
     return true;
   }
+  console.log(`[turn] ignoring stale turn id ${notifiedTurnId} for ${msg.method}; active id is ${activeTurnId}`);
   return false;
+}
+
+function resetActiveTurnId() {
+  activeTurnId = null;
+  activeTurnIdConfirmed = false;
+}
+
+function recordExpectedTurnId(result) {
+  if (activeTurnIdConfirmed) return;
+  activeTurnId = result?.turn?.id || result?.turnId || activeTurnId;
 }
 
 function escapeRegExp(value) {
@@ -202,15 +224,18 @@ function stripThisBotMention(text) {
   return text.replace(new RegExp(`<@!?${escapeRegExp(BOT_APP_ID)}>`, "g"), "").trim();
 }
 
-async function loadRootAccess() {
+async function loadRootAccess(log = true) {
   if (!ROOT_MULTI_CHANNEL) return;
   const access = JSON.parse(await readFile(ROOT_ACCESS_FILE, "utf8"));
-  rootAccess = access;
-  rootChannelAccess = new Map(Object.entries(access.groups || {}));
-  if (!rootChannelAccess.has(CHANNEL_ID)) {
-    console.log(`Warning: primary root channel ${CHANNEL_ID} is not in ${ROOT_ACCESS_FILE}`);
+  const channelAccess = new Map(Object.entries(access.groups || {}));
+  if (channelAccess.get(CHANNEL_ID)?.requireMention !== false) {
+    throw new Error(`Primary root channel ${CHANNEL_ID} is not configured as a no-mention channel in ${ROOT_ACCESS_FILE}`);
   }
-  console.log(`Root multi-channel routing enabled for ${rootChannelAccess.size} channel(s)`);
+  rootAccess = access;
+  rootChannelAccess = channelAccess;
+  if (log) {
+    console.log(`Root multi-channel routing enabled for ${rootChannelAccess.size} channel(s)`);
+  }
 }
 
 function allowedRootUsersFor(channelConfig) {
@@ -222,13 +247,20 @@ function allowedRootUsersFor(channelConfig) {
   return new Set(ids);
 }
 
-function shouldHandleDiscordMessage(msg) {
+async function shouldHandleDiscordMessage(msg) {
   if (msg.author.bot) return false;
   if (!ROOT_MULTI_CHANNEL) {
     if (msg.channel.id !== CHANNEL_ID) return false;
     if (ALLOWED_USER_IDS.size > 0 && !ALLOWED_USER_IDS.has(msg.author.id)) return false;
     if (mentionsRootBot(msg)) return false;
     return true;
+  }
+
+  try {
+    await loadRootAccess(false);
+  } catch (err) {
+    console.error(`Root access reload failed: ${err.message || err}`);
+    return false;
   }
 
   const channelConfig = rootChannelAccess.get(msg.channel.id);
@@ -510,7 +542,7 @@ function handleNotification(msg) {
         const bootstrapReason = pendingBootstrapInstructionReason;
         pendingBootstrapInstructionReason = null;
         turnActive = false;
-        activeTurnId = null;
+        resetActiveTurnId();
         fallbackText = "";
         mcpReplyCalled = false;
         suppressTurnOutput = false;
@@ -542,10 +574,7 @@ function handleNotification(msg) {
       break;
 
     case "turn/started":
-      if (!isCurrentThreadNotification(msg)) break;
-      if (msg.params?.turn?.id) {
-        activeTurnId = msg.params.turn.id;
-      }
+      isCurrentTurnNotification(msg);
       break;
 
     case "item/started":
@@ -650,7 +679,7 @@ async function onTurnCompleted() {
     fallbackText = "";
   }
   turnActive = false;
-  activeTurnId = null;
+  resetActiveTurnId();
   mcpReplyCalled = false;
   suppressTurnOutput = false;
   activeOutputChannelId = null;
@@ -682,7 +711,7 @@ async function sendTurn(input, channelId = CHANNEL_ID) {
   deltaBuffer = "";
   fallbackText = "";
   mcpReplyCalled = false;
-  activeTurnId = null;
+  resetActiveTurnId();
   await startTyping(channelId);
   try {
     const result = await sendRequest("turn/start", {
@@ -690,16 +719,12 @@ async function sendTurn(input, channelId = CHANNEL_ID) {
       input,
       approvalPolicy: "never",
     });
-    if (result?.turn?.id) {
-      activeTurnId = result.turn.id;
-    } else if (result?.turnId) {
-      activeTurnId = result.turnId;
-    }
+    recordExpectedTurnId(result);
   } catch (err) {
     console.error("turn/start failed:", err);
     stopTyping();
     turnActive = false;
-    activeTurnId = null;
+    resetActiveTurnId();
     fallbackText = "";
     await sendToDiscord("**Error:** Failed to send message to Codex");
     activeOutputChannelId = null;
@@ -718,18 +743,14 @@ async function sendBootstrapInstructionTurn(reason) {
   fallbackText = "";
   mcpReplyCalled = false;
   suppressTurnOutput = true;
-  activeTurnId = null;
+  resetActiveTurnId();
   try {
     const result = await sendRequest("turn/start", {
       threadId,
       input: [{ type: "text", text: SYSTEM_INSTRUCTION }],
       approvalPolicy: "never",
     });
-    if (result?.turn?.id) {
-      activeTurnId = result.turn.id;
-    } else if (result?.turnId) {
-      activeTurnId = result.turnId;
-    }
+    recordExpectedTurnId(result);
     for (let i = 0; i < 150 && turnActive; i++) {
       await new Promise((r) => setTimeout(r, 100));
     }
@@ -737,7 +758,7 @@ async function sendBootstrapInstructionTurn(reason) {
     fallbackText = "";
     if (turnActive) {
       turnActive = false;
-      activeTurnId = null;
+      resetActiveTurnId();
       fallbackText = "";
       mcpReplyCalled = false;
       suppressTurnOutput = false;
@@ -747,7 +768,7 @@ async function sendBootstrapInstructionTurn(reason) {
   } catch (err) {
     console.error(`Bootstrap instruction failed${reason ? ` (${reason})` : ""}:`, err);
     turnActive = false;
-    activeTurnId = null;
+    resetActiveTurnId();
     fallbackText = "";
     mcpReplyCalled = false;
     suppressTurnOutput = false;
@@ -981,7 +1002,10 @@ async function registerDiscordMcp() {
         BOT_TOKEN,
         CHANNEL_ID,
         DISCORD_REPLY_TOKEN,
-        ...(ROOT_MULTI_CHANNEL ? { DISCORD_CHANNEL_OVERRIDE: "1" } : {}),
+        ...(ROOT_MULTI_CHANNEL ? {
+          DISCORD_CHANNEL_OVERRIDE: "1",
+          DISCORD_ACCESS_FILE: ROOT_ACCESS_FILE,
+        } : {}),
       },
     },
   });
@@ -1060,7 +1084,7 @@ function startDiscordBot() {
   });
 
   client.on("messageCreate", async (msg) => {
-    if (!shouldHandleDiscordMessage(msg)) return;
+    if (!(await shouldHandleDiscordMessage(msg))) return;
 
     const channelId = msg.channel.id;
     const text = stripThisBotMention(msg.content.trim());
@@ -1102,7 +1126,7 @@ function startDiscordBot() {
         }
         threadId = null;
         turnActive = false;
-        activeTurnId = null;
+        resetActiveTurnId();
         mcpReplyCalled = false;
         suppressTurnOutput = false;
         pendingBootstrapInstructionReason = null;
@@ -1122,7 +1146,7 @@ function startDiscordBot() {
       } catch (err) {
         threadResetting = false;
         turnActive = false;
-        activeTurnId = null;
+        resetActiveTurnId();
         fallbackText = "";
         await sendToDiscord(`**Error:** Failed to clear — ${err.message || err}`, channelId);
         activeOutputChannelId = null;

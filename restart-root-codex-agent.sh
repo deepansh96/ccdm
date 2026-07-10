@@ -14,6 +14,98 @@ WS_PORT="${ROOT_CODEX_WS_PORT:-18399}"
 CODEX_HOME_DIR="${ROOT_CODEX_HOME:-${CODEX_HOME:-$HOME/.codex}}"
 BOT_DISPLAY_NAME="${ROOT_CODEX_BOT_DISPLAY_NAME:-root-codex}"
 
+collect_tree() {
+  local pid="$1"
+  [[ "$pid" == <-> ]] || return 0
+  kill -0 "$pid" 2>/dev/null || return 0
+  echo "$pid"
+  local child
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    collect_tree "$child"
+  done
+}
+
+terminate_pids() {
+  local all=()
+  local pid tree
+  for pid in "$@"; do
+    [[ "$pid" == <-> ]] || continue
+    tree="$(collect_tree "$pid")"
+    [[ -n "$tree" ]] || continue
+    all+=("${(@f)tree}")
+  done
+  all=("${(@u)all}")
+  (( ${#all} == 0 )) && return 0
+
+  kill -TERM $all 2>/dev/null || true
+  sleep 2
+  for pid in $all; do
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  done
+}
+
+find_root_codex_listener_pids() {
+  python3 - "$WS_PORT" "$BOT_APP_ID" <<'PY'
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+ws_port, bot_app_id = sys.argv[1:3]
+try:
+    ps = subprocess.check_output(
+        ["ps", "axeww", "-o", "pid=,command="],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+except Exception:
+    sys.exit(0)
+
+def command_argv(command: str) -> list[str]:
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return []
+
+def has_env(command: str, name: str, value: str) -> bool:
+    env_re = re.compile(rf'''(?:^|\s){re.escape(name)}=(?:"([^"]*)"|'([^']*)'|([^\s]+))''')
+    for match in env_re.finditer(command):
+        found = next(group for group in match.groups() if group is not None)
+        if found == value:
+            return True
+    return False
+
+def is_root_bridge(command: str) -> bool:
+    argv = command_argv(command)
+    return (
+        len(argv) >= 2
+        and os.path.basename(argv[0]) == "node"
+        and os.path.normpath(argv[1]).endswith("scripts/codex-bridge.js")
+        and (has_env(command, "BOT_APP_ID", bot_app_id) or has_env(command, "WS_PORT", ws_port))
+    )
+
+def is_app_server(command: str) -> bool:
+    argv = command_argv(command)
+    return (
+        bool(argv)
+        and os.path.basename(argv[0]) in {"node", "codex"}
+        and "app-server" in argv
+        and f"ws://127.0.0.1:{ws_port}" in argv
+    )
+
+for line in ps.splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    pid_text, _, command = line.partition(" ")
+    if not pid_text.isdigit() or "ps axeww" in command or "python3 -" in command:
+        continue
+    if is_root_bridge(command) or is_app_server(command):
+        print(pid_text)
+PY
+}
+
 if [[ -z "$CHANNEL_ID" && -f "$ACCESS_FILE" ]]; then
   CHANNEL_ID="$(python3 - "$ACCESS_FILE" <<'PY'
 import json
@@ -34,6 +126,30 @@ fi
 if [[ -z "$CHANNEL_ID" ]]; then
   echo "Usage: $0 <channel_id> (or set ROOT_CODEX_CHANNEL_ID)" >&2
   echo "Refusing to guess because this root bot can be allowed in multiple channels." >&2
+  exit 1
+fi
+
+if [[ ! -f "$ACCESS_FILE" ]]; then
+  echo "Missing root access file: $ACCESS_FILE" >&2
+  exit 1
+fi
+
+if ! python3 - "$ACCESS_FILE" "$CHANNEL_ID" <<'PY'
+import json
+import sys
+
+access_file, channel_id = sys.argv[1:3]
+groups = json.load(open(access_file)).get("groups", {})
+channel = groups.get(channel_id)
+if not isinstance(channel, dict) or channel.get("requireMention") is not False:
+    print(
+        f"Root channel {channel_id} is not configured as a no-mention channel in {access_file}. "
+        "Add it to groups with requireMention set to false before restarting.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
+then
   exit 1
 fi
 
@@ -71,18 +187,14 @@ print("\t".join([
 PY
 )"
 
-ALLOWED_USER_IDS="${ROOT_CODEX_ALLOWED_USER_IDS:-$(python3 - "$REGISTRY_USER_ID" "$ACCESS_FILE" "$CHANNEL_ID" <<'PY'
+ALLOWED_USER_IDS="${ROOT_CODEX_ALLOWED_USER_IDS:-$(python3 - "$REGISTRY_USER_ID" "$ACCESS_FILE" <<'PY'
 import json
-import os
 import sys
 
 ids = [sys.argv[1]]
 access_path = sys.argv[2]
-channel_id = sys.argv[3]
-if os.path.exists(access_path):
-    access = json.load(open(access_path))
-    ids.extend(access.get("allowFrom") or [])
-    ids.extend((access.get("groups", {}).get(channel_id, {}) or {}).get("allowFrom") or [])
+access = json.load(open(access_path))
+ids.extend(access.get("allowFrom") or [])
 seen = set()
 deduped = []
 for user_id in ids:
@@ -132,6 +244,13 @@ if tmux has-session -t root_agent 2>/dev/null; then
     tmux kill-session -t root_agent 2>/dev/null || true
     sleep 1
   fi
+fi
+
+ORPHAN_PIDS="$(find_root_codex_listener_pids)"
+if [[ -n "$ORPHAN_PIDS" ]]; then
+  echo "Cleaning remaining root Codex listener process(es):"
+  echo "$ORPHAN_PIDS" | sed 's/^/  /'
+  terminate_pids "${(@f)ORPHAN_PIDS}"
 fi
 
 if ! tmux new-session -d -s root_agent -- zsh -ic "cd '$SCRIPT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' BOT_TOKEN='$BOT_TOKEN' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$SCRIPT_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$ALLOWED_USER_IDS' GUILD_ID='$GUILD_ID' ROOT_BOT_TOKEN='$BOT_TOKEN' ROOT_BOT_APP_ID='$BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' BOT_DISPLAY_NAME='$BOT_DISPLAY_NAME' ROOT_MULTI_CHANNEL='1' ROOT_ACCESS_FILE='$ACCESS_FILE' node scripts/codex-bridge.js"; then
