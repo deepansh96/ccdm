@@ -957,6 +957,7 @@ test("bridge sends the bootstrap instruction turn after idle compact completion"
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, {
     compactComplete: true,
+    compactTurnId: "compact-turn",
   });
   const bridge = startBridge(workspace, { port: codex.port });
 

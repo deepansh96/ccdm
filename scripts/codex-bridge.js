@@ -1186,10 +1186,22 @@ function startDiscordBot() {
       console.log("[discord] /compact requested");
       await msg.react("🔄");
       activeOutputChannelId = channelId;
+      const idleCompaction = !turnActive;
+      if (idleCompaction) {
+        turnActive = true;
+        suppressTurnOutput = true;
+        resetActiveTurnId();
+      }
       try {
         await sendRequest("thread/compact/start", { threadId });
         await sendToDiscord("Compaction started.", channelId);
       } catch (err) {
+        if (idleCompaction) {
+          turnActive = false;
+          suppressTurnOutput = false;
+          resetActiveTurnId();
+          processQueue();
+        }
         await sendToDiscord(`**Error:** Failed to compact — ${err.message || err}`, channelId);
       }
       return;
