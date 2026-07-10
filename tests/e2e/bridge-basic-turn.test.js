@@ -1181,6 +1181,10 @@ test("bridge records diagnostics when Discord send fails", async () => {
 test("bridge builds Codex input for empty messages and image, text, binary, and failed attachments", async () => {
   const workspace = createBridgeWorkspace();
   const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.attachments["https://cdn.discordapp.com/attachments/channel/message/diagram.png"] = {
+    body: "image bytes",
+    contentType: "image/png",
+  };
   seed.fixtures.discord.attachments["https://cdn.discordapp.com/attachments/channel/message/notes.txt"] = {
     body: "line one\nline two",
     contentType: "text/plain",
@@ -1255,7 +1259,7 @@ test("bridge builds Codex input for empty messages and image, text, binary, and 
     .filter((input) => !input[0]?.text?.startsWith("You are communicating with the user via Discord"));
   assert.equal(userTurns.length, 1);
   assert.equal(userTurns[0][0].type, "image");
-  assert.equal(userTurns[0][0].url, "https://cdn.discordapp.com/attachments/channel/message/diagram.png");
+  assert.equal(userTurns[0][0].url, "data:image/png;base64,aW1hZ2UgYnl0ZXM=");
   assert.match(userTurns[0][1].text, /--- File: notes\.txt ---\nline one\nline two/);
   assert.match(userTurns[0][2].text, /\.discord-attachments/);
   assert.match(userTurns[0][2].text, /archive\.bin/);
@@ -1263,6 +1267,7 @@ test("bridge builds Codex input for empty messages and image, text, binary, and 
     state.fixtures.discord.attachmentFetches.map((entry) => entry.url).sort(),
     [
       "https://cdn.discordapp.com/attachments/channel/message/archive.bin",
+      "https://cdn.discordapp.com/attachments/channel/message/diagram.png",
       "https://cdn.discordapp.com/attachments/channel/message/missing.txt",
       "https://cdn.discordapp.com/attachments/channel/message/notes.txt",
     ],

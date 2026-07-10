@@ -896,6 +896,14 @@ async function fetchAttachmentText(url) {
   return await res.text();
 }
 
+async function fetchAttachmentDataUrl(url, contentType) {
+  const res = await fetch(url);
+  if (!res.ok) return null;
+  const type = contentType || res.headers.get("content-type") || "application/octet-stream";
+  const data = Buffer.from(await res.arrayBuffer()).toString("base64");
+  return `data:${type};base64,${data}`;
+}
+
 async function downloadAttachment(url, filename) {
   const dir = path.join(PROJECT_DIR, ".discord-attachments");
   await mkdir(dir, { recursive: true });
@@ -1012,7 +1020,8 @@ async function buildInput(msg, textOverride = null) {
   }
   for (const att of msg.attachments.values()) {
     if (att.contentType && att.contentType.startsWith("image/")) {
-      input.push({ type: "image", url: att.url });
+      const dataUrl = await fetchAttachmentDataUrl(att.url, att.contentType);
+      if (dataUrl) input.push({ type: "image", url: dataUrl });
     } else if (AUDIO_TRANSCRIPTION_ENABLED && isAudioFile(att)) {
       try {
         const transcript = await transcribeAudioAttachment(att);
