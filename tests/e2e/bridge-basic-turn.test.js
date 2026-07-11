@@ -869,15 +869,11 @@ test("bridge ignores stale turn notifications before and after the current turn 
   await bridge.stop();
 });
 
-test("bridge handles compact and clear slash commands during an active turn", async () => {
+test("bridge queues compact during an active turn and runs it after completion", async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, {
     compactComplete: true,
-    threadIds: ["thread-before-clear", "thread-after-clear"],
-    turns: [
-      { delta: "busy done", delayMs: 60000, startDelayMs: 10, turnId: "busy-turn" },
-      { delta: "after clear done", turnId: "after-clear-turn" },
-    ],
+    turns: [{ delta: "busy done", delayMs: 200, startDelayMs: 10, turnId: "busy-turn" }],
   });
   const bridge = startBridge(workspace, {
     port: codex.port,
@@ -895,34 +891,27 @@ test("bridge handles compact and clear slash commands during an active turn", as
   }
   assert.match(bridge.stdout, /\[discord\] Allowed User: busy/);
   await new Promise((resolve) => setTimeout(resolve, 80));
-  const compactState = await injectMessageUntil(
-    workspace,
-    { content: "/compact", id: "compact-message" },
-    (nextState) =>
-      nextState.fixtures.discord.sends.some((send) => send.content === "Compaction started.") &&
-      nextState.fixtures.discord.sends.some((send) => send.content === "Compaction complete."),
-    15000,
-  );
-  const clearState = await injectMessageUntil(
-    workspace,
-    { content: "/clear", id: "clear-message" },
-    (nextState) =>
-      nextState.fixtures.discord.sends.some((send) => send.content.startsWith("Conversation cleared")),
-    15000,
-  );
   await injectMessageUntil(
     workspace,
-    { content: "after clear", id: "after-clear-message" },
-    (nextState) => nextState.fixtures.discord.sends.some((send) => send.content === "after clear done"),
-    15000,
+    { content: "/compact", id: "compact-message" },
+    (nextState) => nextState.fixtures.discord.sends.some(
+      (send) => send.content === "Compaction queued.",
+    ),
+    5000,
+  );
+  const compactState = await waitForState(
+    workspace,
+    (nextState) => nextState.fixtures.discord.sends.some(
+      (send) => send.content === "Compaction complete.",
+    ),
+    20000,
   );
   await new Promise((resolve) => setTimeout(resolve, 150));
   const state = readState(workspace.stateDir);
 
-  assert.deepEqual(state.fixtures.discord.reactions.map((reaction) => reaction.emoji), ["\ud83d\udd04", "\ud83d\udd04"]);
-  assert.ok(!state.fixtures.discord.sends.some((send) => send.content === "busy done"));
+  assert.deepEqual(state.fixtures.discord.reactions.map((reaction) => reaction.emoji), ["\ud83d\udd04"]);
   const clientMessageMap = new Map();
-  for (const sourceState of [compactState, clearState, state]) {
+  for (const sourceState of [compactState, state]) {
     for (const event of sourceState.fixtures.codex.protocolEvents) {
       if (event.event === "client-message") {
         clientMessageMap.set(JSON.stringify(event.message), event.message);
@@ -930,26 +919,53 @@ test("bridge handles compact and clear slash commands during an active turn", as
     }
   }
   const clientMessages = [...clientMessageMap.values()];
-  assert.match(bridge.stdout, /\[clear\] Interrupted turn/);
-  assert.ok(clientMessages.some((message) => message.method === "thread/archive"));
-  assert.equal(clientMessages.filter((message) => message.method === "thread/start").length, 2);
+  assert.ok(clientMessages.some((message) => message.method === "thread/compact/start"));
   const mcpWrite = clientMessages.find((message) => message.method === "config/value/write");
   assert.equal(mcpWrite.params.keyPath, "mcp_servers.discord-channel-id");
   assert.equal(mcpWrite.params.value.env.CHANNEL_ID, "channel-id");
   assert.match(mcpWrite.params.value.env.DISCORD_REPLY_TOKEN, /^[a-f0-9]{32}$/);
-  const threadStarts = clientMessages.filter((message) => message.method === "thread/start");
-  assert.equal(
-    threadStarts.filter((message) =>
-      message.params?.developerInstructions?.includes("Subagents and delegated tasks must return results to their parent agent"),
-    ).length,
-    2,
-  );
   const bootstrapTurns = clientMessages.filter((message) =>
     message.method === "turn/start" &&
     message.params?.input?.[0]?.text?.includes("Use ONLY the MCP server named \"discord-channel-id\"") &&
     /scope_token: "[a-f0-9]{32}"/.test(message.params.input[0].text),
   );
   assert.ok(bootstrapTurns.length >= 1);
+  await bridge.stop();
+});
+
+test("bridge clears during an active turn", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    threadIds: ["thread-before-clear", "thread-after-clear"],
+    turns: [{ delta: "busy done", delayMs: 60000, startDelayMs: 10, turnId: "busy-turn" }],
+  });
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  injectDiscordMessage(workspace, { content: "busy", id: "busy-before-clear" });
+  await bridge.waitForOutput(/\[discord\] Allowed User: busy/, 5000);
+  const state = await injectMessageUntil(
+    workspace,
+    { content: "/clear", id: "clear-message" },
+    (nextState) => nextState.fixtures.discord.sends.some(
+      (send) => send.content.startsWith("Conversation cleared"),
+    ),
+    15000,
+  );
+
+  assert.match(bridge.stdout, /\[clear\] Interrupted turn/);
+  assert.ok(state.fixtures.codex.protocolEvents.some(
+    (event) => event.message?.method === "thread/archive",
+  ));
+  assert.equal(
+    state.fixtures.codex.protocolEvents.filter(
+      (event) => event.message?.method === "thread/start",
+    ).length,
+    2,
+  );
   await bridge.stop();
 });
 

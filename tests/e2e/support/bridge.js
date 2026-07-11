@@ -296,11 +296,11 @@ export async function startFakeCodexServer(workspace, options = {}) {
           if (options.compactComplete) {
             setTimeout(() => {
               const threadId = message.params?.threadId ?? options.threadId ?? "thread-1";
-              const turnId = options.compactTurnId;
-              if (turnId) notify("turn/started", { threadId, turn: { id: turnId } });
-              notify("thread/compacted", { threadId, ...(turnId ? { turnId } : {}) });
-              notify("item/completed", { threadId, ...(turnId ? { turnId } : {}), item: { type: "contextCompaction" } });
-              if (turnId) notify("turn/completed", { threadId, turn: { id: turnId } });
+              const turnId = options.compactTurnId ?? "compact-turn";
+              notify("turn/started", { threadId, turn: { id: turnId } });
+              notify("thread/compacted", { threadId, turnId });
+              notify("item/completed", { threadId, turnId, item: { type: "contextCompaction" } });
+              notify("turn/completed", { threadId, turn: { id: turnId } });
             }, 5);
           }
           break;

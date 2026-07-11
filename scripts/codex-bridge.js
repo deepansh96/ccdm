@@ -79,6 +79,7 @@ let activeTurnIdConfirmed = false;
 let mcpReplyCalled = false;
 let suppressTurnOutput = false;
 let pendingBootstrapInstructionReason = null;
+let pendingCompactionChannelId = null;
 let messageQueue = [];
 let discordClient = null;
 let discordChannel = null;
@@ -762,6 +763,10 @@ async function onTurnCompleted() {
   pendingBootstrapInstructionReason = null;
   if (bootstrapReason) {
     sendBootstrapInstructionTurn(bootstrapReason);
+  } else if (pendingCompactionChannelId) {
+    const channelId = pendingCompactionChannelId;
+    pendingCompactionChannelId = null;
+    startCompaction(channelId);
   } else {
     processQueue();
   }
@@ -861,6 +866,24 @@ async function onContextCompactionCompleted() {
   }
   await sendToDiscord("Compaction complete.");
   activeOutputChannelId = null;
+}
+
+async function startCompaction(channelId) {
+  turnActive = true;
+  suppressTurnOutput = true;
+  activeOutputChannelId = channelId;
+  resetActiveTurnId();
+  try {
+    await sendRequest("thread/compact/start", { threadId });
+    await sendToDiscord("Compaction started.", channelId);
+  } catch (err) {
+    turnActive = false;
+    suppressTurnOutput = false;
+    resetActiveTurnId();
+    await sendToDiscord(`**Error:** Failed to compact — ${err.message || err}`, channelId);
+    activeOutputChannelId = null;
+    processQueue();
+  }
 }
 
 const TEXT_EXTENSIONS = new Set([
@@ -1185,24 +1208,11 @@ function startDiscordBot() {
     if (bridgeSlashCommand && text === "/compact") {
       console.log("[discord] /compact requested");
       await msg.react("🔄");
-      activeOutputChannelId = channelId;
-      const idleCompaction = !turnActive;
-      if (idleCompaction) {
-        turnActive = true;
-        suppressTurnOutput = true;
-        resetActiveTurnId();
-      }
-      try {
-        await sendRequest("thread/compact/start", { threadId });
-        await sendToDiscord("Compaction started.", channelId);
-      } catch (err) {
-        if (idleCompaction) {
-          turnActive = false;
-          suppressTurnOutput = false;
-          resetActiveTurnId();
-          processQueue();
-        }
-        await sendToDiscord(`**Error:** Failed to compact — ${err.message || err}`, channelId);
+      if (turnActive) {
+        pendingCompactionChannelId = channelId;
+        await sendToDiscord("Compaction queued.", channelId);
+      } else {
+        await startCompaction(channelId);
       }
       return;
     }
@@ -1216,6 +1226,7 @@ function startDiscordBot() {
       const previousTurnId = activeTurnId;
       try {
         messageQueue = [];
+        pendingCompactionChannelId = null;
         if (previousThreadId && (previousTurnId || turnActive)) {
           try {
             const interruptParams = { threadId: previousThreadId };
