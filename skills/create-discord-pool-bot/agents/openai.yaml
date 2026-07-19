@@ -1,0 +1,4 @@
+interface:
+  display_name: "Create Discord Pool Bot"
+  short_description: "Create and register Discord pool bots"
+  default_prompt: "Use $create-discord-pool-bot to create the next Discord bot and add it to the CCDM pool."

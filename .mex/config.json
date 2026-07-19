@@ -1,0 +1,7 @@
+{
+  "scaffold_id": "89e013b4-267e-42f4-852c-2bf2a8d652fb",
+  "scaffold_name": "discord-root-agent",
+  "aiTools": ["claude", "codex"],
+  "origin": null,
+  "upstream": null
+}

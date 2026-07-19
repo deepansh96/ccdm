@@ -207,7 +207,7 @@ print('\t'.join([
     '1' if p.get('text_reply_fallback') is True else '__NONE__',
     (p.get('codex_model') or p.get('model') or '__NONE__'),
     (p.get('codex_reasoning_effort') or p.get('model_reasoning_effort') or '__NONE__'),
-    (p.get('codex_service_tier') or p.get('service_tier') or '__NONE__'),
+    (p.get('codex_service_tier') or p.get('service_tier') or 'priority'),
 ]))
 ")"
 
