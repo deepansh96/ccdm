@@ -12,7 +12,7 @@ edges:
     condition: when specific technology details are needed
   - target: context/decisions.md
     condition: when understanding why the architecture is structured this way
-last_updated: 2026-07-19
+last_updated: 2026-07-24
 ---
 
 # Architecture
@@ -33,6 +33,7 @@ The root agent coordinates lifecycle and access. Each project agent works only i
 - **`registry.json`** - source of truth for bot pool, project assignments, channels, tmux names, account homes, and runtime PIDs; local and untracked because it contains secrets.
 - **Session scripts** - `start-session.sh`, `start-codex-session.sh`, and `stop-session.sh` enforce one listener per assignment and maintain registry runtime state.
 - **`scripts/codex-bridge.js`** - connects Discord to `codex app-server`, injects mid-turn messages, handles attachments/audio, and exposes channel-scoped MCP tools.
+- **Discord range export** - `export-discord-range.js` paginates an inclusive message range into a temporary transcript; Codex exposes it through the bridge MCP, while `start-session.sh` adds the same export-only MCP to local Claude sessions.
 - **`scripts/guest-access.js`** - creates and synchronizes project-scoped Discord roles, channel overrides, and bot allowlists.
 - **E2E harness** - Node's built-in test runner plus fixture binaries and local fakes; default tests never contact Discord or agent services.
 

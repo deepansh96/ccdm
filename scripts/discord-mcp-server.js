@@ -1,14 +1,21 @@
 #!/usr/bin/env node
 
 const { createInterface } = require("readline");
+const { execFile } = require("child_process");
 const { createHmac, timingSafeEqual } = require("crypto");
+const { promisify } = require("util");
 const path = require("path");
 const { writeFile, mkdir, stat, readFile } = require("fs/promises");
 const { createReadStream } = require("fs");
 
+const execFileAsync = promisify(execFile);
+const EXPORT_SCRIPT = path.resolve(__dirname, "export-discord-range.js");
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const DISCORD_REPLY_TOKEN = process.env.DISCORD_REPLY_TOKEN;
+const EXPORT_ONLY = ["1", "true", "yes", "on"].includes(
+  (process.env.DISCORD_MCP_EXPORT_ONLY || "").toLowerCase()
+);
 const DISCORD_CHANNEL_OVERRIDE = ["1", "true", "yes", "on"].includes(
   (process.env.DISCORD_CHANNEL_OVERRIDE || "").toLowerCase()
 );
@@ -22,8 +29,8 @@ const DISCORD_GLOBAL_USER_IDS = new Set(
     .filter(Boolean)
 );
 
-if (!BOT_TOKEN || !CHANNEL_ID) {
-  process.stderr.write("Missing BOT_TOKEN or CHANNEL_ID\n");
+if ((!BOT_TOKEN && !EXPORT_ONLY) || !CHANNEL_ID) {
+  process.stderr.write(`Missing ${EXPORT_ONLY ? "CHANNEL_ID" : "BOT_TOKEN or CHANNEL_ID"}\n`);
   process.exit(1);
 }
 
@@ -248,7 +255,7 @@ const replyProperties = {
   },
 };
 
-const TOOLS = [
+const ALL_TOOLS = [
   {
     name: "reply",
     description:
@@ -299,6 +306,25 @@ const TOOLS = [
     },
   },
   {
+    name: "export_message_range",
+    description:
+      "Export up to 10,000 Discord messages and their attachments to a temporary transcript. The range is inclusive; omit the end ID to continue through the latest message. Read the returned file, then delete its temporary directory.",
+    inputSchema: {
+      type: "object",
+      properties: withChannelOverride({
+        start_message_id: {
+          type: "string",
+          description: "First message ID to export (inclusive).",
+        },
+        end_message_id: {
+          type: "string",
+          description: "Last message ID to export (inclusive). Omit to export through the latest message.",
+        },
+      }),
+      required: requiredWithChannel(["start_message_id"]),
+    },
+  },
+  {
     name: "download_attachment",
     description:
       "Download an attachment from a Discord message to a local file. Returns the local file path.",
@@ -322,8 +348,15 @@ const TOOLS = [
     },
   },
 ];
+const TOOLS = EXPORT_ONLY
+  ? ALL_TOOLS.filter((tool) => tool.name === "export_message_range")
+  : ALL_TOOLS;
 
 async function handleToolCall(name, args) {
+  if (EXPORT_ONLY && name !== "export_message_range") {
+    throw new Error(`Tool unavailable in export-only mode: ${name}`);
+  }
+
   switch (name) {
     case "reply": {
       const { text, files, reply_to, scope_token } = args;
@@ -379,6 +412,24 @@ async function handleToolCall(name, args) {
         return `[${ts}] ${author}: ${m.content}${attachments} (id: ${m.id})`;
       });
       return formatted.join("\n");
+    }
+
+    case "export_message_range": {
+      const channelId = await targetChannelId(args);
+      const scriptArgs = [
+        EXPORT_SCRIPT,
+        channelId,
+        args.start_message_id,
+        ...(args.end_message_id ? [args.end_message_id] : []),
+      ];
+      try {
+        const { stdout } = await execFileAsync(process.execPath, scriptArgs, {
+          env: process.env,
+        });
+        return `exported to ${stdout.trim()}`;
+      } catch (error) {
+        throw new Error((error.stderr || error.message).trim());
+      }
     }
 
     case "download_attachment": {

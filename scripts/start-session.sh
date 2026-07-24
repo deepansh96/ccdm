@@ -210,13 +210,13 @@ PY
 # Read project config and resolve bot's state_dir from the pool
 # Uses tab delimiter to handle paths with spaces; empty optional fields are
 # printed as __NONE__ because adjacent tabs collapse under zsh IFS splitting.
-IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME MODEL CLAUDE_HOME <<< "$(python3 -c "
+IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME MODEL CLAUDE_HOME CHANNEL_ID <<< "$(python3 -c "
 import json, os
 r = json.load(open('$REGISTRY'))
 p = r['projects']['$PROJECT']
 bot = next(b for b in r['pool'] if b['id'] == p['bot_id'])
 claude_home = os.path.expanduser(p['claude_home']) if p.get('claude_home') else '__NONE__'
-print(os.path.expanduser(p['path']) + '\t' + os.path.expanduser(bot['state_dir']) + '\t' + p['screen_name'] + '\t' + (p.get('model') or '__NONE__') + '\t' + claude_home)
+print(os.path.expanduser(p['path']) + '\t' + os.path.expanduser(bot['state_dir']) + '\t' + p['screen_name'] + '\t' + (p.get('model') or '__NONE__') + '\t' + claude_home + '\t' + str(p['channel_id']))
 ")"
 
 [[ "$MODEL" == "__NONE__" ]] && MODEL=""
@@ -247,7 +247,33 @@ if [[ -n "$EXISTING_PIDS" ]]; then
   exit 1
 fi
 
-tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$PATH_DIR' && DISCORD_STATE_DIR='$STATE_DIR'$CONFIG_DIR_ENV claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions$MODEL_FLAG"
+MCP_CONFIG="$STATE_DIR/ccdm-message-export-mcp.json"
+python3 - "$MCP_CONFIG" "$SCRIPT_DIR/discord-mcp-server.js" "$CHANNEL_ID" "$STATE_DIR" <<'PY'
+import json
+import os
+import sys
+
+config_path, server_script, channel_id, state_dir = sys.argv[1:5]
+os.makedirs(os.path.dirname(config_path), exist_ok=True)
+with open(config_path, "w") as f:
+    json.dump({
+        "mcpServers": {
+            "discord-message-export": {
+                "command": "node",
+                "args": [server_script],
+                "env": {
+                    "CHANNEL_ID": channel_id,
+                    "DISCORD_STATE_DIR": state_dir,
+                    "DISCORD_MCP_EXPORT_ONLY": "1",
+                },
+            },
+        },
+    }, f, indent=2)
+    f.write("\n")
+os.chmod(config_path, 0o600)
+PY
+
+tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$PATH_DIR' && DISCORD_STATE_DIR='$STATE_DIR'$CONFIG_DIR_ENV claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions --mcp-config '$MCP_CONFIG'$MODEL_FLAG"
 echo "Started Discord bot in tmux session '$SCREEN_NAME'"
 echo "Attach with: tmux attach -t $SCREEN_NAME"
 record_claude_pid "$STATE_DIR" "$CLAUDE_HOME"

@@ -71,7 +71,7 @@ test("Discord MCP initializes, lists tools, accepts initialized notifications, a
   assert.equal(output[0].result.serverInfo.name, "discord-mcp");
   assert.deepEqual(
     output[1].result.tools.map((tool) => tool.name),
-    ["reply", "edit_message", "react", "fetch_messages", "download_attachment"],
+    ["reply", "edit_message", "react", "fetch_messages", "export_message_range", "download_attachment"],
   );
   const replyTool = output[1].result.tools.find((tool) => tool.name === "reply");
   assert.match(replyTool.inputSchema.properties.files.description, /Max 10 files, 25MB each/);
@@ -85,6 +85,50 @@ test("Discord MCP initializes, lists tools, accepts initialized notifications, a
     id: "fake-message-1",
     messageReference: { message_id: "parent-message" },
   });
+});
+
+test("Discord MCP exports a message range through the latest message", async () => {
+  const workspace = createBridgeWorkspace();
+  const state = readState(workspace.stateDir);
+  state.fixtures.discord.restMessages = [
+    { id: "103", timestamp: "2026-07-13T10:02:00.000Z", content: "latest", author: { id: "2", username: "Bob" }, attachments: [] },
+    { id: "102", timestamp: "2026-07-13T10:01:00.000Z", content: "start", author: { id: "1", username: "Alice" }, attachments: [] },
+    { id: "101", timestamp: "2026-07-13T10:00:00.000Z", content: "older", author: { id: "1", username: "Alice" }, attachments: [] },
+  ];
+  writeState(state, workspace.stateDir);
+
+  const result = await runMcp(
+    workspace,
+    [toolCall(1, "export_message_range", { start_message_id: "102" })],
+    { env: { CHANNEL_ID: "100" } },
+  );
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const output = responseById(result).get(1).result.content[0].text;
+  const exportPath = output.replace(/^exported to /, "");
+  const text = fs.readFileSync(exportPath, "utf8");
+  assert.match(text, /Message ID: 102/);
+  assert.match(text, /Message ID: 103/);
+  assert.doesNotMatch(text, /Message ID: 101/);
+  assert.equal(fs.statSync(exportPath).mode & 0o777, 0o600);
+});
+
+test("Discord MCP export-only mode hides and rejects all other tools", async () => {
+  const workspace = createBridgeWorkspace();
+  const result = await runNodeEntrypoint(workspace, "scripts/discord-mcp-server.js", {
+    env: bridgeChildEnv(workspace, {
+      BOT_TOKEN: "",
+      CHANNEL_ID: "channel-id",
+      DISCORD_MCP_EXPORT_ONLY: "1",
+    }),
+    input: `${rpc(1, "tools/list", {})}\n${toolCall(2, "reply", { text: "hidden" })}\n`,
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const output = responseById(result);
+  assert.deepEqual(output.get(1).result.tools.map((tool) => tool.name), ["export_message_range"]);
+  assert.equal(output.get(2).result.isError, true);
+  assert.match(output.get(2).result.content[0].text, /unavailable in export-only mode/);
 });
 
 test("Discord MCP writes require the bridge scope token when configured", async () => {

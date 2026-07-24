@@ -285,6 +285,7 @@ function routeDiscordApi(url, init = {}) {
   const listMessagesMatch = /^\/api\/v10\/channels\/([^/]+)\/messages$/.exec(url.pathname);
   if (url.hostname === "discord.com" && listMessagesMatch && method === "GET") {
     const limit = Number(url.searchParams.get("limit") || "20");
+    const before = url.searchParams.get("before");
     const state = readState();
     updateState((nextState) => {
       nextState.fixtures.discord.fetches ||= [];
@@ -292,6 +293,7 @@ function routeDiscordApi(url, init = {}) {
         authorization: headerValue(init.headers, "Authorization"),
         channelId: listMessagesMatch[1],
         limit,
+        ...(before ? { before } : {}),
       });
     });
     if (!Number.isInteger(limit) || limit < 1) {
@@ -300,7 +302,10 @@ function routeDiscordApi(url, init = {}) {
         status: 400,
       });
     }
-    return response(JSON.stringify((state.fixtures?.discord?.restMessages ?? []).slice(0, limit)), {
+    const messages = state.fixtures?.discord?.restMessages ?? [];
+    const beforeIndex = before ? messages.findIndex((message) => message.id === before) : -1;
+    const page = beforeIndex >= 0 ? messages.slice(beforeIndex + 1) : messages;
+    return response(JSON.stringify(page.slice(0, limit)), {
       headers: { "content-type": "application/json" },
     });
   }

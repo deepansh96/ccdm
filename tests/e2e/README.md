@@ -138,7 +138,7 @@ The Discord MCP JSON-RPC scenarios drive `scripts/discord-mcp-server.js` directl
 
 - The fake Discord REST store covers `POST/PATCH/GET /channels/:channel/messages`, `PUT /reactions/:emoji/@me`, single-message attachment lookup, scripted 400/401/403/404/429/5xx API failures, and CDN attachment downloads.
 - `tests/e2e/support/form-data-shim.cjs` is installed by the preload as the workspace-local `form-data` package so dynamic `import("form-data")` resolves without the real dependency. Its `FormData.prototype.submit()` implementation routes Discord uploads into fixture state and blocks non-Discord submit targets as `form-data` egress.
-- MCP tests cover `initialize`, `notifications/initialized`, `tools/list`, unknown methods, malformed JSON input, missing env, and each public tool: `reply`, `edit_message`, `react`, `fetch_messages`, and `download_attachment`.
+- MCP tests cover `initialize`, `notifications/initialized`, `tools/list`, unknown methods, malformed JSON input, missing env, export-only mode, and each public tool: `reply`, `edit_message`, `react`, `fetch_messages`, `export_message_range`, and `download_attachment`.
 - Reply coverage includes empty text, missing files, reply references, upload success/failure, and the current behavior that advertised 10-file and 25MB limits are not locally enforced before upload.
 - Fetch/download coverage includes limit capping and bad negative limits, attachment default index, out-of-range and negative indexes, missing attachments, absolute save directories, filesystem writes, CDN failures, and blocked network egress.
 

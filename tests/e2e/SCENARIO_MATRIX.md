@@ -25,6 +25,7 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Fixture contracts | process ownership | Covered | `ps axeww -o pid=,command=` and `pgrep -P` expose harness-owned rows and omit fabricated or foreign PID state. |
 | Fixture contracts | Claude listener | Covered | `--version`, Discord channel argument validation, listener invocation recording, and fixture session metadata. |
 | Claude start | Successful Claude launch | Covered | Drives `scripts/start-session.sh`, resolves bot state dir, constructs tmux launch, records PID/session, and emits expected stdout. |
+| Claude start | Message-range MCP | Covered | Writes a token-free, mode-0600 MCP config that exposes only the assigned channel's range exporter alongside the official Discord plugin. |
 | Claude start | Paths with spaces/quotes | Covered | Project paths with spaces and double quotes are captured through the tmux launch contract. |
 | Claude start | Account override via `claude_home` | Covered | Projects with `claude_home` launch with `CLAUDE_CONFIG_DIR` in the tmux command and record PID/session metadata from the alternate Claude home's `sessions/` directory. |
 | Claude start | Already-running tmux guard | Covered | Existing target tmux session exits successfully without launching another listener. |
@@ -59,6 +60,7 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Fixture contracts | Fake Codex active-turn protocol | Covered | Covers `thread/compact/start`, context-compaction completion, `thread/archive`, successful and failed `turn/steer`, and approval request responses. |
 | Fixture contracts | `ws` dependency resolution | Covered | Bridge fixture self-test proves `ws` resolves from harness `NODE_PATH` before launching the bridge. |
 | Codex bridge | Boot and MCP registration | Covered | Drives `scripts/codex-bridge.js` with fake Codex app-server, writes/reloads `discord-channel-id`, and removes stale `discord-*` MCP config. |
+| Discord history | Inclusive range export | Covered | Exports start-to-end or start-to-latest history oldest-first, includes message IDs and attachments, uses the bot state token for Claude, and exposes the tool through the Codex MCP. |
 | Codex bridge | Login success/failure | Covered | Successful boot records Discord login/ready; configured login rejection exits the bridge. |
 | Codex bridge | Channel cache/fetch paths | Covered | Covers cache-hit boot and cache-miss fetch with recorded channel fetch state. |
 | Codex bridge | Filtering | Covered | Bot-authored, wrong-channel, and wrong-user injected messages do not start user turns or send replies. |
