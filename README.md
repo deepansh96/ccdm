@@ -95,8 +95,8 @@ Codex projects can also pin runtime settings per session:
 ```
 
 These registry values are passed through to `codex app-server` as config
-overrides when `scripts/start-codex-session.sh` launches the bridge. Use
-`codex_service_tier` only for Codex service tiers such as `"priority"`;
+overrides when `scripts/start-codex-session.sh` launches the bridge. Fast mode
+is off unless `codex_service_tier` is set to a tier such as `"priority"`;
 Sol/Terra/Luna are model slugs.
 
 You also need:

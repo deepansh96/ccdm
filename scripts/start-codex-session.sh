@@ -207,7 +207,7 @@ print('\t'.join([
     '1' if p.get('text_reply_fallback') is True else '__NONE__',
     (p.get('codex_model') or p.get('model') or '__NONE__'),
     (p.get('codex_reasoning_effort') or p.get('model_reasoning_effort') or '__NONE__'),
-    (p.get('codex_service_tier') or p.get('service_tier') or 'priority'),
+    (p.get('codex_service_tier') or p.get('service_tier') or '__NONE__'),
 ]))
 ")"
 
@@ -262,7 +262,7 @@ PY
 [[ "$TEXT_REPLY_FALLBACK_FLAG" == "__NONE__" ]] && TEXT_REPLY_FALLBACK_FLAG=""
 [[ "$CODEX_MODEL_VALUE" == "__NONE__" ]] && CODEX_MODEL_VALUE=""
 [[ "$CODEX_REASONING_EFFORT_VALUE" == "__NONE__" ]] && CODEX_REASONING_EFFORT_VALUE=""
-[[ "$CODEX_SERVICE_TIER_VALUE" == "__NONE__" ]] && CODEX_SERVICE_TIER_VALUE=""
+[[ "$CODEX_SERVICE_TIER_VALUE" == "__NONE__" ]] && CODEX_SERVICE_TIER_VALUE="default"
 BOT_DISPLAY_NAME="${BOT_DISPLAY_OVERRIDE:-${BOT_ID}-${PROJECT}-codex}"
 AUDIO_TRANSCRIPTION_ENV=""
 TRANSCRIBE_AUDIO_FLAG="${CODEX_BRIDGE_TRANSCRIBE_AUDIO:-${USE_AUDIO_TRANSCRIPTION_IN_BRIDGE:-}}"
@@ -281,10 +281,7 @@ CODEX_REASONING_ENV=""
 if [[ -n "$CODEX_REASONING_EFFORT_VALUE" ]]; then
   CODEX_REASONING_ENV=" CODEX_REASONING_EFFORT='${CODEX_REASONING_EFFORT_VALUE}'"
 fi
-CODEX_SERVICE_TIER_ENV=""
-if [[ -n "$CODEX_SERVICE_TIER_VALUE" ]]; then
-  CODEX_SERVICE_TIER_ENV=" CODEX_SERVICE_TIER='${CODEX_SERVICE_TIER_VALUE}'"
-fi
+CODEX_SERVICE_TIER_ENV=" CODEX_SERVICE_TIER='${CODEX_SERVICE_TIER_VALUE}'"
 
 tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' BOT_TOKEN='$BOT_TOKEN' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$DISCORD_USER_IDS' GUILD_ID='$GUILD_ID' ROOT_BOT_TOKEN='$ROOT_TOKEN' ROOT_BOT_APP_ID='$ROOT_BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' BOT_DISPLAY_NAME='$BOT_DISPLAY_NAME'$AUDIO_TRANSCRIPTION_ENV$TEXT_REPLY_FALLBACK_ENV$CODEX_MODEL_ENV$CODEX_REASONING_ENV$CODEX_SERVICE_TIER_ENV node scripts/codex-bridge.js"
 echo "Started Codex bridge in tmux session '$SCREEN_NAME'"
