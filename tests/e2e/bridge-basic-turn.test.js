@@ -1098,7 +1098,7 @@ test("root bridge restarts through the root Codex restart script", async () => {
 test("bridge stops typing after a non-retryable Codex error", async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, {
-    turns: [{ error: "model unavailable", complete: false }],
+    turns: [{ error: "model unavailable" }],
   });
   const bridge = startBridge(workspace, { port: codex.port });
 
@@ -1124,6 +1124,114 @@ test("bridge stops typing after a non-retryable Codex error", async () => {
 
   assert.ok(typingCountAfterFailure >= 1);
   assert.equal(afterDelay.fixtures.discord.typing.length, typingCountAfterFailure);
+  await bridge.stop();
+});
+
+test("bridge retries a terminal response.failed once before reporting it", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    turns: [
+      { error: "stream disconnected before completion: response.failed event received" },
+      { delta: "Recovered response" },
+    ],
+  });
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await injectMessageUntil(
+    workspace,
+    { content: "recover this turn", id: "recover-this-turn" },
+    (nextState) => nextState.fixtures.discord.sends.some((send) => send.content === "Recovered response"),
+    5000,
+  );
+  const state = await waitForState(
+    workspace,
+    (nextState) => nextState.fixtures.codex.protocolEvents.some(
+      (event) =>
+        event.event === "client-message" &&
+        event.message.method === "turn/start" &&
+        event.message.params.input?.[0]?.text ===
+          "Retry the previous user request. The prior model response failed before any work began.",
+    ),
+    5000,
+  );
+
+  assert.equal(
+    state.fixtures.discord.sends.some((send) => send.content.startsWith("**Error:**")),
+    false,
+  );
+  assert.ok(
+    state.fixtures.codex.protocolEvents.some(
+      (event) =>
+        event.event === "client-message" &&
+        event.message.method === "turn/start" &&
+        event.message.params.input?.[0]?.text ===
+          "Retry the previous user request. The prior model response failed before any work began.",
+    ),
+  );
+  await bridge.stop();
+});
+
+test("bridge reports response.failed after its single recovery attempt", async () => {
+  const workspace = createBridgeWorkspace();
+  const error = "stream disconnected before completion: response.failed event received";
+  const codex = await startFakeCodexServer(workspace, {
+    turns: [
+      { error },
+      { error },
+      { delta: "unexpected third attempt" },
+    ],
+  });
+  const bridge = startBridge(workspace, { port: codex.port });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const state = await injectMessageUntil(
+    workspace,
+    { content: "fail twice", id: "fail-twice" },
+    (nextState) => nextState.fixtures.discord.sends.some(
+      (send) => send.content === `**Error:** ${error}`,
+    ),
+    5000,
+  );
+
+  await bridge.waitForOutput(/Retrying terminal response\.failed turn once/, 5000);
+  assert.equal(
+    bridge.stdout.match(/Retrying terminal response\.failed turn once/g)?.length,
+    1,
+  );
+  assert.equal(
+    state.fixtures.discord.sends.some((send) => send.content === "unexpected third attempt"),
+    false,
+  );
+  await bridge.stop();
+});
+
+test("bridge does not retry response.failed after agent work starts", async () => {
+  const workspace = createBridgeWorkspace();
+  const error = "stream disconnected before completion: response.failed event received";
+  const codex = await startFakeCodexServer(workspace, {
+    turns: [
+      { error, mcpReply: true },
+      { delta: "unexpected retry" },
+    ],
+  });
+  const bridge = startBridge(workspace, { port: codex.port });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await injectMessageUntil(
+    workspace,
+    { content: "start work then fail", id: "start-work-then-fail" },
+    (nextState) => nextState.fixtures.discord.sends.some(
+      (send) => send.content === `**Error:** ${error}`,
+    ),
+    5000,
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.doesNotMatch(bridge.stdout, /Retrying terminal response\.failed turn once/);
   await bridge.stop();
 });
 
