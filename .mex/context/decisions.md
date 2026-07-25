@@ -16,7 +16,7 @@ edges:
     condition: when changing lifecycle or process ownership
   - target: context/discord-security.md
     condition: when changing channel isolation or reply authority
-last_updated: 2026-07-19
+last_updated: 2026-07-24
 ---
 
 # Decisions
@@ -28,6 +28,14 @@ last_updated: 2026-07-19
      The history must be preserved — this is the event clock. -->
 
 ## Decision Log
+
+### Export long Discord history through a shared, read-only MCP tool
+**Date:** 2026-07-24
+**Status:** Active
+**Decision:** Reuse the repository's range exporter through the Codex Discord MCP and an export-only MCP config generated for local Claude sessions.
+**Reasoning:** Temporary transcripts keep large ranges out of MCP responses, and a separate helper avoids modifying Anthropic's update-managed Discord plugin.
+**Alternatives considered:** Expand `fetch_messages` responses or patch the official Claude plugin; rejected because large results consume model context and plugin updates overwrite local edits.
+**Consequences:** Local Claude sessions receive a token-free generated MCP config, Codex uses its existing scoped server, and remote Claude hosts require the helper to be deployed separately.
 
 ### Use root AGENTS.md as the canonical agent anchor
 **Date:** 2026-07-19

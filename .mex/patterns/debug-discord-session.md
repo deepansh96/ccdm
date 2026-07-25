@@ -10,7 +10,7 @@ edges:
     condition: when permissions, scope tokens, or routing may be wrong
   - target: context/session-management.md
     condition: when process or tmux state may be wrong
-last_updated: 2026-07-19
+last_updated: 2026-07-25
 ---
 
 # Debug A Discord Session
@@ -27,6 +27,7 @@ last_updated: 2026-07-19
 - Do not print tokens or scope tokens while debugging.
 - Root mentions and project messages intentionally follow different routing paths.
 - Claude commands are tmux relay; Codex commands are handled in the bridge.
+- `stream disconnected before completion: response.failed event received` is a terminal upstream Responses event after Codex has exhausted its internal retries, not a Discord disconnect. The bridge retries it once only when no agent work has started, which avoids repeating possible side effects.
 
 ## Verify
 - [ ] One user message produces at most one response from the assigned bot.

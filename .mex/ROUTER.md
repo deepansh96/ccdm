@@ -18,7 +18,7 @@ edges:
     condition: when changing bot permissions, guest access, channel routing, or credentials
   - target: patterns/INDEX.md
     condition: when starting a task — check the pattern index for a matching pattern file
-last_updated: 2026-07-19
+last_updated: 2026-07-25
 ---
 
 # Session Bootstrap
@@ -32,7 +32,9 @@ Then read this file fully before doing anything else in this session.
 - Root bot manages a registry-backed pool of isolated Discord project bots.
 - Claude sessions run through the official Discord plugin; Codex sessions run through `scripts/codex-bridge.js`.
 - Start, stop, registration, guest access, command relay, voice transcription, and local-fake E2E coverage are present.
+- Local Claude and Codex project bots can export an inclusive Discord message range to a temporary text file.
 - Per-project Claude and Codex account/model overrides are supported.
+- The Codex bridge retries a generic terminal `response.failed` once when the failed turn produced no agent work.
 
 **Not built:**
 - Remote VM lifecycle operations are documented but intentionally performed by the user on the remote host.

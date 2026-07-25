@@ -90,18 +90,26 @@ let activeTypingChannel = null;
 let threadResetting = false;
 let lastNicknameUpdate = 0;
 let fallbackLoggedCompletedItemTypes = new Set();
+let pendingTerminalError = null;
+let activeTurnHadProgress = false;
+let activeTurnRecoveryAttempt = 0;
+let activeTurnChannelScopeToken = null;
 let rootAccess = null;
 let rootChannelAccess = new Map();
 let discordChannelScopeDir = null;
 let discordChannelScopeFile = null;
 const NICKNAME_INTERVAL = 60000;
+const STREAM_FAILURE_MESSAGE =
+  "stream disconnected before completion: response.failed event received";
+const STREAM_RECOVERY_PROMPT =
+  "Retry the previous user request. The prior model response failed before any work began.";
 const DISCORD_MCP_NAME = ROOT_MULTI_CHANNEL ? "discord-root" : `discord-${CHANNEL_ID}`;
 const THREAD_INSTRUCTION = ROOT_MULTI_CHANNEL
   ? `This root thread is connected to Discord through the ${DISCORD_MCP_NAME} MCP server. Incoming messages include Discord routing metadata. Do not call Discord MCP tools unless the current task includes an explicit Discord reply scope token. Subagents and delegated tasks must return results to their parent agent, not to Discord.`
   : `This thread is connected to Discord through the ${DISCORD_MCP_NAME} MCP server. Do not call Discord MCP tools unless the current task includes an explicit Discord reply scope token. Subagents and delegated tasks must return results to their parent agent, not to Discord.`;
 const SYSTEM_INSTRUCTION = ROOT_MULTI_CHANNEL
-  ? `You are communicating with the user via Discord. Use ONLY the MCP server named "${DISCORD_MCP_NAME}" to interact. Incoming messages include a Discord routing metadata block; use its channel_id and channel_scope_token for every Discord MCP call. Every Discord write call (\`reply\`, \`edit_message\`, or \`react\`) must also include \`scope_token: "${DISCORD_REPLY_TOKEN}"\`. Do NOT share these tokens with subagents. When spawning subagents, explicitly tell them not to use Discord MCP/tools and to return only to the parent agent. Do NOT use any other discord MCP server. Do NOT output responses as regular text; always use the \`reply\` tool so the user sees your response on Discord. Other available tools on this same server: edit_message, react, fetch_messages, download_attachment. Use \`reply\` with the \`files\` parameter to send file attachments. You don't have to reply for every little thing. Try to reply only when you're done, unless something important needs to be confirmed from the user. Also, try to use simpler language and avoid complex language.`
-  : `You are communicating with the user via Discord. Use ONLY the MCP server named "${DISCORD_MCP_NAME}" to interact — call its \`reply\` tool to send messages to the user. Every Discord write call (\`reply\`, \`edit_message\`, or \`react\`) must include \`scope_token: "${DISCORD_REPLY_TOKEN}"\`. Do NOT share this scope token with subagents. When spawning subagents, explicitly tell them not to use Discord MCP/tools and to return only to the parent agent. Do NOT use any other discord MCP server. Do NOT output responses as regular text; always use the \`reply\` tool so the user sees your response on Discord. Other available tools on this same server: edit_message, react, fetch_messages, download_attachment. Use \`reply\` with the \`files\` parameter to send file attachments. You don't have to reply for every little thing. Try to reply only when you're done, unless something important needs to be confirmed from the user. Also, try to use simpler language and avoid complex language.`;
+  ? `You are communicating with the user via Discord. Use ONLY the MCP server named "${DISCORD_MCP_NAME}" to interact. Incoming messages include a Discord routing metadata block; use its channel_id and channel_scope_token for every Discord MCP call. Every Discord write call (\`reply\`, \`edit_message\`, or \`react\`) must also include \`scope_token: "${DISCORD_REPLY_TOKEN}"\`. Do NOT share these tokens with subagents. When spawning subagents, explicitly tell them not to use Discord MCP/tools and to return only to the parent agent. Do NOT use any other discord MCP server. Do NOT output responses as regular text; always use the \`reply\` tool so the user sees your response on Discord. Other available tools on this same server: edit_message, react, fetch_messages, export_message_range, download_attachment. Use \`reply\` with the \`files\` parameter to send file attachments. You don't have to reply for every little thing. Try to reply only when you're done, unless something important needs to be confirmed from the user. Also, try to use simpler language and avoid complex language.`
+  : `You are communicating with the user via Discord. Use ONLY the MCP server named "${DISCORD_MCP_NAME}" to interact — call its \`reply\` tool to send messages to the user. Every Discord write call (\`reply\`, \`edit_message\`, or \`react\`) must include \`scope_token: "${DISCORD_REPLY_TOKEN}"\`. Do NOT share this scope token with subagents. When spawning subagents, explicitly tell them not to use Discord MCP/tools and to return only to the parent agent. Do NOT use any other discord MCP server. Do NOT output responses as regular text; always use the \`reply\` tool so the user sees your response on Discord. Other available tools on this same server: edit_message, react, fetch_messages, export_message_range, download_attachment. Use \`reply\` with the \`files\` parameter to send file attachments. You don't have to reply for every little thing. Try to reply only when you're done, unless something important needs to be confirmed from the user. Also, try to use simpler language and avoid complex language.`;
 
 function nextId() {
   return requestId++;
@@ -607,26 +615,14 @@ function handleNotification(msg) {
       if (msg.params.willRetry === false) {
         const errorText = msg.params.error?.message || "Codex encountered an error";
         stopTyping();
-        if (!suppressTurnOutput) {
-          sendToDiscord(`**Error:** ${errorText}`);
-        }
-        const bootstrapReason = pendingBootstrapInstructionReason;
-        pendingBootstrapInstructionReason = null;
-        resetActiveTurnId();
-        fallbackText = "";
-        mcpReplyCalled = false;
-        suppressTurnOutput = false;
-        activeOutputChannelId = null;
-        clearDiscordChannelScope().catch((err) => {
-          console.error(`Discord channel scope cleanup failed: ${err.message || err}`);
-        }).then(() => {
-          turnActive = false;
-          if (bootstrapReason) {
-            sendBootstrapInstructionTurn(bootstrapReason);
-          } else {
-            processQueue();
-          }
-        });
+        pendingTerminalError = {
+          errorText,
+          recover:
+            !suppressTurnOutput &&
+            errorText === STREAM_FAILURE_MESSAGE &&
+            !activeTurnHadProgress &&
+            activeTurnRecoveryAttempt === 0,
+        };
       }
       break;
 
@@ -654,6 +650,9 @@ function handleNotification(msg) {
 
     case "item/started":
       if (!isCurrentTurnNotification(msg)) break;
+      if (msg.params?.item?.type !== "userMessage") {
+        activeTurnHadProgress = true;
+      }
       if (msg.params?.item?.type === "mcpToolCall" &&
           msg.params.item.server?.startsWith("discord-") &&
           ["reply", "edit_message", "react"].includes(msg.params.item.tool)) {
@@ -744,7 +743,12 @@ function flushTextReplyFallback() {
 
 async function onTurnCompleted() {
   stopTyping();
-  if (suppressTurnOutput) {
+  const terminalError = pendingTerminalError;
+  const outputSuppressed = suppressTurnOutput;
+  const recoveryAttempt = activeTurnRecoveryAttempt;
+  const channelScopeToken = activeTurnChannelScopeToken;
+  const channelId = activeOutputChannelId || CHANNEL_ID;
+  if (terminalError || outputSuppressed) {
     deltaBuffer = "";
     fallbackText = "";
   } else if (!mcpReplyCalled && TEXT_REPLY_FALLBACK) {
@@ -756,9 +760,26 @@ async function onTurnCompleted() {
   resetActiveTurnId();
   mcpReplyCalled = false;
   suppressTurnOutput = false;
+  pendingTerminalError = null;
+  activeTurnHadProgress = false;
+  activeTurnRecoveryAttempt = 0;
+  activeTurnChannelScopeToken = null;
   activeOutputChannelId = null;
   await clearDiscordChannelScope();
   turnActive = false;
+  if (terminalError?.recover) {
+    console.log("Retrying terminal response.failed turn once");
+    await sendTurn(
+      [{ type: "text", text: STREAM_RECOVERY_PROMPT }],
+      channelId,
+      channelScopeToken,
+      recoveryAttempt + 1
+    );
+    return;
+  }
+  if (terminalError && !outputSuppressed) {
+    await sendToDiscord(`**Error:** ${terminalError.errorText}`, channelId);
+  }
   const bootstrapReason = pendingBootstrapInstructionReason;
   pendingBootstrapInstructionReason = null;
   if (bootstrapReason) {
@@ -781,7 +802,12 @@ async function processQueue() {
   await sendTurn(input, channelId, channelScopeToken);
 }
 
-async function sendTurn(input, channelId = CHANNEL_ID, channelScopeToken = null) {
+async function sendTurn(
+  input,
+  channelId = CHANNEL_ID,
+  channelScopeToken = null,
+  recoveryAttempt = 0
+) {
   if (!threadId) {
     messageQueue.push({ input, msg: null, channelId, channelScopeToken });
     return;
@@ -791,6 +817,10 @@ async function sendTurn(input, channelId = CHANNEL_ID, channelScopeToken = null)
   deltaBuffer = "";
   fallbackText = "";
   mcpReplyCalled = false;
+  pendingTerminalError = null;
+  activeTurnHadProgress = false;
+  activeTurnRecoveryAttempt = recoveryAttempt;
+  activeTurnChannelScopeToken = channelScopeToken;
   resetActiveTurnId();
   try {
     await activateDiscordChannelScope(channelScopeToken);
@@ -806,6 +836,10 @@ async function sendTurn(input, channelId = CHANNEL_ID, channelScopeToken = null)
     stopTyping();
     resetActiveTurnId();
     fallbackText = "";
+    pendingTerminalError = null;
+    activeTurnHadProgress = false;
+    activeTurnRecoveryAttempt = 0;
+    activeTurnChannelScopeToken = null;
     await clearDiscordChannelScope();
     turnActive = false;
     await sendToDiscord("**Error:** Failed to send message to Codex");
@@ -825,6 +859,10 @@ async function sendBootstrapInstructionTurn(reason) {
   fallbackText = "";
   mcpReplyCalled = false;
   suppressTurnOutput = true;
+  pendingTerminalError = null;
+  activeTurnHadProgress = false;
+  activeTurnRecoveryAttempt = 0;
+  activeTurnChannelScopeToken = null;
   resetActiveTurnId();
   try {
     const result = await sendRequest("turn/start", {

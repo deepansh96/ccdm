@@ -151,6 +151,24 @@ test("start-session starts a Claude project through tmux and records PID/session
   assert.equal(state.fixtures.tmux.sessions.alpha_session.cwd, projectPath);
   assert.equal(state.fixtures.tmux.sessions.alpha_session.env.DISCORD_STATE_DIR, stateDir);
   assert.equal(state.fixtures.tmux.sessions.alpha_session.sendKeys, undefined);
+  const mcpConfigPath = path.join(stateDir, "ccdm-message-export-mcp.json");
+  const mcpConfig = JSON.parse(fs.readFileSync(mcpConfigPath, "utf8"));
+  assert.deepEqual(mcpConfig, {
+    mcpServers: {
+      "discord-message-export": {
+        command: "node",
+        args: [path.join(workspace.repoDir, "scripts", "discord-mcp-server.js")],
+        env: {
+          CHANNEL_ID: "channel-1",
+          DISCORD_STATE_DIR: stateDir,
+          DISCORD_MCP_EXPORT_ONLY: "1",
+        },
+      },
+    },
+  });
+  assert.equal(fs.statSync(mcpConfigPath).mode & 0o777, 0o600);
+  assert.doesNotMatch(fs.readFileSync(mcpConfigPath, "utf8"), /fixture-token/);
+  assert.match(state.fixtures.tmux.sessions.alpha_session.shellCommand, /--mcp-config/);
   assert.equal(fs.existsSync(path.join(workspace.homeDir, ".claude", ".claude.json")), false);
 });
 
