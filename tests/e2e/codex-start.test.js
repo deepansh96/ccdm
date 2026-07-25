@@ -197,7 +197,7 @@ test("start-codex-session constructs a bridge tmux launch, removes stale MCP con
     BOT_TOKEN: registrySeed.pool[1].token,
     CHANNEL_ID: registrySeed.projects.alpha.channel_id,
     CODEX_HOME: codexHome,
-    CODEX_SERVICE_TIER: "",
+    CODEX_SERVICE_TIER: "default",
     GUILD_ID: registrySeed.guild_id,
     PROJECT_DIR: registrySeed.projects.alpha.path,
     ROOT_BOT_APP_ID: "root-listener-id",
