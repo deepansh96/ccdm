@@ -210,6 +210,7 @@ Message the root agent bot on Discord with any of these:
 | `restart yourself` | Self-restart the root agent |
 | `create a poll` | Create a native Discord poll in any channel |
 | `/compact` / `/clear` / `/restart` | From a Codex project channel, manage that Codex session directly |
+| `/pause` / `/unpause` | Queue new Codex messages without interrupting the active turn, then resume them in order |
 | `@root /compact` / `@root /clear` | From a Claude project channel, relay the slash command into that project's tmux session |
 
 ### Registering a New Project

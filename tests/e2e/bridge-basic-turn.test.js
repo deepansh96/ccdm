@@ -933,6 +933,76 @@ test("bridge queues compact during an active turn and runs it after completion",
   await bridge.stop();
 });
 
+test("bridge pauses new turns and sends queued messages in order after unpause", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    turns: [
+      { delta: "active done", delayMs: 300, startDelayMs: 10, turnId: "active-turn" },
+      { delta: "first queued done", turnId: "first-queued-turn" },
+      { delta: "second queued done", turnId: "second-queued-turn" },
+    ],
+  });
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await injectMessageUntil(
+    workspace,
+    { content: "active", id: "active-message" },
+    (state) => state.fixtures.codex.protocolEvents.some(
+      (event) =>
+        event.message?.method === "turn/start" &&
+        event.message.params.input?.[0]?.text === "active",
+    ),
+  );
+  await injectMessageUntil(
+    workspace,
+    { content: "/pause", id: "pause-message" },
+    (state) => state.fixtures.discord.sends.some(
+      (send) => send.content === "Bridge paused. New messages will be queued.",
+    ),
+  );
+  for (const [id, content] of [
+    ["first-queued-message", "first queued"],
+    ["second-queued-message", "second queued"],
+  ]) {
+    await injectMessageUntil(
+      workspace,
+      { content, id },
+      (state) => state.fixtures.discord.reactions.some(
+        (reaction) => reaction.messageId === id && reaction.emoji === "⏳",
+      ),
+    );
+  }
+
+  const pausedState = await waitForState(
+    workspace,
+    (state) => state.fixtures.discord.sends.some((send) => send.content === "active done"),
+    5000,
+  );
+  const pausedUserTurns = pausedState.fixtures.codex.protocolEvents
+    .filter((event) => event.message?.method === "turn/start")
+    .map((event) => event.message.params.input?.[0]?.text)
+    .filter((text) => text && !text.startsWith("You are communicating with the user via Discord"));
+  assert.deepEqual(pausedUserTurns, ["active"]);
+
+  const unpausedState = await injectMessageUntil(
+    workspace,
+    { content: "/unpause", id: "unpause-message" },
+    (state) => state.fixtures.discord.sends.some((send) => send.content === "second queued done"),
+    5000,
+  );
+  assert.deepEqual(
+    unpausedState.fixtures.discord.sends
+      .map((send) => send.content)
+      .filter((content) => ["active done", "first queued done", "second queued done"].includes(content)),
+    ["active done", "first queued done", "second queued done"],
+  );
+  await bridge.stop();
+});
+
 test("bridge clears during an active turn", async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, {

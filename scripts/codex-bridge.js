@@ -81,6 +81,7 @@ let suppressTurnOutput = false;
 let pendingBootstrapInstructionReason = null;
 let pendingCompactionChannelId = null;
 let messageQueue = [];
+let bridgePaused = false;
 let discordClient = null;
 let discordChannel = null;
 let codexProcess = null;
@@ -794,7 +795,7 @@ async function onTurnCompleted() {
 }
 
 async function processQueue() {
-  if (threadResetting || turnActive || !threadId || messageQueue.length === 0) return;
+  if (bridgePaused || threadResetting || turnActive || !threadId || messageQueue.length === 0) return;
   const { input, msg: queuedMsg, channelId, channelScopeToken } = messageQueue.shift();
   if (queuedMsg) {
     queuedMsg.reactions.cache.get("⏳")?.users.remove(queuedMsg.client.user.id).catch(() => {});
@@ -1243,6 +1244,23 @@ function startDiscordBot() {
     const text = stripThisBotMention(msg.content.trim());
     const bridgeSlashCommand = !ROOT_MULTI_CHANNEL || channelId === CHANNEL_ID;
 
+    if (bridgeSlashCommand && text === "/pause") {
+      console.log("[discord] /pause requested");
+      bridgePaused = true;
+      await msg.react("⏸️");
+      await sendToDiscord("Bridge paused. New messages will be queued.", channelId);
+      return;
+    }
+
+    if (bridgeSlashCommand && text === "/unpause") {
+      console.log("[discord] /unpause requested");
+      bridgePaused = false;
+      processQueue();
+      await msg.react("▶️");
+      await sendToDiscord("Bridge unpaused.", channelId);
+      return;
+    }
+
     if (bridgeSlashCommand && text === "/compact") {
       console.log("[discord] /compact requested");
       await msg.react("🔄");
@@ -1338,7 +1356,7 @@ function startDiscordBot() {
 
     console.log(`[discord] ${msg.author.username}: ${text || "(attachment)"} [${input.length} part(s)]`);
 
-    if (threadResetting) {
+    if (bridgePaused || threadResetting) {
       messageQueue.push({ input, msg, channelId, channelScopeToken });
       await msg.react("⏳");
     } else if (ROOT_MULTI_CHANNEL && turnActive) {
