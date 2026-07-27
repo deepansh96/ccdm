@@ -8,6 +8,7 @@ import WebSocket from "ws";
 import {
   createBridgeWorkspace,
   injectDiscordMessage,
+  injectDiscordReaction,
   runPreloadProbe,
   startBridge,
   startFakeCodexServer,
@@ -1003,6 +1004,83 @@ test("bridge pauses new turns and sends queued messages in order after unpause",
   await bridge.stop();
 });
 
+test("bridge forwards thumbs-up and thumbs-down reactions on its own messages", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    turns: [
+      { delta: "up received", turnId: "thumbs-up-turn" },
+      { delta: "down received", turnId: "thumbs-down-turn" },
+    ],
+  });
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  for (const reaction of [
+    { emoji: "🎉", id: "ignored-emoji" },
+    {
+      emoji: "👍",
+      id: "ignored-user-message",
+      message: { author: { bot: false, id: "allowed-user-id" } },
+    },
+    {
+      emoji: "👍",
+      id: "ignored-user",
+      user: { id: "other-user" },
+    },
+  ]) {
+    await injectReactionUntil(
+      workspace,
+      reaction,
+      (state) => state.fixtures.discord.deliveredReactions.some(
+        (delivered) => delivered.id === reaction.id,
+      ),
+      1000,
+    );
+  }
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  await injectReactionUntil(
+    workspace,
+    {
+      emoji: "👍",
+      id: "thumbs-up",
+      messageId: "bot-message-up",
+      partial: true,
+      message: { content: "The PR is ready.", partial: true },
+      user: { partial: true },
+    },
+    (state) => state.fixtures.discord.sends.some((send) => send.content === "up received"),
+    1000,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  const state = await injectReactionUntil(
+    workspace,
+    {
+      emoji: "👎",
+      id: "thumbs-down",
+      messageId: "bot-message-down",
+    },
+    (nextState) => nextState.fixtures.discord.sends.some(
+      (send) => send.content === "down received",
+    ),
+    1000,
+  );
+  const reactionTurns = state.fixtures.codex.protocolEvents
+    .filter((event) => event.message?.method === "turn/start")
+    .map((event) => event.message.params.input?.[0]?.text)
+    .filter((text) => text && !text.startsWith("You are communicating with the user via Discord"));
+
+  assert.deepEqual(reactionTurns, [
+    'User Allowed User reacted 👍 to your message: "The PR is ready." (message ID: bot-message-up).',
+    "User Allowed User reacted 👎 to your message (message ID: bot-message-down).",
+  ]);
+  await bridge.stop();
+});
+
 test("bridge clears during an active turn", async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, {
@@ -1606,6 +1684,26 @@ async function injectMessageUntil(workspace, message, predicate, timeoutMs = 500
       state.fixtures.discord.deliveredMessages.some((entry) => entry.id === id);
     if (!alreadyKnown) {
       injectDiscordMessage(workspace, { ...message, id });
+    }
+    try {
+      return await waitForState(workspace, predicate, timeoutMs);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError;
+}
+
+async function injectReactionUntil(workspace, reaction, predicate, timeoutMs = 5000) {
+  let lastError;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const id = reaction.id ?? `reaction-${attempt}`;
+    const state = readState(workspace.stateDir);
+    const alreadyKnown =
+      state.fixtures.discord.injectedReactions.some((entry) => entry.id === id) ||
+      state.fixtures.discord.deliveredReactions.some((entry) => entry.id === id);
+    if (!alreadyKnown) {
+      injectDiscordReaction(workspace, { ...reaction, id });
     }
     try {
       return await waitForState(workspace, predicate, timeoutMs);
