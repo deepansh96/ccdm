@@ -100,6 +100,46 @@ function fixtureMessage(client, raw) {
   };
 }
 
+function fixtureReaction(client, raw) {
+  const message = {
+    author: {
+      bot: raw.message?.author?.bot ?? true,
+      id: raw.message?.author?.id ?? client.user.id,
+      username: raw.message?.author?.username ?? "Fixture Bot",
+    },
+    channel: { id: raw.channelId, name: `channel-${raw.channelId}` },
+    channelId: raw.channelId,
+    content: raw.message?.content ?? "",
+    id: raw.messageId,
+    partial: raw.message?.partial ?? false,
+    async fetch() {
+      this.partial = false;
+      return this;
+    },
+  };
+  const reaction = {
+    emoji: { name: raw.emoji },
+    message,
+    partial: raw.partial ?? false,
+    async fetch() {
+      this.partial = false;
+      return this;
+    },
+  };
+  const user = {
+    bot: raw.user?.bot ?? false,
+    globalName: raw.user?.globalName,
+    id: raw.user?.id ?? "allowed-user-id",
+    partial: raw.user?.partial ?? false,
+    username: raw.user?.username ?? "Allowed User",
+    async fetch() {
+      this.partial = false;
+      return this;
+    },
+  };
+  return { reaction, user };
+}
+
 class Client extends EventEmitter {
   constructor(options = {}) {
     super();
@@ -159,17 +199,30 @@ class Client extends EventEmitter {
     if (this._poller) return;
     this._poller = setInterval(() => {
       let delivered = null;
+      let deliveredReaction = null;
       updateState((state) => {
         const messages = state.fixtures?.discord?.injectedMessages ?? [];
         const next = messages.find((message) => !message.delivered);
-        if (!next) return;
-        next.delivered = true;
-        state.fixtures.discord.deliveredMessages ||= [];
-        state.fixtures.discord.deliveredMessages.push({ id: next.id });
-        delivered = { ...next };
+        if (next) {
+          next.delivered = true;
+          state.fixtures.discord.deliveredMessages ||= [];
+          state.fixtures.discord.deliveredMessages.push({ id: next.id });
+          delivered = { ...next };
+          return;
+        }
+        const reactions = state.fixtures?.discord?.injectedReactions ?? [];
+        const nextReaction = reactions.find((reaction) => !reaction.delivered);
+        if (!nextReaction) return;
+        nextReaction.delivered = true;
+        state.fixtures.discord.deliveredReactions ||= [];
+        state.fixtures.discord.deliveredReactions.push({ id: nextReaction.id });
+        deliveredReaction = { ...nextReaction };
       });
       if (delivered) {
         this.emit("messageCreate", fixtureMessage(this, delivered));
+      } else if (deliveredReaction) {
+        const { reaction, user } = fixtureReaction(this, deliveredReaction);
+        this.emit("messageReactionAdd", reaction, user);
       }
     }, 25);
     this._poller.unref();
@@ -179,11 +232,14 @@ class Client extends EventEmitter {
 const GatewayIntentBits = {
   GuildMessages: 2,
   Guilds: 1,
+  GuildMessageReactions: 8,
   MessageContent: 4,
 };
 
 const Partials = {
   Message: "MESSAGE",
+  Reaction: "REACTION",
+  User: "USER",
 };
 
 module.exports = {

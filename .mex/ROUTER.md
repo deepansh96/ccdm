@@ -18,7 +18,7 @@ edges:
     condition: when changing bot permissions, guest access, channel routing, or credentials
   - target: patterns/INDEX.md
     condition: when starting a task — check the pattern index for a matching pattern file
-last_updated: 2026-07-26
+last_updated: 2026-07-27
 ---
 
 # Session Bootstrap
@@ -36,6 +36,7 @@ Then read this file fully before doing anything else in this session.
 - Per-project Claude and Codex account/model overrides are supported.
 - The Codex bridge retries a generic terminal `response.failed` once when the failed turn produced no agent work.
 - The Codex bridge can pause new turns in memory, queue incoming messages, and resume them in order.
+- The Codex bridge forwards allowed users' 👍 and 👎 reactions on its own messages to the active Codex thread.
 
 **Not built:**
 - Remote VM lifecycle operations are documented but intentionally performed by the user on the remote host.

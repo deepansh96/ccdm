@@ -59,6 +59,7 @@ const TURN_ID_RECONCILIATION_METHODS = new Set([
   "item/started",
   "item/agentMessage/delta",
 ]);
+const FORWARDED_REACTIONS = new Set(["👍", "👎"]);
 
 if (!BOT_TOKEN || !CHANNEL_ID || !PROJECT_DIR) {
   console.error(
@@ -349,6 +350,28 @@ async function shouldHandleDiscordMessage(msg) {
   if (allowed.size > 0 && !allowed.has(msg.author.id)) return false;
   if (channelConfig.requireMention !== false && !mentionsThisBot(msg)) return false;
   return true;
+}
+
+async function shouldHandleDiscordReaction(reaction, user) {
+  if (user.bot) return false;
+  const channelId = reaction.message.channelId || reaction.message.channel?.id;
+  if (!channelId) return false;
+  if (!ROOT_MULTI_CHANNEL) {
+    return channelId === CHANNEL_ID &&
+      (ALLOWED_USER_IDS.size === 0 || ALLOWED_USER_IDS.has(user.id));
+  }
+
+  try {
+    await loadRootAccess(false);
+  } catch (err) {
+    console.error(`Root access reload failed: ${err.message || err}`);
+    return false;
+  }
+
+  const channelConfig = rootChannelAccess.get(channelId);
+  if (!channelConfig) return false;
+  const allowed = allowedRootUsersFor(channelConfig);
+  return allowed.size === 0 || allowed.has(user.id);
 }
 
 function splitMessage(text, limit = 2000) {
@@ -803,6 +826,33 @@ async function processQueue() {
   await sendTurn(input, channelId, channelScopeToken);
 }
 
+async function routeInput(input, msg, channelId, channelScopeToken) {
+  const queueInput = async () => {
+    messageQueue.push({ input, msg, channelId, channelScopeToken });
+    if (msg) await msg.react("⏳");
+  };
+
+  if (bridgePaused || threadResetting || (ROOT_MULTI_CHANNEL && turnActive)) {
+    await queueInput();
+  } else if (turnActive && activeTurnId && !suppressTurnOutput) {
+    try {
+      await sendRequest("turn/steer", {
+        threadId,
+        input,
+        expectedTurnId: activeTurnId,
+      });
+      console.log(`[steer] Injected into active turn ${activeTurnId}`);
+    } catch (err) {
+      console.log(`[steer] Failed (${err.message || err}), queuing instead`);
+      await queueInput();
+    }
+  } else if (turnActive) {
+    await queueInput();
+  } else {
+    await sendTurn(input, channelId, channelScopeToken);
+  }
+}
+
 async function sendTurn(
   input,
   channelId = CHANNEL_ID,
@@ -1125,6 +1175,29 @@ async function buildInput(msg, textOverride = null) {
   return { input, channelScopeToken };
 }
 
+function buildReactionInput(reaction, user) {
+  const channelId = reaction.message.channelId || reaction.message.channel.id;
+  const source = reaction.message.content.trim().replace(/\s+/g, " ");
+  const excerpt = source.length > 80 ? `${source.slice(0, 77)}...` : source;
+  const text = `User ${user.globalName || user.username || user.id} reacted ${reaction.emoji.name} to your message${excerpt ? `: "${excerpt}"` : ""} (message ID: ${reaction.message.id}).`;
+  const msg = {
+    id: reaction.message.id,
+    author: user,
+    channel: { id: channelId, name: reaction.message.channel?.name },
+  };
+  const channelScopeToken = ROOT_MULTI_CHANNEL
+    ? createDiscordChannelScopeToken(msg)
+    : null;
+  return {
+    channelId,
+    channelScopeToken,
+    input: [{
+      type: "text",
+      text: ROOT_MULTI_CHANNEL ? rootRoutingContext(msg, text, channelScopeToken) : text,
+    }],
+  };
+}
+
 async function registerDiscordMcp() {
   const mcpName = DISCORD_MCP_NAME;
 
@@ -1215,9 +1288,10 @@ function startDiscordBot() {
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.GuildMessageReactions,
       GatewayIntentBits.MessageContent,
     ],
-    partials: [Partials.Message],
+    partials: [Partials.Message, Partials.Reaction, Partials.User],
   });
   discordClient = client;
 
@@ -1235,6 +1309,24 @@ function startDiscordBot() {
     if (ROOT_MULTI_CHANNEL) {
       console.log(`Root routing active for ${rootChannelAccess.size} configured channel(s)`);
     }
+  });
+
+  client.on("messageReactionAdd", async (reaction, user) => {
+    if (!FORWARDED_REACTIONS.has(reaction.emoji.name)) return;
+    if (!(await shouldHandleDiscordReaction(reaction, user))) return;
+    try {
+      if (user.partial) await user.fetch();
+      if (reaction.partial) await reaction.fetch();
+      if (reaction.message.partial) await reaction.message.fetch();
+    } catch (err) {
+      console.log(`[discord] Failed to fetch reaction context: ${err.message || err}`);
+      return;
+    }
+    if (user.bot || reaction.message.author?.id !== client.user.id) return;
+
+    const { input, channelId, channelScopeToken } = buildReactionInput(reaction, user);
+    console.log(`[discord] ${user.username}: ${reaction.emoji.name} on ${reaction.message.id}`);
+    await routeInput(input, null, channelId, channelScopeToken);
   });
 
   client.on("messageCreate", async (msg) => {
@@ -1356,31 +1448,7 @@ function startDiscordBot() {
 
     console.log(`[discord] ${msg.author.username}: ${text || "(attachment)"} [${input.length} part(s)]`);
 
-    if (bridgePaused || threadResetting) {
-      messageQueue.push({ input, msg, channelId, channelScopeToken });
-      await msg.react("⏳");
-    } else if (ROOT_MULTI_CHANNEL && turnActive) {
-      messageQueue.push({ input, msg, channelId, channelScopeToken });
-      await msg.react("⏳");
-    } else if (turnActive && activeTurnId && !suppressTurnOutput) {
-      try {
-        await sendRequest("turn/steer", {
-          threadId,
-          input,
-          expectedTurnId: activeTurnId,
-        });
-        console.log(`[steer] Injected into active turn ${activeTurnId}`);
-      } catch (err) {
-        console.log(`[steer] Failed (${err.message || err}), queuing instead`);
-        messageQueue.push({ input, msg, channelId, channelScopeToken });
-        await msg.react("⏳");
-      }
-    } else if (turnActive) {
-      messageQueue.push({ input, msg, channelId, channelScopeToken });
-      await msg.react("⏳");
-    } else {
-      await sendTurn(input, channelId, channelScopeToken);
-    }
+    await routeInput(input, msg, channelId, channelScopeToken);
   });
 
   client.login(BOT_TOKEN);

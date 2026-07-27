@@ -49,6 +49,10 @@ bridge transcribes `audio/*` attachments with local `whisper` and sends Codex
 the transcript instead of the audio file. Set `CODEX_BRIDGE_TRANSCRIBE_AUDIO=0`
 to disable it for a bridge process.
 
+The Codex bridge also forwards 👍 and 👎 reactions from allowed users on its
+own messages as short feedback turns containing the reacted message ID and
+an excerpt when available.
+
 ### Codex Accounts
 
 Codex bridge sessions use `CODEX_HOME` to choose which Codex login/profile to

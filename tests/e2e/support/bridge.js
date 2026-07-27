@@ -368,6 +368,31 @@ export function injectDiscordMessage(workspace, message = {}) {
   writeState(state, workspace.stateDir);
 }
 
+export function injectDiscordReaction(workspace, reaction = {}) {
+  const state = readState(workspace.stateDir);
+  state.fixtures.discord.injectedReactions.push({
+    channelId: reaction.channelId ?? "channel-id",
+    delivered: false,
+    emoji: reaction.emoji ?? "👍",
+    id: reaction.id ?? `reaction-${Date.now()}`,
+    message: {
+      author: { bot: true, id: "fixture-bot-user-id", username: "Fixture Bot", ...(reaction.message?.author ?? {}) },
+      content: reaction.message?.content ?? "",
+      partial: reaction.message?.partial ?? false,
+    },
+    messageId: reaction.messageId ?? "bot-message-id",
+    partial: reaction.partial ?? false,
+    user: {
+      bot: false,
+      id: "allowed-user-id",
+      partial: false,
+      username: "Allowed User",
+      ...(reaction.user ?? {}),
+    },
+  });
+  writeState(state, workspace.stateDir);
+}
+
 export async function waitForState(workspace, predicate, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
