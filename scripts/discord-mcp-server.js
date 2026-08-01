@@ -5,8 +5,9 @@ const { execFile } = require("child_process");
 const { createHmac, timingSafeEqual } = require("crypto");
 const { promisify } = require("util");
 const path = require("path");
-const { writeFile, mkdir, stat, readFile } = require("fs/promises");
+const { writeFile, mkdir, mkdtemp, stat, readFile } = require("fs/promises");
 const { createReadStream } = require("fs");
+const { tmpdir } = require("os");
 
 const execFileAsync = promisify(execFile);
 const EXPORT_SCRIPT = path.resolve(__dirname, "export-discord-range.js");
@@ -45,15 +46,25 @@ function makeError(id, code, message) {
   return { jsonrpc: "2.0", id, error: { code, message } };
 }
 
-async function discordGet(endpoint) {
-  const res = await fetch(`${API_BASE}${endpoint}`, {
-    headers: { Authorization: `Bot ${BOT_TOKEN}` },
-  });
-  if (!res.ok) {
+async function discordGet(endpoint, retryRateLimits = false) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const res = await fetch(`${API_BASE}${endpoint}`, {
+      headers: { Authorization: `Bot ${BOT_TOKEN}` },
+    });
+    if (res.ok) return res.json();
+
     const text = await res.text();
-    throw new Error(`Discord API ${res.status}: ${text}`);
+    if (!retryRateLimits || res.status !== 429 || attempt === 4) {
+      throw new Error(`Discord API ${res.status}: ${text}`);
+    }
+    let retryAfter = 1;
+    try {
+      retryAfter = Number(JSON.parse(text).retry_after ?? retryAfter);
+    } catch {
+      // Discord normally returns JSON for rate limits; use a short fallback delay.
+    }
+    await new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
   }
-  return res.json();
 }
 
 async function discordPost(endpoint, body) {
@@ -306,6 +317,21 @@ const ALL_TOOLS = [
     },
   },
   {
+    name: "read_last_x_messages_in_channel",
+    description:
+      "Read the last X messages in the Discord channel, oldest-first with message IDs. Reads up to 100 inline; larger reads return a temporary transcript path.",
+    inputSchema: {
+      type: "object",
+      properties: withChannelOverride({
+        count: {
+          type: "number",
+          description: "Number of recent messages to read (1-10,000).",
+        },
+      }),
+      required: requiredWithChannel(["count"]),
+    },
+  },
+  {
     name: "export_message_range",
     description:
       "Export up to 10,000 Discord messages and their attachments to a temporary transcript. The range is inclusive; omit the end ID to continue through the latest message. Read the returned file, then delete its temporary directory.",
@@ -396,12 +422,38 @@ async function handleToolCall(name, args) {
       return `reacted with ${emoji}`;
     }
 
-    case "fetch_messages": {
+    case "fetch_messages":
+    case "read_last_x_messages_in_channel": {
       const channelId = await targetChannelId(args);
-      const limit = Math.min(args.limit || 20, 100);
-      const messages = await discordGet(
-        `/channels/${channelId}/messages?limit=${limit}`
-      );
+      const limit = name === "read_last_x_messages_in_channel"
+        ? args.count
+        : Math.min(args.limit || 20, 100);
+      if (
+        name === "read_last_x_messages_in_channel"
+        && (!Number.isInteger(limit) || limit < 1 || limit > 10000)
+      ) {
+        throw new Error("count must be an integer between 1 and 10,000");
+      }
+      let messages;
+      if (name === "read_last_x_messages_in_channel") {
+        messages = [];
+        let before;
+        // ponytail: 10,000-message cap matches export; raise only if MCP payload limits prove safe.
+        while (messages.length < limit) {
+          const pageLimit = Math.min(limit - messages.length, 100);
+          const page = await discordGet(
+            `/channels/${channelId}/messages?limit=${pageLimit}${before ? `&before=${before}` : ""}`,
+            true
+          );
+          messages.push(...page);
+          if (page.length < pageLimit) break;
+          before = page.at(-1).id;
+        }
+      } else {
+        messages = await discordGet(
+          `/channels/${channelId}/messages?limit=${limit}`
+        );
+      }
       messages.reverse();
       const formatted = messages.map((m) => {
         const ts = m.timestamp;
@@ -411,7 +463,14 @@ async function handleToolCall(name, args) {
           : "";
         return `[${ts}] ${author}: ${m.content}${attachments} (id: ${m.id})`;
       });
-      return formatted.join("\n");
+      const output = formatted.join("\n");
+      if (name === "read_last_x_messages_in_channel" && limit > 100) {
+        const directory = await mkdtemp(path.join(tmpdir(), "discord-recent-"));
+        const transcript = path.join(directory, "messages.txt");
+        await writeFile(transcript, `${output}\n`, { mode: 0o600 });
+        return `saved ${messages.length} messages to ${transcript}`;
+      }
+      return output;
     }
 
     case "export_message_range": {
