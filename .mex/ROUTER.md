@@ -33,7 +33,7 @@ Then read this file fully before doing anything else in this session.
 - Claude sessions run through the official Discord plugin; Codex sessions run through `scripts/codex-bridge.js`.
 - Start, stop, registration, guest access, command relay, voice transcription, and local-fake E2E coverage are present.
 - Local Claude and Codex project bots can export an inclusive Discord message range to a temporary text file.
-- Codex Discord tools can read the last requested 1-10,000 messages in their scoped channel.
+- Codex Discord tools can read the last requested 1-10,000 messages in their scoped channel, returning larger reads as private temporary transcripts.
 - Per-project Claude and Codex account/model overrides are supported.
 - The Codex bridge retries a generic terminal `response.failed` once when the failed turn produced no agent work.
 - The Codex bridge can pause new turns in memory, queue incoming messages, and resume them in order.

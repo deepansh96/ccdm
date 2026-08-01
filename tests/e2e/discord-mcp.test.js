@@ -131,6 +131,10 @@ test("Discord MCP reads 500 recent messages across API pages", async () => {
     author: { username: "Alice", bot: false },
     attachments: [],
   }));
+  state.fixtures.discord.restFailures = [{
+    status: 429,
+    body: { message: "rate limited", retry_after: 0, global: false },
+  }];
   writeState(state, workspace.stateDir);
 
   const result = await runMcp(workspace, [
@@ -138,10 +142,18 @@ test("Discord MCP reads 500 recent messages across API pages", async () => {
   ]);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  const messages = responseById(result).get(1).result.content[0].text.split("\n");
+  const transcript = responseById(result).get(1).result.content[0].text
+    .replace(/^saved 500 messages to /, "");
+  const messages = fs.readFileSync(transcript, "utf8").trim().split("\n");
   assert.equal(messages.length, 500);
   assert.match(messages[0], /id: 1005/);
   assert.match(messages.at(-1), /id: 1504/);
+  assert.equal(fs.statSync(transcript).mode & 0o777, 0o600);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.restFailureUses, [{
+    method: "GET",
+    path: "/api/v10/channels/channel-id/messages",
+    status: 429,
+  }]);
   assert.deepEqual(
     readState(workspace.stateDir).fixtures.discord.fetches.map(({ limit, before }) => ({ limit, before })),
     [

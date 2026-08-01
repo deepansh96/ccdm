@@ -140,7 +140,7 @@ The Discord MCP JSON-RPC scenarios drive `scripts/discord-mcp-server.js` directl
 - `tests/e2e/support/form-data-shim.cjs` is installed by the preload as the workspace-local `form-data` package so dynamic `import("form-data")` resolves without the real dependency. Its `FormData.prototype.submit()` implementation routes Discord uploads into fixture state and blocks non-Discord submit targets as `form-data` egress.
 - MCP tests cover `initialize`, `notifications/initialized`, `tools/list`, unknown methods, malformed JSON input, missing env, export-only mode, and each public tool: `reply`, `edit_message`, `react`, `fetch_messages`, `read_last_x_messages_in_channel`, `export_message_range`, and `download_attachment`.
 - Reply coverage includes empty text, missing files, reply references, upload success/failure, and the current behavior that advertised 10-file and 25MB limits are not locally enforced before upload.
-- Fetch/download coverage includes limit capping, 500-message pagination, bad negative limits, attachment default index, out-of-range and negative indexes, missing attachments, absolute save directories, filesystem writes, CDN failures, and blocked network egress.
+- Fetch/download coverage includes limit capping, rate-limit retry, a private transcript for 500-message pagination, bad negative limits, attachment default index, out-of-range and negative indexes, missing attachments, absolute save directories, filesystem writes, CDN failures, and blocked network egress.
 
 The Claude usage-report scenarios drive `scripts/claude-usage.sh` with fixture home data and local-fake external boundaries:
 
