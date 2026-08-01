@@ -71,7 +71,15 @@ test("Discord MCP initializes, lists tools, accepts initialized notifications, a
   assert.equal(output[0].result.serverInfo.name, "discord-mcp");
   assert.deepEqual(
     output[1].result.tools.map((tool) => tool.name),
-    ["reply", "edit_message", "react", "fetch_messages", "export_message_range", "download_attachment"],
+    [
+      "reply",
+      "edit_message",
+      "react",
+      "fetch_messages",
+      "read_last_x_messages_in_channel",
+      "export_message_range",
+      "download_attachment",
+    ],
   );
   const replyTool = output[1].result.tools.find((tool) => tool.name === "reply");
   assert.match(replyTool.inputSchema.properties.files.description, /Max 10 files, 25MB each/);
@@ -111,6 +119,39 @@ test("Discord MCP exports a message range through the latest message", async () 
   assert.match(text, /Message ID: 103/);
   assert.doesNotMatch(text, /Message ID: 101/);
   assert.equal(fs.statSync(exportPath).mode & 0o777, 0o600);
+});
+
+test("Discord MCP reads 500 recent messages across API pages", async () => {
+  const workspace = createBridgeWorkspace();
+  const state = readState(workspace.stateDir);
+  state.fixtures.discord.restMessages = Array.from({ length: 505 }, (_, index) => ({
+    id: String(1504 - index),
+    timestamp: "2026-08-01T10:00:00.000Z",
+    content: `message ${1504 - index}`,
+    author: { username: "Alice", bot: false },
+    attachments: [],
+  }));
+  writeState(state, workspace.stateDir);
+
+  const result = await runMcp(workspace, [
+    toolCall(1, "read_last_x_messages_in_channel", { count: 500 }),
+  ]);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const messages = responseById(result).get(1).result.content[0].text.split("\n");
+  assert.equal(messages.length, 500);
+  assert.match(messages[0], /id: 1005/);
+  assert.match(messages.at(-1), /id: 1504/);
+  assert.deepEqual(
+    readState(workspace.stateDir).fixtures.discord.fetches.map(({ limit, before }) => ({ limit, before })),
+    [
+      { limit: 100, before: undefined },
+      { limit: 100, before: "1405" },
+      { limit: 100, before: "1305" },
+      { limit: 100, before: "1205" },
+      { limit: 100, before: "1105" },
+    ],
+  );
 });
 
 test("Discord MCP export-only mode hides and rejects all other tools", async () => {
@@ -302,6 +343,8 @@ test("Discord MCP reports JSON-RPC errors and drives edit, react, and fetch tool
     toolCall(11, "edit_message", { message_id: "message-1", text: "updated" }),
     toolCall(12, "react", { message_id: "message-1", emoji: "👍" }),
     toolCall(13, "fetch_messages", { limit: 2 }),
+    toolCall(14, "read_last_x_messages_in_channel", { count: 1 }),
+    toolCall(15, "read_last_x_messages_in_channel", { count: 0 }),
   ]);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
@@ -314,6 +357,12 @@ test("Discord MCP reports JSON-RPC errors and drives edit, react, and fetch tool
     output.get(13).result.content[0].text,
     "[2026-05-28T10:00:00.000Z] me: oldest (id: old-message)\n[2026-05-28T10:00:01.000Z] Alice: newest +1att (id: new-message)",
   );
+  assert.equal(
+    output.get(14).result.content[0].text,
+    "[2026-05-28T10:00:01.000Z] Alice: newest +1att (id: new-message)",
+  );
+  assert.equal(output.get(15).result.isError, true);
+  assert.match(output.get(15).result.content[0].text, /integer between 1 and 10,000/);
 
   const discord = readState(workspace.stateDir).fixtures.discord;
   assert.deepEqual(discord.edits[0], {
@@ -329,6 +378,7 @@ test("Discord MCP reports JSON-RPC errors and drives edit, react, and fetch tool
     messageId: "message-1",
   });
   assert.deepEqual(discord.fetches[0], { authorization: "Bot bot-token", channelId: "channel-id", limit: 2 });
+  assert.deepEqual(discord.fetches[1], { authorization: "Bot bot-token", channelId: "channel-id", limit: 1 });
 });
 
 test("Discord MCP replies with files through the FormData shim and reports upload failures", async () => {

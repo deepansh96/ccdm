@@ -306,6 +306,21 @@ const ALL_TOOLS = [
     },
   },
   {
+    name: "read_last_x_messages_in_channel",
+    description:
+      "Read the last X messages in the Discord channel. Returns oldest-first with message IDs.",
+    inputSchema: {
+      type: "object",
+      properties: withChannelOverride({
+        count: {
+          type: "number",
+          description: "Number of recent messages to read (1-10,000).",
+        },
+      }),
+      required: requiredWithChannel(["count"]),
+    },
+  },
+  {
     name: "export_message_range",
     description:
       "Export up to 10,000 Discord messages and their attachments to a temporary transcript. The range is inclusive; omit the end ID to continue through the latest message. Read the returned file, then delete its temporary directory.",
@@ -396,12 +411,37 @@ async function handleToolCall(name, args) {
       return `reacted with ${emoji}`;
     }
 
-    case "fetch_messages": {
+    case "fetch_messages":
+    case "read_last_x_messages_in_channel": {
       const channelId = await targetChannelId(args);
-      const limit = Math.min(args.limit || 20, 100);
-      const messages = await discordGet(
-        `/channels/${channelId}/messages?limit=${limit}`
-      );
+      const limit = name === "read_last_x_messages_in_channel"
+        ? args.count
+        : Math.min(args.limit || 20, 100);
+      if (
+        name === "read_last_x_messages_in_channel"
+        && (!Number.isInteger(limit) || limit < 1 || limit > 10000)
+      ) {
+        throw new Error("count must be an integer between 1 and 10,000");
+      }
+      let messages;
+      if (name === "read_last_x_messages_in_channel") {
+        messages = [];
+        let before;
+        // ponytail: 10,000-message cap matches export; raise only if MCP payload limits prove safe.
+        while (messages.length < limit) {
+          const pageLimit = Math.min(limit - messages.length, 100);
+          const page = await discordGet(
+            `/channels/${channelId}/messages?limit=${pageLimit}${before ? `&before=${before}` : ""}`
+          );
+          messages.push(...page);
+          if (page.length < pageLimit) break;
+          before = page.at(-1).id;
+        }
+      } else {
+        messages = await discordGet(
+          `/channels/${channelId}/messages?limit=${limit}`
+        );
+      }
       messages.reverse();
       const formatted = messages.map((m) => {
         const ts = m.timestamp;

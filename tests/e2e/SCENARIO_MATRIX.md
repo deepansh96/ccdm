@@ -88,7 +88,7 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Root restart | Teardown failure diagnostics | Covered | Cleanup failure after restart is recorded under fixture diagnostics. |
 | Live smoke | Default skip | Covered | Skips unless `CCDM_LIVE_E2E=1` and documented secrets are set. |
 | Discord MCP | JSON-RPC lifecycle | Covered | Drives `scripts/discord-mcp-server.js` through stdin/stdout for `initialize`, `notifications/initialized`, `tools/list`, unknown methods, malformed JSON input, and missing env. |
-| Discord MCP | Reply/edit/react/fetch tools | Covered | Covers text replies with references, empty-text file replies, missing files, edit, react, fetch limit capping, and bad negative limits. |
+| Discord MCP | Reply/edit/react/fetch tools | Covered | Covers text replies with references, empty-text file replies, missing files, edit, react, fetch limit capping, bad negative limits, and paginated reads of the last 500 messages. |
 | Discord MCP | Download attachment tool | Covered | Covers default index, explicit index, out-of-range and negative indexes, missing attachments, absolute save directories, filesystem writes, CDN failures, and blocked network failures. |
 | Discord MCP | Fake REST API failures | Covered | Scripted fake Discord REST failures propagate 400, 401, 403, 404, 429 including rate-limit body, and 5xx as MCP error content. |
 | Fixture contracts | FormData upload shim | Covered | Preload installs a workspace-local `form-data` shim whose `FormData.prototype.submit()` routes uploads through fake Discord and blocks missed non-Discord egress. |
