@@ -16,7 +16,7 @@ edges:
     condition: when changing lifecycle or process ownership
   - target: context/discord-security.md
     condition: when changing channel isolation or reply authority
-last_updated: 2026-07-24
+last_updated: 2026-08-09
 ---
 
 # Decisions
@@ -28,6 +28,14 @@ last_updated: 2026-07-24
      The history must be preserved — this is the event clock. -->
 
 ## Decision Log
+
+### Isolate CCDM Codex state with one optional shared home
+**Date:** 2026-08-09
+**Status:** Active
+**Decision:** Allow a top-level registry `codex_home` to become the default for root and project Codex bridges, while keeping project `codex_home` and `ROOT_CODEX_HOME` as higher-priority overrides.
+**Reasoning:** ChatGPT Desktop and mixed long-lived Codex runtimes can rewrite the same `models_cache.json`; a CCDM-only home separates that cache without duplicating configuration across projects or breaking existing installs.
+**Alternatives considered:** Force `~/.codex-ccdm` for every install or require one override per project; rejected because the first would invalidate existing login expectations and the second repeats configuration.
+**Consequences:** Isolation is opt-in and requires one login in the shared home; every CCDM app-server must be restarted together after a CLI upgrade.
 
 ### Export long Discord history through a shared, read-only MCP tool
 **Date:** 2026-07-24

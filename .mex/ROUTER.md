@@ -18,7 +18,7 @@ edges:
     condition: when changing bot permissions, guest access, channel routing, or credentials
   - target: patterns/INDEX.md
     condition: when starting a task — check the pattern index for a matching pattern file
-last_updated: 2026-08-01
+last_updated: 2026-08-09
 ---
 
 # Session Bootstrap
@@ -35,6 +35,7 @@ Then read this file fully before doing anything else in this session.
 - Local Claude and Codex project bots can export an inclusive Discord message range to a temporary text file.
 - Codex Discord tools can read the last requested 1-10,000 messages in their scoped channel, returning larger reads as private temporary transcripts.
 - Per-project Claude and Codex account/model overrides are supported.
+- An optional top-level `codex_home` gives root and project Codex bridges one CCDM-only home while preserving per-project and root overrides.
 - The Codex bridge retries a generic terminal `response.failed` once when the failed turn produced no agent work.
 - The Codex bridge can pause new turns in memory, queue incoming messages, and resume them in order.
 - The Codex bridge forwards allowed users' 👍 and 👎 reactions on its own messages to the active Codex thread.

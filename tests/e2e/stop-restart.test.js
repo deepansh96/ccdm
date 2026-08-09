@@ -39,6 +39,7 @@ function buildRegistry(workspace, overrides = {}) {
     max_pool_size: 50,
     project_bot_role_id: null,
     category_ids: [],
+    ...(overrides.codexHome ? { codex_home: overrides.codexHome } : {}),
     pool: [
       {
         id: "bot1",
@@ -289,7 +290,8 @@ test("restart-root-agent simulates root_agent cleanup, retry, fresh launch, and 
 
 test("restart-root-codex-agent starts the root bot through the Codex bridge", async () => {
   const workspace = createWorkspace();
-  seedRegistry(workspace, buildRegistry(workspace));
+  const codexHome = path.join(workspace.homeDir, ".codex-ccdm");
+  seedRegistry(workspace, buildRegistry(workspace, { codexHome }));
   const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
   fs.mkdirSync(rootStateDir, { recursive: true });
   fs.writeFileSync(path.join(rootStateDir, ".env"), "DISCORD_BOT_TOKEN=cm9vdC1hcHA.fixture.token\n");
@@ -321,6 +323,7 @@ test("restart-root-codex-agent starts the root bot through the Codex bridge", as
 
   const result = await runScript(workspace, "restart-root-codex-agent.sh", {
     args: ["root-channel-id"],
+    env: { CODEX_HOME: path.join(workspace.homeDir, ".codex-legacy") },
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
@@ -338,7 +341,7 @@ test("restart-root-codex-agent starts the root bot through the Codex bridge", as
     BOT_DISPLAY_NAME: "root-codex",
     BOT_TOKEN: "cm9vdC1hcHA.fixture.token",
     CHANNEL_ID: "root-channel-id",
-    CODEX_HOME: path.join(workspace.homeDir, ".codex"),
+    CODEX_HOME: codexHome,
     GUILD_ID: "guild-id",
     PROJECT_DIR: workspace.repoDir,
     ROOT_ACCESS_FILE: path.join(rootStateDir, "access.json"),
@@ -349,6 +352,51 @@ test("restart-root-codex-agent starts the root bot through the Codex bridge", as
   });
   assert.equal(session.bridgeCommand, "node scripts/codex-bridge.js");
   assert.equal(session.killAttempts, 2);
+});
+
+test("restart-root-codex-agent keeps ROOT_CODEX_HOME above the shared home", async () => {
+  const workspace = createWorkspace();
+  const rootHome = path.join(workspace.homeDir, ".codex-root");
+  seedRegistry(workspace, buildRegistry(workspace, {
+    codexHome: path.join(workspace.homeDir, ".codex-ccdm"),
+  }));
+  const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
+  fs.mkdirSync(rootStateDir, { recursive: true });
+  fs.writeFileSync(path.join(rootStateDir, ".env"), "DISCORD_BOT_TOKEN=cm9vdC1hcHA.fixture.token\n");
+  fs.writeFileSync(path.join(rootStateDir, "access.json"), `${JSON.stringify({
+    allowFrom: [],
+    groups: { "root-channel-id": { requireMention: false } },
+  })}\n`);
+
+  const result = await runScript(workspace, "restart-root-codex-agent.sh", {
+    args: ["root-channel-id"],
+    env: { ROOT_CODEX_HOME: rootHome },
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent.env.CODEX_HOME, rootHome);
+});
+
+test("restart-root-codex-agent keeps the legacy default without home overrides", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, buildRegistry(workspace));
+  const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
+  fs.mkdirSync(rootStateDir, { recursive: true });
+  fs.writeFileSync(path.join(rootStateDir, ".env"), "DISCORD_BOT_TOKEN=cm9vdC1hcHA.fixture.token\n");
+  fs.writeFileSync(path.join(rootStateDir, "access.json"), `${JSON.stringify({
+    allowFrom: [],
+    groups: { "root-channel-id": { requireMention: false } },
+  })}\n`);
+
+  const result = await runScript(workspace, "restart-root-codex-agent.sh", {
+    args: ["root-channel-id"],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.equal(
+    readState(workspace.stateDir).fixtures.tmux.sessions.root_agent.env.CODEX_HOME,
+    path.join(workspace.homeDir, ".codex"),
+  );
 });
 
 test("restart-root-codex-agent rejects an unconfigured channel before stopping the current root", async () => {
