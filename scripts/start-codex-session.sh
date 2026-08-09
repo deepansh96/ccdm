@@ -202,7 +202,7 @@ print('\t'.join([
     root_bot_app_id,
     bot['app_id'],
     bot['id'],
-    os.path.expanduser(p.get('codex_home', '~/.codex')),
+    os.path.expanduser(p.get('codex_home') or r.get('codex_home') or '~/.codex'),
     (p.get('bot_display_name') or '__NONE__'),
     '1' if p.get('text_reply_fallback') is True else '__NONE__',
     (p.get('codex_model') or p.get('model') or '__NONE__'),

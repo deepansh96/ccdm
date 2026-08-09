@@ -21,6 +21,7 @@ function buildCodexRegistry(workspace, options = {}) {
     max_pool_size: 50,
     project_bot_role_id: null,
     category_ids: [],
+    ...(options.globalCodexHome ? { codex_home: options.globalCodexHome } : {}),
     pool: [
       {
         id: "bot1",
@@ -133,9 +134,9 @@ test("npm fixture fails closed when a scenario tries to run package installation
 
 test("start-codex-session constructs a bridge tmux launch, removes stale MCP config, and records PID", async () => {
   const workspace = createWorkspace();
-  const codexHome = path.join(workspace.homeDir, ".codex-api");
+  const codexHome = path.join(workspace.homeDir, ".codex-ccdm");
   const defaultCodexHome = path.join(workspace.homeDir, ".codex");
-  const registrySeed = buildCodexRegistry(workspace, { codexHome });
+  const registrySeed = buildCodexRegistry(workspace, { globalCodexHome: codexHome });
   seedRegistry(workspace, registrySeed);
   fs.mkdirSync(path.join(workspace.homeDir, ".claude", "channels", "discord"), { recursive: true });
   fs.writeFileSync(
@@ -208,6 +209,23 @@ test("start-codex-session constructs a bridge tmux launch, removes stale MCP con
   assert.equal(state.fixtures.codex.bridgeInvocations.length, 1);
   assert.equal(state.fixtures.codex.appServerInvocations.length, 0);
   assert.equal(state.fixtures.npm.invocations.length, 0);
+});
+
+test("start-codex-session keeps project Codex homes above the shared home", async () => {
+  const workspace = createWorkspace();
+  const sharedHome = path.join(workspace.homeDir, ".codex-ccdm");
+  const projectHome = path.join(workspace.homeDir, ".codex-api");
+  seedRegistry(workspace, buildCodexRegistry(workspace, {
+    codexHome: projectHome,
+    globalCodexHome: sharedHome,
+  }));
+
+  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
+    args: ["alpha"],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex.env.CODEX_HOME, projectHome);
 });
 
 test("start-codex-session passes text reply fallback only for flagged Codex projects", async () => {

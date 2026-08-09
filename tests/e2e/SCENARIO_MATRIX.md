@@ -38,8 +38,8 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Claude command relay | Root-triggered slash commands | Covered | Drives `scripts/send-claude-command.sh`, resolves by project or channel id, sends `/compact` and `/clear` with `tmux send-keys`, and refuses Codex, remote, invalid, or stopped targets. |
 | Codex start | Registry fixture schema | Covered | Codex registries include Discord user/guild values, placeholder bot tokens, app IDs, channel IDs, `type: "codex"`, screen names, `ws_port`, and the current `bot1` root-token invariant. |
 | Codex start | Successful bridge launch | Covered | Drives `scripts/start-codex-session.sh`, builds the bridge tmux command, records the bridge PID, and leaves app-server spawning to bridge slices. |
-| Codex start | Stale MCP cleanup | Covered | Removes stale `discord-*` MCP blocks from the selected `CODEX_HOME/config.toml` while preserving unrelated MCP config and leaving the default Codex home untouched when `codex_home` is set. |
-| Codex start | Bridge environment construction | Covered | Asserts `CODEX_HOME`, `BOT_TOKEN`, `CHANNEL_ID`, `PROJECT_DIR`, `WS_PORT`, `ALLOWED_USER_IDS`, `GUILD_ID`, `ROOT_BOT_TOKEN`, `BOT_APP_ID`, and `BOT_DISPLAY_NAME` from registry fields. |
+| Codex start | Stale MCP cleanup | Covered | Removes stale `discord-*` MCP blocks from the selected `CODEX_HOME/config.toml` while preserving unrelated MCP config and leaving Desktop's default Codex home untouched when the shared home is set. |
+| Codex start | Bridge environment construction | Covered | Asserts the project/shared/default `CODEX_HOME` precedence plus `BOT_TOKEN`, channel, project, guild, root-bot, app-id, and model environment fields. |
 | Guest access | Project-scoped invite setup | Covered | Creates a project guest role keyed by channel, writes role and member-specific denies on managed/sibling channels, waits for target-user invite processing, updates bot allowlists after Discord setup succeeds, records the invite code, and returns a one-use invite. |
 | Guest access | Revoke | Covered | Removes the user from project config, bot allowlists, the project guest role, and any recorded outstanding invite codes only after Discord cleanup succeeds. |
 | Guest access | Grant failures | Covered | `grant` fails without persisting local access when the user is not already in the guild; invite/sync can still tolerate not-yet-joined users; invite setup fails closed when managed channel discovery fails. |
@@ -83,7 +83,7 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Stop session | Orphan listener sweep | Covered | Remaining Claude listeners, Codex bridge processes, and Codex app-server processes are found through fixture process state and terminated. |
 | Stop session | SIGTERM-resistant child fallback | Covered | A harness-owned child that ignores SIGTERM is removed by the stop script's SIGKILL fallback. |
 | Stop session | Missing Codex sweep fields | Covered | Missing channel, port, or app id skips the Codex listener sweep and documents the stderr warning. |
-| Root restart | Existing root cleanup and retry | Covered | Simulates `root_agent`, pane PID lookup, child `pkill`, first kill failure, retry, fresh launch, fast background sleep, and `send-keys Enter`. |
+| Root restart | Existing root cleanup and retry | Covered | Simulates cleanup and fresh launch, including the shared `CODEX_HOME` and higher-priority `ROOT_CODEX_HOME` override. |
 | Root restart | Launch failure diagnostics | Covered | Injected tmux `new-session` failure returns non-zero with command diagnostics and fixture state. |
 | Root restart | Teardown failure diagnostics | Covered | Cleanup failure after restart is recorded under fixture diagnostics. |
 | Live smoke | Default skip | Covered | Skips unless `CCDM_LIVE_E2E=1` and documented secrets are set. |

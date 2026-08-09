@@ -16,7 +16,7 @@ edges:
     condition: when performing a start, stop, or restart
   - target: patterns/register-project.md
     condition: when assigning or releasing a project bot
-last_updated: 2026-07-19
+last_updated: 2026-08-09
 ---
 
 # Session Management
@@ -35,7 +35,9 @@ Claude slash commands from project channels are relayed by the root bot through 
 
 ## Codex Lifecycle
 
-Use `scripts/start-codex-session.sh <project>`. It passes channel, guild, bot, allowlist, account, model, and WebSocket configuration to `codex-bridge.js`, which owns `codex app-server`. Optional `codex_home` isolates auth; model overrides use `codex_model`, `codex_reasoning_effort`, and `codex_service_tier`.
+Use `scripts/start-codex-session.sh <project>`. It passes channel, guild, bot, allowlist, account, model, and WebSocket configuration to `codex-bridge.js`, which owns `codex app-server`. A project's optional `codex_home` overrides the top-level shared `codex_home`; without either, projects use `~/.codex`. The root bridge resolves `ROOT_CODEX_HOME`, then the shared registry home, then ambient `CODEX_HOME`, then `~/.codex`. Model overrides use `codex_model`, `codex_reasoning_effort`, and `codex_service_tier`.
+
+After a Codex CLI upgrade, stop every long-lived CCDM Codex session before starting any replacement, then restart the root Codex bridge. Running app-server processes keep their original runtime version.
 
 Codex channels handle `/compact`, `/clear`, and `/restart` directly in the bridge.
 

@@ -15,7 +15,7 @@ edges:
     condition: when understanding how components connect during setup
   - target: context/discord-security.md
     condition: when configuring bot tokens, allowlists, roles, or channel permissions
-last_updated: 2026-07-19
+last_updated: 2026-08-09
 ---
 
 # Setup
@@ -37,7 +37,8 @@ last_updated: 2026-07-19
 - `DISCORD_BOT_TOKEN` (required per bot) - stored in each local Discord state directory, never in tracked files.
 - `DISCORD_STATE_DIR` (required for Claude sessions) - selects the assigned bot's plugin state.
 - `CLAUDE_CONFIG_DIR` (optional) - selects a secondary Claude account home.
-- `CODEX_HOME` (optional) - selects a Codex account home; defaults to `~/.codex`.
+- Top-level registry `codex_home` (optional) - selects one shared CCDM Codex home for root and project bridges; defaults to `~/.codex` when absent.
+- `ROOT_CODEX_HOME` (optional) - overrides the shared home for the root Codex bridge.
 - `CODEX_BRIDGE_TRANSCRIBE_AUDIO=0` (optional) - disables bridge voice transcription.
 - `CCDM_LIVE_E2E=1` (optional) - enables explicitly requested live smoke tests.
 

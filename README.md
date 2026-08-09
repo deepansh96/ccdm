@@ -56,8 +56,30 @@ an excerpt when available.
 ### Codex Accounts
 
 Codex bridge sessions use `CODEX_HOME` to choose which Codex login/profile to
-run under. By default, CCDM uses `~/.codex`, so existing Codex projects keep
-using your normal ChatGPT/subscription login.
+run under. For backward compatibility, CCDM uses `~/.codex` when no override
+is configured.
+
+To keep CCDM's model cache separate from ChatGPT Desktop and other Codex
+surfaces, add one top-level setting to `registry.json`:
+
+```json
+"codex_home": "~/.codex-ccdm"
+```
+
+Before starting CCDM with that setting, create the home, add
+`cli_auth_credentials_store = "file"` to `~/.codex-ccdm/config.toml`, and log
+in once:
+
+```bash
+mkdir -p ~/.codex-ccdm
+CODEX_HOME=$HOME/.codex-ccdm codex login
+CODEX_HOME=$HOME/.codex-ccdm codex login status
+```
+
+The top-level home becomes the default for the root Codex bridge and every
+Codex project. A project's own `codex_home` still wins, and `ROOT_CODEX_HOME`
+still overrides the root bridge. With the shared CCDM home enabled, CCDM does
+not read or rewrite Desktop's `~/.codex/models_cache.json`.
 
 To run selected projects with a secondary API-key account, create a separate
 Codex home and log in there:
@@ -86,8 +108,14 @@ that account:
 }
 ```
 
-Projects without `codex_home` continue to use `~/.codex`. Treat each
-`auth.json` under a Codex home like a password.
+Projects without their own `codex_home` use the top-level home, or `~/.codex`
+when the top-level setting is absent. Treat each `auth.json` under a Codex home
+like a password.
+
+After upgrading the Codex CLI, stop all long-lived CCDM Codex sessions before
+starting any of them again, then restart the root Codex bridge. Updating the
+binary does not replace already-running app-server processes, so a partial
+restart can mix runtime versions inside the shared CCDM home.
 
 Codex projects can also pin runtime settings per session:
 
@@ -146,6 +174,7 @@ If you prefer to set things up by hand:
      "discord_user_id": "123456789012345678",
      "guild_id": "YOUR_DISCORD_SERVER_ID",
      "max_pool_size": 50,
+     "codex_home": null,
      "project_bot_role_id": null,
      "category_ids": [],
      "pool": [],
