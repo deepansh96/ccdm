@@ -1171,6 +1171,7 @@ test("bridge restarts its own Codex session from slash command", async () => {
       },
     }, null, 2)}\n`,
   );
+  fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
   const codex = await startFakeCodexServer(workspace);
   const bridge = startBridge(workspace, { port: codex.port });
 

@@ -133,3 +133,8 @@ This audit maps the PRD workflow bullets from issue #4 to automated scenarios or
 | Live smoke | Live real-service checks | Covered | Default skip row verifies the Live Gate; issue #4 does not require a live-smoke scenario matrix. |
 | Diagnostics | Commands, streams, fixture state, file diffs, and redaction | Covered | Harness diagnostics rows above assert actionable failure context with secret redaction. |
 | Instruction-only root-agent workflows | Register, deregister, pool management, polls, context report, and other conversational workflows | Deferred | These remain Extraction Follow-Ups until implemented as executable surfaces. |
+| Codex start | Shared legacy Codex Home resolver | Covered | `scripts/start-codex-session.sh` invokes the shared resolver and records the resolved project/global/`~/.codex` selection in the tmux launch environment. |
+| Codex start | Selector validation | Covered | Null selectors are unset; empty, whitespace, wrong-typed, relative, and environment-variable-containing selectors fail with actionable errors. |
+| Codex start | Codex Home usability validation | Covered | Missing, non-directory, non-writable, broken-symlink, and unusable `config.toml` homes fail before MCP cleanup, tmux creation, or PID recording. |
+| Codex start | Symlink and path normalization | Covered | A valid symlink and a home path containing spaces and `.` components launch successfully while preserving the symlink path in `CODEX_HOME`. |
+| Codex start | Target-only validation scope | Covered | A broken legacy selector on an unrelated project does not block a valid target launch. |

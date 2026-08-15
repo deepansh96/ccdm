@@ -189,6 +189,9 @@ if os.path.exists(root_env):
         except Exception:
             pass
 allowed_user_ids = [r['discord_user_id']] + list(p.get('guest_user_ids') or [])
+def legacy_home_candidate(value):
+    return value if isinstance(value, str) and value.strip() else None
+legacy_home = legacy_home_candidate(p.get('codex_home')) or legacy_home_candidate(r.get('codex_home')) or '~/.codex'
 print('\t'.join([
     os.path.expanduser(p['path']),
     os.path.expanduser(bot['state_dir']),
@@ -202,7 +205,7 @@ print('\t'.join([
     root_bot_app_id,
     bot['app_id'],
     bot['id'],
-    os.path.expanduser(p.get('codex_home') or r.get('codex_home') or '~/.codex'),
+    os.path.expanduser(legacy_home),
     (p.get('bot_display_name') or '__NONE__'),
     '1' if p.get('text_reply_fallback') is True else '__NONE__',
     (p.get('codex_model') or p.get('model') or '__NONE__'),
@@ -210,6 +213,13 @@ print('\t'.join([
     (p.get('codex_service_tier') or p.get('service_tier') or '__NONE__'),
 ]))
 ")"
+
+if CODEX_HOME_DIR="$(python3 "$SCRIPT_DIR/resolve-codex-home.py" "$REGISTRY" "$PROJECT")"; then
+  :
+else
+  resolver_status=$?
+  exit "$resolver_status"
+fi
 
 if tmux has-session -t "=$SCREEN_NAME" 2>/dev/null; then
   echo "Session '$SCREEN_NAME' is already running."
