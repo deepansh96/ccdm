@@ -152,6 +152,12 @@ The Claude usage-report scenarios drive `scripts/claude-usage.sh` with fixture h
 - OAuth profile and usage routes are faked through `https://api.anthropic.com/api/oauth/{profile,usage}`. Malformed API responses are covered as current graceful warning behavior.
 - Scheduled Discord usage posting is handled outside the default E2E suite by a local LaunchAgent documented in `CLAUDE.local.md`. The removed tmux usage-loop scripts are no longer part of the tracked executable surface.
 
+The tracked `scripts/usage-stats-poster.py` scenarios drive the manual Discord posting surface with the same Test Workspace and Keychain fixture plus a local HTTP fake for Anthropic and Discord:
+
+- The poster reads an ignored root `.usage-stats-poster.json`, derives `registry.json` from the repository location, and posts a Claude-only embed with the registry root bot token. Codex discovery and LaunchAgent installation remain follow-up slices.
+- The tracked `.usage-stats-poster.example.json` contains placeholders only. Tests cover config validation, import/help no-I/O behavior, configured Claude API-account transcript cost estimates, Discord field truncation, missing credentials, malformed config, unreachable endpoints, and credential redaction.
+- `anthropic_base_url` and `discord_base_url` are optional config overrides used only to point default E2E scenarios at the local HTTP fake; production defaults remain the real service URLs.
+
 The nickname/statusline scenarios drive `scripts/cc-discord-nicknames.sh`, `scripts/cc-statusline-wrapper.sh`, and their shared `_update-nickname.sh` helper:
 
 - Project sessions read the fixture root bot token from fixture `HOME/.claude/channels/discord/.env`, resolve the project bot app id through the fixture registry, and send `PATCH /api/v10/guilds/:guild/members/:appId` through the shell-level fake `curl`.

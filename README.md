@@ -373,6 +373,16 @@ launchctl unload ~/Library/LaunchAgents/com.discord.usage-stats-poster.plist
 launchctl load ~/Library/LaunchAgents/com.discord.usage-stats-poster.plist
 ```
 
+CCDM also tracks the poster executable for manual runs. Copy the placeholder config to the ignored root config, edit the destination channel and any Claude API-account transcript paths, validate it, then post:
+
+```bash
+cp .usage-stats-poster.example.json .usage-stats-poster.json
+python3 scripts/usage-stats-poster.py --validate-config
+python3 scripts/usage-stats-poster.py
+```
+
+The tracked poster currently reports Claude usage; Codex account discovery and scheduled installation are separate follow-up surfaces.
+
 ## Context Nicknames
 
 CCDM can update each bot's Discord nickname to show its current context window usage — for example, `bot4-my-app · 42%`. This lets you see at a glance how much context each session has used, right from the Discord member list or channel messages.

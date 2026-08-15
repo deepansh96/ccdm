@@ -1,0 +1,9 @@
+{
+  "discord_channel_id": "REPLACE_WITH_DISCORD_CHANNEL_ID",
+  "claude_api_accounts": [
+    {
+      "path": "REPLACE_WITH_CLAUDE_API_CONFIG_PATH",
+      "label": "REPLACE_WITH_CLAUDE_API_ACCOUNT_LABEL"
+    }
+  ]
+}
