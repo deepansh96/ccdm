@@ -681,7 +681,7 @@ test("bridge handles approvals, active-turn steer, and stale-turn queue fallback
   const codex = await startFakeCodexServer(workspace, {
     steer: ["success", "failure"],
     turns: [
-      { approvals: true, delta: "first done", delayMs: 5000, startDelayMs: 10, turnId: "turn-active" },
+      { approvals: true, delta: "first done", startDelayMs: 10, turnId: "turn-active", waitForRelease: true },
       { delta: "queued done" },
     ],
   });
@@ -704,11 +704,17 @@ test("bridge handles approvals, active-turn steer, and stale-turn queue fallback
   };
 
   await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
-  injectDiscordMessage(workspace, { content: "first", id: "first" });
-  await bridge.waitForOutput(/\[discord\] Allowed User: first/, 5000);
+  await injectMessageUntil(
+    workspace,
+    { content: "first", id: "first" },
+    (nextState) => nextState.fixtures.codex.protocolEvents.some(
+      (event) => event.message?.method === "turn/start" && event.message.params.input?.[0]?.text === "first",
+    ),
+  );
   await new Promise((resolve) => setTimeout(resolve, 250));
   await injectAndWait({ content: "steer succeeds", id: "steer-succeeds" }, /\[steer\] Injected into active turn turn-active/);
   await injectAndWait({ content: "steer queues", id: "steer-queues" }, /\[steer\] Failed \(stale turn\), queuing instead/);
+  codex.releaseTurn("turn-active");
   const state = await waitForState(
     workspace,
     (nextState) => {
@@ -751,11 +757,11 @@ test("bridge drains queued messages after Codex reports a different active turn 
     turns: [
       {
         delta: "first done",
-        delayMs: 1000,
         startDelayMs: 10,
         turnId: "returned-turn",
         notificationTurnId: "actual-turn",
         omitTurnStarted: true,
+        waitForRelease: true,
       },
       { delta: "queued done" },
     ],
@@ -766,11 +772,17 @@ test("bridge drains queued messages after Codex reports a different active turn 
   });
 
   await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
-  injectDiscordMessage(workspace, { content: "first", id: "first-mismatch" });
-  await bridge.waitForOutput(/\[discord\] Allowed User: first/, 5000);
+  await injectMessageUntil(
+    workspace,
+    { content: "first", id: "first-mismatch" },
+    (nextState) => nextState.fixtures.codex.protocolEvents.some(
+      (event) => event.message?.method === "turn/start" && event.message.params.input?.[0]?.text === "first",
+    ),
+  );
   await new Promise((resolve) => setTimeout(resolve, 100));
   injectDiscordMessage(workspace, { content: "queued after mismatch", id: "queued-after-mismatch" });
   await bridge.waitForOutput(/\[steer\] Failed \(stale turn\), queuing instead/, 5000);
+  codex.releaseTurn("returned-turn");
 
   const state = await waitForState(
     workspace,
@@ -874,7 +886,7 @@ test("bridge queues compact during an active turn and runs it after completion",
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, {
     compactComplete: true,
-    turns: [{ delta: "busy done", delayMs: 200, startDelayMs: 10, turnId: "busy-turn" }],
+    turns: [{ delta: "busy done", startDelayMs: 10, turnId: "busy-turn", waitForRelease: true }],
   });
   const bridge = startBridge(workspace, {
     port: codex.port,
@@ -882,15 +894,13 @@ test("bridge queues compact during an active turn and runs it after completion",
   });
 
   await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
-  for (let attempt = 0; attempt < 3 && !/\[discord\] Allowed User: busy/.test(bridge.stdout); attempt++) {
-    injectDiscordMessage(workspace, { content: "busy", id: `busy-${attempt}` });
-    try {
-      await bridge.waitForOutput(/\[discord\] Allowed User: busy/, 5000);
-    } catch {
-      // Retry injection if the previous message landed before the shim poller was ready.
-    }
-  }
-  assert.match(bridge.stdout, /\[discord\] Allowed User: busy/);
+  await injectMessageUntil(
+    workspace,
+    { content: "busy", id: "busy-0" },
+    (nextState) => nextState.fixtures.codex.protocolEvents.some(
+      (event) => event.message?.method === "turn/start" && event.message.params.input?.[0]?.text === "busy",
+    ),
+  );
   await new Promise((resolve) => setTimeout(resolve, 80));
   await injectMessageUntil(
     workspace,
@@ -900,6 +910,7 @@ test("bridge queues compact during an active turn and runs it after completion",
     ),
     5000,
   );
+  codex.releaseTurn("busy-turn");
   const compactState = await waitForState(
     workspace,
     (nextState) => nextState.fixtures.discord.sends.some(
@@ -1085,7 +1096,7 @@ test("bridge clears during an active turn", async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, {
     threadIds: ["thread-before-clear", "thread-after-clear"],
-    turns: [{ delta: "busy done", delayMs: 60000, startDelayMs: 10, turnId: "busy-turn" }],
+    turns: [{ delta: "busy done", startDelayMs: 10, turnId: "busy-turn", waitForRelease: true }],
   });
   const bridge = startBridge(workspace, {
     port: codex.port,
@@ -1093,25 +1104,26 @@ test("bridge clears during an active turn", async () => {
   });
 
   await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
-  injectDiscordMessage(workspace, { content: "busy", id: "busy-before-clear" });
-  await bridge.waitForOutput(/\[discord\] Allowed User: busy/, 5000);
-  const state = await injectMessageUntil(
+  await injectMessageUntil(
+    workspace,
+    { content: "busy", id: "busy-before-clear" },
+    () => codex.clientMessages.some(
+      (message) => message.method === "turn/start" && message.params?.input?.[0]?.text === "busy",
+    ),
+  );
+  await injectMessageUntil(
     workspace,
     { content: "/clear", id: "clear-message" },
-    (nextState) => nextState.fixtures.discord.sends.some(
-      (send) => send.content.startsWith("Conversation cleared"),
-    ),
+    (nextState) =>
+      nextState.fixtures.discord.sends.some((send) => send.content.startsWith("Conversation cleared")) &&
+      codex.clientMessages.filter((message) => message.method === "thread/start").length === 2,
     15000,
   );
 
   assert.match(bridge.stdout, /\[clear\] Interrupted turn/);
-  assert.ok(state.fixtures.codex.protocolEvents.some(
-    (event) => event.message?.method === "thread/archive",
-  ));
+  assert.ok(codex.clientMessages.some((message) => message.method === "thread/archive"));
   assert.equal(
-    state.fixtures.codex.protocolEvents.filter(
-      (event) => event.message?.method === "thread/start",
-    ).length,
+    codex.clientMessages.filter((message) => message.method === "thread/start").length,
     2,
   );
   await bridge.stop();
@@ -1297,30 +1309,18 @@ test("bridge retries a terminal response.failed once before reporting it", async
     (nextState) => nextState.fixtures.discord.sends.some((send) => send.content === "Recovered response"),
     5000,
   );
-  const state = await waitForState(
-    workspace,
-    (nextState) => nextState.fixtures.codex.protocolEvents.some(
-      (event) =>
-        event.event === "client-message" &&
-        event.message.method === "turn/start" &&
-        event.message.params.input?.[0]?.text ===
-          "Retry the previous user request. The prior model response failed before any work began.",
-    ),
-    5000,
+  const recoveryTurn = codex.clientMessages.find(
+    (message) =>
+      message.method === "turn/start" &&
+      message.params.input?.[0]?.text ===
+        "Retry the previous user request. The prior model response failed before any work began.",
   );
+  assert.ok(recoveryTurn);
+  const state = readState(workspace.stateDir);
 
   assert.equal(
     state.fixtures.discord.sends.some((send) => send.content.startsWith("**Error:**")),
     false,
-  );
-  assert.ok(
-    state.fixtures.codex.protocolEvents.some(
-      (event) =>
-        event.event === "client-message" &&
-        event.message.method === "turn/start" &&
-        event.message.params.input?.[0]?.text ===
-          "Retry the previous user request. The prior model response failed before any work began.",
-    ),
   );
   await bridge.stop();
 });

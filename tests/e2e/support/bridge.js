@@ -138,12 +138,15 @@ export async function startFakeCodexServer(workspace, options = {}) {
   let serverRequestId = 10000;
   let threadStartCount = 0;
   const interruptedTurnIds = new Set();
+  const pendingTurnReleases = new Map();
+  const clientMessages = [];
   markCodexServer(workspace, port, { ready: true, ...(options.fixture ?? {}) });
 
   server.on("connection", (socket) => {
     recordCodexEvent(workspace, { event: "connection", port });
     socket.on("message", (data) => {
       const message = JSON.parse(data.toString());
+      clientMessages.push(message);
       recordCodexEvent(workspace, { event: "client-message", message });
       if (!message.method) return;
       if (message.method === "initialized") return;
@@ -233,7 +236,7 @@ export async function startFakeCodexServer(workspace, options = {}) {
             }
           }, plan.startDelayMs ?? plan.delayMs ?? 10);
           startTimer.unref?.();
-          const completionTimer = setTimeout(() => {
+          const completeTurn = () => {
             if (interruptedTurnIds.has(turnId)) return;
             for (const notification of plan.notificationsBeforeComplete ?? []) {
               notify(notification.method, {
@@ -274,12 +277,21 @@ export async function startFakeCodexServer(workspace, options = {}) {
             if (plan.complete !== false) {
               notify("turn/completed", { threadId: turnThreadId, turn: { id: notificationTurnId } });
             }
-          }, plan.delayMs ?? 10);
-          completionTimer.unref?.();
+            pendingTurnReleases.delete(turnId);
+          };
+          if (plan.waitForRelease) {
+            pendingTurnReleases.set(turnId, completeTurn);
+          } else {
+            const completionTimer = setTimeout(completeTurn, plan.delayMs ?? 10);
+            completionTimer.unref?.();
+          }
           break;
         }
         case "turn/interrupt":
-          if (message.params?.turnId) interruptedTurnIds.add(message.params.turnId);
+          if (message.params?.turnId) {
+            interruptedTurnIds.add(message.params.turnId);
+            pendingTurnReleases.delete(message.params.turnId);
+          }
           reply({});
           break;
         case "turn/steer": {
@@ -320,6 +332,12 @@ export async function startFakeCodexServer(workspace, options = {}) {
   return {
     port,
     server,
+    clientMessages,
+    releaseTurn(turnId) {
+      const release = pendingTurnReleases.get(turnId);
+      if (!release) throw new Error(`No pending fake turn release for ${turnId}`);
+      release();
+    },
     async close() {
       await new Promise((resolve) => server.close(resolve));
       markCodexServer(workspace, port, { ready: false });
