@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve and validate a legacy Codex Home for a project or root launch."""
+"""Resolve and validate a Codex Home for a project or root launch."""
 
 import json
 import os
@@ -33,6 +33,25 @@ def environment_selector(key: str, label: str) -> str | None:
     return value
 
 
+def codex_accounts(registry: dict[str, Any]) -> dict[str, str]:
+    accounts = registry.get("codex_accounts")
+    if accounts is None:
+        return {}
+    if not isinstance(accounts, dict):
+        raise ResolverError("codex_accounts must be an object mapping Codex Account Aliases to Codex Home paths")
+
+    validated: dict[str, str] = {}
+    for alias, home in accounts.items():
+        if not isinstance(alias, str) or not alias.strip():
+            raise ResolverError("codex_accounts must use non-empty Codex Account Alias names")
+        if not isinstance(home, str):
+            raise ResolverError(f"codex_accounts['{alias}'] must be a non-empty string Codex Home path")
+        if not home.strip():
+            raise ResolverError(f"codex_accounts['{alias}'] must not be empty or whitespace-only")
+        validated[alias] = home
+    return validated
+
+
 def expand_path(raw_path: str, label: str) -> str:
     if raw_path == "~" or raw_path.startswith("~/"):
         home = os.environ.get("HOME")
@@ -44,6 +63,16 @@ def expand_path(raw_path: str, label: str) -> str:
         raise ResolverError(f"{label} path '{raw_path}' must be absolute or use '~'")
 
     return os.path.normpath(raw_path)
+
+
+def validate_account_alias(accounts: dict[str, str], alias: str, label: str) -> None:
+    if alias not in accounts:
+        raise ResolverError(f"{label} refers to unknown Codex Account Alias '{alias}'")
+
+
+def resolve_account_home(accounts: dict[str, str], alias: str, label: str) -> str:
+    validate_account_alias(accounts, alias, label)
+    return validate_home(accounts[alias], f"Codex Account Alias '{alias}'")
 
 
 def validate_home(raw_path: str, label: str) -> str:
@@ -95,13 +124,30 @@ def resolve_codex_home(registry: dict[str, Any], project: str) -> str:
     if not isinstance(projects, dict) or project not in projects:
         raise ResolverError(f"project '{project}' is not present in registry.json")
     project_config = projects[project]
+    accounts = codex_accounts(registry)
 
     global_home = selector_value(registry, "codex_home", "top-level codex_home")
+    global_account = selector_value(registry, "default_codex_account", "default_codex_account")
     project_home = selector_value(project_config, "codex_home", f"project '{project}' codex_home")
+    project_account = selector_value(project_config, "codex_account", f"project '{project}' codex_account")
+
+    if project_account is not None and project_home is not None:
+        raise ResolverError(
+            f"project '{project}' cannot set both codex_account and codex_home at the same scope"
+        )
+    if global_account is not None and global_home is not None:
+        raise ResolverError("registry cannot set both default_codex_account and top-level codex_home at the same scope")
+    if global_account is not None:
+        validate_account_alias(accounts, global_account, "default_codex_account")
+
+    if project_account is not None:
+        return resolve_account_home(accounts, project_account, f"project '{project}' codex_account")
 
     if project_home is not None:
         selected_home = project_home
         selected_label = f"project '{project}' codex_home"
+    elif global_account is not None:
+        return resolve_account_home(accounts, global_account, "default_codex_account")
     elif global_home is not None:
         selected_home = global_home
         selected_label = "top-level codex_home"
@@ -117,7 +163,13 @@ def resolve_root_codex_home(registry: dict[str, Any]) -> str:
     if root_override is not None:
         return validate_home(root_override, "ROOT_CODEX_HOME")
 
+    accounts = codex_accounts(registry)
     global_home = selector_value(registry, "codex_home", "top-level codex_home")
+    global_account = selector_value(registry, "default_codex_account", "default_codex_account")
+    if global_account is not None and global_home is not None:
+        raise ResolverError("registry cannot set both default_codex_account and top-level codex_home at the same scope")
+    if global_account is not None:
+        return resolve_account_home(accounts, global_account, "default_codex_account")
     if global_home is not None:
         return validate_home(global_home, "top-level codex_home")
 

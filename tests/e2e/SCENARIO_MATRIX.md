@@ -127,6 +127,9 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Usage stats poster | Interval override and idempotent replacement | Covered | `--interval` changes `StartInterval`; repeated installation unloads before loading and converges to the same plist. |
 | Usage stats poster | Render validation and failure ordering | Covered | An invalid template fails with an actionable error before any `launchctl` call or replacement plist is loaded. |
 | Usage stats poster | Opt-in installation and manual post boundary | Covered | Installation reports launch state/log paths, makes no Discord request, and `setup.sh` never invokes the installer; live posting remains a separate manual command. |
+| Codex start | Named Codex Account selection | Covered | Project `codex_account` overrides the Default Codex Account, selector-free projects inherit `default_codex_account`, and legacy raw-home precedence remains observable in the recorded tmux `CODEX_HOME`. |
+| Codex start | Named selector validation and failure ordering | Covered | Malformed `codex_accounts`, null/empty/wrong-typed selectors, same-scope named/raw conflicts, unknown aliases, unusable aliased homes, and unrelated-project failures occur before MCP cleanup, tmux creation, or PID mutation. |
+| Root restart | Named Codex Account selection and override | Covered | Root restart resolves `default_codex_account`, preserves `ROOT_CODEX_HOME` as the higher-priority emergency override, rejects unknown/conflicting selectors before teardown, and re-reads a changed account selection on restart. |
 
 ## Phase-One Workflow Audit
 

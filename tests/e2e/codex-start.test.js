@@ -222,6 +222,278 @@ test("start-codex-session constructs a bridge tmux launch, removes stale MCP con
   assert.equal(state.fixtures.npm.invocations.length, 0);
 });
 
+test("start-codex-session launches a project under its Codex Account Alias home", async () => {
+  const workspace = createWorkspace();
+  const projectAccountHome = path.join(workspace.homeDir, ".codex-project-account");
+  fs.mkdirSync(projectAccountHome, { recursive: true });
+  const registrySeed = buildCodexRegistry(workspace);
+  registrySeed.codex_accounts = { "codex-project": projectAccountHome };
+  registrySeed.projects.alpha.codex_account = "codex-project";
+  seedRegistry(workspace, registrySeed);
+
+  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
+    args: ["alpha"],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.equal(
+    readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex.env.CODEX_HOME,
+    projectAccountHome,
+  );
+});
+
+test("start-codex-session inherits the Default Codex Account when a project has no selector", async () => {
+  const workspace = createWorkspace();
+  const defaultAccountHome = path.join(workspace.homeDir, ".codex-default-account");
+  fs.mkdirSync(defaultAccountHome, { recursive: true });
+  const registrySeed = buildCodexRegistry(workspace);
+  registrySeed.codex_accounts = { "codex-default": defaultAccountHome };
+  registrySeed.default_codex_account = "codex-default";
+  seedRegistry(workspace, registrySeed);
+
+  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
+    args: ["alpha"],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.equal(
+    readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex.env.CODEX_HOME,
+    defaultAccountHome,
+  );
+});
+
+test("start-codex-session rejects a project Codex Account Alias and Legacy Codex Home conflict", async () => {
+  const workspace = createWorkspace();
+  const accountHome = path.join(workspace.homeDir, ".codex-account");
+  const legacyHome = path.join(workspace.homeDir, ".codex-legacy");
+  fs.mkdirSync(accountHome, { recursive: true });
+  fs.mkdirSync(legacyHome, { recursive: true });
+  const registrySeed = buildCodexRegistry(workspace);
+  registrySeed.codex_accounts = { "codex-account": accountHome };
+  registrySeed.projects.alpha.codex_account = "codex-account";
+  registrySeed.projects.alpha.codex_home = legacyHome;
+  seedRegistry(workspace, registrySeed);
+
+  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
+    args: ["alpha"],
+  });
+
+  assert.notEqual(result.exitCode, 0);
+  assert.match(`${result.stdout}\n${result.stderr}`, /project 'alpha'.*(codex_account.*codex_home|codex_home.*codex_account)/);
+  const state = readState(workspace.stateDir);
+  assert.deepEqual(state.fixtures.tmux.sessions, {});
+  assert.equal(readRegistry(workspace).projects.alpha.pid, null);
+});
+
+test("start-codex-session rejects an unknown project Codex Account Alias without falling back", async () => {
+  const workspace = createWorkspace();
+  const configuredHome = path.join(workspace.homeDir, ".codex-configured");
+  fs.mkdirSync(configuredHome, { recursive: true });
+  const registrySeed = buildCodexRegistry(workspace);
+  registrySeed.codex_accounts = { configured: configuredHome };
+  registrySeed.projects.alpha.codex_account = "missing-account";
+  seedRegistry(workspace, registrySeed);
+
+  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
+    args: ["alpha"],
+  });
+
+  assert.notEqual(result.exitCode, 0);
+  assert.match(`${result.stdout}\n${result.stderr}`, /unknown Codex Account Alias 'missing-account'/);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {});
+  assert.equal(readRegistry(workspace).projects.alpha.pid, null);
+});
+
+test("start-codex-session rejects an unknown Default Codex Account even when the project has a legacy override", async () => {
+  const workspace = createWorkspace();
+  const legacyHome = path.join(workspace.homeDir, ".codex-legacy");
+  fs.mkdirSync(legacyHome, { recursive: true });
+  const registrySeed = buildCodexRegistry(workspace, { codexHome: legacyHome });
+  registrySeed.codex_accounts = { configured: path.join(workspace.homeDir, ".codex-configured") };
+  registrySeed.default_codex_account = "missing-account";
+  registrySeed.projects.alpha.codex_home = path.join(workspace.homeDir, ".codex-project-legacy");
+  fs.mkdirSync(registrySeed.projects.alpha.codex_home, { recursive: true });
+  seedRegistry(workspace, registrySeed);
+
+  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
+    args: ["alpha"],
+  });
+
+  assert.notEqual(result.exitCode, 0);
+  assert.match(`${result.stdout}\n${result.stderr}`, /default_codex_account.*unknown Codex Account Alias 'missing-account'/);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {});
+  assert.equal(readRegistry(workspace).projects.alpha.pid, null);
+});
+
+test("start-codex-session rejects malformed named-account maps and project selectors", async () => {
+  const cases = [
+    {
+      name: "map wrong type",
+      setup(registry) {
+        registry.codex_accounts = [];
+      },
+      message: /codex_accounts.*object mapping/,
+    },
+    {
+      name: "map value wrong type",
+      setup(registry) {
+        registry.codex_accounts = { configured: 42 };
+      },
+      message: /codex_accounts\['configured'\].*non-empty string/,
+    },
+    {
+      name: "empty project selector",
+      setup(registry, workspace) {
+        registry.codex_accounts = { configured: path.join(workspace.homeDir, ".codex-configured") };
+        registry.projects.alpha.codex_account = " ";
+      },
+      message: /project 'alpha' codex_account.*empty or whitespace-only/,
+    },
+    {
+      name: "wrong-typed project selector",
+      setup(registry, workspace) {
+        registry.codex_accounts = { configured: path.join(workspace.homeDir, ".codex-configured") };
+        registry.projects.alpha.codex_account = 42;
+      },
+      message: /project 'alpha' codex_account.*non-empty string/,
+    },
+  ];
+
+  for (const invalidCase of cases) {
+    const workspace = createWorkspace();
+    const registrySeed = buildCodexRegistry(workspace);
+    invalidCase.setup(registrySeed, workspace);
+    seedRegistry(workspace, registrySeed);
+
+    const result = await runScript(workspace, "scripts/start-codex-session.sh", {
+      args: ["alpha"],
+    });
+
+    assert.notEqual(result.exitCode, 0, invalidCase.name);
+    assert.match(`${result.stdout}\n${result.stderr}`, invalidCase.message, invalidCase.name);
+    assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {}, invalidCase.name);
+    assert.equal(readRegistry(workspace).projects.alpha.pid, null, invalidCase.name);
+  }
+});
+
+test("start-codex-session treats a null project Codex Account Alias as unset", async () => {
+  const workspace = createWorkspace();
+  const defaultAccountHome = path.join(workspace.homeDir, ".codex-default-account");
+  fs.mkdirSync(defaultAccountHome, { recursive: true });
+  const registrySeed = buildCodexRegistry(workspace);
+  registrySeed.codex_accounts = { "codex-default": defaultAccountHome };
+  registrySeed.default_codex_account = "codex-default";
+  registrySeed.projects.alpha.codex_account = null;
+  seedRegistry(workspace, registrySeed);
+
+  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
+    args: ["alpha"],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.equal(
+    readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex.env.CODEX_HOME,
+    defaultAccountHome,
+  );
+});
+
+test("start-codex-session applies Codex Home validation to an aliased home", async () => {
+  const cases = [
+    {
+      name: "missing",
+      setup(workspace) {
+        return path.join(workspace.homeDir, ".codex-missing-account");
+      },
+      message: /Codex Account Alias 'selected'.*does not exist/,
+    },
+    {
+      name: "non-directory",
+      setup(workspace) {
+        const selectedHome = path.join(workspace.homeDir, ".codex-account-file");
+        fs.writeFileSync(selectedHome, "not a directory\n");
+        return selectedHome;
+      },
+      message: /Codex Account Alias 'selected'.*not a directory/,
+    },
+    {
+      name: "inaccessible",
+      setup(workspace) {
+        const selectedHome = path.join(workspace.homeDir, ".codex-account-read-only");
+        fs.mkdirSync(selectedHome, { recursive: true });
+        fs.chmodSync(selectedHome, 0o555);
+        return selectedHome;
+      },
+      message: /Codex Account Alias 'selected'.*not writable/,
+    },
+    {
+      name: "unusable config",
+      setup(workspace) {
+        const selectedHome = path.join(workspace.homeDir, ".codex-account-config-directory");
+        fs.mkdirSync(path.join(selectedHome, "config.toml"), { recursive: true });
+        return selectedHome;
+      },
+      message: /Codex Account Alias 'selected'.*config\.toml.*not a regular file/,
+    },
+  ];
+
+  for (const invalidCase of cases) {
+    const workspace = createWorkspace();
+    const selectedHome = invalidCase.setup(workspace);
+    const registrySeed = buildCodexRegistry(workspace);
+    registrySeed.codex_accounts = { selected: selectedHome };
+    registrySeed.projects.alpha.codex_account = "selected";
+    seedRegistry(workspace, registrySeed);
+    const markerPath = path.join(selectedHome, "stale-mcp-marker");
+    if (invalidCase.name === "unusable config") {
+      fs.writeFileSync(markerPath, "stale\n");
+    }
+
+    const result = await runScript(workspace, "scripts/start-codex-session.sh", {
+      args: ["alpha"],
+    });
+
+    assert.notEqual(result.exitCode, 0, invalidCase.name);
+    assert.match(`${result.stdout}\n${result.stderr}`, invalidCase.message, invalidCase.name);
+    assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {}, invalidCase.name);
+    assert.equal(readRegistry(workspace).projects.alpha.pid, null, invalidCase.name);
+    if (invalidCase.name === "unusable config") {
+      assert.equal(fs.readFileSync(markerPath, "utf8"), "stale\n", invalidCase.name);
+    }
+  }
+});
+
+test("start-codex-session ignores a broken Codex Account Alias on an unrelated project", async () => {
+  const workspace = createWorkspace();
+  const selectedHome = path.join(workspace.homeDir, ".codex-selected");
+  fs.mkdirSync(selectedHome, { recursive: true });
+  const registrySeed = buildCodexRegistry(workspace, {
+    extraProjects: {
+      beta: {
+        path: path.join(workspace.tmpDir, "beta project"),
+        bot_id: "bot3",
+        screen_name: "beta_codex",
+        channel_id: "beta-channel-id",
+        type: "codex",
+        codex_account: "missing-account",
+        ws_port: 18343,
+        session_id: null,
+        pid: null,
+      },
+    },
+  });
+  registrySeed.codex_accounts = { selected: selectedHome };
+  registrySeed.projects.alpha.codex_account = "selected";
+  seedRegistry(workspace, registrySeed);
+
+  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
+    args: ["alpha"],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex.env.CODEX_HOME, selectedHome);
+  assert.equal(readRegistry(workspace).projects.beta.pid, null);
+});
+
 test("start-codex-session rejects a missing Codex home before lifecycle mutation", async () => {
   const workspace = createWorkspace();
   const missingHome = path.join(workspace.homeDir, ".codex-missing");
