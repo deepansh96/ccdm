@@ -35,13 +35,14 @@ Then read this file fully before doing anything else in this session.
 - Local Claude and Codex project bots can export an inclusive Discord message range to a temporary text file.
 - Codex Discord tools can read the last requested 1-10,000 messages in their scoped channel, returning larger reads as private temporary transcripts.
 - Per-project Claude and Codex account/model overrides are supported.
-- An optional top-level `codex_home` gives root and project Codex bridges one CCDM-only home while preserving per-project and root overrides.
-- Project Codex launches resolve and validate the selected legacy home before MCP cleanup, tmux creation, or PID recording through `scripts/resolve-codex-home.py`.
+- Named Codex Account aliases and `default_codex_account` select root and project Codex Homes, while legacy `codex_home` and root overrides remain supported.
+- Project Codex launches resolve and validate the selected named or legacy home before MCP cleanup, tmux creation, or PID recording through `scripts/resolve-codex-home.py`.
 - The Codex bridge retries a generic terminal `response.failed` once when the failed turn produced no agent work.
 - The Codex bridge can pause new turns in memory, queue incoming messages, and resume them in order.
 - The Codex bridge forwards allowed users' 👍 and 👎 reactions on its own messages to the active Codex thread.
 - The tracked Usage Stats Poster discovers named and legacy Codex Homes, deduplicates shared homes, and falls back from live rate limits to recent session JSONL data.
 - The opt-in `scripts/install-usage-stats-poster.sh` renders, validates, and idempotently loads a secret-free LaunchAgent for the tracked Usage Stats Poster.
+- Fresh setup output, `registry.example.json`, and the operator README expose generic named-account fields, precedence, migration, and rollback guidance without local credentials or account paths.
 
 **Not built:**
 - Remote VM lifecycle operations are documented but intentionally performed by the user on the remote host.

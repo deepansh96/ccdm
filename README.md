@@ -55,62 +55,100 @@ an excerpt when available.
 
 ### Codex Accounts
 
-Codex bridge sessions use `CODEX_HOME` to choose which Codex login/profile to
-run under. For backward compatibility, CCDM uses `~/.codex` when no override
-is configured.
-
-To keep CCDM's model cache separate from ChatGPT Desktop and other Codex
-surfaces, add one top-level setting to `registry.json`:
+CCDM names each Codex Account with a stable **Codex Account Alias**. The alias
+is the account identity; its mapped **Codex Home** is the directory containing
+that account's configuration, credentials, cache, and sessions. Configure
+aliases in the top level of `registry.json`:
 
 ```json
-"codex_home": "~/.codex-ccdm"
+"codex_accounts": {
+  "primary": "~/.codex-primary",
+  "secondary": "~/.codex-secondary"
+},
+"default_codex_account": "primary"
 ```
 
-Before starting CCDM with that setting, create the home, add
-`cli_auth_credentials_store = "file"` to `~/.codex-ccdm/config.toml`, and log
-in once:
-
-```bash
-mkdir -p ~/.codex-ccdm
-CODEX_HOME=$HOME/.codex-ccdm codex login
-CODEX_HOME=$HOME/.codex-ccdm codex login status
-```
-
-The top-level home becomes the default for the root Codex bridge and every
-Codex project. A project's own `codex_home` still wins, and `ROOT_CODEX_HOME`
-still overrides the root bridge. With the shared CCDM home enabled, CCDM does
-not read or rewrite Desktop's `~/.codex/models_cache.json`.
-
-To run selected projects with a secondary API-key account, create a separate
-Codex home and log in there:
-
-```bash
-mkdir -p ~/.codex-api
-printf '%s' "$OPENAI_API_KEY" | CODEX_HOME=$HOME/.codex-api codex login --with-api-key
-CODEX_HOME=$HOME/.codex-api codex login status
-```
-
-For the most predictable account separation, add this to
-`~/.codex-api/config.toml` before logging in:
-
-```toml
-cli_auth_credentials_store = "file"
-```
-
-Then add `codex_home` to any Codex project in `registry.json` that should use
-that account:
+The Default Codex Account is inherited by new Codex projects and by the root
+bridge unless a higher-priority selector is present. A project can opt into a
+non-default account with `codex_account`:
 
 ```json
 {
   "type": "codex",
   "ws_port": 18342,
-  "codex_home": "~/.codex-api"
+  "codex_account": "secondary"
 }
 ```
 
-Projects without their own `codex_home` use the top-level home, or `~/.codex`
-when the top-level setting is absent. Treat each `auth.json` under a Codex home
-like a password.
+The `codex_account` field is persisted on a project only when it selects a
+non-default account. Projects selecting the default, including new Codex
+projects, silently inherit `default_codex_account` and do not need a
+project-level selector.
+
+#### Login preparation
+
+Prepare every new Codex Home before starting a session. For a subscription
+account, create the directory, use file-backed credentials, and run the normal
+subscription `codex login`:
+
+```bash
+mkdir -p ~/.codex-secondary
+printf '%s\n' 'cli_auth_credentials_store = "file"' > ~/.codex-secondary/config.toml
+CODEX_HOME=$HOME/.codex-secondary codex login
+CODEX_HOME=$HOME/.codex-secondary codex login status
+```
+
+Do not use `--with-api-key` for a subscription account. Keep each `auth.json`
+and other credential contents private; never put them in the registry, README,
+or logs.
+
+#### Precedence and legacy compatibility
+
+The **Legacy Codex Home Override** is a raw `codex_home` path retained for
+registries that predate named accounts. A named selector and a raw-home
+selector at the same configuration scope are a hard error. Unknown aliases,
+empty selectors, and unusable selected homes also fail with an actionable
+error before stale MCP cleanup, tmux creation, PID mutation, or root-session
+teardown. CCDM uses `~/.codex` only when no configured selector applies.
+
+**Project precedence** (highest priority first):
+
+1. Project `codex_account` or project `codex_home`.
+2. Top-level `default_codex_account` or top-level Legacy Codex Home Override.
+3. `~/.codex`.
+
+**Root precedence** (highest priority first):
+
+1. `ROOT_CODEX_HOME`, the emergency direct-path override.
+2. Top-level `default_codex_account` or top-level Legacy Codex Home Override.
+3. Ambient `CODEX_HOME`.
+4. `~/.codex`.
+
+There is no `ROOT_CODEX_ACCOUNT`; use `ROOT_CODEX_HOME` when the registry
+needs to be bypassed during recovery. The bridge receives only the resolved
+absolute `CODEX_HOME`, never an alias.
+
+#### Manual migration checklist
+
+Migration is documented and operator-executed; `setup.sh` does not migrate an
+existing ignored `registry.json`:
+
+1. **Create and authenticate the new home.** Prepare the file-backed
+   subscription Codex Home and complete `codex login`.
+2. **Migrate the ignored `registry.json`.** Replace the top-level
+   `codex_home` with `codex_accounts` and `default_codex_account`; add
+   project `codex_account` only for projects that need a non-default account.
+3. **Restart every affected long-lived Codex project session and the root
+   Codex bridge.** Stop the old processes first, then start them again so each
+   process reads the current account selection.
+4. Verify each session's resolved account without recording credentials or
+   `auth.json` contents.
+
+**Rollback:** restore the previous top-level Legacy Codex Home Override (and
+remove named project selectors that are no longer needed), then restart every
+affected project and the root Codex bridge again. Keep the older external Usage
+Stats Poster directory and LaunchAgent until the tracked replacement has been
+verified; removing that rollback copy is a separate operation.
 
 After upgrading the Codex CLI, stop all long-lived CCDM Codex sessions before
 starting any of them again, then restart the root Codex bridge. Updating the
@@ -174,7 +212,8 @@ If you prefer to set things up by hand:
      "discord_user_id": "123456789012345678",
      "guild_id": "YOUR_DISCORD_SERVER_ID",
      "max_pool_size": 50,
-     "codex_home": null,
+     "codex_accounts": {},
+     "default_codex_account": null,
      "project_bot_role_id": null,
      "category_ids": [],
      "pool": [],

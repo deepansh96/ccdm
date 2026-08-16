@@ -2,7 +2,10 @@
   "discord_user_id": "YOUR_DISCORD_USER_ID",
   "guild_id": "YOUR_DISCORD_SERVER_ID",
   "max_pool_size": 50,
-  "codex_home": null,
+  "codex_accounts": {
+    "example-account": "~/.codex-example"
+  },
+  "default_codex_account": "example-account",
   "project_bot_role_id": null,
   "category_ids": [],
   "pool": [],

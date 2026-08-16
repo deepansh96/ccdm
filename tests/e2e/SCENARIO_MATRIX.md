@@ -161,3 +161,6 @@ This audit maps the PRD workflow bullets from issue #4 to automated scenarios or
 | Usage stats poster | No-I/O lifecycle paths | Covered | Import, `--help`, and `--validate-config` run without registry, Keychain, token, or network access. |
 | Usage stats poster | Claude API-account estimates | Covered | Synthetic transcript JSONL verifies message deduplication, hand-authored token/cost formatting, and Discord field truncation. |
 | Usage stats poster | Safe failure output | Covered | Missing or malformed config, missing Keychain credentials, and unreachable Anthropic/Discord endpoints produce useful output without credential leakage. |
+| Setup | Named account registry template | Covered | The real fresh `setup.sh` surface emits empty `codex_accounts` and null `default_codex_account` fields without the legacy `codex_home` key. |
+| Setup | Generic registry example | Covered | `registry.example.json` parses as JSON and uses generic placeholder aliases and Codex Home paths. |
+| Documentation | Named account operator documentation | Covered | README documents alias/home terminology, both-scope precedence, validation failures, login preparation, persistence, migration, restart, and rollback. |
