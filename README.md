@@ -397,8 +397,19 @@ The rendered LaunchAgent contains no token, channel ID, or poster configuration.
 
 The poster reports:
 - Claude Code limits from Anthropic OAuth APIs via the macOS Keychain credential
-- ChatGPT/Codex limits from local Codex session files under `~/.codex/sessions`
-- API-key Codex account token usage from `~/.codex-api/sessions`, once a project runs with `"codex_home": "~/.codex-api"`
+- ChatGPT/Codex limits for every alias in the top-level `codex_accounts`
+  registry map, with `default_codex_account` shown first and the remaining
+  aliases shown alphabetically
+- Local token-usage fallback from each named Codex Home's `sessions` directory
+  when live rate limits are unavailable
+
+The poster reads the same named-account registry configuration shown in
+[Codex Accounts](#codex-accounts); it does not need a separate list of Codex
+Homes. Aliases that resolve to the same Codex Home are reported only once.
+Older registries without `codex_accounts` remain supported: top-level and
+project-level raw `codex_home` paths are discovered as **Legacy Codex Home**
+entries. Direct `~/.codex` and `~/.codex-api` session paths are legacy
+compatibility examples, not the recommended configuration.
 
 Codex API-key session files currently expose token counts, not ChatGPT-style
 rate-limit percentages. OpenAI Platform usage/cost API reporting requires an API
