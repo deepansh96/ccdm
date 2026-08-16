@@ -20,6 +20,7 @@ const FIXTURE_TOOLS = new Set([
   "codex",
   "curl",
   "jq",
+  "launchctl",
   "npm",
   "npx",
   "pgrep",
@@ -184,6 +185,7 @@ function initialState() {
         uploads: [],
       },
       network: { blocked: [] },
+      launchctl: { invocations: [] },
       npm: { invocations: [] },
       npx: { invocations: [] },
       processes: [],
@@ -260,6 +262,7 @@ function normalizeState(value) {
       npm: { invocations: value?.fixtures?.npm?.invocations || [] },
       npx: { invocations: value?.fixtures?.npx?.invocations || [] },
       network: { blocked: value?.fixtures?.network?.blocked || [] },
+      launchctl: { invocations: value?.fixtures?.launchctl?.invocations || [] },
       processes: value?.fixtures?.processes || [],
       security: {
         credentials: value?.fixtures?.security?.credentials || {},
@@ -1009,6 +1012,22 @@ function runCodex() {
   setInterval(() => {}, 1000);
 }
 
+function runLaunchctl() {
+  const operation = args[0];
+  if (!["load", "unload", "list"].includes(operation)) {
+    console.error("unsupported launchctl invocation");
+    process.exit(2);
+  }
+  const target = args[1] || null;
+  updateState((state) => {
+    state.fixtures.launchctl.invocations.push({ operation, target });
+    return state;
+  });
+  if (operation === "list") {
+    process.stdout.write("-\\t0\\t" + (target || "") + "\\n");
+  }
+}
+
 switch (tool) {
   case "tmux":
     runTmux();
@@ -1027,6 +1046,9 @@ switch (tool) {
     break;
   case "codex":
     runCodex();
+    break;
+  case "launchctl":
+    runLaunchctl();
     break;
   case "curl":
     runCurl();

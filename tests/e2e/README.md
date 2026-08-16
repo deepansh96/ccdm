@@ -153,7 +153,7 @@ The Claude usage-report scenarios drive `scripts/claude-usage.sh` with fixture h
 - The `security` fixture supports `find-generic-password -s "Claude Code-credentials" -w`, records invocations, and returns test-seeded OAuth keychain JSON. Missing credentials make the script exercise its current graceful no-auth path.
 - The `curl` fixture records method, URL, path, query, headers, and body under `$CCDM_TEST_STATE`, matches extensible route entries by method/hostname/path/url, supports JSON and raw-body response modes, and blocks unapproved targets as network egress.
 - OAuth profile and usage routes are faked through `https://api.anthropic.com/api/oauth/{profile,usage}`. Malformed API responses are covered as current graceful warning behavior.
-- Scheduled Discord usage posting is handled outside the default E2E suite by a local LaunchAgent documented in `CLAUDE.local.md`. The removed tmux usage-loop scripts are no longer part of the tracked executable surface.
+- The `launchctl` fixture records LaunchAgent `unload`, `load`, and `list` calls under `$CCDM_TEST_STATE`; installer scenarios never touch the real user's LaunchAgents directory.
 
 The tracked `scripts/usage-stats-poster.py` scenarios drive the manual Discord posting surface with the same Test Workspace and Keychain fixture plus a local HTTP fake for Anthropic and Discord:
 
@@ -163,6 +163,7 @@ The tracked `scripts/usage-stats-poster.py` scenarios drive the manual Discord p
 - The tracked `.usage-stats-poster.example.json` contains placeholders only. Tests cover config validation, import/help no-I/O behavior, configured Claude API-account transcript cost estimates, Discord field truncation, missing credentials, malformed config, unreachable endpoints, and credential redaction.
 - Poster scenarios cover named-account ordering, shared-home deduplication and labeling, legacy fallback, unavailable homes, live-rate-limit failure and JSONL fallback, corrupt session records, and environment isolation.
 - `anthropic_base_url` and `discord_base_url` are optional config overrides used only to point default E2E scenarios at the local HTTP fake; production defaults remain the real service URLs.
+- `tests/e2e/usage-stats-installer.test.js` drives the opt-in LaunchAgent installer through the `launchctl` fixture and asserts absolute-path plist rendering, secret/config exclusion, interval overrides, invalid-render refusal, unload-before-load replacement, idempotency, launch-state/log reporting, no automatic Discord post, and unchanged `setup.sh` behavior.
 
 The nickname/statusline scenarios drive `scripts/cc-discord-nicknames.sh`, `scripts/cc-statusline-wrapper.sh`, and their shared `_update-nickname.sh` helper:
 

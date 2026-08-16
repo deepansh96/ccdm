@@ -341,9 +341,16 @@ Ask the root agent for a usage report by messaging `usage`, `limits`, or `how mu
 
 ## Scheduled Usage Stats Poster
 
-A separate macOS LaunchAgent can post usage stats to Discord on a schedule. This is the current live setup for automated usage reporting; it is not the old tmux-based `usage-report-loop.sh` flow.
+A separate, opt-in macOS LaunchAgent can post usage stats to Discord on a schedule. It is not installed by `setup.sh` and it is not the old tmux-based `usage-report-loop.sh` flow.
 
-The LaunchAgent runs a Python poster script every 30 minutes:
+The tracked installer renders and validates `~/Library/LaunchAgents/com.discord.usage-stats-poster.plist` with absolute paths to Python, Codex, the poster, and its logs. Reinstalling unloads the existing label before loading the new plist, so changing the interval is idempotent:
+
+```bash
+scripts/install-usage-stats-poster.sh                 # 1800 seconds (30 minutes)
+scripts/install-usage-stats-poster.sh --interval 900  # 15 minutes
+```
+
+The rendered LaunchAgent contains no token, channel ID, or poster configuration. The installer never sends a Discord request; it only schedules the poster.
 
 ```bash
 ~/Library/LaunchAgents/com.discord.usage-stats-poster.plist
@@ -362,26 +369,29 @@ Useful commands:
 
 ```bash
 launchctl list | grep usage-stats-poster
-tail -120 /tmp/usage-stats-poster.log
-tail -120 /tmp/usage-stats-poster.err
+tail -120 "${TMPDIR:-/tmp}/usage-stats-poster.log"
+tail -120 "${TMPDIR:-/tmp}/usage-stats-poster.err"
 ```
 
-After changing the plist interval or script path, reload it:
-
-```bash
-launchctl unload ~/Library/LaunchAgents/com.discord.usage-stats-poster.plist
-launchctl load ~/Library/LaunchAgents/com.discord.usage-stats-poster.plist
-```
-
-CCDM also tracks the poster executable for manual runs. Copy the placeholder config to the ignored root config, edit the destination channel and any Claude API-account transcript paths, validate it, then post:
+Configuration stays in the ignored root `.usage-stats-poster.json`. Start from the tracked placeholder example, edit the destination channel and any Claude API-account transcript paths, then validate it:
 
 ```bash
 cp .usage-stats-poster.example.json .usage-stats-poster.json
 python3 scripts/usage-stats-poster.py --validate-config
+```
+
+Run a live post separately after validation; installation never triggers this command:
+
+```bash
 python3 scripts/usage-stats-poster.py
 ```
 
-The tracked poster currently reports Claude usage; Codex account discovery and scheduled installation are separate follow-up surfaces.
+To roll back the schedule, unload and remove only CCDM's rendered LaunchAgent. Keep the older external poster directory and its LaunchAgent available until the replacement has been verified; deleting that external rollback copy is out of scope.
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.discord.usage-stats-poster.plist
+rm ~/Library/LaunchAgents/com.discord.usage-stats-poster.plist
+```
 
 ## Context Nicknames
 

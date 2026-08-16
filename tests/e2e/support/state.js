@@ -83,6 +83,9 @@ function initialState() {
       network: {
         blocked: [],
       },
+      launchctl: {
+        invocations: [],
+      },
       npm: {
         invocations: [],
       },
@@ -188,6 +191,9 @@ function normalizeState(value) {
       },
       network: {
         blocked: value?.fixtures?.network?.blocked ?? [],
+      },
+      launchctl: {
+        invocations: value?.fixtures?.launchctl?.invocations ?? [],
       },
       processes: value?.fixtures?.processes ?? [],
       registry: value?.fixtures?.registry ?? null,

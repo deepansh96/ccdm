@@ -106,7 +106,7 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Claude usage | Local stats summaries | Covered | Fixture `stats-cache.json` covers lifetime totals, daily averages, this-week, this-month, monthly breakdown, busiest days, day-of-week distribution, and streaks. |
 | Claude usage | History and sessions | Covered | Fixture `history.jsonl` and session JSON files cover project counts, session listing, and corrupt session JSON tolerance. |
 | Claude usage | Relative date logic | Covered | Stats fixture around the current test date asserts last-seven-days inclusion and current/longest streak behavior. |
-| Usage stats poster | LaunchAgent boundary | Documented | The real scheduled Discord poster is local LaunchAgent-driven and documented in CLAUDE.local.md, README.md, and CLAUDE.md rather than tracked as the removed tmux loop. |
+| Usage stats poster | LaunchAgent boundary | Covered | The tracked opt-in installer renders and loads the Usage Stats Poster LaunchAgent through the fixture `launchctl` boundary. |
 | Fixture contracts | `npx` no-network guard | Covered | Fake `npx -y ccstatusline@latest` returns deterministic statusline output, records stdin/args, and blocks unapproved package execution without network access. |
 | Fixture contracts | Discord nickname curl PATCH | Covered | Fake `curl` parses shell-level `PATCH /api/v10/guilds/:guild/members/:member`, records method, URL, headers, and body, and mirrors entries into the unified fake Discord nickname store. |
 | Nickname/statusline | Project app-id PATCH path | Covered | `cc-statusline-wrapper.sh` reads fixture root `.env`, resolves the project app id from registry state, records the app-id member PATCH, and returns deterministic `ccstatusline` output. |
@@ -122,6 +122,11 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Usage stats poster | Unavailable Codex Homes | Covered | Missing configured homes remain in the Discord report as unavailable and are not silently dropped or queried. |
 | Usage stats poster | Live limits and JSONL fallback | Covered | The fake `codex app-server --stdio` rate-limit response is preferred; failures fall back to hand-authored recent token-count JSONL while corrupt lines are ignored. |
 | Usage stats poster | Discovery environment isolation | Covered | A `ROOT_CODEX_HOME` environment value is ignored; only homes configured by the registry are queried and rendered. |
+| Fixture contracts | LaunchAgent fixture | Covered | The `launchctl` fixture records unload, load, and list calls without touching the host LaunchAgents service. |
+| Usage stats poster | Secret-free LaunchAgent rendering | Covered | Installer scenarios hand-author absolute Python, Codex, poster, and log paths plus the 1800-second default and assert no credentials, channel IDs, or config values are rendered. |
+| Usage stats poster | Interval override and idempotent replacement | Covered | `--interval` changes `StartInterval`; repeated installation unloads before loading and converges to the same plist. |
+| Usage stats poster | Render validation and failure ordering | Covered | An invalid template fails with an actionable error before any `launchctl` call or replacement plist is loaded. |
+| Usage stats poster | Opt-in installation and manual post boundary | Covered | Installation reports launch state/log paths, makes no Discord request, and `setup.sh` never invokes the installer; live posting remains a separate manual command. |
 
 ## Phase-One Workflow Audit
 
@@ -140,7 +145,7 @@ This audit maps the PRD workflow bullets from issue #4 to automated scenarios or
 | Nickname/statusline | Rate limiting, disable behavior, fixture root `.env`, PATCH construction, npx no-network statusline pipeline | Covered | Nickname/statusline and fixture contract rows above drive the nickname/statusline scripts. |
 | Root restart | Fixture tmux/process restart behavior without touching the real `root_agent` session | Covered | Root restart rows above drive `restart-root-agent.sh`. |
 | Root restart | Shared resolver validation before teardown | Covered | Root Codex restart rows above drive `restart-root-codex-agent.sh` and assert resolved launch homes plus failure ordering. |
-| Usage stats poster | Local LaunchAgent execution | Deferred | The poster depends on local macOS LaunchAgent state, live Discord posting, Keychain auth, and local Codex session files, so default E2E covers the reusable `claude-usage.sh` report but not the scheduler. |
+| Usage stats poster | Local LaunchAgent execution | Covered | The installer and plist are exercised against the local-fake `launchctl` boundary; live service execution and Discord delivery remain manual/opt-in operations. |
 | Live smoke | Live real-service checks | Covered | Default skip row verifies the Live Gate; issue #4 does not require a live-smoke scenario matrix. |
 | Diagnostics | Commands, streams, fixture state, file diffs, and redaction | Covered | Harness diagnostics rows above assert actionable failure context with secret redaction. |
 | Instruction-only root-agent workflows | Register, deregister, pool management, polls, context report, and other conversational workflows | Deferred | These remain Extraction Follow-Ups until implemented as executable surfaces. |
