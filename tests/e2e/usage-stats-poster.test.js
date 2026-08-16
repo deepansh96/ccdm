@@ -26,6 +26,7 @@ async function startPosterApi({ organization = { organization_type: "pro" } } = 
         body,
         method: request.method,
         path: request.url,
+        userAgent: request.headers["user-agent"],
       });
 
       if (request.method === "GET" && request.url === "/api/oauth/profile") {
@@ -135,6 +136,7 @@ test("poster posts a Claude usage embed through the configured Discord endpoint"
   const post = api.requests.find((request) => request.method === "POST");
   assert.ok(post);
   assert.equal(post.authorization, "Bot fixture-root-token");
+  assert.equal(post.userAgent, "ccdm-usage-stats-poster/1.0");
   const payload = JSON.parse(post.body);
   assert.equal(payload.embeds[0].title, "Usage Report");
   assert.deepEqual(payload.embeds[0].fields, [

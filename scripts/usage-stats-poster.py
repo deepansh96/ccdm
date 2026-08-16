@@ -654,6 +654,7 @@ def post_to_discord(config, bot_token, claude_value, codex_value=None):
         headers={
             "Authorization": f"Bot {bot_token}",
             "Content-Type": "application/json",
+            "User-Agent": "ccdm-usage-stats-poster/1.0",
         },
         method="POST",
     )
