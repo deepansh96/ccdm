@@ -396,7 +396,7 @@ The rendered LaunchAgent contains no token, channel ID, or poster configuration.
 ```
 
 The poster reports:
-- Claude Code limits from Anthropic OAuth APIs via the macOS Keychain credential
+- Claude Code limits from Anthropic OAuth APIs via the macOS Keychain credentials
 - ChatGPT/Codex limits for every alias in the top-level `codex_accounts`
   registry map, with `default_codex_account` shown first and the remaining
   aliases shown alphabetically
@@ -410,6 +410,20 @@ Older registries without `codex_accounts` remain supported: top-level and
 project-level raw `codex_home` paths are discovered as **Legacy Codex Home**
 entries. Direct `~/.codex` and `~/.codex-api` session paths are legacy
 compatibility examples, not the recommended configuration.
+
+Claude OAuth accounts are discovered from the default `~/.claude` login and
+valid extra `~/.claude-*` config directories. Each extra directory must have a
+`.claude.json` with an OAuth organization name or email address; that label is
+used in the report. Its Keychain service is derived from the first eight hex
+characters of the SHA-256 hash of the config-directory path, while the default
+login uses `Claude Code-credentials`. No account names or local paths are
+hardcoded in the poster.
+
+Named and legacy Codex selectors may be mixed across configuration scopes. The
+poster preserves named-account default-first ordering, adds selected/configured
+legacy homes, and deduplicates shared paths. It rejects the same-scope conflict
+between `default_codex_account` and top-level `codex_home` (and the analogous
+project-level `codex_account`/`codex_home` conflict).
 
 Codex API-key session files currently expose token counts, not ChatGPT-style
 rate-limit percentages. OpenAI Platform usage/cost API reporting requires an API

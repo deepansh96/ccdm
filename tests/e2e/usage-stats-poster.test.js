@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -12,8 +13,9 @@ test.afterEach(async () => {
   await cleanup();
 });
 
-async function startPosterApi({ organization = { organization_type: "pro" } } = {}) {
+async function startPosterApi({ organization = { organization_type: "pro" }, unauthorizedTokens = [] } = {}) {
   const requests = [];
+  const unauthorized = new Set(unauthorizedTokens);
   const server = http.createServer((request, response) => {
     let body = "";
     request.setEncoding("utf8");
@@ -30,6 +32,11 @@ async function startPosterApi({ organization = { organization_type: "pro" } } = 
       });
 
       if (request.method === "GET" && request.url === "/api/oauth/profile") {
+        if (unauthorized.has(request.headers.authorization?.replace(/^Bearer /, ""))) {
+          response.statusCode = 401;
+          response.end();
+          return;
+        }
         if (request.headers.authorization !== "Bearer fixture-oauth-token") {
           response.statusCode = 401;
           response.end();
@@ -46,6 +53,11 @@ async function startPosterApi({ organization = { organization_type: "pro" } } = 
         return;
       }
       if (request.method === "GET" && request.url === "/api/oauth/usage") {
+        if (unauthorized.has(request.headers.authorization?.replace(/^Bearer /, ""))) {
+          response.statusCode = 401;
+          response.end();
+          return;
+        }
         if (request.headers.authorization !== "Bearer fixture-oauth-token") {
           response.statusCode = 401;
           response.end();
@@ -159,6 +171,123 @@ test("poster posts a Claude usage embed through the configured Discord endpoint"
   ]);
 });
 
+test("poster discovers labeled extra Claude OAuth config directories with derived Keychain services", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const emailDir = path.join(workspace.homeDir, ".claude-email");
+  const organizationDir = path.join(workspace.homeDir, ".claude-organization");
+  fs.mkdirSync(emailDir);
+  fs.mkdirSync(organizationDir);
+  fs.writeFileSync(
+    path.join(emailDir, ".claude.json"),
+    `${JSON.stringify({ oauthAccount: { emailAddress: "fixture-email@example.test" } })}\n`,
+  );
+  fs.writeFileSync(
+    path.join(organizationDir, ".claude.json"),
+    `${JSON.stringify({ oauthAccount: { organizationName: "Fixture Organization" } })}\n`,
+  );
+  fs.mkdirSync(path.join(workspace.homeDir, ".claude-malformed"));
+  fs.writeFileSync(path.join(workspace.homeDir, ".claude-malformed", ".claude.json"), "{broken\n");
+  fs.writeFileSync(path.join(workspace.homeDir, ".claude-not-a-directory"), "fixture\n");
+  seedPosterWorkspace(workspace, api.baseUrl);
+
+  const serviceFor = (configDir) => `Claude Code-credentials-${crypto
+    .createHash("sha256")
+    .update(configDir)
+    .digest("hex")
+    .slice(0, 8)}`;
+  const emailService = serviceFor(emailDir);
+  const organizationService = serviceFor(organizationDir);
+  const state = readState(workspace.stateDir);
+  state.fixtures.security.credentials[emailService] = {
+    claudeAiOauth: { accessToken: "fixture-oauth-token" },
+  };
+  state.fixtures.security.credentials[organizationService] = {
+    claudeAiOauth: { accessToken: "fixture-oauth-token" },
+  };
+  writeState(state, workspace.stateDir);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const post = api.requests.find((request) => request.method === "POST");
+  assert.ok(post);
+  const claudeValue = JSON.parse(post.body).embeds[0].fields[0].value;
+  assert.match(claudeValue, /\*\*Personal\*\* \(Pro\)/);
+  assert.match(claudeValue, /\*\*fixture-email@example\.test\*\* \(Pro\)/);
+  assert.match(claudeValue, /\*\*Fixture Organization\*\* \(Pro\)/);
+  assert.deepEqual(
+    readState(workspace.stateDir).fixtures.security.invocations.map((entry) => entry.service),
+    ["Claude Code-credentials", emailService, organizationService],
+  );
+  assert.deepEqual(
+    api.requests.filter((request) => request.method === "GET").map((request) => request.path),
+    [
+      "/api/oauth/profile",
+      "/api/oauth/usage",
+      "/api/oauth/profile",
+      "/api/oauth/usage",
+      "/api/oauth/profile",
+      "/api/oauth/usage",
+    ],
+  );
+});
+
+test("poster gives each Claude OAuth HTTP 401 an account-specific login action", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi({
+    unauthorizedTokens: ["fixture-personal-401", "fixture-login-401", "fixture-refresh-401"],
+  });
+  const loginDir = path.join(workspace.homeDir, ".claude-login");
+  const refreshDir = path.join(workspace.homeDir, ".claude-refresh");
+  fs.mkdirSync(loginDir);
+  fs.mkdirSync(refreshDir);
+  fs.writeFileSync(
+    path.join(loginDir, ".claude.json"),
+    `${JSON.stringify({ oauthAccount: { organizationName: "Fixture Login" } })}\n`,
+  );
+  fs.writeFileSync(
+    path.join(refreshDir, ".claude.json"),
+    `${JSON.stringify({ oauthAccount: { organizationName: "Fixture Refresh" } })}\n`,
+  );
+  seedPosterWorkspace(workspace, api.baseUrl);
+  const serviceFor = (configDir) => `Claude Code-credentials-${crypto
+    .createHash("sha256")
+    .update(configDir)
+    .digest("hex")
+    .slice(0, 8)}`;
+  const loginService = serviceFor(loginDir);
+  const refreshService = serviceFor(refreshDir);
+  const state = readState(workspace.stateDir);
+  state.fixtures.security.credentials = {
+    "Claude Code-credentials": {
+      claudeAiOauth: { accessToken: "fixture-personal-401" },
+    },
+    [loginService]: {
+      claudeAiOauth: { accessToken: "fixture-login-401" },
+    },
+    [refreshService]: {
+      claudeAiOauth: { accessToken: "fixture-refresh-401", refreshToken: "fixture-refresh-token" },
+    },
+  };
+  writeState(state, workspace.stateDir);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const post = api.requests.find((request) => request.method === "POST");
+  assert.ok(post);
+  const claudeValue = JSON.parse(post.body).embeds[0].fields[0].value;
+  assert.match(claudeValue, /\*\*Personal\*\*[\s\S]*Needs re-login: `CLAUDE_CONFIG_DIR=~\/\.claude claude \/login`/);
+  assert.match(claudeValue, /\*\*Fixture Login\*\*[\s\S]*Needs re-login: `CLAUDE_CONFIG_DIR=~\/\.claude-login claude \/login`/);
+  assert.match(claudeValue, /\*\*Fixture Refresh\*\*[\s\S]*Auth expired — start a session on this account to refresh/);
+  assert.deepEqual(
+    readState(workspace.stateDir).fixtures.security.invocations.map((entry) => entry.service),
+    ["Claude Code-credentials", loginService, refreshService],
+  );
+  assert.equal(api.requests.filter((request) => request.method === "GET").length, 3);
+});
+
 test("poster uses N/A when the Claude organization value is malformed", async () => {
   const workspace = createWorkspace();
   const api = await startPosterApi({ organization: ["not", "an", "object"] });
@@ -264,7 +393,10 @@ test("poster reports named Codex Accounts in default-first alphabetical order", 
   );
   const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
   fs.writeFileSync(responsesPath, `${JSON.stringify({
-    [fs.realpathSync(defaultHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 12 }, secondary: { usedPercent: 34 } } },
+    [fs.realpathSync(defaultHome)]: {
+      rateLimits: { planType: "chatgpt", primary: { usedPercent: 12 }, secondary: { usedPercent: 34 } },
+      rateLimitResetCredits: { availableCount: 2 },
+    },
     [fs.realpathSync(alphaHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 56 }, secondary: { usedPercent: 78 } } },
     [fs.realpathSync(premiumHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 21 }, secondary: { usedPercent: 43 } } },
   }, null, 2)}\n`);
@@ -290,6 +422,58 @@ test("poster reports named Codex Accounts in default-first alphabetical order", 
   assert.match(codexValue, /\*\*codex-default\*\* \(ChatGPT\)[\s\S]*12%/);
   assert.match(codexValue, /\*\*codex-alpha\*\* \(ChatGPT\)[\s\S]*56%/);
   assert.match(codexValue, /\*\*codex-premium\*\* \(ChatGPT\)[\s\S]*21%/);
+  assert.match(codexValue, /\*\*codex-default\*\*[\s\S]*Full resets available: \*\*2\*\*/);
+});
+
+test("poster terminates a Codex process when stdout setup fails", async () => {
+  const workspace = createWorkspace();
+  const probe = path.join(workspace.repoDir, "codex-fd-cleanup-probe.py");
+  fs.writeFileSync(
+    probe,
+    `#!/usr/bin/env python3
+import runpy
+from pathlib import Path
+
+poster = runpy.run_path("scripts/usage-stats-poster.py", run_name="poster_fd_cleanup_probe")
+
+class BrokenStdout:
+    def fileno(self):
+        raise OSError("fixture stdout fd failure")
+
+class FakeStdin:
+    def close(self):
+        pass
+
+class FakeProcess:
+    def __init__(self):
+        self.stdin = FakeStdin()
+        self.stdout = BrokenStdout()
+        self.terminated = 0
+        self.killed = 0
+
+    def terminate(self):
+        self.terminated += 1
+
+    def kill(self):
+        self.killed += 1
+
+    def wait(self, timeout=None):
+        return 0
+
+process = FakeProcess()
+poster["subprocess"].Popen = lambda *args, **kwargs: process
+assert poster["read_codex_rate_limits"](Path("/fixture/codex")) is None
+assert process.terminated == 1
+assert process.killed == 0
+print("fd cleanup verified")
+`,
+  );
+  fs.chmodSync(probe, 0o755);
+
+  const result = await runScript(workspace, "codex-fd-cleanup-probe.py");
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /fd cleanup verified/);
 });
 
 test("poster deduplicates named aliases that share a Codex Home", async () => {
@@ -463,6 +647,106 @@ test("poster falls back to recent Codex session tokens after a live rate-limit f
   assert.doesNotMatch(codexValue, new RegExp(secretLikeText));
 });
 
+test("poster preserves stale rate-limit fallback age and ignores a newer malformed record", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const codexHome = path.join(workspace.homeDir, ".codex-stale-rate-limits");
+  fs.mkdirSync(path.join(codexHome, "sessions"), { recursive: true });
+  const now = Date.now();
+  const staleTimestamp = new Date(now - 12 * 60 * 1000).toISOString();
+  const newerTimestamp = new Date(now - 60 * 1000).toISOString();
+  fs.writeFileSync(
+    path.join(codexHome, "sessions", "rollout-fixture.jsonl"),
+    [
+      JSON.stringify({
+        type: "event_msg",
+        timestamp: staleTimestamp,
+        payload: {
+          type: "token_count",
+          rate_limits: { planType: "chatgpt", primary: { usedPercent: 28 } },
+        },
+      }),
+      JSON.stringify({
+        type: "event_msg",
+        timestamp: newerTimestamp,
+        payload: { type: "token_count", rate_limits: { primary: {} } },
+      }),
+    ].join("\n") + "\n",
+  );
+  seedPosterWorkspace(workspace, api.baseUrl);
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    `${JSON.stringify({
+      codex_accounts: { "codex-stale-rate-limits": codexHome },
+      default_codex_account: "codex-stale-rate-limits",
+      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      projects: {},
+    }, null, 2)}\n`,
+  );
+  const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
+  fs.writeFileSync(responsesPath, `${JSON.stringify({
+    [fs.realpathSync(codexHome)]: { mode: "error" },
+  }, null, 2)}\n`);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+    env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const post = api.requests.find((request) => request.method === "POST");
+  assert.ok(post);
+  const codexValue = JSON.parse(post.body).embeds[0].fields.find(({ name }) => name === "Codex").value;
+  assert.match(codexValue, /28%/);
+  assert.match(codexValue, /\*1[01-3]m ago\*/);
+});
+
+test("poster preserves stale token-count fallback age markers", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const codexHome = path.join(workspace.homeDir, ".codex-stale-token-count");
+  fs.mkdirSync(path.join(codexHome, "sessions"), { recursive: true });
+  const staleTimestamp = new Date(Date.now() - 11 * 60 * 1000).toISOString();
+  fs.writeFileSync(
+    path.join(codexHome, "sessions", "rollout-fixture.jsonl"),
+    `${JSON.stringify({
+      type: "event_msg",
+      timestamp: staleTimestamp,
+      payload: {
+        type: "token_count",
+        info: {
+          last_token_usage: { total_tokens: 321 },
+          total_token_usage: { total_tokens: 654 },
+        },
+      },
+    })}\n`,
+  );
+  seedPosterWorkspace(workspace, api.baseUrl);
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    `${JSON.stringify({
+      codex_accounts: { "codex-stale-token-count": codexHome },
+      default_codex_account: "codex-stale-token-count",
+      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      projects: {},
+    }, null, 2)}\n`,
+  );
+  const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
+  fs.writeFileSync(responsesPath, `${JSON.stringify({
+    [fs.realpathSync(codexHome)]: { mode: "error" },
+  }, null, 2)}\n`);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+    env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const post = api.requests.find((request) => request.method === "POST");
+  assert.ok(post);
+  const codexValue = JSON.parse(post.body).embeds[0].fields.find(({ name }) => name === "Codex").value;
+  assert.match(codexValue, /Last turn: \*\*321\*\* tokens/);
+  assert.match(codexValue, /\*1[01-3]m ago\*/);
+});
+
 test("poster discovers only registry Codex Homes, not ROOT_CODEX_HOME", async () => {
   const workspace = createWorkspace();
   const api = await startPosterApi();
@@ -500,6 +784,160 @@ test("poster discovers only registry Codex Homes, not ROOT_CODEX_HOME", async ()
   const codexValue = JSON.parse(post.body).embeds[0].fields.find(({ name }) => name === "Codex").value;
   assert.match(codexValue, /\*\*configured\*\*[\s\S]*17%/);
   assert.doesNotMatch(codexValue, /leaked/);
+});
+
+test("poster reports malformed named Codex registry fields instead of degrading silently", async () => {
+  const api = await startPosterApi();
+  const cases = [
+    {
+      registry: { codex_accounts: [], default_codex_account: null },
+      error: /codex_accounts must be an object mapping aliases to paths/,
+    },
+    {
+      registry: { codex_accounts: { configured: "/fixture/codex" }, default_codex_account: 42 },
+      error: /default_codex_account must be a non-empty alias or null/,
+    },
+    {
+      registry: { codex_accounts: { configured: "/fixture/codex" }, default_codex_account: "missing" },
+      error: /default_codex_account refers to unknown alias 'missing'/,
+    },
+    {
+      registry: {
+        codex_accounts: { configured: "/fixture/codex" },
+        default_codex_account: "configured",
+        codex_home: "/fixture/raw",
+      },
+      error: /cannot set both default_codex_account and top-level codex_home at the same scope/,
+    },
+    {
+      registry: {
+        codex_accounts: { configured: "/fixture/codex" },
+        projects: { project: { codex_account: "missing" } },
+      },
+      error: /project 'project' codex_account refers to unknown alias 'missing'/,
+    },
+    {
+      registry: {
+        codex_accounts: { configured: "/fixture/codex" },
+        projects: { project: { codex_account: "configured", codex_home: "/fixture/raw" } },
+      },
+      error: /project 'project' cannot set both codex_account and codex_home at the same scope/,
+    },
+  ];
+
+  for (const { registry, error } of cases) {
+    const workspace = createWorkspace();
+    seedPosterWorkspace(workspace, api.baseUrl);
+    fs.writeFileSync(
+      path.join(workspace.repoDir, "registry.json"),
+      `${JSON.stringify({
+        ...registry,
+        pool: [{ id: "bot1", token: "fixture-root-token" }],
+        projects: registry.projects ?? {},
+      }, null, 2)}\n`,
+    );
+
+    const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, error);
+    assert.equal(api.requests.filter((request) => request.method === "POST").length, 0);
+  }
+});
+
+test("poster merges named accounts with project legacy homes and deduplicates shared paths", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const defaultHome = path.join(workspace.homeDir, ".codex-named-default");
+  const namedOtherHome = path.join(workspace.homeDir, ".codex-named-other");
+  const projectHome = path.join(workspace.homeDir, ".codex-project");
+  fs.mkdirSync(defaultHome);
+  fs.mkdirSync(namedOtherHome);
+  fs.mkdirSync(projectHome);
+  seedPosterWorkspace(workspace, api.baseUrl);
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    `${JSON.stringify({
+      codex_accounts: {
+        "named-other": namedOtherHome,
+        "named-default": defaultHome,
+      },
+      default_codex_account: "named-default",
+      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      projects: {
+        "project-raw": { codex_home: projectHome },
+        "project-shared": { codex_home: namedOtherHome },
+      },
+    }, null, 2)}\n`,
+  );
+  const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
+  fs.writeFileSync(responsesPath, `${JSON.stringify({
+    [fs.realpathSync(defaultHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 11 } } },
+    [fs.realpathSync(namedOtherHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 22 } } },
+    [fs.realpathSync(projectHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 33 } } },
+  }, null, 2)}\n`);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+    env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const post = api.requests.find((request) => request.method === "POST");
+  assert.ok(post);
+  const codexValue = JSON.parse(post.body).embeds[0].fields.find(({ name }) => name === "Codex").value;
+  assert.deepEqual(
+    readState(workspace.stateDir).fixtures.codex.stdioInvocations.map(({ env }) => path.basename(env.CODEX_HOME)),
+    [".codex-named-default", ".codex-named-other", ".codex-project"],
+  );
+  assert.match(codexValue, /\*\*named-default\*\*[\s\S]*11%/);
+  assert.match(codexValue, /\*\*named-other\*\*[\s\S]*22%/);
+  assert.match(codexValue, /\*\*Legacy Codex Home\*\*[\s\S]*33%/);
+  assert.doesNotMatch(codexValue, /Legacy Codex Home 2/);
+});
+
+test("poster merges top-level legacy homes with named accounts when no top-level default is selected", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const alphaHome = path.join(workspace.homeDir, ".codex-named-alpha");
+  const zuluHome = path.join(workspace.homeDir, ".codex-named-zulu");
+  const topLegacyHome = path.join(workspace.homeDir, ".codex-top-legacy");
+  const projectLegacyHome = path.join(workspace.homeDir, ".codex-project-legacy");
+  for (const home of [alphaHome, zuluHome, topLegacyHome, projectLegacyHome]) fs.mkdirSync(home);
+  seedPosterWorkspace(workspace, api.baseUrl);
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    `${JSON.stringify({
+      codex_accounts: { "named-zulu": zuluHome, "named-alpha": alphaHome },
+      default_codex_account: null,
+      codex_home: topLegacyHome,
+      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      projects: { "project-legacy": { codex_home: projectLegacyHome } },
+    }, null, 2)}\n`,
+  );
+  const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
+  fs.writeFileSync(responsesPath, `${JSON.stringify({
+    [fs.realpathSync(alphaHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 14 } } },
+    [fs.realpathSync(zuluHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 25 } } },
+    [fs.realpathSync(topLegacyHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 36 } } },
+    [fs.realpathSync(projectLegacyHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 47 } } },
+  }, null, 2)}\n`);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+    env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const post = api.requests.find((request) => request.method === "POST");
+  assert.ok(post);
+  const codexValue = JSON.parse(post.body).embeds[0].fields.find(({ name }) => name === "Codex").value;
+  assert.deepEqual(
+    readState(workspace.stateDir).fixtures.codex.stdioInvocations.map(({ env }) => path.basename(env.CODEX_HOME)),
+    [".codex-named-alpha", ".codex-named-zulu", ".codex-top-legacy", ".codex-project-legacy"],
+  );
+  assert.match(codexValue, /\*\*named-alpha\*\*[\s\S]*14%/);
+  assert.match(codexValue, /\*\*named-zulu\*\*[\s\S]*25%/);
+  assert.match(codexValue, /\*\*Legacy Codex Home\*\*[\s\S]*36%/);
+  assert.match(codexValue, /\*\*Legacy Codex Home 2\*\*[\s\S]*47%/);
 });
 
 test("poster labels a shared home with the alphabetically first alias without a default", async () => {

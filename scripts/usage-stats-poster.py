@@ -2,6 +2,7 @@
 """Post configured Claude usage statistics to one Discord channel."""
 
 import argparse
+import hashlib
 import json
 import os
 import select
@@ -29,6 +30,14 @@ CLAUDE_PRICES = {
 
 class PosterError(Exception):
     """An actionable, safe-to-display poster error."""
+
+
+class PosterHTTPError(PosterError):
+    """An HTTP failure whose status can drive account-specific guidance."""
+
+    def __init__(self, label, status):
+        super().__init__(f"{label} request failed (HTTP {status})")
+        self.status = status
 
 
 def fmt_reset(reset_str, now):
@@ -179,12 +188,16 @@ def _read_oauth_credential(service):
         return None
     try:
         credential = json.loads(result.stdout.strip())
-        oauth = credential["claudeAiOauth"]
-        if not isinstance(oauth.get("accessToken"), str) or not oauth["accessToken"]:
-            return None
-        return oauth
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    except (TypeError, ValueError, json.JSONDecodeError):
         return None
+    if not isinstance(credential, dict):
+        return None
+    oauth = credential.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return None
+    if not isinstance(oauth.get("accessToken"), str) or not oauth["accessToken"]:
+        return None
+    return oauth
 
 
 def _request_json(base_url, endpoint, headers, label):
@@ -196,26 +209,78 @@ def _request_json(base_url, endpoint, headers, label):
     try:
         with urlopen(request, timeout=10) as response:
             if not 200 <= response.status < 300:
-                raise PosterError(f"{label} request failed (HTTP {response.status})")
+                raise PosterHTTPError(label, response.status)
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
-        raise PosterError(f"{label} request failed (HTTP {error.code})") from None
+        raise PosterHTTPError(label, error.code) from None
     except (URLError, TimeoutError, OSError, UnicodeDecodeError, json.JSONDecodeError):
         raise PosterError(f"{label} request failed; check the endpoint and try again") from None
 
 
-def get_claude_oauth_stats(base_url):
-    oauth = _read_oauth_credential("Claude Code-credentials")
+def claude_account_label(config_json_path):
+    """Return the account label stored by Claude Code, if it is usable."""
+    try:
+        data = json.loads(Path(config_json_path).read_text())
+    except (OSError, UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    oauth_account = data.get("oauthAccount")
+    if not isinstance(oauth_account, dict):
+        return None
+    for key in ("organizationName", "emailAddress"):
+        label = oauth_account.get(key)
+        if isinstance(label, str) and label.strip():
+            return label.strip()
+    return None
+
+
+def discover_claude_accounts():
+    """Return the default login and valid extra Claude config-dir logins.
+
+    Claude Code stores the default login in ``Claude Code-credentials`` and
+    derives each ``CLAUDE_CONFIG_DIR`` login's Keychain service from the first
+    eight hex characters of that config directory's SHA-256 hash.
+    """
+    accounts = [("Claude Code-credentials", "Personal", "~/.claude")]
+    try:
+        home = Path.home()
+        config_dirs = sorted(home.glob(".claude-*"))
+    except (OSError, RuntimeError, ValueError):
+        return accounts
+
+    for config_dir in config_dirs:
+        try:
+            if not config_dir.is_dir():
+                continue
+        except OSError:
+            continue
+        label = claude_account_label(config_dir / ".claude.json")
+        if not label:
+            continue
+        suffix = hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
+        accounts.append(
+            (
+                f"Claude Code-credentials-{suffix}",
+                label,
+                f"~/{config_dir.name}",
+            )
+        )
+    return accounts
+
+
+def get_claude_account_stats(base_url, service, label, dir_hint, missing_message=None):
+    oauth = _read_oauth_credential(service)
     if not oauth:
-        return "**Personal**\n*Could not get OAuth token*"
+        return missing_message
 
     expires_at = oauth.get("expiresAt")
     if expires_at:
         try:
             if float(expires_at) / 1000 < datetime.now(timezone.utc).timestamp():
                 if oauth.get("refreshToken"):
-                    return "**Personal**\n*OAuth token expired — start a session on this account to refresh*"
-                return "**Personal**\n*Needs re-login before usage can be fetched*"
+                    return f"**{label}**\n*OAuth token expired — start a session on this account to refresh*"
+                return _claude_relogin_block(label, dir_hint)
         except (TypeError, ValueError):
             pass
 
@@ -227,8 +292,14 @@ def get_claude_oauth_stats(base_url):
     try:
         profile = _request_json(base_url, "/api/oauth/profile", headers, "Anthropic profile")
         usage = _request_json(base_url, "/api/oauth/usage", headers, "Anthropic usage")
+    except PosterHTTPError as error:
+        if error.status == 401:
+            if oauth.get("refreshToken"):
+                return f"**{label}**\n*Auth expired — start a session on this account to refresh*"
+            return _claude_relogin_block(label, dir_hint)
+        return f"**{label}**\n*Anthropic usage is temporarily unavailable*"
     except PosterError:
-        return "**Personal**\n*Anthropic usage is temporarily unavailable*"
+        return f"**{label}**\n*Anthropic usage is temporarily unavailable*"
 
     organization = profile.get("organization") if isinstance(profile, dict) else None
     organization_type = organization.get("organization_type") if isinstance(organization, dict) else None
@@ -237,7 +308,7 @@ def get_claude_oauth_stats(base_url):
     else:
         plan = "N/A"
     now = datetime.now(timezone.utc)
-    lines = [f"**Personal** ({plan})"]
+    lines = [f"**{label}** ({plan})"]
     for key, limit_label in (("five_hour", "5-Hour"), ("seven_day", "7-Day")):
         data = usage.get(key) if isinstance(usage, dict) else None
         if not isinstance(data, dict):
@@ -249,6 +320,22 @@ def get_claude_oauth_stats(base_url):
     if isinstance(extra_usage, dict) and extra_usage.get("is_enabled"):
         lines.append(f"Extra usage: **${_safe_int(extra_usage.get('used_credits')) / 100:.2f}** spent")
     return "\n".join(lines)
+
+
+def _claude_relogin_block(label, dir_hint):
+    command = f"CLAUDE_CONFIG_DIR={dir_hint} claude /login"
+    return f"**{label}**\n*Needs re-login: `{command}`*"
+
+
+def get_claude_oauth_stats(base_url):
+    """Return the default Claude OAuth account block."""
+    return get_claude_account_stats(
+        base_url,
+        "Claude Code-credentials",
+        "Personal",
+        "~/.claude",
+        missing_message="**Personal**\n*Could not get OAuth token*",
+    )
 
 
 def _parse_url(value, field):
@@ -358,22 +445,7 @@ def _group_codex_accounts(entries, default_alias=None):
     return accounts
 
 
-def discover_codex_accounts(registry):
-    """Return configured Codex Account labels and resolved Codex Homes."""
-    named_accounts = registry.get("codex_accounts") if isinstance(registry, dict) else None
-    if isinstance(named_accounts, dict):
-        default_alias = registry.get("default_codex_account")
-        default_is_configured = isinstance(default_alias, str) and default_alias in named_accounts
-        aliases = [alias for alias in named_accounts if isinstance(alias, str) and alias.strip()]
-        ordered_aliases = []
-        if default_is_configured:
-            ordered_aliases.append(default_alias)
-        ordered_aliases.extend(sorted(alias for alias in aliases if alias != default_alias))
-        return _group_codex_accounts(
-            [(alias, named_accounts[alias]) for alias in ordered_aliases],
-            default_alias if default_is_configured else None,
-        )
-
+def _legacy_codex_accounts(registry, named_aliases=None):
     raw_homes = []
     if isinstance(registry.get("codex_home"), str):
         raw_homes.append(registry["codex_home"])
@@ -381,14 +453,89 @@ def discover_codex_accounts(registry):
     if isinstance(projects, dict):
         for project_name in sorted(projects):
             project = projects[project_name]
-            if isinstance(project, dict) and isinstance(project.get("codex_home"), str):
+            if not isinstance(project, dict):
+                continue
+            project_account = project.get("codex_account")
+            if project_account is not None:
+                if not isinstance(project_account, str) or not project_account.strip():
+                    raise PosterError(f"project {project_name!r} codex_account must be a non-empty alias or null")
+            if project.get("codex_account") is not None and project.get("codex_home") is not None:
+                raise PosterError(
+                    f"project {project_name!r} cannot set both codex_account and codex_home at the same scope"
+                )
+            if project_account is not None and (named_aliases is None or project_account not in named_aliases):
+                raise PosterError(
+                    f"project {project_name!r} codex_account refers to unknown alias {project_account!r}"
+                )
+            if isinstance(project.get("codex_home"), str):
                 raw_homes.append(project["codex_home"])
-    entries = [("Legacy Codex Home" if index == 0 else f"Legacy Codex Home {index + 1}", home)
-               for index, home in enumerate(raw_homes)]
+    entries = [
+        ("Legacy Codex Home" if index == 0 else f"Legacy Codex Home {index + 1}", home)
+        for index, home in enumerate(raw_homes)
+    ]
     accounts = _group_codex_accounts(entries)
     for index, account in enumerate(accounts):
         account["label"] = "Legacy Codex Home" if index == 0 else f"Legacy Codex Home {index + 1}"
     return accounts
+
+
+def _merge_codex_accounts(named_accounts, legacy_accounts):
+    """Merge named and legacy homes, preferring named labels on shared homes."""
+    merged = list(named_accounts)
+    seen_homes = {str(account["home"]) for account in merged if account["home"] is not None}
+    visible_legacy = []
+    for account in legacy_accounts:
+        home_key = str(account["home"]) if account["home"] is not None else None
+        if home_key is not None and home_key in seen_homes:
+            continue
+        if home_key is not None:
+            seen_homes.add(home_key)
+        visible_legacy.append(account)
+    for index, account in enumerate(visible_legacy):
+        account["label"] = "Legacy Codex Home" if index == 0 else f"Legacy Codex Home {index + 1}"
+    return merged + visible_legacy
+
+
+def discover_codex_accounts(registry):
+    """Return configured Codex Account labels and resolved Codex Homes."""
+    if not isinstance(registry, dict):
+        raise PosterError("registry.json must contain a JSON object")
+    top_default = registry.get("default_codex_account")
+    top_home = registry.get("codex_home")
+    if "codex_accounts" in registry:
+        named_accounts = registry["codex_accounts"]
+        if not isinstance(named_accounts, dict):
+            raise PosterError("registry.json codex_accounts must be an object mapping aliases to paths")
+        for alias, raw_home in named_accounts.items():
+            if not isinstance(alias, str) or not alias.strip():
+                raise PosterError("registry.json codex_accounts must use non-empty alias names")
+            if not isinstance(raw_home, str) or not raw_home.strip():
+                raise PosterError(f"registry.json codex_accounts[{alias!r}] must be a non-empty path")
+
+        if top_default is not None and top_home is not None:
+            raise PosterError("registry cannot set both default_codex_account and top-level codex_home at the same scope")
+        default_alias = top_default
+        if default_alias is not None:
+            if not isinstance(default_alias, str) or not default_alias.strip():
+                raise PosterError("registry.json default_codex_account must be a non-empty alias or null")
+            if default_alias not in named_accounts:
+                raise PosterError(
+                    f"registry.json default_codex_account refers to unknown alias {default_alias!r}"
+                )
+        aliases = list(named_accounts)
+        ordered_aliases = ([default_alias] if default_alias is not None else [])
+        ordered_aliases.extend(sorted(alias for alias in aliases if alias != default_alias))
+        named = _group_codex_accounts(
+            [(alias, named_accounts[alias]) for alias in ordered_aliases],
+            default_alias,
+        )
+        return _merge_codex_accounts(named, _legacy_codex_accounts(registry, set(named_accounts)))
+
+    if top_default is not None and top_home is not None:
+        raise PosterError("registry cannot set both default_codex_account and top-level codex_home at the same scope")
+    if top_default is not None:
+        raise PosterError("registry.json default_codex_account requires a codex_accounts object")
+    return _legacy_codex_accounts(registry)
 
 
 def _format_plan(value):
@@ -413,7 +560,27 @@ def _format_rate_limit_reset(value):
         return None
 
 
-def format_codex_rate_limits(rate_limits, label):
+def _format_age_marker(source_ts):
+    if not isinstance(source_ts, str) or not source_ts:
+        return None
+    try:
+        record_time = datetime.fromisoformat(source_ts.replace("Z", "+00:00"))
+        if record_time.tzinfo is None:
+            record_time = record_time.replace(tzinfo=timezone.utc)
+        age_minutes = int((datetime.now(timezone.utc) - record_time).total_seconds() / 60)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f"*{age_minutes}m ago*" if age_minutes > 5 else None
+
+
+def _valid_codex_rate_limits(value):
+    return isinstance(value, dict) and any(
+        isinstance(value.get(key), dict) and bool(value.get(key))
+        for key in ("primary", "secondary")
+    )
+
+
+def format_codex_rate_limits(rate_limits, label, reset_credits=None, source_ts=None):
     plan = _format_plan(rate_limits.get("planType", rate_limits.get("plan_type")))
     lines = [f"**{label}** ({plan})"]
     for key, window_label in (("primary", "5-Hour"), ("secondary", "7-Day")):
@@ -429,6 +596,13 @@ def format_codex_rate_limits(rate_limits, label):
         reset = _format_rate_limit_reset(data.get("resetsAt", data.get("resets_at")))
         reset_part = f"  resets in {reset}" if reset else ""
         lines.append(f"{window_label}: {text_bar(used_percent)}{reset_part}")
+    if reset_credits is None:
+        reset_credits = rate_limits.get("rateLimitResetCredits")
+    if isinstance(reset_credits, dict) and isinstance(reset_credits.get("availableCount"), int):
+        lines.append(f"Full resets available: **{reset_credits['availableCount']}**")
+    age_marker = _format_age_marker(source_ts)
+    if age_marker:
+        lines.append(age_marker)
     return "\n".join(lines)
 
 
@@ -448,11 +622,27 @@ def read_codex_rate_limits(codex_home):
     except (OSError, subprocess.SubprocessError):
         return None
 
+    def terminate_process():
+        try:
+            process.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            process.terminate()
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                process.kill()
+                process.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
     stdout_buffer = bytearray()
     try:
         stdout_fd = process.stdout.fileno()
         os.set_blocking(stdout_fd, False)
     except (AttributeError, OSError, ValueError):
+        terminate_process()
         return None
 
     def read_line(deadline):
@@ -533,23 +723,14 @@ def read_codex_rate_limits(codex_home):
         rate_limits = result.get("rateLimits")
         if not isinstance(rate_limits, dict):
             return None
+        rate_limits = dict(rate_limits)
+        if "rateLimitResetCredits" in result:
+            rate_limits["rateLimitResetCredits"] = result["rateLimitResetCredits"]
         return rate_limits
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
     finally:
-        try:
-            process.stdin.close()
-        except (OSError, ValueError):
-            pass
-        try:
-            process.terminate()
-            process.wait(timeout=2)
-        except (OSError, subprocess.TimeoutExpired):
-            try:
-                process.kill()
-                process.wait(timeout=2)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
+        terminate_process()
 
 
 def _latest_codex_session_data(codex_home):
@@ -558,6 +739,7 @@ def _latest_codex_session_data(codex_home):
         return None
     cutoff = time.time() - timedelta(days=7).total_seconds()
     latest = None
+    latest_rate_limit = None
     try:
         files = list(sessions_dir.rglob("*.jsonl"))
     except OSError:
@@ -581,16 +763,22 @@ def _latest_codex_session_data(codex_home):
                 info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
                 last_usage = info.get("last_token_usage") if isinstance(info.get("last_token_usage"), dict) else {}
                 total_usage = info.get("total_token_usage") if isinstance(info.get("total_token_usage"), dict) else {}
-                rate_limits = payload.get("rate_limits") if isinstance(payload.get("rate_limits"), dict) else None
-                if not last_usage and not total_usage and not rate_limits:
+                candidate_rate_limits = payload.get("rate_limits")
+                rate_limits = candidate_rate_limits if _valid_codex_rate_limits(candidate_rate_limits) else None
+                if not last_usage and not total_usage and rate_limits is None:
                     continue
                 timestamp = record.get("timestamp")
                 sort_key = (str(timestamp) if isinstance(timestamp, str) else "", modified)
                 if latest is None or sort_key >= latest[0]:
                     latest = (sort_key, rate_limits, last_usage, total_usage)
+                if rate_limits is not None and (latest_rate_limit is None or sort_key >= latest_rate_limit[0]):
+                    latest_rate_limit = (sort_key, rate_limits, last_usage, total_usage)
             except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
                 continue
-    return latest[1:] if latest is not None else None
+    if latest is None:
+        return None
+    source = latest_rate_limit or latest
+    return source[1], source[2], source[3], source[0][0]
 
 
 def get_codex_home_stats(codex_home, label):
@@ -604,14 +792,17 @@ def get_codex_home_stats(codex_home, label):
     session_data = _latest_codex_session_data(codex_home)
     if session_data is None:
         return f"**{label}**\n*Live rate limits unavailable; no recent usage data*"
-    rate_limits, last_usage, total_usage = session_data
+    rate_limits, last_usage, total_usage, source_ts = session_data
     if isinstance(rate_limits, dict):
-        return format_codex_rate_limits(rate_limits, label)
+        return format_codex_rate_limits(rate_limits, label, source_ts=source_ts)
     lines = [f"**{label}** (Codex)", "*Live rate limits unavailable*"]
     if last_usage:
         lines.append(f"Last turn: **{fmt_tokens(last_usage.get('total_tokens'))}** tokens")
     if total_usage:
         lines.append(f"Session total: **{fmt_tokens(total_usage.get('total_tokens'))}** tokens")
+    age_marker = _format_age_marker(source_ts)
+    if age_marker:
+        lines.append(age_marker)
     return "\n".join(lines)
 
 
@@ -627,6 +818,10 @@ def get_codex_stats(registry):
 
 def get_claude_stats(config):
     blocks = [get_claude_oauth_stats(config["anthropic_base_url"])]
+    for service, label, dir_hint in discover_claude_accounts()[1:]:
+        block = get_claude_account_stats(config["anthropic_base_url"], service, label, dir_hint)
+        if block:
+            blocks.append(block)
     for account in config["claude_api_accounts"]:
         if account["path"].is_dir():
             blocks.append(get_claude_api_stats(account["path"], account["label"]))
