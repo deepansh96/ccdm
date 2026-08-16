@@ -80,6 +80,30 @@ _Avoid_: tests only, undocumented harness
 The minimum pass/fail standard for the local-fake E2E suite to be considered complete.
 _Avoid_: coverage percentage, unit-test count
 
+**Codex Account**:
+An authenticated Codex identity that CCDM can use to start Codex sessions.
+_Avoid_: Codex Home, `CODEX_HOME`, profile directory
+
+**Codex Account Alias**:
+A stable, human-readable name for a **Codex Account**, mapped to one **Codex Home**.
+_Avoid_: home path, account folder
+
+**Codex Home**:
+The local directory that contains one Codex configuration, credentials, cache, and sessions.
+_Avoid_: Codex Account, Codex Account Alias
+
+**Default Codex Account**:
+The **Codex Account Alias** used by root and project Codex sessions that do not select another account.
+_Avoid_: default Codex Home, shared home
+
+**Legacy Codex Home Override**:
+A raw Codex home path retained for compatibility with configurations that predate **Codex Account Aliases**.
+_Avoid_: Codex Account Alias, named account
+
+**Usage Stats Poster**:
+The scheduled CCDM executable that reports configured Claude and Codex account usage to one Discord channel.
+_Avoid_: local poster script, usage daemon
+
 ## Relationships
 
 - The **End-to-End Test Suite** uses **Local Fakes** by default.
@@ -93,6 +117,10 @@ _Avoid_: coverage percentage, unit-test count
 - Default E2E runs use a **Test Workspace** and never read or write real CCDM state, Claude/Codex state, tmux sessions, keychain entries, or Discord credentials.
 - A **Live Gate** is required before any **Live Smoke Suite** test may use real external services.
 - The **Default CI Suite** runs the full local-fake E2E suite without real external services.
+- A **Codex Account Alias** maps one stable name to one **Codex Home**.
+- The **Default Codex Account** supplies the account for Codex sessions without a project override.
+- A **Legacy Codex Home Override** selects a raw path and is mutually exclusive with a named selector at the same configuration scope.
+- The **Usage Stats Poster** discovers Codex usage from configured **Codex Account Aliases** and deduplicates aliases that share one **Codex Home**.
 - The **Live Smoke Suite** stays narrow and checks only real-boundary drift such as Discord visibility, one session round trip, attachments, and cleanup.
 - A **Feature Regression** belongs in the suite only after the feature exists.
 - **Instruction-Only Workflows** should become **Extraction Follow-Ups**, not hidden scope inside the E2E suite issue.

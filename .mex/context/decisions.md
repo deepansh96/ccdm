@@ -16,10 +16,18 @@ edges:
     condition: when changing lifecycle or process ownership
   - target: context/discord-security.md
     condition: when changing channel isolation or reply authority
-last_updated: 2026-08-09
+last_updated: 2026-08-16
 ---
 
 # Decisions
+
+### Validate Codex homes before lifecycle mutation
+**Date:** 2026-08-16
+**Status:** Active
+**Decision:** Project Codex startup and root Codex restart use `scripts/resolve-codex-home.py` to resolve named or legacy selectors and validate the selected home before stale MCP cleanup, tmux creation, PID recording, or root-session teardown.
+**Reasoning:** A missing, malformed, or unusable home must fail with an actionable error without mutating a running project's configuration, registry state, or root listener. The resolver validates only global selectors and the target project's selectors for project launches; root restart applies its environment and top-level precedence without inspecting project entries.
+**Alternatives considered:** Keep inline shell/Python precedence and validate after launch setup; rejected because command substitution can mask failures and lifecycle mutation would already have occurred.
+**Consequences:** Successful project launches and root restarts pass only an absolute, normalized `CODEX_HOME` to the bridge. Named aliases use the same validation and precedence surface as legacy raw-home selectors; setup, the example registry, and operator documentation expose the generic configuration model.
 
 <!-- HOW TO USE THIS FILE:
      Each decision follows the format below.

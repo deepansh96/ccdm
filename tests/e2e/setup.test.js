@@ -13,6 +13,16 @@ test.afterEach(async () => {
   await cleanup();
 });
 
+test("registry example exposes generic named Codex account fields", () => {
+  const registryExample = JSON.parse(fs.readFileSync("registry.example.json", "utf8"));
+
+  assert.deepEqual(registryExample.codex_accounts, {
+    "example-account": "~/.codex-example",
+  });
+  assert.equal(registryExample.default_codex_account, "example-account");
+  assert.equal("codex_home" in registryExample, false);
+});
+
 test("setup creates a first-run registry, state files, and executable scripts", async () => {
   const workspace = createWorkspace();
 
@@ -28,6 +38,8 @@ test("setup creates a first-run registry, state files, and executable scripts", 
     discord_user_id: "123456789",
     guild_id: "987654321",
     max_pool_size: 50,
+    codex_accounts: {},
+    default_codex_account: null,
     project_bot_role_id: null,
     category_ids: [],
     pool: [],
@@ -101,6 +113,8 @@ test("setup overwrites an existing registry when requested", async () => {
     discord_user_id: "new-user",
     guild_id: "new-guild",
     max_pool_size: 50,
+    codex_accounts: {},
+    default_codex_account: null,
     project_bot_role_id: null,
     category_ids: [],
     pool: [],

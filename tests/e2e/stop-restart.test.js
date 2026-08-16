@@ -125,6 +125,15 @@ function codexAppServerCommand() {
   return "codex app-server --listen ws://127.0.0.1:18342";
 }
 
+function seedRootCodexFiles(workspace) {
+  const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
+  fs.mkdirSync(rootStateDir, { recursive: true });
+  fs.writeFileSync(path.join(rootStateDir, ".env"), "DISCORD_BOT_TOKEN=cm9vdC1hcHA.fixture.token\n");
+  fs.writeFileSync(path.join(rootStateDir, "access.json"), `${JSON.stringify({
+    groups: { "root-channel-id": { requireMention: false } },
+  })}\n`);
+}
+
 async function stopProject(workspace) {
   return runScript(workspace, "scripts/stop-session.sh", { args: ["alpha"] });
 }
@@ -291,6 +300,7 @@ test("restart-root-agent simulates root_agent cleanup, retry, fresh launch, and 
 test("restart-root-codex-agent starts the root bot through the Codex bridge", async () => {
   const workspace = createWorkspace();
   const codexHome = path.join(workspace.homeDir, ".codex-ccdm");
+  fs.mkdirSync(codexHome, { recursive: true });
   seedRegistry(workspace, buildRegistry(workspace, { codexHome }));
   const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
   fs.mkdirSync(rootStateDir, { recursive: true });
@@ -354,12 +364,122 @@ test("restart-root-codex-agent starts the root bot through the Codex bridge", as
   assert.equal(session.killAttempts, 2);
 });
 
+test("restart-root-codex-agent uses the Default Codex Account when no emergency override is set", async () => {
+  const workspace = createWorkspace();
+  const defaultAccountHome = path.join(workspace.homeDir, ".codex-default-account");
+  fs.mkdirSync(defaultAccountHome, { recursive: true });
+  const registry = buildRegistry(workspace, { sessionType: "codex" });
+  registry.codex_accounts = { "codex-default": defaultAccountHome };
+  registry.default_codex_account = "codex-default";
+  seedRegistry(workspace, registry);
+  seedRootCodexFiles(workspace);
+
+  const result = await runScript(workspace, "restart-root-codex-agent.sh", {
+    args: ["root-channel-id"],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent.env.CODEX_HOME, defaultAccountHome);
+});
+
+test("restart-root-codex-agent rejects malformed global named-account selectors before teardown", async () => {
+  const cases = [
+    {
+      name: "map wrong type",
+      setup(registry) {
+        registry.codex_accounts = [];
+        registry.default_codex_account = "configured";
+      },
+      message: /codex_accounts.*object mapping/,
+    },
+    {
+      name: "empty default selector",
+      setup(registry, workspace) {
+        registry.codex_accounts = { configured: path.join(workspace.homeDir, ".codex-configured") };
+        registry.default_codex_account = " ";
+      },
+      message: /default_codex_account.*empty or whitespace-only/,
+    },
+    {
+      name: "wrong-typed default selector",
+      setup(registry, workspace) {
+        registry.codex_accounts = { configured: path.join(workspace.homeDir, ".codex-configured") };
+        registry.default_codex_account = 42;
+      },
+      message: /default_codex_account.*non-empty string/,
+    },
+  ];
+
+  for (const invalidCase of cases) {
+    const workspace = createWorkspace();
+    const registry = buildRegistry(workspace, { sessionType: "codex" });
+    invalidCase.setup(registry, workspace);
+    seedRegistry(workspace, registry);
+    seedRootCodexFiles(workspace);
+
+    const result = await runScript(workspace, "restart-root-codex-agent.sh", {
+      args: ["root-channel-id"],
+    });
+
+    assert.notEqual(result.exitCode, 0, invalidCase.name);
+    assert.match(`${result.stdout}\n${result.stderr}`, invalidCase.message, invalidCase.name);
+    assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {}, invalidCase.name);
+  }
+});
+
+test("restart-root-codex-agent rejects an unknown Default Codex Account before root teardown", async () => {
+  const workspace = createWorkspace();
+  const registry = buildRegistry(workspace, { sessionType: "codex" });
+  registry.codex_accounts = { configured: path.join(workspace.homeDir, ".codex-configured") };
+  registry.default_codex_account = "missing-account";
+  seedRegistry(workspace, registry);
+  seedRootCodexFiles(workspace);
+  const panePid = spawnOwnedProcess(workspace, "zsh root pane");
+  const childPid = spawnOwnedProcess(workspace, "node scripts/codex-bridge.js", { ppid: panePid });
+  seedTmuxSession("root_agent", { panePid, paneOutput: "old root\n" }, { stateDir: workspace.stateDir });
+
+  const result = await runScript(workspace, "restart-root-codex-agent.sh", {
+    args: ["root-channel-id"],
+  });
+
+  assert.notEqual(result.exitCode, 0);
+  assert.match(`${result.stdout}\n${result.stderr}`, /unknown Codex Account Alias 'missing-account'/);
+  const state = readState(workspace.stateDir);
+  assert.equal(state.fixtures.tmux.sessions.root_agent.panePid, panePid);
+  assert.equal(isAlive(childPid), true);
+});
+
+test("restart-root-codex-agent rejects a Default Codex Account and Legacy Codex Home conflict", async () => {
+  const workspace = createWorkspace();
+  const accountHome = path.join(workspace.homeDir, ".codex-account");
+  const legacyHome = path.join(workspace.homeDir, ".codex-legacy");
+  fs.mkdirSync(accountHome, { recursive: true });
+  fs.mkdirSync(legacyHome, { recursive: true });
+  const registry = buildRegistry(workspace, { sessionType: "codex", codexHome: legacyHome });
+  registry.codex_accounts = { "codex-account": accountHome };
+  registry.default_codex_account = "codex-account";
+  seedRegistry(workspace, registry);
+  seedRootCodexFiles(workspace);
+
+  const result = await runScript(workspace, "restart-root-codex-agent.sh", {
+    args: ["root-channel-id"],
+  });
+
+  assert.notEqual(result.exitCode, 0);
+  assert.match(`${result.stdout}\n${result.stderr}`, /default_codex_account.*top-level codex_home/);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {});
+});
+
 test("restart-root-codex-agent keeps ROOT_CODEX_HOME above the shared home", async () => {
   const workspace = createWorkspace();
   const rootHome = path.join(workspace.homeDir, ".codex-root");
-  seedRegistry(workspace, buildRegistry(workspace, {
-    codexHome: path.join(workspace.homeDir, ".codex-ccdm"),
-  }));
+  const defaultAccountHome = path.join(workspace.homeDir, ".codex-default-account");
+  fs.mkdirSync(rootHome, { recursive: true });
+  fs.mkdirSync(defaultAccountHome, { recursive: true });
+  const registry = buildRegistry(workspace);
+  registry.codex_accounts = { "codex-default": defaultAccountHome };
+  registry.default_codex_account = "codex-default";
+  seedRegistry(workspace, registry);
   const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
   fs.mkdirSync(rootStateDir, { recursive: true });
   fs.writeFileSync(path.join(rootStateDir, ".env"), "DISCORD_BOT_TOKEN=cm9vdC1hcHA.fixture.token\n");
@@ -377,8 +497,182 @@ test("restart-root-codex-agent keeps ROOT_CODEX_HOME above the shared home", asy
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent.env.CODEX_HOME, rootHome);
 });
 
+test("restart-root-codex-agent validates the selected home before tearing down root_agent", async () => {
+  const workspace = createWorkspace();
+  const missingHome = path.join(workspace.homeDir, ".missing-root-codex");
+  seedRegistry(workspace, buildRegistry(workspace, { codexHome: missingHome }));
+  const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
+  fs.mkdirSync(rootStateDir, { recursive: true });
+  fs.writeFileSync(path.join(rootStateDir, ".env"), "DISCORD_BOT_TOKEN=cm9vdC1hcHA.fixture.token\n");
+  fs.writeFileSync(path.join(rootStateDir, "access.json"), `${JSON.stringify({
+    groups: { "root-channel-id": { requireMention: false } },
+  })}\n`);
+  const panePid = spawnOwnedProcess(workspace, "zsh root pane");
+  const childPid = spawnOwnedProcess(workspace, "node scripts/codex-bridge.js", { ppid: panePid });
+  seedTmuxSession("root_agent", { panePid, paneOutput: "old root\n" }, { stateDir: workspace.stateDir });
+
+  const result = await runScript(workspace, "restart-root-codex-agent.sh", {
+    args: ["root-channel-id"],
+  });
+
+  assert.notEqual(result.exitCode, 0);
+  assert.match(`${result.stdout}\n${result.stderr}`, /top-level codex_home.*does not exist/);
+  const state = readState(workspace.stateDir);
+  assert.equal(state.fixtures.tmux.sessions.root_agent.panePid, panePid);
+  assert.equal(isAlive(childPid), true);
+  assert.deepEqual(Object.keys(state.fixtures.tmux.sessions), ["root_agent"]);
+});
+
+test("restart-root-codex-agent rejects every invalid selected home before root teardown", async () => {
+  const cases = [
+    {
+      name: "missing",
+      setup(workspace) {
+        return path.join(workspace.homeDir, ".missing-root-codex");
+      },
+      message: /does not exist/,
+    },
+    {
+      name: "non-directory",
+      setup(workspace) {
+        const selectedHome = path.join(workspace.homeDir, ".root-codex-file");
+        fs.writeFileSync(selectedHome, "not a directory\n");
+        return selectedHome;
+      },
+      message: /not a directory/,
+    },
+    {
+      name: "inaccessible",
+      setup(workspace) {
+        const selectedHome = path.join(workspace.homeDir, ".root-codex-read-only");
+        fs.mkdirSync(selectedHome, { recursive: true });
+        fs.chmodSync(selectedHome, 0o555);
+        return selectedHome;
+      },
+      message: /not writable/,
+    },
+    {
+      name: "broken symlink",
+      setup(workspace) {
+        const selectedHome = path.join(workspace.homeDir, ".broken-root-codex");
+        fs.symlinkSync(path.join(workspace.tmpDir, "missing-root-target"), selectedHome, "dir");
+        return selectedHome;
+      },
+      message: /broken symlink/,
+    },
+    {
+      name: "unusable config",
+      setup(workspace) {
+        const selectedHome = path.join(workspace.homeDir, ".root-codex-config-directory");
+        fs.mkdirSync(path.join(selectedHome, "config.toml"), { recursive: true });
+        return selectedHome;
+      },
+      message: /config\.toml.*not a regular file/,
+    },
+    {
+      name: "empty selector",
+      setup() {
+        return "";
+      },
+      message: /top-level codex_home.*empty or whitespace-only/,
+    },
+    {
+      name: "wrong-typed selector",
+      setup() {
+        return 42;
+      },
+      message: /top-level codex_home.*non-empty string/,
+    },
+  ];
+
+  for (const invalidCase of cases) {
+    const workspace = createWorkspace();
+    const registry = buildRegistry(workspace);
+    registry.codex_home = invalidCase.setup(workspace);
+    seedRegistry(workspace, registry);
+    seedRootCodexFiles(workspace);
+    const panePid = spawnOwnedProcess(workspace, `zsh root pane (${invalidCase.name})`);
+    const childPid = spawnOwnedProcess(workspace, `node scripts/codex-bridge.js (${invalidCase.name})`, { ppid: panePid });
+    seedTmuxSession("root_agent", { panePid, paneOutput: "old root\n" }, { stateDir: workspace.stateDir });
+
+    const result = await runScript(workspace, "restart-root-codex-agent.sh", {
+      args: ["root-channel-id"],
+    });
+
+    assert.notEqual(result.exitCode, 0, invalidCase.name);
+    assert.match(`${result.stdout}\n${result.stderr}`, invalidCase.message, invalidCase.name);
+    const state = readState(workspace.stateDir);
+    assert.equal(state.fixtures.tmux.sessions.root_agent.panePid, panePid, invalidCase.name);
+    assert.equal(isAlive(childPid), true, invalidCase.name);
+    await cleanup();
+  }
+});
+
+test("restart-root-codex-agent uses ambient CODEX_HOME when the registry has no home", async () => {
+  const workspace = createWorkspace();
+  const ambientHome = path.join(workspace.homeDir, ".codex-ambient");
+  fs.mkdirSync(ambientHome, { recursive: true });
+  seedRegistry(workspace, buildRegistry(workspace));
+  seedRootCodexFiles(workspace);
+
+  const result = await runScript(workspace, "restart-root-codex-agent.sh", {
+    args: ["root-channel-id"],
+    env: { CODEX_HOME: ambientHome },
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent.env.CODEX_HOME, ambientHome);
+});
+
+test("restart-root-codex-agent lets ROOT_CODEX_HOME recover from a broken registry home", async () => {
+  const workspace = createWorkspace();
+  const rootHome = path.join(workspace.homeDir, ".codex-emergency");
+  fs.mkdirSync(rootHome, { recursive: true });
+  const registry = buildRegistry(workspace);
+  registry.codex_home = path.join(workspace.homeDir, ".broken-registry-codex");
+  seedRegistry(workspace, registry);
+  seedRootCodexFiles(workspace);
+
+  const result = await runScript(workspace, "restart-root-codex-agent.sh", {
+    args: ["root-channel-id"],
+    env: { ROOT_CODEX_HOME: rootHome },
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent.env.CODEX_HOME, rootHome);
+});
+
+test("restart-root-codex-agent re-reads the registry home on every restart", async () => {
+  const workspace = createWorkspace();
+  const firstHome = path.join(workspace.homeDir, ".codex-first");
+  const secondHome = path.join(workspace.homeDir, ".codex-second");
+  fs.mkdirSync(firstHome, { recursive: true });
+  fs.mkdirSync(secondHome, { recursive: true });
+  const registry = buildRegistry(workspace);
+  registry.codex_accounts = { first: firstHome, second: secondHome };
+  registry.default_codex_account = "first";
+  seedRegistry(workspace, registry);
+  seedRootCodexFiles(workspace);
+
+  const firstResult = await runScript(workspace, "restart-root-codex-agent.sh", {
+    args: ["root-channel-id"],
+  });
+  assert.equal(firstResult.exitCode, 0, firstResult.stderr || firstResult.stdout);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent.env.CODEX_HOME, firstHome);
+
+  registry.default_codex_account = "second";
+  fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), `${JSON.stringify(registry, null, 2)}\n`);
+
+  const secondResult = await runScript(workspace, "restart-root-codex-agent.sh", {
+    args: ["root-channel-id"],
+  });
+  assert.equal(secondResult.exitCode, 0, secondResult.stderr || secondResult.stdout);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent.env.CODEX_HOME, secondHome);
+});
+
 test("restart-root-codex-agent keeps the legacy default without home overrides", async () => {
   const workspace = createWorkspace();
+  fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
   seedRegistry(workspace, buildRegistry(workspace));
   const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
   fs.mkdirSync(rootStateDir, { recursive: true });

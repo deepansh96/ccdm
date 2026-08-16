@@ -47,7 +47,8 @@ The teardown manager exposes `registerTeardownCallback(fn)` and `cleanup()`. Cal
       "appServerInvocations": [],
       "bridgeInvocations": [],
       "protocolEvents": [],
-      "servers": {}
+      "servers": {},
+      "stdioInvocations": []
     },
     "curl": {
       "requests": [],
@@ -112,7 +113,13 @@ The tmux/process fixture contract covers the Claude start surface:
 The same tmux/process contract covers the Codex startup surface:
 
 - `tmux new-session -d -s <name> -- zsh -ic <command>` validates the bridge launch shape and records `CODEX_HOME`, `BOT_TOKEN`, `CHANNEL_ID`, `PROJECT_DIR`, `WS_PORT`, `ALLOWED_USER_IDS`, `GUILD_ID`, `ROOT_BOT_TOKEN`, `BOT_APP_ID`, and `BOT_DISPLAY_NAME`.
-- Codex startup tests seed registries with `type: "codex"`, `ws_port`, optional `codex_home`, placeholder bot tokens, app IDs, channel IDs, Discord user/guild values, and the current `bot1` root-token invariant.
+- Codex startup tests seed registries with `type: "codex"`, `ws_port`, named `codex_accounts`/ `default_codex_account` fields or optional legacy `codex_home`, placeholder bot tokens, app IDs, channel IDs, Discord user/guild values, and the current `bot1` root-token invariant.
+- `scripts/resolve-codex-home.py` validates named and legacy selectors and supports the root restart's `ROOT_CODEX_HOME` → top-level named/raw selector → ambient `CODEX_HOME` → `~/.codex` precedence through the same executable surface. It expands `~`, normalizes path components without resolving symlinks, and requires a usable home plus any present `config.toml` before project startup mutates MCP config, or before either launch path mutates tmux or registry state.
+- Named-account startup scenarios seed `codex_accounts`, `default_codex_account`, and project `codex_account` selectors, then assert project overrides, Default Codex Account inheritance, root selection, `ROOT_CODEX_HOME` precedence, and registry re-read through the recorded `CODEX_HOME`.
+- Named-account failures cover malformed alias maps, null/empty/wrong-typed selectors, same-scope named/raw conflicts, unknown aliases, aliased-home usability, and broken unrelated-project selectors while preserving the existing failure-ordering assertions.
+- Fresh setup and registry example scenarios assert generic named-account fields, the absence of the legacy `codex_home` key from fresh output, and placeholder-only values; the operator documentation audit checks the account model, precedence, login, persistence, migration, restart, and rollback guidance.
+- Codex resolver scenarios cover null versus malformed selectors, actionable failures for missing/non-directory/inaccessible homes and unusable `config.toml`, broken versus valid symlinks, paths with spaces, unresolved paths, and ignored broken selectors on unrelated projects. Successful scenarios assert the resolved `CODEX_HOME` in the recorded tmux launch; failure scenarios assert no tmux session, MCP cleanup, or PID mutation.
+- Root restart scenarios additionally assert ambient fallback, emergency `ROOT_CODEX_HOME` recovery over a broken registry home, current-registry re-read on repeated restarts, and preservation of the existing `root_agent` tmux session and listener process when root validation fails.
 - The fixture records only the bridge command construction. App-server spawning and WebSocket protocol behavior belong to later Codex bridge scenarios.
 - The `npm` fixture fails closed and records invocations so startup scenarios can prove Test Workspaces do not run package installation or contact npm.
 
@@ -131,6 +138,7 @@ The Codex bridge/basic-turn scenarios add child-scoped JavaScript interception. 
 - The `discord.js` shim exports `Client`, `GatewayIntentBits`, and `Partials`, records login/ready/channel fetch/typing/send behavior, and consumes test-injected gateway messages from `$CCDM_TEST_STATE`.
 - `startFakeCodexServer()` owns the fake Codex WebSocket protocol. It covers `initialize`/`initialized`, MCP status/delete/write/reload, `thread/start`, system and user `turn/start`, active-turn `turn/steer`, `thread/compact/start`, `thread/archive`, approval requests, agent deltas, MCP reply detection, context-compaction completion, token-usage notifications, WebSocket close, and startup no-thread-id failure.
 - The `codex` fixture validates `app-server --listen ws://127.0.0.1:<port>`, requires a harness-owned fake server for that port, records the invocation, and stays alive until the bridge exits.
+- The `codex` fixture also implements the poster's `app-server --stdio` JSON-RPC boundary, records one invocation per selected `CODEX_HOME`, and returns scenario-authored live rate-limit or failure responses.
 - Bridge control-flow scenarios cover successful steer, stale-turn queue fallback, queued reaction cleanup, `/compact`, `/clear`, `/restart`, compact/clear during an active turn, non-retryable Codex errors, guarded one-shot recovery from a generic terminal `response.failed`, MCP cleanup/registration failures, and command diagnostics.
 - Attachment scenarios cover empty messages, inline image data, fetched text attachments, binary downloads into `.discord-attachments`, attachment fetch failures, and Discord send failures. The Discord shim can reject `channel.send()` through fixture state so tests can assert the bridge's current failure diagnostics.
 
@@ -148,7 +156,19 @@ The Claude usage-report scenarios drive `scripts/claude-usage.sh` with fixture h
 - The `security` fixture supports `find-generic-password -s "Claude Code-credentials" -w`, records invocations, and returns test-seeded OAuth keychain JSON. Missing credentials make the script exercise its current graceful no-auth path.
 - The `curl` fixture records method, URL, path, query, headers, and body under `$CCDM_TEST_STATE`, matches extensible route entries by method/hostname/path/url, supports JSON and raw-body response modes, and blocks unapproved targets as network egress.
 - OAuth profile and usage routes are faked through `https://api.anthropic.com/api/oauth/{profile,usage}`. Malformed API responses are covered as current graceful warning behavior.
-- Scheduled Discord usage posting is handled outside the default E2E suite by a local LaunchAgent documented in `CLAUDE.local.md`. The removed tmux usage-loop scripts are no longer part of the tracked executable surface.
+- The `launchctl` fixture records LaunchAgent `unload`, `load`, and `list` calls under `$CCDM_TEST_STATE`; installer scenarios never touch the real user's LaunchAgents directory.
+
+The tracked `scripts/usage-stats-poster.py` scenarios drive the manual Discord posting surface with the same Test Workspace and Keychain fixture plus a local HTTP fake for Anthropic and Discord:
+
+- The poster reads an ignored root `.usage-stats-poster.json`, derives `registry.json` from the repository location, and posts Claude and configured Codex sections with the registry root bot token.
+- Claude OAuth discovery reports the default login plus valid extra `~/.claude-*` config directories, using each directory's `.claude.json` organization/email label and derived Keychain service; malformed or non-directory candidates are ignored.
+- Named Codex Account discovery uses `codex_accounts` with the Default Codex Account first, alphabetical remaining aliases, one query per unique Codex Home, and deterministic shared-home labels. Registries without named accounts fall back to top-level and project Legacy Codex Home overrides; malformed named-account fields fail visibly.
+- Valid mixed registries retain named-account ordering, add non-conflicting top-level/project Legacy Codex Homes, and deduplicate shared paths; same-scope named/raw selector conflicts fail visibly.
+- Missing or unreadable configured homes remain visible as unavailable. The poster tries live `codex app-server --stdio` rate limits first, renders available full-reset credits, then falls back to recent session JSONL token counts while ignoring corrupt or partial records and marking stale rate-limit/token-count data. It uses registry values only and never discovers `ROOT_CODEX_HOME` from its environment.
+- The tracked `.usage-stats-poster.example.json` contains placeholders only. Tests cover config validation, import/help no-I/O behavior, configured Claude API-account transcript cost estimates, Discord field truncation, missing credentials, malformed config, unreachable endpoints, and credential redaction.
+- Poster scenarios cover named-account ordering, shared-home deduplication and labeling, legacy fallback, malformed named-account validation, unavailable homes, full-reset metadata, live-rate-limit failure and stale JSONL fallback, corrupt session records, account-specific Claude 401 guidance, and environment isolation.
+- `anthropic_base_url` and `discord_base_url` are optional config overrides used only to point default E2E scenarios at the local HTTP fake; production defaults remain the real service URLs.
+- `tests/e2e/usage-stats-installer.test.js` drives the opt-in LaunchAgent installer through the `launchctl` fixture and asserts absolute-path plist rendering, secret/config exclusion, interval overrides, invalid-render refusal, unload-before-load replacement, idempotency, launch-state/log reporting, no automatic Discord post, and unchanged `setup.sh` behavior.
 
 The nickname/statusline scenarios drive `scripts/cc-discord-nicknames.sh`, `scripts/cc-statusline-wrapper.sh`, and their shared `_update-nickname.sh` helper:
 

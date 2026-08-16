@@ -38,6 +38,7 @@ function initialState() {
         bridgeInvocations: [],
         protocolEvents: [],
         servers: {},
+        stdioInvocations: [],
       },
       discord: {
         attachmentFetches: [],
@@ -81,6 +82,12 @@ function initialState() {
       },
       network: {
         blocked: [],
+      },
+      launchctl: {
+        invocations: [],
+        loaded: [],
+        loadFailuresRemaining: 0,
+        unloadFailuresRemaining: 0,
       },
       npm: {
         invocations: [],
@@ -132,6 +139,7 @@ function normalizeState(value) {
         bridgeInvocations: value?.fixtures?.codex?.bridgeInvocations ?? [],
         protocolEvents: value?.fixtures?.codex?.protocolEvents ?? [],
         servers: value?.fixtures?.codex?.servers ?? {},
+        stdioInvocations: value?.fixtures?.codex?.stdioInvocations ?? [],
       },
       discord: {
         ...initialState().fixtures.discord,
@@ -186,6 +194,12 @@ function normalizeState(value) {
       },
       network: {
         blocked: value?.fixtures?.network?.blocked ?? [],
+      },
+      launchctl: {
+        invocations: value?.fixtures?.launchctl?.invocations ?? [],
+        loaded: value?.fixtures?.launchctl?.loaded ?? [],
+        loadFailuresRemaining: value?.fixtures?.launchctl?.loadFailuresRemaining ?? 0,
+        unloadFailuresRemaining: value?.fixtures?.launchctl?.unloadFailuresRemaining ?? 0,
       },
       processes: value?.fixtures?.processes ?? [],
       registry: value?.fixtures?.registry ?? null,

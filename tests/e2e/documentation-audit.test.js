@@ -3,6 +3,7 @@ import fs from "node:fs";
 import test from "node:test";
 
 const readme = fs.readFileSync("tests/e2e/README.md", "utf8");
+const operatorReadme = fs.readFileSync("README.md", "utf8");
 const matrix = fs.readFileSync("tests/e2e/SCENARIO_MATRIX.md", "utf8");
 
 test("e2e documentation publishes the final coverage audit and follow-up boundaries", () => {
@@ -56,5 +57,49 @@ test("e2e documentation publishes the final coverage audit and follow-up boundar
     "Instruction-only root-agent workflows",
   ]) {
     assert.match(matrix, new RegExp(`\\| ${workflow} \\|`));
+  }
+});
+
+test("operator documentation publishes the named Codex account model", () => {
+  for (const phrase of [
+    "Codex Account Alias",
+    "Codex Home",
+    "codex_accounts",
+    "default_codex_account",
+    "codex_account",
+    "Project precedence",
+    "Root precedence",
+    "Legacy Codex Home Override",
+    "ROOT_CODEX_HOME",
+    "same configuration scope",
+    "unknown alias",
+    "cli_auth_credentials_store = \"file\"",
+    "subscription",
+    "codex login",
+    "persisted on a project only",
+    "Manual migration checklist",
+    "Create and authenticate the new home",
+    "migrate the ignored",
+    "restart every affected long-lived Codex project session",
+    "Rollback",
+  ]) {
+    assert.match(operatorReadme, new RegExp(phrase, "i"));
+  }
+
+  for (const workflow of [
+    "Named account registry template",
+    "Named account operator documentation",
+  ]) {
+    assert.match(matrix, new RegExp(`\\| ${workflow} \\|`));
+  }
+});
+
+test("e2e README records the named-account setup and documentation scenarios", () => {
+  for (const phrase of [
+    "Fresh setup and registry example scenarios",
+    "generic named-account fields",
+    "operator documentation",
+  ]) {
+    assert.match(readme, new RegExp(phrase, "i"));
   }
 });

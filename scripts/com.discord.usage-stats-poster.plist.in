@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+<key>Label</key>
+<string>com.discord.usage-stats-poster</string>
+<key>ProgramArguments</key>
+<array>
+<string>__PYTHON_PATH__</string>
+<string>__POSTER_PATH__</string>
+</array>
+<key>StartInterval</key>
+<integer>__INTERVAL__</integer>
+<key>EnvironmentVariables</key>
+<dict>
+<key>CCDM_CODEX_PATH</key>
+<string>__CODEX_PATH__</string>
+<key>PATH</key>
+<string>__CODEX_BIN_DIR__:/usr/bin:/bin</string>
+</dict>
+<key>StandardOutPath</key>
+<string>__STDOUT_PATH__</string>
+<key>StandardErrorPath</key>
+<string>__STDERR_PATH__</string>
+</dict>
+</plist>

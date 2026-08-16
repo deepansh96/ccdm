@@ -170,7 +170,7 @@ print(f"Recorded PID {pid}")
 PY
 }
 
-IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME BOT_TOKEN CHANNEL_ID WS_PORT DISCORD_USER_IDS GUILD_ID ROOT_TOKEN ROOT_BOT_APP_ID BOT_APP_ID BOT_ID CODEX_HOME_DIR BOT_DISPLAY_OVERRIDE TEXT_REPLY_FALLBACK_FLAG CODEX_MODEL_VALUE CODEX_REASONING_EFFORT_VALUE CODEX_SERVICE_TIER_VALUE <<< "$(python3 -c "
+IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME BOT_TOKEN CHANNEL_ID WS_PORT DISCORD_USER_IDS GUILD_ID ROOT_TOKEN ROOT_BOT_APP_ID BOT_APP_ID BOT_ID BOT_DISPLAY_OVERRIDE TEXT_REPLY_FALLBACK_FLAG CODEX_MODEL_VALUE CODEX_REASONING_EFFORT_VALUE CODEX_SERVICE_TIER_VALUE <<< "$(python3 -c "
 import base64, json, os, re
 r = json.load(open('$REGISTRY'))
 p = r['projects']['$PROJECT']
@@ -202,7 +202,6 @@ print('\t'.join([
     root_bot_app_id,
     bot['app_id'],
     bot['id'],
-    os.path.expanduser(p.get('codex_home') or r.get('codex_home') or '~/.codex'),
     (p.get('bot_display_name') or '__NONE__'),
     '1' if p.get('text_reply_fallback') is True else '__NONE__',
     (p.get('codex_model') or p.get('model') or '__NONE__'),
@@ -210,6 +209,13 @@ print('\t'.join([
     (p.get('codex_service_tier') or p.get('service_tier') or '__NONE__'),
 ]))
 ")"
+
+if CODEX_HOME_DIR="$(python3 "$SCRIPT_DIR/resolve-codex-home.py" "$REGISTRY" "$PROJECT")"; then
+  :
+else
+  resolver_status=$?
+  exit "$resolver_status"
+fi
 
 if tmux has-session -t "=$SCREEN_NAME" 2>/dev/null; then
   echo "Session '$SCREEN_NAME' is already running."

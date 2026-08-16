@@ -214,9 +214,8 @@ if [[ -z "$BOT_TOKEN" ]]; then
   exit 1
 fi
 
-IFS=$'\t' read -r REGISTRY_USER_ID GUILD_ID REGISTRY_ROOT_APP_ID REGISTRY_CODEX_HOME <<< "$(python3 - "$REGISTRY" <<'PY'
+IFS=$'\t' read -r REGISTRY_USER_ID GUILD_ID REGISTRY_ROOT_APP_ID <<< "$(python3 - "$REGISTRY" <<'PY'
 import json
-import os
 import sys
 
 registry = json.load(open(sys.argv[1]))
@@ -225,11 +224,16 @@ print("\t".join([
     str(registry.get("discord_user_id") or ""),
     str(registry.get("guild_id") or ""),
     str(root_bot.get("app_id") or ""),
-    os.path.expanduser(str(registry.get("codex_home") or "")),
 ]))
 PY
 )"
-CODEX_HOME_DIR="${ROOT_CODEX_HOME:-${REGISTRY_CODEX_HOME:-${CODEX_HOME:-$HOME/.codex}}}"
+
+if CODEX_HOME_DIR="$(python3 "$SCRIPT_DIR/scripts/resolve-codex-home.py" "$REGISTRY" --root)"; then
+  :
+else
+  resolver_status=$?
+  exit "$resolver_status"
+fi
 
 ALLOWED_USER_IDS="${ROOT_CODEX_ALLOWED_USER_IDS:-$(python3 - "$REGISTRY_USER_ID" "$ACCESS_FILE" <<'PY'
 import json

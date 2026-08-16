@@ -20,6 +20,7 @@ const FIXTURE_TOOLS = new Set([
   "codex",
   "curl",
   "jq",
+  "launchctl",
   "npm",
   "npx",
   "pgrep",
@@ -144,7 +145,7 @@ function initialState() {
     fixtures: {
       claude: { invocations: [] },
       curl: { requests: [], routes: [] },
-      codex: { appServerInvocations: [], bridgeInvocations: [], protocolEvents: [], servers: {} },
+      codex: { appServerInvocations: [], bridgeInvocations: [], protocolEvents: [], servers: {}, stdioInvocations: [] },
       discord: {
         attachmentFetches: [],
         attachments: {},
@@ -184,6 +185,7 @@ function initialState() {
         uploads: [],
       },
       network: { blocked: [] },
+      launchctl: { invocations: [], loaded: [], loadFailuresRemaining: 0, unloadFailuresRemaining: 0 },
       npm: { invocations: [] },
       npx: { invocations: [] },
       processes: [],
@@ -216,6 +218,7 @@ function normalizeState(value) {
         bridgeInvocations: value?.fixtures?.codex?.bridgeInvocations || [],
         protocolEvents: value?.fixtures?.codex?.protocolEvents || [],
         servers: value?.fixtures?.codex?.servers || {},
+        stdioInvocations: value?.fixtures?.codex?.stdioInvocations || [],
       },
       discord: {
         ...base.fixtures.discord,
@@ -259,6 +262,12 @@ function normalizeState(value) {
       npm: { invocations: value?.fixtures?.npm?.invocations || [] },
       npx: { invocations: value?.fixtures?.npx?.invocations || [] },
       network: { blocked: value?.fixtures?.network?.blocked || [] },
+      launchctl: {
+        invocations: value?.fixtures?.launchctl?.invocations || [],
+        loaded: value?.fixtures?.launchctl?.loaded || [],
+        loadFailuresRemaining: value?.fixtures?.launchctl?.loadFailuresRemaining || 0,
+        unloadFailuresRemaining: value?.fixtures?.launchctl?.unloadFailuresRemaining || 0,
+      },
       processes: value?.fixtures?.processes || [],
       security: {
         credentials: value?.fixtures?.security?.credentials || {},
@@ -906,7 +915,87 @@ function runSecurity() {
   process.stdout.write(JSON.stringify(credential));
 }
 
+function runCodexStdio() {
+  const state = readState();
+  const responseFile = process.env.CCDM_TEST_CODEX_STDIO_RESPONSES;
+  let responses = {};
+  if (responseFile) {
+    try {
+      responses = JSON.parse(fs.readFileSync(responseFile, "utf8"));
+    } catch (error) {
+      console.error("invalid fake Codex stdio response file");
+      process.exit(43);
+    }
+  }
+  const home = process.env.CODEX_HOME || "";
+  const configuredResponse = responses[home];
+  updateState((nextState) => {
+    nextState.fixtures.codex.stdioInvocations.push({
+      args,
+      cwd: process.cwd(),
+      env: { CODEX_HOME: home },
+      pid: process.pid,
+    });
+    return nextState;
+  });
+  const readline = require("node:readline");
+  const input = readline.createInterface({ input: process.stdin });
+  input.on("line", (line) => {
+    let request;
+    try {
+      request = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (request.method === "initialize") {
+      const initializeResponse = JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} });
+      if (configuredResponse?.mode === "buffered") {
+        process.stdout.write(
+          initializeResponse + "\\n" + JSON.stringify({
+            jsonrpc: "2.0",
+            id: 2,
+            result: configuredResponse.result,
+          }) + "\\n",
+        );
+      } else {
+        process.stdout.write(initializeResponse + "\\n");
+      }
+      return;
+    }
+    if (request.method !== "account/rateLimits/read") {
+      return;
+    }
+    if (!configuredResponse || configuredResponse.mode === "error") {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: "2.0",
+        id: request.id,
+        error: { code: -32000, message: "fixture rate limit failure" },
+      }) + "\\n");
+      return;
+    }
+    if (configuredResponse.mode === "malformed") {
+      process.stdout.write("not-json\\n");
+      return;
+    }
+    if (configuredResponse.mode === "non-object") {
+      process.stdout.write("[]\\n");
+      return;
+    }
+    process.stdout.write(JSON.stringify({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: configuredResponse,
+    }) + "\\n");
+  });
+  process.on("SIGTERM", () => process.exit(0));
+  process.on("SIGINT", () => process.exit(0));
+}
+
 function runCodex() {
+  if (args[0] === "app-server" && args.includes("--stdio")) {
+    runCodexStdio();
+    return;
+  }
   const listenIndex = args.indexOf("--listen");
   if (args[0] !== "app-server" || listenIndex === -1 || !args[listenIndex + 1]) {
     console.error("unsupported codex invocation");
@@ -943,6 +1032,47 @@ function runCodex() {
   setInterval(() => {}, 1000);
 }
 
+function runLaunchctl() {
+  const operation = args[0];
+  if (!["load", "unload", "list"].includes(operation)) {
+    console.error("unsupported launchctl invocation");
+    process.exit(2);
+  }
+  const target = args[1] || null;
+  let failed = false;
+  updateState((nextState) => {
+    const launchctl = nextState.fixtures.launchctl;
+    launchctl.invocations.push({ operation, target });
+    if (operation === "load" && launchctl.loadFailuresRemaining > 0) {
+      launchctl.loadFailuresRemaining -= 1;
+      failed = true;
+      return nextState;
+    }
+    if (operation === "unload" && launchctl.unloadFailuresRemaining > 0) {
+      launchctl.unloadFailuresRemaining -= 1;
+      failed = true;
+      return nextState;
+    }
+    const label = target ? path.basename(target).replace(/\.plist$/, "") : null;
+    if (operation === "load" && label && !launchctl.loaded.includes(label)) {
+      launchctl.loaded.push(label);
+    }
+    if (operation === "unload" && label) {
+      launchctl.loaded = launchctl.loaded.filter((entry) => entry !== label);
+    }
+    return nextState;
+  });
+  if (failed) {
+    process.exit(1);
+  }
+  if (operation === "list") {
+    if (!readState().fixtures.launchctl.loaded.includes(target)) {
+      process.exit(1);
+    }
+    process.stdout.write("-\\t0\\t" + (target || "") + "\\n");
+  }
+}
+
 switch (tool) {
   case "tmux":
     runTmux();
@@ -961,6 +1091,9 @@ switch (tool) {
     break;
   case "codex":
     runCodex();
+    break;
+  case "launchctl":
+    runLaunchctl();
     break;
   case "curl":
     runCurl();

@@ -55,62 +55,100 @@ an excerpt when available.
 
 ### Codex Accounts
 
-Codex bridge sessions use `CODEX_HOME` to choose which Codex login/profile to
-run under. For backward compatibility, CCDM uses `~/.codex` when no override
-is configured.
-
-To keep CCDM's model cache separate from ChatGPT Desktop and other Codex
-surfaces, add one top-level setting to `registry.json`:
+CCDM names each Codex Account with a stable **Codex Account Alias**. The alias
+is the account identity; its mapped **Codex Home** is the directory containing
+that account's configuration, credentials, cache, and sessions. Configure
+aliases in the top level of `registry.json`:
 
 ```json
-"codex_home": "~/.codex-ccdm"
+"codex_accounts": {
+  "primary": "~/.codex-primary",
+  "secondary": "~/.codex-secondary"
+},
+"default_codex_account": "primary"
 ```
 
-Before starting CCDM with that setting, create the home, add
-`cli_auth_credentials_store = "file"` to `~/.codex-ccdm/config.toml`, and log
-in once:
-
-```bash
-mkdir -p ~/.codex-ccdm
-CODEX_HOME=$HOME/.codex-ccdm codex login
-CODEX_HOME=$HOME/.codex-ccdm codex login status
-```
-
-The top-level home becomes the default for the root Codex bridge and every
-Codex project. A project's own `codex_home` still wins, and `ROOT_CODEX_HOME`
-still overrides the root bridge. With the shared CCDM home enabled, CCDM does
-not read or rewrite Desktop's `~/.codex/models_cache.json`.
-
-To run selected projects with a secondary API-key account, create a separate
-Codex home and log in there:
-
-```bash
-mkdir -p ~/.codex-api
-printf '%s' "$OPENAI_API_KEY" | CODEX_HOME=$HOME/.codex-api codex login --with-api-key
-CODEX_HOME=$HOME/.codex-api codex login status
-```
-
-For the most predictable account separation, add this to
-`~/.codex-api/config.toml` before logging in:
-
-```toml
-cli_auth_credentials_store = "file"
-```
-
-Then add `codex_home` to any Codex project in `registry.json` that should use
-that account:
+The Default Codex Account is inherited by new Codex projects and by the root
+bridge unless a higher-priority selector is present. A project can opt into a
+non-default account with `codex_account`:
 
 ```json
 {
   "type": "codex",
   "ws_port": 18342,
-  "codex_home": "~/.codex-api"
+  "codex_account": "secondary"
 }
 ```
 
-Projects without their own `codex_home` use the top-level home, or `~/.codex`
-when the top-level setting is absent. Treat each `auth.json` under a Codex home
-like a password.
+The `codex_account` field is persisted on a project only when it selects a
+non-default account. Projects selecting the default, including new Codex
+projects, silently inherit `default_codex_account` and do not need a
+project-level selector.
+
+#### Login preparation
+
+Prepare every new Codex Home before starting a session. For a subscription
+account, create the directory, use file-backed credentials, and run the normal
+subscription `codex login`:
+
+```bash
+mkdir -p ~/.codex-secondary
+printf '%s\n' 'cli_auth_credentials_store = "file"' > ~/.codex-secondary/config.toml
+CODEX_HOME=$HOME/.codex-secondary codex login
+CODEX_HOME=$HOME/.codex-secondary codex login status
+```
+
+Do not use `--with-api-key` for a subscription account. Keep each `auth.json`
+and other credential contents private; never put them in the registry, README,
+or logs.
+
+#### Precedence and legacy compatibility
+
+The **Legacy Codex Home Override** is a raw `codex_home` path retained for
+registries that predate named accounts. A named selector and a raw-home
+selector at the same configuration scope are a hard error. Unknown aliases,
+empty selectors, and unusable selected homes also fail with an actionable
+error before stale MCP cleanup, tmux creation, PID mutation, or root-session
+teardown. CCDM uses `~/.codex` only when no configured selector applies.
+
+**Project precedence** (highest priority first):
+
+1. Project `codex_account` or project `codex_home`.
+2. Top-level `default_codex_account` or top-level Legacy Codex Home Override.
+3. `~/.codex`.
+
+**Root precedence** (highest priority first):
+
+1. `ROOT_CODEX_HOME`, the emergency direct-path override.
+2. Top-level `default_codex_account` or top-level Legacy Codex Home Override.
+3. Ambient `CODEX_HOME`.
+4. `~/.codex`.
+
+There is no `ROOT_CODEX_ACCOUNT`; use `ROOT_CODEX_HOME` when the registry
+needs to be bypassed during recovery. The bridge receives only the resolved
+absolute `CODEX_HOME`, never an alias.
+
+#### Manual migration checklist
+
+Migration is documented and operator-executed; `setup.sh` does not migrate an
+existing ignored `registry.json`:
+
+1. **Create and authenticate the new home.** Prepare the file-backed
+   subscription Codex Home and complete `codex login`.
+2. **Migrate the ignored `registry.json`.** Replace the top-level
+   `codex_home` with `codex_accounts` and `default_codex_account`; add
+   project `codex_account` only for projects that need a non-default account.
+3. **Restart every affected long-lived Codex project session and the root
+   Codex bridge.** Stop the old processes first, then start them again so each
+   process reads the current account selection.
+4. Verify each session's resolved account without recording credentials or
+   `auth.json` contents.
+
+**Rollback:** restore the previous top-level Legacy Codex Home Override (and
+remove named project selectors that are no longer needed), then restart every
+affected project and the root Codex bridge again. Keep the older external Usage
+Stats Poster directory and LaunchAgent until the tracked replacement has been
+verified; removing that rollback copy is a separate operation.
 
 After upgrading the Codex CLI, stop all long-lived CCDM Codex sessions before
 starting any of them again, then restart the root Codex bridge. Updating the
@@ -174,7 +212,8 @@ If you prefer to set things up by hand:
      "discord_user_id": "123456789012345678",
      "guild_id": "YOUR_DISCORD_SERVER_ID",
      "max_pool_size": 50,
-     "codex_home": null,
+     "codex_accounts": {},
+     "default_codex_account": null,
      "project_bot_role_id": null,
      "category_ids": [],
      "pool": [],
@@ -341,18 +380,50 @@ Ask the root agent for a usage report by messaging `usage`, `limits`, or `how mu
 
 ## Scheduled Usage Stats Poster
 
-A separate macOS LaunchAgent can post usage stats to Discord on a schedule. This is the current live setup for automated usage reporting; it is not the old tmux-based `usage-report-loop.sh` flow.
+A separate, opt-in macOS LaunchAgent can post usage stats to Discord on a schedule. It is not installed by `setup.sh` and it is not the old tmux-based `usage-report-loop.sh` flow.
 
-The LaunchAgent runs a Python poster script every 30 minutes:
+The tracked installer renders and validates `~/Library/LaunchAgents/com.discord.usage-stats-poster.plist` with absolute paths to Python, Codex, the poster, and its logs. The LaunchAgent is interval-only, so installation does not trigger an immediate post. Reinstalling unloads the existing label before loading the new plist, so changing the interval is idempotent; if the new load fails, the prior plist and loaded/unloaded schedule are restored:
+
+```bash
+scripts/install-usage-stats-poster.sh                 # 1800 seconds (30 minutes)
+scripts/install-usage-stats-poster.sh --interval 900  # 15 minutes
+```
+
+The rendered LaunchAgent contains no token, channel ID, or poster configuration. The installer never sends a Discord request; it only schedules the poster.
 
 ```bash
 ~/Library/LaunchAgents/com.discord.usage-stats-poster.plist
 ```
 
 The poster reports:
-- Claude Code limits from Anthropic OAuth APIs via the macOS Keychain credential
-- ChatGPT/Codex limits from local Codex session files under `~/.codex/sessions`
-- API-key Codex account token usage from `~/.codex-api/sessions`, once a project runs with `"codex_home": "~/.codex-api"`
+- Claude Code limits from Anthropic OAuth APIs via the macOS Keychain credentials
+- ChatGPT/Codex limits for every alias in the top-level `codex_accounts`
+  registry map, with `default_codex_account` shown first and the remaining
+  aliases shown alphabetically
+- Local token-usage fallback from each named Codex Home's `sessions` directory
+  when live rate limits are unavailable
+
+The poster reads the same named-account registry configuration shown in
+[Codex Accounts](#codex-accounts); it does not need a separate list of Codex
+Homes. Aliases that resolve to the same Codex Home are reported only once.
+Older registries without `codex_accounts` remain supported: top-level and
+project-level raw `codex_home` paths are discovered as **Legacy Codex Home**
+entries. Direct `~/.codex` and `~/.codex-api` session paths are legacy
+compatibility examples, not the recommended configuration.
+
+Claude OAuth accounts are discovered from the default `~/.claude` login and
+valid extra `~/.claude-*` config directories. Each extra directory must have a
+`.claude.json` with an OAuth organization name or email address; that label is
+used in the report. Its Keychain service is derived from the first eight hex
+characters of the SHA-256 hash of the config-directory path, while the default
+login uses `Claude Code-credentials`. No account names or local paths are
+hardcoded in the poster.
+
+Named and legacy Codex selectors may be mixed across configuration scopes. The
+poster preserves named-account default-first ordering, adds selected/configured
+legacy homes, and deduplicates shared paths. It rejects the same-scope conflict
+between `default_codex_account` and top-level `codex_home` (and the analogous
+project-level `codex_account`/`codex_home` conflict).
 
 Codex API-key session files currently expose token counts, not ChatGPT-style
 rate-limit percentages. OpenAI Platform usage/cost API reporting requires an API
@@ -362,15 +433,28 @@ Useful commands:
 
 ```bash
 launchctl list | grep usage-stats-poster
-tail -120 /tmp/usage-stats-poster.log
-tail -120 /tmp/usage-stats-poster.err
+tail -120 "${TMPDIR:-/tmp}/usage-stats-poster.log"
+tail -120 "${TMPDIR:-/tmp}/usage-stats-poster.err"
 ```
 
-After changing the plist interval or script path, reload it:
+Configuration stays in the ignored root `.usage-stats-poster.json`. Start from the tracked placeholder example, edit the destination channel and any Claude API-account transcript paths, then validate it:
+
+```bash
+cp .usage-stats-poster.example.json .usage-stats-poster.json
+python3 scripts/usage-stats-poster.py --validate-config
+```
+
+Run a live post separately after validation; installation never triggers this command:
+
+```bash
+python3 scripts/usage-stats-poster.py
+```
+
+To roll back the schedule, unload and remove only CCDM's rendered LaunchAgent. Keep the older external poster directory and its LaunchAgent available until the replacement has been verified; deleting that external rollback copy is out of scope.
 
 ```bash
 launchctl unload ~/Library/LaunchAgents/com.discord.usage-stats-poster.plist
-launchctl load ~/Library/LaunchAgents/com.discord.usage-stats-poster.plist
+rm ~/Library/LaunchAgents/com.discord.usage-stats-poster.plist
 ```
 
 ## Context Nicknames

@@ -82,6 +82,8 @@ REGISTRY_CONTENT="{
   \"discord_user_id\": \"$discord_id\",
   \"guild_id\": \"$guild_id\",
   \"max_pool_size\": 50,
+  \"codex_accounts\": {},
+  \"default_codex_account\": null,
   \"project_bot_role_id\": null,
   \"category_ids\": [],
   \"pool\": [],
