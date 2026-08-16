@@ -40,6 +40,7 @@ Then read this file fully before doing anything else in this session.
 - The Codex bridge retries a generic terminal `response.failed` once when the failed turn produced no agent work.
 - The Codex bridge can pause new turns in memory, queue incoming messages, and resume them in order.
 - The Codex bridge forwards allowed users' 👍 and 👎 reactions on its own messages to the active Codex thread.
+- The tracked Usage Stats Poster discovers named and legacy Codex Homes, deduplicates shared homes, and falls back from live rate limits to recent session JSONL data.
 
 **Not built:**
 - Remote VM lifecycle operations are documented but intentionally performed by the user on the remote host.

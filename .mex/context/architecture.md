@@ -35,7 +35,7 @@ The root agent coordinates lifecycle and access. Each project agent works only i
 - **`scripts/codex-bridge.js`** - connects Discord to `codex app-server`, injects mid-turn messages, handles attachments/audio, and exposes channel-scoped MCP tools.
 - **Discord range export** - `export-discord-range.js` paginates an inclusive message range into a temporary transcript; Codex exposes it through the bridge MCP, while `start-session.sh` adds the same export-only MCP to local Claude sessions.
 - **`scripts/guest-access.js`** - creates and synchronizes project-scoped Discord roles, channel overrides, and bot allowlists.
-- **`scripts/usage-stats-poster.py`** - reads the ignored poster config, gathers Claude usage through the Keychain and Anthropic OAuth boundaries, and posts a Claude embed through the root bot token; Codex discovery and scheduling are separate follow-ups.
+- **`scripts/usage-stats-poster.py`** - reads the ignored poster config, gathers Claude usage through the Keychain and Anthropic OAuth boundaries, discovers configured named or legacy Codex Homes, and posts a combined usage embed through the root bot token; scheduling remains a separate installer surface.
 - **E2E harness** - Node's built-in test runner plus fixture binaries and local fakes; default tests never contact Discord or agent services.
 
 ## External Dependencies

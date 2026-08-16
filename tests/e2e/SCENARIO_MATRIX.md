@@ -116,6 +116,12 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Nickname/statusline | Rate-limit skip/send | Covered | First context update sends, immediate repeated update with the same unique state basename is skipped by the production rate-limit file. |
 | Nickname/statusline | Hardcoded `/tmp` context files | Covered | Tests use unique `DISCORD_STATE_DIR` basenames, assert the current `/tmp/cc-context-<state>` boundary, and clean those files explicitly. |
 | Nickname/statusline | Shell curl vs JS Discord interception | Covered | README documents that nickname scripts use the shell-level fake `curl`, while bridge/MCP Discord behavior uses child-scoped JS preload/shims. |
+| Usage stats poster | Named Codex Account discovery | Covered | The tracked poster discovers `codex_accounts`, emits Default Codex Account first and remaining aliases alphabetically, and posts one report section per unique Codex Home. |
+| Usage stats poster | Shared Codex Home deduplication | Covered | Two aliases sharing a home produce one stdio app-server query; the default alias wins the label, otherwise the alphabetically first alias is used. |
+| Usage stats poster | Legacy Codex Home fallback | Covered | Registries without `codex_accounts` report top-level and project `codex_home` values as visible Legacy Codex Home sections. |
+| Usage stats poster | Unavailable Codex Homes | Covered | Missing configured homes remain in the Discord report as unavailable and are not silently dropped or queried. |
+| Usage stats poster | Live limits and JSONL fallback | Covered | The fake `codex app-server --stdio` rate-limit response is preferred; failures fall back to hand-authored recent token-count JSONL while corrupt lines are ignored. |
+| Usage stats poster | Discovery environment isolation | Covered | A `ROOT_CODEX_HOME` environment value is ignored; only homes configured by the registry are queried and rendered. |
 
 ## Phase-One Workflow Audit
 

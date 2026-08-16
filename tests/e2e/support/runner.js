@@ -144,7 +144,7 @@ function initialState() {
     fixtures: {
       claude: { invocations: [] },
       curl: { requests: [], routes: [] },
-      codex: { appServerInvocations: [], bridgeInvocations: [], protocolEvents: [], servers: {} },
+      codex: { appServerInvocations: [], bridgeInvocations: [], protocolEvents: [], servers: {}, stdioInvocations: [] },
       discord: {
         attachmentFetches: [],
         attachments: {},
@@ -216,6 +216,7 @@ function normalizeState(value) {
         bridgeInvocations: value?.fixtures?.codex?.bridgeInvocations || [],
         protocolEvents: value?.fixtures?.codex?.protocolEvents || [],
         servers: value?.fixtures?.codex?.servers || {},
+        stdioInvocations: value?.fixtures?.codex?.stdioInvocations || [],
       },
       discord: {
         ...base.fixtures.discord,
@@ -906,7 +907,72 @@ function runSecurity() {
   process.stdout.write(JSON.stringify(credential));
 }
 
+function runCodexStdio() {
+  const state = readState();
+  const responseFile = process.env.CCDM_TEST_CODEX_STDIO_RESPONSES;
+  let responses = {};
+  if (responseFile) {
+    try {
+      responses = JSON.parse(fs.readFileSync(responseFile, "utf8"));
+    } catch (error) {
+      console.error("invalid fake Codex stdio response file");
+      process.exit(43);
+    }
+  }
+  const home = process.env.CODEX_HOME || "";
+  const configuredResponse = responses[home];
+  updateState((nextState) => {
+    nextState.fixtures.codex.stdioInvocations.push({
+      args,
+      cwd: process.cwd(),
+      env: { CODEX_HOME: home },
+      pid: process.pid,
+    });
+    return nextState;
+  });
+  const readline = require("node:readline");
+  const input = readline.createInterface({ input: process.stdin });
+  input.on("line", (line) => {
+    let request;
+    try {
+      request = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (request.method === "initialize") {
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} }) + "\\n");
+      return;
+    }
+    if (request.method !== "account/rateLimits/read") {
+      return;
+    }
+    if (!configuredResponse || configuredResponse.mode === "error") {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: "2.0",
+        id: request.id,
+        error: { code: -32000, message: "fixture rate limit failure" },
+      }) + "\\n");
+      return;
+    }
+    if (configuredResponse.mode === "malformed") {
+      process.stdout.write("not-json\\n");
+      return;
+    }
+    process.stdout.write(JSON.stringify({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: configuredResponse,
+    }) + "\\n");
+  });
+  process.on("SIGTERM", () => process.exit(0));
+  process.on("SIGINT", () => process.exit(0));
+}
+
 function runCodex() {
+  if (args[0] === "app-server" && args.includes("--stdio")) {
+    runCodexStdio();
+    return;
+  }
   const listenIndex = args.indexOf("--listen");
   if (args[0] !== "app-server" || listenIndex === -1 || !args[listenIndex + 1]) {
     console.error("unsupported codex invocation");

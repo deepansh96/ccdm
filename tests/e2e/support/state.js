@@ -38,6 +38,7 @@ function initialState() {
         bridgeInvocations: [],
         protocolEvents: [],
         servers: {},
+        stdioInvocations: [],
       },
       discord: {
         attachmentFetches: [],
@@ -132,6 +133,7 @@ function normalizeState(value) {
         bridgeInvocations: value?.fixtures?.codex?.bridgeInvocations ?? [],
         protocolEvents: value?.fixtures?.codex?.protocolEvents ?? [],
         servers: value?.fixtures?.codex?.servers ?? {},
+        stdioInvocations: value?.fixtures?.codex?.stdioInvocations ?? [],
       },
       discord: {
         ...initialState().fixtures.discord,

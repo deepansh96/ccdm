@@ -47,7 +47,8 @@ The teardown manager exposes `registerTeardownCallback(fn)` and `cleanup()`. Cal
       "appServerInvocations": [],
       "bridgeInvocations": [],
       "protocolEvents": [],
-      "servers": {}
+      "servers": {},
+      "stdioInvocations": []
     },
     "curl": {
       "requests": [],
@@ -134,6 +135,7 @@ The Codex bridge/basic-turn scenarios add child-scoped JavaScript interception. 
 - The `discord.js` shim exports `Client`, `GatewayIntentBits`, and `Partials`, records login/ready/channel fetch/typing/send behavior, and consumes test-injected gateway messages from `$CCDM_TEST_STATE`.
 - `startFakeCodexServer()` owns the fake Codex WebSocket protocol. It covers `initialize`/`initialized`, MCP status/delete/write/reload, `thread/start`, system and user `turn/start`, active-turn `turn/steer`, `thread/compact/start`, `thread/archive`, approval requests, agent deltas, MCP reply detection, context-compaction completion, token-usage notifications, WebSocket close, and startup no-thread-id failure.
 - The `codex` fixture validates `app-server --listen ws://127.0.0.1:<port>`, requires a harness-owned fake server for that port, records the invocation, and stays alive until the bridge exits.
+- The `codex` fixture also implements the poster's `app-server --stdio` JSON-RPC boundary, records one invocation per selected `CODEX_HOME`, and returns scenario-authored live rate-limit or failure responses.
 - Bridge control-flow scenarios cover successful steer, stale-turn queue fallback, queued reaction cleanup, `/compact`, `/clear`, `/restart`, compact/clear during an active turn, non-retryable Codex errors, guarded one-shot recovery from a generic terminal `response.failed`, MCP cleanup/registration failures, and command diagnostics.
 - Attachment scenarios cover empty messages, inline image data, fetched text attachments, binary downloads into `.discord-attachments`, attachment fetch failures, and Discord send failures. The Discord shim can reject `channel.send()` through fixture state so tests can assert the bridge's current failure diagnostics.
 
@@ -155,8 +157,11 @@ The Claude usage-report scenarios drive `scripts/claude-usage.sh` with fixture h
 
 The tracked `scripts/usage-stats-poster.py` scenarios drive the manual Discord posting surface with the same Test Workspace and Keychain fixture plus a local HTTP fake for Anthropic and Discord:
 
-- The poster reads an ignored root `.usage-stats-poster.json`, derives `registry.json` from the repository location, and posts a Claude-only embed with the registry root bot token. Codex discovery and LaunchAgent installation remain follow-up slices.
+- The poster reads an ignored root `.usage-stats-poster.json`, derives `registry.json` from the repository location, and posts Claude and configured Codex sections with the registry root bot token.
+- Named Codex Account discovery uses `codex_accounts` with the Default Codex Account first, alphabetical remaining aliases, one query per unique Codex Home, and deterministic shared-home labels. Registries without named accounts fall back to top-level and project Legacy Codex Home overrides.
+- Missing or unreadable configured homes remain visible as unavailable. The poster tries live `codex app-server --stdio` rate limits first, then falls back to recent session JSONL token counts while ignoring corrupt or partial records. It uses registry values only and never discovers `ROOT_CODEX_HOME` from its environment.
 - The tracked `.usage-stats-poster.example.json` contains placeholders only. Tests cover config validation, import/help no-I/O behavior, configured Claude API-account transcript cost estimates, Discord field truncation, missing credentials, malformed config, unreachable endpoints, and credential redaction.
+- Poster scenarios cover named-account ordering, shared-home deduplication and labeling, legacy fallback, unavailable homes, live-rate-limit failure and JSONL fallback, corrupt session records, and environment isolation.
 - `anthropic_base_url` and `discord_base_url` are optional config overrides used only to point default E2E scenarios at the local HTTP fake; production defaults remain the real service URLs.
 
 The nickname/statusline scenarios drive `scripts/cc-discord-nicknames.sh`, `scripts/cc-statusline-wrapper.sh`, and their shared `_update-nickname.sh` helper:

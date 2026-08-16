@@ -4,9 +4,11 @@
 import argparse
 import json
 import os
+import select
 import subprocess
 import sys
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -305,7 +307,7 @@ def load_config(path):
     return parse_config(raw)
 
 
-def load_registry(path):
+def load_registry_data(path):
     try:
         registry = json.loads(path.read_text())
     except FileNotFoundError:
@@ -318,7 +320,272 @@ def load_registry(path):
     bot = next((entry for entry in registry["pool"] if isinstance(entry, dict) and entry.get("id") == root_bot_id), None)
     if not isinstance(bot, dict) or not isinstance(bot.get("token"), str) or not bot["token"]:
         raise PosterError("registry.json has no token for the configured root bot")
-    return bot["token"]
+    return registry, bot["token"]
+
+
+def load_registry(path):
+    """Load the root bot token for callers that only need the Discord credential."""
+    return load_registry_data(path)[1]
+
+
+def _resolved_codex_home(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return Path(value).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        try:
+            return Path(os.path.abspath(os.path.expanduser(value)))
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+
+def _group_codex_accounts(entries, default_alias=None):
+    ordered = []
+    groups = {}
+    for alias, raw_home in entries:
+        home = _resolved_codex_home(raw_home)
+        key = str(home) if home is not None else f"invalid:{alias}"
+        if key not in groups:
+            groups[key] = {"aliases": [], "home": home}
+            ordered.append(groups[key])
+        groups[key]["aliases"].append(alias)
+
+    accounts = []
+    for group in ordered:
+        aliases = sorted(group["aliases"])
+        label = default_alias if default_alias in aliases else aliases[0]
+        accounts.append({"label": label, "home": group["home"]})
+    return accounts
+
+
+def discover_codex_accounts(registry):
+    """Return configured Codex Account labels and resolved Codex Homes."""
+    named_accounts = registry.get("codex_accounts") if isinstance(registry, dict) else None
+    if isinstance(named_accounts, dict):
+        default_alias = registry.get("default_codex_account")
+        default_is_configured = isinstance(default_alias, str) and default_alias in named_accounts
+        aliases = [alias for alias in named_accounts if isinstance(alias, str) and alias.strip()]
+        ordered_aliases = []
+        if default_is_configured:
+            ordered_aliases.append(default_alias)
+        ordered_aliases.extend(sorted(alias for alias in aliases if alias != default_alias))
+        return _group_codex_accounts(
+            [(alias, named_accounts[alias]) for alias in ordered_aliases],
+            default_alias if default_is_configured else None,
+        )
+
+    raw_homes = []
+    if isinstance(registry.get("codex_home"), str):
+        raw_homes.append(registry["codex_home"])
+    projects = registry.get("projects", {})
+    if isinstance(projects, dict):
+        for project_name in sorted(projects):
+            project = projects[project_name]
+            if isinstance(project, dict) and isinstance(project.get("codex_home"), str):
+                raw_homes.append(project["codex_home"])
+    entries = [("Legacy Codex Home" if index == 0 else f"Legacy Codex Home {index + 1}", home)
+               for index, home in enumerate(raw_homes)]
+    accounts = _group_codex_accounts(entries)
+    for index, account in enumerate(accounts):
+        account["label"] = "Legacy Codex Home" if index == 0 else f"Legacy Codex Home {index + 1}"
+    return accounts
+
+
+def _format_plan(value):
+    plan = str(value or "Codex").replace("_", " ").strip()
+    if plan.lower() == "chatgpt":
+        return "ChatGPT"
+    return plan.title()
+
+
+def _format_rate_limit_reset(value):
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            reset = datetime.fromtimestamp(value, timezone.utc)
+        else:
+            reset = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if reset.tzinfo is None:
+                reset = reset.replace(tzinfo=timezone.utc)
+        return fmt_reset(reset.isoformat(), datetime.now(timezone.utc))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def format_codex_rate_limits(rate_limits, label):
+    plan = _format_plan(rate_limits.get("planType", rate_limits.get("plan_type")))
+    lines = [f"**{label}** ({plan})"]
+    for key, window_label in (("primary", "5-Hour"), ("secondary", "7-Day")):
+        data = rate_limits.get(key)
+        if not isinstance(data, dict):
+            continue
+        duration = data.get("windowDurationMins", data.get("window_duration_mins"))
+        if duration == 300:
+            window_label = "5-Hour"
+        elif duration == 10080:
+            window_label = "7-Day"
+        used_percent = data.get("usedPercent", data.get("used_percent", 0)) or 0
+        reset = _format_rate_limit_reset(data.get("resetsAt", data.get("resets_at")))
+        reset_part = f"  resets in {reset}" if reset else ""
+        lines.append(f"{window_label}: {text_bar(used_percent)}{reset_part}")
+    return "\n".join(lines)
+
+
+def read_codex_rate_limits(codex_home):
+    """Read one Codex Home's live rate limits through the local app-server boundary."""
+    environment = os.environ.copy()
+    environment.pop("ROOT_CODEX_HOME", None)
+    environment["CODEX_HOME"] = str(codex_home)
+    try:
+        process = subprocess.Popen(
+            ["codex", "app-server", "--stdio"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    def request(request_id, method, params=None):
+        message = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            message["params"] = params
+        try:
+            process.stdin.write(json.dumps(message) + "\n")
+            process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            return None
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                ready, _, _ = select.select([process.stdout], [], [], max(0, deadline - time.monotonic()))
+            except (OSError, ValueError):
+                return None
+            if not ready:
+                return None
+            try:
+                line = process.stdout.readline()
+                response = json.loads(line)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                return None
+            if response.get("id") != request_id:
+                continue
+            if response.get("error") is not None:
+                return None
+            return response.get("result")
+        return None
+
+    try:
+        initialized = request(1, "initialize", {
+            "clientInfo": {"name": "usage-stats-poster", "version": "1.0.0"},
+        })
+        if not isinstance(initialized, dict):
+            return None
+        try:
+            process.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "initialized"}) + "\n")
+            process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            return None
+        result = request(2, "account/rateLimits/read")
+        if not isinstance(result, dict):
+            return None
+        rate_limits = result.get("rateLimits")
+        if not isinstance(rate_limits, dict):
+            return None
+        return rate_limits
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    finally:
+        try:
+            process.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            process.terminate()
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                process.kill()
+                process.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+
+def _latest_codex_session_data(codex_home):
+    sessions_dir = codex_home / "sessions" if codex_home is not None else None
+    if sessions_dir is None or not sessions_dir.is_dir():
+        return None
+    cutoff = time.time() - timedelta(days=7).total_seconds()
+    latest = None
+    try:
+        files = list(sessions_dir.rglob("*.jsonl"))
+    except OSError:
+        return None
+    for transcript in files:
+        try:
+            modified = transcript.stat().st_mtime
+            if modified < cutoff:
+                continue
+            lines = transcript.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                record = json.loads(line)
+                payload = record.get("payload")
+                if not isinstance(record, dict) or not isinstance(payload, dict):
+                    continue
+                if record.get("type") != "event_msg" or payload.get("type") != "token_count":
+                    continue
+                info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+                last_usage = info.get("last_token_usage") if isinstance(info.get("last_token_usage"), dict) else {}
+                total_usage = info.get("total_token_usage") if isinstance(info.get("total_token_usage"), dict) else {}
+                rate_limits = payload.get("rate_limits") if isinstance(payload.get("rate_limits"), dict) else None
+                if not last_usage and not total_usage and not rate_limits:
+                    continue
+                timestamp = record.get("timestamp")
+                sort_key = (str(timestamp) if isinstance(timestamp, str) else "", modified)
+                if latest is None or sort_key >= latest[0]:
+                    latest = (sort_key, rate_limits, last_usage, total_usage)
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+    return latest[1:] if latest is not None else None
+
+
+def get_codex_home_stats(codex_home, label):
+    """Read one configured Codex Home, degrading safely to recent session data."""
+    if codex_home is None or not codex_home.is_dir() or not os.access(codex_home, os.R_OK | os.X_OK):
+        return f"**{label}**\n*Codex Home unavailable*"
+    live = read_codex_rate_limits(codex_home)
+    if isinstance(live, dict):
+        return format_codex_rate_limits(live, label)
+
+    session_data = _latest_codex_session_data(codex_home)
+    if session_data is None:
+        return f"**{label}**\n*Live rate limits unavailable; no recent usage data*"
+    rate_limits, last_usage, total_usage = session_data
+    if isinstance(rate_limits, dict):
+        return format_codex_rate_limits(rate_limits, label)
+    lines = [f"**{label}** (Codex)", "*Live rate limits unavailable*"]
+    if last_usage:
+        lines.append(f"Last turn: **{fmt_tokens(last_usage.get('total_tokens'))}** tokens")
+    if total_usage:
+        lines.append(f"Session total: **{fmt_tokens(total_usage.get('total_tokens'))}** tokens")
+    return "\n".join(lines)
+
+
+def get_codex_stats(registry):
+    accounts = discover_codex_accounts(registry)
+    if not accounts:
+        return None
+    value = "\n\n".join(get_codex_home_stats(account["home"], account["label"]) for account in accounts)
+    if len(value) > 1024:
+        value = value[:1000].rstrip() + "\n*truncated*"
+    return value
 
 
 def get_claude_stats(config):
@@ -334,7 +601,7 @@ def get_claude_stats(config):
     return value
 
 
-def post_to_discord(config, bot_token, claude_value):
+def post_to_discord(config, bot_token, claude_value, codex_value=None):
     timestamp = datetime.now().strftime("%b %d, %H:%M")
     embed = {
         "title": "Usage Report",
@@ -342,6 +609,8 @@ def post_to_discord(config, bot_token, claude_value):
         "fields": [{"name": "Claude Code", "value": claude_value, "inline": True}],
         "footer": {"text": timestamp},
     }
+    if codex_value is not None:
+        embed["fields"].append({"name": "Codex", "value": codex_value, "inline": True})
     request = Request(
         f"{config['discord_base_url'].rstrip('/')}/api/v10/channels/{config['discord_channel_id']}/messages",
         data=json.dumps({"embeds": [embed]}).encode("utf-8"),
@@ -382,8 +651,8 @@ def main(argv=None):
         if args.validate_config:
             print("Poster configuration is valid")
             return 0
-        bot_token = load_registry(REGISTRY_PATH)
-        post_to_discord(config, bot_token, get_claude_stats(config))
+        registry, bot_token = load_registry_data(REGISTRY_PATH)
+        post_to_discord(config, bot_token, get_claude_stats(config), get_codex_stats(registry))
         return 0
     except PosterError as error:
         print(f"Error: {error}", file=sys.stderr)

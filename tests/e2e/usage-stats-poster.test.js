@@ -157,6 +157,311 @@ test("poster posts a Claude usage embed through the configured Discord endpoint"
   ]);
 });
 
+test("poster reports named Codex Accounts in default-first alphabetical order", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const defaultHome = path.join(workspace.homeDir, ".codex-default");
+  const alphaHome = path.join(workspace.homeDir, ".codex-alpha");
+  const premiumHome = path.join(workspace.homeDir, ".codex-premium");
+  fs.mkdirSync(defaultHome);
+  fs.mkdirSync(alphaHome);
+  fs.mkdirSync(premiumHome);
+  seedPosterWorkspace(workspace, api.baseUrl);
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    `${JSON.stringify({
+      codex_accounts: {
+        "codex-premium": premiumHome,
+        "codex-alpha": alphaHome,
+        "codex-default": defaultHome,
+      },
+      default_codex_account: "codex-default",
+      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      projects: {},
+    }, null, 2)}\n`,
+  );
+  const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
+  fs.writeFileSync(responsesPath, `${JSON.stringify({
+    [fs.realpathSync(defaultHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 12 }, secondary: { usedPercent: 34 } } },
+    [fs.realpathSync(alphaHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 56 }, secondary: { usedPercent: 78 } } },
+    [fs.realpathSync(premiumHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 21 }, secondary: { usedPercent: 43 } } },
+  }, null, 2)}\n`);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+    env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const post = api.requests.find((request) => request.method === "POST");
+  assert.ok(post);
+  const payload = JSON.parse(post.body);
+  assert.deepEqual(
+    readState(workspace.stateDir).fixtures.codex.stdioInvocations.map(({ env }) => path.basename(env.CODEX_HOME)),
+    [".codex-default", ".codex-alpha", ".codex-premium"],
+  );
+  assert.deepEqual(payload.embeds[0].fields.map(({ name }) => name), ["Claude Code", "Codex"]);
+  const codexValue = payload.embeds[0].fields[1].value;
+  assert.deepEqual(
+    [...codexValue.matchAll(/\*\*(codex-[^*]+)\*\*/g)].map(([, label]) => label),
+    ["codex-default", "codex-alpha", "codex-premium"],
+  );
+  assert.match(codexValue, /\*\*codex-default\*\* \(ChatGPT\)[\s\S]*12%/);
+  assert.match(codexValue, /\*\*codex-alpha\*\* \(ChatGPT\)[\s\S]*56%/);
+  assert.match(codexValue, /\*\*codex-premium\*\* \(ChatGPT\)[\s\S]*21%/);
+});
+
+test("poster deduplicates named aliases that share a Codex Home", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const sharedHome = path.join(workspace.homeDir, ".codex-shared");
+  const otherHome = path.join(workspace.homeDir, ".codex-other");
+  fs.mkdirSync(sharedHome);
+  fs.mkdirSync(otherHome);
+  seedPosterWorkspace(workspace, api.baseUrl);
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    `${JSON.stringify({
+      codex_accounts: {
+        "codex-zulu": sharedHome,
+        "codex-default": sharedHome,
+        "codex-alpha": otherHome,
+      },
+      default_codex_account: "codex-default",
+      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      projects: {},
+    }, null, 2)}\n`,
+  );
+  const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
+  fs.writeFileSync(responsesPath, `${JSON.stringify({
+    [fs.realpathSync(sharedHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 11 } } },
+    [fs.realpathSync(otherHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 22 } } },
+  }, null, 2)}\n`);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+    env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const post = api.requests.find((request) => request.method === "POST");
+  assert.ok(post);
+  const payload = JSON.parse(post.body);
+  const codexValue = payload.embeds[0].fields.find(({ name }) => name === "Codex").value;
+  assert.deepEqual(
+    [...codexValue.matchAll(/\*\*(codex-[^*]+)\*\*/g)].map(([, label]) => label),
+    ["codex-default", "codex-alpha"],
+  );
+  assert.equal(readState(workspace.stateDir).fixtures.codex.stdioInvocations.length, 2);
+  assert.match(codexValue, /\*\*codex-default\*\*[\s\S]*11%/);
+  assert.doesNotMatch(codexValue, /codex-zulu/);
+});
+
+test("poster falls back to raw Codex Homes in a legacy registry", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const sharedHome = path.join(workspace.homeDir, ".codex-legacy");
+  const projectHome = path.join(workspace.homeDir, ".codex-project");
+  fs.mkdirSync(sharedHome);
+  fs.mkdirSync(projectHome);
+  seedPosterWorkspace(workspace, api.baseUrl);
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    `${JSON.stringify({
+      codex_home: sharedHome,
+      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      projects: { project: { codex_home: projectHome, type: "codex" } },
+    }, null, 2)}\n`,
+  );
+  const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
+  fs.writeFileSync(responsesPath, `${JSON.stringify({
+    [fs.realpathSync(sharedHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 31 } } },
+    [fs.realpathSync(projectHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 42 } } },
+  }, null, 2)}\n`);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+    env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const post = api.requests.find((request) => request.method === "POST");
+  assert.ok(post);
+  const codexValue = JSON.parse(post.body).embeds[0].fields.find(({ name }) => name === "Codex").value;
+  assert.deepEqual(
+    [...codexValue.matchAll(/\*\*(Legacy Codex Home(?: \d+)?)\*\*/g)].map(([, label]) => label),
+    ["Legacy Codex Home", "Legacy Codex Home 2"],
+  );
+  assert.match(codexValue, /\*\*Legacy Codex Home\*\*[\s\S]*31%/);
+  assert.match(codexValue, /\*\*Legacy Codex Home 2\*\*[\s\S]*42%/);
+});
+
+test("poster reports a missing configured Codex Home as unavailable", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const availableHome = path.join(workspace.homeDir, ".codex-available");
+  const missingHome = path.join(workspace.homeDir, ".codex-missing");
+  fs.mkdirSync(availableHome);
+  seedPosterWorkspace(workspace, api.baseUrl);
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    `${JSON.stringify({
+      codex_accounts: { available: availableHome, missing: missingHome },
+      default_codex_account: "missing",
+      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      projects: {},
+    }, null, 2)}\n`,
+  );
+  const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
+  fs.writeFileSync(responsesPath, `${JSON.stringify({
+    [fs.realpathSync(availableHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 19 } } },
+  }, null, 2)}\n`);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+    env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const post = api.requests.find((request) => request.method === "POST");
+  assert.ok(post);
+  const codexValue = JSON.parse(post.body).embeds[0].fields.find(({ name }) => name === "Codex").value;
+  assert.match(codexValue, /\*\*missing\*\*[\s\S]*Codex Home unavailable/);
+  assert.match(codexValue, /\*\*available\*\*[\s\S]*19%/);
+  assert.equal(readState(workspace.stateDir).fixtures.codex.stdioInvocations.length, 1);
+});
+
+test("poster falls back to recent Codex session tokens after a live rate-limit failure", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const codexHome = path.join(workspace.homeDir, ".codex-fallback");
+  fs.mkdirSync(path.join(codexHome, "sessions"), { recursive: true });
+  const secretLikeText = "fixture-secret-must-not-appear";
+  fs.writeFileSync(
+    path.join(codexHome, "sessions", "rollout-fixture.jsonl"),
+    [
+      "{partial",
+      JSON.stringify({
+        type: "event_msg",
+        timestamp: new Date().toISOString(),
+        payload: {
+          type: "token_count",
+          info: {
+            last_token_usage: { total_tokens: 321, detail: secretLikeText },
+            total_token_usage: { total_tokens: 654 },
+          },
+        },
+      }),
+      JSON.stringify({ payload: { type: "token_count", info: "corrupt" } }),
+    ].join("\n") + "\n",
+  );
+  seedPosterWorkspace(workspace, api.baseUrl);
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    `${JSON.stringify({
+      codex_accounts: { "codex-fallback": codexHome },
+      default_codex_account: "codex-fallback",
+      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      projects: {},
+    }, null, 2)}\n`,
+  );
+  const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
+  fs.writeFileSync(responsesPath, `${JSON.stringify({
+    [fs.realpathSync(codexHome)]: { mode: "error" },
+  }, null, 2)}\n`);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+    env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const post = api.requests.find((request) => request.method === "POST");
+  assert.ok(post);
+  const codexValue = JSON.parse(post.body).embeds[0].fields.find(({ name }) => name === "Codex").value;
+  assert.match(codexValue, /\*\*codex-fallback\*\* \(Codex\)/);
+  assert.match(codexValue, /Live rate limits unavailable/);
+  assert.match(codexValue, /Last turn: \*\*321\*\* tokens/);
+  assert.match(codexValue, /Session total: \*\*654\*\* tokens/);
+  assert.doesNotMatch(codexValue, new RegExp(secretLikeText));
+});
+
+test("poster discovers only registry Codex Homes, not ROOT_CODEX_HOME", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const configuredHome = path.join(workspace.homeDir, ".codex-configured");
+  const leakedHome = path.join(workspace.homeDir, ".codex-leaked");
+  fs.mkdirSync(configuredHome);
+  fs.mkdirSync(leakedHome);
+  seedPosterWorkspace(workspace, api.baseUrl);
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    `${JSON.stringify({
+      codex_accounts: { configured: configuredHome },
+      default_codex_account: "configured",
+      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      projects: {},
+    }, null, 2)}\n`,
+  );
+  const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
+  fs.writeFileSync(responsesPath, `${JSON.stringify({
+    [fs.realpathSync(configuredHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 17 } } },
+  }, null, 2)}\n`);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+    env: {
+      CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath,
+      ROOT_CODEX_HOME: leakedHome,
+    },
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const invocations = readState(workspace.stateDir).fixtures.codex.stdioInvocations;
+  assert.deepEqual(invocations.map(({ env }) => path.basename(env.CODEX_HOME)), [".codex-configured"]);
+  const post = api.requests.find((request) => request.method === "POST");
+  assert.ok(post);
+  const codexValue = JSON.parse(post.body).embeds[0].fields.find(({ name }) => name === "Codex").value;
+  assert.match(codexValue, /\*\*configured\*\*[\s\S]*17%/);
+  assert.doesNotMatch(codexValue, /leaked/);
+});
+
+test("poster labels a shared home with the alphabetically first alias without a default", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const uniqueHome = path.join(workspace.homeDir, ".codex-unique");
+  const sharedHome = path.join(workspace.homeDir, ".codex-shared-no-default");
+  fs.mkdirSync(uniqueHome);
+  fs.mkdirSync(sharedHome);
+  seedPosterWorkspace(workspace, api.baseUrl);
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    `${JSON.stringify({
+      codex_accounts: {
+        "codex-zulu": sharedHome,
+        "codex-alpha": uniqueHome,
+        "codex-beta": sharedHome,
+      },
+      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      projects: {},
+    }, null, 2)}\n`,
+  );
+  const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
+  fs.writeFileSync(responsesPath, `${JSON.stringify({
+    [fs.realpathSync(uniqueHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 13 } } },
+    [fs.realpathSync(sharedHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 24 } } },
+  }, null, 2)}\n`);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+    env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const post = api.requests.find((request) => request.method === "POST");
+  assert.ok(post);
+  const codexValue = JSON.parse(post.body).embeds[0].fields.find(({ name }) => name === "Codex").value;
+  assert.deepEqual(
+    [...codexValue.matchAll(/\*\*(codex-[^*]+)\*\*/g)].map(([, label]) => label),
+    ["codex-alpha", "codex-beta"],
+  );
+  assert.equal(readState(workspace.stateDir).fixtures.codex.stdioInvocations.length, 2);
+  assert.doesNotMatch(codexValue, /codex-zulu/);
+});
+
 test("poster import, help, and config validation do not access runtime services", async () => {
   const workspace = createWorkspace();
   fs.writeFileSync(
