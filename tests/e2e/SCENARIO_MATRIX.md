@@ -84,6 +84,10 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Stop session | SIGTERM-resistant child fallback | Covered | A harness-owned child that ignores SIGTERM is removed by the stop script's SIGKILL fallback. |
 | Stop session | Missing Codex sweep fields | Covered | Missing channel, port, or app id skips the Codex listener sweep and documents the stderr warning. |
 | Root restart | Existing root cleanup and retry | Covered | Simulates cleanup and fresh launch, including the shared `CODEX_HOME` and higher-priority `ROOT_CODEX_HOME` override. |
+| Root restart | Shared legacy Codex Home resolver | Covered | Routes root restart through `scripts/resolve-codex-home.py` with `ROOT_CODEX_HOME` → top-level `codex_home` → ambient `CODEX_HOME` → `~/.codex` precedence. |
+| Root restart | Root Codex Home validation | Covered | Rejects missing, non-directory, inaccessible, broken-symlink, unusable-config, empty, and wrong-typed selections with actionable errors. |
+| Root restart | Root validation failure ordering | Covered | A failed resolver leaves the existing `root_agent` tmux session and listener process in place and creates no replacement session. |
+| Root restart | Emergency override and registry re-read | Covered | A usable `ROOT_CODEX_HOME` bypasses a broken registry home, and repeated restarts use the current top-level selection. |
 | Root restart | Launch failure diagnostics | Covered | Injected tmux `new-session` failure returns non-zero with command diagnostics and fixture state. |
 | Root restart | Teardown failure diagnostics | Covered | Cleanup failure after restart is recorded under fixture diagnostics. |
 | Live smoke | Default skip | Covered | Skips unless `CCDM_LIVE_E2E=1` and documented secrets are set. |
@@ -129,6 +133,7 @@ This audit maps the PRD workflow bullets from issue #4 to automated scenarios or
 | Claude usage | OAuth/keychain fallback, local stats parsing, malformed data tolerance, version reporting | Covered | Claude usage rows above drive `scripts/claude-usage.sh`. |
 | Nickname/statusline | Rate limiting, disable behavior, fixture root `.env`, PATCH construction, npx no-network statusline pipeline | Covered | Nickname/statusline and fixture contract rows above drive the nickname/statusline scripts. |
 | Root restart | Fixture tmux/process restart behavior without touching the real `root_agent` session | Covered | Root restart rows above drive `restart-root-agent.sh`. |
+| Root restart | Shared resolver validation before teardown | Covered | Root Codex restart rows above drive `restart-root-codex-agent.sh` and assert resolved launch homes plus failure ordering. |
 | Usage stats poster | Local LaunchAgent execution | Deferred | The poster depends on local macOS LaunchAgent state, live Discord posting, Keychain auth, and local Codex session files, so default E2E covers the reusable `claude-usage.sh` report but not the scheduler. |
 | Live smoke | Live real-service checks | Covered | Default skip row verifies the Live Gate; issue #4 does not require a live-smoke scenario matrix. |
 | Diagnostics | Commands, streams, fixture state, file diffs, and redaction | Covered | Harness diagnostics rows above assert actionable failure context with secret redaction. |

@@ -1198,6 +1198,7 @@ test("bridge restarts its own Codex session from slash command", async () => {
 
 test("root bridge restarts through the root Codex restart script", async () => {
   const workspace = createBridgeWorkspace();
+  fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
   const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
   fs.mkdirSync(rootStateDir, { recursive: true });
   fs.writeFileSync(path.join(rootStateDir, ".env"), "DISCORD_BOT_TOKEN=cm9vdC1hcHA.fixture.token\n");

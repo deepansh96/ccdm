@@ -35,7 +35,7 @@ Claude slash commands from project channels are relayed by the root bot through 
 
 ## Codex Lifecycle
 
-Use `scripts/start-codex-session.sh <project>`. It validates the target project's and top-level legacy `codex_home` selectors through the shared resolver before stale MCP cleanup, tmux creation, or PID recording, then passes the resolved channel, guild, bot, allowlist, home, model, and WebSocket configuration to `codex-bridge.js`, which owns `codex app-server`. A project's optional `codex_home` overrides the top-level shared `codex_home`; without either, projects use `~/.codex`. The root bridge resolves `ROOT_CODEX_HOME`, then the shared registry home, then ambient `CODEX_HOME`, then `~/.codex`. Model overrides use `codex_model`, `codex_reasoning_effort`, and `codex_service_tier`.
+Use `scripts/start-codex-session.sh <project>`. It validates the target project's and top-level legacy `codex_home` selectors through the shared resolver before stale MCP cleanup, tmux creation, or PID recording, then passes the resolved channel, guild, bot, allowlist, home, model, and WebSocket configuration to `codex-bridge.js`, which owns `codex app-server`. A project's optional `codex_home` overrides the top-level shared `codex_home`; without either, projects use `~/.codex`. The root bridge uses the same resolver for `ROOT_CODEX_HOME`, then the shared registry home, then ambient `CODEX_HOME`, then `~/.codex`, and validates the selection before tearing down `root_agent`. Model overrides use `codex_model`, `codex_reasoning_effort`, and `codex_service_tier`.
 
 After a Codex CLI upgrade, stop every long-lived CCDM Codex session before starting any replacement, then restart the root Codex bridge. Running app-server processes keep their original runtime version.
 

@@ -21,13 +21,13 @@ last_updated: 2026-08-16
 
 # Decisions
 
-### Validate project Codex homes before lifecycle mutation
+### Validate Codex homes before lifecycle mutation
 **Date:** 2026-08-16
 **Status:** Active
-**Decision:** Project Codex startup uses `scripts/resolve-codex-home.py` to resolve the project legacy `codex_home`, top-level legacy `codex_home`, or `~/.codex` selection and validate the selected home before stale MCP cleanup, tmux creation, or PID recording.
-**Reasoning:** A missing, malformed, or unusable home must fail with an actionable error without mutating a running project's configuration or registry state. The resolver validates only global selectors and the target project's selectors so unrelated project misconfiguration cannot block a launch.
+**Decision:** Project Codex startup and root Codex restart use `scripts/resolve-codex-home.py` to resolve their legacy selectors and validate the selected home before stale MCP cleanup, tmux creation, PID recording, or root-session teardown.
+**Reasoning:** A missing, malformed, or unusable home must fail with an actionable error without mutating a running project's configuration, registry state, or root listener. The resolver validates only global selectors and the target project's selectors for project launches; root restart applies its environment and top-level precedence without inspecting project entries.
 **Alternatives considered:** Keep inline shell/Python precedence and validate after launch setup; rejected because command substitution can mask failures and lifecycle mutation would already have occurred.
-**Consequences:** Successful project launches pass only an absolute, normalized `CODEX_HOME` to the bridge. Named-account selector support and root restart integration remain later slices using the same resolver surface.
+**Consequences:** Successful project launches and root restarts pass only an absolute, normalized `CODEX_HOME` to the bridge. Named-account selector support remains a later slice using the same resolver surface.
 
 <!-- HOW TO USE THIS FILE:
      Each decision follows the format below.

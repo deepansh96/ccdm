@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve and validate the legacy Codex Home for a project launch."""
+"""Resolve and validate a legacy Codex Home for a project or root launch."""
 
 import json
 import os
@@ -19,6 +19,15 @@ def selector_value(container: Any, key: str, label: str) -> str | None:
     value = container[key]
     if not isinstance(value, str):
         raise ResolverError(f"{label} must be a non-empty string; got {type(value).__name__}")
+    if not value.strip():
+        raise ResolverError(f"{label} must not be empty or whitespace-only")
+    return value
+
+
+def environment_selector(key: str, label: str) -> str | None:
+    value = os.environ.get(key)
+    if value is None or value == "":
+        return None
     if not value.strip():
         raise ResolverError(f"{label} must not be empty or whitespace-only")
     return value
@@ -103,9 +112,25 @@ def resolve_codex_home(registry: dict[str, Any], project: str) -> str:
     return validate_home(selected_home, selected_label)
 
 
+def resolve_root_codex_home(registry: dict[str, Any]) -> str:
+    root_override = environment_selector("ROOT_CODEX_HOME", "ROOT_CODEX_HOME")
+    if root_override is not None:
+        return validate_home(root_override, "ROOT_CODEX_HOME")
+
+    global_home = selector_value(registry, "codex_home", "top-level codex_home")
+    if global_home is not None:
+        return validate_home(global_home, "top-level codex_home")
+
+    ambient_home = environment_selector("CODEX_HOME", "ambient CODEX_HOME")
+    if ambient_home is not None:
+        return validate_home(ambient_home, "ambient CODEX_HOME")
+
+    return validate_home("~/.codex", "default codex_home")
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 3:
-        print(f"Usage: {argv[0]} <registry.json> <project>", file=sys.stderr)
+        print(f"Usage: {argv[0]} <registry.json> <project>|--root", file=sys.stderr)
         return 2
 
     try:
@@ -113,7 +138,10 @@ def main(argv: list[str]) -> int:
             registry = json.load(registry_file)
         if not isinstance(registry, dict):
             raise ResolverError("registry.json must contain a JSON object")
-        resolved_home = resolve_codex_home(registry, argv[2])
+        if argv[2] == "--root":
+            resolved_home = resolve_root_codex_home(registry)
+        else:
+            resolved_home = resolve_codex_home(registry, argv[2])
     except ResolverError as error:
         print(f"Codex Home validation failed: {error}", file=sys.stderr)
         return 1
