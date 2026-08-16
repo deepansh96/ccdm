@@ -779,8 +779,13 @@ test("bridge drains queued messages after Codex reports a different active turn 
       (event) => event.message?.method === "turn/start" && event.message.params.input?.[0]?.text === "first",
     ),
   );
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  injectDiscordMessage(workspace, { content: "queued after mismatch", id: "queued-after-mismatch" });
+  await injectMessageUntil(
+    workspace,
+    { content: "queued after mismatch", id: "queued-after-mismatch" },
+    (nextState) => nextState.fixtures.discord.deliveredMessages.some(
+      (message) => message.id === "queued-after-mismatch",
+    ),
+  );
   await bridge.waitForOutput(/\[steer\] Failed \(stale turn\), queuing instead/, 5000);
   codex.releaseTurn("returned-turn");
 
