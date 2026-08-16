@@ -85,6 +85,9 @@ function initialState() {
       },
       launchctl: {
         invocations: [],
+        loaded: [],
+        loadFailuresRemaining: 0,
+        unloadFailuresRemaining: 0,
       },
       npm: {
         invocations: [],
@@ -194,6 +197,9 @@ function normalizeState(value) {
       },
       launchctl: {
         invocations: value?.fixtures?.launchctl?.invocations ?? [],
+        loaded: value?.fixtures?.launchctl?.loaded ?? [],
+        loadFailuresRemaining: value?.fixtures?.launchctl?.loadFailuresRemaining ?? 0,
+        unloadFailuresRemaining: value?.fixtures?.launchctl?.unloadFailuresRemaining ?? 0,
       },
       processes: value?.fixtures?.processes ?? [],
       registry: value?.fixtures?.registry ?? null,

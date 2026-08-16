@@ -41,7 +41,7 @@ Then read this file fully before doing anything else in this session.
 - The Codex bridge can pause new turns in memory, queue incoming messages, and resume them in order.
 - The Codex bridge forwards allowed users' 👍 and 👎 reactions on its own messages to the active Codex thread.
 - The tracked Usage Stats Poster discovers named and legacy Codex Homes, deduplicates shared homes, and falls back from live rate limits to recent session JSONL data.
-- The opt-in `scripts/install-usage-stats-poster.sh` renders, validates, and idempotently loads a secret-free LaunchAgent for the tracked Usage Stats Poster.
+- The opt-in `scripts/install-usage-stats-poster.sh` renders, validates, and idempotently loads an interval-only secret-free LaunchAgent for the tracked Usage Stats Poster, restoring the prior plist and loaded schedule when a replacement load fails.
 - Fresh setup output, `registry.example.json`, and the operator README expose generic named-account fields, precedence, migration, and rollback guidance without local credentials or account paths.
 
 **Not built:**

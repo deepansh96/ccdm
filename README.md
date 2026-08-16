@@ -382,7 +382,7 @@ Ask the root agent for a usage report by messaging `usage`, `limits`, or `how mu
 
 A separate, opt-in macOS LaunchAgent can post usage stats to Discord on a schedule. It is not installed by `setup.sh` and it is not the old tmux-based `usage-report-loop.sh` flow.
 
-The tracked installer renders and validates `~/Library/LaunchAgents/com.discord.usage-stats-poster.plist` with absolute paths to Python, Codex, the poster, and its logs. Reinstalling unloads the existing label before loading the new plist, so changing the interval is idempotent:
+The tracked installer renders and validates `~/Library/LaunchAgents/com.discord.usage-stats-poster.plist` with absolute paths to Python, Codex, the poster, and its logs. The LaunchAgent is interval-only, so installation does not trigger an immediate post. Reinstalling unloads the existing label before loading the new plist, so changing the interval is idempotent; if the new load fails, the prior plist and loaded/unloaded schedule are restored:
 
 ```bash
 scripts/install-usage-stats-poster.sh                 # 1800 seconds (30 minutes)

@@ -170,7 +170,7 @@ print(f"Recorded PID {pid}")
 PY
 }
 
-IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME BOT_TOKEN CHANNEL_ID WS_PORT DISCORD_USER_IDS GUILD_ID ROOT_TOKEN ROOT_BOT_APP_ID BOT_APP_ID BOT_ID CODEX_HOME_DIR BOT_DISPLAY_OVERRIDE TEXT_REPLY_FALLBACK_FLAG CODEX_MODEL_VALUE CODEX_REASONING_EFFORT_VALUE CODEX_SERVICE_TIER_VALUE <<< "$(python3 -c "
+IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME BOT_TOKEN CHANNEL_ID WS_PORT DISCORD_USER_IDS GUILD_ID ROOT_TOKEN ROOT_BOT_APP_ID BOT_APP_ID BOT_ID BOT_DISPLAY_OVERRIDE TEXT_REPLY_FALLBACK_FLAG CODEX_MODEL_VALUE CODEX_REASONING_EFFORT_VALUE CODEX_SERVICE_TIER_VALUE <<< "$(python3 -c "
 import base64, json, os, re
 r = json.load(open('$REGISTRY'))
 p = r['projects']['$PROJECT']
@@ -189,9 +189,6 @@ if os.path.exists(root_env):
         except Exception:
             pass
 allowed_user_ids = [r['discord_user_id']] + list(p.get('guest_user_ids') or [])
-def legacy_home_candidate(value):
-    return value if isinstance(value, str) and value.strip() else None
-legacy_home = legacy_home_candidate(p.get('codex_home')) or legacy_home_candidate(r.get('codex_home')) or '~/.codex'
 print('\t'.join([
     os.path.expanduser(p['path']),
     os.path.expanduser(bot['state_dir']),
@@ -205,7 +202,6 @@ print('\t'.join([
     root_bot_app_id,
     bot['app_id'],
     bot['id'],
-    os.path.expanduser(legacy_home),
     (p.get('bot_display_name') or '__NONE__'),
     '1' if p.get('text_reply_fallback') is True else '__NONE__',
     (p.get('codex_model') or p.get('model') or '__NONE__'),

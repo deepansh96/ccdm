@@ -12,7 +12,7 @@ test.afterEach(async () => {
   await cleanup();
 });
 
-async function startPosterApi() {
+async function startPosterApi({ organization = { organization_type: "pro" } } = {}) {
   const requests = [];
   const server = http.createServer((request, response) => {
     let body = "";
@@ -40,7 +40,7 @@ async function startPosterApi() {
             display_name: "Fixture User",
             email: "fixture@example.test",
           },
-          organization: { organization_type: "pro" },
+          organization,
         }));
         return;
       }
@@ -155,6 +155,86 @@ test("poster posts a Claude usage embed through the configured Discord endpoint"
   assert.deepEqual(readState(workspace.stateDir).fixtures.security.invocations.map((entry) => entry.args), [
     ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
   ]);
+});
+
+test("poster uses N/A when the Claude organization value is malformed", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi({ organization: ["not", "an", "object"] });
+  seedPosterWorkspace(workspace, api.baseUrl);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", { cwd: workspace.tmpDir });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const post = api.requests.find((request) => request.method === "POST");
+  assert.ok(post);
+  assert.match(JSON.parse(post.body).embeds[0].fields[0].value, /^\*\*Personal\*\* \(N\/A\)/);
+});
+
+test("poster falls back when Codex JSON-RPC returns a non-object response", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const codexHome = path.join(workspace.homeDir, ".codex-non-object");
+  fs.mkdirSync(codexHome);
+  seedPosterWorkspace(workspace, api.baseUrl);
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    `${JSON.stringify({
+      codex_accounts: { "codex-non-object": codexHome },
+      default_codex_account: "codex-non-object",
+      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      projects: {},
+    }, null, 2)}\n`,
+  );
+  const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
+  fs.writeFileSync(responsesPath, `${JSON.stringify({
+    [fs.realpathSync(codexHome)]: { mode: "non-object" },
+  }, null, 2)}\n`);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+    env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const post = api.requests.find((request) => request.method === "POST");
+  assert.ok(post);
+  const codexValue = JSON.parse(post.body).embeds[0].fields.find(({ name }) => name === "Codex").value;
+  assert.match(codexValue, /\*\*codex-non-object\*\*/);
+  assert.match(codexValue, /Live rate limits unavailable; no recent usage data/);
+});
+
+test("poster reads Codex JSON-RPC lines already buffered above the descriptor", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const codexHome = path.join(workspace.homeDir, ".codex-buffered");
+  fs.mkdirSync(codexHome);
+  seedPosterWorkspace(workspace, api.baseUrl);
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    `${JSON.stringify({
+      codex_accounts: { "codex-buffered": codexHome },
+      default_codex_account: "codex-buffered",
+      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      projects: {},
+    }, null, 2)}\n`,
+  );
+  const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
+  fs.writeFileSync(responsesPath, `${JSON.stringify({
+    [fs.realpathSync(codexHome)]: {
+      mode: "buffered",
+      result: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 27 } } },
+    },
+  }, null, 2)}\n`);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+    env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const post = api.requests.find((request) => request.method === "POST");
+  assert.ok(post);
+  const codexValue = JSON.parse(post.body).embeds[0].fields.find(({ name }) => name === "Codex").value;
+  assert.match(codexValue, /\*\*codex-buffered\*\* \(ChatGPT\)/);
+  assert.match(codexValue, /27%/);
 });
 
 test("poster reports named Codex Accounts in default-first alphabetical order", async () => {

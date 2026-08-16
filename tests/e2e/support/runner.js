@@ -185,7 +185,7 @@ function initialState() {
         uploads: [],
       },
       network: { blocked: [] },
-      launchctl: { invocations: [] },
+      launchctl: { invocations: [], loaded: [], loadFailuresRemaining: 0, unloadFailuresRemaining: 0 },
       npm: { invocations: [] },
       npx: { invocations: [] },
       processes: [],
@@ -262,7 +262,12 @@ function normalizeState(value) {
       npm: { invocations: value?.fixtures?.npm?.invocations || [] },
       npx: { invocations: value?.fixtures?.npx?.invocations || [] },
       network: { blocked: value?.fixtures?.network?.blocked || [] },
-      launchctl: { invocations: value?.fixtures?.launchctl?.invocations || [] },
+      launchctl: {
+        invocations: value?.fixtures?.launchctl?.invocations || [],
+        loaded: value?.fixtures?.launchctl?.loaded || [],
+        loadFailuresRemaining: value?.fixtures?.launchctl?.loadFailuresRemaining || 0,
+        unloadFailuresRemaining: value?.fixtures?.launchctl?.unloadFailuresRemaining || 0,
+      },
       processes: value?.fixtures?.processes || [],
       security: {
         credentials: value?.fixtures?.security?.credentials || {},
@@ -943,7 +948,18 @@ function runCodexStdio() {
       return;
     }
     if (request.method === "initialize") {
-      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} }) + "\\n");
+      const initializeResponse = JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} });
+      if (configuredResponse?.mode === "buffered") {
+        process.stdout.write(
+          initializeResponse + "\\n" + JSON.stringify({
+            jsonrpc: "2.0",
+            id: 2,
+            result: configuredResponse.result,
+          }) + "\\n",
+        );
+      } else {
+        process.stdout.write(initializeResponse + "\\n");
+      }
       return;
     }
     if (request.method !== "account/rateLimits/read") {
@@ -959,6 +975,10 @@ function runCodexStdio() {
     }
     if (configuredResponse.mode === "malformed") {
       process.stdout.write("not-json\\n");
+      return;
+    }
+    if (configuredResponse.mode === "non-object") {
+      process.stdout.write("[]\\n");
       return;
     }
     process.stdout.write(JSON.stringify({
@@ -1019,11 +1039,36 @@ function runLaunchctl() {
     process.exit(2);
   }
   const target = args[1] || null;
-  updateState((state) => {
-    state.fixtures.launchctl.invocations.push({ operation, target });
-    return state;
+  let failed = false;
+  updateState((nextState) => {
+    const launchctl = nextState.fixtures.launchctl;
+    launchctl.invocations.push({ operation, target });
+    if (operation === "load" && launchctl.loadFailuresRemaining > 0) {
+      launchctl.loadFailuresRemaining -= 1;
+      failed = true;
+      return nextState;
+    }
+    if (operation === "unload" && launchctl.unloadFailuresRemaining > 0) {
+      launchctl.unloadFailuresRemaining -= 1;
+      failed = true;
+      return nextState;
+    }
+    const label = target ? path.basename(target).replace(/\.plist$/, "") : null;
+    if (operation === "load" && label && !launchctl.loaded.includes(label)) {
+      launchctl.loaded.push(label);
+    }
+    if (operation === "unload" && label) {
+      launchctl.loaded = launchctl.loaded.filter((entry) => entry !== label);
+    }
+    return nextState;
   });
+  if (failed) {
+    process.exit(1);
+  }
   if (operation === "list") {
+    if (!readState().fixtures.launchctl.loaded.includes(target)) {
+      process.exit(1);
+    }
     process.stdout.write("-\\t0\\t" + (target || "") + "\\n");
   }
 }

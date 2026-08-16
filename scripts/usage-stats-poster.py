@@ -230,8 +230,12 @@ def get_claude_oauth_stats(base_url):
     except PosterError:
         return "**Personal**\n*Anthropic usage is temporarily unavailable*"
 
-    organization = profile.get("organization", {}) if isinstance(profile, dict) else {}
-    plan = str(organization.get("organization_type", "N/A")).replace("_", " ").title()
+    organization = profile.get("organization") if isinstance(profile, dict) else None
+    organization_type = organization.get("organization_type") if isinstance(organization, dict) else None
+    if isinstance(organization_type, str) and organization_type.strip():
+        plan = organization_type.strip().replace("_", " ").title()
+    else:
+        plan = "N/A"
     now = datetime.now(timezone.utc)
     lines = [f"**Personal** ({plan})"]
     for key, limit_label in (("five_hour", "5-Hour"), ("seven_day", "7-Day")):
@@ -321,11 +325,6 @@ def load_registry_data(path):
     if not isinstance(bot, dict) or not isinstance(bot.get("token"), str) or not bot["token"]:
         raise PosterError("registry.json has no token for the configured root bot")
     return registry, bot["token"]
-
-
-def load_registry(path):
-    """Load the root bot token for callers that only need the Discord credential."""
-    return load_registry_data(path)[1]
 
 
 def _resolved_codex_home(value):
@@ -444,33 +443,71 @@ def read_codex_rate_limits(codex_home):
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
             env=environment,
         )
     except (OSError, subprocess.SubprocessError):
         return None
+
+    stdout_buffer = bytearray()
+    try:
+        stdout_fd = process.stdout.fileno()
+        os.set_blocking(stdout_fd, False)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+    def read_line(deadline):
+        while True:
+            try:
+                line_end = stdout_buffer.index(b"\n")
+            except ValueError:
+                line_end = None
+            if line_end is not None:
+                line = bytes(stdout_buffer[:line_end])
+                del stdout_buffer[:line_end + 1]
+                return line
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                ready, _, _ = select.select([stdout_fd], [], [], remaining)
+            except (OSError, ValueError):
+                return None
+            if not ready:
+                return None
+            try:
+                chunk = os.read(stdout_fd, 65536)
+            except BlockingIOError:
+                continue
+            except OSError:
+                return None
+            if not chunk:
+                if not stdout_buffer:
+                    return None
+                line = bytes(stdout_buffer)
+                stdout_buffer.clear()
+                return line
+            stdout_buffer.extend(chunk)
 
     def request(request_id, method, params=None):
         message = {"jsonrpc": "2.0", "id": request_id, "method": method}
         if params is not None:
             message["params"] = params
         try:
-            process.stdin.write(json.dumps(message) + "\n")
+            process.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
             process.stdin.flush()
         except (BrokenPipeError, OSError, ValueError):
             return None
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            try:
-                ready, _, _ = select.select([process.stdout], [], [], max(0, deadline - time.monotonic()))
-            except (OSError, ValueError):
-                return None
-            if not ready:
+            line = read_line(deadline)
+            if line is None:
                 return None
             try:
-                line = process.stdout.readline()
-                response = json.loads(line)
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                response = json.loads(line.decode("utf-8"))
+            except (OSError, UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError):
+                return None
+            if not isinstance(response, dict):
                 return None
             if response.get("id") != request_id:
                 continue
@@ -486,7 +523,7 @@ def read_codex_rate_limits(codex_home):
         if not isinstance(initialized, dict):
             return None
         try:
-            process.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "initialized"}) + "\n")
+            process.stdin.write((json.dumps({"jsonrpc": "2.0", "method": "initialized"}) + "\n").encode("utf-8"))
             process.stdin.flush()
         except (BrokenPipeError, OSError, ValueError):
             return None

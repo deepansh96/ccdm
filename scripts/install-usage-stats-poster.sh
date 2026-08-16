@@ -70,13 +70,15 @@ fi
 LOG_ROOT=$(cd -- "$LOG_ROOT" && pwd -P)
 PLIST_DIR=$HOME/Library/LaunchAgents
 PLIST_PATH=$PLIST_DIR/$LABEL.plist
+CANDIDATE_PATH=$PLIST_DIR/.$LABEL.$$.candidate
+BACKUP_PATH=$PLIST_DIR/.$LABEL.$$.backup
 STDOUT_PATH=$LOG_ROOT/usage-stats-poster.log
 STDERR_PATH=$LOG_ROOT/usage-stats-poster.err
 CODEX_BIN_DIR=$(dirname -- "$CODEX_PATH")
 
 mkdir -p "$PLIST_DIR"
 
-"$PYTHON_PATH" - "$TEMPLATE_PATH" "$PLIST_PATH" "$PYTHON_PATH" "$CODEX_PATH" "$CODEX_BIN_DIR" "$POSTER_PATH" "$STDOUT_PATH" "$STDERR_PATH" "$INTERVAL" "$LABEL" <<'PY'
+"$PYTHON_PATH" - "$TEMPLATE_PATH" "$CANDIDATE_PATH" "$PYTHON_PATH" "$CODEX_PATH" "$CODEX_BIN_DIR" "$POSTER_PATH" "$STDOUT_PATH" "$STDERR_PATH" "$INTERVAL" "$LABEL" <<'PY'
 import html
 import os
 import plistlib
@@ -97,8 +99,8 @@ from pathlib import Path
     label,
 ) = sys.argv[1:]
 template_path = Path(template_name)
-destination_path = Path(destination_name)
-temporary_path = destination_path.with_name(f".{destination_path.name}.{os.getpid()}.tmp")
+candidate_path = Path(destination_name)
+temporary_path = candidate_path.with_name(f".{candidate_path.name}.{os.getpid()}.tmp")
 values = {
     "__PYTHON_PATH__": python_path,
     "__CODEX_PATH__": codex_path,
@@ -143,23 +145,118 @@ try:
     if not all(os.path.isabs(value) for value in (python_path, codex_path, poster_path, stdout_path, stderr_path)):
         invalid("all executable and log paths must be absolute")
 
-    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    candidate_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path.write_text(rendered, encoding="utf-8")
     plistlib.loads(temporary_path.read_bytes())
-    os.replace(temporary_path, destination_path)
+    os.replace(temporary_path, candidate_path)
 except SystemExit:
     raise
 except (OSError, UnicodeError, ValueError, plistlib.InvalidFileException) as error:
     invalid(str(error) or "unable to parse the rendered XML")
 PY
 
-if ! launchctl unload "$PLIST_PATH" >/dev/null 2>&1; then
-  :
+prior_job_loaded=0
+if launchctl list "$LABEL" >/dev/null 2>&1; then
+  prior_job_loaded=1
 fi
-if ! launchctl load "$PLIST_PATH" >/dev/null 2>&1; then
-  echo "Error: unable to load LaunchAgent '$LABEL'" >&2
+
+if ! launchctl unload "$PLIST_PATH" >/dev/null 2>&1; then
+  if [ "$prior_job_loaded" -eq 1 ]; then
+    echo "Error: unable to unload LaunchAgent '$LABEL'" >&2
+    "$PYTHON_PATH" - "$CANDIDATE_PATH" <<'PY'
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).unlink(missing_ok=True)
+PY
+    exit 1
+  fi
+fi
+
+prior_plist_exists=0
+if [ -f "$PLIST_PATH" ]; then
+  prior_plist_exists=1
+fi
+
+if ! "$PYTHON_PATH" - "$PLIST_PATH" "$CANDIDATE_PATH" "$BACKUP_PATH" "$prior_plist_exists" <<'PY'
+import os
+from pathlib import Path
+import shutil
+import sys
+
+destination_path = Path(sys.argv[1])
+candidate_path = Path(sys.argv[2])
+backup_path = Path(sys.argv[3])
+prior_plist_exists = sys.argv[4] == "1"
+
+try:
+    if prior_plist_exists:
+        shutil.copy2(destination_path, backup_path)
+    os.replace(candidate_path, destination_path)
+except Exception:
+    backup_path.unlink(missing_ok=True)
+    candidate_path.unlink(missing_ok=True)
+    raise
+PY
+then
+  echo "Error: unable to install rendered LaunchAgent '$LABEL'" >&2
+  if [ "$prior_job_loaded" -eq 1 ] && ! launchctl load "$PLIST_PATH" >/dev/null 2>&1; then
+    echo "Error: failed to restore the previous schedule" >&2
+  fi
   exit 1
 fi
+
+rollback() {
+  rollback_status=0
+  if ! launchctl unload "$PLIST_PATH" >/dev/null 2>&1; then
+    :
+  fi
+  if ! "$PYTHON_PATH" - "$PLIST_PATH" "$BACKUP_PATH" "$CANDIDATE_PATH" "$prior_plist_exists" <<'PY'
+from pathlib import Path
+import os
+import sys
+
+destination_path = Path(sys.argv[1])
+backup_path = Path(sys.argv[2])
+candidate_path = Path(sys.argv[3])
+prior_plist_exists = sys.argv[4] == "1"
+
+try:
+    if prior_plist_exists:
+        os.replace(backup_path, destination_path)
+    else:
+        destination_path.unlink(missing_ok=True)
+    candidate_path.unlink(missing_ok=True)
+except Exception:
+    raise
+PY
+  then
+    rollback_status=1
+  fi
+  if [ "$prior_job_loaded" -eq 1 ]; then
+    if ! launchctl load "$PLIST_PATH" >/dev/null 2>&1; then
+      rollback_status=1
+    fi
+  fi
+  if [ "$rollback_status" -ne 0 ]; then
+    echo "Error: unable to load LaunchAgent '$LABEL'; failed to restore the previous schedule" >&2
+  else
+    echo "Error: unable to load LaunchAgent '$LABEL'; restored the previous schedule" >&2
+  fi
+  return "$rollback_status"
+}
+
+if ! launchctl load "$PLIST_PATH" >/dev/null 2>&1; then
+  rollback
+  exit 1
+fi
+
+"$PYTHON_PATH" - "$BACKUP_PATH" <<'PY'
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).unlink(missing_ok=True)
+PY
 
 launch_state=loaded
 if launch_state_output=$(launchctl list "$LABEL" 2>/dev/null); then

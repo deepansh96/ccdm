@@ -4,7 +4,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { createWorkspace, runScript } from "./support/runner.js";
-import { readState } from "./support/state.js";
+import { readState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => {
@@ -41,8 +41,6 @@ test("installer renders a secret-free LaunchAgent with the default interval", as
 </array>
 <key>StartInterval</key>
 <integer>1800</integer>
-<key>RunAtLoad</key>
-<true/>
 <key>EnvironmentVariables</key>
 <dict>
 <key>CCDM_CODEX_PATH</key>
@@ -76,6 +74,7 @@ test("installer applies an interval override, replaces the agent, and reports lo
 
   const state = readState(workspace.stateDir);
   assert.deepEqual(state.fixtures.launchctl.invocations, [
+    { operation: "list", target: "com.discord.usage-stats-poster" },
     { operation: "unload", target: plistPath(workspace) },
     { operation: "load", target: plistPath(workspace) },
     { operation: "list", target: "com.discord.usage-stats-poster" },
@@ -100,8 +99,36 @@ test("installer is idempotent when reinstalling the same LaunchAgent", async () 
   assert.equal(fs.readFileSync(plistPath(workspace), "utf8"), firstPlist);
   assert.deepEqual(
     readState(workspace.stateDir).fixtures.launchctl.invocations.map(({ operation }) => operation),
-    ["unload", "load", "list", "unload", "load", "list"],
+    ["list", "unload", "load", "list", "list", "unload", "load", "list"],
   );
+});
+
+test("failed reload restores the prior plist and loaded schedule", async () => {
+  const workspace = createWorkspace();
+  const first = await runScript(workspace, "scripts/install-usage-stats-poster.sh", {
+    args: ["--interval", "1800"],
+  });
+  assert.equal(first.exitCode, 0, first.stderr || first.stdout);
+  const priorPlist = fs.readFileSync(plistPath(workspace), "utf8");
+
+  const state = readState(workspace.stateDir);
+  state.fixtures.launchctl.loadFailuresRemaining = 1;
+  writeState(state, workspace.stateDir);
+
+  const result = await runScript(workspace, "scripts/install-usage-stats-poster.sh", {
+    args: ["--interval", "900"],
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /restored the previous schedule/);
+  assert.equal(fs.readFileSync(plistPath(workspace), "utf8"), priorPlist);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.launchctl.loaded, ["com.discord.usage-stats-poster"]);
+  assert.deepEqual(
+    readState(workspace.stateDir).fixtures.launchctl.invocations.map(({ operation }) => operation),
+    ["list", "unload", "load", "list", "list", "unload", "load", "unload", "load"],
+  );
+  assert.deepEqual(fs.readdirSync(path.dirname(plistPath(workspace))), ["com.discord.usage-stats-poster.plist"]);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.sends, []);
 });
 
 test("invalid rendered plist fails before launchctl replacement", async () => {

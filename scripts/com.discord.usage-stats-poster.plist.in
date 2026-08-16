@@ -11,8 +11,6 @@
 </array>
 <key>StartInterval</key>
 <integer>__INTERVAL__</integer>
-<key>RunAtLoad</key>
-<true/>
 <key>EnvironmentVariables</key>
 <dict>
 <key>CCDM_CODEX_PATH</key>
