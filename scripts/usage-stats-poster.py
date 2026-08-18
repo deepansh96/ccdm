@@ -2,13 +2,19 @@
 """Post configured Claude usage statistics to one Discord channel."""
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
+import math
 import os
+import stat
 import select
 import subprocess
 import sys
+import tempfile
 import time
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -20,6 +26,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
 DEFAULT_CONFIG_PATH = ROOT_DIR / ".usage-stats-poster.json"
 REGISTRY_PATH = ROOT_DIR / "registry.json"
+DEFAULT_HISTORY_DB_PATH = Path.home() / "Library" / "Application Support" / "CCDM" / "usage-stats" / "history.sqlite3"
+HISTORY_RETENTION_DAYS = 365
+HISTORY_WARNING_BYTES = 5 * 1024 * 1024 * 1024
+HISTORY_WARNING_INTERVAL = timedelta(hours=24)
+RENDERER_PATH = SCRIPT_DIR / "usage-dashboard-renderer.py"
+HISTORY_SCHEMA_VERSION = 1
 CLAUDE_PRICES = {
     "claude-haiku-4-5": (1.0, 5.0),
     "claude-sonnet-4-6": (3.0, 15.0),
@@ -46,7 +58,7 @@ def fmt_reset(reset_str, now):
     try:
         reset = datetime.fromisoformat(str(reset_str).replace("Z", "+00:00"))
         total_minutes = int((reset - now).total_seconds() / 60)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if total_minutes < 0:
         return "now"
@@ -67,6 +79,19 @@ def text_bar(pct, width=15):
     value = max(0, min(value, 100))
     filled = round(value / 100 * width)
     return f"`[{'#' * filled}{'.' * (width - filled)}]` **{value:.0f}%**"
+
+
+def _safe_percentage(value):
+    """Return a finite, clamped percentage or ``None`` when unavailable."""
+    if isinstance(value, bool):
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return max(0.0, min(100.0, value))
 
 
 def fmt_tokens(value):
@@ -378,6 +403,23 @@ def parse_config(raw):
     if discord_base_url is None:
         discord_base_url = os.environ.get("CCDM_DISCORD_BASE_URL") or os.environ.get("DISCORD_BASE_URL")
 
+    history_value = raw.get(
+        "history_db_path",
+        raw.get("history_path", raw.get("usage_history_path", raw.get("usage_history_db"))),
+    )
+    if history_value is None:
+        history_value = os.environ.get("CCDM_USAGE_STATS_DB_PATH") or os.environ.get("CCDM_USAGE_STATS_HISTORY_DB")
+    if history_value is None:
+        history_db_path = DEFAULT_HISTORY_DB_PATH
+    elif not isinstance(history_value, str) or not history_value.strip():
+        raise PosterError("history_db_path must be a non-empty path")
+    else:
+        history_db_path = Path(os.path.expanduser(history_value))
+        if not history_db_path.is_absolute():
+            raise PosterError("history_db_path must be an absolute path or use ~")
+    if history_db_path.name in {"", ".", ".."}:
+        raise PosterError("history_db_path must name a SQLite database file")
+
     return {
         "discord_channel_id": channel_id,
         "anthropic_base_url": _parse_url(anthropic_base_url, "anthropic_base_url")
@@ -385,6 +427,7 @@ def parse_config(raw):
         "discord_base_url": _parse_url(discord_base_url, "discord_base_url")
         or "https://discord.com",
         "claude_api_accounts": normalized_accounts,
+        "history_db_path": history_db_path,
     }
 
 
@@ -592,10 +635,11 @@ def format_codex_rate_limits(rate_limits, label, reset_credits=None, source_ts=N
             window_label = "5-Hour"
         elif duration == 10080:
             window_label = "7-Day"
-        used_percent = data.get("usedPercent", data.get("used_percent", 0)) or 0
+        used_percent = _safe_percentage(data.get("usedPercent", data.get("used_percent")))
         reset = _format_rate_limit_reset(data.get("resetsAt", data.get("resets_at")))
         reset_part = f"  resets in {reset}" if reset else ""
-        lines.append(f"{window_label}: {text_bar(used_percent)}{reset_part}")
+        value_text = text_bar(used_percent) if used_percent is not None else "*unavailable*"
+        lines.append(f"{window_label}: {value_text}{reset_part}")
     if reset_credits is None:
         reset_credits = rate_limits.get("rateLimitResetCredits")
     if isinstance(reset_credits, dict) and isinstance(reset_credits.get("availableCount"), int):
@@ -833,6 +877,221 @@ def get_claude_stats(config):
     return value
 
 
+def _normalise_reset_timestamp(value):
+    """Return a stable UTC timestamp, or ``None`` for malformed input."""
+    try:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            if not math.isfinite(float(value)):
+                return None
+            parsed = datetime.fromtimestamp(value, timezone.utc)
+        elif isinstance(value, str) and value.strip():
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        else:
+            return None
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _collect_claude_oauth_metric(base_url, service, label, dir_hint):
+    """Collect a credential-free, renderer-friendly Claude account metric.
+
+    The returned object intentionally contains only display labels, rate-limit
+    percentages, and reset timestamps.  In particular, the OAuth credential,
+    transcript path, and response payload are never returned to the history
+    writer.
+    """
+    metric = {"provider": "claude", "account": label, "limits": []}
+    oauth = _read_oauth_credential(service)
+    if not oauth:
+        metric["status"] = "unavailable"
+        metric["reason"] = "Could not get OAuth token"
+        metric["missing_oauth"] = True
+        metric["text"] = f"**{label}**\n*Could not get OAuth token*"
+        return metric
+    expires_at = oauth.get("expiresAt")
+    if expires_at:
+        try:
+            if float(expires_at) / 1000 < datetime.now(timezone.utc).timestamp():
+                metric["status"] = "unavailable"
+                metric["reason"] = "OAuth token expired"
+                metric["text"] = (
+                    f"**{label}**\n*OAuth token expired — start a session on this account to refresh*"
+                    if oauth.get("refreshToken")
+                    else _claude_relogin_block(label, dir_hint)
+                )
+                return metric
+        except (TypeError, ValueError):
+            pass
+
+    headers = {
+        "Authorization": f"Bearer {oauth['accessToken']}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-code/usage-stats-poster",
+    }
+    try:
+        profile = _request_json(base_url, "/api/oauth/profile", headers, "Anthropic profile")
+        usage = _request_json(base_url, "/api/oauth/usage", headers, "Anthropic usage")
+    except PosterHTTPError as error:
+        metric["status"] = "unavailable"
+        metric["reason"] = "Auth expired" if error.status == 401 else "Anthropic usage unavailable"
+        metric["text"] = (
+            f"**{label}**\n*Auth expired — start a session on this account to refresh*"
+            if error.status == 401 and oauth.get("refreshToken")
+            else _claude_relogin_block(label, dir_hint)
+            if error.status == 401
+            else f"**{label}**\n*Anthropic usage is temporarily unavailable*"
+        )
+        return metric
+    except PosterError:
+        metric["status"] = "unavailable"
+        metric["reason"] = "Anthropic usage unavailable"
+        metric["text"] = f"**{label}**\n*Anthropic usage is temporarily unavailable*"
+        return metric
+
+    organization = profile.get("organization") if isinstance(profile, dict) else None
+    organization_type = organization.get("organization_type") if isinstance(organization, dict) else None
+    metric["plan"] = str(organization_type or "N/A").replace("_", " ").title()
+    for key, window in (("five_hour", "5-hour"), ("seven_day", "7-day")):
+        data = usage.get(key) if isinstance(usage, dict) else None
+        if not isinstance(data, dict):
+            continue
+        raw_percent = data.get("utilization")
+        try:
+            percent = float(raw_percent)
+            if isinstance(raw_percent, bool) or not math.isfinite(percent):
+                raise ValueError
+        except (TypeError, ValueError):
+            percent = None
+        metric["limits"].append({
+            "window": window,
+            "used_percent": max(0.0, min(100.0, percent)) if percent is not None else None,
+            "available": percent is not None,
+            "status": "available" if percent is not None else "unavailable",
+            "reason": None if percent is not None else "Usage percentage unavailable",
+            "resets_at": _normalise_reset_timestamp(data.get("resets_at")),
+        })
+    if not metric["limits"]:
+        metric["status"] = "unavailable"
+        metric["reason"] = "No rate-limit data"
+    lines = [f"**{label}** ({metric['plan']})"]
+    for limit in metric["limits"]:
+        reset = fmt_reset(limit.get("resets_at"), datetime.now(timezone.utc))
+        reset_part = f"  resets in {reset}" if reset else ""
+        value_text = text_bar(limit["used_percent"]) if limit["available"] else "*unavailable*"
+        lines.append(f"{'5-Hour' if limit['window'] == '5-hour' else '7-Day'}: {value_text}{reset_part}")
+    extra_usage = usage.get("extra_usage", {}) if isinstance(usage, dict) else {}
+    if isinstance(extra_usage, dict) and extra_usage.get("is_enabled"):
+        lines.append(f"Extra usage: **${_safe_int(extra_usage.get('used_credits')) / 100:.2f}** spent")
+    metric["text"] = "\n".join(lines)
+    return metric
+
+
+def collect_claude_metrics(config):
+    """Return structured current Claude metrics for history and rendering."""
+    metrics = []
+    for index, (service, label, dir_hint) in enumerate(discover_claude_accounts()):
+        metric = _collect_claude_oauth_metric(config["anthropic_base_url"], service, label, dir_hint)
+        if index > 0 and metric.get("missing_oauth"):
+            metric["text"] = None
+        metrics.append(metric)
+    for account in config["claude_api_accounts"]:
+        # API-key transcript accounts remain visible in the text report, but
+        # have no comparable percentage limit.  Keep a safe unavailable card
+        # for the dashboard without persisting transcript counts or paths.
+        api_metric = {
+            "provider": "claude",
+            "account": account["label"],
+            "limits": [{
+                "window": "rate limits",
+                "available": False,
+                "status": "unavailable",
+                "reason": "API-key account has no rate-limit percentage",
+            }],
+        }
+        if account["path"].is_dir():
+            api_metric["text"] = get_claude_api_stats(account["path"], account["label"])
+        else:
+            api_metric["text"] = f"**{account['label']}** (API key)\n*Config directory unavailable*"
+        metrics.append(api_metric)
+    return metrics
+
+
+def _metric_from_codex_rate_limits(rate_limits, label, source="live", source_ts=None):
+    metric = {"provider": "codex", "account": label, "limits": [], "source": source}
+    if not isinstance(rate_limits, dict):
+        metric["status"] = "unavailable"
+        metric["reason"] = "Live rate limits unavailable"
+        return metric
+    for key, window in (("primary", "5-hour"), ("secondary", "7-day")):
+        data = rate_limits.get(key)
+        if not isinstance(data, dict):
+            continue
+        value = _safe_percentage(data.get("usedPercent", data.get("used_percent")))
+        limit = {
+            "window": window,
+            "available": value is not None,
+            "status": "available" if value is not None else "unavailable",
+            "reason": None if value is not None else "Usage percentage unavailable",
+            "used_percent": max(0.0, min(100.0, value)) if value is not None else None,
+            "resets_at": _normalise_reset_timestamp(data.get("resetsAt", data.get("resets_at"))),
+        }
+        metric["limits"].append(limit)
+    if not metric["limits"]:
+        metric["status"] = "unavailable"
+        metric["reason"] = "No rate-limit data"
+    metric["text"] = format_codex_rate_limits(rate_limits, label, source_ts=source_ts)
+    if source_ts:
+        metric["source_ts"] = source_ts
+    return metric
+
+
+def collect_codex_metrics(registry):
+    """Return structured current Codex metrics without retaining source paths."""
+    metrics = []
+    for account in discover_codex_accounts(registry):
+        home = account["home"]
+        label = account["label"]
+        if home is None or not home.is_dir() or not os.access(home, os.R_OK | os.X_OK):
+            metrics.append({
+                "provider": "codex", "account": label, "limits": [{
+                    "window": "rate limits", "available": False,
+                    "status": "unavailable", "reason": "Codex Home unavailable",
+                }], "text": f"**{label}**\n*Codex Home unavailable*",
+            })
+            continue
+        live = read_codex_rate_limits(home)
+        if isinstance(live, dict):
+            metrics.append(_metric_from_codex_rate_limits(live, label))
+            continue
+        session_data = _latest_codex_session_data(home)
+        if session_data is not None and isinstance(session_data[0], dict):
+            metrics.append(_metric_from_codex_rate_limits(session_data[0], label, "local_session", session_data[3]))
+            continue
+        text = [f"**{label}**", "*Live rate limits unavailable; no recent usage data*"]
+        if session_data is not None:
+            _, last_usage, total_usage, source_ts = session_data
+            text = [f"**{label}** (Codex)", "*Live rate limits unavailable*"]
+            if last_usage:
+                text.append(f"Last turn: **{fmt_tokens(last_usage.get('total_tokens'))}** tokens")
+            if total_usage:
+                text.append(f"Session total: **{fmt_tokens(total_usage.get('total_tokens'))}** tokens")
+            age_marker = _format_age_marker(source_ts)
+            if age_marker:
+                text.append(age_marker)
+        metrics.append({
+            "provider": "codex", "account": label, "limits": [{
+                "window": "rate limits", "available": False,
+                "status": "unavailable", "reason": "No recent usage data",
+            }], "text": "\n".join(text),
+        })
+    return metrics
+
+
 def post_to_discord(config, bot_token, claude_value, codex_value=None):
     timestamp = datetime.now().strftime("%b %d, %H:%M")
     embed = {
@@ -866,6 +1125,508 @@ def post_to_discord(config, bot_token, claude_value, codex_value=None):
     print(f"Posted (message ID: {message_id})")
 
 
+def _utc_now():
+    """Read an optional deterministic clock used by local validation tests."""
+    for key in ("CCDM_USAGE_STATS_NOW", "CCDM_TEST_NOW"):
+        value = os.environ.get(key)
+        if not value:
+            continue
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except ValueError:
+            continue
+    return datetime.now(timezone.utc)
+
+
+def _floor_utc(value, minutes):
+    value = value.astimezone(timezone.utc)
+    return value.replace(minute=(value.minute // minutes) * minutes, second=0, microsecond=0)
+
+
+def _iso_utc(value):
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _safe_label(value, fallback):
+    if not isinstance(value, str) or not value.strip():
+        return fallback
+    # Labels are supplied by account metadata.  Replace path separators and
+    # control characters so an accidental local path cannot enter history.
+    cleaned = " ".join(value.replace("/", "·").replace("\\", "·").split())
+    return cleaned[:160] or fallback
+
+
+def _safe_history_cards(metrics):
+    cards = []
+    for metric in metrics:
+        if not isinstance(metric, dict):
+            continue
+        provider = _safe_label(metric.get("provider"), "usage").lower()
+        account = _safe_label(metric.get("account"), "unknown")
+        limits = metric.get("limits")
+        if not isinstance(limits, list):
+            limits = []
+        for index, limit in enumerate(limits):
+            if not isinstance(limit, dict):
+                continue
+            window = _safe_label(limit.get("window"), f"limit-{index + 1}")
+            value = _safe_percentage(limit.get("used_percent"))
+            available = limit.get("available") is not False and value is not None
+            card = {
+                "provider": provider,
+                "account": account,
+                "window": window,
+                "available": bool(available),
+                "status": "available" if available else "unavailable",
+            }
+            if available:
+                card["used_percent"] = max(0.0, min(100.0, value))
+            reason = limit.get("reason") or metric.get("reason")
+            if not available and isinstance(reason, str):
+                card["reason"] = _safe_label(reason, "Data unavailable")[:200]
+            reset = _normalise_reset_timestamp(limit.get("resets_at"))
+            if reset:
+                card["resets_at"] = reset
+            cards.append(card)
+        if not limits:
+            cards.append({
+                "provider": provider,
+                "account": account,
+                "window": "rate limits",
+                "available": False,
+                "status": "unavailable",
+                "reason": _safe_label(metric.get("reason"), "Data unavailable"),
+            })
+    return cards
+
+
+def _lstat(path):
+    try:
+        return os.lstat(path)
+    except OSError as error:
+        raise PosterError(f"unable to inspect usage history path: {error}") from None
+
+
+def _assert_no_symlink_components(path, allow_missing=True):
+    """Reject symlinked ancestors before creating or opening feature files."""
+    path = Path(path)
+    current = Path(path.anchor) if path.anchor else Path()
+    for component in path.parts[1:] if path.anchor else path.parts:
+        current /= component
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            if allow_missing:
+                continue
+            raise PosterError(f"usage history path does not exist: {current}") from None
+        except OSError as error:
+            raise PosterError(f"unable to inspect usage history path: {error}") from None
+        if stat.S_ISLNK(mode):
+            # macOS exposes /var and /tmp as stable aliases to /private/*;
+            # accepting only these OS-owned aliases keeps normal temp/home
+            # paths usable while rejecting operator-controlled symlink hops.
+            if sys.platform == "darwin" and str(current) in {"/var", "/tmp"}:
+                continue
+            raise PosterError(f"usage history path cannot contain symlink: {current}")
+
+
+def _assert_regular_file(path, label="usage history file"):
+    try:
+        info = os.lstat(path)
+    except OSError as error:
+        raise PosterError(f"unable to inspect {label}: {error}") from None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise PosterError(f"{label} must be a regular, non-symlink file: {path}")
+    return info
+
+
+class HistoryStore:
+    """Small, private SQLite history store guarded by an advisory lock."""
+
+    def __init__(self, db_path):
+        self.db_path = Path(db_path).expanduser()
+        if not self.db_path.is_absolute():
+            raise PosterError("history_db_path must be absolute")
+        self.history_dir = self.db_path.parent
+        self.lock_path = self.history_dir / ".history.lock"
+        self.sidecar_paths = (
+            Path(f"{self.db_path}-wal"),
+            Path(f"{self.db_path}-shm"),
+            Path(f"{self.db_path}-journal"),
+        )
+
+    def _prepare_directory(self):
+        try:
+            _assert_no_symlink_components(self.history_dir)
+            _assert_no_symlink_components(self.db_path)
+            _assert_no_symlink_components(self.lock_path)
+            for sidecar in self.sidecar_paths:
+                _assert_no_symlink_components(sidecar)
+
+            if self.history_dir.exists():
+                directory_info = _lstat(self.history_dir)
+                if stat.S_ISLNK(directory_info.st_mode) or not stat.S_ISDIR(directory_info.st_mode):
+                    raise PosterError("usage history directory must be a real directory")
+                # An existing feature directory is never chmod'd: custom
+                # database paths may live below a shared parent.  Require it
+                # to already be private instead of mutating unrelated state.
+                if directory_info.st_mode & 0o077:
+                    raise PosterError("usage history directory must be private (mode 0700 or stricter)")
+            else:
+                self.history_dir.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.mkdir(self.history_dir, 0o700)
+                except FileExistsError:
+                    pass
+                directory_info = _lstat(self.history_dir)
+                if stat.S_ISLNK(directory_info.st_mode) or not stat.S_ISDIR(directory_info.st_mode):
+                    raise PosterError("usage history directory must be a real directory")
+                os.chmod(self.history_dir, 0o700)
+
+            if self.db_path.exists():
+                _assert_regular_file(self.db_path, "usage history database")
+            for path in (self.lock_path, *self.sidecar_paths):
+                if path.exists():
+                    _assert_regular_file(path, "usage history sidecar")
+        except OSError as error:
+            raise PosterError(f"unable to prepare usage history directory: {error}") from None
+
+    def _validate_schema(self, connection):
+        try:
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        except (sqlite3.Error, TypeError, ValueError, IndexError) as error:
+            raise PosterError(f"usage history schema is unreadable or corrupt: {error}") from None
+        if version not in (0, HISTORY_SCHEMA_VERSION):
+            raise PosterError(
+                f"unsupported usage history schema version {version}; expected {HISTORY_SCHEMA_VERSION}"
+            )
+        required = {
+            "snapshots": {"slot_utc", "generated_at", "payload_json"},
+            "posts": {"slot_utc", "posted_at", "message_id"},
+            "warnings": {"warning_key", "warned_at"},
+        }
+        try:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+        except sqlite3.Error as error:
+            raise PosterError(f"usage history schema is unreadable or corrupt: {error}") from None
+        if version == 0:
+            if not tables:
+                # A brand-new database has no tables; initialize it in place.
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.execute(
+                        "CREATE TABLE snapshots (slot_utc TEXT PRIMARY KEY, generated_at TEXT NOT NULL, payload_json TEXT NOT NULL)"
+                    )
+                    connection.execute(
+                        "CREATE TABLE posts (slot_utc TEXT PRIMARY KEY, posted_at TEXT NOT NULL, message_id TEXT NOT NULL)"
+                    )
+                    connection.execute(
+                        "CREATE TABLE warnings (warning_key TEXT PRIMARY KEY, warned_at TEXT NOT NULL)"
+                    )
+                    connection.execute("PRAGMA user_version = 1")
+                    connection.commit()
+                except sqlite3.Error as error:
+                    with contextlib.suppress(sqlite3.Error):
+                        connection.rollback()
+                    raise PosterError(f"unable to initialize usage history schema atomically: {error}") from None
+                except BaseException:
+                    with contextlib.suppress(sqlite3.Error):
+                        connection.rollback()
+                    raise
+            elif tables == set(required):
+                # Version 0 was written before user_version was introduced.
+                # Adopt a complete legacy store without rewriting its rows.
+                for table, columns in required.items():
+                    try:
+                        actual = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+                    except sqlite3.Error as error:
+                        raise PosterError(f"usage history schema table {table!r} is unreadable: {error}") from None
+                    if actual != columns:
+                        raise PosterError(f"usage history schema table {table!r} is corrupt or unsupported")
+            else:
+                raise PosterError("usage history schema is partial or unsupported; refusing to migrate it")
+            connection.execute("PRAGMA user_version = 1")
+            connection.commit()
+            return
+        if tables != set(required):
+            raise PosterError("usage history schema is partial or unsupported; refusing to migrate it")
+        for table, columns in required.items():
+            try:
+                actual = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+            except sqlite3.Error as error:
+                raise PosterError(f"usage history schema table {table!r} is unreadable: {error}") from None
+            if actual != columns:
+                raise PosterError(f"usage history schema table {table!r} is corrupt or unsupported")
+
+    @contextlib.contextmanager
+    def locked(self):
+        self._prepare_directory()
+        fd = None
+        lock_acquired = False
+        connection = None
+        try:
+            try:
+                nofollow = getattr(os, "O_NOFOLLOW", 0)
+                fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT | nofollow, 0o600)
+                os.fchmod(fd, 0o600)
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise PosterError("usage history lock must be a regular file")
+            except OSError as error:
+                raise PosterError(f"unable to open usage history lock: {error}") from None
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    lock_acquired = True
+                except OSError as error:
+                    raise PosterError(f"unable to acquire usage history lock: {error}") from None
+                try:
+                    nofollow = getattr(os, "O_NOFOLLOW", 0)
+                    probe_fd = os.open(self.db_path, os.O_RDWR | os.O_CREAT | nofollow, 0o600)
+                    try:
+                        if not stat.S_ISREG(os.fstat(probe_fd).st_mode):
+                            raise PosterError("usage history database must be a regular file")
+                    finally:
+                        os.close(probe_fd)
+                    previous_umask = os.umask(0o077)
+                    try:
+                        connection = sqlite3.connect(self.db_path, timeout=10)
+                    finally:
+                        os.umask(previous_umask)
+                    connection.execute("PRAGMA busy_timeout = 10000")
+                    connection.execute("PRAGMA journal_mode = DELETE")
+                    self._validate_schema(connection)
+                    _assert_regular_file(self.db_path, "usage history database")
+                    for path in self.sidecar_paths:
+                        if path.exists():
+                            _assert_regular_file(path, "usage history sidecar")
+                    os.chmod(self.db_path, 0o600)
+                    yield connection
+                except PosterError:
+                    raise
+                except (OSError, sqlite3.Error) as error:
+                    raise PosterError(f"unable to open usage history database: {error}") from None
+                finally:
+                    if connection is not None:
+                        connection.close()
+            finally:
+                if lock_acquired:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except OSError as error:
+                        raise PosterError(f"unable to release usage history lock: {error}") from None
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError as error:
+                    raise PosterError(f"unable to close usage history lock: {error}") from None
+
+    def write_snapshot(self, connection, slot, payload):
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        connection.execute(
+            "INSERT OR IGNORE INTO snapshots(slot_utc, generated_at, payload_json) VALUES (?, ?, ?)",
+            (_iso_utc(slot), payload["generated_at"], encoded),
+        )
+        connection.commit()
+        row = connection.execute(
+            "SELECT payload_json FROM snapshots WHERE slot_utc = ?", (_iso_utc(slot),)
+        ).fetchone()
+        if not row:
+            return payload
+        try:
+            return json.loads(row[0])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            # A damaged current slot is replaced atomically with the newly
+            # collected sanitized snapshot; older malformed rows remain
+            # safely ignored by history().
+            print(
+                f"Warning: replacing malformed usage snapshot for UTC slot {_iso_utc(slot)}",
+                file=sys.stderr,
+            )
+            connection.execute(
+                "UPDATE snapshots SET generated_at = ?, payload_json = ? WHERE slot_utc = ?",
+                (payload["generated_at"], encoded, _iso_utc(slot)),
+            )
+            connection.commit()
+            return payload
+
+    def retain(self, connection, now):
+        cutoff = _iso_utc(now - timedelta(days=HISTORY_RETENTION_DAYS))
+        connection.execute("DELETE FROM snapshots WHERE slot_utc < ?", (cutoff,))
+        connection.commit()
+
+    def history(self, connection, since=None):
+        if since is None:
+            rows = connection.execute("SELECT payload_json FROM snapshots ORDER BY slot_utc").fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT payload_json FROM snapshots WHERE slot_utc >= ? ORDER BY slot_utc", (_iso_utc(since),)
+            ).fetchall()
+        result = []
+        for row in rows:
+            try:
+                value = json.loads(row[0])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict):
+                result.append(value)
+        return result
+
+    def has_post(self, connection, slot):
+        return connection.execute("SELECT 1 FROM posts WHERE slot_utc = ?", (_iso_utc(slot),)).fetchone() is not None
+
+    def record_post(self, connection, slot, message_id, posted_at):
+        connection.execute(
+            "INSERT OR IGNORE INTO posts(slot_utc, posted_at, message_id) VALUES (?, ?, ?)",
+            (_iso_utc(slot), _iso_utc(posted_at), str(message_id or "unknown")),
+        )
+        connection.commit()
+
+    def maybe_warn_size(self, connection, now):
+        # Only feature-owned SQLite artifacts are measured.  In particular,
+        # never recurse through a configured Codex Home or Claude transcript
+        # directory if an operator chose a nearby custom database path.
+        owned_names = {
+            self.db_path.name,
+            f"{self.db_path.name}-wal",
+            f"{self.db_path.name}-shm",
+            f"{self.db_path.name}-journal",
+            self.lock_path.name,
+        }
+        size = 0
+        try:
+            for entry in self.history_dir.iterdir():
+                if entry.name not in owned_names:
+                    continue
+                info = os.lstat(entry)
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                    continue
+                size += info.st_size
+        except OSError as error:
+            print(f"Warning: unable to inspect usage history size: {error}", file=sys.stderr)
+            return
+        if size <= HISTORY_WARNING_BYTES:
+            return
+        row = connection.execute(
+            "SELECT warned_at FROM warnings WHERE warning_key = 'history-size'"
+        ).fetchone()
+        last = None
+        if row:
+            try:
+                last = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                last = None
+        if last is not None and now - last < HISTORY_WARNING_INTERVAL:
+            return
+        print(
+            "Warning: Usage Stats history directory exceeds 5 GiB "
+            f"({size} bytes); old snapshots will be retained for {HISTORY_RETENTION_DAYS} days",
+            file=sys.stderr,
+        )
+        if sys.platform == "darwin" and os.environ.get("CCDM_USAGE_STATS_NOTIFY", "1").lower() not in {"0", "false", "no"}:
+            try:
+                subprocess.run(
+                    ["osascript", "-e", 'display notification "Usage Stats history exceeds 5 GiB" with title "CCDM"'],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+        connection.execute(
+            "INSERT OR REPLACE INTO warnings(warning_key, warned_at) VALUES ('history-size', ?)",
+            (_iso_utc(now),),
+        )
+        connection.commit()
+
+
+def _dashboard_input(current, history):
+    return {
+        "schema_version": 1,
+        "generated_at": current.get("generated_at"),
+        "cards": current.get("cards", []),
+        "history": history,
+    }
+
+
+def _render_dashboard(payload, destination):
+    if not RENDERER_PATH.is_file():
+        raise PosterError(f"usage dashboard renderer not found: {RENDERER_PATH.name}")
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("ccdm_usage_dashboard_renderer", RENDERER_PATH)
+        if spec is None or spec.loader is None:
+            raise ImportError("unable to load renderer")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        renderer = getattr(module, "render_trend_first", module.render_dashboard)
+        rendered = renderer(payload, destination)
+        result = Path(rendered)
+        _assert_regular_file(result, "rendered usage dashboard")
+        result.chmod(0o600)
+        return result
+    except (ImportError, OSError, ValueError, TypeError, SystemExit) as error:
+        raise PosterError(f"unable to render usage dashboard: {error}") from None
+
+
+def post_dashboard_to_discord(config, bot_token, image_path, now):
+    """Upload the trend PNG using Discord's multipart attachment endpoint."""
+    boundary = f"----ccdm-usage-stats-{os.urandom(12).hex()}"
+    filename = "usage-dashboard.png"
+    payload = {
+        "embeds": [{
+            "title": "Usage Trends",
+            "color": 0x5865F2,
+            "image": {"url": f"attachment://{filename}"},
+            "footer": {"text": now.strftime("%b %d, %H:%M UTC")},
+        }],
+    }
+    try:
+        _assert_regular_file(image_path, "rendered usage dashboard")
+        image_bytes = Path(image_path).read_bytes()
+    except (OSError, PosterError) as error:
+        raise PosterError(f"unable to read rendered usage dashboard image: {error}") from None
+    chunks = []
+    chunks.append(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\n"
+        f"Content-Type: application/json\r\n\r\n{json.dumps(payload, separators=(',', ':'))}\r\n".encode()
+    )
+    chunks.append(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"{filename}\"\r\n"
+        f"Content-Type: image/png\r\n\r\n".encode() + image_bytes + b"\r\n"
+    )
+    chunks.append(f"--{boundary}--\r\n".encode())
+    request = Request(
+        f"{config['discord_base_url'].rstrip('/')}/api/v10/channels/{config['discord_channel_id']}/messages",
+        data=b"".join(chunks),
+        headers={
+            "Authorization": f"Bot {bot_token}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "ccdm-usage-stats-poster/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            if not 200 <= response.status < 300:
+                raise PosterError(f"Discord dashboard post failed (HTTP {response.status})")
+            result = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        raise PosterError(f"Discord dashboard post failed (HTTP {error.code})") from None
+    except (URLError, TimeoutError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise PosterError("Discord dashboard post failed; check the endpoint and try again") from None
+    return result.get("id", "unknown") if isinstance(result, dict) else "unknown"
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="poster config JSON path")
@@ -873,6 +1634,21 @@ def build_parser():
         "--validate-config",
         action="store_true",
         help="parse the config and exit without reading registry credentials or contacting services",
+    )
+    parser.add_argument(
+        "--collect-only",
+        action="store_true",
+        help="collect and persist one local history snapshot without posting",
+    )
+    parser.add_argument(
+        "--scheduled",
+        action="store_true",
+        help="run the LaunchAgent behavior: post a trend image only in a UTC 30-minute slot",
+    )
+    parser.add_argument(
+        "--post-now",
+        action="store_true",
+        help="manually force the trend image post (still records a local post ledger entry)",
     )
     return parser
 
@@ -885,7 +1661,82 @@ def main(argv=None):
             print("Poster configuration is valid")
             return 0
         registry, bot_token = load_registry_data(REGISTRY_PATH)
-        post_to_discord(config, bot_token, get_claude_stats(config), get_codex_stats(registry))
+        scheduled = (
+            args.scheduled
+            or args.post_now
+            or args.collect_only
+            or os.environ.get("CCDM_USAGE_STATS_AUTOMATED") == "1"
+        )
+
+        # Preserve the legacy/manual surface as a completely independent
+        # operation.  In particular, a broken or unwritable history path must
+        # never prevent an operator from posting the existing JSON embed.
+        if not scheduled:
+            claude_metrics = collect_claude_metrics(config)
+            codex_metrics = collect_codex_metrics(registry)
+            claude_value = "\n\n".join(
+                metric["text"]
+                for metric in claude_metrics
+                if isinstance(metric.get("text"), str) and metric["text"]
+            )
+            codex_value = "\n\n".join(
+                metric["text"]
+                for metric in codex_metrics
+                if isinstance(metric.get("text"), str) and metric["text"]
+            ) or None
+            if len(claude_value) > 1024:
+                claude_value = claude_value[:1000].rstrip() + "\n*truncated*"
+            if len(codex_value or "") > 1024:
+                codex_value = codex_value[:1000].rstrip() + "\n*truncated*"
+            post_to_discord(config, bot_token, claude_value, codex_value)
+            return 0
+
+        now = _utc_now()
+        claude_metrics = collect_claude_metrics(config)
+        codex_metrics = collect_codex_metrics(registry)
+        metrics = claude_metrics + codex_metrics
+        current_payload = {
+            "schema_version": 1,
+            "generated_at": _iso_utc(_floor_utc(now, 10)),
+            "cards": _safe_history_cards(metrics),
+        }
+        store = HistoryStore(config["history_db_path"])
+        with store.locked() as connection:
+            store.retain(connection, now)
+            current_payload = store.write_snapshot(connection, _floor_utc(now, 10), current_payload)
+            store.maybe_warn_size(connection, now)
+            if args.collect_only:
+                print(f"Collected usage snapshot (UTC slot: {current_payload['generated_at']})")
+                return 0
+            if scheduled:
+                post_slot = _floor_utc(now, 30)
+                if not args.post_now and now.minute % 30 >= 10:
+                    print(f"Collected usage snapshot (next post slot: {_iso_utc(post_slot + timedelta(minutes=30))})")
+                    return 0
+                if store.has_post(connection, post_slot):
+                    print(f"Usage dashboard already posted for UTC slot: {_iso_utc(post_slot)}")
+                    return 0
+                history = store.history(connection, since=now - timedelta(hours=24))
+                temp_name = None
+                try:
+                    temp_fd, temp_name = tempfile.mkstemp(
+                        prefix="usage-dashboard-", suffix=".png", dir=str(store.history_dir)
+                    )
+                    try:
+                        os.fchmod(temp_fd, 0o600)
+                    finally:
+                        os.close(temp_fd)
+                    _assert_no_symlink_components(temp_name, allow_missing=False)
+                    _assert_regular_file(temp_name, "temporary dashboard image")
+                    image_path = _render_dashboard(_dashboard_input(current_payload, history), temp_name)
+                    message_id = post_dashboard_to_discord(config, bot_token, image_path, now)
+                    store.record_post(connection, post_slot, message_id, now)
+                    print(f"Posted trend dashboard (message ID: {message_id}; UTC slot: {_iso_utc(post_slot)})")
+                finally:
+                    if temp_name:
+                        Path(temp_name).unlink(missing_ok=True)
+                return 0
+
         return 0
     except PosterError as error:
         print(f"Error: {error}", file=sys.stderr)

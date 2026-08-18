@@ -16,10 +16,18 @@ edges:
     condition: when changing lifecycle or process ownership
   - target: context/discord-security.md
     condition: when changing channel isolation or reply authority
-last_updated: 2026-08-16
+last_updated: 2026-08-18
 ---
 
 # Decisions
+
+### Keep Usage Stats history local, sanitized, and slot-idempotent
+**Date:** 2026-08-18
+**Status:** Active
+**Decision:** The opt-in Usage Stats LaunchAgent runs every 600 seconds, records one sanitized snapshot per UTC 10-minute slot in a private SQLite database, and uploads the trend-first PNG only once per UTC 30-minute slot using an advisory lock and posts ledger. Snapshot retention is 365 days; feature-owned size warnings are suppressed for 24 hours and never traverse agent source logs.
+**Reasoning:** Local history enables meaningful trend rendering without introducing a remote service or persisting credentials/transcripts/paths. Ten-minute collection tolerates LaunchAgent drift while the 30-minute ledger prevents duplicate Discord posts.
+**Alternatives considered:** Keep only the current text embed or write raw provider/session files; rejected because neither supports a reliable trend view and raw files would expand credential/privacy scope.
+**Consequences:** The installer must remain interval-only and rollback-safe; the renderer stays credential- and Discord-free, and manual JSON posting remains available for compatibility.
 
 ### Validate Codex homes before lifecycle mutation
 **Date:** 2026-08-16

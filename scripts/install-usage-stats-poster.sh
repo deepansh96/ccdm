@@ -5,7 +5,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd -P)
 TEMPLATE_PATH=$SCRIPT_DIR/com.discord.usage-stats-poster.plist.in
 POSTER_PATH=$SCRIPT_DIR/usage-stats-poster.py
 LABEL=com.discord.usage-stats-poster
-INTERVAL=1800
+INTERVAL=600
 
 usage() {
   echo "Usage: $0 [--interval seconds]"
@@ -48,6 +48,12 @@ PYTHON_PATH=$(command -v python3 || true)
 CODEX_PATH=$(command -v codex || true)
 if [ -z "$PYTHON_PATH" ]; then
   echo "Error: python3 is required to install the Usage Stats Poster LaunchAgent" >&2
+  exit 1
+fi
+if ! "$PYTHON_PATH" -c 'import PIL' >/dev/null 2>&1; then
+  echo "Error: Pillow is required by the Usage Stats dashboard renderer" >&2
+  echo "Install it for this Python with: $PYTHON_PATH -m pip install Pillow" >&2
+  echo "No LaunchAgent or plist changes were made" >&2
   exit 1
 fi
 if [ -z "$CODEX_PATH" ]; then
