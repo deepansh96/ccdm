@@ -18,7 +18,7 @@ edges:
     condition: when changing bot permissions, guest access, channel routing, or credentials
   - target: patterns/INDEX.md
     condition: when starting a task — check the pattern index for a matching pattern file
-last_updated: 2026-08-16
+last_updated: 2026-08-18
 ---
 
 # Session Bootstrap
@@ -41,7 +41,8 @@ Then read this file fully before doing anything else in this session.
 - The Codex bridge can pause new turns in memory, queue incoming messages, and resume them in order.
 - The Codex bridge forwards allowed users' 👍 and 👎 reactions on its own messages to the active Codex thread.
 - The tracked Usage Stats Poster discovers named and legacy Codex Homes, deduplicates shared homes, and falls back from live rate limits to recent session JSONL data.
-- The opt-in `scripts/install-usage-stats-poster.sh` renders, validates, and idempotently loads an interval-only secret-free LaunchAgent for the tracked Usage Stats Poster, restoring the prior plist and loaded schedule when a replacement load fails.
+- The tracked Usage Stats Poster also collects sanitized UTC 10-minute snapshots in a private SQLite history, retains them for 365 days, warns on feature-owned history growth, and uses the shared trend-first renderer for one multipart PNG post per UTC 30-minute slot; the local posts ledger and advisory lock make retries idempotent.
+- The opt-in `scripts/install-usage-stats-poster.sh` renders, validates, and idempotently loads a 600-second interval-only secret-free LaunchAgent for the tracked Usage Stats Poster, restoring the prior plist and loaded schedule when a replacement load fails.
 - Fresh setup output, `registry.example.json`, and the operator README expose generic named-account fields, precedence, migration, and rollback guidance without local credentials or account paths.
 
 **Not built:**

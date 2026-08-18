@@ -382,14 +382,16 @@ Ask the root agent for a usage report by messaging `usage`, `limits`, or `how mu
 
 A separate, opt-in macOS LaunchAgent can post usage stats to Discord on a schedule. It is not installed by `setup.sh` and it is not the old tmux-based `usage-report-loop.sh` flow.
 
-The tracked installer renders and validates `~/Library/LaunchAgents/com.discord.usage-stats-poster.plist` with absolute paths to Python, Codex, the poster, and its logs. The LaunchAgent is interval-only, so installation does not trigger an immediate post. Reinstalling unloads the existing label before loading the new plist, so changing the interval is idempotent; if the new load fails, the prior plist and loaded/unloaded schedule are restored:
+The tracked installer requires Python 3 with Pillow (the renderer dependency), then renders and validates `~/Library/LaunchAgents/com.discord.usage-stats-poster.plist` with absolute paths to Python, Codex, the poster, and its logs. If Pillow is missing it prints a `python3 -m pip install Pillow` remediation and exits before touching LaunchAgents or the existing plist. The LaunchAgent is interval-only and runs every 600 seconds, so installation does not trigger an immediate post. Every automated run records a local structured snapshot in UTC 10-minute slots; the trend-first PNG is uploaded only once per UTC 30-minute slot. Manual JSON-embed invocations remain independent of the history database. Reinstalling unloads the existing label before loading the new plist, so changing the interval is idempotent; if the new load fails, the prior plist and loaded/unloaded schedule are restored:
 
 ```bash
-scripts/install-usage-stats-poster.sh                 # 1800 seconds (30 minutes)
+scripts/install-usage-stats-poster.sh                 # 600 seconds (10 minutes)
 scripts/install-usage-stats-poster.sh --interval 900  # 15 minutes
 ```
 
 The rendered LaunchAgent contains no token, channel ID, or poster configuration. The installer never sends a Discord request; it only schedules the poster.
+
+History is stored at `~/Library/Application Support/CCDM/usage-stats/history.sqlite3` by default (override with the ignored config's `history_db_path`). The database and lock are private (`0700` directory, `0600` files), snapshots are retained for 365 days, and an advisory lock makes repeated LaunchAgent runs idempotent. Only feature-owned SQLite files count toward the 5 GiB warning; Codex session logs and Claude transcripts are never counted or deleted. A warning is emitted at most once every 24 hours while the feature-owned history directory remains over the limit.
 
 ```bash
 ~/Library/LaunchAgents/com.discord.usage-stats-poster.plist
@@ -444,11 +446,13 @@ cp .usage-stats-poster.example.json .usage-stats-poster.json
 python3 scripts/usage-stats-poster.py --validate-config
 ```
 
-Run a live post separately after validation; installation never triggers this command:
+Run a live legacy JSON-embed post separately after validation; installation never triggers this command:
 
 ```bash
 python3 scripts/usage-stats-poster.py
 ```
+
+To exercise the scheduled trend surface manually, use `--scheduled --post-now`; `--collect-only` records a snapshot without contacting Discord. Scheduled runs outside a UTC 30-minute window collect history but do not upload an image.
 
 To roll back the schedule, unload and remove only CCDM's rendered LaunchAgent. Keep the older external poster directory and its LaunchAgent available until the replacement has been verified; deleting that external rollback copy is out of scope.
 

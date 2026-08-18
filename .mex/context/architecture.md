@@ -12,7 +12,7 @@ edges:
     condition: when specific technology details are needed
   - target: context/decisions.md
     condition: when understanding why the architecture is structured this way
-last_updated: 2026-08-16
+last_updated: 2026-08-18
 ---
 
 # Architecture
@@ -35,7 +35,8 @@ The root agent coordinates lifecycle and access. Each project agent works only i
 - **`scripts/codex-bridge.js`** - connects Discord to `codex app-server`, injects mid-turn messages, handles attachments/audio, and exposes channel-scoped MCP tools.
 - **Discord range export** - `export-discord-range.js` paginates an inclusive message range into a temporary transcript; Codex exposes it through the bridge MCP, while `start-session.sh` adds the same export-only MCP to local Claude sessions.
 - **`scripts/guest-access.js`** - creates and synchronizes project-scoped Discord roles, channel overrides, and bot allowlists.
-- **`scripts/usage-stats-poster.py`** - reads the ignored poster config, gathers the default and valid extra Claude OAuth accounts through the Keychain and Anthropic OAuth boundaries, discovers and deduplicates compatible named/legacy Codex Homes, and posts a combined usage embed through the root bot token; scheduling remains a separate installer surface.
+- **`scripts/usage-stats-poster.py`** - reads the ignored poster config, gathers the default and valid extra Claude OAuth accounts through the Keychain and Anthropic OAuth boundaries, discovers and deduplicates compatible named/legacy Codex Homes, writes sanitized UTC-slot snapshots to a private SQLite history with advisory locking/retention, and preserves the manual combined embed surface. Automated LaunchAgent runs render the shared trend-first dashboard and upload one multipart PNG per UTC 30-minute slot through a local ledger.
+- **`scripts/usage-dashboard-renderer.py`** - credential-free Pillow renderer for the trend-first PNG; the installer validates that Pillow is importable before replacing the LaunchAgent.
 - **E2E harness** - Node's built-in test runner plus fixture binaries and local fakes; default tests never contact Discord or agent services.
 
 ## External Dependencies
@@ -46,7 +47,7 @@ The root agent coordinates lifecycle and access. Each project agent works only i
 - `macOS Keychain / local auth files` - store agent credentials; never copy their contents into tracked files.
 
 ## What Does NOT Exist Here
-- No database or web application; durable configuration is JSON and local state files.
+- No web application; durable configuration is JSON and the Usage Stats feature's private SQLite history is local state only. The history writer never traverses or deletes Claude/Codex source logs.
 - No daemon supervisor for project sessions; tmux sessions must be restarted after reboot.
 - No remote-host orchestration; remote setup commands are handed to the user.
 - No real external calls in the default E2E suite; live smoke tests require `CCDM_LIVE_E2E=1`.

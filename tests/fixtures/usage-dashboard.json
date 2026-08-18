@@ -1,0 +1,61 @@
+{
+  "generated_at": "2026-08-18T20:30:00Z",
+  "accounts": [
+    {
+      "provider": "claude",
+      "account": "personal",
+      "limits": [
+        {"window": "5-hour", "used_percent": 42, "reset": "2h 30m"},
+        {"window": "7-day", "used_percent": 68, "reset": "3d 5h"}
+      ]
+    },
+    {
+      "provider": "claude",
+      "account": "team",
+      "limits": [
+        {"window": "5-hour", "available": false, "reason": "Auth expired"}
+      ]
+    },
+    {
+      "provider": "codex",
+      "account": "primary",
+      "limits": [
+        {"window": "5-hour", "used_percent": 27, "reset": "2h 30m"},
+        {"window": "7-day", "used_percent": 54, "reset": "3d 5h"}
+      ]
+    }
+  ],
+  "history": [
+    {
+      "at": "2026-08-17T20:30:00Z",
+      "values": {
+        "claude:personal:5-hour": 4,
+        "claude:personal:7-day": 20,
+        "claude:team:5-hour": null,
+        "codex:primary:5-hour": 2,
+        "codex:primary:7-day": 9
+      }
+    },
+    {
+      "at": "2026-08-18T10:30:00Z",
+      "reset": true,
+      "values": {
+        "claude:personal:5-hour": 58,
+        "claude:personal:7-day": 48,
+        "claude:team:5-hour": null,
+        "codex:primary:5-hour": 22,
+        "codex:primary:7-day": 35
+      }
+    },
+    {
+      "at": "2026-08-18T20:30:00Z",
+      "values": {
+        "claude:personal:5-hour": 42,
+        "claude:personal:7-day": 68,
+        "claude:team:5-hour": null,
+        "codex:primary:5-hour": 27,
+        "codex:primary:7-day": 54
+      }
+    }
+  ]
+}
