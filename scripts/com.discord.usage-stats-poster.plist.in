@@ -15,6 +15,8 @@
 <dict>
 <key>CCDM_CODEX_PATH</key>
 <string>__CODEX_PATH__</string>
+<key>CCDM_USAGE_STATS_AUTOMATED</key>
+<string>1</string>
 <key>PATH</key>
 <string>__CODEX_BIN_DIR__:/usr/bin:/bin</string>
 </dict>

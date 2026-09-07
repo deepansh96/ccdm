@@ -219,11 +219,10 @@ import json
 import sys
 
 registry = json.load(open(sys.argv[1]))
-root_bot = next((bot for bot in registry.get("pool", []) if bot.get("id") == "bot1"), {})
 print("\t".join([
     str(registry.get("discord_user_id") or ""),
     str(registry.get("guild_id") or ""),
-    str(root_bot.get("app_id") or ""),
+    str(registry.get("root_bot_app_id") or ""),
 ]))
 PY
 )"
@@ -301,7 +300,7 @@ if [[ -n "$ORPHAN_PIDS" ]]; then
   terminate_pids "${(@f)ORPHAN_PIDS}"
 fi
 
-if ! tmux new-session -d -s root_agent -- zsh -ic "cd '$SCRIPT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' BOT_TOKEN='$BOT_TOKEN' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$SCRIPT_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$ALLOWED_USER_IDS' GUILD_ID='$GUILD_ID' ROOT_BOT_TOKEN='$BOT_TOKEN' ROOT_BOT_APP_ID='$BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' BOT_DISPLAY_NAME='$BOT_DISPLAY_NAME' ROOT_MULTI_CHANNEL='1' ROOT_ACCESS_FILE='$ACCESS_FILE' node scripts/codex-bridge.js"; then
+if ! tmux new-session -d -s root_agent -- zsh -ic "cd '$SCRIPT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' BOT_TOKEN='$BOT_TOKEN' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$SCRIPT_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$ALLOWED_USER_IDS' GUILD_ID='$GUILD_ID' ROOT_BOT_APP_ID='$BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' BOT_DISPLAY_NAME='$BOT_DISPLAY_NAME' ROOT_MULTI_CHANNEL='1' ROOT_ACCESS_FILE='$ACCESS_FILE' node scripts/codex-bridge.js"; then
   echo "Failed to create tmux session 'root_agent'" >&2
   exit 1
 fi

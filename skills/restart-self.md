@@ -21,7 +21,7 @@ Restart your own session (Claude Code or Codex). This kills your current process
    Then determine your session type: check if you're a Claude Code session or a Codex bridge session. Look up your project in registry.json (at the CCDM root directory) and check the `type` field. If `type` is `"codex"`, you're a Codex session. Otherwise you're Claude Code.
 
 3. **Determine the launch command.** Based on what you detected:
-   - `SESSION_NAME`: the tmux session name (e.g., `quiz`, `viz`, `plio`)
+   - `SESSION_NAME`: the tmux session name (e.g., `alpha`, `beta`, `gamma`)
    - `PROJECT_DIR`: your current working directory
    - Use `bash -ic` on Linux, `zsh -ic` on macOS (check `uname`)
 

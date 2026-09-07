@@ -170,14 +170,13 @@ print(f"Recorded PID {pid}")
 PY
 }
 
-IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME BOT_TOKEN CHANNEL_ID WS_PORT DISCORD_USER_IDS GUILD_ID ROOT_TOKEN ROOT_BOT_APP_ID BOT_APP_ID BOT_ID BOT_DISPLAY_OVERRIDE TEXT_REPLY_FALLBACK_FLAG CODEX_MODEL_VALUE CODEX_REASONING_EFFORT_VALUE CODEX_SERVICE_TIER_VALUE <<< "$(python3 -c "
+IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME BOT_TOKEN CHANNEL_ID WS_PORT DISCORD_USER_IDS GUILD_ID ROOT_BOT_APP_ID BOT_APP_ID BOT_ID BOT_DISPLAY_OVERRIDE TEXT_REPLY_FALLBACK_FLAG CODEX_MODEL_VALUE CODEX_REASONING_EFFORT_VALUE CODEX_SERVICE_TIER_VALUE <<< "$(python3 -c "
 import base64, json, os, re
 r = json.load(open('$REGISTRY'))
 p = r['projects']['$PROJECT']
 bot = next(b for b in r['pool'] if b['id'] == p['bot_id'])
-root_bot = next(b for b in r['pool'] if b['id'] == 'bot1')
-root_bot_app_id = root_bot['app_id']
-root_env = os.path.expanduser('~/.claude/channels/discord/.env')
+root_bot_app_id = r.get('root_bot_app_id', '')
+root_env = os.path.join(os.path.expanduser(os.environ.get('ROOT_DISCORD_STATE_DIR') or '~/.claude/channels/discord'), '.env')
 if os.path.exists(root_env):
     text = open(root_env).read()
     match = re.search(r'DISCORD_BOT_TOKEN=(\S+)', text)
@@ -188,6 +187,8 @@ if os.path.exists(root_env):
             root_bot_app_id = base64.urlsafe_b64decode(token_id).decode()
         except Exception:
             pass
+if not root_bot_app_id:
+    raise ValueError('Root bot identity missing; configure root Discord state or root_bot_app_id')
 allowed_user_ids = [r['discord_user_id']] + list(p.get('guest_user_ids') or [])
 print('\t'.join([
     os.path.expanduser(p['path']),
@@ -198,7 +199,6 @@ print('\t'.join([
     str(p.get('ws_port', 18300)),
     ','.join(dict.fromkeys(str(user_id) for user_id in allowed_user_ids if str(user_id))),
     r['guild_id'],
-    root_bot['token'],
     root_bot_app_id,
     bot['app_id'],
     bot['id'],
@@ -289,7 +289,7 @@ if [[ -n "$CODEX_REASONING_EFFORT_VALUE" ]]; then
 fi
 CODEX_SERVICE_TIER_ENV=" CODEX_SERVICE_TIER='${CODEX_SERVICE_TIER_VALUE}'"
 
-tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' BOT_TOKEN='$BOT_TOKEN' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$DISCORD_USER_IDS' GUILD_ID='$GUILD_ID' ROOT_BOT_TOKEN='$ROOT_TOKEN' ROOT_BOT_APP_ID='$ROOT_BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' BOT_DISPLAY_NAME='$BOT_DISPLAY_NAME'$AUDIO_TRANSCRIPTION_ENV$TEXT_REPLY_FALLBACK_ENV$CODEX_MODEL_ENV$CODEX_REASONING_ENV$CODEX_SERVICE_TIER_ENV node scripts/codex-bridge.js"
+tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' BOT_TOKEN='$BOT_TOKEN' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$DISCORD_USER_IDS' GUILD_ID='$GUILD_ID' ROOT_BOT_APP_ID='$ROOT_BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' BOT_DISPLAY_NAME='$BOT_DISPLAY_NAME'$AUDIO_TRANSCRIPTION_ENV$TEXT_REPLY_FALLBACK_ENV$CODEX_MODEL_ENV$CODEX_REASONING_ENV$CODEX_SERVICE_TIER_ENV node scripts/codex-bridge.js"
 echo "Started Codex bridge in tmux session '$SCREEN_NAME'"
 echo "Attach with: tmux attach -t $SCREEN_NAME"
 record_codex_pid "$CHANNEL_ID" "$BOT_APP_ID"

@@ -16,10 +16,33 @@ edges:
     condition: when changing lifecycle or process ownership
   - target: context/discord-security.md
     condition: when changing channel isolation or reply authority
-last_updated: 2026-08-16
+last_updated: 2026-09-07
 ---
 
 # Decisions
+
+### Keep the legacy Usage Report beside provider dashboards
+**Date:** 2026-08-23
+**Status:** Active
+**Decision:** Each automated Usage Stats post is one atomic Discord message containing the original bounded text Usage Report embed plus two PNG attachments, one each for Claude and Codex. Codex remains weekly-only, charts begin at the earliest real stored slot, and Claude API-key accounts remain graph outliers with sanitized cost facts in the Claude rail.
+**Reasoning:** The text summary remains faster to scan and accessible when images are inconvenient, while the two provider-specific images retain historical trends. Reusing one message preserves the existing slot ledger and avoids partial delivery or duplicate retries.
+**Alternatives considered:** Send the text report as a second Discord message or restore a text-only schedule; rejected because separate delivery weakens slot idempotency and removing the images loses trend history.
+**Consequences:** Manual JSON posting remains independent of SQLite, and scheduled posting reuses the same formatting and Discord field-size bounds before attaching both images.
+
+### Keep Usage Stats history local, sanitized, and slot-idempotent
+**Date:** 2026-08-18
+**Status:** Active
+**Decision:** The opt-in Usage Stats LaunchAgent runs every 600 seconds, records one sanitized snapshot per UTC 10-minute slot in a private SQLite database, and uploads its combined text-and-dashboard report only once per UTC 30-minute slot using an advisory lock and posts ledger. Snapshot retention is 365 days; feature-owned size warnings are suppressed for 24 hours and never traverse agent source logs.
+**Reasoning:** Local history enables meaningful trend rendering without introducing a remote service or persisting credentials/transcripts/paths. Ten-minute collection tolerates LaunchAgent drift while the 30-minute ledger prevents duplicate Discord posts.
+**Alternatives considered:** Keep only the current text embed or write raw provider/session files; rejected because neither supports a reliable trend view and raw files would expand credential/privacy scope.
+**Consequences:** The installer must remain interval-only and rollback-safe; the renderer stays credential- and Discord-free, and manual JSON posting remains available for compatibility.
+
+### Render provider-specific Usage Stats dashboards without migrating history
+**Date:** 2026-08-19
+**Status:** Superseded by “Keep the legacy Usage Report beside provider dashboards” (2026-08-23)
+**Decision:** An automated Usage Stats post contains two PNG attachments, one each for Claude and Codex. Codex is rendered as a weekly limit only, and legacy schema-v1 Codex `5-hour` cards are translated in the in-memory render payload rather than rewritten in SQLite. Charts begin at the earliest real stored slot. Claude API-key accounts remain graph outliers and instead expose sanitized local cost/count/status facts in the Claude rail.
+**Reasoning:** Provider-specific images reduce mixed-limit ambiguity while retaining the existing private, slot-idempotent database and post ledger. A render-time compatibility mapping avoids a destructive database migration.
+**Consequences:** One scheduled post remains one ledger row and one Discord message, manual JSON embeds remain independent, and renderer payloads may include safe provider notes that are never persisted as transcript paths or raw records.
 
 ### Validate Codex homes before lifecycle mutation
 **Date:** 2026-08-16

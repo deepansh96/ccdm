@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
@@ -13,7 +15,7 @@ test.afterEach(async () => {
   await cleanup();
 });
 
-async function startPosterApi({ organization = { organization_type: "pro" }, unauthorizedTokens = [] } = {}) {
+async function startPosterApi({ organization = { organization_type: "pro" }, unauthorizedTokens = [], acceptDashboard = false, usage = {} } = {}) {
   const requests = [];
   const unauthorized = new Set(unauthorizedTokens);
   const server = http.createServer((request, response) => {
@@ -26,6 +28,7 @@ async function startPosterApi({ organization = { organization_type: "pro" }, una
       requests.push({
         authorization: request.headers.authorization,
         body,
+        contentType: request.headers["content-type"],
         method: request.method,
         path: request.url,
         userAgent: request.headers["user-agent"],
@@ -68,10 +71,29 @@ async function startPosterApi({ organization = { organization_type: "pro" }, una
           extra_usage: { is_enabled: true, used_credits: 1250 },
           five_hour: { utilization: 37 },
           seven_day: { utilization: 62 },
+          ...usage,
         }));
         return;
       }
       if (request.method === "POST" && request.url === "/api/v10/channels/fixture-channel/messages") {
+        if (acceptDashboard && request.headers["content-type"]?.startsWith("multipart/form-data;")) {
+          if (
+            request.headers.authorization !== "Bot fixture-root-token" ||
+            !request.headers["content-type"].includes("boundary=") ||
+            !body.includes('name="payload_json"') ||
+            !body.includes('filename="claude-usage-dashboard.png"') ||
+            !body.includes('filename="codex-usage-dashboard.png"') ||
+            !body.includes("Content-Type: image/png")
+          ) {
+            response.statusCode = 401;
+            response.end();
+            return;
+          }
+          response.statusCode = 200;
+          response.setHeader("content-type", "application/json");
+          response.end(JSON.stringify({ id: "dashboard-1" }));
+          return;
+        }
         let payload;
         try {
           payload = JSON.parse(body);
@@ -108,6 +130,9 @@ async function startPosterApi({ organization = { organization_type: "pro" }, una
 }
 
 function seedPosterWorkspace(workspace, baseUrl, extraConfig = {}) {
+  const rootState = path.join(workspace.homeDir, ".claude", "channels", "discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n");
   fs.writeFileSync(
     path.join(workspace.repoDir, ".usage-stats-poster.json"),
     `${JSON.stringify({
@@ -120,7 +145,7 @@ function seedPosterWorkspace(workspace, baseUrl, extraConfig = {}) {
   fs.writeFileSync(
     path.join(workspace.repoDir, "registry.json"),
     `${JSON.stringify({
-      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -169,6 +194,301 @@ test("poster posts a Claude usage embed through the configured Discord endpoint"
   assert.deepEqual(readState(workspace.stateDir).fixtures.security.invocations.map((entry) => entry.args), [
     ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
   ]);
+});
+
+test("manual JSON posting does not open or write the configured history database", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const sharedParent = path.join(workspace.homeDir, "shared-state");
+  const historyPath = path.join(sharedParent, "usage.sqlite3");
+  fs.mkdirSync(sharedParent);
+  fs.chmodSync(sharedParent, 0o755);
+  seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.equal(fs.existsSync(historyPath), false);
+  assert.equal(fs.existsSync(path.join(sharedParent, ".history.lock")), false);
+  assert.equal(fs.statSync(sharedParent).mode & 0o777, 0o755);
+  assert.equal(api.requests.filter((request) => request.method === "POST").length, 1);
+});
+
+test("missing or malformed Claude utilization is recorded as unavailable", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi({
+    usage: { five_hour: {}, seven_day: { utilization: "not-a-number" } },
+  });
+  const historyPath = path.join(workspace.homeDir, "history", "history.sqlite3");
+  seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", { args: ["--collect-only"] });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const payloadProbe = spawnSync("python3", ["-c", [
+    "import sqlite3, sys",
+    "connection = sqlite3.connect(sys.argv[1])",
+    "print(connection.execute('select payload_json from snapshots').fetchone()[0])",
+  ].join("\n"), historyPath], { encoding: "utf8" });
+  assert.equal(payloadProbe.status, 0, payloadProbe.stderr);
+  assert.match(payloadProbe.stdout, /\"available\":false/);
+  assert.doesNotMatch(payloadProbe.stdout, /\"used_percent\":0/);
+});
+
+test("history store preserves shared parents and rejects unsupported schemas and symlink paths", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const sharedParent = path.join(workspace.homeDir, "shared");
+  const featureDir = path.join(sharedParent, "usage-stats");
+  const historyPath = path.join(featureDir, "history.sqlite3");
+  fs.mkdirSync(sharedParent);
+  fs.chmodSync(sharedParent, 0o755);
+  seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
+  const collected = await runScript(workspace, "scripts/usage-stats-poster.py", { args: ["--collect-only"] });
+  assert.equal(collected.exitCode, 0, collected.stderr || collected.stdout);
+  assert.equal(fs.statSync(sharedParent).mode & 0o777, 0o755);
+  assert.equal(fs.statSync(featureDir).mode & 0o777, 0o700);
+
+  const probe = (code, ...args) => spawnSync("python3", ["-c", [
+    "import importlib.util, sys",
+    "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
+    "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
+    code,
+  ].join("\n"), path.join("scripts", "usage-stats-poster.py"), ...args], { encoding: "utf8" });
+  const schemaDir = path.join(workspace.tmpDir, "schema");
+  fs.mkdirSync(schemaDir, 0o700);
+  const unsupportedDb = path.join(schemaDir, "unsupported.sqlite3");
+  const created = spawnSync("python3", ["-c", [
+    "import sqlite3, sys",
+    "connection = sqlite3.connect(sys.argv[1]); connection.execute('pragma user_version=99'); connection.commit()",
+  ].join("\n"), unsupportedDb], { encoding: "utf8" });
+  assert.equal(created.status, 0, created.stderr);
+  const schemaFailure = probe(
+    "try:\n with poster.HistoryStore(sys.argv[2]).locked(): pass\nexcept poster.PosterError as error:\n print(error); raise SystemExit(1)",
+    unsupportedDb,
+  );
+  assert.equal(schemaFailure.status, 1);
+  assert.match(schemaFailure.stdout, /unsupported usage history schema version 99/);
+
+  const legacyDb = path.join(schemaDir, "legacy-v0.sqlite3");
+  const legacy = spawnSync("python3", ["-c", [
+    "import sqlite3, sys",
+    "connection = sqlite3.connect(sys.argv[1])",
+    "connection.executescript('CREATE TABLE snapshots (slot_utc TEXT PRIMARY KEY, generated_at TEXT NOT NULL, payload_json TEXT NOT NULL); CREATE TABLE posts (slot_utc TEXT PRIMARY KEY, posted_at TEXT NOT NULL, message_id TEXT NOT NULL); CREATE TABLE warnings (warning_key TEXT PRIMARY KEY, warned_at TEXT NOT NULL);')",
+    "connection.execute(\"insert into snapshots values (?, ?, ?)\", ('2026-08-18T12:00:00Z', '2026-08-18T12:00:00Z', '{\\\"generated_at\\\":\\\"2026-08-18T12:00:00Z\\\",\\\"cards\\\":[]}'))",
+    "connection.commit()",
+  ].join("\n"), legacyDb], { encoding: "utf8" });
+  assert.equal(legacy.status, 0, legacy.stderr);
+  const migrated = probe(
+    "try:\n with poster.HistoryStore(sys.argv[2]).locked(): pass\nexcept poster.PosterError as error:\n print(error); raise SystemExit(1)",
+    legacyDb,
+  );
+  assert.equal(migrated.status, 0, migrated.stderr || migrated.stdout);
+  const migrationProbe = spawnSync("python3", ["-c", [
+    "import sqlite3, sys",
+    "connection = sqlite3.connect(sys.argv[1])",
+    "print(connection.execute('pragma user_version').fetchone()[0])",
+    "print(connection.execute('select payload_json from snapshots').fetchone()[0])",
+  ].join("\n"), legacyDb], { encoding: "utf8" });
+  assert.equal(migrationProbe.status, 0, migrationProbe.stderr);
+  assert.match(migrationProbe.stdout, /^1\n/);
+  assert.match(migrationProbe.stdout, /cards/);
+
+  const atomicInitialization = probe(
+    "import sqlite3\nconnection = sqlite3.connect(':memory:')\ncreated = [0]\ndef authorize(action, arg1, arg2, database, source):\n if action == sqlite3.SQLITE_CREATE_TABLE:\n  created[0] += 1\n  if created[0] == 2:\n   return sqlite3.SQLITE_DENY\n return sqlite3.SQLITE_OK\nconnection.set_authorizer(authorize)\ntry:\n poster.HistoryStore._validate_schema(None, connection)\nexcept poster.PosterError as error:\n print(error)\nelse:\n raise SystemExit(2)\nconnection.set_authorizer(lambda *args: sqlite3.SQLITE_OK)\nprint(connection.execute(\"select count(*) from sqlite_master where type = 'table' and name not like 'sqlite_%'\").fetchone()[0])\nprint(connection.execute('pragma user_version').fetchone()[0])",
+    path.join(schemaDir, "atomic-probe.sqlite3"),
+  );
+  assert.equal(atomicInitialization.status, 0, atomicInitialization.stderr);
+  assert.match(atomicInitialization.stdout, /unable to initialize usage history schema atomically/);
+  assert.match(atomicInitialization.stdout, /\n0\n0\s*$/);
+
+  const deniedOpen = probe(
+    "def denied(*args, **kwargs):\n raise PermissionError('fixture lock permission denied')\nposter.os.open = denied\ntry:\n with poster.HistoryStore(sys.argv[2]).locked(): pass\nexcept poster.PosterError as error:\n print(error); raise SystemExit(1)",
+    path.join(workspace.tmpDir, "permission", "history.sqlite3"),
+  );
+  assert.equal(deniedOpen.status, 1);
+  assert.match(deniedOpen.stdout, /unable to open usage history lock/);
+
+  const deniedFchmod = probe(
+    "closed = []\nreal_close = poster.os.close\ndef tracked_close(fd):\n closed.append(fd)\n return real_close(fd)\nposter.os.close = tracked_close\ndef denied(*args, **kwargs):\n raise PermissionError('fixture fchmod permission denied')\nposter.os.fchmod = denied\ntry:\n with poster.HistoryStore(sys.argv[2]).locked(): pass\nexcept poster.PosterError as error:\n print(error)\nprint('closed', len(closed))",
+    path.join(workspace.tmpDir, "fchmod-permission", "history.sqlite3"),
+  );
+  assert.equal(deniedFchmod.status, 0);
+  assert.match(deniedFchmod.stdout, /unable to open usage history lock/);
+  assert.match(deniedFchmod.stdout, /closed 1/);
+
+  const deniedFlock = probe(
+    "def denied(*args, **kwargs):\n raise PermissionError('fixture flock permission denied')\nposter.fcntl.flock = denied\ntry:\n with poster.HistoryStore(sys.argv[2]).locked(): pass\nexcept poster.PosterError as error:\n print(error); raise SystemExit(1)",
+    path.join(workspace.tmpDir, "flock-permission", "history.sqlite3"),
+  );
+  assert.equal(deniedFlock.status, 1);
+  assert.match(deniedFlock.stdout, /unable to acquire usage history lock/);
+
+  const deniedUnlock = probe(
+    "closed = []\nreal_close = poster.os.close\ndef tracked_close(fd):\n closed.append(fd)\n return real_close(fd)\nposter.os.close = tracked_close\nreal_flock = poster.fcntl.flock\ndef deny_unlock(fd, operation):\n if operation == poster.fcntl.LOCK_UN:\n  raise PermissionError('fixture unlock permission denied')\n return real_flock(fd, operation)\nposter.fcntl.flock = deny_unlock\ntry:\n with poster.HistoryStore(sys.argv[2]).locked(): pass\nexcept poster.PosterError as error:\n print(error)\nprint('closed', len(closed))",
+    path.join(workspace.tmpDir, "unlock-permission", "history.sqlite3"),
+  );
+  assert.equal(deniedUnlock.status, 0);
+  assert.match(deniedUnlock.stdout, /unable to release usage history lock/);
+  assert.match(deniedUnlock.stdout, /closed [2-9]/);
+
+  const targetDir = path.join(workspace.tmpDir, "real-history");
+  fs.mkdirSync(targetDir);
+  const ancestorAlias = path.join(workspace.tmpDir, "history-alias");
+  fs.symlinkSync(targetDir, ancestorAlias, "dir");
+  const ancestorFailure = probe(
+    "try:\n with poster.HistoryStore(sys.argv[2]).locked(): pass\nexcept poster.PosterError as error:\n print(error); raise SystemExit(1)",
+    path.join(ancestorAlias, "history.sqlite3"),
+  );
+  assert.equal(ancestorFailure.status, 1);
+  assert.match(ancestorFailure.stdout, /cannot contain symlink/);
+
+  const lockDir = path.join(workspace.tmpDir, "lock-history");
+  fs.mkdirSync(lockDir, 0o700);
+  fs.symlinkSync(path.join(workspace.tmpDir, "lock-target"), path.join(lockDir, ".history.lock"));
+  const lockFailure = probe(
+    "try:\n with poster.HistoryStore(sys.argv[2]).locked(): pass\nexcept poster.PosterError as error:\n print(error); raise SystemExit(1)",
+    path.join(lockDir, "history.sqlite3"),
+  );
+  assert.equal(lockFailure.status, 1);
+  assert.match(lockFailure.stdout, /cannot contain symlink/);
+});
+
+test("dashboard image read failures are surfaced as PosterError", () => {
+  const missingImage = path.join(os.tmpdir(), `ccdm-missing-dashboard-${process.pid}.png`);
+  const probe = spawnSync("python3", ["-c", [
+    "import importlib.util, sys",
+    "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
+    "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
+    "from datetime import datetime, timezone",
+    "try:",
+    " poster.post_dashboard_to_discord({'discord_base_url': 'http://127.0.0.1:1', 'discord_channel_id': 'x'}, 'token', {'claude': sys.argv[2], 'codex': sys.argv[2]}, 'Claude usage')",
+    "except poster.PosterError as error:",
+    " print(error); raise SystemExit(0)",
+    "raise SystemExit(2)",
+  ].join("\n"), path.join("scripts", "usage-stats-poster.py"), missingImage], { encoding: "utf8" });
+  assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+  assert.match(probe.stdout, /unable to read rendered usage dashboard image/);
+});
+
+test("Codex structured metrics reject invalid percentages and preserve numeric reset epochs", () => {
+  const probe = spawnSync("python3", ["-c", [
+    "import importlib.util, json, math, sys",
+    "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
+    "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
+    "invalid = []",
+    "for value in (True, float('nan'), float('inf'), float('-inf'), 10 ** 1000, 'not-a-number'):",
+    " metric = poster._metric_from_codex_rate_limits({'primary': {'usedPercent': value, 'resetsAt': 1735689600}}, 'fixture')",
+    " invalid.append(metric['limits'][0])",
+    "legacy = [poster.format_codex_rate_limits({'primary': {'usedPercent': value}}, 'fixture') for value in (True, float('nan'), float('inf'), float('-inf'), 10 ** 1000, 'not-a-number')]",
+    "valid = poster._metric_from_codex_rate_limits({'primary': {'usedPercent': 25, 'resetsAt': 1735689600}}, 'fixture')",
+    "safe = poster._safe_history_cards([{'provider': 'codex', 'account': 'fixture', 'limits': [{'window': '5-hour', 'available': True, 'used_percent': float('nan'), 'resets_at': 1735689600}]}])",
+    "print(json.dumps({'invalid': invalid, 'legacy': legacy, 'valid': valid['limits'][0], 'safe': safe}))",
+  ].join("\n"), path.join("scripts", "usage-stats-poster.py")], { encoding: "utf8" });
+  assert.equal(probe.status, 0, probe.stderr);
+  const result = JSON.parse(probe.stdout);
+  for (const limit of result.invalid) {
+    assert.equal(limit.available, false);
+    assert.equal(limit.used_percent, null);
+    assert.equal(limit.resets_at, "2025-01-01T00:00:00Z");
+  }
+  for (const text of result.legacy) {
+    assert.match(text, /Weekly: \*unavailable\*/);
+    assert.doesNotMatch(text, /(?:5-Hour|7-Day):/);
+    assert.doesNotMatch(text, /\*\*\s*(?:0|1|100)%/);
+  }
+  assert.equal(result.valid.available, true);
+  assert.equal(result.valid.used_percent, 25);
+  assert.equal(result.valid.resets_at, "2025-01-01T00:00:00Z");
+  assert.equal(result.safe[0].available, false);
+  assert.equal(Object.hasOwn(result.safe[0], "used_percent"), false);
+  assert.equal(result.safe[0].resets_at, "2025-01-01T00:00:00Z");
+});
+
+test("Codex dashboard metrics are weekly only and old SQLite cards are translated at render time", () => {
+  const probe = spawnSync("python3", ["-c", [
+    "import importlib.util, json, sys",
+    "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
+    "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
+    "metric = poster._metric_from_codex_rate_limits({'primary': {'usedPercent': 12, 'windowDurationMins': 10080}, 'secondary': {'usedPercent': 99}}, 'fixture')",
+    "current = {'generated_at': '2026-08-18T12:30:00Z', 'cards': poster._safe_history_cards([metric])}",
+    "old = {'generated_at': '2026-08-18T12:20:00Z', 'cards': [{'provider': 'codex', 'account': 'fixture', 'window': '5-hour', 'available': True, 'used_percent': 10}]}",
+    "payload = poster._provider_dashboard_input(current, [old], 'codex', [metric])",
+    "print(json.dumps({'current': payload['cards'], 'history': payload['history'], 'old': old}))",
+  ].join("\n"), path.join("scripts", "usage-stats-poster.py")], { encoding: "utf8" });
+  assert.equal(probe.status, 0, probe.stderr);
+  const result = JSON.parse(probe.stdout);
+  assert.equal(result.current.length, 1);
+  assert.equal(result.current[0].window, "Weekly");
+  assert.equal(result.history[0].cards[0].window, "Weekly");
+  assert.equal(result.old.cards[0].window, "5-hour");
+});
+
+test("history uses valid SQLite slots as the authoritative chronological timestamp", () => {
+  const probe = spawnSync("python3", ["-c", [
+    "import importlib.util, json, sqlite3, sys, tempfile",
+    "from pathlib import Path",
+    "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
+    "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
+    "root = Path(tempfile.mkdtemp()); root.chmod(0o700)",
+    "store = poster.HistoryStore(root / 'history.sqlite3')",
+    "with store.locked() as connection:",
+    " connection.execute(\"insert into snapshots values (?, ?, ?)\", ('2026-08-18T12:20:00Z', 'wrong', json.dumps({'generated_at': '2099-01-01T00:00:00Z', 'cards': []})) )",
+    " connection.execute(\"insert into snapshots values (?, ?, ?)\", ('not-a-slot', 'wrong', json.dumps({'generated_at': '2026-01-01T00:00:00Z', 'cards': []})) )",
+    " connection.execute(\"insert into snapshots values (?, ?, ?)\", ('2026-08-18T12:10:00Z', 'wrong', json.dumps({'generated_at': '1999-01-01T00:00:00Z', 'cards': []})) )",
+    " connection.commit(); print(json.dumps([item['generated_at'] for item in store.history(connection)]))",
+  ].join("\n"), path.join("scripts", "usage-stats-poster.py")], { encoding: "utf8" });
+  assert.equal(probe.status, 0, probe.stderr);
+  assert.deepEqual(JSON.parse(probe.stdout), ["2026-08-18T12:10:00Z", "2026-08-18T12:20:00Z"]);
+});
+
+test("legacy Codex 5-hour and 7-day cards collapse to one weekly 7-day value", () => {
+  const probe = spawnSync("python3", ["-c", [
+    "import importlib.util, json, sys",
+    "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
+    "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
+    "snapshot = {'cards': [{'provider': 'codex', 'account': 'one', 'window': '5-hour', 'used_percent': 8}, {'provider': 'codex', 'account': 'one', 'window': '7-day', 'used_percent': 77}]}",
+    "payload = poster._provider_dashboard_input(snapshot, [snapshot], 'codex', [])",
+    "print(json.dumps(payload['cards']))",
+  ].join("\n"), path.join("scripts", "usage-stats-poster.py")], { encoding: "utf8" });
+  assert.equal(probe.status, 0, probe.stderr);
+  const cards = JSON.parse(probe.stdout);
+  assert.equal(cards.length, 1);
+  assert.deepEqual([cards[0].window, cards[0].used_percent], ["Weekly", 77]);
+});
+
+test("Claude API estimate notes retain only local costs, counts, and status", () => {
+  const probe = spawnSync("python3", ["-c", [
+    "import importlib.util, json, sys",
+    "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
+    "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
+    "note = poster._claude_api_dashboard_note('Example/API', {'status': 'estimated_local', 'today_cost': 1.25, 'month_cost': 3.5, 'today_requests': 2, 'month_requests': 4})",
+    "cards = poster._safe_history_cards([{'provider': 'claude', 'account': 'Example/API', 'limits': [], 'dashboard_note': note}])",
+    "print(json.dumps({'note': note, 'cards': cards}))",
+  ].join("\n"), path.join("scripts", "usage-stats-poster.py")], { encoding: "utf8" });
+  assert.equal(probe.status, 0, probe.stderr);
+  const { note, cards } = JSON.parse(probe.stdout);
+  assert.match(note.title, /Example·API/);
+  assert.match(note.lines.join("\n"), /Today  \$1\.2500 · 2 requests/);
+  assert.match(note.lines.join("\n"), /This month  \$3\.5000 · 4 requests/);
+  assert.match(note.lines.join("\n"), /no rate-limit graph/);
+  assert.deepEqual(cards, []);
+});
+
+test("missing Claude API config keeps the unavailable/manual status", () => {
+  const probe = spawnSync("python3", ["-c", [
+    "import importlib.util, json, sys",
+    "from pathlib import Path",
+    "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
+    "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
+    "estimate = poster.get_claude_api_estimate(Path('/definitely-missing-ccdm-api-config'))",
+    "print(json.dumps({'status': estimate['status'], 'text': poster.get_claude_api_stats(Path('/definitely-missing-ccdm-api-config'), 'Fixture', estimate=estimate), 'note': poster._claude_api_dashboard_note('Fixture', estimate)}))",
+  ].join("\n"), path.join("scripts", "usage-stats-poster.py")], { encoding: "utf8" });
+  assert.equal(probe.status, 0, probe.stderr);
+  const result = JSON.parse(probe.stdout);
+  assert.equal(result.status, "unavailable");
+  assert.match(result.text, /Unable to read local usage/);
+  assert.match(result.note.lines.join("\n"), /Local usage unavailable/);
 });
 
 test("poster discovers labeled extra Claude OAuth config directories with derived Keychain services", async () => {
@@ -312,7 +632,7 @@ test("poster falls back when Codex JSON-RPC returns a non-object response", asyn
     `${JSON.stringify({
       codex_accounts: { "codex-non-object": codexHome },
       default_codex_account: "codex-non-object",
-      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -344,7 +664,7 @@ test("poster reads Codex JSON-RPC lines already buffered above the descriptor", 
     `${JSON.stringify({
       codex_accounts: { "codex-buffered": codexHome },
       default_codex_account: "codex-buffered",
-      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -387,7 +707,7 @@ test("poster reports named Codex Accounts in default-first alphabetical order", 
         "codex-default": defaultHome,
       },
       default_codex_account: "codex-default",
-      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -419,9 +739,10 @@ test("poster reports named Codex Accounts in default-first alphabetical order", 
     [...codexValue.matchAll(/\*\*(codex-[^*]+)\*\*/g)].map(([, label]) => label),
     ["codex-default", "codex-alpha", "codex-premium"],
   );
-  assert.match(codexValue, /\*\*codex-default\*\* \(ChatGPT\)[\s\S]*12%/);
-  assert.match(codexValue, /\*\*codex-alpha\*\* \(ChatGPT\)[\s\S]*56%/);
-  assert.match(codexValue, /\*\*codex-premium\*\* \(ChatGPT\)[\s\S]*21%/);
+  assert.match(codexValue, /\*\*codex-default\*\* \(ChatGPT\)[\s\S]*Weekly:.*34%/);
+  assert.match(codexValue, /\*\*codex-alpha\*\* \(ChatGPT\)[\s\S]*Weekly:.*78%/);
+  assert.match(codexValue, /\*\*codex-premium\*\* \(ChatGPT\)[\s\S]*Weekly:.*43%/);
+  assert.doesNotMatch(codexValue, /(?:5-Hour|7-Day):/);
   assert.match(codexValue, /\*\*codex-default\*\*[\s\S]*Full resets available: \*\*2\*\*/);
 });
 
@@ -493,7 +814,7 @@ test("poster deduplicates named aliases that share a Codex Home", async () => {
         "codex-alpha": otherHome,
       },
       default_codex_account: "codex-default",
-      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -533,7 +854,7 @@ test("poster falls back to raw Codex Homes in a legacy registry", async () => {
     path.join(workspace.repoDir, "registry.json"),
     `${JSON.stringify({
       codex_home: sharedHome,
-      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: { project: { codex_home: projectHome, type: "codex" } },
     }, null, 2)}\n`,
   );
@@ -571,7 +892,7 @@ test("poster reports a missing configured Codex Home as unavailable", async () =
     `${JSON.stringify({
       codex_accounts: { available: availableHome, missing: missingHome },
       default_codex_account: "missing",
-      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -623,7 +944,7 @@ test("poster falls back to recent Codex session tokens after a live rate-limit f
     `${JSON.stringify({
       codex_accounts: { "codex-fallback": codexHome },
       default_codex_account: "codex-fallback",
-      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -679,7 +1000,7 @@ test("poster preserves stale rate-limit fallback age and ignores a newer malform
     `${JSON.stringify({
       codex_accounts: { "codex-stale-rate-limits": codexHome },
       default_codex_account: "codex-stale-rate-limits",
-      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -726,7 +1047,7 @@ test("poster preserves stale token-count fallback age markers", async () => {
     `${JSON.stringify({
       codex_accounts: { "codex-stale-token-count": codexHome },
       default_codex_account: "codex-stale-token-count",
-      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -760,7 +1081,7 @@ test("poster discovers only registry Codex Homes, not ROOT_CODEX_HOME", async ()
     `${JSON.stringify({
       codex_accounts: { configured: configuredHome },
       default_codex_account: "configured",
-      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -832,7 +1153,7 @@ test("poster reports malformed named Codex registry fields instead of degrading 
       path.join(workspace.repoDir, "registry.json"),
       `${JSON.stringify({
         ...registry,
-        pool: [{ id: "bot1", token: "fixture-root-token" }],
+        pool: [{ id: "bot1", token: "fixture-project-token" }],
         projects: registry.projects ?? {},
       }, null, 2)}\n`,
     );
@@ -863,7 +1184,7 @@ test("poster merges named accounts with project legacy homes and deduplicates sh
         "named-default": defaultHome,
       },
       default_codex_account: "named-default",
-      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {
         "project-raw": { codex_home: projectHome },
         "project-shared": { codex_home: namedOtherHome },
@@ -910,7 +1231,7 @@ test("poster merges top-level legacy homes with named accounts when no top-level
       codex_accounts: { "named-zulu": zuluHome, "named-alpha": alphaHome },
       default_codex_account: null,
       codex_home: topLegacyHome,
-      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: { "project-legacy": { codex_home: projectLegacyHome } },
     }, null, 2)}\n`,
   );
@@ -956,7 +1277,7 @@ test("poster labels a shared home with the alphabetically first alias without a 
         "codex-alpha": uniqueHome,
         "codex-beta": sharedHome,
       },
-      pool: [{ id: "bot1", token: "fixture-root-token" }],
+      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -1136,4 +1457,171 @@ test("poster publishes a placeholder example and ignores local config", () => {
   assert.match(fs.readFileSync(".gitignore", "utf8"), /^\.usage-stats-poster\.json$/m);
   assert.doesNotMatch(fs.readFileSync(".usage-stats-poster.example.json", "utf8"), /\b\d{17,20}\b/);
   assert.doesNotMatch(fs.readFileSync("scripts/usage-stats-poster.py", "utf8"), /^\s*(?:import|from)\s+(?:requests|httpx|aiohttp)\b/m);
+});
+
+test("scheduled poster uploads the original text report with both trend PNGs once per 30-minute slot", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi({ acceptDashboard: true });
+  const historyPath = path.join(workspace.homeDir, "Library", "Application Support", "CCDM", "usage-stats", "history.sqlite3");
+  seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
+  const codexHome = path.join(workspace.homeDir, ".codex-scheduled");
+  fs.mkdirSync(codexHome);
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    `${JSON.stringify({
+      codex_accounts: { "codex-scheduled": codexHome },
+      default_codex_account: "codex-scheduled",
+      pool: [{ id: "bot1", token: "fixture-project-token" }],
+      projects: {},
+    }, null, 2)}\n`,
+  );
+  const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
+  fs.writeFileSync(responsesPath, `${JSON.stringify({
+    [fs.realpathSync(codexHome)]: {
+      rateLimits: { planType: "chatgpt", primary: { usedPercent: 42, windowDurationMins: 10080 } },
+    },
+  }, null, 2)}\n`);
+  const run = (now) => runScript(workspace, "scripts/usage-stats-poster.py", {
+    args: ["--scheduled"],
+    env: {
+      CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath,
+      CCDM_TEST_NOW: now,
+      CCDM_USAGE_STATS_NOTIFY: "0",
+    },
+  });
+
+  const collect = await run("2026-08-18T12:20:00Z");
+  assert.equal(collect.exitCode, 0, collect.stderr || collect.stdout);
+  assert.match(collect.stdout, /Collected usage snapshot/);
+  assert.equal(api.requests.filter((request) => request.method === "POST").length, 0);
+
+  const posted = await run("2026-08-18T12:30:00Z");
+  assert.equal(posted.exitCode, 0, posted.stderr || posted.stdout);
+  assert.match(posted.stdout, /Posted trend dashboard/);
+  const dashboardPost = api.requests.find((request) => request.method === "POST");
+  assert.ok(dashboardPost);
+  assert.match(dashboardPost.contentType || "", /multipart\/form-data/);
+  assert.match(dashboardPost.body, /filename="claude-usage-dashboard\.png"/);
+  assert.match(dashboardPost.body, /filename="codex-usage-dashboard\.png"/);
+  const payloadMatch = dashboardPost.body.match(
+    /name="payload_json"\r\nContent-Type: application\/json\r\n\r\n([^\r]+)\r\n--/,
+  );
+  assert.ok(payloadMatch, "multipart request should contain payload_json");
+  const dashboardPayload = JSON.parse(payloadMatch[1]);
+  assert.equal(dashboardPayload.embeds.length, 1);
+  assert.equal(dashboardPayload.embeds[0].title, "Usage Report");
+  assert.deepEqual(dashboardPayload.embeds[0].fields.map(({ name }) => name), ["Claude Code", "Codex"]);
+  assert.match(dashboardPayload.embeds[0].fields[0].value, /\*\*Personal\*\* \(Pro\)/);
+  assert.match(dashboardPayload.embeds[0].fields[0].value, /5-Hour:/);
+  assert.match(dashboardPayload.embeds[0].fields[0].value, /7-Day:/);
+  assert.match(dashboardPayload.embeds[0].fields[1].value, /\*\*codex-scheduled\*\* \(ChatGPT\)/);
+  assert.match(dashboardPayload.embeds[0].fields[1].value, /Weekly:.*42%/);
+  assert.doesNotMatch(dashboardPayload.embeds[0].fields[1].value, /(?:5-Hour|7-Day):/);
+
+  const duplicate = await run("2026-08-18T12:35:00Z");
+  assert.equal(duplicate.exitCode, 0, duplicate.stderr || duplicate.stdout);
+  assert.match(duplicate.stdout, /already posted/);
+  assert.equal(api.requests.filter((request) => request.method === "POST").length, 1);
+  const finalMinuteInSlot = await run("2026-08-18T12:39:59Z");
+  assert.equal(finalMinuteInSlot.exitCode, 0, finalMinuteInSlot.stderr || finalMinuteInSlot.stdout);
+  assert.match(finalMinuteInSlot.stdout, /already posted/);
+  const nextSlot = await run("2026-08-18T12:40:00Z");
+  assert.equal(nextSlot.exitCode, 0, nextSlot.stderr || nextSlot.stdout);
+  assert.match(nextSlot.stdout, /Collected usage snapshot/);
+  assert.equal(api.requests.filter((request) => request.method === "POST").length, 1);
+
+  const query = (sql) => {
+    const result = spawnSync("python3", ["-c", [
+      "import sqlite3, sys",
+      "connection = sqlite3.connect(sys.argv[1])",
+      "for row in connection.execute(sys.argv[2]):",
+      "    print('\\t'.join(str(value) for value in row))",
+    ].join("\n"), historyPath, sql], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim().split("\n").filter(Boolean);
+  };
+  assert.equal(query("select count(*) from snapshots")[0], "3");
+  assert.equal(query("select count(*) from posts")[0], "1");
+  const payload = query("select payload_json from snapshots order by slot_utc").join("\n");
+  assert.doesNotMatch(payload, /fixture-(oauth|root)-token|projects|history\.sqlite3/);
+  assert.equal(fs.statSync(historyPath).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(path.dirname(historyPath)).mode & 0o777, 0o700);
+
+  const oldSnapshot = spawnSync("python3", ["-c", [
+    "import json, sqlite3, sys",
+    "connection = sqlite3.connect(sys.argv[1])",
+    "connection.execute(\"insert or replace into snapshots(slot_utc, generated_at, payload_json) values (?, ?, ?)\", ('2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', json.dumps({'generated_at': '2024-01-01T00:00:00Z', 'cards': []})) )",
+    "connection.commit()",
+  ].join("\n"), historyPath], { encoding: "utf8" });
+  assert.equal(oldSnapshot.status, 0, oldSnapshot.stderr);
+
+  const sourceLog = path.join(path.dirname(historyPath), "codex-sessions", "session.jsonl");
+  fs.mkdirSync(path.dirname(sourceLog), { recursive: true });
+  fs.writeFileSync(sourceLog, "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\"}}\n");
+  const sourceLogContents = fs.readFileSync(sourceLog, "utf8");
+  fs.truncateSync(historyPath, 5 * 1024 * 1024 * 1024 + 1);
+  const warning = await run("2026-08-18T12:50:00Z");
+  assert.equal(warning.exitCode, 0, warning.stderr || warning.stdout);
+  assert.match(warning.stderr, /exceeds 5 GiB/);
+  assert.equal(query("select count(*) from snapshots")[0], "4");
+  assert.equal(fs.readFileSync(sourceLog, "utf8"), sourceLogContents);
+  const suppressed = await run("2026-08-18T12:55:00Z");
+  assert.equal(suppressed.exitCode, 0, suppressed.stderr || suppressed.stdout);
+  assert.doesNotMatch(suppressed.stderr, /exceeds 5 GiB/);
+});
+
+test("malformed current-slot snapshots are replaced by the next sanitized collection", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const historyPath = path.join(workspace.homeDir, "history", "history.sqlite3");
+  seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
+  const run = () => runScript(workspace, "scripts/usage-stats-poster.py", {
+    args: ["--collect-only"],
+    env: { CCDM_TEST_NOW: "2026-08-18T12:20:00Z", CCDM_USAGE_STATS_NOTIFY: "0" },
+  });
+
+  const first = await run();
+  assert.equal(first.exitCode, 0, first.stderr || first.stdout);
+  const corrupt = spawnSync("python3", ["-c", [
+    "import sqlite3, sys",
+    "connection = sqlite3.connect(sys.argv[1])",
+    "connection.execute(\"update snapshots set payload_json = '{broken-json'\")",
+    "connection.commit()",
+  ].join("\n"), historyPath], { encoding: "utf8" });
+  assert.equal(corrupt.status, 0, corrupt.stderr);
+
+  const repaired = await run();
+  assert.equal(repaired.exitCode, 0, repaired.stderr || repaired.stdout);
+  assert.match(repaired.stderr, /replacing malformed usage snapshot/);
+  const payload = spawnSync("python3", ["-c", [
+    "import json, sqlite3, sys",
+    "connection = sqlite3.connect(sys.argv[1])",
+    "print(json.loads(connection.execute('select payload_json from snapshots').fetchone()[0])['generated_at'])",
+  ].join("\n"), historyPath], { encoding: "utf8" });
+  assert.equal(payload.status, 0, payload.stderr);
+  assert.equal(payload.stdout.trim(), "2026-08-18T12:20:00Z");
+});
+
+test("poster never falls back to a project pool token when root credentials are missing", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  seedPosterWorkspace(workspace, api.baseUrl);
+  fs.unlinkSync(path.join(workspace.homeDir, ".claude/channels/discord/.env"));
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /cannot read root Discord credentials/);
+  assert.equal(api.requests.length, 0);
+  assert.doesNotMatch(result.stderr, /fixture-project-token/);
+});
+
+test("poster can use a custom root state directory without a root pool entry", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  seedPosterWorkspace(workspace, api.baseUrl);
+  fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), JSON.stringify({ pool: [], projects: {} }));
+  const custom = path.join(workspace.homeDir, "custom root");
+  fs.renameSync(path.join(workspace.homeDir, ".claude/channels/discord"), custom);
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", { env: { ROOT_DISCORD_STATE_DIR: custom } });
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(api.requests.find(r => r.method === "POST").authorization, "Bot fixture-root-token");
 });

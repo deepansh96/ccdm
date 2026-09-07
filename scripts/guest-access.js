@@ -56,10 +56,18 @@ function unique(values) {
   return [...new Set(values.filter(Boolean).map(String))];
 }
 
-function rootToken(registry) {
-  const rootBot = (registry.pool || []).find((bot) => bot.id === "bot1");
-  if (!rootBot?.token) throw new Error("registry.json is missing bot1 root token");
-  return rootBot.token;
+function rootToken() {
+  const stateDir = expandHome(process.env.ROOT_DISCORD_STATE_DIR || "~/.claude/channels/discord");
+  let contents;
+  try {
+    contents = fs.readFileSync(path.join(stateDir, ".env"), "utf8");
+  } catch {
+    throw new Error("Cannot read root Discord credentials; check ROOT_DISCORD_STATE_DIR");
+  }
+  const line = contents.split(/\r?\n/).find((entry) => entry.startsWith("DISCORD_BOT_TOKEN="));
+  const token = line?.slice("DISCORD_BOT_TOKEN=".length).trim().replace(/^(["'])(.*)\1$/, "$2");
+  if (!token || /\s/.test(token)) throw new Error("Root Discord state has no valid DISCORD_BOT_TOKEN");
+  return token;
 }
 
 function projectBot(registry, project) {
@@ -208,7 +216,7 @@ function persistGuestAccess(registry, project, roleId, userIds) {
 }
 
 async function prepareGuestAccess(registry, target, userId, options = {}) {
-  const token = rootToken(registry);
+  const token = rootToken();
   const [[projectName, project]] = resolveProjects(registry, target);
   const roleId = await ensureGuestRole(registry, projectName, project, token);
   const guestUserIds = unique([...(project.guest_user_ids || []), userId]);
@@ -282,7 +290,7 @@ async function deleteInvite(token, code) {
 }
 
 async function revoke(registry, target, userId) {
-  const token = rootToken(registry);
+  const token = rootToken();
   const [[projectName, project]] = resolveProjects(registry, target);
   if (project.guest_role_id) {
     await tryDeleteMemberRole(registry, userId, project.guest_role_id, token);
@@ -301,7 +309,7 @@ async function revoke(registry, target, userId) {
 }
 
 async function sync(registry, target) {
-  const token = rootToken(registry);
+  const token = rootToken();
   for (const [projectName, project] of resolveProjects(registry, target)) {
     if (!project.channel_id) continue;
     if ((project.guest_user_ids || []).length > 0 && !project.guest_role_id) {

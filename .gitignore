@@ -9,3 +9,10 @@ CLAUDE.local.md
 node_modules/
 PUBLIC_REPO_PLAN.md
 .ralph/
+
+# Local agent journals, Python caches, and usage-history databases
+.mex/events/
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.sqlite3-*

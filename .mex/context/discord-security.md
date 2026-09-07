@@ -16,14 +16,18 @@ edges:
     condition: when granting, syncing, listing, or revoking guest access
   - target: patterns/debug-discord-session.md
     condition: when a bot cannot read or reply in its assigned channel
-last_updated: 2026-07-24
+last_updated: 2026-09-07
 ---
 
 # Discord Security
 
 ## Bot Isolation
 
-Each project bot gets the zero-permission `project-bot` role with `VIEW_CHANNEL` denied on managed categories, then a member-level allow override only on its assigned channel. The root bot can see managed channels but requires mention outside its root channel. Local `access.json` allowlists are required in addition to Discord permissions.
+The intended setup gives each project bot the zero-permission `project-bot` role with `VIEW_CHANNEL` denied on managed categories, then a member-level allow override only on its assigned channel. The root bot can see managed channels but requires mention outside its root channel. Local `access.json` allowlists are required in addition to Discord permissions.
+
+Project bots must not have Administrator on any assigned role: it bypasses even member-level channel denies. Before removing it, back up role and channel permissions, confirm the granting role is exclusive to the bot, and verify that its assigned channel already grants the required messaging permissions. Confirm allowed and denied channel access after the change. Record machine-specific audit outcomes and credential issues only in ignored local notes.
+
+Guest management and usage reporting read `DISCORD_BOT_TOKEN` from `ROOT_DISCORD_STATE_DIR/.env`, defaulting to `~/.claude/channels/discord/.env`. Missing or invalid root credentials fail before Discord requests, with no pool fallback. The old poster `root_bot_id` selector is no longer used. Project launchers derive the root identity from root state or an explicit `root_bot_app_id`, never a pool position, and no longer pass the unused management token to project bridges. Exports require explicit credentials or the bot assigned to their channel.
 
 ## Credentials
 

@@ -1168,6 +1168,7 @@ test("bridge restarts its own Codex session from slash command", async () => {
   fs.writeFileSync(
     path.join(workspace.repoDir, "registry.json"),
     `${JSON.stringify({
+      root_bot_app_id: "root-bot-app-id",
       discord_user_id: "allowed-user-id",
       guild_id: "guild-id",
       pool: [

@@ -382,14 +382,16 @@ Ask the root agent for a usage report by messaging `usage`, `limits`, or `how mu
 
 A separate, opt-in macOS LaunchAgent can post usage stats to Discord on a schedule. It is not installed by `setup.sh` and it is not the old tmux-based `usage-report-loop.sh` flow.
 
-The tracked installer renders and validates `~/Library/LaunchAgents/com.discord.usage-stats-poster.plist` with absolute paths to Python, Codex, the poster, and its logs. The LaunchAgent is interval-only, so installation does not trigger an immediate post. Reinstalling unloads the existing label before loading the new plist, so changing the interval is idempotent; if the new load fails, the prior plist and loaded/unloaded schedule are restored:
+The tracked installer requires Python 3 with Pillow (the renderer dependency), then renders and validates `~/Library/LaunchAgents/com.discord.usage-stats-poster.plist` with absolute paths to Python, Codex, the poster, and its logs. If Pillow is missing it prints a `python3 -m pip install Pillow` remediation and exits before touching LaunchAgents or the existing plist. The LaunchAgent is interval-only and runs every 600 seconds, so installation does not trigger an immediate post. Every automated run records a local structured snapshot in UTC 10-minute slots; the original text Usage Report and separate Claude/Codex trend PNGs are uploaded together only once per UTC 30-minute slot. Manual JSON-embed invocations remain independent of the history database. Reinstalling unloads the existing label before loading the new plist, so changing the interval is idempotent; if the new load fails, the prior plist and loaded/unloaded schedule are restored:
 
 ```bash
-scripts/install-usage-stats-poster.sh                 # 1800 seconds (30 minutes)
+scripts/install-usage-stats-poster.sh                 # 600 seconds (10 minutes)
 scripts/install-usage-stats-poster.sh --interval 900  # 15 minutes
 ```
 
 The rendered LaunchAgent contains no token, channel ID, or poster configuration. The installer never sends a Discord request; it only schedules the poster.
+
+History is stored at `~/Library/Application Support/CCDM/usage-stats/history.sqlite3` by default (override with the ignored config's `history_db_path`). The database and lock are private (`0700` directory, `0600` files), snapshots are retained for 365 days, and an advisory lock makes repeated LaunchAgent runs idempotent. The two provider PNGs begin at the earliest actual stored snapshot; no artificial history is backfilled. Only feature-owned SQLite files count toward the 5 GiB warning; Codex session logs and Claude transcripts are never counted or deleted. A warning is emitted at most once every 24 hours while the feature-owned history directory remains over the limit.
 
 ```bash
 ~/Library/LaunchAgents/com.discord.usage-stats-poster.plist
@@ -402,6 +404,8 @@ The poster reports:
   aliases shown alphabetically
 - Local token-usage fallback from each named Codex Home's `sessions` directory
   when live rate limits are unavailable
+
+Each automated Discord post atomically attaches separate Claude and Codex PNGs. Codex is displayed as a weekly allowance only; old local snapshots that called it `5-hour` are translated while rendering and are never rewritten in SQLite. Claude API-key accounts have no comparable limit graph, but their Claude rail shows sanitized local estimated Today and This month costs, request counts, and status.
 
 The poster reads the same named-account registry configuration shown in
 [Codex Accounts](#codex-accounts); it does not need a separate list of Codex
@@ -437,6 +441,8 @@ tail -120 "${TMPDIR:-/tmp}/usage-stats-poster.log"
 tail -120 "${TMPDIR:-/tmp}/usage-stats-poster.err"
 ```
 
+Guest management and the usage poster read `DISCORD_BOT_TOKEN` from the root bot’s `.env` at `~/.claude/channels/discord/.env`. Set `ROOT_DISCORD_STATE_DIR` to select a different root state directory (also set it in the poster LaunchAgent environment when applicable). They never borrow a project bot token or infer root from `bot1`; the old poster `root_bot_id` pool selector is no longer used. Missing root credentials cause an error before Discord requests. Project launches derive root’s identity from that state, with an explicit `root_bot_app_id` registry fallback, and do not pass management credentials to project bridges. Message exports require explicit credentials or a bot registered for the requested channel.
+
 Configuration stays in the ignored root `.usage-stats-poster.json`. Start from the tracked placeholder example, edit the destination channel and any Claude API-account transcript paths, then validate it:
 
 ```bash
@@ -444,11 +450,13 @@ cp .usage-stats-poster.example.json .usage-stats-poster.json
 python3 scripts/usage-stats-poster.py --validate-config
 ```
 
-Run a live post separately after validation; installation never triggers this command:
+Run a live legacy JSON-embed post separately after validation; installation never triggers this command:
 
 ```bash
 python3 scripts/usage-stats-poster.py
 ```
+
+To exercise the scheduled report manually, use `--scheduled --post-now`; `--collect-only` records a snapshot without contacting Discord. Scheduled runs outside a UTC 30-minute window collect history but do not upload the text report or images.
 
 To roll back the schedule, unload and remove only CCDM's rendered LaunchAgent. Keep the older external poster directory and its LaunchAgent available until the replacement has been verified; deleting that external rollback copy is out of scope.
 

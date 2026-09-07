@@ -18,7 +18,7 @@ edges:
     condition: when changing bot permissions, guest access, channel routing, or credentials
   - target: patterns/INDEX.md
     condition: when starting a task — check the pattern index for a matching pattern file
-last_updated: 2026-08-16
+last_updated: 2026-09-07
 ---
 
 # Session Bootstrap
@@ -29,6 +29,7 @@ Then read this file fully before doing anything else in this session.
 
 ## Current Project State
 **Working:**
+- Guest management and usage reporting read root credentials from root Discord state. Exports no longer borrow an unrelated pool token, and project launches no longer pass management credentials, allowing project bots to run without Administrator.
 - Root bot manages a registry-backed pool of isolated Discord project bots.
 - Claude sessions run through the official Discord plugin; Codex sessions run through `scripts/codex-bridge.js`.
 - Start, stop, registration, guest access, command relay, voice transcription, and local-fake E2E coverage are present.
@@ -41,7 +42,8 @@ Then read this file fully before doing anything else in this session.
 - The Codex bridge can pause new turns in memory, queue incoming messages, and resume them in order.
 - The Codex bridge forwards allowed users' 👍 and 👎 reactions on its own messages to the active Codex thread.
 - The tracked Usage Stats Poster discovers named and legacy Codex Homes, deduplicates shared homes, and falls back from live rate limits to recent session JSONL data.
-- The opt-in `scripts/install-usage-stats-poster.sh` renders, validates, and idempotently loads an interval-only secret-free LaunchAgent for the tracked Usage Stats Poster, restoring the prior plist and loaded schedule when a replacement load fails.
+- The tracked Usage Stats Poster also collects sanitized UTC 10-minute snapshots in a private SQLite history, retains them for 365 days, warns on feature-owned history growth, and atomically posts the original text Usage Report with separate Claude and Codex trend PNGs per UTC 30-minute slot; the local posts ledger and advisory lock make retries idempotent.
+- The opt-in `scripts/install-usage-stats-poster.sh` renders, validates, and idempotently loads a 600-second interval-only secret-free LaunchAgent for the tracked Usage Stats Poster, restoring the prior plist and loaded schedule when a replacement load fails.
 - Fresh setup output, `registry.example.json`, and the operator README expose generic named-account fields, precedence, migration, and rollback guidance without local credentials or account paths.
 
 **Not built:**

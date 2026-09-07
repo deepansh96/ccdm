@@ -16,6 +16,7 @@ function buildCodexRegistry(workspace, options = {}) {
   const projectPath = options.projectPath ?? path.join(workspace.tmpDir, 'project with spaces and "quotes"');
   const stateDir = options.stateDir ?? path.join(workspace.homeDir, ".claude", "channels", "discord2");
   const registry = {
+    root_bot_app_id: "root-app-id",
     discord_user_id: "allowed-user-id",
     guild_id: "guild-id",
     max_pool_size: 50,
@@ -213,7 +214,6 @@ test("start-codex-session constructs a bridge tmux launch, removes stale MCP con
     GUILD_ID: registrySeed.guild_id,
     PROJECT_DIR: registrySeed.projects.alpha.path,
     ROOT_BOT_APP_ID: "root-listener-id",
-    ROOT_BOT_TOKEN: registrySeed.pool[0].token,
     WS_PORT: String(registrySeed.projects.alpha.ws_port),
   });
   assert.equal(session.bridgeCommand, "node scripts/codex-bridge.js");
@@ -896,8 +896,7 @@ test("start-codex-session reports current executable failures for registry looku
   const missingRootBotResult = await runScript(missingRootBot, "scripts/start-codex-session.sh", {
     args: ["alpha"],
   });
-  assert.notEqual(missingRootBotResult.exitCode, 0);
-  assert.match(missingRootBotResult.stderr, /StopIteration/);
+  assert.equal(missingRootBotResult.exitCode, 0, missingRootBotResult.stderr);
 });
 
 test("start-codex-session preserves current duplicate channel and port registry behavior", async () => {
@@ -938,4 +937,16 @@ test("start-codex-session preserves current duplicate channel and port registry 
   const state = readState(workspace.stateDir);
   assert.ok(state.fixtures.tmux.sessions.alpha_codex);
   assert.equal(state.fixtures.tmux.sessions.beta_codex, undefined);
+});
+
+test("project launch refuses to infer root identity from a project pool entry", async () => {
+  const workspace = createWorkspace();
+  const registry = buildCodexRegistry(workspace);
+  delete registry.root_bot_app_id;
+  seedRegistry(workspace, registry);
+  const result = await runScript(workspace, "scripts/start-codex-session.sh", { args: ["alpha"] });
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /Root bot identity missing/);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex, undefined);
+  assert.doesNotMatch(result.stderr, /root-token/);
 });

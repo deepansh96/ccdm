@@ -1,5 +1,6 @@
 {
   "discord_channel_id": "REPLACE_WITH_DISCORD_CHANNEL_ID",
+  "history_db_path": "~/Library/Application Support/CCDM/usage-stats/history.sqlite3",
   "claude_api_accounts": [
     {
       "path": "REPLACE_WITH_CLAUDE_API_CONFIG_PATH",

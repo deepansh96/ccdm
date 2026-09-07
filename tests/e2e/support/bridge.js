@@ -356,7 +356,6 @@ export function startBridge(workspace, options = {}) {
     CHANNEL_ID: options.channelId ?? "channel-id",
     GUILD_ID: options.guildId ?? "guild-id",
     PROJECT_DIR: options.projectDir ?? workspace.repoDir,
-    ROOT_BOT_TOKEN: options.rootBotToken ?? "root-token",
     ROOT_BOT_APP_ID: options.rootBotAppId ?? "root-bot-app-id",
     WS_PORT: String(options.port),
     ...(options.env ?? {}),

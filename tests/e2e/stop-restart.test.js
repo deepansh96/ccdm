@@ -356,7 +356,6 @@ test("restart-root-codex-agent starts the root bot through the Codex bridge", as
     PROJECT_DIR: workspace.repoDir,
     ROOT_ACCESS_FILE: path.join(rootStateDir, "access.json"),
     ROOT_BOT_APP_ID: "root-app",
-    ROOT_BOT_TOKEN: "cm9vdC1hcHA.fixture.token",
     ROOT_MULTI_CHANNEL: "1",
     WS_PORT: "18399",
   });

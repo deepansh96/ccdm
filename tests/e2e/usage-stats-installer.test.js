@@ -21,6 +21,22 @@ test("usage stats poster installer is a tracked executable surface", () => {
   assert.ok(fs.statSync(installer).mode & 0o111);
 });
 
+test("installer fails before any plist or launchctl write when Pillow is unavailable", async () => {
+  const workspace = createWorkspace();
+  const pythonFixture = path.join(workspace.fixtureDir, "python3");
+  fs.writeFileSync(pythonFixture, "#!/bin/sh\nexit 1\n");
+  fs.chmodSync(pythonFixture, 0o755);
+
+  const result = await runScript(workspace, "scripts/install-usage-stats-poster.sh");
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /Pillow is required/);
+  assert.match(result.stderr, /python3 -m pip install Pillow/);
+  assert.match(result.stderr, /No LaunchAgent or plist changes were made/);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.launchctl.invocations, []);
+  assert.equal(fs.existsSync(plistPath(workspace)), false);
+});
+
 test("installer renders a secret-free LaunchAgent with the default interval", async () => {
   const workspace = createWorkspace();
   const result = await runScript(workspace, "scripts/install-usage-stats-poster.sh");
@@ -40,11 +56,13 @@ test("installer renders a secret-free LaunchAgent with the default interval", as
 <string>${path.join(resolvedRepoDir, "scripts", "usage-stats-poster.py")}</string>
 </array>
 <key>StartInterval</key>
-<integer>1800</integer>
+<integer>600</integer>
 <key>EnvironmentVariables</key>
 <dict>
 <key>CCDM_CODEX_PATH</key>
 <string>${path.join(workspace.fixtureDir, "codex")}</string>
+<key>CCDM_USAGE_STATS_AUTOMATED</key>
+<string>1</string>
 <key>PATH</key>
 <string>${workspace.fixtureDir}:/usr/bin:/bin</string>
 </dict>

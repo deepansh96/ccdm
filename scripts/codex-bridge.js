@@ -24,7 +24,6 @@ const ALLOWED_USER_IDS = new Set(
     .filter(Boolean)
 );
 const GUILD_ID = process.env.GUILD_ID;
-const ROOT_BOT_TOKEN = process.env.ROOT_BOT_TOKEN;
 const ROOT_BOT_APP_ID = process.env.ROOT_BOT_APP_ID;
 const BOT_APP_ID = process.env.BOT_APP_ID;
 const BOT_DISPLAY_NAME = process.env.BOT_DISPLAY_NAME || "codex";

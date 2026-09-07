@@ -17,6 +17,9 @@ test.afterEach(async () => {
 });
 
 function buildRegistry(workspace) {
+  const rootState = path.join(workspace.homeDir, ".claude", "channels", "discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=root-token\n");
   return {
     discord_user_id: OWNER_ID,
     guild_id: "guild-id",
@@ -27,7 +30,7 @@ function buildRegistry(workspace) {
       {
         id: "bot1",
         app_id: "root-app-id",
-        token: "root-token",
+        token: "project-only-token",
         state_dir: path.join(workspace.homeDir, ".claude", "channels", "discord"),
         assigned_to: null,
       },
@@ -313,4 +316,32 @@ test("guest revoke keeps local access when Discord cleanup fails", async () => {
   const updated = readRegistry(workspace);
   assert.deepEqual(updated.projects.alpha.guest_user_ids, [GUEST_ID]);
   assert.deepEqual(updated.projects.alpha.guest_invites, { [GUEST_ID]: ["fake-invite-1"] });
+});
+
+test("guest access fails before Discord writes when root credentials are missing, even with bot1 present", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, buildRegistry(workspace));
+  fs.unlinkSync(path.join(workspace.homeDir, ".claude/channels/discord/.env"));
+  const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
+    args: ["grant", "alpha", GUEST_ID], env: preloadEnv(workspace),
+  });
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /Cannot read root Discord credentials/);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.roleCreates, []);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.permissionOverwrites, []);
+  assert.doesNotMatch(result.stderr, /project-only-token/);
+});
+
+test("guest access reads an explicitly selected root state directory", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, buildRegistry(workspace));
+  const custom = path.join(workspace.homeDir, "custom root");
+  fs.mkdirSync(custom);
+  fs.writeFileSync(path.join(custom, ".env"), 'DISCORD_BOT_TOKEN="custom-root-token"\n');
+  const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
+    args: ["grant", "alpha", GUEST_ID],
+    env: { ...preloadEnv(workspace), ROOT_DISCORD_STATE_DIR: custom },
+  });
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(readState(workspace.stateDir).fixtures.discord.roleCreates[0].authorization, "Bot custom-root-token");
 });

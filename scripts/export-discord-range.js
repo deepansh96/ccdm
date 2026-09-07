@@ -38,9 +38,7 @@ async function botToken() {
   }
   const registry = JSON.parse(await readFile(path.join(__dirname, "..", "registry.json"), "utf8"));
   const project = Object.values(registry.projects || {}).find((entry) => String(entry.channel_id) === channelId);
-  const bot = (registry.pool || []).find((entry) => entry.id === project?.bot_id)
-    || (registry.pool || []).find((entry) => entry.id === "bot1")
-    || registry.pool?.[0];
+  const bot = (registry.pool || []).find((entry) => entry.id === project?.bot_id);
   if (!bot?.token) throw new Error("No bot token found; set DISCORD_BOT_TOKEN");
   return bot.token;
 }

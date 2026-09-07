@@ -108,6 +108,14 @@ function shellQuote(value) {
 }
 
 function hostCommandPath(name) {
+  if (name === "python3") {
+    const python = spawnSync("python3", ["-c", "import sys; print(sys.executable)"], {
+      encoding: "utf8",
+    });
+    if (python.status === 0 && python.stdout.trim()) {
+      return python.stdout.trim();
+    }
+  }
   const result = spawnSync("/bin/sh", ["-lc", `command -v ${name}`], {
     encoding: "utf8",
   });
@@ -378,7 +386,6 @@ function parseCodexBridgeLaunch(shellCommand) {
     "WS_PORT",
     "ALLOWED_USER_IDS",
     "GUILD_ID",
-    "ROOT_BOT_TOKEN",
     "ROOT_BOT_APP_ID",
     "BOT_APP_ID",
     "BOT_DISPLAY_NAME",

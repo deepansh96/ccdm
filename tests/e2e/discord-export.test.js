@@ -96,3 +96,17 @@ test("paginates ranges larger than Discord's 100-message page limit", async () =
     ["1204", "1104", "1004"],
   );
 });
+
+test("exports refuse an unregistered channel instead of borrowing bot1 credentials", async () => {
+  const workspace = createWorkspace();
+  fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), JSON.stringify({
+    pool: [{ id: "bot1", token: "project-only-token" }], projects: {},
+  }));
+  const result = await runNodeEntrypoint(workspace, "scripts/export-discord-range.js", {
+    args: ["100", "101"],
+    env: bridgeChildEnv(workspace, { BOT_TOKEN: "", DISCORD_BOT_TOKEN: "", DISCORD_STATE_DIR: "" }),
+  });
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /No bot token found/);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.messageFetches, []);
+});
