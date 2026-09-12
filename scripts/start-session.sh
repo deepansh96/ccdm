@@ -210,22 +210,43 @@ PY
 # Read project config and resolve bot's state_dir from the pool
 # Uses tab delimiter to handle paths with spaces; empty optional fields are
 # printed as __NONE__ because adjacent tabs collapse under zsh IFS splitting.
-IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME MODEL CLAUDE_HOME CHANNEL_ID <<< "$(python3 -c "
-import json, os
-r = json.load(open('$REGISTRY'))
-p = r['projects']['$PROJECT']
+PROJECT_CONFIG_FIELDS="$(python3 - "$REGISTRY" "$PROJECT" <<'PY'
+import json, os, sys
+r = json.load(open(sys.argv[1]))
+p = r['projects'][sys.argv[2]]
+effort = p.get('claude_effort')
+if effort is None or effort == '':
+    effort = '__NONE__'
+elif not isinstance(effort, str) or effort not in ('low', 'medium', 'high', 'xhigh', 'max'):
+    sys.exit('Invalid claude_effort (expected low, medium, high, xhigh, or max)')
 bot = next(b for b in r['pool'] if b['id'] == p['bot_id'])
 claude_home = os.path.expanduser(p['claude_home']) if p.get('claude_home') else '__NONE__'
-print(os.path.expanduser(p['path']) + '\t' + os.path.expanduser(bot['state_dir']) + '\t' + p['screen_name'] + '\t' + (p.get('model') or '__NONE__') + '\t' + claude_home + '\t' + str(p['channel_id']))
-")"
+print(os.path.expanduser(p['path']) + '\t' + os.path.expanduser(bot['state_dir']) + '\t' + p['screen_name'] + '\t' + (p.get('model') or '__NONE__') + '\t' + effort + '\t' + claude_home + '\t' + str(p['channel_id']))
+PY
+)" || exit $?
+IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME MODEL CLAUDE_EFFORT CLAUDE_HOME CHANNEL_ID <<< "$PROJECT_CONFIG_FIELDS"
 
 [[ "$MODEL" == "__NONE__" ]] && MODEL=""
+[[ "$CLAUDE_EFFORT" == "__NONE__" ]] && CLAUDE_EFFORT=""
 [[ "$CLAUDE_HOME" == "__NONE__" ]] && CLAUDE_HOME=""
 
 # Optional model override (e.g. "claude-opus-4-8[1m]"). Empty -> account default.
 MODEL_FLAG=""
 if [[ -n "$MODEL" ]]; then
   MODEL_FLAG=" --model '$MODEL'"
+fi
+
+# Optional Claude effort override. Empty -> account/model default.
+EFFORT_FLAG=""
+if [[ -n "$CLAUDE_EFFORT" ]]; then
+  case "$CLAUDE_EFFORT" in
+    low|medium|high|xhigh|max) ;;
+    *)
+      echo "Invalid claude_effort '$CLAUDE_EFFORT' for '$PROJECT' (expected low, medium, high, xhigh, or max)" >&2
+      exit 1
+      ;;
+  esac
+  EFFORT_FLAG=" --effort '$CLAUDE_EFFORT'"
 fi
 
 # Optional account override (e.g. "~/.claude-work"). Empty -> default ~/.claude login.
@@ -273,7 +294,7 @@ with open(config_path, "w") as f:
 os.chmod(config_path, 0o600)
 PY
 
-tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$PATH_DIR' && DISCORD_STATE_DIR='$STATE_DIR'$CONFIG_DIR_ENV claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions --mcp-config '$MCP_CONFIG'$MODEL_FLAG"
+tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$PATH_DIR' && DISCORD_STATE_DIR='$STATE_DIR'$CONFIG_DIR_ENV claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions --mcp-config '$MCP_CONFIG'$MODEL_FLAG$EFFORT_FLAG"
 echo "Started Discord bot in tmux session '$SCREEN_NAME'"
 echo "Attach with: tmux attach -t $SCREEN_NAME"
 record_claude_pid "$STATE_DIR" "$CLAUDE_HOME"

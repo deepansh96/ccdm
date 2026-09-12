@@ -16,7 +16,7 @@ edges:
     condition: when performing a start, stop, or restart
   - target: patterns/register-project.md
     condition: when assigning or releasing a project bot
-last_updated: 2026-08-16
+last_updated: 2026-09-12
 ---
 
 # Session Management
@@ -29,7 +29,7 @@ Never print tokens. Treat missing project `type` as `claude`. Use exact tmux tar
 
 ## Claude Lifecycle
 
-Use `scripts/start-session.sh <project>`. It resolves the assigned state directory, rejects duplicate tmux/listener processes, launches Claude through `zsh -ic`, and records PID/session ID. Optional `claude_home` selects `CLAUDE_CONFIG_DIR`.
+Use `scripts/start-session.sh <project>`. It resolves the assigned state directory, rejects duplicate tmux/listener processes, launches Claude through `zsh -ic`, and records PID/session ID. Optional `claude_home` selects `CLAUDE_CONFIG_DIR`; `model` and `claude_effort` set the listener's `--model` and `--effort` flags. Supported effort values are `low`, `medium`, `high`, `xhigh`, and `max`. Missing, null, or empty effort uses the default; other values are rejected before field splitting, MCP config creation, or launch.
 
 Claude slash commands from project channels are relayed by the root bot through `scripts/send-claude-command.sh`; they are tmux keystrokes, not protocol calls.
 

@@ -18,7 +18,7 @@ edges:
     condition: when changing bot permissions, guest access, channel routing, or credentials
   - target: patterns/INDEX.md
     condition: when starting a task — check the pattern index for a matching pattern file
-last_updated: 2026-09-07
+last_updated: 2026-09-12
 ---
 
 # Session Bootstrap
@@ -35,7 +35,7 @@ Then read this file fully before doing anything else in this session.
 - Start, stop, registration, guest access, command relay, voice transcription, and local-fake E2E coverage are present.
 - Local Claude and Codex project bots can export an inclusive Discord message range to a temporary text file.
 - Codex Discord tools can read the last requested 1-10,000 messages in their scoped channel, returning larger reads as private temporary transcripts.
-- Per-project Claude and Codex account/model overrides are supported.
+- Per-project Claude and Codex account, model, and effort overrides are supported.
 - Named Codex Account aliases and `default_codex_account` select root and project Codex Homes, while legacy `codex_home` and root overrides remain supported.
 - Project Codex launches resolve and validate the selected named or legacy home before MCP cleanup, tmux creation, or PID recording through `scripts/resolve-codex-home.py`.
 - The Codex bridge retries a generic terminal `response.failed` once when the failed turn produced no agent work.

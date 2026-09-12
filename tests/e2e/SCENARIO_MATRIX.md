@@ -27,6 +27,7 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Claude start | Successful Claude launch | Covered | Drives `scripts/start-session.sh`, resolves bot state dir, constructs tmux launch, records PID/session, and emits expected stdout. |
 | Claude start | Message-range MCP | Covered | Writes a token-free, mode-0600 MCP config that exposes only the assigned channel's range exporter alongside the official Discord plugin. |
 | Claude start | Paths with spaces/quotes | Covered | Project paths with spaces and double quotes are captured through the tmux launch contract. |
+| Claude start | Model and effort overrides | Covered | Projects with `model` and `claude_effort` pass `--model` and `--effort` to the Claude listener. All five effort levels and unset defaults preserve account/channel fields; malformed strings and non-string values fail without launch, MCP config creation, or registry changes. |
 | Claude start | Account override via `claude_home` | Covered | Projects with `claude_home` launch with `CLAUDE_CONFIG_DIR` in the tmux command and record PID/session metadata from the alternate Claude home's `sessions/` directory. |
 | Claude start | Already-running tmux guard | Covered | Existing target tmux session exits successfully without launching another listener. |
 | Claude start | Duplicate listener guard | Covered | Existing Claude Discord listener using the same state dir fails before creating the target tmux session. |

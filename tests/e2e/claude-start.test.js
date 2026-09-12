@@ -172,6 +172,65 @@ test("start-session starts a Claude project through tmux and records PID/session
   assert.equal(fs.existsSync(path.join(workspace.homeDir, ".claude", ".claude.json")), false);
 });
 
+test("start-session honors Claude model and effort overrides", async () => {
+  const workspace = createWorkspace();
+  const registrySeed = buildClaudeRegistry(workspace);
+  registrySeed.projects.alpha.model = "claude-fable-5";
+  registrySeed.projects.alpha.claude_effort = "high";
+  seedRegistry(workspace, registrySeed);
+
+  const result = await runScript(workspace, "scripts/start-session.sh", {
+    args: ["alpha"],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const state = readState(workspace.stateDir);
+  assert.match(
+    state.fixtures.tmux.sessions.alpha_session.shellCommand,
+    /--model 'claude-fable-5' --effort 'high'/,
+  );
+});
+
+for (const effort of ["invalid", "high\tbad", "high\nbad", "__NONE__", false, 0, 1, [], {}]) {
+  test(`start-session rejects invalid Claude effort ${JSON.stringify(effort)} before side effects`, async () => {
+    const workspace = createWorkspace();
+    const registrySeed = buildClaudeRegistry(workspace);
+    registrySeed.projects.alpha.claude_effort = effort;
+    seedRegistry(workspace, registrySeed);
+    const registryBefore = fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8");
+
+    const result = await runScript(workspace, "scripts/start-session.sh", { args: ["alpha"] });
+
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, /Invalid claude_effort/);
+    const state = readState(workspace.stateDir);
+    assert.equal(state.fixtures.claude.invocations.length, 0);
+    assert.equal(state.fixtures.tmux.sessions.alpha_session, undefined);
+    assert.equal(fs.existsSync(path.join(registrySeed.pool[0].state_dir, "ccdm-message-export-mcp.json")), false);
+    assert.equal(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"), registryBefore);
+  });
+}
+
+for (const effort of [undefined, null, "", "low", "medium", "high", "xhigh", "max"]) {
+  test(`start-session preserves account and channel with Claude effort ${JSON.stringify(effort)}`, async () => {
+    const workspace = createWorkspace();
+    const registrySeed = buildClaudeRegistry(workspace);
+    registrySeed.projects.alpha.claude_effort = effort;
+    registrySeed.projects.alpha.claude_home = "~/.claude-work";
+    seedRegistry(workspace, registrySeed);
+
+    const result = await runScript(workspace, "scripts/start-session.sh", { args: ["alpha"] });
+
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+    const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session;
+    assert.equal(session.env.CLAUDE_CONFIG_DIR, path.join(workspace.homeDir, ".claude-work"));
+    if (effort) assert.ok(session.shellCommand.includes(`--effort '${effort}'`));
+    else assert.doesNotMatch(session.shellCommand, /--effort/);
+    const mcpConfig = JSON.parse(fs.readFileSync(path.join(registrySeed.pool[0].state_dir, "ccdm-message-export-mcp.json"), "utf8"));
+    assert.equal(mcpConfig.mcpServers["discord-message-export"].env.CHANNEL_ID, registrySeed.projects.alpha.channel_id);
+  });
+}
+
 test("start-session honors claude_home: launches with CLAUDE_CONFIG_DIR and records session metadata from the alternate Claude home", async () => {
   const workspace = createWorkspace();
   const claudeHome = path.join(workspace.homeDir, ".claude-work");

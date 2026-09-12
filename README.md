@@ -155,6 +155,20 @@ starting any of them again, then restart the root Codex bridge. Updating the
 binary does not replace already-running app-server processes, so a partial
 restart can mix runtime versions inside the shared CCDM home.
 
+Claude projects can pin their account, model, and effort per session:
+
+```json
+{
+  "claude_home": "~/.claude-work",
+  "model": "claude-fable-5",
+  "claude_effort": "high"
+}
+```
+
+`scripts/start-session.sh` passes these values as `CLAUDE_CONFIG_DIR`,
+`--model`, and `--effort`. Supported effort values are `low`, `medium`,
+`high`, `xhigh`, and `max`.
+
 Codex projects can also pin runtime settings per session:
 
 ```json
