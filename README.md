@@ -312,7 +312,9 @@ scripts/start-codex-session.sh my-project --resume <thread_uuid>
 
 The selected Codex home must contain that saved thread. The bridge resumes it
 and refreshes the Discord instructions and reply credentials. A failed resume
-stops startup instead of silently creating a fresh conversation. `/clear` still
+stops startup instead of silently creating a fresh conversation. Resume launches
+wait up to 60 seconds for listener readiness before reporting success. A failed
+or timed-out startup returns an error and cleans up the session and saved PID. `/clear` still
 starts a new conversation; the resume argument applies only at startup.
 
 To change Codex accounts while retaining the conversation, first locate its

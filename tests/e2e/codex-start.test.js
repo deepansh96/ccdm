@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { createWorkspace, runScript } from "./support/runner.js";
-import { readState, seedFixtureProcess, seedRegistry, seedTmuxSession } from "./support/state.js";
+import { readState, seedFixtureProcess, seedRegistry, seedTmuxSession, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 
 test.afterEach(async () => {
@@ -212,6 +212,7 @@ test("start-codex-session constructs a bridge tmux launch, removes stale MCP con
     CODEX_HOME: codexHome,
     CODEX_SERVICE_TIER: "default",
     CODEX_RESUME_THREAD_ID: "",
+    CODEX_STARTUP_READY_FILE: "",
     GUILD_ID: registrySeed.guild_id,
     PROJECT_DIR: registrySeed.projects.alpha.path,
     ROOT_BOT_APP_ID: "root-listener-id",
@@ -230,11 +231,47 @@ test("start-codex-session forwards an explicit resume ID and ignores an inherite
     const id = "00000000-0000-4000-8000-000000000001";
     const result = await runScript(workspace, "scripts/start-codex-session.sh", {
       args: resume ? ["alpha", "--resume", id] : ["alpha"],
-      env: { CODEX_RESUME_THREAD_ID: "inherited-other-thread" },
+      env: { CODEX_RESUME_THREAD_ID: "inherited-other-thread", CODEX_STARTUP_READY_FILE: "/unwanted/inherited/file" },
     });
     assert.equal(result.exitCode, 0, result.stderr || result.stdout);
     assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex.env.CODEX_RESUME_THREAD_ID,
       resume ? id : "");
+    const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex;
+    assert.equal(readRegistry(workspace).projects.alpha.pid, session.pid);
+    if (resume) {
+      assert.ok(session.env.CODEX_STARTUP_READY_FILE);
+      assert.equal(fs.existsSync(path.dirname(session.env.CODEX_STARTUP_READY_FILE)), false);
+    } else {
+      assert.equal(session.env.CODEX_STARTUP_READY_FILE, "");
+    }
+  }
+});
+
+test("resume startup failures clean the listener, runtime state, and readiness directory", async () => {
+  for (const startupMode of ["exit", "timeout"]) {
+    const workspace = createWorkspace();
+    const registry = buildCodexRegistry(workspace);
+    registry.projects.alpha.pid = 99999999;
+    registry.projects.alpha.session_id = "old-session";
+    seedRegistry(workspace, registry);
+    const state = readState(workspace.stateDir);
+    state.fixtures.tmux.startupMode = startupMode;
+    writeState(state, workspace.stateDir);
+    const result = await runScript(workspace, "scripts/start-codex-session.sh", {
+      args: ["alpha", "--resume", "00000000-0000-4000-8000-000000000001"],
+      timeoutMs: 75000,
+    });
+    assert.equal(result.exitCode, 1, result.stderr || result.stdout);
+    assert.match(result.stderr, startupMode === "exit" ? /bridge exited/ : /timed out/);
+    assert.doesNotMatch(result.stdout, /Started Codex bridge|Recorded PID/);
+    assert.equal(readRegistry(workspace).projects.alpha.pid, null);
+    assert.equal(readRegistry(workspace).projects.alpha.session_id, null);
+    const after = readState(workspace.stateDir);
+    assert.deepEqual(after.fixtures.tmux.sessions, {});
+    const launch = after.fixtures.codex.bridgeInvocations[0];
+    assert.ok(launch.env.CODEX_STARTUP_READY_FILE);
+    assert.equal(fs.existsSync(path.dirname(launch.env.CODEX_STARTUP_READY_FILE)), false);
+    assert.throws(() => process.kill(launch.pid, 0), { code: "ESRCH" });
   }
 });
 

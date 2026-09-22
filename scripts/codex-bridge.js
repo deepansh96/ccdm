@@ -3,7 +3,7 @@
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const { spawn } = require("child_process");
 const { createHmac, randomBytes } = require("crypto");
-const { writeFile, mkdir, mkdtemp, readFile, rm } = require("fs/promises");
+const { writeFile, mkdir, mkdtemp, readFile, rm, rename } = require("fs/promises");
 const { rmSync } = require("fs");
 const os = require("os");
 const path = require("path");
@@ -1295,19 +1295,23 @@ function startDiscordBot() {
   });
   discordClient = client;
 
-  client.on("ready", () => {
-    console.log(`Discord bot logged in as ${client.user.tag}`);
-    discordChannel = client.channels.cache.get(CHANNEL_ID);
-    if (!discordChannel) {
-      client.channels.fetch(CHANNEL_ID).then((ch) => {
-        discordChannel = ch;
-        console.log(`Listening in #${ch.name}`);
-      });
-    } else {
+  client.once("ready", async () => {
+    try {
+      console.log(`Discord bot logged in as ${client.user.tag}`);
+      discordChannel = client.channels.cache.get(CHANNEL_ID) || await client.channels.fetch(CHANNEL_ID);
+      if (!discordChannel) throw new Error("Discord channel unavailable");
       console.log(`Listening in #${discordChannel.name}`);
-    }
-    if (ROOT_MULTI_CHANNEL) {
-      console.log(`Root routing active for ${rootChannelAccess.size} configured channel(s)`);
+      if (process.env.CODEX_STARTUP_READY_FILE) {
+        const readyFile = process.env.CODEX_STARTUP_READY_FILE;
+        await writeFile(`${readyFile}.tmp`, "ready\n", { mode: 0o600 });
+        await rename(`${readyFile}.tmp`, readyFile);
+      }
+      if (ROOT_MULTI_CHANNEL) {
+        console.log(`Root routing active for ${rootChannelAccess.size} configured channel(s)`);
+      }
+    } catch (err) {
+      console.error("Discord startup failed:", err);
+      process.exit(1);
     }
   });
 

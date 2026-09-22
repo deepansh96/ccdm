@@ -219,12 +219,15 @@ test("fake Codex app-server supports active-turn controls and approval requests"
 
 test("bridge resumes the requested thread but clear starts a fresh conversation", async () => {
   const workspace = createBridgeWorkspace();
+  const readyFile = path.join(workspace.tmpDir, "ready");
   const codex = await startFakeCodexServer(workspace);
   const bridge = startBridge(workspace, {
     port: codex.port,
-    env: { CODEX_RESUME_THREAD_ID: "saved-thread" },
+    env: { CODEX_RESUME_THREAD_ID: "saved-thread", CODEX_STARTUP_READY_FILE: readyFile },
   });
   await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await waitForState(workspace, () => fs.existsSync(readyFile));
+  assert.equal(fs.readFileSync(readyFile, "utf8"), "ready\n");
   const resume = codex.clientMessages.find((m) => m.method === "thread/resume");
   assert.equal(resume.params.threadId, "saved-thread");
   assert.equal(resume.params.cwd, workspace.repoDir);
@@ -238,12 +241,14 @@ test("bridge resumes the requested thread but clear starts a fresh conversation"
 
 test("failed resume never silently starts a fresh conversation", async () => {
   const workspace = createBridgeWorkspace();
+  const readyFile = path.join(workspace.tmpDir, "ready");
   const codex = await startFakeCodexServer(workspace, { resumeError: "Saved thread unavailable" });
   const bridge = startBridge(workspace, {
     port: codex.port,
-    env: { CODEX_RESUME_THREAD_ID: "missing-thread" },
+    env: { CODEX_RESUME_THREAD_ID: "missing-thread", CODEX_STARTUP_READY_FILE: readyFile },
   });
   await bridge.waitForOutput(/Saved thread unavailable/, 7000);
+  assert.equal(fs.existsSync(readyFile), false);
   assert.ok(!codex.clientMessages.some((m) => m.method === "thread/start" || m.method === "turn/start"));
   await bridge.stop();
 });

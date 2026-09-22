@@ -334,11 +334,12 @@ function activeOwnedProcesses(state) {
   );
 }
 
-function spawnPlaceholder() {
-  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+function spawnPlaceholder(readyFile = "") {
+  const child = spawn(process.execPath, ["-e", "if (process.env.READY_FILE) setTimeout(() => require('fs').writeFileSync(process.env.READY_FILE, 'ready'), 300); setInterval(() => {}, 1000)"], {
     detached: true,
     env: {
       CCDM_FIXTURE_PLACEHOLDER: "1",
+      READY_FILE: readyFile,
       CCDM_TEST_STATE: stateDir,
     },
     stdio: "ignore",
@@ -375,9 +376,9 @@ function parseCodexBridgeLaunch(shellCommand) {
   }
   const env = {};
   const envText = match[2];
-  const envRe = /([A-Z_]+)='([^']*)'/g;
+  const envRe = /([A-Z_]+)=(?:'([^']*)'|([^\\s]+))/g;
   for (const envMatch of envText.matchAll(envRe)) {
-    env[envMatch[1]] = envMatch[2];
+    env[envMatch[1]] = envMatch[2] ?? envMatch[3];
   }
   const required = [
     "BOT_TOKEN",
@@ -453,7 +454,12 @@ function runTmux() {
   if (subcommand === "has-session") {
     const targetIndex = args.indexOf("-t");
     const name = normalizeSessionTarget(args[targetIndex + 1]);
-    process.exit(readState().fixtures.tmux.sessions[name] ? 0 : 1);
+    const session = readState().fixtures.tmux.sessions[name];
+    if (session?.startupMode === "exit") {
+      updateState((state) => { delete state.fixtures.tmux.sessions[name]; return state; });
+      process.exit(1);
+    }
+    process.exit(session ? 0 : 1);
   }
 
   if (subcommand === "new-session") {
@@ -483,7 +489,8 @@ function runTmux() {
     const priorKillAttempts =
       tmuxState.lastKilledSessions?.[name]?.killAttempts ?? preexistingSession?.killAttempts ?? 0;
     const launch = parseTmuxLaunch(shellCommand);
-    const pid = spawnPlaceholder();
+    const readyFile = tmuxState.startupMode ? "" : launch.env.CODEX_STARTUP_READY_FILE;
+    const pid = spawnPlaceholder(readyFile);
     const sessionId = \`fixture-session-\${pid}\`;
     const processCommand =
       launch.kind === "codex-bridge"
@@ -511,6 +518,7 @@ function runTmux() {
         pid,
         killAttempts: priorKillAttempts,
         shellCommand,
+        startupMode: tmuxState.startupMode,
       };
       state.fixtures.processes.push({
         command: processCommand,
