@@ -30,6 +30,7 @@ last_updated: 2026-09-22
 - For CLI image tests, separate the prompt from variadic image arguments: `codex exec -i image.png -- 'Describe this image'`. Otherwise the prompt can be consumed as another image argument.
 - Keep the private `api-key` and all home contents outside the checkout. Do not copy unrelated provider credentials or MCP configurations into the new home.
 - Pi may store a key-provider command rather than a literal key. Resolve a reviewed credential reference privately and pass its output through stdin; never print the resolved credential.
+- The usage poster reports the home from its `ccdm-deepseek.json` marker and private `api-key`, sending the key only to the fixed official `GET /user/balance` endpoint (a literal loopback fake is allowed in tests) and validating USD/CNY amounts exactly; DeepSeek exposes no account spend or quota, so the dashboard shows the account-wide balance and local token totals only.
 - The helper is scoped to Flash. Other DeepSeek models and provider quota reporting require separate work and validation.
 
 ## Verify

@@ -71,6 +71,34 @@ PALETTE = (
 )
 PLOT_VERTICAL_INSET = 10
 
+# Rail note geometry.  Notes sit below the current-limit rows and are bounded
+# so a long note can never collide with the cards above or the panel below.
+RAIL_NOTES_TOP = 300
+RAIL_NOTES_MAX = 6
+RAIL_NOTES_MIN_CONTENT = 180
+# Space kept between the lowest card row and the note band above it.
+RAIL_NOTES_GAP = 16
+# Card row geometry.  The visible count is reduced (reserving the overflow
+# marker) so a long card list can never run into the notes below it.
+RAIL_ROW_MIN_SINGLE = 48
+RAIL_ROW_MIN_GROUP = 82
+RAIL_ROW_MAX = 142
+RAIL_ROW_PAD = 4
+RAIL_CARD_OVERFLOW_HEIGHT = 26
+NOTE_TAG_TOP = 13
+NOTE_TITLE_TOP = 31
+NOTE_CONTENT_TOP = 56
+NOTE_LINE_HEIGHT = 20
+NOTE_TEXT_HEIGHT = 16
+NOTE_BOTTOM_PAD = 10
+NOTE_STRIDE_GAP = 10
+NOTE_COST_HEIGHT = 116
+# Visual lines a single note may occupy.  The stack is additionally clamped to
+# the rail budget, so this only caps how much one note can grow.
+NOTE_VISUAL_LINE_LIMIT = 6
+NOTE_TAG_DEFAULT = "API USAGE"
+_COST_LINE_PREFIXES = ("Today", "This month")
+
 _PERCENT_KEYS = (
     "used_percent",
     "utilization",
@@ -483,7 +511,12 @@ def normalize_data(raw: dict[str, Any]) -> dict[str, Any]:
             continue
         safe_lines = [_text(line)[:160] for line in lines if _text(line)]
         if safe_lines:
-            notes.append({"title": title[:160], "lines": safe_lines[:4]})
+            tag = _text(raw_note.get("tag"))
+            notes.append({
+                "title": title[:160],
+                "lines": safe_lines[:4],
+                "tag": tag[:32] or None,
+            })
     return {"generated_at": generated_at, "cards": cards, "history": history, "notes": notes}
 
 
@@ -815,31 +848,153 @@ def _availability_summary(cards: list[dict[str, Any]]) -> str:
     return f"{available} of {total} limits available"
 
 
-def _rail_notes_height(notes: list[dict[str, Any]]) -> int:
-    """Reserve a legible, dedicated space for API-only cost facts."""
-    return sum(126 + max(0, len(note.get("lines", [])) - 2) * 18 for note in notes)
+def _cost_note_lines(note: dict[str, Any]) -> list[str]:
+    """Return the labelled cost lines when a note uses the two-column shape."""
+    lines = [line for line in note.get("lines", []) if line.startswith(_COST_LINE_PREFIXES)]
+    # The Claude API estimate is the only note that renders as columns: two
+    # labelled lines each carrying a "value · detail" pair.
+    if len(lines) >= 2 and all(" · " in line for line in lines[:2]):
+        return lines
+    return []
+
+
+def _wrap_note_line(
+    draw: ImageDraw.ImageDraw,
+    value: str,
+    font: ImageFont.ImageFont,
+    width: int,
+    remaining: int,
+) -> list[str]:
+    """Wrap one note line to ``width`` pixels over at most ``remaining`` lines."""
+    words = value.split()
+    if not words:
+        return []
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if current and _measure(draw, candidate, font)[0] > width:
+            lines.append(current)
+            current = word
+            if len(lines) >= remaining:
+                break
+        else:
+            current = candidate
+    if len(lines) < remaining and current:
+        lines.append(current)
+    if not lines:
+        return []
+    # Anything that did not fit is folded into an explicit ellipsis so a
+    # truncated note never looks complete.
+    consumed = " ".join(lines).split()
+    if len(consumed) < len(words):
+        lines[-1] = _fit(f"{lines[-1]} …", draw, font, width)
+    return [_fit(line, draw, font, width) for line in lines[:remaining]]
+
+
+def _note_visual_lines(
+    draw: ImageDraw.ImageDraw,
+    note: dict[str, Any],
+    font: ImageFont.ImageFont,
+    width: int,
+    limit: int = NOTE_VISUAL_LINE_LIMIT,
+) -> list[str]:
+    """Flatten a note's logical lines into the bounded visual lines to draw."""
+    visual: list[str] = []
+    for raw_line in note.get("lines", []):
+        remaining = limit - len(visual)
+        if remaining <= 0:
+            break
+        visual.extend(_wrap_note_line(draw, raw_line, font, width, remaining))
+    return visual[:limit]
+
+
+def _note_text_height(line_count: int) -> int:
+    count = max(1, int(line_count))
+    return NOTE_CONTENT_TOP + (count - 1) * NOTE_LINE_HEIGHT + NOTE_TEXT_HEIGHT + NOTE_BOTTOM_PAD
+
+
+def _note_stack_height(entries: list[dict[str, Any]]) -> int:
+    if not entries:
+        return 0
+    return sum(entry["height"] for entry in entries) + NOTE_STRIDE_GAP * (len(entries) - 1)
+
+
+def _rail_notes_layout(
+    draw: ImageDraw.ImageDraw,
+    notes: list[dict[str, Any]],
+    x1: int,
+    x2: int,
+    top: int,
+    bottom: int,
+    max_height: int | None = None,
+) -> dict[str, Any]:
+    """Lay out rail notes in a bounded band without touching the limit rows.
+
+    Returns ``{"height": int, "entries": [...]}`` where each entry carries the
+    note, its rendered lines, and an absolute ``y`` position.  Cost notes keep
+    their existing fixed geometry; every other note renders as bounded
+    multiline text.
+    """
+    width = max(40, (x2 - 24) - (x1 + 38))
+    budget = max(0, int(bottom - top))
+    if max_height is not None:
+        budget = max(0, min(budget, int(max_height)))
+    entries: list[dict[str, Any]] = []
+    font = _font(16)
+    for note in notes[:RAIL_NOTES_MAX]:
+        if _cost_note_lines(note):
+            entries.append({"note": note, "kind": "cost", "lines": [], "height": NOTE_COST_HEIGHT})
+            continue
+        visual = _note_visual_lines(draw, note, font, width)
+        entries.append({
+            "note": note,
+            "kind": "text",
+            "lines": visual,
+            "height": _note_text_height(len(visual)),
+        })
+
+    # Shrink from the bottom until the stack fits: drop trailing visual lines
+    # first, then whole notes.  Bounded input can never overflow the panel.
+    while entries and _note_stack_height(entries) > budget:
+        trimmable = [entry for entry in entries if entry["kind"] == "text" and len(entry["lines"]) > 1]
+        if trimmable:
+            victim = max(trimmable, key=lambda entry: len(entry["lines"]))
+            victim["lines"] = victim["lines"][:-1]
+            victim["lines"][-1] = _fit(f"{victim['lines'][-1]} …", draw, font, width)
+            victim["height"] = _note_text_height(len(victim["lines"]))
+            continue
+        entries.pop()
+
+    total = _note_stack_height(entries)
+    y = max(top, bottom - total)
+    for entry in entries:
+        entry["y"] = y
+        y += entry["height"] + NOTE_STRIDE_GAP
+    return {"height": total, "entries": entries}
 
 
 def _draw_rail(draw: ImageDraw.ImageDraw, normalized: dict[str, Any], box: tuple[int, int, int, int]) -> None:
     x1, y1, x2, y2 = box
     cards = normalized["cards"]
-    notes = normalized.get("notes", [])
     rounded_rectangle(draw, box, 24, RAIL)
     draw.text((x1 + 34, y1 + 38), "NOW", font=_font(16, True), fill=RAIL_MUTED)
     draw.text((x1 + 34, y1 + 70), "Current limits", font=_font(30, True), fill="#f8fafc")
     subtitle = _availability_summary(cards)
     draw.text((x1 + 34, y1 + 114), subtitle, font=_font(17), fill=RAIL_MUTED)
+    geometry = _rail_geometry(draw, normalized, box)
+    content_y = geometry["content_y"]
+    notes_layout = geometry["notes"]
     if not cards:
-        draw.text((x1 + 34, y1 + 166), "No current limits", font=_font(20), fill=RAIL_MUTED)
-        _draw_rail_notes(draw, notes, x1, y2 - 28, x2)
+        draw.text((x1 + 34, content_y), "No current limits", font=_font(20), fill=RAIL_MUTED)
+        _draw_rail_notes(draw, notes_layout, x1, x2)
         return
 
-    content_y = y1 + 166
-    note_height = _rail_notes_height(notes)
-    content_height = y2 - content_y - 28 - note_height - (16 if notes else 0)
-    groups = _rail_groups(cards)
-    if any(len(group) > 1 for group in groups):
-        row_height = max(82, min(142, content_height // len(groups)))
+    visible = geometry["visible"]
+    row_height = geometry["row_height"]
+    overflow = geometry["overflow"]
+    if geometry["grouped"]:
+        groups = geometry["groups"][:visible]
         small = _font(13)
         name_font = _font(18, True)
         value_font = _font(max(24, min(34, row_height - 66)), False)
@@ -882,15 +1037,15 @@ def _draw_rail(draw: ImageDraw.ImageDraw, normalized: dict[str, Any], box: tuple
                     rounded_rectangle(draw, (bar[0], bar[1], bar[0] + fill_width, bar[3]), 5, card["color"])
                 reset_text = f"reset {card['reset']}" if card["reset"] else (card["reason"] or "reset unavailable")
                 draw.text((tile_x, bar_y + 13), _fit(reset_text, draw, small, tile_width), font=small, fill=RAIL_MUTED)
-        _draw_rail_notes(draw, notes, x1, y2 - 28, x2)
+        _draw_rail_overflow(draw, x1, content_y, visible, row_height, overflow, small)
+        _draw_rail_notes(draw, notes_layout, x1, x2)
         return
 
-    row_height = max(48, min(142, content_height // len(cards)))
     small = _font(15)
     name_font = _font(18, True)
     value_font = _font(max(25, min(42, row_height - 25)), False)
     compact = row_height < 79
-    for index, card in enumerate(cards):
+    for index, card in enumerate(cards[:visible]):
         row_y = content_y + index * row_height
         if index:
             draw.line((x1 + 34, row_y - 11, x2 - 34, row_y - 11), fill="#39424c", width=2)
@@ -926,33 +1081,123 @@ def _draw_rail(draw: ImageDraw.ImageDraw, normalized: dict[str, Any], box: tuple
             # makes a sparse multi-account rail collide with the next title.
             reset_y = bar_y + 18
             draw.text((x1 + 34, reset_y), _fit(reset_text, draw, small, x2 - x1 - 68), font=small, fill=RAIL_MUTED)
-    _draw_rail_notes(draw, notes, x1, y2 - 28, x2)
+    _draw_rail_overflow(draw, x1, content_y, visible, row_height, overflow, small)
+    _draw_rail_notes(draw, notes_layout, x1, x2)
 
 
-def _draw_rail_notes(draw: ImageDraw.ImageDraw, notes: list[dict[str, Any]], x1: int, bottom: int, x2: int) -> None:
-    """Draw a dedicated API-cost section, separate from rate-limit cards."""
-    if not notes:
+def _bounded_rows(
+    count: int,
+    available: int,
+    min_row: int,
+    max_row: int,
+    overflow_height: int,
+) -> tuple[int, int, int]:
+    """Fit ``count`` rows into ``available`` pixels, returning the visible count.
+
+    ``row_height`` is derived from the available height, then the visible count
+    is reduced (reserving space for the overflow marker) until the painted block
+    fits.  This deterministic policy keeps a long card list from running into
+    the note band below it.
+    """
+    if count <= 0 or available <= 0:
+        return 0, max_row, max(0, count)
+    row_height = max(min_row, min(max_row, available // count))
+    visible = count
+    while visible >= 1:
+        reserve = overflow_height if visible < count else 0
+        if visible * row_height + RAIL_ROW_PAD <= available - reserve:
+            break
+        visible -= 1
+    return visible, row_height, count - visible
+
+
+def _rail_geometry(draw: ImageDraw.ImageDraw, normalized: dict[str, Any], box: tuple[int, int, int, int]) -> dict[str, Any]:
+    """Compute the rail card/note geometry without drawing anything."""
+    x1, y1, x2, y2 = box
+    cards = normalized["cards"]
+    notes = normalized.get("notes", [])
+    content_y = y1 + 166
+    notes_bottom = y2 - 28
+    notes_budget = max(0, min(notes_bottom - RAIL_NOTES_TOP, notes_bottom - content_y - RAIL_NOTES_MIN_CONTENT))
+    notes_layout = _rail_notes_layout(draw, notes, x1, x2, RAIL_NOTES_TOP, notes_bottom, notes_budget)
+    entries = notes_layout["entries"]
+    notes_top = entries[0]["y"] if entries else notes_bottom
+    cards_bottom_limit = notes_top - (RAIL_NOTES_GAP if entries else 0)
+    available = max(0, cards_bottom_limit - content_y)
+    groups = _rail_groups(cards)
+    grouped = any(len(group) > 1 for group in groups)
+    if grouped:
+        visible, row_height, overflow = _bounded_rows(
+            len(groups), available, RAIL_ROW_MIN_GROUP, RAIL_ROW_MAX, RAIL_CARD_OVERFLOW_HEIGHT
+        )
+    else:
+        visible, row_height, overflow = _bounded_rows(
+            len(cards), available, RAIL_ROW_MIN_SINGLE, RAIL_ROW_MAX, RAIL_CARD_OVERFLOW_HEIGHT
+        )
+    card_bottom = content_y + (visible * row_height + RAIL_ROW_PAD if visible else 0)
+    return {
+        "content_y": content_y,
+        "notes_bottom": notes_bottom,
+        "notes": notes_layout,
+        "notes_top": notes_top,
+        "available": available,
+        "groups": groups,
+        "grouped": grouped,
+        "visible": visible,
+        "row_height": row_height,
+        "overflow": overflow,
+        "card_bottom": card_bottom,
+    }
+
+
+def _draw_rail_overflow(
+    draw: ImageDraw.ImageDraw,
+    x1: int,
+    content_y: int,
+    visible: int,
+    row_height: int,
+    overflow: int,
+    font: ImageFont.ImageFont,
+) -> None:
+    """Draw a bounded marker for card rows that could not fit in the rail."""
+    if overflow <= 0:
         return
-    height = _rail_notes_height(notes)
-    y = max(300, bottom - height)
-    for note in notes:
-        rounded_rectangle(draw, (x1 + 24, y, x2 - 24, y + 116), 12, "#2c353f")
-        draw.text((x1 + 38, y + 13), "API USAGE", font=_font(12, True), fill="#b9c3ce")
-        draw.text((x1 + 38, y + 31), _fit(note["title"], draw, _font(16, True), x2 - x1 - 76), font=_font(16, True), fill="#f8fafc")
-        usage_lines = [line for line in note["lines"] if line.startswith(("Today", "This month"))]
-        if len(usage_lines) >= 2:
-            for index, line in enumerate(usage_lines[:2]):
+    y = content_y + (visible * row_height + 6 if visible else 0)
+    draw.text((x1 + 34, y), f"+{overflow} more limits not shown", font=font, fill=RAIL_MUTED)
+
+
+def _draw_rail_notes(draw: ImageDraw.ImageDraw, layout: dict[str, Any], x1: int, x2: int) -> None:
+    """Draw a dedicated API section, separate from the rate-limit cards."""
+    entries = layout.get("entries") or []
+    if not entries:
+        return
+    width = max(40, (x2 - 24) - (x1 + 38))
+    for entry in entries:
+        note = entry["note"]
+        y = entry["y"]
+        height = entry["height"]
+        rounded_rectangle(draw, (x1 + 24, y, x2 - 24, y + height), 12, "#2c353f")
+        tag = _fit(note.get("tag") or NOTE_TAG_DEFAULT, draw, _font(12, True), width)
+        draw.text((x1 + 38, y + NOTE_TAG_TOP), tag, font=_font(12, True), fill="#b9c3ce")
+        draw.text((x1 + 38, y + NOTE_TITLE_TOP), _fit(note["title"], draw, _font(16, True), width), font=_font(16, True), fill="#f8fafc")
+        if entry["kind"] == "cost":
+            for index, line in enumerate(_cost_note_lines(note)[:2]):
                 label = "Today" if line.startswith("Today") else "This month"
                 value = line[len(label):].strip()
                 cost, _, requests = value.partition(" · ")
                 column_x = x1 + 38 + index * ((x2 - x1 - 76) // 2)
-                draw.text((column_x, y + 56), label.upper(), font=_font(11, True), fill=RAIL_MUTED)
+                draw.text((column_x, y + NOTE_CONTENT_TOP), label.upper(), font=_font(11, True), fill=RAIL_MUTED)
                 draw.text((column_x, y + 70), _fit(cost, draw, _font(22, True), (x2 - x1 - 84) // 2), font=_font(22, True), fill="#f8fafc")
                 draw.text((column_x, y + 97), _fit(requests, draw, _font(11), (x2 - x1 - 84) // 2), font=_font(11), fill=RAIL_MUTED)
-        else:
-            line = note["lines"][0] if note["lines"] else "Local usage unavailable"
-            draw.text((x1 + 38, y + 62), _fit(line, draw, _font(16), x2 - x1 - 76), font=_font(16), fill=RAIL_MUTED)
-        y += 126
+            continue
+        lines = entry["lines"] or ["Local usage unavailable"]
+        for index, line in enumerate(lines):
+            draw.text(
+                (x1 + 38, y + NOTE_CONTENT_TOP + index * NOTE_LINE_HEIGHT),
+                line,
+                font=_font(16),
+                fill="#f8fafc" if index == 0 else "#c7d1dc",
+            )
 
 
 def render_dashboard(data: dict[str, Any], output: str | Path) -> Path:

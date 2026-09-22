@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import stat
 import select
 import subprocess
@@ -15,11 +16,12 @@ import sys
 import tempfile
 import time
 import sqlite3
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -31,6 +33,25 @@ HISTORY_RETENTION_DAYS = 365
 HISTORY_WARNING_BYTES = 5 * 1024 * 1024 * 1024
 HISTORY_WARNING_INTERVAL = timedelta(hours=24)
 RENDERER_PATH = SCRIPT_DIR / "usage-dashboard-renderer.py"
+DEEPSEEK_USAGE_MODULE_PATH = SCRIPT_DIR / "deepseek-local-usage.py"
+DEEPSEEK_MARKER_NAME = "ccdm-deepseek.json"
+DEEPSEEK_MARKER = {"version": 1, "provider": "deepseek"}
+DEEPSEEK_KEY_NAME = "api-key"
+DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_BALANCE_ENDPOINT = "/user/balance"
+DEEPSEEK_MARKER_MAX_BYTES = 4 * 1024
+DEEPSEEK_KEY_MAX_BYTES = 4 * 1024
+DEEPSEEK_RESPONSE_MAX_BYTES = 64 * 1024
+DEEPSEEK_COVERAGE_NOTE = (
+    "Coverage: local Codex sessions only; the API exposes no account spend or quota"
+)
+# DeepSeek returns decimal money as strings.  Accept only bounded, plain
+# non-negative decimals so no float rounding or exponent parsing is involved.
+DEEPSEEK_AMOUNT_PATTERN = re.compile(r"^\d{1,24}(?:\.\d{1,8})?$")
+# DeepSeek documents exactly these currency values in the balance schema, so a
+# balance row in any other currency is treated as malformed rather than shown.
+DEEPSEEK_CURRENCIES = ("CNY", "USD")
+DEEPSEEK_KEY_PATTERN = re.compile(r"^sk-[A-Za-z0-9_-]+$")
 HISTORY_SCHEMA_VERSION = 1
 CLAUDE_PRICES = {
     "claude-haiku-4-5": (1.0, 5.0),
@@ -397,6 +418,44 @@ def _parse_url(value, field):
     return value.rstrip("/")
 
 
+def _parse_loopback_base_url(value, field):
+    """Accept only a literal loopback ``http://`` override for local tests.
+
+    The official DeepSeek endpoint is HTTPS; the only supported override is a
+    plain HTTP loopback origin so local-fake tests never send the private API
+    key to a real host or through a redirect.  ``urlparse`` itself can raise
+    ``ValueError`` for a malformed bracketed host, so parsing is wrapped to
+    surface a safe ``PosterError`` instead of a traceback.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise PosterError(f"{field} must be a non-empty URL")
+    try:
+        parsed = urlparse(value.strip())
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except ValueError:
+        raise PosterError(f"{field} override must be a literal loopback http:// URL") from None
+    if (
+        parsed.scheme != "http"
+        or host not in {"127.0.0.1", "::1", "localhost"}
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in ("", "/")
+    ):
+        raise PosterError(f"{field} override must be a literal loopback http:// URL")
+    if port is None:
+        raise PosterError(f"{field} override must include an explicit loopback port")
+    if not 0 <= port <= 65535:
+        raise PosterError(f"{field} override must use a port between 0 and 65535")
+    # IPv6 literals must keep their brackets when rebuilt into a URL.
+    host_text = f"[{host}]" if ":" in host else host
+    return f"http://{host_text}:{port}"
+
+
 def parse_config(raw):
     if not isinstance(raw, dict):
         raise PosterError("poster config must contain a JSON object")
@@ -426,6 +485,11 @@ def parse_config(raw):
     if discord_base_url is None:
         discord_base_url = os.environ.get("CCDM_DISCORD_BASE_URL") or os.environ.get("DISCORD_BASE_URL")
 
+    deepseek_base_url = raw.get("deepseek_base_url")
+    if deepseek_base_url is None:
+        deepseek_base_url = os.environ.get("CCDM_DEEPSEEK_BASE_URL")
+    deepseek_base_url = _parse_loopback_base_url(deepseek_base_url, "deepseek_base_url") or DEEPSEEK_DEFAULT_BASE_URL
+
     history_value = raw.get(
         "history_db_path",
         raw.get("history_path", raw.get("usage_history_path", raw.get("usage_history_db"))),
@@ -449,6 +513,7 @@ def parse_config(raw):
         or "https://api.anthropic.com",
         "discord_base_url": _parse_url(discord_base_url, "discord_base_url")
         or "https://discord.com",
+        "deepseek_base_url": deepseek_base_url,
         "claude_api_accounts": normalized_accounts,
         "history_db_path": history_db_path,
     }
@@ -853,6 +918,13 @@ def get_codex_home_stats(codex_home, label):
     """Read one configured Codex Home, degrading safely to recent session data."""
     if codex_home is None or not codex_home.is_dir() or not os.access(codex_home, os.R_OK | os.X_OK):
         return f"**{label}**\n*Codex Home unavailable*"
+    if is_deepseek_home(codex_home):
+        # DeepSeek reporting bypasses the subscription rate-limit request: the
+        # home reports its real account-wide API balance plus this machine's
+        # local token totals through the same display helper as the dashboard.
+        # A DeepSeek-backed root Codex session still runs through the Codex
+        # app-server; only this rate-limit query is skipped.
+        return _deepseek_home_report(codex_home, label)
     live = read_codex_rate_limits(codex_home)
     if isinstance(live, dict):
         return format_codex_rate_limits(live, label)
@@ -875,13 +947,24 @@ def get_codex_home_stats(codex_home, label):
 
 
 def get_codex_stats(registry):
-    accounts = discover_codex_accounts(registry)
-    if not accounts:
+    """Return the legacy text report through the shared metrics helpers.
+
+    Routing through ``collect_codex_metrics`` keeps this legacy surface equal
+    to the scheduled dashboard path, so a DeepSeek home reports its real
+    account-wide balance instead of a placeholder note, while still issuing one
+    balance request per distinct DeepSeek key.
+    """
+    metrics = collect_codex_metrics(registry)
+    if not metrics:
         return None
-    value = "\n\n".join(get_codex_home_stats(account["home"], account["label"]) for account in accounts)
+    value = "\n\n".join(
+        metric["text"]
+        for metric in metrics
+        if isinstance(metric.get("text"), str) and metric["text"]
+    )
     if len(value) > 1024:
         value = value[:1000].rstrip() + "\n*truncated*"
-    return value
+    return value or None
 
 
 def get_claude_stats(config):
@@ -1115,12 +1198,450 @@ def _metric_from_codex_rate_limits(rate_limits, label, source="live", source_ts=
     return metric
 
 
-def collect_codex_metrics(registry):
-    """Return structured current Codex metrics without retaining source paths."""
+def _read_bounded_regular_text(path, limit, *, private=False):
+    """Read a bounded regular, non-symlink file, or return ``None``.
+
+    ``O_NONBLOCK`` is set so opening a FIFO cannot block before ``fstat`` gets
+    a chance to reject it, and ``O_CLOEXEC`` keeps the descriptor out of any
+    child process.  ``O_NOFOLLOW`` plus ``fstat`` on the open descriptor closes
+    the symlink-swap window between check and read.  ``private`` additionally
+    requires a current-owner, owner-only credential file so it cannot be group
+    or world readable.
+    """
+    flags = os.O_RDONLY
+    for name in ("O_NONBLOCK", "O_CLOEXEC", "O_NOFOLLOW"):
+        flags |= getattr(os, name, 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        if private:
+            if info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+                return None
+            get_owner = getattr(os, "geteuid", None)
+            if get_owner is not None and info.st_uid != get_owner():
+                return None
+        if info.st_size > limit:
+            return None
+        chunks = []
+        remaining = limit + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+    if len(data) > limit:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def is_deepseek_home(home):
+    """Return True only for a home carrying the exact DeepSeek setup marker.
+
+    The marker is the sole autodiscovery signal.  An absent or unrecognised
+    marker leaves the home on the existing ordinary Codex path.
+    """
+    if not isinstance(home, Path):
+        return False
+    try:
+        if not home.is_dir():
+            return False
+    except OSError:
+        return False
+    text = _read_bounded_regular_text(home / DEEPSEEK_MARKER_NAME, DEEPSEEK_MARKER_MAX_BYTES)
+    if text is None:
+        return False
+    try:
+        marker = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return marker == DEEPSEEK_MARKER
+
+
+def read_deepseek_key(home):
+    """Return a validated private API key from a DeepSeek home, else ``None``.
+
+    The key is used in-memory only for the balance request; it is never
+    returned to the history writer, logs, or the rendered dashboard.
+    """
+    if not isinstance(home, Path):
+        return None
+    text = _read_bounded_regular_text(home / DEEPSEEK_KEY_NAME, DEEPSEEK_KEY_MAX_BYTES, private=True)
+    if text is None:
+        return None
+    key = text.strip()
+    if not DEEPSEEK_KEY_PATTERN.fullmatch(key):
+        return None
+    return key
+
+
+def _deepseek_account_groups(accounts):
+    """Group configured DeepSeek homes by their private key digest (memory-only)."""
+    groups = []
+    by_digest = {}
+    for account in accounts:
+        home = account.get("home")
+        label = _safe_label(account.get("label"), "DeepSeek")
+        if not is_deepseek_home(home):
+            continue
+        key = read_deepseek_key(home)
+        if key is None:
+            # Unreadable credentials stay distinct; never guess they match
+            # another home, and never expose the reason's source path.
+            groups.append({
+                "label": label,
+                "aliases": [label],
+                "homes": [home],
+                "key": None,
+                "digest": None,
+            })
+            continue
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        group = by_digest.get(digest)
+        if group is None:
+            group = {"label": label, "aliases": [label], "homes": [home], "key": key, "digest": digest}
+            by_digest[digest] = group
+            groups.append(group)
+            continue
+        group["homes"].append(home)
+        if label not in group["aliases"]:
+            group["aliases"].append(label)
+
+    for group in groups:
+        aliases = sorted(group["aliases"])
+        if not aliases:
+            group["label"] = "DeepSeek"
+        elif len(aliases) == 1:
+            group["label"] = aliases[0]
+        elif len(aliases) <= 3:
+            group["label"] = " + ".join(aliases) + " (shared key)"
+        else:
+            group["label"] = f"{aliases[0]} +{len(aliases) - 1} more (shared key)"
+    return groups
+
+
+def _format_deepseek_amount(value):
+    """Return a bounded decimal money string, or ``None`` when malformed."""
+    if not isinstance(value, str) or not DEEPSEEK_AMOUNT_PATTERN.match(value.strip()):
+        return None
+    try:
+        number = Decimal(value.strip())
+    except (InvalidOperation, ValueError):
+        return None
+    if not number.is_finite() or number < 0:
+        return None
+    text = format(number, "f")
+    return text if len(text) <= 40 else None
+
+
+def parse_deepseek_balance(payload):
+    """Return sanitized balance data or raise ``PosterError`` for malformed input.
+
+    Every documented field is required.  ``currency`` must be one of DeepSeek's
+    documented values and may appear at most once per response; a missing or
+    malformed ``total_balance``, ``granted_balance``, or ``topped_up_balance``
+    fails the whole response instead of degrading one field to ``None``.  The
+    decimal strings are preserved exactly, so ``0.00`` never becomes ``0``.
+    """
+    if not isinstance(payload, dict):
+        raise PosterError("DeepSeek balance response was malformed")
+    is_available = payload.get("is_available")
+    if not isinstance(is_available, bool):
+        raise PosterError("DeepSeek balance response was malformed")
+    entries = payload.get("balance_infos")
+    if not isinstance(entries, list) or not entries:
+        raise PosterError("DeepSeek balance response was malformed")
+    sanitized = []
+    seen_currencies = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise PosterError("DeepSeek balance response was malformed")
+        currency = entry.get("currency")
+        if not isinstance(currency, str) or currency.strip() not in DEEPSEEK_CURRENCIES:
+            raise PosterError("DeepSeek balance response was malformed")
+        currency = currency.strip()
+        if currency in seen_currencies:
+            # A duplicated currency row cannot be shown as one truthful balance.
+            raise PosterError("DeepSeek balance response was malformed")
+        seen_currencies.add(currency)
+        total = _format_deepseek_amount(entry.get("total_balance"))
+        granted = _format_deepseek_amount(entry.get("granted_balance"))
+        topped_up = _format_deepseek_amount(entry.get("topped_up_balance"))
+        if total is None or granted is None or topped_up is None:
+            raise PosterError("DeepSeek balance response was malformed")
+        sanitized.append({
+            "currency": currency,
+            "total": total,
+            "granted": granted,
+            "topped_up": topped_up,
+        })
+    return {"is_available": is_available, "entries": sanitized}
+
+
+class _DeepSeekNoRedirect(HTTPRedirectHandler):
+    """Refuse redirects so a private API key is never forwarded elsewhere."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        return None
+
+
+def _deepseek_opener():
+    return build_opener(_DeepSeekNoRedirect)
+
+
+def _deepseek_request_origin(base_url):
+    """Return the validated origin the balance request may be sent to.
+
+    Only the fixed official DeepSeek origin and a literal loopback test origin
+    accepted by ``_parse_loopback_base_url`` are allowed.  This re-checks the
+    boundary at the request site, so a private API key can never be sent to an
+    arbitrary remote host or to a URL with embedded credentials, and the
+    redirect handler above still refuses to forward it elsewhere.  No generic
+    remote override exists.
+    """
+    if not isinstance(base_url, str) or not base_url.strip():
+        raise PosterError("DeepSeek balance endpoint was not a supported origin")
+    candidate = base_url.strip().rstrip("/")
+    if candidate == DEEPSEEK_DEFAULT_BASE_URL:
+        return DEEPSEEK_DEFAULT_BASE_URL
+    loopback = _parse_loopback_base_url(candidate, "deepseek_base_url")
+    if loopback is None:
+        raise PosterError("DeepSeek balance endpoint was not a supported origin")
+    return loopback
+
+
+def fetch_deepseek_balance(key, base_url, opener=None, timeout=10):
+    """Fetch and validate the account-wide balance for one private key.
+
+    ``base_url`` is re-validated here against the fixed official origin and the
+    literal loopback test origin, so this helper can never be pointed at an
+    unrelated remote host or a credentials-bearing URL.
+    """
+    origin = _deepseek_request_origin(base_url)
+    request = Request(
+        f"{origin}{DEEPSEEK_BALANCE_ENDPOINT}",
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+            "User-Agent": "ccdm-usage-stats-poster/1.0",
+        },
+        method="GET",
+    )
+    client = opener or _deepseek_opener()
+    try:
+        with client.open(request, timeout=timeout) as response:
+            status = getattr(response, "status", None) or response.getcode()
+            if not 200 <= status < 300:
+                raise PosterHTTPError("DeepSeek balance", status)
+            raw = response.read(DEEPSEEK_RESPONSE_MAX_BYTES + 1)
+    except HTTPError as error:
+        # The response body may echo credentials; only the status is surfaced.
+        raise PosterHTTPError("DeepSeek balance", error.code) from None
+    except (URLError, TimeoutError, OSError):
+        raise PosterError("DeepSeek balance request failed; check the endpoint and try again") from None
+    if len(raw) > DEEPSEEK_RESPONSE_MAX_BYTES:
+        raise PosterError("DeepSeek balance response was too large")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        raise PosterError("DeepSeek balance response was malformed") from None
+    return parse_deepseek_balance(payload)
+
+
+_DEEPSEEK_USAGE_UNSET = object()
+
+
+def load_deepseek_usage_module(path=None):
+    """Import the sibling local-usage module relative to this script."""
+    target = Path(path) if path is not None else DEEPSEEK_USAGE_MODULE_PATH
+    try:
+        if not target.is_file() or target.is_symlink():
+            return None
+    except OSError:
+        return None
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("ccdm_deepseek_local_usage", target)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except (ImportError, OSError, ValueError, TypeError, SystemExit):
+        return None
+
+
+def _sanitize_local_usage(result):
+    """Reduce B's contract to bounded, path-free, JSON-safe display fields."""
+    unavailable = {"status": "unavailable", "reason": "Local DeepSeek usage unavailable"}
+    if not isinstance(result, dict) or result.get("status") not in {"available", "unavailable"}:
+        return unavailable
+    if result.get("status") == "unavailable":
+        return {"status": "unavailable", "reason": _safe_label(result.get("reason"), "Local DeepSeek usage unavailable")}
+    period = result.get("period")
+    if not isinstance(period, str) or not re.fullmatch(r"\d{4}-\d{2}", period):
+        return {"status": "unavailable", "reason": "Local DeepSeek usage data was malformed"}
+    counters = {}
+    for name in ("input_tokens", "cached_input_tokens", "output_tokens",
+                 "reasoning_output_tokens", "total_tokens", "sessions"):
+        value = result.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return {"status": "unavailable", "reason": "Local DeepSeek usage data was malformed"}
+        counters[name] = value
+    return {
+        "status": "available",
+        "period": period,
+        "partial": result.get("partial") is True,
+        **counters,
+    }
+
+
+def collect_deepseek_local_usage(module, homes, now):
+    """Call the agreed sibling API ``collect_month_usage(homes, now)``."""
+    collector = getattr(module, "collect_month_usage", None) if module is not None else None
+    if not callable(collector):
+        return {"status": "unavailable", "reason": "Local DeepSeek usage collector unavailable"}
+    try:
+        result = collector(list(homes), now)
+    except Exception:  # noqa: BLE001 - never let a collector crash the poster
+        return {"status": "unavailable", "reason": "Local DeepSeek usage collection failed"}
+    return _sanitize_local_usage(result)
+
+
+def _deepseek_display(label, balance, usage):
+    """Return (note_lines, text_lines) for one DeepSeek key group.
+
+    The balance is always labelled account-wide, and the text report exposes
+    the documented paid/granted breakdown.  The dashboard note keeps only the
+    totals so it stays inside the renderer's four-logical-line budget.  Local
+    monthly totals stay labelled local, and no spend or quota percentage is
+    derived from the balances.
+    """
+    if isinstance(balance, dict) and balance.get("status") == "available":
+        totals = " · ".join(f"{entry['total']} {entry['currency']}" for entry in balance["entries"])
+        breakdown = " · ".join(
+            f"**{entry['total']} {entry['currency']}** (paid {entry['topped_up']} · granted {entry['granted']})"
+            for entry in balance["entries"]
+        )
+        balance_note = f"Account-wide balance {totals}"
+        balance_text = f"Account-wide balance: {breakdown}"
+        if balance.get("is_available") is False:
+            balance_note += " · insufficient for API calls"
+            balance_text += " · *insufficient for API calls*"
+    else:
+        reason = _safe_label(balance.get("reason") if isinstance(balance, dict) else None, "not reported")
+        balance_note = f"Account-wide balance unavailable ({reason})"
+        balance_text = f"Account-wide balance: *unavailable ({reason})*"
+
+    if isinstance(usage, dict) and usage.get("status") == "available":
+        sessions = usage["sessions"]
+        spend_note = (
+            f"Local Codex {usage['period']}: {fmt_tokens(usage['total_tokens'])} tokens · "
+            f"{sessions} session{'s' if sessions != 1 else ''}{' · partial' if usage.get('partial') else ''}"
+        )
+        spend_text = spend_note
+    else:
+        reason = _safe_label(usage.get("reason") if isinstance(usage, dict) else None, "not reported")
+        spend_note = f"Local Codex usage unavailable ({reason})"
+        spend_text = f"Local usage: *unavailable ({reason})*"
+
+    return [balance_note, spend_note, DEEPSEEK_COVERAGE_NOTE], [balance_text, spend_text, DEEPSEEK_COVERAGE_NOTE]
+
+
+def _deepseek_balance_state(key, base_url, fetcher):
+    """Return the display-only balance state for one private key.
+
+    Shared by the grouped dashboard path and the single-home legacy text path
+    so both surfaces report the same real balance and the same bounded
+    unavailable reasons.  Never raises to the caller.
+    """
+    if key is None:
+        return {"status": "unavailable", "reason": "DeepSeek API key unavailable"}
+    try:
+        return {"status": "available", **fetcher(key, base_url)}
+    except PosterHTTPError as error:
+        return {"status": "unavailable", "reason": f"DeepSeek balance unavailable (HTTP {error.status})"}
+    except PosterError:
+        return {"status": "unavailable", "reason": "DeepSeek balance unavailable"}
+
+
+def collect_deepseek_metrics(config, registry, now=None, usage_module=_DEEPSEEK_USAGE_UNSET, balance_fetcher=None):
+    """Return display-only DeepSeek balance notes without quota/history cards.
+
+    One balance request is issued per distinct private key per run; homes that
+    share a key are grouped because the key proves a shared credential, while
+    distinct keys stay distinct because no account identifier is available.
+    """
+    config = config if isinstance(config, dict) else {}
+    now = now or datetime.now(timezone.utc)
+    base_url = config.get("deepseek_base_url") or DEEPSEEK_DEFAULT_BASE_URL
+    if usage_module is _DEEPSEEK_USAGE_UNSET:
+        usage_module = load_deepseek_usage_module()
+    fetcher = balance_fetcher or fetch_deepseek_balance
+    metrics = []
+    for group in _deepseek_account_groups(discover_codex_accounts(registry)):
+        label = group["label"]
+        usage = collect_deepseek_local_usage(usage_module, group["homes"], now)
+        balance = _deepseek_balance_state(group.get("key"), base_url, fetcher)
+        note_lines, text_lines = _deepseek_display(label, balance, usage)
+        metrics.append({
+            "provider": "codex",
+            "account": label,
+            "limits": [],
+            "source": "deepseek",
+            "dashboard_note": {"title": f"{label} · DeepSeek", "lines": note_lines},
+            "text": "\n".join([f"**{label}** (DeepSeek)"] + text_lines),
+            "status": "available" if balance.get("status") == "available" else "unavailable",
+            "reason": None if balance.get("status") == "available" else balance.get("reason"),
+        })
+    return metrics
+
+
+def _deepseek_home_report(home, label, now=None, usage_module=_DEEPSEEK_USAGE_UNSET, balance_fetcher=None):
+    """Return the real text report for one DeepSeek home (legacy text path).
+
+    Uses the same display helper and balance state as the grouped dashboard
+    path, so a legacy caller sees the account-wide balance, the paid/granted
+    breakdown, and the local token totals instead of a placeholder note.
+    """
+    now = now or datetime.now(timezone.utc)
+    if usage_module is _DEEPSEEK_USAGE_UNSET:
+        usage_module = load_deepseek_usage_module()
+    fetcher = balance_fetcher or fetch_deepseek_balance
+    balance = _deepseek_balance_state(read_deepseek_key(home), DEEPSEEK_DEFAULT_BASE_URL, fetcher)
+    usage = collect_deepseek_local_usage(usage_module, [home], now)
+    _, text_lines = _deepseek_display(label, balance, usage)
+    return "\n".join([f"**{label}** (DeepSeek)"] + text_lines)
+
+
+def collect_codex_metrics(registry, config=None, now=None, deepseek_usage=_DEEPSEEK_USAGE_UNSET, deepseek_balance=None):
+    """Return structured current Codex metrics without retaining source paths.
+
+    DeepSeek homes bypass the subscription rate-limit request: their live
+    balance comes from the DeepSeek HTTP API and their local totals from the
+    sibling collector, so no Codex rate-limit websocket/stdio call is made for
+    them.  A DeepSeek-backed root Codex session still runs through the Codex
+    app-server; only this rate-limit query is skipped.
+    """
     metrics = []
     for account in discover_codex_accounts(registry):
         home = account["home"]
         label = account["label"]
+        if is_deepseek_home(home):
+            continue
         if home is None or not home.is_dir() or not os.access(home, os.R_OK | os.X_OK):
             metrics.append({
                 "provider": "codex", "account": label, "limits": [{
@@ -1154,7 +1675,13 @@ def collect_codex_metrics(registry):
                 "status": "unavailable", "reason": "No recent usage data",
             }], "text": "\n".join(text),
         })
-    return metrics
+    return metrics + collect_deepseek_metrics(
+        config,
+        registry,
+        now=now,
+        usage_module=deepseek_usage,
+        balance_fetcher=deepseek_balance,
+    )
 
 
 def _usage_report_values(claude_metrics, codex_metrics):
@@ -1812,14 +2339,14 @@ def main(argv=None):
         # never prevent an operator from posting the existing JSON embed.
         if not scheduled:
             claude_metrics = collect_claude_metrics(config)
-            codex_metrics = collect_codex_metrics(registry)
+            codex_metrics = collect_codex_metrics(registry, config)
             claude_value, codex_value = _usage_report_values(claude_metrics, codex_metrics)
             post_to_discord(config, bot_token, claude_value, codex_value)
             return 0
 
         now = _utc_now()
         claude_metrics = collect_claude_metrics(config)
-        codex_metrics = collect_codex_metrics(registry)
+        codex_metrics = collect_codex_metrics(registry, config, now=now)
         metrics = claude_metrics + codex_metrics
         claude_value, codex_value = _usage_report_values(claude_metrics, codex_metrics)
         current_payload = {
