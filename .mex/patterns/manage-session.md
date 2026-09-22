@@ -8,7 +8,7 @@ triggers:
 edges:
   - target: context/session-management.md
     condition: always before changing session state
-last_updated: 2026-07-19
+last_updated: 2026-09-22
 ---
 
 # Manage A Session
@@ -24,6 +24,7 @@ last_updated: 2026-07-19
 - Never launch the bridge/plugin manually; the scripts provide required environment and duplicate-listener checks.
 - A tmux session being absent does not prove the listener is stopped.
 - Remote projects cannot be controlled through local tmux.
+- Codex starts fresh unless explicitly launched with `--resume <thread_uuid>`. For account/home migration, follow the history-preserving restart procedure in `context/session-management.md`; verify the saved rollout before stopping and retain the source for recovery.
 
 ## Verify
 - [ ] Exactly one assigned listener exists.

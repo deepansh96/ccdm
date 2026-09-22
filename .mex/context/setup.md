@@ -15,7 +15,7 @@ edges:
     condition: when understanding how components connect during setup
   - target: context/discord-security.md
     condition: when configuring bot tokens, allowlists, roles, or channel permissions
-last_updated: 2026-08-09
+last_updated: 2026-09-22
 ---
 
 # Setup
@@ -24,6 +24,7 @@ last_updated: 2026-08-09
 - Node.js 22+ and npm.
 - Claude Code CLI and/or Codex CLI, authenticated for the sessions being run.
 - `tmux`, `zsh`, Python 3, and `jq`.
+- The dashboard E2E tests require Pillow in the `python3` environment. CI provisions Python 3.11 and installs Pillow before `npm test`.
 - A Discord server and bot credentials; local `whisper` is optional for voice transcription.
 
 ## First-time Setup

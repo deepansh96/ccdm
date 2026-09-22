@@ -18,7 +18,7 @@ edges:
     condition: when changing bot permissions, guest access, channel routing, or credentials
   - target: patterns/INDEX.md
     condition: when starting a task — check the pattern index for a matching pattern file
-last_updated: 2026-09-12
+last_updated: 2026-09-22
 ---
 
 # Session Bootstrap
@@ -38,6 +38,7 @@ Then read this file fully before doing anything else in this session.
 - Per-project Claude and Codex account, model, and effort overrides are supported.
 - Named Codex Account aliases and `default_codex_account` select root and project Codex Homes, while legacy `codex_home` and root overrides remain supported.
 - Project Codex launches resolve and validate the selected named or legacy home before MCP cleanup, tmux creation, or PID recording through `scripts/resolve-codex-home.py`.
+- Project Codex launches support explicit `--resume <thread_uuid>` for saved conversations, including a copied rollout after a home change; resume waits for listener readiness and cleans runtime state on failure, without falling back to a fresh thread.
 - The Codex bridge retries a generic terminal `response.failed` once when the failed turn produced no agent work.
 - The Codex bridge can pause new turns in memory, queue incoming messages, and resume them in order.
 - The Codex bridge forwards allowed users' 👍 and 👎 reactions on its own messages to the active Codex thread.

@@ -16,7 +16,7 @@ edges:
     condition: when performing a start, stop, or restart
   - target: patterns/register-project.md
     condition: when assigning or releasing a project bot
-last_updated: 2026-09-12
+last_updated: 2026-09-22
 ---
 
 # Session Management
@@ -40,6 +40,8 @@ Use `scripts/start-codex-session.sh <project>`. It validates the target project'
 After a Codex CLI upgrade, stop every long-lived CCDM Codex session before starting any replacement, then restart the root Codex bridge. Running app-server processes keep their original runtime version.
 
 Codex channels handle `/compact`, `/clear`, and `/restart` directly in the bridge.
+
+For an explicit history-preserving restart, use `scripts/start-codex-session.sh <project> --resume <thread_uuid>`. This resumes only at startup; `/clear` still creates a fresh thread. A resume launch requires the fresh Discord instruction request to be accepted and waits up to 60 seconds for listener readiness before reporting success. Failure or timeout returns nonzero and uses the common stop script to clean up listeners and registry runtime state instead of silently creating a new conversation. To change accounts while preserving history, identify and verify the current rollout's thread ID and project directory, stop the old session through the common stop script, copy that rollout into the target home's corresponding `sessions/` path without overwriting an existing file, update only the project's account selector, and start with `--resume`. Keep the original rollout and account selection for recovery. Credentials are never copied. Verify the resumed thread ID, selected process home, and channel listener. In-flight processes do not survive the restart.
 
 ## Stop Invariant
 

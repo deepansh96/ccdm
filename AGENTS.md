@@ -1,7 +1,7 @@
 ---
 name: agents
 description: Always-loaded project anchor for CCDM.
-last_updated: 2026-08-29
+last_updated: 2026-09-22
 ---
 
 # CCDM - Claude Code Discord Manager
@@ -17,6 +17,8 @@ CCDM manages isolated Claude Code and Codex Discord sessions for multiple local 
 - One project bot serves one assigned channel; stop existing listeners before starting replacements.
 - When a restart request comes from or names a registered project channel, restart that project's isolated session; restart the root agent only when the user explicitly asks to restart root.
 - Use `zsh -ic` for tmux launches so user-installed tools resolve correctly.
+- Project Codex conversations can resume across homes/accounts: copy the verified rollout into the target home's matching `sessions/` path, then start with `--resume <thread_uuid>`.
+- Follow `.mex/context/session-management.md` for the stop/copy/account-switch sequence; retain the source rollout, never overwrite a target rollout, and never copy credentials.
 
 ## Commands
 - Test: `npm test`
