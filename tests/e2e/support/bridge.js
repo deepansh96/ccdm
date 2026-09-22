@@ -198,6 +198,13 @@ export async function startFakeCodexServer(workspace, options = {}) {
         case "config/mcpServer/reload":
           reply({});
           break;
+        case "thread/resume":
+          if (options.resumeError) {
+            replyError({ code: -32000, message: options.resumeError });
+          } else {
+            reply({ thread: { id: message.params.threadId } });
+          }
+          break;
         case "thread/start":
           threadStartCount += 1;
           {

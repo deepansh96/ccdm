@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Usage: ./scripts/start-codex-session.sh <project_name>
+# Usage: ./scripts/start-codex-session.sh <project_name> [--resume <thread_uuid>]
 # Reads registry.json to get project config and starts a Codex Discord bridge session.
 
 set -euo pipefail
@@ -9,9 +9,29 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 REGISTRY="$ROOT_DIR/registry.json"
 
 PROJECT="${1:-}"
+RESUME_THREAD_ID=""
+if (( $# > 1 )); then
+  if [[ $# != 3 || "$2" != "--resume" ]]; then
+    echo "Usage: $0 <project_name> [--resume <thread_uuid>]" >&2
+    exit 1
+  fi
+  RESUME_THREAD_ID="$3"
+  if ! python3 - "$RESUME_THREAD_ID" <<'PY'
+import sys, uuid
+try:
+    if str(uuid.UUID(sys.argv[1])) != sys.argv[1]:
+        sys.exit(1)
+except ValueError:
+    sys.exit(1)
+PY
+  then
+    echo "Resume thread must be a canonical UUID" >&2
+    exit 1
+  fi
+fi
 
 if [[ -z "$PROJECT" ]]; then
-  echo "Usage: $0 <project_name>"
+  echo "Usage: $0 <project_name> [--resume <thread_uuid>]"
   exit 1
 fi
 
@@ -287,7 +307,7 @@ CODEX_REASONING_ENV=""
 if [[ -n "$CODEX_REASONING_EFFORT_VALUE" ]]; then
   CODEX_REASONING_ENV=" CODEX_REASONING_EFFORT='${CODEX_REASONING_EFFORT_VALUE}'"
 fi
-CODEX_SERVICE_TIER_ENV=" CODEX_SERVICE_TIER='${CODEX_SERVICE_TIER_VALUE}'"
+CODEX_SERVICE_TIER_ENV=" CODEX_SERVICE_TIER='${CODEX_SERVICE_TIER_VALUE}' CODEX_RESUME_THREAD_ID='${RESUME_THREAD_ID}'"
 
 tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' BOT_TOKEN='$BOT_TOKEN' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$DISCORD_USER_IDS' GUILD_ID='$GUILD_ID' ROOT_BOT_APP_ID='$ROOT_BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' BOT_DISPLAY_NAME='$BOT_DISPLAY_NAME'$AUDIO_TRANSCRIPTION_ENV$TEXT_REPLY_FALLBACK_ENV$CODEX_MODEL_ENV$CODEX_REASONING_ENV$CODEX_SERVICE_TIER_ENV node scripts/codex-bridge.js"
 echo "Started Codex bridge in tmux session '$SCREEN_NAME'"

@@ -1249,8 +1249,9 @@ async function registerDiscordMcp() {
   console.log(`MCP server status: ${found ? JSON.stringify(found.status || "found") : "checking..."}`);
 }
 
-async function startCodexThread() {
-  const result = await sendRequest("thread/start", {
+async function startCodexThread(resumeThreadId = "") {
+  const result = await sendRequest(resumeThreadId ? "thread/resume" : "thread/start", {
+    ...(resumeThreadId ? { threadId: resumeThreadId } : {}),
     cwd: PROJECT_DIR,
     sandbox: "danger-full-access",
     approvalPolicy: "never",
@@ -1277,7 +1278,7 @@ async function initializeCodex() {
 
   await registerDiscordMcp();
 
-  await startCodexThread();
+  await startCodexThread(process.env.CODEX_RESUME_THREAD_ID || "");
   await sendBootstrapInstructionTurn("startup");
   console.log(`Codex thread started: ${threadId}`);
 }

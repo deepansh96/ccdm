@@ -299,6 +299,32 @@ Message the root agent bot on Discord with any of these:
 | `/pause` / `/unpause` | Queue new Codex messages without interrupting the active turn, then resume them in order |
 | `@root /compact` / `@root /clear` | From a Claude project channel, relay the slash command into that project's tmux session |
 
+### Resuming a Codex conversation
+
+Normal project launches and `/restart` start a new conversation. To explicitly
+continue a saved conversation, get its UUID from the bridge's `Codex thread
+started:` log line, then run:
+
+```bash
+scripts/stop-session.sh my-project
+scripts/start-codex-session.sh my-project --resume <thread_uuid>
+```
+
+The selected Codex home must contain that saved thread. The bridge resumes it
+and refreshes the Discord instructions and reply credentials. A failed resume
+stops startup instead of silently creating a fresh conversation. `/clear` still
+starts a new conversation; the resume argument applies only at startup.
+
+To change Codex accounts while retaining the conversation, first locate its
+`sessions/.../rollout-...-<thread_uuid>.jsonl` file in the old home and verify
+the thread ID and project directory in its session metadata. Stop the project,
+copy that file into the same relative `sessions/` location in the target home
+without overwriting an existing file, and set the project's `codex_account` to
+the target alias. Then launch with `--resume <thread_uuid>`. Keep the original
+file and account selection for recovery. The target account must already be
+logged in; do not copy credentials between homes. This preserves the saved
+conversation, not running tools or child-agent processes.
+
 ### Registering a New Project
 
 Once the root agent is running and you have bots in the pool, message it in `#root`:

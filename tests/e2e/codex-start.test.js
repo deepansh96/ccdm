@@ -211,6 +211,7 @@ test("start-codex-session constructs a bridge tmux launch, removes stale MCP con
     CHANNEL_ID: registrySeed.projects.alpha.channel_id,
     CODEX_HOME: codexHome,
     CODEX_SERVICE_TIER: "default",
+    CODEX_RESUME_THREAD_ID: "",
     GUILD_ID: registrySeed.guild_id,
     PROJECT_DIR: registrySeed.projects.alpha.path,
     ROOT_BOT_APP_ID: "root-listener-id",
@@ -220,6 +221,40 @@ test("start-codex-session constructs a bridge tmux launch, removes stale MCP con
   assert.equal(state.fixtures.codex.bridgeInvocations.length, 1);
   assert.equal(state.fixtures.codex.appServerInvocations.length, 0);
   assert.equal(state.fixtures.npm.invocations.length, 0);
+});
+
+test("start-codex-session forwards an explicit resume ID and ignores an inherited one", async () => {
+  for (const resume of [true, false]) {
+    const workspace = createWorkspace();
+    seedRegistry(workspace, buildCodexRegistry(workspace));
+    const id = "00000000-0000-4000-8000-000000000001";
+    const result = await runScript(workspace, "scripts/start-codex-session.sh", {
+      args: resume ? ["alpha", "--resume", id] : ["alpha"],
+      env: { CODEX_RESUME_THREAD_ID: "inherited-other-thread" },
+    });
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+    assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex.env.CODEX_RESUME_THREAD_ID,
+      resume ? id : "");
+  }
+});
+
+test("start-codex-session rejects malformed resume arguments before changing state", async () => {
+  const workspace = createWorkspace();
+  const seed = buildCodexRegistry(workspace);
+  seedRegistry(workspace, seed);
+  for (const args of [
+    ["alpha", "--resume"],
+    ["alpha", "--resume", ""],
+    ["alpha", "--resume", "not-a-uuid"],
+    ["alpha", "--resume", "$(touch injected)"],
+    ["alpha", "--resume", "00000000-0000-4000-8000-000000000001", "extra"],
+    ["alpha", "--unknown", "00000000-0000-4000-8000-000000000001"],
+  ]) {
+    const result = await runScript(workspace, "scripts/start-codex-session.sh", { args });
+    assert.notEqual(result.exitCode, 0);
+    assert.deepEqual(readRegistry(workspace), seed);
+    assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {});
+  }
 });
 
 test("start-codex-session launches a project under its Codex Account Alias home", async () => {

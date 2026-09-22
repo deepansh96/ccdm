@@ -217,6 +217,37 @@ test("fake Codex app-server supports active-turn controls and approval requests"
   assert.ok(clientMethods.includes("turn/steer"));
 });
 
+test("bridge resumes the requested thread but clear starts a fresh conversation", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace);
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_RESUME_THREAD_ID: "saved-thread" },
+  });
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const resume = codex.clientMessages.find((m) => m.method === "thread/resume");
+  assert.equal(resume.params.threadId, "saved-thread");
+  assert.equal(resume.params.cwd, workspace.repoDir);
+  assert.ok(!codex.clientMessages.some((m) => m.method === "thread/start"));
+  assert.ok(codex.clientMessages.some((m) => m.method === "turn/start" && m.params.threadId === "saved-thread"));
+  await injectMessageUntil(workspace, { content: "/clear", id: "clear-resumed" },
+    () => codex.clientMessages.some((m) => m.method === "thread/start"), 7000);
+  assert.equal(codex.clientMessages.filter((m) => m.method === "thread/resume").length, 1);
+  await bridge.stop();
+});
+
+test("failed resume never silently starts a fresh conversation", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, { resumeError: "Saved thread unavailable" });
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_RESUME_THREAD_ID: "missing-thread" },
+  });
+  await bridge.waitForOutput(/Saved thread unavailable/, 7000);
+  assert.ok(!codex.clientMessages.some((m) => m.method === "thread/start" || m.method === "turn/start"));
+  await bridge.stop();
+});
+
 test("bridge boots, registers Discord MCP, removes stale MCP, and completes one allowed text turn with opt-in text fallback", async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, {
