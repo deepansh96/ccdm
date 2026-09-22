@@ -263,8 +263,17 @@ test("usage dashboard chart insets percentage extrema while preserving linear ma
   assert.equal(mapping.values[1] - mapping.values[2], mapping.values[2] - mapping.values[3]);
 });
 
+// Note text wraps against real font metrics, so how many visual lines a note
+// occupies is platform specific.  Compare the words that actually survive
+// instead: the wrapping must keep source content in order and the "…" marker
+// must only appear once the visual-line budget is exhausted.
+function noteWords(lines) {
+  return lines.flatMap((line) => line.split(/\s+/).filter((token) => token && token !== "…"));
+}
+
 test("usage dashboard renders generic notes as bounded multiline text", () => {
   const probe = runProbe([
+    "import os",
     "notes = [",
     "    {'title': 'DeepSeek · local Codex sessions', 'tag': 'DEEPSEEK',",
     "     'lines': ['This month 12.57M tokens · 3 sessions', 'Input 12.47M · Output 100.0k',",
@@ -273,23 +282,61 @@ test("usage dashboard renders generic notes as bounded multiline text", () => {
     "     'lines': ['Today  $1.2500 · 2 requests', 'This month  $3.5000 · 4 requests',",
     "               'Local estimate · no rate-limit graph']},",
     "]",
+    "width = (1568 - 24) - (1176 + 38)",
     "layout = module._rail_notes_layout(draw, notes, 1176, 1568, module.RAIL_NOTES_TOP, 940, 420)",
+    "alternates = [",
+    "    module._note_visual_lines(draw, notes[0], module._font(16, path=path), width)",
+    "    for path in module._FONT_PATHS if os.path.exists(path)",
+    "]",
     "print(json.dumps({",
     "    'kinds': [entry['kind'] for entry in layout['entries']],",
     "    'lines': [entry['lines'] for entry in layout['entries']],",
     "    'heights': [entry['height'] for entry in layout['entries']],",
+    "    'tops': [entry['y'] for entry in layout['entries']],",
     "    'height': layout['height'],",
+    "    'source': notes[0]['lines'],",
+    "    'limit': module.NOTE_VISUAL_LINE_LIMIT,",
+    "    'gap': module.NOTE_STRIDE_GAP,",
+    "    'band_top': module.RAIL_NOTES_TOP,",
+    "    'band_bottom': 940,",
+    "    'cost_height': module.NOTE_COST_HEIGHT,",
+    "    'text_heights': [module._note_text_height(len(entry['lines'])) for entry in layout['entries'] if entry['kind'] == 'text'],",
+    "    'alternates': alternates,",
     "}))",
   ]);
   assert.equal(probe.status, 0, probe.stderr);
   const layout = JSON.parse(probe.stdout);
+  const sourceWords = noteWords(layout.source);
   // The Claude estimate keeps its dedicated two-column layout...
   assert.deepEqual(layout.kinds, ["text", "cost"]);
-  // ...while the generic DeepSeek note renders every bounded line.
-  assert.equal(layout.lines[0].length, 4);
+  // ...while the generic DeepSeek note renders every source word, in order,
+  // wrapped only by font metrics and never padded or reordered.
+  assert.deepEqual(noteWords(layout.lines[0]), sourceWords, "generic note must keep every source word in order");
+  assert.ok(layout.lines[0].every((line) => !line.endsWith("…")), "a note inside its budget must not elide content");
+  assert.ok(layout.lines[0].length <= layout.limit, `note used ${layout.lines[0].length} of ${layout.limit} visual lines`);
+  assert.ok(layout.lines[0].length >= layout.source.length, "every logical line renders at least one visual line");
   assert.deepEqual(layout.lines[1], []);
+  // Whatever font this host resolves must honour the same ordering guarantee.
+  for (const [index, alternate] of layout.alternates.entries()) {
+    const words = noteWords(alternate);
+    assert.deepEqual(words, sourceWords.slice(0, words.length), `alternate font ${index} must keep source words in order`);
+    assert.ok(alternate.length <= layout.limit, `alternate font ${index} exceeded the visual-line budget`);
+  }
+  // Boxes grow with their lines and the stack stays inside the rail band.
+  assert.equal(layout.heights[0], layout.text_heights[0], "note box height must match its rendered lines");
+  assert.equal(layout.heights[1], layout.cost_height, "cost note keeps its fixed geometry");
   assert.ok(layout.heights[0] > layout.heights[1], "multiline note box must grow with its lines");
-  assert.ok(layout.height <= 420);
+  const stack = layout.heights.reduce((sum, height) => sum + height, 0) + layout.gap * (layout.heights.length - 1);
+  assert.equal(layout.height, stack, "stack height must cover every note and the inter-note gap");
+  assert.ok(layout.height <= 420, `note stack height ${layout.height} exceeded its budget`);
+  assert.ok(
+    layout.tops.every((top, index) => top >= layout.band_top && top + layout.heights[index] <= layout.band_bottom),
+    "notes must sit inside the rail band",
+  );
+  assert.ok(
+    layout.tops.every((top, index) => index === 0 || top >= layout.tops[index - 1] + layout.heights[index - 1]),
+    "notes must not overlap",
+  );
 });
 
 test("usage dashboard binds the note stack to the rail panel budget", () => {
