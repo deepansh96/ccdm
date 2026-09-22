@@ -175,3 +175,5 @@ This audit maps the PRD workflow bullets from issue #4 to automated scenarios or
 | Documentation | Named account operator documentation | Covered | README documents alias/home terminology, both-scope precedence, validation failures, login preparation, persistence, migration, restart, and rollback. |
 
 - DeepSeek Exa opt-in: hosted MCP configuration survives scoped Discord cleanup; default homes omit Exa and rotation rejects setup-only options.
+
+- Root steering: same-channel/same-author follow-ups reuse the active grant; cross-channel and cross-author messages queue, and a failed steer retains the original queued scope.

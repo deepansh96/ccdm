@@ -43,6 +43,7 @@ Then read this file fully before doing anything else in this session.
 - Project Codex launches support explicit `--resume <thread_uuid>` for saved conversations, including a copied rollout after a home change; resume waits for listener readiness and cleans runtime state on failure, without falling back to a fresh thread.
 - The Codex bridge retries a generic terminal `response.failed` once when the failed turn produced no agent work.
 - The Codex bridge can pause new turns in memory, queue incoming messages, and resume them in order.
+- Root Codex sessions steer active turns for the same channel and author while preserving the active Discord grant; other channels/authors queue, and failed steering falls back to a fresh scoped turn.
 - The Codex bridge forwards allowed users' 👍 and 👎 reactions on its own messages to the active Codex thread.
 - The tracked Usage Stats Poster discovers named and legacy Codex Homes, deduplicates shared homes, and falls back from live rate limits to recent session JSONL data.
 - The tracked Usage Stats Poster also collects sanitized UTC 10-minute snapshots in a private SQLite history, retains them for 365 days, warns on feature-owned history growth, and atomically posts the original text Usage Report with separate Claude and Codex trend PNGs per UTC 30-minute slot; the local posts ledger and advisory lock make retries idempotent.

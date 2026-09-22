@@ -825,19 +825,42 @@ async function processQueue() {
   await sendTurn(input, channelId, channelScopeToken);
 }
 
+function canSteerRootScope(channelId, token) {
+  if (channelId !== activeOutputChannelId || !token || !activeTurnChannelScopeToken) return false;
+  try {
+    // Both tokens were minted locally. Keep the active grant unchanged while tools run.
+    const incoming = JSON.parse(Buffer.from(token.split(".")[0], "base64url").toString());
+    const active = JSON.parse(Buffer.from(activeTurnChannelScopeToken.split(".")[0], "base64url").toString());
+    return incoming.channel_id === active.channel_id && incoming.author_id === active.author_id;
+  } catch {
+    return false;
+  }
+}
+
 async function routeInput(input, msg, channelId, channelScopeToken) {
   const queueInput = async () => {
     messageQueue.push({ input, msg, channelId, channelScopeToken });
     if (msg) await msg.react("⏳");
   };
 
-  if (bridgePaused || threadResetting || (ROOT_MULTI_CHANNEL && turnActive)) {
+  const rootScopeMatches = ROOT_MULTI_CHANNEL && canSteerRootScope(channelId, channelScopeToken);
+  if (bridgePaused || threadResetting || (ROOT_MULTI_CHANNEL && turnActive && !rootScopeMatches)) {
     await queueInput();
   } else if (turnActive && activeTurnId && !suppressTurnOutput) {
     try {
+      // Reuse this turn's grant, so in-flight tool calls and the correction remain valid.
+      // Queue fallback retains the original input and its own grant for the next turn.
+      const steerInput = rootScopeMatches
+        ? input.map((part, index) => index === 0 && part.type === "text"
+          ? { ...part, text: part.text.replace(
+            `channel_scope_token: ${channelScopeToken}`,
+            `channel_scope_token: ${activeTurnChannelScopeToken}`,
+          ) }
+          : part)
+        : input;
       await sendRequest("turn/steer", {
         threadId,
-        input,
+        input: steerInput,
         expectedTurnId: activeTurnId,
       });
       console.log(`[steer] Injected into active turn ${activeTurnId}`);

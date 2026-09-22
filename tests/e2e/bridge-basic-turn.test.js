@@ -1777,3 +1777,67 @@ async function injectReactionUntil(workspace, reaction, predicate, timeoutMs = 5
   }
   throw lastError;
 }
+
+test("root steers only the active channel and author, retaining the active grant and safe queue fallback", async () => {
+  const workspace = createBridgeWorkspace();
+  const accessFile = path.join(workspace.tmpDir, "root-steer-access.json");
+  const users = ["allowed-user-id", "second-user-id"];
+  fs.writeFileSync(accessFile, JSON.stringify({ allowFrom: users, groups: {
+    "root-channel": { requireMention: false, allowFrom: users },
+    "other-channel": { requireMention: false, allowFrom: users },
+  } }));
+  const codex = await startFakeCodexServer(workspace, {
+    steer: ["success", "failure"],
+    turns: [
+      { turnId: "root-active", waitForRelease: true, delta: "active done" },
+      { delta: "other channel done" }, { delta: "other author done" }, { delta: "fallback done" },
+    ],
+  });
+  const bridge = startBridge(workspace, {
+    botAppId: "root-bot-id", rootBotAppId: "root-bot-id", channelId: "root-channel", port: codex.port,
+    env: { ROOT_MULTI_CHANNEL: "1", ROOT_ACCESS_FILE: accessFile, CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
+  const messages = (state) => state.fixtures.codex.protocolEvents
+    .filter((e) => e.event === "client-message").map((e) => e.message);
+  const turns = (state) => messages(state).filter((m) => m.method === "turn/start" &&
+    m.params.input?.[0]?.text?.startsWith("Discord routing metadata:"));
+  const grant = (input) => input[0].text.match(/channel_scope_token: (\S+)/)[1];
+  await bridge.waitForOutput(/Root routing active for 2 configured channel/, 7000);
+  await injectMessageUntil(workspace, { channelId: "root-channel", content: "start", id: "root-start" },
+    (state) => turns(state).length === 1);
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const before = readState(workspace.stateDir);
+  const activeGrant = grant(turns(before)[0].params.input);
+  const config = messages(before).find((m) => m.method === "config/value/write" && m.params.keyPath === "mcp_servers.discord-root");
+  const scopeFile = config.params.value.env.DISCORD_CHANNEL_SCOPE_FILE;
+  await injectMessageUntil(workspace, { channelId: "root-channel", content: "correction", id: "root-correction" },
+    (state) => messages(state).some((m) => m.method === "turn/steer"));
+  await bridge.waitForOutput(/Injected into active turn root-active/, 5000);
+  let state = readState(workspace.stateDir);
+  assert.equal(grant(messages(state).find((m) => m.method === "turn/steer").params.input), activeGrant);
+  assert.equal(fs.readFileSync(scopeFile, "utf8"), activeGrant);
+  for (const message of [
+    { channelId: "other-channel", content: "other channel", id: "other-channel-message" },
+    { channelId: "root-channel", content: "other author", id: "other-author-message", author: { id: "second-user-id" } },
+  ]) {
+    await injectMessageUntil(workspace, message,
+      (next) => next.fixtures.discord.reactions.some((r) => r.messageId === message.id && r.emoji === "⏳"));
+  }
+  state = readState(workspace.stateDir);
+  assert.equal(messages(state).filter((m) => m.method === "turn/steer").length, 1);
+  assert.equal(turns(state).length, 1);
+  assert.equal(fs.readFileSync(scopeFile, "utf8"), activeGrant);
+  await injectMessageUntil(workspace, { channelId: "root-channel", content: "fallback", id: "root-fallback" },
+    (next) => messages(next).filter((m) => m.method === "turn/steer").length === 2);
+  await bridge.waitForOutput(/Failed \(stale turn\), queuing instead/, 5000);
+  codex.releaseTurn("root-active");
+  state = await waitForState(workspace,
+    (next) => next.fixtures.discord.sends.some((send) => send.content === "fallback done"), 15000);
+  const queued = turns(state).slice(1);
+  assert.equal(queued.length, 3);
+  assert.match(queued[0].params.input[0].text, /channel_id: other-channel/);
+  assert.match(queued[1].params.input[0].text, /author_id: second-user-id/);
+  assert.match(queued[2].params.input[0].text, /Message:\nfallback/);
+  for (const turn of queued) assert.notEqual(grant(turn.params.input), activeGrant);
+  await bridge.stop();
+});
