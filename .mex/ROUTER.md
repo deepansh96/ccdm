@@ -38,7 +38,7 @@ Then read this file fully before doing anything else in this session.
 - Per-project Claude and Codex account, model, and effort overrides are supported.
 - Named Codex Account aliases and `default_codex_account` select root and project Codex Homes, while legacy `codex_home` and root overrides remain supported.
 - `scripts/setup-codex-mimo.py` prepares isolated MiMo Codex homes with private file-backed provider authentication, validated vendor catalogs, and key rotation; existing named-account launchers select them without lifecycle changes.
-- `scripts/setup-codex-deepseek.py` prepares DeepSeek Flash homes with private credentials and key rotation, extracting the vendor catalog as data without executing its installer; `deepseek-flash` currently selects V4.1 Flash with image support.
+- `scripts/setup-codex-deepseek.py` prepares DeepSeek Flash homes with private credentials and key rotation, extracting the vendor catalog as data without executing its installer; `deepseek-flash` currently selects V4.1 Flash with image support; optional `--with-exa` adds hosted web search/page reading.
 - Project Codex launches resolve and validate the selected named or legacy home before MCP cleanup, tmux creation, or PID recording through `scripts/resolve-codex-home.py`.
 - Project Codex launches support explicit `--resume <thread_uuid>` for saved conversations, including a copied rollout after a home change; resume waits for listener readiness and cleans runtime state on failure, without falling back to a fresh thread.
 - The Codex bridge retries a generic terminal `response.failed` once when the failed turn produced no agent work.
