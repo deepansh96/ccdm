@@ -228,9 +228,11 @@ including its `ccdm-deepseek.json` setup marker, outside the repository.
 
 Flash accepts image input; browser/computer control additionally needs a
 configured Computer Use tool/plugin. Supported reasoning efforts are `low`,
-`high`, and `max`; the helper defaults to `high`. DeepSeek quota reporting is not included
-in the ChatGPT usage dashboards. The helper does not make billable inference
-calls; test the home separately before assigning a bot.
+`high`, and `max`; the helper defaults to `high`. DeepSeek has no ChatGPT-style
+quota window, so its usage dashboard shows the account-wide balance returned by
+the official `GET /user/balance` API plus this machine's local DeepSeek token
+totals instead of a rate-limit graph. The helper does not make billable
+inference calls; test the home separately before assigning a bot.
 
 To add web search and page reading through [Exa MCP](https://exa.ai/docs/get-started/exa-mcp),
 pass `--with-exa` when creating a new home. For an existing home, add this table to its `config.toml`:
@@ -654,6 +656,12 @@ Run a live legacy JSON-embed post separately after validation; installation neve
 ```bash
 python3 scripts/usage-stats-poster.py
 ```
+
+Configured Codex Homes that carry the `ccdm-deepseek.json` setup marker are reported from DeepSeek instead of the Codex rate-limit request. The poster reads the home's private `api-key` directly, fetches the account-wide balance from the fixed official `GET /user/balance` endpoint on `https://api.deepseek.com` (one request per distinct key per run), and pairs it with this month's local DeepSeek token totals from the DeepSeek session rollouts. The text report labels the balance account-wide and exposes the paid/granted breakdown; the bounded dashboard note shows no quota card, and no money history or spend figure is derived from the balance. A DeepSeek-backed root Codex session still runs through the Codex app-server; only this rate-limit query is skipped. Homes sharing a key are grouped under one labeled note, and a rollout copied between them is counted once; distinct keys stay separate because no account identifier is available. Reference: [Get User Balance](https://api-docs.deepseek.com/api/get-user-balance/).
+
+Coverage is this machine's local Codex sessions in the configured DeepSeek homes only. Other clients, other machines, ephemeral workers, and deleted rollouts are excluded, so the note never claims a provider-wide total. The API reports an account balance rather than spend or quota, so the balance is account-wide while the token totals stay local; responses that do not match DeepSeek's documented balance schema are reported as unavailable instead of shown.
+
+For local tests only, `deepseek_base_url` may point at a literal `http://127.0.0.1:<port>` (or `localhost`/`[::1]`) fake; any other origin is refused at both config and request time.
 
 To exercise the scheduled report manually, use `--scheduled --post-now`; `--collect-only` records a snapshot without contacting Discord. Scheduled runs outside a UTC 30-minute window collect history but do not upload the text report or images.
 
