@@ -172,6 +172,69 @@ MiMo billing/quota reporting is not added to CCDM's ChatGPT usage dashboards.
 References: [MiMo Codex integration](https://mimo.mi.com/docs/en-US/tokenplan/integration/codex-configuration)
 and [Codex provider configuration](https://learn.chatgpt.com/docs/config-file/config-reference).
 
+#### DeepSeek 4.1 Flash API accounts
+
+DeepSeek 4.1 Flash uses the API model name `deepseek-flash` as of September 22,
+2026. Prepare its own Codex home with Python 3.10+ and a recent Codex CLI
+(tested with 0.153.4):
+
+```bash
+python3 scripts/setup-codex-deepseek.py --home ~/.codex-deepseek
+```
+
+Enter your DeepSeek API key at the hidden prompt. Automation can set
+`DEEPSEEK_API_KEY` or pipe the key through stdin; the environment variable takes
+precedence. Never put credentials in command arguments or tracked files. The
+helper stores the key in a private `api-key` file, and Codex reads it with its
+provider authentication command. No OpenAI login is needed.
+
+The helper downloads DeepSeek's official setup script **as data only**, extracts
+its literal model-catalog JSON without executing the script, and retains the
+`deepseek-flash` entry. It validates standard Responses, shell/patch tools,
+vision, and high reasoning support before creating any state. If the upstream
+script layout changes, setup fails; `--catalog-file <path>` accepts a downloaded
+catalog JSON or vendor script for offline preparation.
+
+This catalog is different from MiMo's: DeepSeek uses `use_responses_lite = false`
+and `shell_type = "shell_command"`. Do not reuse MiMo's catalog. The generated
+configuration selects `https://api.deepseek.com/`, high reasoning, and disabled
+built-in web search. The API alias may change models in future; consult the
+vendor's model reference when upgrading.
+
+Add the new home to the existing `codex_accounts` object in ignored
+`registry.json`, keeping the other entries and default:
+
+```json
+"deepseek": "~/.codex-deepseek"
+```
+
+Select `"codex_account": "deepseek"` on the intended Codex project. Remove any
+same-scope `codex_home` and incompatible model/effort/service-tier overrides, then stop
+and start that project with the standard CCDM scripts. To roll back, restore its
+previous account selector and restart it. Setup itself does not edit the registry
+or restart sessions, and refuses existing homes and paths inside this checkout.
+
+```bash
+CODEX_HOME=$HOME/.codex-deepseek codex exec --strict-config --skip-git-repo-check \
+  -C /tmp -s read-only 'What is 2 + 2? Reply only with the answer.'
+
+python3 scripts/setup-codex-deepseek.py --home ~/.codex-deepseek --rotate-key
+```
+
+Rotation replaces only the private key, preserving configuration, MCP entries,
+catalog, and history; restart affected sessions to refresh authentication. The
+home uses mode `0700`, and generated files use `0600`. Keep the full home,
+including its `ccdm-deepseek.json` setup marker, outside the repository.
+
+Flash accepts image input; browser/computer control additionally needs a
+configured Computer Use tool/plugin. Supported reasoning efforts are `low`,
+`high`, and `max`; the helper defaults to `high`. DeepSeek quota reporting is not included
+in the ChatGPT usage dashboards. The helper does not make billable inference
+calls; test the home separately before assigning a bot.
+
+References: [DeepSeek Codex integration](https://api-docs.deepseek.com/quick_start/agent_integrations/codex/)
+and [DeepSeek model reference](https://api-docs.deepseek.com/quick_start/pricing/).
+
 #### Precedence and legacy compatibility
 
 The **Legacy Codex Home Override** is a raw `codex_home` path retained for

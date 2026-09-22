@@ -4,6 +4,8 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 
 | Area | Scenario | Status | Notes |
 | --- | --- | --- | --- |
+| DeepSeek setup | Private Flash home and named-account launch | Covered | Local catalog and dummy keys; verifies provider auth survives existing stale MCP cleanup. |
+| DeepSeek setup | Catalog extraction, validation, and key rotation | Covered | Parses vendor shell text as data without execution; checks vision/tool metadata, Unicode paths, credential sources, foreign markers, and overwrite refusal. |
 | MiMo setup | Private home and named-account launch | Covered | Local catalog and dummy credentials; existing Codex launcher retains provider auth while removing stale Discord MCP entries. |
 | MiMo setup | Credential rotation and billing validation | Covered | Pay-as-you-go and individual/team Token Plan keys; preserves config/catalog, rejects wrong billing, existing homes, checkout paths, symlinks, and invalid catalogs. |
 | Setup | Prerequisite failure | Covered | Missing fixture tool fails before prompts. |

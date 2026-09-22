@@ -51,6 +51,7 @@ last_updated: 2026-09-22
 - `scripts/guest-access.js list [project]` - inspects project guest access.
 - `npx mex-agent check` - checks memory scaffold drift.
 - `python3 scripts/setup-codex-mimo.py --home ~/.codex-mimo --billing payg` - prepares an isolated MiMo Codex home (Python 3.10+, recent Codex supporting provider auth commands); use `--billing token-plan` for subscription keys or `--rotate-key` to replace an existing key.
+- `python3 scripts/setup-codex-deepseek.py --home ~/.codex-deepseek` - prepares an isolated DeepSeek Flash home using the same private credential pattern; `--catalog-file` accepts catalog JSON or a vendor script parsed as data, and `--rotate-key` preserves other home state.
 
 ## Common Issues
 **Duplicate listener refusal:** Run `scripts/stop-session.sh <project>` before retrying start; do not bypass the listener scan.
