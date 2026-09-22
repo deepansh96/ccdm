@@ -177,3 +177,5 @@ This audit maps the PRD workflow bullets from issue #4 to automated scenarios or
 - DeepSeek Exa opt-in: hosted MCP configuration survives scoped Discord cleanup; default homes omit Exa and rotation rejects setup-only options.
 
 - Root steering: same-channel/same-author follow-ups reuse the active grant; cross-channel and cross-author messages queue, and a failed steer retains the original queued scope.
+
+- Codex readiness: paginated MCP `data` parsing, stale-server removal, delayed/missing reply tools, no-action bootstrap, tracking beyond 15 seconds, explicit deadline cancellation, and failed bootstrap completion.

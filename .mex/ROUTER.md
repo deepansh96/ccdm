@@ -41,6 +41,7 @@ Then read this file fully before doing anything else in this session.
 - `scripts/setup-codex-deepseek.py` prepares DeepSeek Flash homes with private credentials and key rotation, extracting the vendor catalog as data without executing its installer; `deepseek-flash` currently selects V4.1 Flash with image support; optional `--with-exa` adds hosted web search/page reading.
 - Project Codex launches resolve and validate the selected named or legacy home before MCP cleanup, tmux creation, or PID recording through `scripts/resolve-codex-home.py`.
 - Project Codex launches support explicit `--resume <thread_uuid>` for saved conversations, including a copied rollout after a home change; resume waits for listener readiness and cleans runtime state on failure, without falling back to a fresh thread.
+- Codex startup waits for the scoped Discord reply tool, uses a no-action bootstrap, and tracks bootstrap completion or explicitly interrupts on timeout.
 - The Codex bridge retries a generic terminal `response.failed` once when the failed turn produced no agent work.
 - The Codex bridge can pause new turns in memory, queue incoming messages, and resume them in order.
 - Root Codex sessions steer active turns for the same channel and author while preserving the active Discord grant; other channels/authors queue, and failed steering falls back to a fresh scoped turn.

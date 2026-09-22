@@ -1841,3 +1841,73 @@ test("root steers only the active channel and author, retaining the active grant
   for (const turn of queued) assert.notEqual(grant(turn.params.input), activeGrant);
   await bridge.stop();
 });
+
+test("Discord MCP readiness follows data pages and waits for the reply tool before starting a thread", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, { staleMcpName: "discord-stale", mcpReadyAfter: 5, paginatedMcp: true });
+  const bridge = startBridge(workspace, { port: codex.port });
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const messages = codex.clientMessages;
+  assert.ok(messages.some((m) => m.method === "config/value/delete" && m.params.keyPath === "mcp_servers.discord-stale"));
+  const start = messages.findIndex((m) => m.method === "thread/start");
+  assert.ok(messages.slice(0, start).filter((m) => m.method === "mcpServerStatus/list").length >= 4);
+  assert.match(bridge.stdout, /reply tool available/);
+  assert.ok(messages.some((m) => m.method === "mcpServerStatus/list" && m.params.cursor === "discord-page"));
+  const bootstrap = messages.find((m) => m.method === "turn/start");
+  assert.match(bootstrap.params.input[0].text, /Do not call tools, inspect files, or send a Discord message/);
+  assert.match(messages[start].params.developerInstructions, /Never reconstruct the Discord transport/);
+  await bridge.stop();
+});
+
+test("Discord MCP missing reply fails startup without advertising a listener", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, { missingReply: true });
+  const bridge = startBridge(workspace, { port: codex.port, env: { CODEX_MCP_READY_TIMEOUT_MS: "250" } });
+  const result = await bridge.closed;
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /did not expose the reply tool/);
+  assert.ok(!codex.clientMessages.some((m) => m.method === "thread/start"));
+  assert.equal(readState(workspace.stateDir).fixtures.discord.logins.length, 0);
+});
+
+test("slow bootstrap remains tracked beyond the old fifteen-second cutoff", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    bootstrapPlan: { turnId: "slow-bootstrap", waitForRelease: true },
+  });
+  const bridge = startBridge(workspace, { port: codex.port });
+  await waitForState(workspace, (state) => state.fixtures.codex.protocolEvents.some(
+    (e) => e.message?.method === "turn/start"), 7000);
+  await new Promise((resolve) => setTimeout(resolve, 15500));
+  assert.doesNotMatch(bridge.stdout, /Bootstrap instruction sent|Listening in/);
+  assert.equal(readState(workspace.stateDir).fixtures.discord.logins.length, 0);
+  codex.releaseTurn("slow-bootstrap");
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  assert.doesNotMatch(bridge.stdout, /no turn is active/);
+  await bridge.stop();
+});
+
+test("bootstrap deadline explicitly interrupts and fails closed instead of forgetting an active turn", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    bootstrapPlan: { turnId: "blocked-bootstrap", waitForRelease: true },
+  });
+  const bridge = startBridge(workspace, { port: codex.port, env: { CODEX_BOOTSTRAP_TIMEOUT_MS: "250" } });
+  const result = await bridge.closed;
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /Bootstrap timed out/);
+  assert.ok(codex.clientMessages.some((m) => m.method === "turn/interrupt" && m.params.turnId === "blocked-bootstrap"));
+  assert.equal(readState(workspace.stateDir).fixtures.discord.logins.length, 0);
+});
+
+test("failed bootstrap completion without a separate error event fails startup", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    bootstrapPlan: { status: "failed", terminalError: { message: "provider bootstrap failure" } },
+  });
+  const bridge = startBridge(workspace, { port: codex.port });
+  const result = await bridge.closed;
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /provider bootstrap failure/);
+  assert.equal(readState(workspace.stateDir).fixtures.discord.logins.length, 0);
+});

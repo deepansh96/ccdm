@@ -137,6 +137,8 @@ export async function startFakeCodexServer(workspace, options = {}) {
   const steerPlans = [...(options.steer ?? [])];
   let serverRequestId = 10000;
   let threadStartCount = 0;
+  let registeredMcpName = `discord-${options.channelId ?? "channel-id"}`;
+  let mcpStatusCount = 0;
   const interruptedTurnIds = new Set();
   const pendingTurnReleases = new Map();
   const clientMessages = [];
@@ -174,10 +176,15 @@ export async function startFakeCodexServer(workspace, options = {}) {
             replyError({ code: -32000, message: options.failMcpStatus });
             break;
           }
+          mcpStatusCount += 1;
+          if (options.paginatedMcp && !message.params?.cursor) {
+            reply({ data: [{ name: "unrelated", tools: {} }], nextCursor: "discord-page" });
+            break;
+          }
           reply({
-            servers: [
+            data: [
               ...(options.staleMcpName ? [{ name: options.staleMcpName, status: "running" }] : []),
-              { name: `discord-${options.channelId ?? "channel-id"}`, status: "running" },
+              { name: registeredMcpName, tools: options.missingReply || mcpStatusCount <= (options.mcpReadyAfter ?? 0) ? {} : { reply: { name: "reply" } } },
             ],
           });
           break;
@@ -189,6 +196,7 @@ export async function startFakeCodexServer(workspace, options = {}) {
           reply({});
           break;
         case "config/value/write":
+          if (message.params?.keyPath?.startsWith("mcp_servers.")) registeredMcpName = message.params.keyPath.slice("mcp_servers.".length);
           if (options.failMcpRegistration) {
             replyError({ code: -32000, message: options.failMcpRegistration });
             break;
@@ -224,7 +232,7 @@ export async function startFakeCodexServer(workspace, options = {}) {
             replyError({ code: -32000, message: options.bootstrapError });
             break;
           }
-          const plan = isSystem ? { delta: "", complete: true } : (turnPlans.shift() ?? { delta: "Codex response", complete: true });
+          const plan = isSystem ? (options.bootstrapPlan ?? { delta: "", complete: true }) : (turnPlans.shift() ?? { delta: "Codex response", complete: true });
           const turnId = plan.turnId ?? `turn-${Date.now()}`;
           const notificationTurnId = plan.notificationTurnId ?? turnId;
           const turnThreadId = message.params?.threadId;
@@ -286,7 +294,7 @@ export async function startFakeCodexServer(workspace, options = {}) {
               });
             }
             if (plan.complete !== false) {
-              notify("turn/completed", { threadId: turnThreadId, turn: { id: notificationTurnId } });
+              notify("turn/completed", { threadId: turnThreadId, turn: { id: notificationTurnId, ...(plan.status ? { status: plan.status, error: plan.terminalError } : {}) } });
             }
             pendingTurnReleases.delete(turnId);
           };
