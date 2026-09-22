@@ -31,7 +31,7 @@ function setup(fixture, { key = "sk-fixture-testing-only", args = [] } = {}) {
 test("DeepSeek setup creates private standalone provider state and launches through a named account", async () => {
   const fixture = setupFixture();
   const { workspace, home } = fixture;
-  const result = await setup(fixture);
+  const result = await setup(fixture, { args: ["--with-exa"] });
   assert.equal(result.exitCode, 0, result.stderr);
   assert.doesNotMatch(result.stdout + result.stderr, /sk-fixture-testing-only/);
   assert.equal(fs.statSync(home).mode & 0o777, 0o700);
@@ -40,6 +40,7 @@ test("DeepSeek setup creates private standalone provider state and launches thro
   }
   const configPath = path.join(home, "config.toml");
   const config = fs.readFileSync(configPath, "utf8");
+  assert.match(config, /\[mcp_servers\.exa\]\nurl = "https:\/\/mcp\.exa\.ai\/mcp"/);
   assert.match(config, /https:\/\/api.deepseek.com\//);
   assert.match(config, /\[model_providers.deepseek.auth\]/);
   assert.doesNotMatch(config, /sk-fixture|experimental_bearer_token|env_key|model_supports_reasoning_summaries/);
@@ -65,6 +66,7 @@ test("DeepSeek setup creates private standalone provider state and launches thro
   const cleaned = fs.readFileSync(configPath, "utf8");
   assert.match(cleaned, /\[model_providers.deepseek.auth\]/);
   assert.doesNotMatch(cleaned, /discord-old/);
+  assert.match(cleaned, /\[mcp_servers\.exa\]/);
   assert.equal(fs.readFileSync(path.join(home, "api-key"), "utf8"), "sk-fixture-testing-only\n");
 });
 
@@ -164,4 +166,17 @@ test("DeepSeek rotation replaces only credentials after bridge config changes an
   const mismatch = await setup(fixture, { args: ["--rotate-key"] });
   assert.equal(mismatch.exitCode, 1);
   assert.equal(fs.readFileSync(keyPath, "utf8"), "sk-replacement-testing-only\n");
+});
+
+test("Exa is opt-in and cannot silently change configuration during key rotation", async () => {
+  const fixture = setupFixture();
+  assert.equal((await setup(fixture)).exitCode, 0);
+  const configPath = path.join(fixture.home, "config.toml");
+  const original = fs.readFileSync(configPath, "utf8");
+  assert.doesNotMatch(original, /mcp_servers\.exa/);
+  const result = await setup(fixture, { args: ["--rotate-key", "--with-exa"] });
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /--with-exa is for new homes/);
+  assert.equal(fs.readFileSync(configPath, "utf8"), original);
+  assert.equal(fs.readFileSync(path.join(fixture.home, "api-key"), "utf8"), "sk-fixture-testing-only\n");
 });

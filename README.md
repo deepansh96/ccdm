@@ -232,6 +232,29 @@ configured Computer Use tool/plugin. Supported reasoning efforts are `low`,
 in the ChatGPT usage dashboards. The helper does not make billable inference
 calls; test the home separately before assigning a bot.
 
+To add web search and page reading through [Exa MCP](https://exa.ai/docs/get-started/exa-mcp),
+pass `--with-exa` when creating a new home. For an existing home, add this table to its `config.toml`:
+
+```toml
+[mcp_servers.exa]
+url = "https://mcp.exa.ai/mcp"
+```
+
+Use the table only once; preserve existing provider and tool settings. Direct
+configuration avoids the automatic OAuth prompt from `codex mcp add` in Codex
+0.153.4; the hosted server accepts unauthenticated tool calls.
+
+Start a new session (or restart only the affected CCDM project) to load the tools.
+Exa's hosted endpoint offers keyless, rate-limited access; searches and requested
+page URLs go to Exa. Higher usage needs Exa authentication. Keep
+`web_search = "disabled"`: this disables provider-native search, not MCP tools.
+The setup flag writes configuration only and does not contact Exa. It cannot be
+combined with `--rotate-key`. To remove it:
+
+```sh
+CODEX_HOME="$HOME/.codex-deepseek" codex mcp remove exa
+```
+
 References: [DeepSeek Codex integration](https://api-docs.deepseek.com/quick_start/agent_integrations/codex/)
 and [DeepSeek model reference](https://api-docs.deepseek.com/quick_start/pricing/).
 
