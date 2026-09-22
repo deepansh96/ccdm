@@ -4,6 +4,8 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 
 | Area | Scenario | Status | Notes |
 | --- | --- | --- | --- |
+| MiMo setup | Private home and named-account launch | Covered | Local catalog and dummy credentials; existing Codex launcher retains provider auth while removing stale Discord MCP entries. |
+| MiMo setup | Credential rotation and billing validation | Covered | Pay-as-you-go and individual/team Token Plan keys; preserves config/catalog, rejects wrong billing, existing homes, checkout paths, symlinks, and invalid catalogs. |
 | Setup | Prerequisite failure | Covered | Missing fixture tool fails before prompts. |
 | Setup | First-run registry and root state creation | Covered | Drives `setup.sh` with local fixture binaries. |
 | Setup | Existing registry keep | Covered | Declining overwrite preserves existing JSON. |
