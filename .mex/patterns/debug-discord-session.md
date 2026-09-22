@@ -10,7 +10,7 @@ edges:
     condition: when permissions, scope tokens, or routing may be wrong
   - target: context/session-management.md
     condition: when process or tmux state may be wrong
-last_updated: 2026-09-07
+last_updated: 2026-09-22
 ---
 
 # Debug A Discord Session
@@ -24,6 +24,9 @@ last_updated: 2026-09-07
 6. Stop through `scripts/stop-session.sh`, then start cleanly if process state is inconsistent.
 
 ## Gotchas
+- MCP status in current Codex uses paginated `data`, not just legacy `servers`/`items`. Verify the scoped reply tool is present before starting a thread.
+- Bootstrap is not a user request: instruct the model to acknowledge without tools. Never drop active-turn tracking merely because startup is slow; interrupt on timeout and fail closed.
+- Tool listing alone does not prove the model invokes tools correctly. Use dummy credentials and a local recording MCP stub with the real tool schema to verify direct replies and steering; never let a test agent access live Discord credentials or use shell transport workarounds.
 - When unrelated bots appear in a channel's member list, inspect Administrator grants on every assigned role before changing channel overrides. Administrator bypasses even member-level View Channel denies. Back up channel overwrites first; do not change server roles when authorization covers only one channel.
 - For an authorized single-bot Administrator repair, back up roles and channel overwrites privately, confirm the granting role belongs exclusively to that bot, and calculate its required assigned-channel permissions without Administrator before applying the change. Remove only the Administrator bit, verify assigned-channel history access and an unrelated-channel denial using that bot's identity, and restore the role if verification fails. Compare overwrite collections by ID rather than API response order; Discord can reorder them without changing permissions.
 - Before expanding a repair, resolve the actual root identity separately from legacy pool management credentials and protect both until dependencies are accounted for. A role PATCH can return HTTP 403 for one management identity while succeeding through the authorized root identity; check role hierarchy without changing root's roles. Audit non-Administrator bots too: an unassigned monitoring role can independently grant broad visibility.

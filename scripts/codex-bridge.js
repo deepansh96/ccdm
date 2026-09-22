@@ -74,6 +74,7 @@ let pendingRequests = new Map();
 let deltaBuffer = "";
 let fallbackText = "";
 let turnActive = false;
+let bootstrapCompletion = null;
 let activeTurnId = null;
 let activeTurnIdConfirmed = false;
 let mcpReplyCalled = false;
@@ -629,7 +630,7 @@ function handleNotification(msg) {
 
     case "turn/completed":
       if (!isCurrentTurnNotification(msg)) break;
-      onTurnCompleted();
+      onTurnCompleted(msg.params?.turn);
       break;
 
     case "error":
@@ -764,10 +765,12 @@ function flushTextReplyFallback() {
   }
 }
 
-async function onTurnCompleted() {
+async function onTurnCompleted(turn = {}) {
   stopTyping();
-  const terminalError = pendingTerminalError;
   const outputSuppressed = suppressTurnOutput;
+  const terminalError = pendingTerminalError || (outputSuppressed && ["failed", "interrupted"].includes(turn.status)
+    ? { errorText: turn.error?.message || `Bootstrap ${turn.status}`, recover: false }
+    : null);
   const recoveryAttempt = activeTurnRecoveryAttempt;
   const channelScopeToken = activeTurnChannelScopeToken;
   const channelId = activeOutputChannelId || CHANNEL_ID;
@@ -790,6 +793,12 @@ async function onTurnCompleted() {
   activeOutputChannelId = null;
   await clearDiscordChannelScope();
   turnActive = false;
+  if (outputSuppressed && bootstrapCompletion) {
+    const complete = bootstrapCompletion;
+    bootstrapCompletion = null;
+    if (terminalError) bridgePaused = true;
+    complete(terminalError);
+  }
   if (terminalError?.recover) {
     console.log("Retrying terminal response.failed turn once");
     await sendTurn(
@@ -825,19 +834,42 @@ async function processQueue() {
   await sendTurn(input, channelId, channelScopeToken);
 }
 
+function canSteerRootScope(channelId, token) {
+  if (channelId !== activeOutputChannelId || !token || !activeTurnChannelScopeToken) return false;
+  try {
+    // Both tokens were minted locally. Keep the active grant unchanged while tools run.
+    const incoming = JSON.parse(Buffer.from(token.split(".")[0], "base64url").toString());
+    const active = JSON.parse(Buffer.from(activeTurnChannelScopeToken.split(".")[0], "base64url").toString());
+    return incoming.channel_id === active.channel_id && incoming.author_id === active.author_id;
+  } catch {
+    return false;
+  }
+}
+
 async function routeInput(input, msg, channelId, channelScopeToken) {
   const queueInput = async () => {
     messageQueue.push({ input, msg, channelId, channelScopeToken });
     if (msg) await msg.react("⏳");
   };
 
-  if (bridgePaused || threadResetting || (ROOT_MULTI_CHANNEL && turnActive)) {
+  const rootScopeMatches = ROOT_MULTI_CHANNEL && canSteerRootScope(channelId, channelScopeToken);
+  if (bridgePaused || threadResetting || (ROOT_MULTI_CHANNEL && turnActive && !rootScopeMatches)) {
     await queueInput();
   } else if (turnActive && activeTurnId && !suppressTurnOutput) {
     try {
+      // Reuse this turn's grant, so in-flight tool calls and the correction remain valid.
+      // Queue fallback retains the original input and its own grant for the next turn.
+      const steerInput = rootScopeMatches
+        ? input.map((part, index) => index === 0 && part.type === "text"
+          ? { ...part, text: part.text.replace(
+            `channel_scope_token: ${channelScopeToken}`,
+            `channel_scope_token: ${activeTurnChannelScopeToken}`,
+          ) }
+          : part)
+        : input;
       await sendRequest("turn/steer", {
         threadId,
-        input,
+        input: steerInput,
         expectedTurnId: activeTurnId,
       });
       console.log(`[steer] Injected into active turn ${activeTurnId}`);
@@ -914,26 +946,29 @@ async function sendBootstrapInstructionTurn(reason, { required = false } = {}) {
   activeTurnRecoveryAttempt = 0;
   activeTurnChannelScopeToken = null;
   resetActiveTurnId();
+  const completed = new Promise((resolve) => { bootstrapCompletion = resolve; });
   try {
     const result = await sendRequest("turn/start", {
       threadId,
-      input: [{ type: "text", text: SYSTEM_INSTRUCTION }],
+      input: [{ type: "text", text: `${SYSTEM_INSTRUCTION}\n\nThis message only configures the transport; it is not a user task. Do not call tools, inspect files, or send a Discord message. Reply with exactly READY as plain text; the bridge hides this acknowledgment.` }],
       approvalPolicy: "never",
     });
     recordExpectedTurnId(result);
-    for (let i = 0; i < 150 && turnActive; i++) {
-      await new Promise((r) => setTimeout(r, 100));
+    // A slow provider must not become locally idle while its turn is still running.
+    const timeoutMs = Number(process.env.CODEX_BOOTSTRAP_TIMEOUT_MS || 60000);
+    let timer;
+    const outcome = await Promise.race([
+      completed,
+      new Promise((resolve) => { timer = setTimeout(() => resolve("timeout"), timeoutMs); }),
+    ]);
+    clearTimeout(timer);
+    if (outcome === "timeout") {
+      // Stop accepting/processing work before cancellation, even if acknowledgment is late.
+      bridgePaused = true;
+      await sendRequest("turn/interrupt", { threadId, turnId: activeTurnId });
+      throw new Error("Bootstrap timed out; active turn interrupted. Restart the session.");
     }
-    deltaBuffer = "";
-    fallbackText = "";
-    if (turnActive) {
-      turnActive = false;
-      resetActiveTurnId();
-      fallbackText = "";
-      mcpReplyCalled = false;
-      suppressTurnOutput = false;
-      processQueue();
-    }
+    if (outcome) throw new Error(outcome.errorText || "Bootstrap turn failed");
     console.log(`Bootstrap instruction sent${reason ? ` (${reason})` : ""}`);
   } catch (err) {
     console.error(`Bootstrap instruction failed${reason ? ` (${reason})` : ""}:`, err);
@@ -942,7 +977,8 @@ async function sendBootstrapInstructionTurn(reason, { required = false } = {}) {
     fallbackText = "";
     mcpReplyCalled = false;
     suppressTurnOutput = false;
-    if (required) throw err;
+    bootstrapCompletion = null;
+    if (required || bridgePaused) throw err;
     processQueue();
   }
 }
@@ -1198,13 +1234,23 @@ function buildReactionInput(reaction, user) {
   };
 }
 
+async function listMcpServers() {
+  const servers = [];
+  let cursor;
+  do {
+    const page = await sendRequest("mcpServerStatus/list", { detail: "full", ...(cursor ? { cursor } : {}) });
+    servers.push(...(page?.data || page?.servers || page?.items || []));
+    cursor = page?.nextCursor;
+  } while (cursor);
+  return servers;
+}
+
 async function registerDiscordMcp() {
   const mcpName = DISCORD_MCP_NAME;
 
   // Remove any other discord MCP servers to prevent cross-session replies
   try {
-    const status = await sendRequest("mcpServerStatus/list", { detail: "full" });
-    const servers = status?.servers || status?.items || [];
+    const servers = await listMcpServers();
     for (const s of servers) {
       const name = s.name || s.id;
       if (name && name.startsWith("discord-") && name !== mcpName) {
@@ -1241,13 +1287,21 @@ async function registerDiscordMcp() {
   await sendRequest("config/mcpServer/reload", null);
   console.log("MCP servers reloaded");
 
-  await new Promise((r) => setTimeout(r, 2000));
-  const status = await sendRequest("mcpServerStatus/list", { detail: "full" });
-  const servers = status?.servers || status?.items || [];
-  const found = Array.isArray(servers)
-    ? servers.find((s) => s.name === mcpName || s.id === mcpName)
-    : null;
-  console.log(`MCP server status: ${found ? JSON.stringify(found.status || "found") : "checking..."}`);
+  const deadline = Date.now() + Number(process.env.CODEX_MCP_READY_TIMEOUT_MS || 30000);
+  do {
+    const servers = await listMcpServers();
+    const found = servers.find((s) => (s.name || s.id) === mcpName);
+    const tools = found?.tools;
+    const hasReply = Array.isArray(tools)
+      ? tools.some((tool) => tool.name === "reply")
+      : tools && Object.values(tools).some((tool) => tool.name === "reply");
+    if (hasReply) {
+      console.log(`MCP server ready: ${mcpName} (reply tool available)`);
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  } while (Date.now() < deadline);
+  throw new Error(`Discord MCP ${mcpName} did not expose the reply tool before startup deadline`);
 }
 
 async function startCodexThread(resumeThreadId = "") {
@@ -1256,7 +1310,7 @@ async function startCodexThread(resumeThreadId = "") {
     cwd: PROJECT_DIR,
     sandbox: "danger-full-access",
     approvalPolicy: "never",
-    developerInstructions: THREAD_INSTRUCTION,
+    developerInstructions: `${THREAD_INSTRUCTION} Use the exposed Discord MCP tools directly. If a tool is deferred, discover it through tool search first. Never reconstruct the Discord transport through shell commands, read its credentials or scope files, or launch a replacement MCP server to send a reply.`,
   });
   if (result?.thread?.id) {
     threadId = result.thread.id;
@@ -1281,7 +1335,7 @@ async function initializeCodex() {
 
   const resumeThreadId = process.env.CODEX_RESUME_THREAD_ID || "";
   await startCodexThread(resumeThreadId);
-  await sendBootstrapInstructionTurn("startup", { required: Boolean(resumeThreadId) });
+  await sendBootstrapInstructionTurn("startup", { required: true });
   console.log(`Codex thread started: ${threadId}`);
 }
 

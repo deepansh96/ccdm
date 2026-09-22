@@ -1777,3 +1777,137 @@ async function injectReactionUntil(workspace, reaction, predicate, timeoutMs = 5
   }
   throw lastError;
 }
+
+test("root steers only the active channel and author, retaining the active grant and safe queue fallback", async () => {
+  const workspace = createBridgeWorkspace();
+  const accessFile = path.join(workspace.tmpDir, "root-steer-access.json");
+  const users = ["allowed-user-id", "second-user-id"];
+  fs.writeFileSync(accessFile, JSON.stringify({ allowFrom: users, groups: {
+    "root-channel": { requireMention: false, allowFrom: users },
+    "other-channel": { requireMention: false, allowFrom: users },
+  } }));
+  const codex = await startFakeCodexServer(workspace, {
+    steer: ["success", "failure"],
+    turns: [
+      { turnId: "root-active", waitForRelease: true, delta: "active done" },
+      { delta: "other channel done" }, { delta: "other author done" }, { delta: "fallback done" },
+    ],
+  });
+  const bridge = startBridge(workspace, {
+    botAppId: "root-bot-id", rootBotAppId: "root-bot-id", channelId: "root-channel", port: codex.port,
+    env: { ROOT_MULTI_CHANNEL: "1", ROOT_ACCESS_FILE: accessFile, CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
+  const messages = (state) => state.fixtures.codex.protocolEvents
+    .filter((e) => e.event === "client-message").map((e) => e.message);
+  const turns = (state) => messages(state).filter((m) => m.method === "turn/start" &&
+    m.params.input?.[0]?.text?.startsWith("Discord routing metadata:"));
+  const grant = (input) => input[0].text.match(/channel_scope_token: (\S+)/)[1];
+  await bridge.waitForOutput(/Root routing active for 2 configured channel/, 7000);
+  await injectMessageUntil(workspace, { channelId: "root-channel", content: "start", id: "root-start" },
+    (state) => turns(state).length === 1);
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const before = readState(workspace.stateDir);
+  const activeGrant = grant(turns(before)[0].params.input);
+  const config = messages(before).find((m) => m.method === "config/value/write" && m.params.keyPath === "mcp_servers.discord-root");
+  const scopeFile = config.params.value.env.DISCORD_CHANNEL_SCOPE_FILE;
+  await injectMessageUntil(workspace, { channelId: "root-channel", content: "correction", id: "root-correction" },
+    (state) => messages(state).some((m) => m.method === "turn/steer"));
+  await bridge.waitForOutput(/Injected into active turn root-active/, 5000);
+  let state = readState(workspace.stateDir);
+  assert.equal(grant(messages(state).find((m) => m.method === "turn/steer").params.input), activeGrant);
+  assert.equal(fs.readFileSync(scopeFile, "utf8"), activeGrant);
+  for (const message of [
+    { channelId: "other-channel", content: "other channel", id: "other-channel-message" },
+    { channelId: "root-channel", content: "other author", id: "other-author-message", author: { id: "second-user-id" } },
+  ]) {
+    await injectMessageUntil(workspace, message,
+      (next) => next.fixtures.discord.reactions.some((r) => r.messageId === message.id && r.emoji === "⏳"));
+  }
+  state = readState(workspace.stateDir);
+  assert.equal(messages(state).filter((m) => m.method === "turn/steer").length, 1);
+  assert.equal(turns(state).length, 1);
+  assert.equal(fs.readFileSync(scopeFile, "utf8"), activeGrant);
+  await injectMessageUntil(workspace, { channelId: "root-channel", content: "fallback", id: "root-fallback" },
+    (next) => messages(next).filter((m) => m.method === "turn/steer").length === 2);
+  await bridge.waitForOutput(/Failed \(stale turn\), queuing instead/, 5000);
+  codex.releaseTurn("root-active");
+  state = await waitForState(workspace,
+    (next) => next.fixtures.discord.sends.some((send) => send.content === "fallback done"), 15000);
+  const queued = turns(state).slice(1);
+  assert.equal(queued.length, 3);
+  assert.match(queued[0].params.input[0].text, /channel_id: other-channel/);
+  assert.match(queued[1].params.input[0].text, /author_id: second-user-id/);
+  assert.match(queued[2].params.input[0].text, /Message:\nfallback/);
+  for (const turn of queued) assert.notEqual(grant(turn.params.input), activeGrant);
+  await bridge.stop();
+});
+
+test("Discord MCP readiness follows data pages and waits for the reply tool before starting a thread", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, { staleMcpName: "discord-stale", mcpReadyAfter: 5, paginatedMcp: true });
+  const bridge = startBridge(workspace, { port: codex.port });
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const messages = codex.clientMessages;
+  assert.ok(messages.some((m) => m.method === "config/value/delete" && m.params.keyPath === "mcp_servers.discord-stale"));
+  const start = messages.findIndex((m) => m.method === "thread/start");
+  assert.ok(messages.slice(0, start).filter((m) => m.method === "mcpServerStatus/list").length >= 4);
+  assert.match(bridge.stdout, /reply tool available/);
+  assert.ok(messages.some((m) => m.method === "mcpServerStatus/list" && m.params.cursor === "discord-page"));
+  const bootstrap = messages.find((m) => m.method === "turn/start");
+  assert.match(bootstrap.params.input[0].text, /Do not call tools, inspect files, or send a Discord message/);
+  assert.match(messages[start].params.developerInstructions, /Never reconstruct the Discord transport/);
+  await bridge.stop();
+});
+
+test("Discord MCP missing reply fails startup without advertising a listener", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, { missingReply: true });
+  const bridge = startBridge(workspace, { port: codex.port, env: { CODEX_MCP_READY_TIMEOUT_MS: "250" } });
+  const result = await bridge.closed;
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /did not expose the reply tool/);
+  assert.ok(!codex.clientMessages.some((m) => m.method === "thread/start"));
+  assert.equal(readState(workspace.stateDir).fixtures.discord.logins.length, 0);
+});
+
+test("slow bootstrap remains tracked beyond the old fifteen-second cutoff", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    bootstrapPlan: { turnId: "slow-bootstrap", waitForRelease: true },
+  });
+  const bridge = startBridge(workspace, { port: codex.port });
+  await waitForState(workspace, (state) => state.fixtures.codex.protocolEvents.some(
+    (e) => e.message?.method === "turn/start"), 7000);
+  await new Promise((resolve) => setTimeout(resolve, 15500));
+  assert.doesNotMatch(bridge.stdout, /Bootstrap instruction sent|Listening in/);
+  assert.equal(readState(workspace.stateDir).fixtures.discord.logins.length, 0);
+  codex.releaseTurn("slow-bootstrap");
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  assert.doesNotMatch(bridge.stdout, /no turn is active/);
+  await bridge.stop();
+});
+
+test("bootstrap deadline explicitly interrupts and fails closed instead of forgetting an active turn", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    bootstrapPlan: { turnId: "blocked-bootstrap", waitForRelease: true },
+  });
+  const bridge = startBridge(workspace, { port: codex.port, env: { CODEX_BOOTSTRAP_TIMEOUT_MS: "250" } });
+  const result = await bridge.closed;
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /Bootstrap timed out/);
+  assert.ok(codex.clientMessages.some((m) => m.method === "turn/interrupt" && m.params.turnId === "blocked-bootstrap"));
+  assert.equal(readState(workspace.stateDir).fixtures.discord.logins.length, 0);
+});
+
+test("failed bootstrap completion without a separate error event fails startup", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    bootstrapPlan: { status: "failed", terminalError: { message: "provider bootstrap failure" } },
+  });
+  const bridge = startBridge(workspace, { port: codex.port });
+  const result = await bridge.closed;
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /provider bootstrap failure/);
+  assert.equal(readState(workspace.stateDir).fixtures.discord.logins.length, 0);
+});
