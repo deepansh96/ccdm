@@ -50,6 +50,7 @@ last_updated: 2026-09-22
 - `scripts/stop-session.sh <project>` - stops either session type and clears runtime state.
 - `scripts/guest-access.js list [project]` - inspects project guest access.
 - `npx mex-agent check` - checks memory scaffold drift.
+- `python3 scripts/setup-codex-mimo.py --home ~/.codex-mimo --billing payg` - prepares an isolated MiMo Codex home (Python 3.10+, recent Codex supporting provider auth commands); use `--billing token-plan` for subscription keys or `--rotate-key` to replace an existing key.
 
 ## Common Issues
 **Duplicate listener refusal:** Run `scripts/stop-session.sh <project>` before retrying start; do not bypass the listener scan.

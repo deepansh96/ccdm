@@ -37,6 +37,7 @@ Then read this file fully before doing anything else in this session.
 - Codex Discord tools can read the last requested 1-10,000 messages in their scoped channel, returning larger reads as private temporary transcripts.
 - Per-project Claude and Codex account, model, and effort overrides are supported.
 - Named Codex Account aliases and `default_codex_account` select root and project Codex Homes, while legacy `codex_home` and root overrides remain supported.
+- `scripts/setup-codex-mimo.py` prepares isolated MiMo Codex homes with private file-backed provider authentication, validated vendor catalogs, and key rotation; existing named-account launchers select them without lifecycle changes.
 - Project Codex launches resolve and validate the selected named or legacy home before MCP cleanup, tmux creation, or PID recording through `scripts/resolve-codex-home.py`.
 - Project Codex launches support explicit `--resume <thread_uuid>` for saved conversations, including a copied rollout after a home change; resume waits for listener readiness and cleans runtime state on failure, without falling back to a fresh thread.
 - The Codex bridge retries a generic terminal `response.failed` once when the failed turn produced no agent work.

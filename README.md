@@ -102,6 +102,76 @@ Do not use `--with-api-key` for a subscription account. Keep each `auth.json`
 and other credential contents private; never put them in the registry, README,
 or logs.
 
+#### MiMo API accounts
+
+MiMo can power the existing Codex CLI/app-server bridge using its Responses
+API. Prepare a separate home with Python 3.10+ and a recent Codex CLI
+(tested with 0.153.4):
+
+```bash
+python3 scripts/setup-codex-mimo.py --home ~/.codex-mimo --billing payg
+```
+
+The command prompts for the key without echoing it. Automation can provide
+`MIMO_API_KEY` or pipe the key through stdin; never put a real key in command
+arguments. For a Token Plan key, use `--billing token-plan` instead. Pay-as-you-go
+uses `https://api.xiaomimimo.com/v1` and an `sk-` key; Token Plan uses
+`https://token-plan-cn.xiaomimimo.com/v1` and a `tp-` or `ttp-` key.
+
+The helper creates a new private home, downloads and validates Xiaomi's model
+catalog, and defaults to `mimo-v2.6-pro` with high reasoning and web search
+disabled. `--model` selects another model present in that catalog with Responses
+lite and reasoning support. `--catalog-file` uses a previously downloaded catalog
+for offline setup. Existing homes and paths inside this checkout are rejected.
+No registry, default account, or running session is changed by the helper.
+
+Credentials live in the home's `api-key` file (mode `0600`, home mode `0700`).
+Codex's provider authentication command reads that file directly, so standalone
+Codex and CCDM/tmux launches do not need an inherited `MIMO_API_KEY`. This home
+does not require OpenAI `codex login`. Keep the entire home outside the repository.
+
+Add an alias to the existing `codex_accounts` object in ignored `registry.json`,
+preserving its other entries and the current default:
+
+```json
+"mimo": "~/.codex-mimo"
+```
+
+On a registered Codex project, set `"codex_account": "mimo"`. Remove a legacy
+project `codex_home` selector and any incompatible GPT model or service-tier
+override; omit `codex_model` to use the MiMo home's model. Stop the selected
+project with `scripts/stop-session.sh <project>`, then start it with
+`scripts/start-codex-session.sh <project>`. Other sessions need no restart.
+To switch back, restore that project's previous selector and restart it.
+
+Before assigning a bot, test the home in a disposable directory:
+
+```bash
+CODEX_HOME=$HOME/.codex-mimo codex exec --strict-config --skip-git-repo-check \
+  -C /tmp -s read-only 'What is 2 + 2? Reply only with the answer.'
+```
+
+Replace a testing key later without overwriting configuration, MCP entries,
+catalogs, or history:
+
+```bash
+python3 scripts/setup-codex-mimo.py --home ~/.codex-mimo --billing payg --rotate-key
+```
+
+Use the home's original billing option; switching billing endpoints requires a
+new home. The `ccdm-mimo.json` file records that original billing option for
+rotation. Restart sessions using that home after rotation to refresh authentication.
+
+The vendor catalog enables `use_responses_lite`, needed for custom tools.
+Reasoning support comes from the catalog: the vendor guide's older top-level
+`model_supports_reasoning_summaries` setting is rejected by Codex 0.153.4's strict
+configuration parser and is deliberately omitted. The setup command validates
+catalog metadata but does not make a billable inference call or verify balance.
+MiMo billing/quota reporting is not added to CCDM's ChatGPT usage dashboards.
+
+References: [MiMo Codex integration](https://mimo.mi.com/docs/en-US/tokenplan/integration/codex-configuration)
+and [Codex provider configuration](https://learn.chatgpt.com/docs/config-file/config-reference).
+
 #### Precedence and legacy compatibility
 
 The **Legacy Codex Home Override** is a raw `codex_home` path retained for
