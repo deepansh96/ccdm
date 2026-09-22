@@ -898,7 +898,7 @@ async function sendTurn(
   }
 }
 
-async function sendBootstrapInstructionTurn(reason) {
+async function sendBootstrapInstructionTurn(reason, { required = false } = {}) {
   if (!threadId) return;
   if (turnActive) {
     pendingBootstrapInstructionReason = reason || "pending";
@@ -942,6 +942,7 @@ async function sendBootstrapInstructionTurn(reason) {
     fallbackText = "";
     mcpReplyCalled = false;
     suppressTurnOutput = false;
+    if (required) throw err;
     processQueue();
   }
 }
@@ -1278,8 +1279,9 @@ async function initializeCodex() {
 
   await registerDiscordMcp();
 
-  await startCodexThread(process.env.CODEX_RESUME_THREAD_ID || "");
-  await sendBootstrapInstructionTurn("startup");
+  const resumeThreadId = process.env.CODEX_RESUME_THREAD_ID || "";
+  await startCodexThread(resumeThreadId);
+  await sendBootstrapInstructionTurn("startup", { required: Boolean(resumeThreadId) });
   console.log(`Codex thread started: ${threadId}`);
 }
 

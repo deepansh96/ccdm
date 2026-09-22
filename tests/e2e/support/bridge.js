@@ -220,6 +220,10 @@ export async function startFakeCodexServer(workspace, options = {}) {
           break;
         case "turn/start": {
           const isSystem = message.params?.input?.[0]?.text?.startsWith("You are communicating with the user via Discord");
+          if (isSystem && options.bootstrapError) {
+            replyError({ code: -32000, message: options.bootstrapError });
+            break;
+          }
           const plan = isSystem ? { delta: "", complete: true } : (turnPlans.shift() ?? { delta: "Codex response", complete: true });
           const turnId = plan.turnId ?? `turn-${Date.now()}`;
           const notificationTurnId = plan.notificationTurnId ?? turnId;

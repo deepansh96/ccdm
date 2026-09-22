@@ -253,6 +253,24 @@ test("failed resume never silently starts a fresh conversation", async () => {
   await bridge.stop();
 });
 
+test("resumed startup fails when the fresh Discord instructions are rejected", async () => {
+  const workspace = createBridgeWorkspace();
+  const readyFile = path.join(workspace.tmpDir, "ready");
+  const codex = await startFakeCodexServer(workspace, { bootstrapError: "Bootstrap rejected" });
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_RESUME_THREAD_ID: "saved-thread", CODEX_STARTUP_READY_FILE: readyFile },
+  });
+  await bridge.waitForOutput(/Fatal:/, 5000);
+  assert.equal((await bridge.closed).exitCode, 1);
+  assert.ok(codex.clientMessages.some((m) => m.method === "thread/resume"));
+  assert.ok(codex.clientMessages.some((m) => m.method === "turn/start"));
+  assert.ok(!codex.clientMessages.some((m) => m.method === "thread/start"));
+  assert.match(bridge.stderr, /Bootstrap rejected/);
+  assert.equal(fs.existsSync(readyFile), false);
+  assert.equal(readState(workspace.stateDir).fixtures.discord.logins.length, 0);
+});
+
 test("bridge boots, registers Discord MCP, removes stale MCP, and completes one allowed text turn with opt-in text fallback", async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, {
@@ -1185,6 +1203,8 @@ test("bridge sends the bootstrap instruction turn after idle compact completion"
     (nextState) => nextState.fixtures.discord.sends.some((send) => send.content === "Compaction complete."),
     15000,
   );
+  // Compaction can announce completion before its queued instruction refresh finishes.
+  await bridge.waitForOutput(/Bootstrap instruction sent \(compact\)/, 5000);
   const state = readState(workspace.stateDir);
   const bootstrapTurns = state.fixtures.codex.protocolEvents
     .filter((event) => event.event === "client-message")
