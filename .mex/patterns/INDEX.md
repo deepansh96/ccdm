@@ -16,3 +16,4 @@ Lookup table for all pattern files in this directory. Check here before starting
 | [register-project.md](register-project.md) | Assigning a pool bot to a project or releasing it |
 | [publish-public-repo.md](publish-public-repo.md) | Auditing changes for private data before an authorized public commit and push |
 | [setup-mimo-codex.md](setup-mimo-codex.md) | Preparing or rotating an isolated MiMo home for Codex sessions |
+| [setup-deepseek-codex.md](setup-deepseek-codex.md) | Preparing or rotating an isolated DeepSeek Flash home for Codex sessions |
