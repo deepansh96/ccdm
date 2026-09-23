@@ -243,6 +243,21 @@ test("stop-session sweeps orphan Claude and Codex listener processes", async () 
   assert.equal(isAlive(appServerPid), false);
 });
 
+test("stop-session sweeps an orphaned direct Bun Discord plugin server", async () => {
+  const workspace = createWorkspace();
+  const registry = buildRegistry(workspace);
+  seedRegistry(workspace, registry);
+  const stateDir = registry.pool.find(bot => bot.id === "bot2").state_dir;
+  const pluginServer = path.join(workspace.homeDir, ".claude", "plugins", "cache", "claude-plugins-official", "discord", "0.0.4", "server.ts");
+  const orphanPid = spawnOwnedProcess(workspace, `bun '${pluginServer}' DISCORD_STATE_DIR='${stateDir}'`);
+
+  const result = await stopProject(workspace);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, new RegExp(String(orphanPid)));
+  assert.equal(isAlive(orphanPid), false);
+});
+
 test("stop-session escalates SIGTERM-resistant child processes to SIGKILL", async () => {
   const workspace = createWorkspace();
   const registry = buildRegistry(workspace);
@@ -295,6 +310,81 @@ test("restart-root-agent simulates root_agent cleanup, retry, fresh launch, and 
   assert.equal(session.env.DISCORD_STATE_DIR, "~/.claude/channels/discord");
   assert.deepEqual(session.sendKeys, [["Enter"]]);
   assert.equal(session.killAttempts, 2);
+});
+
+test("opt-in root Claude launch filters project /close through the same channel", async () => {
+  const workspace = createWorkspace();
+  const registry = buildRegistry(workspace);
+  registry.root_bot_app_id = "root-app-id";
+  seedRegistry(workspace, registry);
+  const pluginDir = path.join(workspace.homeDir, ".claude", "plugins", "cache", "claude-plugins-official", "discord", "0.0.4");
+  fs.mkdirSync(pluginDir, { recursive: true });
+  fs.writeFileSync(path.join(pluginDir, "server.ts"), "// fixture official plugin\n");
+
+  const result = await runScript(workspace, "restart-root-agent.sh", { env: { CCDM_CLAUDE_REMINDER_ADAPTER: "1" } });
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const session = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
+  assert.match(session.shellCommand, /--dangerously-load-development-channels server:discord/);
+  assert.doesNotMatch(session.shellCommand, /--channels plugin:discord/);
+  const config = JSON.parse(fs.readFileSync(path.join(workspace.homeDir, ".claude", "channels", "discord", "ccdm-root-reminder-mcp.json"), "utf8"));
+  assert.deepEqual(config.mcpServers.discord.args, [path.join(workspace.repoDir, "scripts", "claude-reminder-channel.js")]);
+  assert.equal(config.mcpServers.discord.env.CCDM_CLAUDE_ROOT_APP_ID, "root-app-id");
+  const settings = JSON.parse(fs.readFileSync(path.join(workspace.homeDir, ".claude", "channels", "discord", "ccdm-root-reminder-settings.json"), "utf8"));
+  assert.equal(settings.enabledPlugins["discord@claude-plugins-official"], false);
+});
+
+test("root Claude reminder launch passes a selected root state directory to its listener", async () => {
+  const workspace = createWorkspace();
+  const registry = buildRegistry(workspace);
+  registry.root_bot_app_id = "root-app-id";
+  seedRegistry(workspace, registry);
+  const pluginDir = path.join(workspace.homeDir, ".claude", "plugins", "cache", "claude-plugins-official", "discord", "0.0.4");
+  fs.mkdirSync(pluginDir, { recursive: true });
+  fs.writeFileSync(path.join(pluginDir, "server.ts"), "// fixture official plugin\n");
+  const selectedState = path.join(workspace.homeDir, "selected-root-discord");
+
+  const result = await runScript(workspace, "restart-root-agent.sh", {
+    env: { CCDM_CLAUDE_REMINDER_ADAPTER: "1", ROOT_DISCORD_STATE_DIR: selectedState },
+  });
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const session = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
+  assert.ok(session.shellCommand.includes(`DISCORD_STATE_DIR='${selectedState}'`));
+  const config = JSON.parse(fs.readFileSync(path.join(selectedState, "ccdm-root-reminder-mcp.json"), "utf8"));
+  assert.equal(config.mcpServers.discord.env.DISCORD_STATE_DIR, selectedState);
+});
+
+test("root Claude reminder launch derives its mention identity from root state", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, buildRegistry(workspace));
+  const pluginDir = path.join(workspace.homeDir, ".claude", "plugins", "cache", "claude-plugins-official", "discord", "0.0.4");
+  fs.mkdirSync(pluginDir, { recursive: true });
+  fs.writeFileSync(path.join(pluginDir, "server.ts"), "// fixture official plugin\n");
+  const rootState = path.join(workspace.homeDir, ".claude", "channels", "discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), `DISCORD_BOT_TOKEN=${Buffer.from("87654321").toString("base64url")}.fixture.fixture\n`);
+
+  const result = await runScript(workspace, "restart-root-agent.sh", { env: { CCDM_CLAUDE_REMINDER_ADAPTER: "1" } });
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const config = JSON.parse(fs.readFileSync(path.join(rootState, "ccdm-root-reminder-mcp.json"), "utf8"));
+  assert.equal(config.mcpServers.discord.env.CCDM_CLAUDE_ROOT_APP_ID, "87654321");
+});
+
+test("root Claude reminder launch rejects an unproven version before teardown", async () => {
+  const workspace = createWorkspace();
+  const registry = buildRegistry(workspace);
+  registry.root_bot_app_id = "root-app-id";
+  seedRegistry(workspace, registry);
+  const pluginDir = path.join(workspace.homeDir, ".claude", "plugins", "cache", "claude-plugins-official", "discord", "0.0.4");
+  fs.mkdirSync(pluginDir, { recursive: true });
+  fs.writeFileSync(path.join(pluginDir, "server.ts"), "// fixture official plugin\n");
+  seedTmuxSession("root_agent", { paneOutput: "existing root\n" }, { stateDir: workspace.stateDir });
+
+  const result = await runScript(workspace, "restart-root-agent.sh", {
+    env: { CCDM_CLAUDE_REMINDER_ADAPTER: "1", CCDM_FIXTURE_CLAUDE_VERSION: "1.0.0 (Claude Code fixture)" },
+  });
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /unsupported Claude Code version/);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent.paneOutput, "existing root\n");
 });
 
 test("restart-root-codex-agent starts the root bot through the Codex bridge", async () => {

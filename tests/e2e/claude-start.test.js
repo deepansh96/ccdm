@@ -172,6 +172,68 @@ test("start-session starts a Claude project through tmux and records PID/session
   assert.equal(fs.existsSync(path.join(workspace.homeDir, ".claude", ".claude.json")), false);
 });
 
+test("opt-in Claude reminder launch uses one filtered channel and command hooks", async () => {
+  const workspace = createWorkspace();
+  const registry = buildClaudeRegistry(workspace);
+  registry.root_bot_app_id = "root-app";
+  seedRegistry(workspace, registry);
+  const pluginDir = path.join(workspace.homeDir, ".claude", "plugins", "cache", "claude-plugins-official", "discord", "0.0.4");
+  fs.mkdirSync(pluginDir, { recursive: true });
+  fs.writeFileSync(path.join(pluginDir, "server.ts"), "// fixture official plugin\n");
+
+  const result = await runScript(workspace, "scripts/start-session.sh", {
+    args: ["alpha"], env: { CCDM_CLAUDE_REMINDER_ADAPTER: "1" },
+  });
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session;
+  assert.match(session.shellCommand, /--dangerously-load-development-channels server:discord/);
+  assert.doesNotMatch(session.shellCommand, /--channels plugin:discord/);
+  assert.match(session.shellCommand, /--settings/);
+  const mcp = JSON.parse(fs.readFileSync(path.join(registry.pool[0].state_dir, "ccdm-message-export-mcp.json"), "utf8"));
+  assert.equal(mcp.mcpServers.discord.command, "node");
+  assert.deepEqual(mcp.mcpServers.discord.args, [path.join(workspace.repoDir, "scripts", "claude-reminder-channel.js")]);
+  assert.equal(mcp.mcpServers["discord-message-export"].env.DISCORD_MCP_EXPORT_ONLY, "1");
+  const settings = JSON.parse(fs.readFileSync(path.join(registry.pool[0].state_dir, "ccdm-conversation-reminder-hooks.json"), "utf8"));
+  assert.equal(settings.enabledPlugins["discord@claude-plugins-official"], false);
+});
+
+test("Claude reminder launch derives root mention identity from root state", async () => {
+  const workspace = createWorkspace();
+  const registry = buildClaudeRegistry(workspace);
+  seedRegistry(workspace, registry);
+  const pluginDir = path.join(workspace.homeDir, ".claude", "plugins", "cache", "claude-plugins-official", "discord", "0.0.4");
+  fs.mkdirSync(pluginDir, { recursive: true });
+  fs.writeFileSync(path.join(pluginDir, "server.ts"), "// fixture official plugin\n");
+  const rootState = path.join(workspace.homeDir, ".claude", "channels", "discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), `DISCORD_BOT_TOKEN=${Buffer.from("12345678").toString("base64url")}.fixture.fixture\n`);
+
+  const result = await runScript(workspace, "scripts/start-session.sh", {
+    args: ["alpha"], env: { CCDM_CLAUDE_REMINDER_ADAPTER: "1" },
+  });
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const mcp = JSON.parse(fs.readFileSync(path.join(registry.pool[0].state_dir, "ccdm-message-export-mcp.json"), "utf8"));
+  assert.equal(mcp.mcpServers.discord.env.CCDM_CLAUDE_ROOT_APP_ID, "12345678");
+});
+
+test("Claude reminder launch rejects an unproven Claude Code version before tmux", async () => {
+  const workspace = createWorkspace();
+  const registry = buildClaudeRegistry(workspace);
+  registry.root_bot_app_id = "root-app";
+  seedRegistry(workspace, registry);
+  const pluginDir = path.join(workspace.homeDir, ".claude", "plugins", "cache", "claude-plugins-official", "discord", "0.0.4");
+  fs.mkdirSync(pluginDir, { recursive: true });
+  fs.writeFileSync(path.join(pluginDir, "server.ts"), "// fixture official plugin\n");
+
+  const result = await runScript(workspace, "scripts/start-session.sh", {
+    args: ["alpha"],
+    env: { CCDM_CLAUDE_REMINDER_ADAPTER: "1", CCDM_FIXTURE_CLAUDE_VERSION: "1.0.0 (Claude Code fixture)" },
+  });
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /unsupported Claude Code version/);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session, undefined);
+});
+
 test("start-session honors Claude model and effort overrides", async () => {
   const workspace = createWorkspace();
   const registrySeed = buildClaudeRegistry(workspace);

@@ -205,12 +205,12 @@ def validate_event(event: object) -> dict:
         raise ValueError("event_time must include a timezone")
     normalized = dict(event)
     normalized["event_order"] = _event_order_key(event["event_order"])
-    if normalized["provider"] not in {"codex", "ccdm-root"}:
+    if normalized["provider"] not in {"codex", "claude", "ccdm-root"}:
         raise ValueError("unsupported event provider")
     event_type = normalized["event_type"]
-    if event_type in {"response_delivered", "turn_completed", "input_needed", "work_resumed", "session_terminated"} and normalized["provider"] != "codex":
-        raise ValueError("provider lifecycle events require the Codex adapter")
-    if event_type in {"owner_activity", "close_requested"} and normalized["provider"] not in {"codex", "ccdm-root"}:
+    if event_type in {"response_delivered", "turn_completed", "input_needed", "work_resumed", "session_terminated"} and normalized["provider"] not in {"codex", "claude"}:
+        raise ValueError("provider lifecycle events require a project adapter")
+    if event_type in {"owner_activity", "close_requested"} and normalized["provider"] not in {"codex", "claude", "ccdm-root"}:
         raise ValueError("owner events require a registered CCDM adapter")
     if event_type in {"response_delivered", "input_needed", "turn_completed", "work_resumed"}:
         for field in ("provider_session_id", "provider_turn_id", "message_id", "interaction_id"):
@@ -254,9 +254,8 @@ def _assignment_result(registry: dict, event: dict) -> tuple[str | None, str | N
         return "stale", "project channel or bot assignment changed"
     if assignment["generation"] != event["assignment_generation"]:
         return "stale", "project assignment generation changed"
-    if event["event_type"] in {"response_delivered", "turn_completed", "input_needed", "work_resumed", "session_terminated"}:
-        if (assignment["project"].get("type") or "claude") != "codex":
-            return "rejected", "Codex lifecycle event targets a non-Codex project"
+    if event["provider"] in {"codex", "claude"} and (assignment["project"].get("type") or "claude") != event["provider"]:
+        return "rejected", "adapter event targets a different project provider"
     if event["event_type"] in {"owner_activity", "close_requested"} and event.get("actor_id") != assignment["owner_id"]:
         return "rejected", "owner event actor does not match the registered owner"
     return None, None

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Show whether one registered Codex project supports observe-only reminder events."""
+"""Show whether one registered project supports observe-only reminder events."""
 
 from __future__ import annotations
 
@@ -46,8 +46,26 @@ def build_readiness(project_name: str, project_root: Path, state_dir: Path) -> d
             "bot_id": assignment["bot_id"],
             "generation": assignment["generation"],
         }
-        if provider != "codex":
-            unsupported_capabilities.append(f"provider {provider} does not have a Codex adapter")
+        if provider not in {"codex", "claude"}:
+            unsupported_capabilities.append(f"provider {provider} has no reminder adapter")
+        if provider == "claude":
+            if str(project.get("path") or "").startswith("remote:"):
+                unsupported_capabilities.append("remote Claude adapter deployment is not verified by local readiness")
+            try:
+                capability = json.loads((state_dir / "capabilities" / f"{project_name}.json").read_text())
+            except (OSError, json.JSONDecodeError):
+                capability = {}
+            verified = (
+                capability.get("assignment_generation") == assignment["generation"]
+                and capability.get("channel_id") == assignment["channel_id"]
+                and capability.get("transport") == "official-discord-stdio-proxy"
+                and capability.get("plugin_version") == "0.0.4"
+                and capability.get("server_version") == "1.0.0"
+                and capability.get("hooks_configured") is True
+                and capability.get("reply_tool_verified") is True
+            )
+            if not verified:
+                unsupported_capabilities.append("Claude launch-scoped transport is not verified for this assignment")
         if not assignment["bot"].get("token"):
             missing_credentials.append("assigned_project_bot_token")
         if not assignment["bot"].get("app_id"):
@@ -76,11 +94,11 @@ def build_readiness(project_name: str, project_root: Path, state_dir: Path) -> d
         "unsupported_capabilities": unsupported_capabilities,
         "assignment": assignment_summary,
         "capabilities": {
-            "scoped_reply_receipts": provider == "codex",
-            "attachment_reply_receipts": provider == "codex",
+            "scoped_reply_receipts": provider in {"codex", "claude"},
+            "attachment_reply_receipts": provider in {"codex", "claude"},
             "successful_text_fallback_receipts": provider == "codex",
-            "progress_input_needed_disposition": provider == "codex",
-            "active_turn_resume_events": provider == "codex",
+            "progress_input_needed_disposition": provider in {"codex", "claude"},
+            "active_turn_resume_events": provider in {"codex", "claude"},
             "owner_activity_events": True,
             "exact_close_interception": True,
             "durable_event_replay": receiver.get("available", False),
@@ -88,7 +106,11 @@ def build_readiness(project_name: str, project_root: Path, state_dir: Path) -> d
         "event_receiver": receiver,
         "events": receiver.get("events", []),
         "tested_runtime": {
-            "bridge_contract": "Codex app-server JSON-RPC over WebSocket; local fake in the default E2E suite",
+            "bridge_contract": (
+                "Claude Code 2.1.281 command hooks and official Discord plugin 0.0.4 MCP stdio; local fake in the default E2E suite"
+                if provider == "claude" else
+                "Codex app-server JSON-RPC over WebSocket; local fake in the default E2E suite"
+            ),
             "provider_login_used": False,
         },
     }
@@ -105,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(readiness, sort_keys=True))
     else:
-        print(f"Codex Conversation Reminder adapter: {readiness['status']}")
+        print(f"{readiness['provider'].capitalize()} Conversation Reminder adapter: {readiness['status']}")
         print(f"Project: {readiness['project']}")
         print(f"Event receiver: {'available' if readiness['event_receiver']['available'] else 'unavailable'}")
         print("Reminder delivery: disabled")

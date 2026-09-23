@@ -18,7 +18,7 @@ edges:
     condition: when changing bot permissions, guest access, channel routing, or credentials
   - target: patterns/INDEX.md
     condition: when starting a task — check the pattern index for a matching pattern file
-last_updated: 2026-09-23
+last_updated: 2026-09-24
 ---
 
 # Session Bootstrap
@@ -32,6 +32,7 @@ Then read this file fully before doing anything else in this session.
 - Guest management and usage reporting read root credentials from root Discord state. Exports no longer borrow an unrelated pool token, and project launches no longer pass management credentials, allowing project bots to run without Administrator.
 - Root bot manages a registry-backed pool of isolated Discord project bots.
 - Claude sessions run through the official Discord plugin; Codex sessions run through `scripts/codex-bridge.js`.
+- Opt-in Claude project launches can route that plugin through a launch-scoped reminder adapter that filters `/close` and records observe-only reply and lifecycle events; reminder delivery remains disabled.
 - Start, stop, registration, guest access, command relay, voice transcription, and local-fake E2E coverage are present.
 - Local Claude and Codex project bots can export an inclusive Discord message range to a temporary text file.
 - Codex Discord tools can read the last requested 1-10,000 messages in their scoped channel, returning larger reads as private temporary transcripts.

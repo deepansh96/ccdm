@@ -1,0 +1,38 @@
+# Claude Project Conversation readiness adapter
+
+This prerequisite observes Claude Project Conversations and filters `/close` before Claude receives it. It does not close conversation state, send ✅, schedule or send Conversation Reminders, or enable delivery. Use the [readiness command](conversation-reminder-codex-adapter.md#readiness) to inspect committed events and pending outbox entries.
+
+## Launch
+
+The supported local combination tested on 2026-09-24 is Claude Code `2.1.281`, official `discord@claude-plugins-official` plugin `0.0.4` (its MCP server reports `1.0.0`), Bun `1.3.11`, Node `22.20.0`, and Python `3.10.4`. `start-session.sh` rejects other Claude Code versions or a missing pinned plugin before tmux starts. The MCP proxy rejects a changed server identity or missing channel/reply capabilities. The default E2E proof uses protocol fakes; it does not log in to Claude or Discord.
+
+For a registered local Claude project, install the official plugin in the selected Claude home, then start the opt-in launch:
+
+```sh
+CCDM_CLAUDE_REMINDER_ADAPTER=1 scripts/start-session.sh <project>
+python3 scripts/conversation-reminder-readiness.py <project> --json
+```
+
+Stop its existing session first with `scripts/stop-session.sh <project>`; duplicate-listener checks reject a replacement while the old project listener exists. The project launcher preserves `claude_home`, model, effort, `zsh -ic`, and the export-only Discord MCP server. It generates private MCP and command-hook settings in the assigned bot state directory. `--dangerously-load-development-channels server:discord` loads the filtered channel during Claude's research preview; its first-use consent may need an operator. The launch settings disable the separately installed official Discord MCP server for that one session, so the maintained proxy owns the sole official plugin child/Gateway connection. The proxy runs the installed `server.ts` directly through Bun, without the package `start` script's install step; the plugin cache is read but never edited.
+
+The root Claude restart script accepts the same opt-in variable for root-management routing in registered project channels. Its preflight checks precede root teardown. It loads the filtered channel with the root bot identity derived from root state (or `root_bot_app_id`) and disables the parallel plugin server for that launch. The root path has no project lifecycle hooks; it filters project-channel `/close` before root management sees it. Neither launcher changes Discord permissions or starts an additional project Gateway listener.
+
+`python3 scripts/conversation-reminder-readiness.py <project> --json` reports `ready-observe-only` only when the current assignment has a verified local Claude transport marker, the pinned plugin/server contract and discovered `reply` tool schema, a private launch settings file containing command hooks, a single-listener configuration, an assigned bot credential, and the durable receiver. It reports blocked assignments and pending events without printing credentials or conversation bodies. A ready result proves the local launch contract, not a current Discord connection or remote deployment. `delivery_enabled` and `reminders_enabled` remain `false`.
+
+## Transport and hook contract
+
+The official plugin applies its own Discord access gate, then emits MCP `notifications/claude/channel` with `content` and `meta.chat_id`, `meta.message_id`, and `meta.user_id`. The launch-scoped stdio proxy receives these actual notifications. It permits normal gated messages in the assigned project channel, records owner activity, and drops an exact trimmed `/close` before forwarding. The assigned or root bot mention may precede `/close` with whitespace; guests' allowed `/close` messages are consumed without an owner event. A root Claude launch applies the same filter to registered project channels. Project tool calls and inbound notifications are confined to the assigned channel. The proxy does not classify natural language or rely on a prompt hook to intercept commands.
+
+The proxy extends the official `reply` tool schema with required `conversation_interaction_id`, copied from the inbound owner `message_id`, and optional `conversation_disposition` (`progress` by default or `input-needed`). It removes those fields before the official plugin handles the call. Only a successful official `reply` result with Discord message IDs creates `response_delivered`; an `input-needed` receipt also creates `input_needed` while Claude may still be active. Failed replies, edits, reactions, and tool starts do not qualify. Replies lacking a valid interaction ID can still be delivered, but they do not qualify completion. Receipt IDs and metadata are persisted privately through the shared version-1 event outbox and assignment-bound receiver.
+
+Launch settings install **command hooks only**; no hook invokes a model. `SessionStart` receives `session_id` and binds it to the unique launch ID and assignment generation. `Stop` receives `session_id`, `stop_hook_active`, `background_tasks`, and `session_crons`. It emits `turn_completed` for confirmed replies only when both task arrays are present and empty. Missing task-registry fields or ongoing background work are treated as unfinished. `StopFailure` discards pending completion markers. `SessionEnd` emits `session_terminated`. New owner input after a still-active input-needed receipt emits `work_resumed`; once a Stop hook clears that receipt marker, later owner input does not claim active resumption. Hook payload text and transcript bodies are never stored.
+
+The receiver can return committed, duplicate, stale, rejected, or retryable failure. The adapter writes an outbox record before ingestion; a receiver outage leaves that record private for `scripts/conversation-reminder-events.py drain` or the next adapter run. As with the Codex prerequisite, `close_requested` is a command event, not a completed closure or acknowledgment.
+
+## Remote projects and compatibility
+
+A remote Claude runtime needs this same maintained checkout, pinned Claude/plugin versions, Node/Bun/Python, the opt-in launch configuration, its assigned bot state and access policy, an assignment-bound private registry entry, and a secure route for its durable events to the shared consumer. The operator must deploy and verify those pieces on that host; local registration does not install the adapter remotely. A remote channel without them is unsupported for reminder delivery. Do not copy root or other project credentials to fill in a missing remote assignment, and do not treat a local readiness marker as proof of a remote runtime.
+
+If the pinned CLI, plugin channel protocol, hook payloads, development-channel policy, or single-listener setting cannot be verified for an operator's deployment, keep readiness blocked and leave reminder enablement off. The tested local fake proof establishes completion, progress, input-needed, `/close`, resumed work, receiver replay, version rejection, and project/root routing; a separately opted-in live smoke test would be needed to establish real provider and Discord compatibility.
+
+References: [Claude channels contract](https://code.claude.com/docs/en/channels-reference), [Claude command-hook payloads](https://code.claude.com/docs/en/hooks), [Claude settings precedence](https://code.claude.com/docs/en/settings).

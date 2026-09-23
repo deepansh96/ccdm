@@ -80,15 +80,22 @@ def is_listener(command: str) -> bool:
     if exe in {"tmux", "zsh", "bash", "sh", "fish", "login"}:
         return False
 
-    if exe == "claude" and "--channels" in argv and any(
-        arg.startswith("plugin:discord") for arg in argv
+    if exe == "claude" and (
+        ("--channels" in argv and any(arg.startswith("plugin:discord") for arg in argv))
+        or ("--dangerously-load-development-channels" in argv and "server:discord" in argv)
     ):
+        return True
+    if exe == "node" and any(os.path.basename(arg) == "claude-reminder-channel.js" for arg in argv[1:]):
         return True
     if exe == "claude-channel-discord":
         return True
     if exe == "bun" and "run" in argv and has_claude_discord_cwd(argv):
         return True
-    if exe == "bun" and any(os.path.basename(arg) == "server.ts" for arg in argv[1:]) and has_claude_discord_plugin_root(command):
+    if exe == "bun" and any(
+        os.path.basename(arg) == "server.ts" and
+        (is_discord_plugin_path(arg) or has_claude_discord_plugin_root(command))
+        for arg in argv[1:]
+    ):
         return True
     return False
 
@@ -143,8 +150,9 @@ def is_claude_discord_process(command: str) -> bool:
     exe = os.path.basename(argv[0])
     if exe in {"tmux", "zsh", "bash", "sh", "fish", "login"}:
         return False
-    return exe == "claude" and "--channels" in argv and any(
-        arg.startswith("plugin:discord") for arg in argv
+    return exe == "claude" and (
+        ("--channels" in argv and any(arg.startswith("plugin:discord") for arg in argv))
+        or ("--dangerously-load-development-channels" in argv and "server:discord" in argv)
     )
 
 def find_pid() -> int | None:
@@ -269,32 +277,113 @@ if [[ -n "$EXISTING_PIDS" ]]; then
 fi
 
 MCP_CONFIG="$STATE_DIR/ccdm-message-export-mcp.json"
-python3 - "$MCP_CONFIG" "$SCRIPT_DIR/discord-mcp-server.js" "$CHANNEL_ID" "$STATE_DIR" <<'PY'
+REMINDER_ADAPTER="${CCDM_CLAUDE_REMINDER_ADAPTER:-0}"
+SETTINGS_FLAG=""
+CHANNEL_FLAG="--channels plugin:discord@claude-plugins-official"
+if [[ "$REMINDER_ADAPTER" == "1" ]]; then
+  CHANNEL_FLAG="--dangerously-load-development-channels server:discord"
+  SETTINGS_FLAG=" --settings '$STATE_DIR/ccdm-conversation-reminder-hooks.json'"
+fi
+python3 - "$MCP_CONFIG" "$SCRIPT_DIR/discord-mcp-server.js" "$CHANNEL_ID" "$STATE_DIR" "$REMINDER_ADAPTER" "$ROOT_DIR" "$PROJECT" "$CLAUDE_HOME" <<'PY'
 import json
 import os
 import sys
+import base64
+import re
+import subprocess
+from pathlib import Path
+from uuid import uuid4
 
-config_path, server_script, channel_id, state_dir = sys.argv[1:5]
+config_path, server_script, channel_id, state_dir, adapter_enabled, root_dir, project, claude_home = sys.argv[1:9]
 os.makedirs(os.path.dirname(config_path), exist_ok=True)
-with open(config_path, "w") as f:
-    json.dump({
-        "mcpServers": {
-            "discord-message-export": {
-                "command": "node",
-                "args": [server_script],
-                "env": {
-                    "CHANNEL_ID": channel_id,
-                    "DISCORD_STATE_DIR": state_dir,
-                    "DISCORD_MCP_EXPORT_ONLY": "1",
-                },
+config = {
+    "mcpServers": {
+        "discord-message-export": {
+            "command": "node",
+            "args": [server_script],
+            "env": {
+                "CHANNEL_ID": channel_id,
+                "DISCORD_STATE_DIR": state_dir,
+                "DISCORD_MCP_EXPORT_ONLY": "1",
             },
         },
-    }, f, indent=2)
+    },
+}
+if adapter_enabled == "1":
+    version = subprocess.run(["claude", "--version"], capture_output=True, text=True)
+    if version.returncode != 0 or not re.match(r"^2\.1\.281(?:\s|$)", version.stdout.strip()):
+        sys.exit("Claude reminder adapter: unsupported Claude Code version (tested: 2.1.281)")
+    registry = json.loads((Path(root_dir) / "registry.json").read_text())
+    bot_id = registry["projects"][project]["bot_id"]
+    bots = [bot for bot in registry["pool"] if bot.get("id") == bot_id]
+    if len(bots) != 1 or not bots[0].get("app_id"):
+        sys.exit("Claude reminder adapter requires an unambiguous assigned bot app ID")
+    root_app_id = registry.get("root_bot_app_id") or ""
+    root_env = Path(os.environ.get("ROOT_DISCORD_STATE_DIR") or Path.home() / ".claude" / "channels" / "discord") / ".env"
+    if root_env.is_file():
+        match = re.search(r"^DISCORD_BOT_TOKEN=(\S+)", root_env.read_text(), re.MULTILINE)
+        if match:
+            encoded_id = match.group(1).split(".")[0]
+            try:
+                root_app_id = base64.urlsafe_b64decode(encoded_id + "=" * (-len(encoded_id) % 4)).decode("ascii")
+            except (ValueError, UnicodeDecodeError):
+                pass
+    if not root_app_id:
+        sys.exit("Claude reminder adapter requires root bot identity")
+    selected_home = Path(claude_home) if claude_home else Path.home() / ".claude"
+    plugin_dir = selected_home / "plugins" / "cache" / "claude-plugins-official" / "discord" / "0.0.4"
+    if not (plugin_dir / "server.ts").is_file():
+        sys.exit("Claude reminder adapter requires installed official Discord plugin 0.0.4")
+    reminder_dir = Path(os.environ.get("CCDM_REMINDER_STATE_DIR") or Path.home() / ".local" / "state" / "ccdm" / "conversation-reminders")
+    launch_id = str(uuid4())
+    env = {
+        "CCDM_REMINDER_PROJECT_ROOT": root_dir,
+        "CCDM_REMINDER_STATE_DIR": str(reminder_dir),
+        "CCDM_REMINDER_RECEIPTS_DIR": str(reminder_dir / "claude-receipts"),
+        "CCDM_CLAUDE_PROJECT": project,
+        "CCDM_CLAUDE_CHANNEL_ID": channel_id,
+        "CCDM_CLAUDE_BOT_APP_ID": str(bots[0]["app_id"]),
+        "CCDM_CLAUDE_ROOT_APP_ID": str(root_app_id),
+        "CCDM_CLAUDE_PLUGIN_ROOT": str(plugin_dir),
+        "CCDM_CLAUDE_LAUNCH_ID": launch_id,
+        "CCDM_CLAUDE_HOOK_SETTINGS": str(Path(state_dir) / "ccdm-conversation-reminder-hooks.json"),
+    }
+    config["mcpServers"]["discord"] = {
+        "command": "node",
+        "args": [str(Path(root_dir) / "scripts" / "claude-reminder-channel.js")],
+        "env": env,
+    }
+    # Hook commands are command hooks: no prompt/agent hook can invoke a model.
+    hook = str(Path(root_dir) / "scripts" / "claude-reminder-hook.js")
+    settings = {"enabledPlugins": {"discord@claude-plugins-official": False},
+                "hooks": {event: [{"hooks": [{"type": "command", "command": f"node '{hook}'"}]}]
+                          for event in ("SessionStart", "Stop", "StopFailure", "SessionEnd")}}
+    settings_path = Path(state_dir) / "ccdm-conversation-reminder-hooks.json"
+    with settings_path.open("w") as f:
+        json.dump(settings, f, indent=2)
+        f.write("\n")
+    os.chmod(settings_path, 0o600)
+    # The Claude process inherits launch-scoped context, including the same ID
+    # as its channel server and its command hooks.
+    with (Path(state_dir) / "ccdm-conversation-reminder-env.json").open("w") as f:
+        json.dump(env, f)
+    os.chmod(Path(state_dir) / "ccdm-conversation-reminder-env.json", 0o600)
+with open(config_path, "w") as f:
+    json.dump(config, f, indent=2)
     f.write("\n")
 os.chmod(config_path, 0o600)
 PY
 
-tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$PATH_DIR' && DISCORD_STATE_DIR='$STATE_DIR'$CONFIG_DIR_ENV claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions --mcp-config '$MCP_CONFIG'$MODEL_FLAG$EFFORT_FLAG"
+REMINDER_ENV=""
+if [[ "$REMINDER_ADAPTER" == "1" ]]; then
+  REMINDER_ENV="$(python3 - "$STATE_DIR/ccdm-conversation-reminder-env.json" <<'PY'
+import json,sys
+e=json.load(open(sys.argv[1]))
+print(''.join(f" {k}='{v}'" for k,v in e.items()))
+PY
+)"
+fi
+tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$PATH_DIR' && DISCORD_STATE_DIR='$STATE_DIR'$CONFIG_DIR_ENV$REMINDER_ENV claude $CHANNEL_FLAG --dangerously-skip-permissions --mcp-config '$MCP_CONFIG'$SETTINGS_FLAG$MODEL_FLAG$EFFORT_FLAG"
 echo "Started Discord bot in tmux session '$SCREEN_NAME'"
 echo "Attach with: tmux attach -t $SCREEN_NAME"
 record_claude_pid "$STATE_DIR" "$CLAUDE_HOME"
