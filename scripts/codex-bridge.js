@@ -682,6 +682,7 @@ function handleNotification(msg) {
       break;
 
     case "turn/completed":
+      if (!turnActive || !notificationTurnId(msg)) break;
       if (!isCurrentTurnNotification(msg)) break;
       onTurnCompleted(msg.params?.turn);
       break;

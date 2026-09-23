@@ -528,3 +528,30 @@ test("clearing an active Codex turn removes its stale scoped reply context", asy
   assert.equal(fs.existsSync(contextFile), false);
   await bridge.stop();
 });
+
+test("a completion notification without a turn ID cannot end the active Codex exchange", async () => {
+  const workspace = createBridgeWorkspace();
+  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  const codex = await startFakeCodexServer(workspace, { turns: [{
+    turnId: "identified-turn", status: "completed", waitForRelease: true, mcpReply: true,
+    notificationsBeforeStart: [{ method: "turn/completed", params: { turn: { status: "completed" } } }],
+  }] });
+  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app" });
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  injectDiscordMessage(workspace, { id: "identified-owner", content: "answer" });
+  const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
+  const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
+  await waitForState(workspace, (state) => state.fixtures.discord.deliveredMessages.some((message) => message.id === "identified-owner"));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.ok(fs.existsSync(contextFile), "unidentified completion must leave the active reply grant intact");
+  const reply = await runNodeEntrypoint(workspace, "scripts/discord-mcp-server.js", {
+    env: bridgeChildEnv(workspace, config.params.value.env),
+    input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "reply", arguments: { text: "answer", scope_token: config.params.value.env.DISCORD_REPLY_TOKEN } } }) + "\n",
+  });
+  assert.equal(JSON.parse(reply.stdout).result.isError, undefined);
+  codex.releaseTurn("identified-turn");
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
+  assert.deepEqual(JSON.parse(result.stdout).events.map((event) => event.event_type), ["owner_activity", "response_delivered", "turn_completed"]);
+  await bridge.stop();
+});
