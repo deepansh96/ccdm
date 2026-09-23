@@ -218,7 +218,9 @@ def validate_event(event: object) -> dict:
                 continue
             if not isinstance(normalized.get(field), str) or not normalized[field]:
                 raise ValueError(f"{event_type} requires {field}")
-    if event_type in {"work_resumed", "owner_activity"} and not isinstance(normalized.get("source_message_id"), str):
+    if event_type in {"work_resumed", "owner_activity", "close_requested"} and (
+        not isinstance(normalized.get("source_message_id"), str) or not normalized["source_message_id"]
+    ):
         raise ValueError(f"{event_type} requires source_message_id")
     if event_type == "session_terminated" and not isinstance(normalized.get("provider_session_id"), str):
         raise ValueError("session_terminated requires provider_session_id")

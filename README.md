@@ -579,6 +579,10 @@ The live data section uses the macOS Keychain to retrieve your Claude Code OAuth
 
 Ask the root agent for a usage report by messaging `usage`, `limits`, or `how much usage left`.
 
+## Project Conversation state
+
+The opt-in foreground [Project Conversation state service](docs/conversation-reminders.md) records owner replies, `/close`, reopening, and due times for registered Claude and Codex channels. Reminder delivery is currently disabled.
+
 ## Scheduled Usage Stats Poster
 
 A separate, opt-in macOS LaunchAgent can post usage stats to Discord on a schedule. It is not installed by `setup.sh` and it is not the old tmux-based `usage-report-loop.sh` flow.

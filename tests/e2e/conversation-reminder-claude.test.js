@@ -233,6 +233,16 @@ test("Claude successful reply exposes a confirmed input-needed receipt", async (
   assert.deepEqual(events.map(event => event.event_type), ["owner_activity", "response_delivered", "input_needed"]);
   assert.equal(events[1].message_id, "fake-message-1");
   assert.equal(events[1].provider_session_id, "fixture-claude-launch");
+  const stateDir = path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders");
+  const sync = await runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["sync", "--project-root", workspace.repoDir, "--state-dir", stateDir],
+  });
+  assert.equal(sync.exitCode, 0, sync.stderr || sync.stdout);
+  const status = await runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["status", "--project-root", workspace.repoDir, "--state-dir", stateDir],
+  });
+  assert.equal(JSON.parse(status.stdout).conversations.demo.state, "awaiting-owner");
+  assert.equal(JSON.parse(status.stdout).delivery_enabled, false);
 });
 
 test("Claude progress reply remains non-qualifying until a Stop hook", async () => {
@@ -344,6 +354,19 @@ test("root Claude routing consumes an allowed mention /close without a model not
   assert.equal(status.exitCode, 0, status.stderr);
   assert.deepEqual(JSON.parse(status.stdout).events.map(event => event.event_type), ["close_requested"]);
   assert.equal(JSON.parse(status.stdout).events[0].provider, "ccdm-root");
+});
+
+test("root Claude mention management stays an acknowledgment rather than a reopening message", async () => {
+  const workspace = createWorkspace();
+  seedClaudeAssignment(workspace);
+  await runChannel(workspace, {
+    content: "<@root-app> status",
+    meta: { chat_id: "channel-1", message_id: "root-management-1", user_id: "owner-id" },
+  }, { root: true, expectNotification: true });
+  const result = await runScript(workspace, "scripts/conversation-reminder-events.py", {
+    args: ["status", "--project", "demo", "--state-dir", path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders")],
+  });
+  assert.equal(JSON.parse(result.stdout).events[0].activity_kind, "management-command");
 });
 
 test("an allowed guest /close never reaches Claude or changes owner readiness", async () => {

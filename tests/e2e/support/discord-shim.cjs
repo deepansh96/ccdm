@@ -29,6 +29,12 @@ function fixtureChannel(id) {
   return {
     id,
     name: `channel-${id}`,
+    permissionsFor(member) {
+      const userId = typeof member === "string" ? member : member?.id;
+      return { has(permission) {
+        return !(readState().fixtures?.discord?.permissionDenials?.[userId] || []).includes(permission);
+      } };
+    },
     async send(content) {
       const failure = readState().fixtures?.discord?.failures?.send;
       if (failure) {

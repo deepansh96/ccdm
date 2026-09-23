@@ -33,6 +33,7 @@ Then read this file fully before doing anything else in this session.
 - Root bot manages a registry-backed pool of isolated Discord project bots.
 - Claude sessions run through the official Discord plugin; Codex sessions run through `scripts/codex-bridge.js`.
 - Opt-in Claude project launches can route that plugin through a launch-scoped reminder adapter that filters `/close` and records observe-only reply and lifecycle events; reminder delivery remains disabled.
+- The foreground Conversation Reminder state service observes registered project channels with root credentials, consumes both provider adapters' durable events, and persists owner closure, acknowledgment, reopening, and informational due times in a private SQLite store. It supports status and durable disable/enable; discovery and reminder delivery remain disabled.
 - Start, stop, registration, guest access, command relay, voice transcription, and local-fake E2E coverage are present.
 - Local Claude and Codex project bots can export an inclusive Discord message range to a temporary text file.
 - Codex Discord tools can read the last requested 1-10,000 messages in their scoped channel, returning larger reads as private temporary transcripts.

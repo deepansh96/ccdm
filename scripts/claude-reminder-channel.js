@@ -84,6 +84,13 @@ function isClose(text) {
   return false;
 }
 
+function isManagement(text) {
+  const trimmed = String(text || "").trim();
+  return ["/compact", "/clear", "/pause", "/unpause", "/restart"].includes(trimmed) || [rootAppId].filter(Boolean).some(id =>
+    [`<@${id}>`, `<@!${id}>`].some(mention => trimmed.startsWith(mention)),
+  );
+}
+
 async function handlePluginMessage(line) {
   let message;
   try { message = JSON.parse(line); } catch { process.stdout.write(`${line}\n`); return; }
@@ -190,7 +197,8 @@ async function handlePluginMessage(line) {
         await reminder.emitEvent("owner_activity", { ...assignment, provider: selectedProject ? "claude" : "ccdm-root" }, {
           actor_id: meta.user_id,
           source_message_id: meta.message_id,
-          activity_kind: meta.attachment_count ? "attachment" : "message",
+          activity_kind: isManagement(message.params?.content) ? "management-command"
+            : meta.attachment_count ? "attachment" : "message",
         }).catch(error => process.stderr.write(`Claude reminder channel: activity recording failed: ${error.message}\n`));
         if (inputNeededMarker && inputNeededMarker.context.interaction_id !== meta.message_id) {
           const { marker, context } = inputNeededMarker;

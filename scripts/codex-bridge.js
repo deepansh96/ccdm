@@ -1684,7 +1684,11 @@ function startDiscordBot() {
       await reminderAdapter.emitEvent("owner_activity", reminderEventContext(assignment), {
         actor_id: msg.author.id,
         source_message_id: msg.id,
-        activity_kind: msg.attachments.size > 0 && !text ? "attachment" : "message",
+        activity_kind: ROOT_MULTI_CHANNEL && [
+          `<@${ROOT_BOT_APP_ID}>`, `<@!${ROOT_BOT_APP_ID}>`,
+        ].some(mention => ROOT_BOT_APP_ID && msg.content.trim().startsWith(mention))
+          ? "management-command"
+          : msg.attachments.size > 0 && !text ? "attachment" : "message",
       });
     }
 
