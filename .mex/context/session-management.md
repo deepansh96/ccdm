@@ -16,7 +16,7 @@ edges:
     condition: when performing a start, stop, or restart
   - target: patterns/register-project.md
     condition: when assigning or releasing a project bot
-last_updated: 2026-09-22
+last_updated: 2026-09-23
 ---
 
 # Session Management
@@ -39,9 +39,11 @@ Use `scripts/start-codex-session.sh <project>`. It validates the target project'
 
 After a Codex CLI upgrade, stop every long-lived CCDM Codex session before starting any replacement, then restart the root Codex bridge. Running app-server processes keep their original runtime version.
 
+A ChatGPT-account home can only run the models listed in that home's `models_cache.json`, which the app-server refreshes at startup against the running CLI's client version. Requesting anything else fails at the backend with `The '<model>' model is not supported when using Codex with a ChatGPT account.` That message also appears when the installed CLI is simply older than the model's release: `gpt-6-sol` was rejected on 0.153.4 and worked immediately after `npm install -g @openai/codex@latest` (0.155.1), which then listed `gpt-6-sol`/`gpt-6-luna` in the refreshed catalog. Confirm the slug against a live home's catalog before writing `codex_model` rather than guessing from a display name.
+
 MiMo API accounts use the same named-account selection and launch path. `scripts/setup-codex-mimo.py` creates an external home with a private `api-key`, provider auth command, and Xiaomi model catalog; it does not mutate registry selectors. Add the home as a `codex_accounts` alias and select it only on the intended project. Omit incompatible GPT model/service-tier overrides. The provider reads credentials from its home, so no MiMo key is passed through tmux command arguments. `--rotate-key` replaces only the private credential; restart affected sessions afterward. MiMo API quota reporting is outside the ChatGPT usage dashboard's scope.
 
-DeepSeek Flash homes follow the same selection and authentication flow through `scripts/setup-codex-deepseek.py`. Its catalog uses standard Responses and shell-command tools, not MiMo's Responses-lite/code-mode metadata. The helper extracts the vendor's literal catalog without executing its installer; only `deepseek-flash` is selected (V4.1 Flash as of 2026-09-22). Image support does not itself configure Computer Use tools, and DeepSeek quota reporting is outside the ChatGPT usage dashboard's scope.
+DeepSeek Flash homes follow the same selection and authentication flow through `scripts/setup-codex-deepseek.py`. Its catalog uses standard Responses and shell-command tools, not MiMo's Responses-lite/code-mode metadata. The helper extracts the vendor's literal catalog without executing its installer; only `deepseek-flash` is selected (V4.1 Flash as of 2026-09-22). Image support does not itself configure Computer Use tools, and usage reporting shows account-wide DeepSeek balance separately from local Codex token totals.
 
 Root multi-channel sessions accept steering only from the active channel and author, reusing the active turn's Discord scope token so in-flight tool calls stay valid. Messages from other channels/authors queue until the turn finishes. Failed steering queues the original message with its own scope for the next turn. Steering was verified live with DeepSeek Flash through app-server; this behavior is provider-independent.
 

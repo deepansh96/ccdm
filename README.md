@@ -228,9 +228,11 @@ including its `ccdm-deepseek.json` setup marker, outside the repository.
 
 Flash accepts image input; browser/computer control additionally needs a
 configured Computer Use tool/plugin. Supported reasoning efforts are `low`,
-`high`, and `max`; the helper defaults to `high`. DeepSeek quota reporting is not included
-in the ChatGPT usage dashboards. The helper does not make billable inference
-calls; test the home separately before assigning a bot.
+`high`, and `max`; the helper defaults to `high`. DeepSeek has no ChatGPT-style
+quota window, so its usage dashboard shows the account-wide balance returned by
+the official `GET /user/balance` API plus this machine's local DeepSeek token
+totals instead of a rate-limit graph. The helper does not make billable
+inference calls; test the home separately before assigning a bot.
 
 To add web search and page reading through [Exa MCP](https://exa.ai/docs/get-started/exa-mcp),
 pass `--with-exa` when creating a new home. For an existing home, add this table to its `config.toml`:
@@ -581,7 +583,7 @@ Ask the root agent for a usage report by messaging `usage`, `limits`, or `how mu
 
 A separate, opt-in macOS LaunchAgent can post usage stats to Discord on a schedule. It is not installed by `setup.sh` and it is not the old tmux-based `usage-report-loop.sh` flow.
 
-The tracked installer requires Python 3 with Pillow (the renderer dependency), then renders and validates `~/Library/LaunchAgents/com.discord.usage-stats-poster.plist` with absolute paths to Python, Codex, the poster, and its logs. If Pillow is missing it prints a `python3 -m pip install Pillow` remediation and exits before touching LaunchAgents or the existing plist. The LaunchAgent is interval-only and runs every 600 seconds, so installation does not trigger an immediate post. Every automated run records a local structured snapshot in UTC 10-minute slots; the original text Usage Report and separate Claude/Codex trend PNGs are uploaded together only once per UTC 30-minute slot. Manual JSON-embed invocations remain independent of the history database. Reinstalling unloads the existing label before loading the new plist, so changing the interval is idempotent; if the new load fails, the prior plist and loaded/unloaded schedule are restored:
+The tracked installer requires Python 3 only, then renders and validates `~/Library/LaunchAgents/com.discord.usage-stats-poster.plist` with absolute paths to Python, Codex, the poster, and its logs. Pillow is not required: the scheduled and manual poster output is text-only, so installation never probes for image libraries, and a missing `python3` exits before touching LaunchAgents or the existing plist. The separate `scripts/usage-dashboard-renderer.py` trend renderer keeps Pillow as an optional dependency when it is invoked manually. The LaunchAgent is interval-only and runs every 600 seconds, so installation does not trigger an immediate post. Every automated run records a local structured snapshot in UTC 10-minute slots; the original text Usage Report is posted on its own only once per UTC 30-minute slot. No trend or balance PNG is rendered or attached by the scheduled or manual output. Manual JSON-embed invocations remain independent of the history database. Reinstalling unloads the existing label before loading the new plist, so changing the interval is idempotent; if the new load fails, the prior plist and loaded/unloaded schedule are restored:
 
 ```bash
 scripts/install-usage-stats-poster.sh                 # 600 seconds (10 minutes)
@@ -590,7 +592,7 @@ scripts/install-usage-stats-poster.sh --interval 900  # 15 minutes
 
 The rendered LaunchAgent contains no token, channel ID, or poster configuration. The installer never sends a Discord request; it only schedules the poster.
 
-History is stored at `~/Library/Application Support/CCDM/usage-stats/history.sqlite3` by default (override with the ignored config's `history_db_path`). The database and lock are private (`0700` directory, `0600` files), snapshots are retained for 365 days, and an advisory lock makes repeated LaunchAgent runs idempotent. The two provider PNGs begin at the earliest actual stored snapshot; no artificial history is backfilled. Only feature-owned SQLite files count toward the 5 GiB warning; Codex session logs and Claude transcripts are never counted or deleted. A warning is emitted at most once every 24 hours while the feature-owned history directory remains over the limit.
+History is stored at `~/Library/Application Support/CCDM/usage-stats/history.sqlite3` by default (override with the ignored config's `history_db_path`). The database and lock are private (`0700` directory, `0600` files), snapshots are retained for 365 days, and an advisory lock makes repeated LaunchAgent runs idempotent. History begins at the earliest actual stored snapshot; no artificial history is backfilled. Only feature-owned SQLite files count toward the 5 GiB warning; Codex session logs and Claude transcripts are never counted or deleted. A warning is emitted at most once every 24 hours while the feature-owned history directory remains over the limit.
 
 ```bash
 ~/Library/LaunchAgents/com.discord.usage-stats-poster.plist
@@ -604,7 +606,7 @@ The poster reports:
 - Local token-usage fallback from each named Codex Home's `sessions` directory
   when live rate limits are unavailable
 
-Each automated Discord post atomically attaches separate Claude and Codex PNGs. Codex is displayed as a weekly allowance only; old local snapshots that called it `5-hour` are translated while rendering and are never rewritten in SQLite. Claude API-key accounts have no comparable limit graph, but their Claude rail shows sanitized local estimated Today and This month costs, request counts, and status.
+Each automated Discord post sends only the original text Usage Report embed. Codex is displayed as a weekly allowance only. Claude API-key accounts have no comparable percentage limit, so their embed text shows sanitized local estimated Today and This month costs, request counts, and status. The credential-free trend renderer (`scripts/usage-dashboard-renderer.py`) is retained for back-compat but is no longer invoked by the posting workflow.
 
 The poster reads the same named-account registry configuration shown in
 [Codex Accounts](#codex-accounts); it does not need a separate list of Codex
@@ -655,7 +657,25 @@ Run a live legacy JSON-embed post separately after validation; installation neve
 python3 scripts/usage-stats-poster.py
 ```
 
-To exercise the scheduled report manually, use `--scheduled --post-now`; `--collect-only` records a snapshot without contacting Discord. Scheduled runs outside a UTC 30-minute window collect history but do not upload the text report or images.
+Configured Codex Homes that carry the `ccdm-deepseek.json` setup marker are reported from DeepSeek instead of the Codex rate-limit request. The poster reads the home's private `api-key` directly, fetches the account-wide balance from the fixed official `GET /user/balance` endpoint on `https://api.deepseek.com` (one request per distinct key per run), and pairs it with this month's local DeepSeek token totals from the DeepSeek session rollouts. The embed shows a compact `deepseek-flash (API)` block: a bold remaining balance, a paid/granted breakdown, this month's local token total and session count, an optional `Tokens:` split line, and a short `Balance: whole account · Usage: local Codex` footer instead of a technical coverage paragraph. No money history or spend figure is derived from the balance. A DeepSeek-backed root Codex session still runs through the Codex app-server; only this rate-limit query is skipped. Homes sharing a key are grouped under one labeled note, and a rollout copied between them is counted once; distinct keys stay separate because no account identifier is available. Reference: [Get User Balance](https://api-docs.deepseek.com/api/get-user-balance/).
+
+Coverage is this machine's local Codex sessions in the configured DeepSeek homes only. Other clients, other machines, ephemeral workers, and deleted rollouts are excluded, so the block never claims a provider-wide total. The API reports an account balance rather than spend or quota, so the balance is account-wide while the token totals stay local; responses that do not match DeepSeek's documented balance schema are reported as unavailable instead of shown.
+
+For local tests only, `deepseek_base_url` may point at a literal `http://127.0.0.1:<port>` (or `localhost`/`[::1]`) fake; any other origin is refused at both config and request time.
+
+Without a configured reference the block shows the real amounts only and never invents a percentage or bar. An optional `deepseek_balance_references` object in `.usage-stats-poster.json` supplies a per-alias display budget for an inline meter whose filled portion represents used balance, labeled with both percent used and percent left:
+
+```json
+{
+  "deepseek_balance_references": {
+    "deepseek-flash": { "currency": "USD", "amount": "50.00" }
+  }
+}
+```
+
+Each entry is a self-contained `{currency, amount}` pair: `currency` must be `USD` or `CNY`, and `amount` a positive decimal string. Extra fields, floats, zero, and negative values are rejected when the config is validated. A reference is a display budget, not a provider quota, so the poster never infers a top-up or deposit total from the current balance; a balance above the reference prints its honest percentage while the bar visually clamps. When a shared-key group is covered by more than one conflicting alias reference, the meter is omitted with a clear status line and both the real balance and the local usage are still shown.
+
+To exercise the scheduled report manually, use `--scheduled --post-now`; `--collect-only` records a snapshot without contacting Discord. Scheduled runs outside a UTC 30-minute window collect history but do not post the text report.
 
 To roll back the schedule, unload and remove only CCDM's rendered LaunchAgent. Keep the older external poster directory and its LaunchAgent available until the replacement has been verified; deleting that external rollback copy is out of scope.
 

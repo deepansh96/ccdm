@@ -21,20 +21,40 @@ test("usage stats poster installer is a tracked executable surface", () => {
   assert.ok(fs.statSync(installer).mode & 0o111);
 });
 
-test("installer fails before any plist or launchctl write when Pillow is unavailable", async () => {
+test("installer succeeds without Pillow when the interpreter cannot import PIL", async () => {
   const workspace = createWorkspace();
   const pythonFixture = path.join(workspace.fixtureDir, "python3");
-  fs.writeFileSync(pythonFixture, "#!/bin/sh\nexit 1\n");
+  // Replace the Python fixture with a shim that fails the (no longer required)
+  // Pillow probe while delegating every other call to the real interpreter, so
+  // the install must succeed even when `import PIL` is unavailable.
+  const realPython = fs.readFileSync(pythonFixture, "utf8").match(/exec '([^']+)'/)?.[1];
+  assert.ok(realPython, "expected the Python fixture to delegate to a resolved interpreter");
+  fs.writeFileSync(
+    pythonFixture,
+    `#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in
+    "import PIL")
+      echo "ModuleNotFoundError: No module named 'PIL'" >&2
+      exit 1
+      ;;
+  esac
+done
+exec '${realPython}' "$@"
+`,
+  );
   fs.chmodSync(pythonFixture, 0o755);
 
   const result = await runScript(workspace, "scripts/install-usage-stats-poster.sh");
 
-  assert.equal(result.exitCode, 1);
-  assert.match(result.stderr, /Pillow is required/);
-  assert.match(result.stderr, /python3 -m pip install Pillow/);
-  assert.match(result.stderr, /No LaunchAgent or plist changes were made/);
-  assert.deepEqual(readState(workspace.stateDir).fixtures.launchctl.invocations, []);
-  assert.equal(fs.existsSync(plistPath(workspace)), false);
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.doesNotMatch(result.stderr, /Pillow/);
+  assert.match(result.stdout, /LaunchAgent 'com\.discord\.usage-stats-poster' loaded/);
+  assert.equal(fs.existsSync(plistPath(workspace)), true);
+  assert.deepEqual(
+    readState(workspace.stateDir).fixtures.launchctl.invocations.map(({ operation }) => operation),
+    ["list", "unload", "load", "list"],
+  );
 });
 
 test("installer renders a secret-free LaunchAgent with the default interval", async () => {
