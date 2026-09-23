@@ -8,6 +8,7 @@ const path = require("path");
 const { writeFile, mkdir, mkdtemp, stat, readFile } = require("fs/promises");
 const { createReadStream } = require("fs");
 const { tmpdir } = require("os");
+const reminderAdapter = require("./conversation-reminder-adapter.js");
 
 const execFileAsync = promisify(execFile);
 const EXPORT_SCRIPT = path.resolve(__dirname, "export-discord-range.js");
@@ -254,6 +255,11 @@ async function targetChannelId(args) {
 
 const replyProperties = {
   text: { type: "string", description: "Message text to send" },
+  conversation_disposition: {
+    type: "string",
+    enum: ["progress", "input-needed"],
+    description: "Conversation reply disposition. Defaults to progress; use input-needed only for a delivered question that asks the owner to respond.",
+  },
   files: {
     type: "array",
     items: { type: "string" },
@@ -385,9 +391,13 @@ async function handleToolCall(name, args) {
 
   switch (name) {
     case "reply": {
-      const { text, files, reply_to, scope_token } = args;
+      const { text, files, reply_to, scope_token, conversation_disposition } = args;
       requireScopeToken(scope_token);
       const channelId = await targetChannelId(args);
+      if (conversation_disposition && !["progress", "input-needed"].includes(conversation_disposition)) {
+        throw new Error("Unsupported conversation disposition");
+      }
+      const reminderContext = await reminderAdapter.readActiveContext(channelId);
       let result;
       if (files && files.length > 0) {
         result = await sendMessageWithFiles(channelId, text, files, reply_to);
@@ -397,6 +407,9 @@ async function handleToolCall(name, args) {
           body.message_reference = { message_id: reply_to };
         }
         result = await discordPost(`/channels/${channelId}/messages`, body);
+      }
+      if (reminderContext) {
+        await reminderAdapter.recordDeliveredReply(reminderContext, result.id, conversation_disposition);
       }
       return `sent (id: ${result.id})`;
     }

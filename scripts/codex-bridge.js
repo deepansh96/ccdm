@@ -12,6 +12,14 @@ const WebSocket = require("ws");
 const MCP_SERVER_SCRIPT = path.resolve(__dirname, "discord-mcp-server.js");
 const ROOT_DIR = path.resolve(__dirname, "..");
 const REGISTRY_PATH = path.join(ROOT_DIR, "registry.json");
+const REMINDER_STATE_DIR = process.env.CCDM_REMINDER_STATE_DIR || path.join(os.homedir(), ".local", "state", "ccdm", "conversation-reminders");
+const REMINDER_CONTEXT_FILE = path.join(REMINDER_STATE_DIR, `active-codex-${process.pid}.json`);
+const REMINDER_RECEIPTS_DIR = path.join(REMINDER_STATE_DIR, "receipts");
+process.env.CCDM_REMINDER_PROJECT_ROOT = ROOT_DIR;
+process.env.CCDM_REMINDER_STATE_DIR = REMINDER_STATE_DIR;
+process.env.CCDM_REMINDER_CONTEXT_FILE = REMINDER_CONTEXT_FILE;
+process.env.CCDM_REMINDER_RECEIPTS_DIR = REMINDER_RECEIPTS_DIR;
+const reminderAdapter = require("./conversation-reminder-adapter.js");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
@@ -96,8 +104,12 @@ let pendingTerminalError = null;
 let activeTurnHadProgress = false;
 let activeTurnRecoveryAttempt = 0;
 let activeTurnChannelScopeToken = null;
+let activeReminderContext = null;
+let lastResumedInputReceiptId = null;
+let pendingInputNeededResumeTurnId = null;
 let rootAccess = null;
 let rootChannelAccess = new Map();
+let bridgeStopping = false;
 let discordChannelScopeDir = null;
 let discordChannelScopeFile = null;
 const NICKNAME_INTERVAL = 60000;
@@ -298,6 +310,24 @@ function mentionsRootBot(msg) {
 
 function mentionsThisBot(msg) {
   return mentionsApp(msg, BOT_APP_ID);
+}
+
+function isCloseCommand(content) {
+  const trimmed = (content || "").trim();
+  if (trimmed === "/close") return true;
+  for (const appId of [BOT_APP_ID, ROOT_BOT_APP_ID]) {
+    if (appId && new RegExp(`^<@!?${escapeRegExp(appId)}>\\s+/close$`).test(trimmed)) return true;
+  }
+  return false;
+}
+
+function reminderEventContext(assignment) {
+  return {
+    ...assignment,
+    provider: ROOT_MULTI_CHANNEL ? "ccdm-root" : "codex",
+    ...(threadId ? { provider_session_id: threadId } : {}),
+    ...(activeTurnId ? { provider_turn_id: activeTurnId } : {}),
+  };
 }
 
 function stripThisBotMention(text) {
@@ -507,9 +537,34 @@ async function sendToDiscord(text, channelId = activeOutputChannelId || CHANNEL_
   const channel = await channelById(channelId);
   if (!channel || !text.trim()) return;
   const chunks = splitMessage(text);
+  const sent = [];
   for (const chunk of chunks) {
-    await channel.send(chunk);
+    sent.push(await channel.send(chunk));
   }
+  return sent;
+}
+
+async function recordSessionTermination() {
+  if (!threadId || ROOT_MULTI_CHANNEL) return;
+  const assignment = await reminderAdapter.resolveAssignmentForChannel(CHANNEL_ID, {
+    requireCodex: true,
+    ...(BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
+  }).catch(() => null);
+  if (!assignment) return;
+  await reminderAdapter.emitEvent("session_terminated", {
+    ...assignment,
+    provider: "codex",
+    provider_session_id: threadId,
+    ...(activeTurnId ? { provider_turn_id: activeTurnId } : {}),
+  }).catch((error) => console.error(`Conversation termination event failed: ${error.message || error}`));
+}
+
+async function exitAfterRuntimeLoss(reason) {
+  if (bridgeStopping) return;
+  bridgeStopping = true;
+  console.error(reason);
+  await recordSessionTermination();
+  process.exit(1);
 }
 
 function startCodexServer() {
@@ -554,8 +609,7 @@ function startCodexServer() {
   });
 
   codexProcess.on("exit", (code) => {
-    console.error(`Codex app-server exited with code ${code}`);
-    process.exit(1);
+    void exitAfterRuntimeLoss(`Codex app-server exited with code ${code}`);
   });
 }
 
@@ -616,8 +670,7 @@ function setupWebSocketHandlers() {
   });
 
   ws.on("close", () => {
-    console.error("WebSocket closed");
-    process.exit(1);
+    void exitAfterRuntimeLoss("WebSocket closed");
   });
 }
 
@@ -756,12 +809,17 @@ function flushDeltaBuffer() {
   }
 }
 
-function flushTextReplyFallback() {
+async function flushTextReplyFallback() {
   const text = deltaBuffer.trim() || fallbackText.trim();
   deltaBuffer = "";
   fallbackText = "";
   if (text) {
-    sendToDiscord(text);
+    const sent = await sendToDiscord(text);
+    if (activeReminderContext) {
+      for (const message of sent || []) {
+        await reminderAdapter.recordDeliveredReply(activeReminderContext, message.id);
+      }
+    }
   }
 }
 
@@ -777,12 +835,33 @@ async function onTurnCompleted(turn = {}) {
   if (terminalError || outputSuppressed) {
     deltaBuffer = "";
     fallbackText = "";
-  } else if (!mcpReplyCalled && TEXT_REPLY_FALLBACK) {
-    flushTextReplyFallback();
+  } else if ((turn.status === "completed" || turn.status === undefined) && !mcpReplyCalled && TEXT_REPLY_FALLBACK) {
+    await flushTextReplyFallback();
   } else {
     deltaBuffer = "";
     fallbackText = "";
   }
+  const completedContext = activeReminderContext;
+  const turnReceipts = completedContext
+    ? await reminderAdapter.receiptsForTurn(completedContext.provider_session_id, completedContext.provider_turn_id)
+    : [];
+  const latestQuestion = turnReceipts.filter((receipt) => receipt.disposition === "input-needed").at(-1);
+  if (latestQuestion && latestQuestion.event_id !== lastResumedInputReceiptId) {
+    pendingInputNeededResumeTurnId = completedContext.provider_turn_id;
+  }
+  if (!terminalError && !outputSuppressed && turn.status === "completed" && completedContext) {
+    const receipts = turnReceipts
+      .filter((receipt) => receipt.interaction_id === completedContext.interaction_id);
+    if (receipts.length > 0) {
+      await reminderAdapter.emitEvent("turn_completed", completedContext, {
+        delivered_message_ids: receipts.map((receipt) => receipt.message_id),
+        source_message_id: completedContext.source_message_id,
+      });
+    }
+  }
+  if (completedContext) await reminderAdapter.removeTurnReceipts(completedContext.provider_session_id, completedContext.provider_turn_id);
+  activeReminderContext = null;
+  await reminderAdapter.clearActiveContext();
   resetActiveTurnId();
   mcpReplyCalled = false;
   suppressTurnOutput = false;
@@ -831,7 +910,7 @@ async function processQueue() {
   if (queuedMsg) {
     queuedMsg.reactions.cache.get("⏳")?.users.remove(queuedMsg.client.user.id).catch(() => {});
   }
-  await sendTurn(input, channelId, channelScopeToken);
+  await sendTurn(input, channelId, channelScopeToken, 0, queuedMsg);
 }
 
 function canSteerRootScope(channelId, token) {
@@ -872,6 +951,24 @@ async function routeInput(input, msg, channelId, channelScopeToken) {
         input: steerInput,
         expectedTurnId: activeTurnId,
       });
+      if (msg && activeReminderContext && msg.author.id === activeReminderContext.owner_id) {
+        const receipts = await reminderAdapter.receiptsForTurn(activeReminderContext.provider_session_id, activeReminderContext.provider_turn_id);
+        const latestQuestion = receipts.filter((receipt) => receipt.disposition === "input-needed").at(-1);
+        if (latestQuestion && latestQuestion.event_id !== lastResumedInputReceiptId) {
+          await reminderAdapter.emitEvent("work_resumed", activeReminderContext, {
+            source_message_id: msg.id,
+            resumed_from_turn_id: activeReminderContext.provider_turn_id,
+          });
+          lastResumedInputReceiptId = latestQuestion.event_id;
+        }
+        activeReminderContext = {
+          ...activeReminderContext,
+          interaction_id: msg.id,
+          source_message_id: msg.id,
+          initiator_id: msg.author.id,
+        };
+        await reminderAdapter.writeActiveContext(activeReminderContext);
+      }
       console.log(`[steer] Injected into active turn ${activeTurnId}`);
     } catch (err) {
       console.log(`[steer] Failed (${err.message || err}), queuing instead`);
@@ -880,7 +977,7 @@ async function routeInput(input, msg, channelId, channelScopeToken) {
   } else if (turnActive) {
     await queueInput();
   } else {
-    await sendTurn(input, channelId, channelScopeToken);
+    await sendTurn(input, channelId, channelScopeToken, 0, msg);
   }
 }
 
@@ -888,10 +985,11 @@ async function sendTurn(
   input,
   channelId = CHANNEL_ID,
   channelScopeToken = null,
-  recoveryAttempt = 0
+  recoveryAttempt = 0,
+  sourceMessage = null
 ) {
   if (!threadId) {
-    messageQueue.push({ input, msg: null, channelId, channelScopeToken });
+    messageQueue.push({ input, msg: sourceMessage, channelId, channelScopeToken });
     return;
   }
   turnActive = true;
@@ -903,6 +1001,8 @@ async function sendTurn(
   activeTurnHadProgress = false;
   activeTurnRecoveryAttempt = recoveryAttempt;
   activeTurnChannelScopeToken = channelScopeToken;
+  activeReminderContext = null;
+  lastResumedInputReceiptId = null;
   resetActiveTurnId();
   try {
     await activateDiscordChannelScope(channelScopeToken);
@@ -913,6 +1013,25 @@ async function sendTurn(
       approvalPolicy: "never",
     });
     recordExpectedTurnId(result);
+    if (sourceMessage?.reminderAssignment && activeTurnId) {
+      activeReminderContext = {
+        ...sourceMessage.reminderAssignment,
+        provider: "codex",
+        provider_session_id: threadId,
+        provider_turn_id: activeTurnId,
+        interaction_id: sourceMessage.id,
+        source_message_id: sourceMessage.id,
+        initiator_id: sourceMessage.author.id,
+      };
+      await reminderAdapter.writeActiveContext(activeReminderContext);
+      if (pendingInputNeededResumeTurnId) {
+        await reminderAdapter.emitEvent("work_resumed", activeReminderContext, {
+          source_message_id: sourceMessage.id,
+          resumed_from_turn_id: pendingInputNeededResumeTurnId,
+        });
+        pendingInputNeededResumeTurnId = null;
+      }
+    }
   } catch (err) {
     console.error("turn/start failed:", err);
     stopTyping();
@@ -922,6 +1041,8 @@ async function sendTurn(
     activeTurnHadProgress = false;
     activeTurnRecoveryAttempt = 0;
     activeTurnChannelScopeToken = null;
+    activeReminderContext = null;
+    await reminderAdapter.clearActiveContext();
     await clearDiscordChannelScope();
     turnActive = false;
     await sendToDiscord("**Error:** Failed to send message to Codex");
@@ -1272,6 +1393,10 @@ async function registerDiscordMcp() {
         BOT_TOKEN,
         CHANNEL_ID,
         DISCORD_REPLY_TOKEN,
+        CCDM_REMINDER_PROJECT_ROOT: ROOT_DIR,
+        CCDM_REMINDER_STATE_DIR: REMINDER_STATE_DIR,
+        CCDM_REMINDER_CONTEXT_FILE: REMINDER_CONTEXT_FILE,
+        CCDM_REMINDER_RECEIPTS_DIR: REMINDER_RECEIPTS_DIR,
         ...(ROOT_MULTI_CHANNEL ? {
           DISCORD_CHANNEL_OVERRIDE: "1",
           DISCORD_ACCESS_FILE: ROOT_ACCESS_FILE,
@@ -1372,7 +1497,6 @@ function startDiscordBot() {
   });
 
   client.on("messageReactionAdd", async (reaction, user) => {
-    if (!FORWARDED_REACTIONS.has(reaction.emoji.name)) return;
     if (!(await shouldHandleDiscordReaction(reaction, user))) return;
     try {
       if (user.partial) await user.fetch();
@@ -1382,7 +1506,22 @@ function startDiscordBot() {
       console.log(`[discord] Failed to fetch reaction context: ${err.message || err}`);
       return;
     }
-    if (user.bot || reaction.message.author?.id !== client.user.id) return;
+    if (user.bot) return;
+    const reactionChannelId = reaction.message.channelId || reaction.message.channel?.id;
+    const assignment = await reminderAdapter.resolveAssignmentForChannel(reactionChannelId, {
+      requireCodex: true,
+      ...(!ROOT_MULTI_CHANNEL && BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
+    }).catch(() => null);
+    const recordedReminder = await reminderAdapter.isRecordedReminderMessage(reaction.message.id);
+    if (recordedReminder) return;
+    if (assignment && user.id === assignment.owner_id) {
+      await reminderAdapter.emitEvent("owner_activity", reminderEventContext(assignment), {
+        actor_id: user.id,
+        source_message_id: reaction.message.id,
+        activity_kind: "reaction",
+      });
+    }
+    if (!FORWARDED_REACTIONS.has(reaction.emoji.name) || reaction.message.author?.id !== client.user.id) return;
 
     const { input, channelId, channelScopeToken } = buildReactionInput(reaction, user);
     console.log(`[discord] ${user.username}: ${reaction.emoji.name} on ${reaction.message.id}`);
@@ -1390,11 +1529,40 @@ function startDiscordBot() {
   });
 
   client.on("messageCreate", async (msg) => {
+    if (!msg.author.bot && isCloseCommand(msg.content)) {
+      const assignment = await reminderAdapter.resolveAssignmentForChannel(msg.channel.id, {
+        requireCodex: true,
+        ...(!ROOT_MULTI_CHANNEL && BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
+      }).catch(() => null);
+      if (assignment) {
+        if (msg.author.id === assignment.owner_id) {
+          await reminderAdapter.emitEvent("close_requested", reminderEventContext(assignment), {
+            actor_id: msg.author.id,
+            source_message_id: msg.id,
+            command: "/close",
+          }).catch((error) => console.error(`Conversation close event failed: ${error.message || error}`));
+        }
+        return;
+      }
+    }
     if (!(await shouldHandleDiscordMessage(msg))) return;
 
     const channelId = msg.channel.id;
     const text = stripThisBotMention(msg.content.trim());
     const bridgeSlashCommand = !ROOT_MULTI_CHANNEL || channelId === CHANNEL_ID;
+    if (bridgeSlashCommand && ["/pause", "/unpause", "/compact", "/clear", "/restart"].includes(text)) {
+      const assignment = await reminderAdapter.resolveAssignmentForChannel(channelId, {
+        requireCodex: true,
+        ...(!ROOT_MULTI_CHANNEL && BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
+      }).catch(() => null);
+      if (assignment && msg.author.id === assignment.owner_id) {
+        await reminderAdapter.emitEvent("owner_activity", reminderEventContext(assignment), {
+          actor_id: msg.author.id,
+          source_message_id: msg.id,
+          activity_kind: "management-command",
+        });
+      }
+    }
 
     if (bridgeSlashCommand && text === "/pause") {
       console.log("[discord] /pause requested");
@@ -1506,6 +1674,19 @@ function startDiscordBot() {
     const { input, channelScopeToken } = await buildInput(msg, text);
     if (input.length === 0) return;
 
+    const assignment = await reminderAdapter.resolveAssignmentForChannel(channelId, {
+      requireCodex: true,
+      ...(!ROOT_MULTI_CHANNEL && BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
+    }).catch(() => null);
+    if (assignment && msg.author.id === assignment.owner_id) {
+      if (!ROOT_MULTI_CHANNEL) msg.reminderAssignment = assignment;
+      await reminderAdapter.emitEvent("owner_activity", reminderEventContext(assignment), {
+        actor_id: msg.author.id,
+        source_message_id: msg.id,
+        activity_kind: msg.attachments.size > 0 && !text ? "attachment" : "message",
+      });
+    }
+
     console.log(`[discord] ${msg.author.username}: ${text || "(attachment)"} [${input.length} part(s)]`);
 
     await routeInput(input, msg, channelId, channelScopeToken);
@@ -1513,8 +1694,14 @@ function startDiscordBot() {
 
   client.login(BOT_TOKEN);
 
-  function cleanup() {
+  let stopping = false;
+  async function cleanup() {
+    if (stopping) return;
+    stopping = true;
+    bridgeStopping = true;
     console.log("Shutting down...");
+    await recordSessionTermination();
+    await reminderAdapter.clearActiveContext().catch(() => {});
     client.destroy();
     if (ws) ws.close();
     if (codexProcess) codexProcess.kill();
@@ -1531,6 +1718,7 @@ function startDiscordBot() {
 
 async function main() {
   await loadRootAccess();
+  await reminderAdapter.drainOutbox();
   await initializeDiscordChannelScope();
   startCodexServer();
   await connectWebSocket();
