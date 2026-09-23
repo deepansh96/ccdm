@@ -18,7 +18,7 @@ edges:
     condition: when changing bot permissions, guest access, channel routing, or credentials
   - target: patterns/INDEX.md
     condition: when starting a task — check the pattern index for a matching pattern file
-last_updated: 2026-09-22
+last_updated: 2026-09-23
 ---
 
 # Session Bootstrap
@@ -47,8 +47,9 @@ Then read this file fully before doing anything else in this session.
 - Root Codex sessions steer active turns for the same channel and author while preserving the active Discord grant; other channels/authors queue, and failed steering falls back to a fresh scoped turn.
 - The Codex bridge forwards allowed users' 👍 and 👎 reactions on its own messages to the active Codex thread.
 - The tracked Usage Stats Poster discovers named and legacy Codex Homes, deduplicates shared homes, and falls back from live rate limits to recent session JSONL data.
-- The tracked Usage Stats Poster also collects sanitized UTC 10-minute snapshots in a private SQLite history, retains them for 365 days, warns on feature-owned history growth, and atomically posts the original text Usage Report with separate Claude and Codex trend PNGs per UTC 30-minute slot; the local posts ledger and advisory lock make retries idempotent.
-- The opt-in `scripts/install-usage-stats-poster.sh` renders, validates, and idempotently loads a 600-second interval-only secret-free LaunchAgent for the tracked Usage Stats Poster, restoring the prior plist and loaded schedule when a replacement load fails.
+- The tracked Usage Stats Poster also collects sanitized UTC 10-minute snapshots in a private SQLite history, retains them for 365 days, warns on feature-owned history growth, and posts the original text Usage Report embed per UTC 30-minute slot without any image attachment; the local posts ledger and advisory lock make retries idempotent.
+- The Usage Stats Poster reports a configured DeepSeek home from its DeepSeek setup marker and private `api-key`: it validates the documented user-balance schema (USD/CNY only, every amount required and preserved exactly), fetches one account-wide balance per distinct key, and pairs it with this machine's local DeepSeek token totals, rendering a compact `deepseek (API)` text block with a bold balance, paid/granted breakdown, monthly local totals, and a short balance/local footer instead of a coverage paragraph. An optional `deepseek_balance_references` display budget (USD/CNY positive decimals) draws the same inline used-balance text bar with used and remaining percentages as the other limits and is never inferred from the current balance; conflicting shared-key references omit the bar with a clear status while the real balance and local usage stay visible.
+- The opt-in `scripts/install-usage-stats-poster.sh` renders, validates, and idempotently loads a 600-second interval-only secret-free LaunchAgent for the tracked text-only Usage Stats Poster with no Pillow dependency (the separate `scripts/usage-dashboard-renderer.py` trend renderer keeps Pillow as an optional manual dependency), restoring the prior plist and loaded schedule when a replacement load fails.
 - Fresh setup output, `registry.example.json`, and the operator README expose generic named-account fields, precedence, migration, and rollback guidance without local credentials or account paths.
 
 **Not built:**

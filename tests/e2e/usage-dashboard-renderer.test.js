@@ -10,6 +10,29 @@ const repoDir = path.resolve(".");
 const script = path.join(repoDir, "scripts", "usage-dashboard-renderer.py");
 const fixture = path.join(repoDir, "tests", "fixtures", "usage-dashboard.json");
 
+function runProbe(body) {
+  return spawnSync("python3", ["-c", [
+    "import importlib.util, json",
+    "from PIL import Image, ImageDraw",
+    `spec = importlib.util.spec_from_file_location("renderer", ${JSON.stringify(script)})`,
+    "module = importlib.util.module_from_spec(spec)",
+    "spec.loader.exec_module(module)",
+    "image = Image.new('RGB', (1600, 1000), '#000000')",
+    "draw = ImageDraw.Draw(image)",
+    ...body,
+  ].join("\n")], { cwd: repoDir, encoding: "utf8" });
+}
+
+function renderNotePng(target, note) {
+  const input = `${target}.json`;
+  fs.writeFileSync(input, JSON.stringify({
+    generated_at: "2026-09-22T18:00:00Z",
+    cards: [{ provider: "codex", account: "deepseek-flash", window: "Weekly", used_percent: 27, reset: "3d 5h" }],
+    notes: [note],
+  }));
+  return { input, output: target };
+}
+
 function runRenderer(output, input = fixture) {
   return new Promise((resolve) => {
     const child = spawn("python3", [script, "--input", input, "--output", output], {
@@ -238,4 +261,253 @@ test("usage dashboard chart insets percentage extrema while preserving linear ma
   assert.ok(mapping.values[0] + 8 <= 500);
   assert.ok(mapping.values[4] - 8 >= 100);
   assert.equal(mapping.values[1] - mapping.values[2], mapping.values[2] - mapping.values[3]);
+});
+
+// Note text wraps against real font metrics, so how many visual lines a note
+// occupies is platform specific.  Compare the words that actually survive
+// instead: the wrapping must keep source content in order and the "…" marker
+// must only appear once the visual-line budget is exhausted.
+function noteWords(lines) {
+  return lines.flatMap((line) => line.split(/\s+/).filter((token) => token && token !== "…"));
+}
+
+test("usage dashboard renders generic notes as bounded multiline text", () => {
+  const probe = runProbe([
+    "import os",
+    "notes = [",
+    "    {'title': 'DeepSeek · local Codex sessions', 'tag': 'DEEPSEEK',",
+    "     'lines': ['This month 12.57M tokens · 3 sessions', 'Input 12.47M · Output 100.0k',",
+    "               'Cached 12.32M in · Reasoning 49.8k out', 'Local homes only · no account-wide spend']},",
+    "    {'title': 'Claude API · API estimate',",
+    "     'lines': ['Today  $1.2500 · 2 requests', 'This month  $3.5000 · 4 requests',",
+    "               'Local estimate · no rate-limit graph']},",
+    "]",
+    "width = (1568 - 24) - (1176 + 38)",
+    "layout = module._rail_notes_layout(draw, notes, 1176, 1568, module.RAIL_NOTES_TOP, 940, 420)",
+    "alternates = [",
+    "    module._note_visual_lines(draw, notes[0], module._font(16, path=path), width)",
+    "    for path in module._FONT_PATHS if os.path.exists(path)",
+    "]",
+    "print(json.dumps({",
+    "    'kinds': [entry['kind'] for entry in layout['entries']],",
+    "    'lines': [entry['lines'] for entry in layout['entries']],",
+    "    'heights': [entry['height'] for entry in layout['entries']],",
+    "    'tops': [entry['y'] for entry in layout['entries']],",
+    "    'height': layout['height'],",
+    "    'source': notes[0]['lines'],",
+    "    'limit': module.NOTE_VISUAL_LINE_LIMIT,",
+    "    'gap': module.NOTE_STRIDE_GAP,",
+    "    'band_top': module.RAIL_NOTES_TOP,",
+    "    'band_bottom': 940,",
+    "    'cost_height': module.NOTE_COST_HEIGHT,",
+    "    'text_heights': [module._note_text_height(len(entry['lines'])) for entry in layout['entries'] if entry['kind'] == 'text'],",
+    "    'alternates': alternates,",
+    "}))",
+  ]);
+  assert.equal(probe.status, 0, probe.stderr);
+  const layout = JSON.parse(probe.stdout);
+  const sourceWords = noteWords(layout.source);
+  // The Claude estimate keeps its dedicated two-column layout...
+  assert.deepEqual(layout.kinds, ["text", "cost"]);
+  // ...while the generic DeepSeek note renders every source word, in order,
+  // wrapped only by font metrics and never padded or reordered.
+  assert.deepEqual(noteWords(layout.lines[0]), sourceWords, "generic note must keep every source word in order");
+  assert.ok(layout.lines[0].every((line) => !line.endsWith("…")), "a note inside its budget must not elide content");
+  assert.ok(layout.lines[0].length <= layout.limit, `note used ${layout.lines[0].length} of ${layout.limit} visual lines`);
+  assert.ok(layout.lines[0].length >= layout.source.length, "every logical line renders at least one visual line");
+  assert.deepEqual(layout.lines[1], []);
+  // Whatever font this host resolves must honour the same ordering guarantee.
+  for (const [index, alternate] of layout.alternates.entries()) {
+    const words = noteWords(alternate);
+    assert.deepEqual(words, sourceWords.slice(0, words.length), `alternate font ${index} must keep source words in order`);
+    assert.ok(alternate.length <= layout.limit, `alternate font ${index} exceeded the visual-line budget`);
+  }
+  // Boxes grow with their lines and the stack stays inside the rail band.
+  assert.equal(layout.heights[0], layout.text_heights[0], "note box height must match its rendered lines");
+  assert.equal(layout.heights[1], layout.cost_height, "cost note keeps its fixed geometry");
+  assert.ok(layout.heights[0] > layout.heights[1], "multiline note box must grow with its lines");
+  const stack = layout.heights.reduce((sum, height) => sum + height, 0) + layout.gap * (layout.heights.length - 1);
+  assert.equal(layout.height, stack, "stack height must cover every note and the inter-note gap");
+  assert.ok(layout.height <= 420, `note stack height ${layout.height} exceeded its budget`);
+  assert.ok(
+    layout.tops.every((top, index) => top >= layout.band_top && top + layout.heights[index] <= layout.band_bottom),
+    "notes must sit inside the rail band",
+  );
+  assert.ok(
+    layout.tops.every((top, index) => index === 0 || top >= layout.tops[index - 1] + layout.heights[index - 1]),
+    "notes must not overlap",
+  );
+});
+
+test("usage dashboard binds the note stack to the rail panel budget", () => {
+  const probe = runProbe([
+    "notes = [{'title': 'Note %d' % index, 'lines': ['x' * 220, 'y' * 220]} for index in range(10)]",
+    "layout = module._rail_notes_layout(draw, notes, 1176, 1568, module.RAIL_NOTES_TOP, 940, 260)",
+    "print(json.dumps({",
+    "    'count': len(layout['entries']),",
+    "    'cap': module.RAIL_NOTES_MAX,",
+    "    'height': layout['height'],",
+    "    'top': layout['entries'][0]['y'] if layout['entries'] else None,",
+    "    'bottom': max((entry['y'] + entry['height'] for entry in layout['entries']), default=0),",
+    "    'floor': module.RAIL_NOTES_TOP,",
+    "}))",
+  ]);
+  assert.equal(probe.status, 0, probe.stderr);
+  const layout = JSON.parse(probe.stdout);
+  assert.ok(layout.count > 0);
+  assert.ok(layout.count <= layout.cap);
+  assert.ok(layout.height <= 260, `note stack height ${layout.height} exceeded its budget`);
+  assert.ok(layout.top >= layout.floor);
+  assert.ok(layout.bottom <= 940);
+});
+
+test("usage dashboard wraps overlong note lines with an explicit ellipsis", () => {
+  const probe = runProbe([
+    "lines = module._wrap_note_line(draw, 'token ' * 80, module._font(16), 200, 3)",
+    "print(json.dumps({'lines': lines, 'widths': [module._measure(draw, line, module._font(16))[0] for line in lines]}))",
+  ]);
+  assert.equal(probe.status, 0, probe.stderr);
+  const wrapped = JSON.parse(probe.stdout);
+  assert.equal(wrapped.lines.length, 3);
+  assert.ok(wrapped.widths.every((width) => width <= 200));
+  assert.match(wrapped.lines.at(-1), /…$/);
+});
+
+test("usage dashboard draws multiple note lines instead of only the first", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-dashboard-notes-"));
+  const single = renderNotePng(path.join(directory, "single.png"), {
+    title: "DeepSeek · local Codex sessions",
+    tag: "DEEPSEEK",
+    lines: ["This month 12.57M tokens · 3 sessions"],
+  });
+  const multi = renderNotePng(path.join(directory, "multi.png"), {
+    title: "DeepSeek · local Codex sessions",
+    tag: "DEEPSEEK",
+    lines: [
+      "This month 12.57M tokens · 3 sessions",
+      "Input 12.47M · Output 100.0k",
+      "Cached 12.32M in · Reasoning 49.8k out",
+      "Local homes only · no account-wide spend",
+    ],
+  });
+  const repeat = renderNotePng(path.join(directory, "multi-repeat.png"), {
+    title: "DeepSeek · local Codex sessions",
+    tag: "DEEPSEEK",
+    lines: [
+      "This month 12.57M tokens · 3 sessions",
+      "Input 12.47M · Output 100.0k",
+      "Cached 12.32M in · Reasoning 49.8k out",
+      "Local homes only · no account-wide spend",
+    ],
+  });
+  const singleRun = await runRenderer(single.output, single.input);
+  const multiRun = await runRenderer(multi.output, multi.input);
+  const repeatRun = await runRenderer(repeat.output, repeat.input);
+  assert.equal(singleRun.code, 0, singleRun.stderr || singleRun.stdout);
+  assert.equal(multiRun.code, 0, multiRun.stderr || multiRun.stdout);
+  assert.equal(repeatRun.code, 0, repeatRun.stderr || repeatRun.stdout);
+  const singleBytes = fs.readFileSync(single.output);
+  const multiBytes = fs.readFileSync(multi.output);
+  const repeatBytes = fs.readFileSync(repeat.output);
+  assert.notDeepEqual(singleBytes, multiBytes, "each note line must change the rendered image");
+  assert.deepEqual(multiBytes, repeatBytes, "multiline notes stay deterministic");
+});
+
+test("usage dashboard renders the shipped DeepSeek local-usage fixture deterministically", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-dashboard-deepseek-"));
+  const deepseekFixture = path.join(repoDir, "tests", "fixtures", "deepseek-usage-dashboard.json");
+  const first = path.join(directory, "first.png");
+  const second = path.join(directory, "second.png");
+  const firstRun = await runRenderer(first, deepseekFixture);
+  const secondRun = await runRenderer(second, deepseekFixture);
+  assert.equal(firstRun.code, 0, firstRun.stderr || firstRun.stdout);
+  assert.equal(secondRun.code, 0, secondRun.stderr || secondRun.stdout);
+  const bytes = fs.readFileSync(first);
+  assert.equal(bytes.readUInt32BE(16), 1600);
+  assert.equal(bytes.readUInt32BE(20), 1000);
+  assert.deepEqual(bytes, fs.readFileSync(second));
+});
+
+test("usage dashboard rail keeps many cards clear of multiline notes", () => {
+  const probe = runProbe([
+    "def build(count):",
+    "    cards = [{'provider': 'codex', 'account': 'acct-%d' % index, 'window': 'Weekly',",
+    "              'used_percent': (index * 7) % 100, 'reset': '3d 5h'} for index in range(count)]",
+    "    notes = [{'title': 'DeepSeek · note %d' % index, 'tag': 'DEEPSEEK',",
+    "              'lines': ['This month 12.57M tokens · 3 sessions',",
+    "                        'Input 12.47M · Output 100.0k',",
+    "                        'Cached 12.32M in · Reasoning 49.8k out']} for index in range(2)]",
+    "    return module.normalize_data({'generated_at': '2026-09-22T18:00:00Z', 'cards': cards, 'notes': notes})",
+    "shapes = []",
+    "for count in (8, 10):",
+    "    normalized = build(count)",
+    "    geom = module._rail_geometry(draw, normalized, (1176, 136, 1568, 968))",
+    "    repeat = module._rail_geometry(draw, normalized, (1176, 136, 1568, 968))",
+    "    notes = geom['notes']['entries']",
+    "    shapes.append({",
+    "        'count': count,",
+    "        'grouped': geom['grouped'],",
+    "        'visible': geom['visible'],",
+    "        'overflow': geom['overflow'],",
+    "        'row_height': geom['row_height'],",
+    "        'card_bottom': geom['card_bottom'],",
+    "        'notes_top': min(entry['y'] for entry in notes),",
+    "        'notes_bottom': max(entry['y'] + entry['height'] for entry in notes),",
+    "        'panel_bottom': geom['notes_bottom'],",
+    "        'notes_floor': module.RAIL_NOTES_TOP,",
+    "        'deterministic': geom == repeat,",
+    "    })",
+    "print(json.dumps(shapes))",
+  ]);
+  assert.equal(probe.status, 0, probe.stderr);
+  const shapes = JSON.parse(probe.stdout);
+  for (const shape of shapes) {
+    assert.equal(shape.grouped, false);
+    assert.equal(shape.visible + shape.overflow, shape.count);
+    assert.ok(shape.visible >= 1, "at least one card row must render");
+    assert.ok(
+      shape.card_bottom <= shape.notes_top,
+      `${shape.count} cards end at ${shape.card_bottom} but notes start at ${shape.notes_top}`,
+    );
+    assert.ok(shape.notes_bottom <= shape.panel_bottom);
+    assert.ok(shape.notes_top >= shape.notes_floor);
+    assert.equal(shape.deterministic, true);
+  }
+  assert.ok(shapes[1].overflow > 0, "ten cards must trigger the bounded overflow marker");
+});
+
+test("usage dashboard renders many cards plus multiline notes deterministically", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-dashboard-overflow-"));
+  const cards = Array.from({ length: 10 }, (_, index) => ({
+    provider: "codex",
+    account: `acct-${index}`,
+    window: "Weekly",
+    used_percent: (index * 7) % 100,
+    reset: "3d 5h",
+  }));
+  const notes = [0, 1].map((index) => ({
+    title: `DeepSeek · note ${index}`,
+    tag: "DEEPSEEK",
+    lines: [
+      "This month 12.57M tokens · 3 sessions",
+      "Input 12.47M · Output 100.0k",
+      "Cached 12.32M in · Reasoning 49.8k out",
+    ],
+  }));
+  const input = path.join(directory, "input.json");
+  fs.writeFileSync(input, JSON.stringify({
+    generated_at: "2026-09-22T18:00:00Z",
+    cards,
+    notes,
+  }));
+  const first = path.join(directory, "first.png");
+  const second = path.join(directory, "second.png");
+  const firstRun = await runRenderer(first, input);
+  const secondRun = await runRenderer(second, input);
+  assert.equal(firstRun.code, 0, firstRun.stderr || firstRun.stdout);
+  assert.equal(secondRun.code, 0, secondRun.stderr || secondRun.stdout);
+  const bytes = fs.readFileSync(first);
+  assert.equal(bytes.readUInt32BE(16), 1600);
+  assert.equal(bytes.readUInt32BE(20), 1000);
+  assert.deepEqual(bytes, fs.readFileSync(second));
 });

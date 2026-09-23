@@ -1459,9 +1459,9 @@ test("poster publishes a placeholder example and ignores local config", () => {
   assert.doesNotMatch(fs.readFileSync("scripts/usage-stats-poster.py", "utf8"), /^\s*(?:import|from)\s+(?:requests|httpx|aiohttp)\b/m);
 });
 
-test("scheduled poster uploads the original text report with both trend PNGs once per 30-minute slot", async () => {
+test("scheduled poster posts the original text report once per 30-minute slot without image attachments", async () => {
   const workspace = createWorkspace();
-  const api = await startPosterApi({ acceptDashboard: true });
+  const api = await startPosterApi();
   const historyPath = path.join(workspace.homeDir, "Library", "Application Support", "CCDM", "usage-stats", "history.sqlite3");
   seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
   const codexHome = path.join(workspace.homeDir, ".codex-scheduled");
@@ -1497,17 +1497,15 @@ test("scheduled poster uploads the original text report with both trend PNGs onc
 
   const posted = await run("2026-08-18T12:30:00Z");
   assert.equal(posted.exitCode, 0, posted.stderr || posted.stdout);
-  assert.match(posted.stdout, /Posted trend dashboard/);
-  const dashboardPost = api.requests.find((request) => request.method === "POST");
-  assert.ok(dashboardPost);
-  assert.match(dashboardPost.contentType || "", /multipart\/form-data/);
-  assert.match(dashboardPost.body, /filename="claude-usage-dashboard\.png"/);
-  assert.match(dashboardPost.body, /filename="codex-usage-dashboard\.png"/);
-  const payloadMatch = dashboardPost.body.match(
-    /name="payload_json"\r\nContent-Type: application\/json\r\n\r\n([^\r]+)\r\n--/,
-  );
-  assert.ok(payloadMatch, "multipart request should contain payload_json");
-  const dashboardPayload = JSON.parse(payloadMatch[1]);
+  assert.match(posted.stdout, /Posted usage report/);
+  const reportPost = api.requests.find((request) => request.method === "POST");
+  assert.ok(reportPost);
+  // The scheduled workflow is text-only: a plain JSON embed, never multipart.
+  assert.equal(reportPost.contentType, "application/json");
+  assert.doesNotMatch(reportPost.body, /multipart\/form-data/);
+  assert.doesNotMatch(reportPost.body, /filename="[^"]*\.png"/);
+  assert.doesNotMatch(reportPost.body, /Content-Type: image\/png/);
+  const dashboardPayload = JSON.parse(reportPost.body);
   assert.equal(dashboardPayload.embeds.length, 1);
   assert.equal(dashboardPayload.embeds[0].title, "Usage Report");
   assert.deepEqual(dashboardPayload.embeds[0].fields.map(({ name }) => name), ["Claude Code", "Codex"]);
@@ -1624,4 +1622,846 @@ test("poster can use a custom root state directory without a root pool entry", a
   const result = await runScript(workspace, "scripts/usage-stats-poster.py", { env: { ROOT_DISCORD_STATE_DIR: custom } });
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(api.requests.find(r => r.method === "POST").authorization, "Bot fixture-root-token");
+});
+
+// ---------------------------------------------------------------------------
+// DeepSeek account balance integration (local fakes only).
+// ---------------------------------------------------------------------------
+
+const DEEPSEEK_FAKE_HELPER_SOURCE = [
+  '"""Local-fake DeepSeek usage collector (used only when the real sibling module is absent)."""',
+  "from datetime import timezone",
+  "",
+  "",
+  "def collect_month_usage(homes, now):",
+  '    period = now.astimezone(timezone.utc).strftime("%Y-%m")',
+  "    return {",
+  '        "status": "available",',
+  '        "period": period,',
+  '        "input_tokens": 900,',
+  '        "cached_input_tokens": 100,',
+  '        "output_tokens": 400,',
+  '        "reasoning_output_tokens": 50,',
+  '        "total_tokens": 1300,',
+  '        "sessions": 1,',
+  '        "partial": False,',
+  "    }",
+  "",
+].join("\n");
+
+function installDeepseekUsageHelper(workspace) {
+  const helperPath = path.join(workspace.repoDir, "scripts", "deepseek-local-usage.py");
+  // Only supply a temporary local fake when the sibling owner's module is not
+  // present; never overwrite a real implementation.
+  if (fs.existsSync(helperPath)) {
+    return false;
+  }
+  fs.writeFileSync(helperPath, DEEPSEEK_FAKE_HELPER_SOURCE);
+  return true;
+}
+
+function seedDeepseekHome(workspace, alias, options = {}) {
+  const home = path.join(workspace.homeDir, alias);
+  fs.mkdirSync(home, { recursive: true });
+  if (options.marker !== undefined) {
+    fs.writeFileSync(path.join(home, "ccdm-deepseek.json"), JSON.stringify(options.marker));
+  }
+  fs.writeFileSync(path.join(home, "config.toml"), 'model = "deepseek-flash"\n');
+  if (options.key !== undefined) {
+    fs.writeFileSync(path.join(home, "api-key"), `${options.key}\n`);
+    fs.chmodSync(path.join(home, "api-key"), options.keyMode ?? 0o600);
+  }
+  if (options.session) {
+    const sessionDir = path.join(home, "sessions", "2026", "09", "22");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionDir, "rollout-fixture-1.jsonl"),
+      `${[
+        JSON.stringify({ type: "session_meta", payload: { id: "session-fixture-1", model_provider: "deepseek" } }),
+        JSON.stringify({ type: "turn_context", payload: { model: "deepseek-flash", turn_id: "turn-1" } }),
+        JSON.stringify({
+          type: "event_msg",
+          timestamp: "2026-09-22T10:00:00Z",
+          payload: {
+            type: "token_count",
+            info: {
+              total_token_usage: {
+                input_tokens: 900,
+                cached_input_tokens: 100,
+                output_tokens: 400,
+                reasoning_output_tokens: 50,
+                total_tokens: 1300,
+              },
+              last_token_usage: {
+                input_tokens: 900,
+                cached_input_tokens: 100,
+                output_tokens: 400,
+                reasoning_output_tokens: 50,
+                total_tokens: 1300,
+              },
+            },
+          },
+        }),
+      ].join("\n")}\n`,
+    );
+  }
+  return home;
+}
+
+async function startDeepseekBalanceApi(handler = () => ({
+  status: 200,
+  body: JSON.stringify({
+    is_available: true,
+    balance_infos: [{
+      currency: "USD",
+      total_balance: "12.34",
+      granted_balance: "0.00",
+      topped_up_balance: "12.34",
+    }],
+  }),
+})) {
+  const requests = [];
+  const server = http.createServer((request, response) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      requests.push({
+        authorization: request.headers.authorization,
+        method: request.method,
+        path: request.url,
+      });
+      const reply = handler(request) || {};
+      response.statusCode = reply.status ?? 200;
+      for (const [name, value] of Object.entries(reply.headers ?? {})) {
+        response.setHeader(name, value);
+      }
+      if (reply.body !== undefined) {
+        response.setHeader("content-type", reply.contentType ?? "application/json");
+        response.end(reply.body);
+      } else {
+        response.end();
+      }
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  registerTeardownCallback(async () => {
+    await new Promise((resolve) => server.close(resolve));
+  });
+  const address = server.address();
+  return { baseUrl: `http://127.0.0.1:${address.port}`, requests };
+}
+
+function probePoster(code, ...args) {
+  return spawnSync("python3", ["-c", [
+    "import importlib.util, sys",
+    "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
+    "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
+    code,
+  ].join("\n"), path.join("scripts", "usage-stats-poster.py"), ...args], { encoding: "utf8" });
+}
+
+function probePosterTimed(timeoutMs, code, ...args) {
+  return spawnSync("python3", ["-c", [
+    "import importlib.util, sys",
+    "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
+    "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
+    code,
+  ].join("\n"), path.join("scripts", "usage-stats-poster.py"), ...args], { encoding: "utf8", timeout: timeoutMs });
+}
+
+test("poster reports a DeepSeek balance and local-session coverage without quota cards", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const balance = await startDeepseekBalanceApi();
+  installDeepseekUsageHelper(workspace);
+  const home = seedDeepseekHome(workspace, "deepseek-flash", {
+    marker: { version: 1, provider: "deepseek" },
+    key: "sk-fixture-deepseek-key",
+    session: true,
+  });
+  const sentinel = path.join(workspace.tmpDir, "auth-command-was-run");
+  fs.writeFileSync(
+    path.join(home, "config.toml"),
+    [
+      'model = "deepseek-flash"',
+      '[model_providers.deepseek.auth]',
+      'command = "/bin/sh"',
+      `args = ["-c", "touch ${sentinel}"]`,
+      "",
+    ].join("\n"),
+  );
+  const historyPath = path.join(workspace.homeDir, "history", "history.sqlite3");
+  seedPosterWorkspace(workspace, api.baseUrl, {
+    deepseek_base_url: balance.baseUrl,
+    history_db_path: historyPath,
+  });
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    `${JSON.stringify({ pool: [], projects: {}, codex_accounts: { "deepseek-flash": home } }, null, 2)}\n`,
+  );
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const post = api.requests.find((request) => request.method === "POST");
+  assert.ok(post);
+  const payload = JSON.parse(post.body);
+  const codexField = payload.embeds[0].fields.find(({ name }) => name === "Codex");
+  assert.ok(codexField, "DeepSeek note should appear in the Codex field");
+  assert.match(codexField.value, /\*\*deepseek-flash\*\* \(API\)\nBalance: \*\*\$12\.34\*\*\nPaid: \$12\.34 · Granted: \$0\.00\n/);
+  assert.match(codexField.value, /\*Balance: whole account · Usage: local Codex\*/);
+  // No reference is configured here, so there is no percentage or inline bar.
+  assert.doesNotMatch(codexField.value, /% left|\[[#.]+\]/);
+  assert.doesNotMatch(codexField.value, /Coverage:/);
+  // The fixture rollout carries the full live token split, so the local totals
+  // are exact: one DeepSeek session with 1300 tokens this UTC month.
+  assert.match(codexField.value, /This month: \*\*1\.3k tokens\*\* · 1 session/);
+  assert.match(codexField.value, /Tokens: in 900 · out 400 · cached 100/);
+
+  assert.equal(balance.requests.length, 1);
+  assert.equal(balance.requests[0].method, "GET");
+  assert.equal(balance.requests[0].path, "/user/balance");
+  assert.equal(balance.requests[0].authorization, "Bearer sk-fixture-deepseek-key");
+  assert.doesNotMatch(result.stdout, /sk-fixture-deepseek-key/);
+  assert.doesNotMatch(result.stderr, /sk-fixture-deepseek-key/);
+  assert.equal(readState(workspace.stateDir).fixtures.codex.stdioInvocations.length, 0);
+  assert.equal(fs.existsSync(sentinel), false, "poster must never execute config.toml auth commands");
+
+  const collected = await runScript(workspace, "scripts/usage-stats-poster.py", { args: ["--collect-only"] });
+  assert.equal(collected.exitCode, 0, collected.stderr || collected.stdout);
+  const snapshot = spawnSync("python3", ["-c", [
+    "import sqlite3, sys",
+    "connection = sqlite3.connect(sys.argv[1])",
+    "print(connection.execute('select payload_json from snapshots').fetchone()[0])",
+  ].join("\n"), historyPath], { encoding: "utf8" });
+  assert.equal(snapshot.status, 0, snapshot.stderr);
+  assert.doesNotMatch(snapshot.stdout, /Balance|12\.34/);
+  assert.doesNotMatch(snapshot.stdout, /deepseek-flash/);
+  assert.doesNotMatch(snapshot.stdout, /sk-fixture-deepseek-key/);
+});
+
+test("DeepSeek coverage reports unavailable without hiding the real balance", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const balance = await startDeepseekBalanceApi();
+  const home = seedDeepseekHome(workspace, "deepseek-flash", {
+    marker: { version: 1, provider: "deepseek" },
+    key: "sk-fixture-deepseek-key",
+    session: true,
+  });
+  // Simulate a host without the sibling local-usage collector: coverage must
+  // degrade to unavailable instead of inventing local totals, while the real
+  // account balance still posts.
+  fs.rmSync(path.join(workspace.repoDir, "scripts", "deepseek-local-usage.py"), { force: true });
+  seedPosterWorkspace(workspace, api.baseUrl, { deepseek_base_url: balance.baseUrl });
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    `${JSON.stringify({ pool: [], projects: {}, codex_accounts: { "deepseek-flash": home } }, null, 2)}\n`,
+  );
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(api.requests.find((request) => request.method === "POST").body);
+  const codexField = payload.embeds[0].fields.find(({ name }) => name === "Codex");
+  assert.ok(codexField);
+  assert.match(codexField.value, /\*\*deepseek-flash\*\* \(API\)/);
+  assert.match(codexField.value, /Balance: \*\*\$12\.34\*\*/);
+  assert.match(codexField.value, /Paid: \$12\.34 · Granted: \$0\.00/);
+  assert.match(
+    codexField.value,
+    /This month: \*unavailable \(Local DeepSeek usage collector unavailable\)\*/,
+  );
+  assert.match(codexField.value, /\*Balance: whole account · Usage: local Codex\*/);
+  assert.doesNotMatch(codexField.value, /This month: \*\*/);
+});
+
+test("DeepSeek key grouping issues one balance request per distinct key", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const balance = await startDeepseekBalanceApi();
+  installDeepseekUsageHelper(workspace);
+  const sharedA = seedDeepseekHome(workspace, "deepseek-primary", {
+    marker: { version: 1, provider: "deepseek" },
+    key: "sk-shared-key-value",
+    session: true,
+  });
+  const sharedB = seedDeepseekHome(workspace, "deepseek-mirror", {
+    marker: { version: 1, provider: "deepseek" },
+    key: "sk-shared-key-value",
+    // The same rollout copied into the mirror home: it shares a session id and
+    // event identity, so the shared-key group must count it once.
+    session: true,
+  });
+  const other = seedDeepseekHome(workspace, "deepseek-other", {
+    marker: { version: 1, provider: "deepseek" },
+    key: "sk-distinct-key-value",
+  });
+  seedPosterWorkspace(workspace, api.baseUrl, { deepseek_base_url: balance.baseUrl });
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    `${JSON.stringify({
+      pool: [],
+      projects: {},
+      codex_accounts: {
+        "deepseek-mirror": sharedB,
+        "deepseek-other": other,
+        "deepseek-primary": sharedA,
+      },
+    }, null, 2)}\n`,
+  );
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const authorizations = balance.requests.map((request) => request.authorization).sort();
+  assert.deepEqual(authorizations, ["Bearer sk-distinct-key-value", "Bearer sk-shared-key-value"]);
+  const payload = JSON.parse(api.requests.find((request) => request.method === "POST").body);
+  const codexField = payload.embeds[0].fields.find(({ name }) => name === "Codex");
+  assert.match(codexField.value, /deepseek-mirror \+ deepseek-primary \(shared key\)/);
+  assert.match(codexField.value, /\*\*deepseek-other\*\*/);
+  assert.doesNotMatch(codexField.value, /sk-(?:shared|distinct)-key-value/);
+  // The copied rollout is deduplicated, so the shared-key note reports the
+  // exact single-copy total for this UTC month rather than double-counting it.
+  assert.match(
+    codexField.value,
+    /\*\*deepseek-mirror \+ deepseek-primary \(shared key\)\*\* \(API\)\nBalance: \*\*\$12\.34\*\*\nPaid: \$12\.34 · Granted: \$0\.00\nThis month: \*\*1\.3k tokens\*\* · 1 session\nTokens: in 900 · out 400 · cached 100\n\*Balance: whole account · Usage: local Codex\*\n/,
+  );
+});
+
+test("malformed or redirecting DeepSeek balance responses stay unavailable and unexposed", async () => {
+  const cases = [
+    { name: "malformed", handler: () => ({ status: 200, body: '{"is_available": true, "balance_infos": "nope"}' }) },
+    { name: "float-amount", handler: () => ({ status: 200, body: JSON.stringify({ is_available: true, balance_infos: [{ currency: "USD", total_balance: 12.34 }] }) }) },
+    {
+      name: "duplicate-currency",
+      handler: () => ({
+        status: 200,
+        body: JSON.stringify({
+          is_available: true,
+          balance_infos: [
+            { currency: "USD", total_balance: "1.00" },
+            { currency: "USD", total_balance: "2.00" },
+          ],
+        }),
+      }),
+    },
+    { name: "unauthorized", handler: () => ({ status: 401, body: "sk-leaked-secret-body" }), expect: /HTTP 401/ },
+    { name: "rate-limited", handler: () => ({ status: 429, body: "sk-leaked-secret-body" }), expect: /HTTP 429/ },
+    { name: "server-error", handler: () => ({ status: 500, body: "sk-leaked-secret-body" }), expect: /HTTP 500/ },
+    { name: "oversized", handler: () => ({ status: 200, body: `{"padding":"${"x".repeat(96 * 1024)}"}` }) },
+    {
+      name: "redirect",
+      handler: () => ({
+        status: 302,
+        headers: { location: "/leaked-secret-body" },
+        body: "sk-leaked-secret-body",
+      }),
+      // A redirect must never be followed to a different origin.
+    },
+  ];
+  for (const testCase of cases) {
+    const workspace = createWorkspace();
+    const api = await startPosterApi();
+    const balance = await startDeepseekBalanceApi(testCase.handler);
+    installDeepseekUsageHelper(workspace);
+    const home = seedDeepseekHome(workspace, "deepseek-flash", {
+      marker: { version: 1, provider: "deepseek" },
+      key: "sk-fixture-deepseek-key",
+    });
+    seedPosterWorkspace(workspace, api.baseUrl, { deepseek_base_url: balance.baseUrl });
+    fs.writeFileSync(
+      path.join(workspace.repoDir, "registry.json"),
+      `${JSON.stringify({ pool: [], projects: {}, codex_accounts: { "deepseek-flash": home } }, null, 2)}\n`,
+    );
+
+    const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+    assert.equal(result.exitCode, 0, `${testCase.name}: ${result.stderr || result.stdout}`);
+    const payload = api.requests.find((request) => request.method === "POST");
+    const codexField = JSON.parse(payload.body).embeds[0].fields.find(({ name }) => name === "Codex");
+    assert.match(codexField.value, /Balance: \*unavailable/, testCase.name);
+    assert.doesNotMatch(codexField.value, /leaked-secret/, testCase.name);
+    assert.doesNotMatch(result.stdout + result.stderr, /leaked-secret/, testCase.name);
+    assert.ok(!(result.stdout + result.stderr).includes(home), testCase.name);
+    if (testCase.expect) {
+      assert.match(codexField.value, testCase.expect, testCase.name);
+    }
+    assert.equal(balance.requests.filter((request) => request.path === "/leaked-secret-body").length, 0, testCase.name);
+  }
+});
+
+test("DeepSeek home marker and private key are required and validated", () => {
+  const probe = probePoster([
+    "import json, os, tempfile",
+    "from pathlib import Path",
+    "root = Path(tempfile.mkdtemp())",
+    "exact = root / 'exact'",
+    "exact.mkdir()",
+    "(exact / 'ccdm-deepseek.json').write_text(json.dumps({'provider': 'deepseek', 'version': 1}))",
+    "(exact / 'api-key').write_text('sk-valid-key-value\\n')",
+    "os.chmod(exact / 'api-key', 0o600)",
+    "print('exact', poster.is_deepseek_home(exact), poster.read_deepseek_key(exact) == 'sk-valid-key-value')",
+    "wrong = root / 'wrong'",
+    "wrong.mkdir()",
+    "(wrong / 'ccdm-deepseek.json').write_text(json.dumps({'provider': 'other', 'version': 1}))",
+    "(wrong / 'api-key').write_text('sk-valid-key-value\\n')",
+    "os.chmod(wrong / 'api-key', 0o600)",
+    "print('wrong', poster.is_deepseek_home(wrong))",
+    "loose = root / 'loose'",
+    "loose.mkdir()",
+    "(loose / 'ccdm-deepseek.json').write_text(json.dumps({'provider': 'deepseek', 'version': 1}))",
+    "(loose / 'api-key').write_text('sk-valid-key-value\\n')",
+    "os.chmod(loose / 'api-key', 0o644)",
+    "print('loose', poster.read_deepseek_key(loose) is None)",
+    "foreign = root / 'foreign'",
+    "foreign.mkdir()",
+    "(foreign / 'ccdm-deepseek.json').write_text(json.dumps({'provider': 'deepseek', 'version': 1}))",
+    "(foreign / 'api-key').write_text('sk-valid-key-value\\n')",
+    "os.chmod(foreign / 'api-key', 0o600)",
+    "real_euid = os.geteuid()",
+    "poster.os.geteuid = lambda: real_euid + 4242",
+    "print('foreign_owner', poster.read_deepseek_key(foreign) is None)",
+    "poster.os.geteuid = lambda: real_euid",
+    "print('current_owner', poster.read_deepseek_key(foreign) == 'sk-valid-key-value')",
+    "linked = root / 'linked'",
+    "linked.mkdir()",
+    "(linked / 'ccdm-deepseek.json').write_text(json.dumps({'provider': 'deepseek', 'version': 1}))",
+    "(linked / 'real-key').write_text('sk-valid-key-value\\n')",
+    "os.chmod(linked / 'real-key', 0o600)",
+    "os.symlink(linked / 'real-key', linked / 'api-key')",
+    "print('symlink', poster.read_deepseek_key(linked) is None)",
+    "print('nokey', poster.read_deepseek_key(root / 'missing') is None)",
+  ].join("\n"));
+  assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+  assert.match(probe.stdout, /^exact True True$/m);
+  assert.match(probe.stdout, /^wrong False$/m);
+  assert.match(probe.stdout, /^loose True$/m);
+  assert.match(probe.stdout, /^foreign_owner True$/m);
+  assert.match(probe.stdout, /^current_owner True$/m);
+  assert.match(probe.stdout, /^symlink True$/m);
+  assert.match(probe.stdout, /^nokey True$/m);
+});
+
+test("DeepSeek credential reads never block on a FIFO", () => {
+  const probe = probePosterTimed(20000, [
+    "import json, os, tempfile, time",
+    "from pathlib import Path",
+    "root = Path(tempfile.mkdtemp())",
+    "home = root / 'home'",
+    "home.mkdir()",
+    "(home / 'ccdm-deepseek.json').write_text(json.dumps({'version': 1, 'provider': 'deepseek'}))",
+    "os.mkfifo(home / 'api-key')",
+    "start = time.monotonic()",
+    "key = poster.read_deepseek_key(home)",
+    "key_elapsed = time.monotonic() - start",
+    "print('fifo_key', key is None, key_elapsed < 2.0)",
+    "os.unlink(home / 'api-key')",
+    "os.unlink(home / 'ccdm-deepseek.json')",
+    "os.mkfifo(home / 'ccdm-deepseek.json')",
+    "start = time.monotonic()",
+    "marker = poster.is_deepseek_home(home)",
+    "marker_elapsed = time.monotonic() - start",
+    "print('fifo_marker', marker is False, marker_elapsed < 2.0)",
+    "os.unlink(home / 'ccdm-deepseek.json')",
+    "(home / 'ccdm-deepseek.json').write_text(json.dumps({'version': 1, 'provider': 'deepseek'}))",
+    "print('marker_after', poster.is_deepseek_home(home))",
+  ].join("\n"));
+  assert.equal(probe.status, 0, `FIFO probe must exit cleanly: ${probe.stderr || probe.stdout}`);
+  assert.match(probe.stdout, /^fifo_key True True$/m);
+  assert.match(probe.stdout, /^fifo_marker True True$/m);
+  assert.match(probe.stdout, /^marker_after True$/m);
+});
+
+test("DeepSeek balance override config accepts only literal loopback http origins", () => {
+  const probe = probePoster([
+    "base = {'discord_channel_id': 'fixture-channel'}",
+    "print('default', poster.parse_config(dict(base))['deepseek_base_url'])",
+    "print('loopback', poster.parse_config({**base, 'deepseek_base_url': 'http://127.0.0.1:4321'})['deepseek_base_url'])",
+    "print('zero_port', poster.parse_config({**base, 'deepseek_base_url': 'http://127.0.0.1:0'})['deepseek_base_url'])",
+    "print('ipv6', poster.parse_config({**base, 'deepseek_base_url': 'http://[::1]:4321'})['deepseek_base_url'])",
+    "for value in ['https://api.deepseek.com', 'http://example.com:80', 'http://127.0.0.1:80/path', 'http://user:pass@127.0.0.1:80', 'http://[::1', 'http://127.0.0.1:65536']:",
+    "    try:",
+    "        poster.parse_config({**base, 'deepseek_base_url': value})",
+    "    except poster.PosterError as error:",
+    "        print('rejected', value, 'sk-' not in str(error))",
+    "    except Exception as error:",
+    "        print('TRACEBACK', value, type(error).__name__)",
+    "    else:",
+    "        print('ACCEPTED', value)",
+  ].join("\n"));
+  assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+  assert.match(probe.stdout, /^default https:\/\/api\.deepseek\.com$/m);
+  assert.match(probe.stdout, /^loopback http:\/\/127\.0\.0\.1:4321$/m);
+  assert.match(probe.stdout, /^zero_port http:\/\/127\.0\.0\.1:0$/m);
+  assert.match(probe.stdout, /^ipv6 http:\/\/\[::1\]:4321$/m);
+  for (const value of ["https://api.deepseek.com", "http://example.com:80", "http://127.0.0.1:80/path", "http://user:pass@127.0.0.1:80", "http://[::1", "http://127.0.0.1:65536"]) {
+    assert.match(probe.stdout, new RegExp(`^rejected ${value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} True$`, "m"));
+  }
+  assert.doesNotMatch(probe.stdout, /ACCEPTED|TRACEBACK/);
+});
+
+test("DeepSeek metric stays a codex display-only note and never shadows ordinary Codex limits", () => {
+  const probe = probePoster([
+    "import json, os, tempfile",
+    "from datetime import datetime, timezone",
+    "from pathlib import Path",
+    "root = Path(tempfile.mkdtemp())",
+    "deepseek_home = root / 'deepseek'",
+    "deepseek_home.mkdir()",
+    "(deepseek_home / 'ccdm-deepseek.json').write_text(json.dumps({'version': 1, 'provider': 'deepseek'}))",
+    "(deepseek_home / 'api-key').write_text('sk-unit-test-key\\n')",
+    "os.chmod(deepseek_home / 'api-key', 0o600)",
+    "ordinary_home = root / 'ordinary'",
+    "ordinary_home.mkdir()",
+    "poster.read_codex_rate_limits = lambda home: {'planType': 'chatgpt', 'primary': {'usedPercent': 42, 'windowDurationMins': 10080}}",
+    "poster._latest_codex_session_data = lambda home: None",
+    "poster.fetch_deepseek_balance = lambda key, base_url, **kwargs: {'is_available': True, 'entries': [{'currency': 'USD', 'total': '3.50', 'granted': '0.00', 'topped_up': '3.50'}]}",
+    "class FakeUsage:",
+    "    @staticmethod",
+    "    def collect_month_usage(homes, now):",
+    "        return {'status': 'available', 'period': '2026-09', 'input_tokens': 10, 'cached_input_tokens': 0, 'output_tokens': 5, 'reasoning_output_tokens': 0, 'total_tokens': 15, 'sessions': 1, 'partial': False}",
+    "registry = {'codex_accounts': {'deepseek-flash': str(deepseek_home), 'work': str(ordinary_home)}}",
+    "metrics = poster.collect_codex_metrics(registry, {}, now=datetime(2026, 9, 22, tzinfo=timezone.utc), deepseek_usage=FakeUsage)",
+    "deepseek = next(m for m in metrics if m['account'] == 'deepseek-flash')",
+    "print('shape', deepseek['provider'], deepseek['limits'] == [], deepseek['source'])",
+    "cards = poster._safe_history_cards(metrics)",
+    "print('cards', [(c['account'], c['window'], c.get('used_percent')) for c in cards])",
+    "print('deepseek_card', any(c['account'] == 'deepseek-flash' for c in cards))",
+    "print('note_title', deepseek['dashboard_note']['title'])",
+    "print('first_line', deepseek['dashboard_note']['lines'][0])",
+  ].join("\n"));
+  assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+  assert.match(probe.stdout, /^shape codex True deepseek$/m);
+  assert.match(probe.stdout, /^cards \[\('work', 'Weekly', 42\.0\)\]$/m);
+  assert.match(probe.stdout, /^deepseek_card False$/m);
+  assert.match(probe.stdout, /^note_title deepseek-flash · API$/m);
+  assert.match(probe.stdout, /^first_line Balance: \*\*\$3\.50\*\*$/m);
+});
+
+test("DeepSeek balance transport failures degrade to a bounded unavailable reason", () => {
+  const probe = probePoster([
+    "from urllib.error import URLError",
+    "class Boom:",
+    "    def open(self, request, timeout=None):",
+    "        raise URLError('fixture timeout')",
+    "try:",
+    "    poster.fetch_deepseek_balance('sk-unit-test-key', 'http://127.0.0.1:9', opener=Boom())",
+    "except poster.PosterError as error:",
+    "    print('timeout', 'unavailable' in str(error).lower() or 'failed' in str(error).lower())",
+    "try:",
+    "    poster.fetch_deepseek_balance('sk-unit-test-key', 'http://127.0.0.1:9', opener=Boom(), timeout=1)",
+    "except poster.PosterError as error:",
+    "    print('no_key', 'sk-unit-test-key' not in str(error))",
+  ].join("\n"));
+  assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+  assert.match(probe.stdout, /^timeout True$/m);
+  assert.match(probe.stdout, /^no_key True$/m);
+});
+
+test("DeepSeek multi-currency balances stay separate and never sum", () => {
+  const probe = probePoster([
+    "payload = {'is_available': False, 'balance_infos': [",
+    "    {'currency': 'USD', 'total_balance': '12.34', 'granted_balance': '0.00', 'topped_up_balance': '12.34'},",
+    "    {'currency': 'CNY', 'total_balance': '88.00', 'granted_balance': '8.00', 'topped_up_balance': '80.00'},",
+    "]}",
+    "balance = {'status': 'available', **poster.parse_deepseek_balance(payload)}",
+    "note_lines, text_lines = poster._deepseek_display('deepseek-flash', balance, {'status': 'available', 'period': '2026-09', 'total_tokens': 0, 'sessions': 0, 'partial': False})",
+    "print('line', note_lines[0])",
+    "print('all', '|'.join(note_lines))",
+    "print('text', text_lines[0])",
+    "print('note_count', len(note_lines))",
+    "_, ref_lines = poster._deepseek_display('deepseek-flash', balance, {'status': 'available', 'period': '2026-09', 'total_tokens': 0, 'sessions': 0, 'partial': False}, reference={'currency': 'CNY', 'amount': '100.00'})",
+    "print('ref_line', ref_lines[0])",
+    "exact = poster.parse_deepseek_balance({'is_available': True, 'balance_infos': [",
+    "    {'currency': 'USD', 'total_balance': '0.10', 'granted_balance': '0.00', 'topped_up_balance': '0.10'}]})['entries'][0]",
+    "print('exact', exact['total'], exact['topped_up'], exact['granted'])",
+    "for bad in [",
+    "    {'is_available': True, 'balance_infos': [{'currency': 'usd', 'total_balance': '1'}]},",
+    "    {'is_available': True, 'balance_infos': [{'currency': 'EUR', 'total_balance': '1.00', 'granted_balance': '0.00', 'topped_up_balance': '1.00'}]},",
+    "    {'is_available': True, 'balance_infos': [{'currency': 'USD', 'total_balance': '1e3'}]},",
+    "    {'is_available': True, 'balance_infos': [{'currency': 'USD', 'total_balance': '-1'}]},",
+    "    {'is_available': True, 'balance_infos': [{'currency': 'USD', 'total_balance': '1.00', 'granted_balance': '0.00'}]},",
+    "    {'is_available': True, 'balance_infos': [{'currency': 'USD', 'total_balance': '1.00', 'granted_balance': 'nope', 'topped_up_balance': '1.00'}]},",
+    "]:",
+    "    try:",
+    "        poster.parse_deepseek_balance(bad)",
+    "    except poster.PosterError:",
+    "        print('rejected', bad['balance_infos'][0]['currency'], bad['balance_infos'][0].get('total_balance'), bad['balance_infos'][0].get('granted_balance'))",
+    "    else:",
+    "        print('ACCEPTED', bad)",
+  ].join("\n"));
+  assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+  assert.match(probe.stdout, /^line Balance: \*\*\$12\.34\*\* · \*\*¥88\.00\*\*$/m);
+  assert.match(probe.stdout, /^text Balance: \*\*\$12\.34\*\* · \*\*¥88\.00\*\*$/m);
+  assert.match(
+    probe.stdout,
+    /^all Balance: \*\*\$12\.34\*\* · \*\*¥88\.00\*\*\|USD: paid \$12\.34 · granted \$0\.00 · CNY: paid ¥80\.00 · granted ¥8\.00\|\*insufficient for API calls\*\|This month: \*\*0 tokens\*\* · 0 sessions\|\*Balance: whole account · Usage: local Codex\*$/m,
+  );
+  assert.doesNotMatch(probe.stdout, /100\.34/, "currencies must never be summed");
+  assert.match(probe.stdout, /^note_count 5$/m);
+  // A CNY reference meters only the CNY balance and still never sums currencies.
+  assert.match(probe.stdout, /^ref_line Balance: `\[##\.{13}\]` \*\*12% used · 88% left\*\* · ¥88\.00 of ¥100\.00 ref$/m);
+  assert.doesNotMatch(probe.stdout, /\[[#.]+\]` \*\*.*left\*\* · \$/);
+  assert.match(probe.stdout, /^exact 0\.10 0\.10 0\.00$/m);
+  assert.match(probe.stdout, /^rejected usd 1 None$/m);
+  assert.match(probe.stdout, /^rejected EUR 1\.00 0\.00$/m);
+  assert.match(probe.stdout, /^rejected USD 1e3 None$/m);
+  assert.match(probe.stdout, /^rejected USD -1 None$/m);
+  assert.match(probe.stdout, /^rejected USD 1\.00 0\.00$/m);
+  assert.match(probe.stdout, /^rejected USD 1\.00 nope$/m);
+  assert.doesNotMatch(probe.stdout, /ACCEPTED/);
+});
+
+test("DeepSeek balance requests are refused outside the official or loopback origins", () => {
+  const probe = probePoster([
+    "from urllib.error import URLError",
+    "class Recorder:",
+    "    def __init__(self):",
+    "        self.urls = []",
+    "    def open(self, request, timeout=None):",
+    "        self.urls.append(request.full_url)",
+    "        raise RuntimeError('refused origins must never be contacted')",
+    "recorder = Recorder()",
+    "for base in ['https://example.com', 'http://user:pass@127.0.0.1:9', 'https://api.deepseek.com.evil.test', 'http://127.0.0.1:9/path']:",
+    "    try:",
+    "        poster.fetch_deepseek_balance('sk-unit-test-key', base, opener=recorder)",
+    "    except poster.PosterError as error:",
+    "        print('refused', base, 'sk-unit-test-key' not in str(error))",
+    "    else:",
+    "        print('SENT', base)",
+    "print('sent_count', len(recorder.urls))",
+    "class Capture:",
+    "    def open(self, request, timeout=None):",
+    "        print('url', request.full_url)",
+    "        raise URLError('fixture stop')",
+    "try:",
+    "    poster.fetch_deepseek_balance('sk-unit-test-key', 'https://api.deepseek.com', opener=Capture())",
+    "except poster.PosterError as error:",
+    "    print('official_error', 'sk-unit-test-key' not in str(error))",
+  ].join("\n"));
+  assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+  for (const value of ["https://example.com", "http://user:pass@127.0.0.1:9", "https://api.deepseek.com.evil.test", "http://127.0.0.1:9/path"]) {
+    assert.match(probe.stdout, new RegExp(`^refused ${value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} True$`, "m"));
+  }
+  assert.match(probe.stdout, /^sent_count 0$/m);
+  assert.match(probe.stdout, /^url https:\/\/api\.deepseek\.com\/user\/balance$/m);
+  assert.match(probe.stdout, /^official_error True$/m);
+  assert.doesNotMatch(probe.stdout, /SENT/);
+});
+
+test("legacy get_codex_stats reports real DeepSeek balance instead of a placeholder", () => {
+  const probe = probePoster([
+    "import json, os, tempfile",
+    "from pathlib import Path",
+    "root = Path(tempfile.mkdtemp())",
+    "home = root / 'deepseek'",
+    "home.mkdir()",
+    "(home / 'ccdm-deepseek.json').write_text(json.dumps({'version': 1, 'provider': 'deepseek'}))",
+    "(home / 'api-key').write_text('sk-unit-test-key\\n')",
+    "os.chmod(home / 'api-key', 0o600)",
+    "poster.load_deepseek_usage_module = lambda path=None: None",
+    "poster.fetch_deepseek_balance = lambda key, base_url, **kwargs: {'is_available': True, 'entries': [{'currency': 'USD', 'total': '5.00', 'granted': '0.00', 'topped_up': '5.00'}]}",
+    "registry = {'codex_accounts': {'deepseek-flash': str(home)}}",
+    "text = poster.get_codex_stats(registry)",
+    "print('placeholder', 'metrics path' in text)",
+    "print('balance', 'Balance: **$5.00**\\nPaid: $5.00 · Granted: $0.00' in text)",
+    "print('local_label', 'local Codex' in text or 'Local usage' in text)",
+    "home_text = poster.get_codex_home_stats(home, 'deepseek-flash')",
+    "print('home_placeholder', 'metrics path' in home_text)",
+    "print('home_balance', 'Balance: **$5.00**' in home_text)",
+    "print('no_accounts', poster.get_codex_stats({'codex_accounts': {}}) is None)",
+  ].join("\n"));
+  assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+  assert.match(probe.stdout, /^placeholder False$/m);
+  assert.match(probe.stdout, /^balance True$/m);
+  assert.match(probe.stdout, /^local_label True$/m);
+  assert.match(probe.stdout, /^home_placeholder False$/m);
+  assert.match(probe.stdout, /^home_balance True$/m);
+  assert.match(probe.stdout, /^no_accounts True$/m);
+});
+
+// ---------------------------------------------------------------------------
+// DeepSeek text-only report: references, conflicts, and no image workflow.
+// ---------------------------------------------------------------------------
+
+test("DeepSeek balance references accept only USD/CNY positive decimals with no extra fields", () => {
+  const probe = probePoster([
+    "base = {'discord_channel_id': 'fixture-channel'}",
+    "print('default', poster.parse_config(dict(base))['deepseek_balance_references'])",
+    "print('usd', poster.parse_config({**base, 'deepseek_balance_references': {'deepseek-flash': {'currency': 'USD', 'amount': '50.00'}}})['deepseek_balance_references'])",
+    "print('cny', poster.parse_config({**base, 'deepseek_balance_references': {'a': {'currency': 'CNY', 'amount': '88'}}})['deepseek_balance_references'])",
+    "for bad in [",
+    "    {'a': {'currency': 'usd', 'amount': '1'}},",
+    "    {'a': {'currency': 'EUR', 'amount': '1'}},",
+    "    {'a': {'currency': 'USD', 'amount': '0'}},",
+    "    {'a': {'currency': 'USD', 'amount': '-1'}},",
+    "    {'a': {'currency': 'USD', 'amount': '1e3'}},",
+    "    {'a': {'currency': 'USD', 'amount': '1.5', 'url': 'http://example.com'}},",
+    "    {'a': {'currency': 'USD', 'amount': 50}},",
+    "    {'': {'currency': 'USD', 'amount': '1'}},",
+    "    {'a': 'nope'},",
+    "    [],",
+    "]:",
+    "    try:",
+    "        poster.parse_config({**base, 'deepseek_balance_references': bad})",
+    "    except poster.PosterError as error:",
+    "        print('rejected', 'sk-' not in str(error), 'http' not in str(error))",
+    "    except Exception as error:",
+    "        print('TRACEBACK', type(error).__name__)",
+    "    else:",
+    "        print('ACCEPTED', bad)",
+  ].join("\n"));
+  assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+  assert.match(probe.stdout, /^default \{\}$/m);
+  assert.match(probe.stdout, /^usd \{'deepseek-flash': \{'currency': 'USD', 'amount': '50\.00'\}\}$/m);
+  assert.match(probe.stdout, /^cny \{'a': \{'currency': 'CNY', 'amount': '88'\}\}$/m);
+  assert.equal((probe.stdout.match(/^rejected True True$/gm) || []).length, 10);
+  assert.doesNotMatch(probe.stdout, /ACCEPTED|TRACEBACK/);
+});
+
+test("scheduled poster posts a referenced DeepSeek block with the inline used-balance meter", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const balance = await startDeepseekBalanceApi();
+  installDeepseekUsageHelper(workspace);
+  const home = seedDeepseekHome(workspace, "deepseek-flash", {
+    marker: { version: 1, provider: "deepseek" },
+    key: "sk-fixture-deepseek-key",
+    session: true,
+  });
+  const historyPath = path.join(workspace.homeDir, "Library", "Application Support", "CCDM", "usage-stats", "history.sqlite3");
+  seedPosterWorkspace(workspace, api.baseUrl, {
+    deepseek_base_url: balance.baseUrl,
+    deepseek_balance_references: { "deepseek-flash": { currency: "USD", amount: "50.00" } },
+    history_db_path: historyPath,
+  });
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    `${JSON.stringify({ pool: [], projects: {}, codex_accounts: { "deepseek-flash": home } }, null, 2)}\n`,
+  );
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+    args: ["--scheduled"],
+    env: { CCDM_TEST_NOW: "2026-09-23T10:30:00Z", CCDM_USAGE_STATS_NOTIFY: "0" },
+  });
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /Posted usage report/);
+
+  const posts = api.requests.filter((request) => request.method === "POST");
+  assert.equal(posts.length, 1, "the scheduled report is a single text post");
+  assert.equal(posts[0].contentType, "application/json");
+  assert.doesNotMatch(posts[0].body, /multipart\/form-data/);
+  assert.doesNotMatch(posts[0].body, /filename="[^"]*\.png"/);
+  const codexField = JSON.parse(posts[0].body).embeds[0].fields.find(({ name }) => name === "Codex");
+  assert.equal(
+    codexField.value,
+    [
+      "**deepseek-flash** (API)",
+      "Balance: `[###########....]` **75% used · 25% left** · $12.34 of $50.00 ref",
+      "Paid: $12.34 · Granted: $0.00",
+      "This month: **1.3k tokens** · 1 session",
+      "Tokens: in 900 · out 400 · cached 100",
+      "*Balance: whole account · Usage: local Codex*",
+    ].join("\n"),
+  );
+  assert.equal(balance.requests.length, 1);
+  assert.doesNotMatch(result.stdout + result.stderr, /sk-fixture-deepseek-key/);
+});
+
+test("scheduled poster never renders or attaches images even when the renderer is missing", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const historyPath = path.join(workspace.homeDir, "Library", "Application Support", "CCDM", "usage-stats", "history.sqlite3");
+  seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
+  // Simulate a host without Pillow and without the trend renderer at all.
+  fs.rmSync(path.join(workspace.repoDir, "scripts", "usage-dashboard-renderer.py"), { force: true });
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+    args: ["--scheduled"],
+    env: { CCDM_TEST_NOW: "2026-09-23T10:30:00Z", CCDM_USAGE_STATS_NOTIFY: "0" },
+  });
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /Posted usage report/);
+  const posts = api.requests.filter((request) => request.method === "POST");
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].contentType, "application/json");
+  assert.doesNotMatch(posts[0].body, /multipart\/form-data|image\/png|filename=/);
+  // No trend or dashboard PNG is ever materialized in the history directory.
+  const historyDir = path.dirname(historyPath);
+  const pngs = fs.existsSync(historyDir)
+    ? fs.readdirSync(historyDir).filter((name) => name.endsWith(".png"))
+    : [];
+  assert.deepEqual(pngs, []);
+  // The poster module no longer references the retired DeepSeek renderer.
+  assert.doesNotMatch(
+    fs.readFileSync("scripts/usage-stats-poster.py", "utf8"),
+    /deepseek-dashboard-renderer|DEEPSEEK_RENDERER/,
+  );
+});
+
+test("DeepSeek reference budget is per-group and omitted on a shared-key conflict", () => {
+  const probe = probePoster([
+    "import json, os, tempfile",
+    "from datetime import datetime, timezone",
+    "from pathlib import Path",
+    "root = Path(tempfile.mkdtemp())",
+    "def mkhome(name, key):",
+    "    home = root / name",
+    "    home.mkdir()",
+    "    (home / 'ccdm-deepseek.json').write_text(json.dumps({'version': 1, 'provider': 'deepseek'}))",
+    "    (home / 'api-key').write_text(key + '\\n')",
+    "    os.chmod(home / 'api-key', 0o600)",
+    "    return home",
+    "shared_a = mkhome('deepseek-primary', 'sk-shared-key-value')",
+    "shared_b = mkhome('deepseek-mirror', 'sk-shared-key-value')",
+    "other = mkhome('deepseek-other', 'sk-distinct-key-value')",
+    "class FakeUsage:",
+    "    @staticmethod",
+    "    def collect_month_usage(homes, now):",
+    "        return {'status': 'available', 'period': '2026-09', 'input_tokens': 10, 'cached_input_tokens': 0, 'output_tokens': 5, 'reasoning_output_tokens': 0, 'total_tokens': 15, 'sessions': 1, 'partial': False}",
+    "poster.fetch_deepseek_balance = lambda key, base_url, **kwargs: {'is_available': True, 'entries': [{'currency': 'USD', 'total': '34.13', 'granted': '0.00', 'topped_up': '34.13'}]}",
+    "registry = {'codex_accounts': {'deepseek-primary': str(shared_a), 'deepseek-mirror': str(shared_b), 'deepseek-other': str(other)}}",
+    "def run(references):",
+    "    return poster.collect_codex_metrics(registry, {'deepseek_balance_references': references}, now=datetime(2026, 9, 22, 18, tzinfo=timezone.utc), deepseek_usage=FakeUsage)",
+    "one = run({'deepseek-mirror': {'currency': 'USD', 'amount': '50.00'}, 'deepseek-other': {'currency': 'USD', 'amount': '20.00'}})",
+    "shared = next(m for m in one if m['account'].startswith('deepseek-mirror'))",
+    "other_metric = next(m for m in one if m['account'] == 'deepseek-other')",
+    "print('shared_line', shared['text'].splitlines()[1])",
+    "print('other_line', other_metric['text'].splitlines()[1])",
+    "conflict = run({'deepseek-primary': {'currency': 'USD', 'amount': '50.00'}, 'deepseek-mirror': {'currency': 'USD', 'amount': '80.00'}})",
+    "shared2 = next(m for m in conflict if m['account'].startswith('deepseek-mirror'))",
+    "body = shared2['text']",
+    "print('conflict_bar', '[#' in body or '[.' in body)",
+    "print('conflict_balance', 'Balance: **$34.13**' in body)",
+    "print('conflict_usage', 'This month: **15 tokens** · 1 session' in body)",
+    "print('conflict_status', 'Balance reference: *omitted (conflicting configured references for shared key)*' in body)",
+  ].join("\n"));
+  assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+  // The applying alias wins even though the shared-key label combines two homes.
+  assert.match(probe.stdout, /^shared_line Balance: `\[#####\.{10}\]` \*\*32% used · 68% left\*\* · \$34\.13 of \$50\.00 ref$/m);
+  // Balance above the reference shows zero usage and an honest remaining percentage.
+  assert.match(probe.stdout, /^other_line Balance: `\[\.{15}\]` \*\*0% used · 171% left\*\* · \$34\.13 of \$20\.00 ref$/m);
+  assert.match(probe.stdout, /^conflict_bar False$/m);
+  assert.match(probe.stdout, /^conflict_balance True$/m);
+  assert.match(probe.stdout, /^conflict_usage True$/m);
+  assert.match(probe.stdout, /^conflict_status True$/m);
+});
+
+test("DeepSeek block keeps amount-only output when the balance or local usage is unavailable", () => {
+  const probe = probePoster([
+    "usage = {'status': 'available', 'period': '2026-09', 'input_tokens': 900, 'cached_input_tokens': 0, 'output_tokens': 400, 'reasoning_output_tokens': 0, 'total_tokens': 1300, 'sessions': 1, 'partial': True}",
+    "balance = {'status': 'available', 'is_available': True, 'entries': [{'currency': 'USD', 'total': '34.13', 'granted': '0.00', 'topped_up': '34.13'}]}",
+    "print('no_ref', poster._deepseek_display('deepseek-flash', balance, usage)[1][0])",
+    "print('partial', [line for line in poster._deepseek_display('deepseek-flash', balance, usage)[1] if line.startswith('This month:')][0])",
+    "missing_usage = {'status': 'unavailable', 'reason': 'Local DeepSeek usage collector unavailable'}",
+    "print('no_usage', poster._deepseek_display('deepseek-flash', balance, missing_usage)[1][-2])",
+    "missing_balance = {'status': 'unavailable', 'reason': 'DeepSeek balance unavailable (HTTP 401)'}",
+    "missing_lines = poster._deepseek_display('deepseek-flash', missing_balance, usage)[1]",
+    "print('no_balance', missing_lines[0])",
+    "print('no_balance_usage', [line for line in missing_lines if line.startswith('This month:')][0])",
+  ].join("\n"));
+  assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+  assert.match(probe.stdout, /^no_ref Balance: \*\*\$34\.13\*\*$/m);
+  assert.match(probe.stdout, /^partial This month: \*\*1\.3k tokens\*\* · 1 session · partial$/m);
+  assert.match(probe.stdout, /^no_usage This month: \*unavailable \(Local DeepSeek usage collector unavailable\)\*$/m);
+  assert.match(probe.stdout, /^no_balance Balance: \*unavailable \(DeepSeek balance unavailable \(HTTP 401\)\)\*$/m);
+  assert.match(probe.stdout, /^no_balance_usage This month: \*\*1\.3k tokens\*\* · 1 session · partial$/m);
 });
