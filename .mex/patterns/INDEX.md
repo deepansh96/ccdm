@@ -1,7 +1,7 @@
 ---
 name: pattern-index
 description: Task routing index for CCDM patterns.
-last_updated: 2026-09-23
+last_updated: 2026-09-25
 ---
 
 # Pattern Index

@@ -13,7 +13,7 @@ edges:
     condition: when restarting a project the user confirmed
   - target: context/discord-security.md
     condition: when handing a login URL or code to the user
-last_updated: 2026-09-24
+last_updated: 2026-09-25
 ---
 
 # Manage A Claude Home Login
@@ -22,9 +22,10 @@ last_updated: 2026-09-24
 Claude credentials are per `CLAUDE_CONFIG_DIR` home (data + config together), and
 they expire on idle. `~/.claude` is the default home; a project's `claude_home`
 can select another, such as `~/.claude-<name>`. Keep the machine's actual home
-inventory in `CLAUDE.local.md`, not in tracked files. Always pass `<home>` as an
-absolute path without a trailing slash (for example `$HOME/.claude`), because the
-hashed Keychain item name is derived from that literal string.
+inventory in `CLAUDE.local.md`, not in tracked files. Always pass `<home>` as
+exactly the absolute path the launcher uses — the project's `claude_home` with `~`
+expanded (for example `$HOME/.claude`, not `$HOME/.claude/`) — because the hashed
+Keychain item name is derived from that literal string.
 Never print credentials or keychain contents; only auth metadata, the one-time
 sign-in URL, and the user's pasted code belong in the flow.
 
@@ -44,17 +45,18 @@ sign-in URL, and the user's pasted code belong in the flow.
    --output-format json` and read `is_error` / `result` / `total_cost_usd`.
    Repeat it without the variable when env-less `~/.claude` projects are affected.
 4. To log in, park the flow so it survives between Discord messages. Check
-   `tmux has-session -t ccdm_claude_login` first; a leftover session makes
+   `tmux has-session -t =ccdm_claude_login` first; a leftover session makes
    `new-session` fail. Launch it the same way the affected projects launch:
    `tmux new-session -d -s ccdm_claude_login -- zsh -ic "CLAUDE_CONFIG_DIR=<home> claude auth login"`
    for a variable-set home, or without `CLAUDE_CONFIG_DIR=<home>` for env-less
    `~/.claude` projects. If both kinds are affected, complete one login of each.
-5. Read the pane and send the user the printed
-   `https://claude.com/cai/oauth/authorize...` URL. That URL uses the manual
+5. Read the pane with `tmux capture-pane -p -J -t =ccdm_claude_login` (`-J`
+   joins the long URL that wraps at the default 80-column width) and send the
+   user the printed `https://claude.com/cai/oauth/authorize...` URL. That URL uses the manual
    redirect: after sign-in the user's browser shows a `code#state` string, and the
    login finishes only when that string is entered at the
    `Paste code here if prompted >` prompt. Ask the user for the full string and
-   send it with `tmux send-keys -t ccdm_claude_login '<code>' Enter`.
+   send it with `tmux send-keys -t =ccdm_claude_login '<code>' Enter`.
 6. Re-check step 2 for the home. A successful login ends the process, which
    closes the tmux session — a missing session is expected on success, not a
    failure.
@@ -77,8 +79,8 @@ sign-in URL, and the user's pasted code belong in the flow.
 - The usage reports (`scripts/usage-stats-poster.py`, `scripts/claude-usage.sh`)
   read both `~/.claude` items, prefer the one whose `expiresAt` is latest, and
   retry the other when it is unexpired and the first is rejected. An auth failure
-  in either report therefore means neither item works, not just the one sessions
-  use.
+  in either report therefore means neither item has a usable access token right
+  now, not just the one sessions use.
 - `claude auth status` reported `loggedIn: false` for a home whose live sessions
   were authenticating fine, and reported a home as usable before a real turn
   succeeded. Always finish with an actual `-p` call.
