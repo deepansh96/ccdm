@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -164,7 +165,27 @@ test("claude usage report reads live OAuth data and local history from fixtures"
   assert.deepEqual(
     state.fixtures.security.invocations.map((entry) => entry.args),
     [
+      [
+        "find-generic-password",
+        "-s",
+        `Claude Code-credentials-${crypto
+          .createHash("sha256")
+          .update(path.join(workspace.homeDir, ".claude"))
+          .digest("hex")
+          .slice(0, 8)}`,
+        "-w",
+      ],
       ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
+      [
+        "find-generic-password",
+        "-s",
+        `Claude Code-credentials-${crypto
+          .createHash("sha256")
+          .update(path.join(workspace.homeDir, ".claude"))
+          .digest("hex")
+          .slice(0, 8)}`,
+        "-w",
+      ],
       ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
     ],
   );

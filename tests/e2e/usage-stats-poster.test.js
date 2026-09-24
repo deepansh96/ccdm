@@ -192,6 +192,16 @@ test("poster posts a Claude usage embed through the configured Discord endpoint"
     ],
   );
   assert.deepEqual(readState(workspace.stateDir).fixtures.security.invocations.map((entry) => entry.args), [
+    [
+      "find-generic-password",
+      "-s",
+      `Claude Code-credentials-${crypto
+        .createHash("sha256")
+        .update(path.join(workspace.homeDir, ".claude"))
+        .digest("hex")
+        .slice(0, 8)}`,
+      "-w",
+    ],
     ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
   ]);
 });
@@ -538,7 +548,7 @@ test("poster discovers labeled extra Claude OAuth config directories with derive
   assert.match(claudeValue, /\*\*Fixture Organization\*\* \(Pro\)/);
   assert.deepEqual(
     readState(workspace.stateDir).fixtures.security.invocations.map((entry) => entry.service),
-    ["Claude Code-credentials", emailService, organizationService],
+    [serviceFor(path.join(workspace.homeDir, ".claude")), "Claude Code-credentials", emailService, organizationService],
   );
   assert.deepEqual(
     api.requests.filter((request) => request.method === "GET").map((request) => request.path),
@@ -603,7 +613,7 @@ test("poster gives each Claude OAuth HTTP 401 an account-specific login action",
   assert.match(claudeValue, /\*\*Fixture Refresh\*\*[\s\S]*Auth expired — start a session on this account to refresh/);
   assert.deepEqual(
     readState(workspace.stateDir).fixtures.security.invocations.map((entry) => entry.service),
-    ["Claude Code-credentials", loginService, refreshService],
+    [serviceFor(path.join(workspace.homeDir, ".claude")), "Claude Code-credentials", loginService, refreshService],
   );
   assert.equal(api.requests.filter((request) => request.method === "GET").length, 3);
 });

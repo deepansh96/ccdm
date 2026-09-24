@@ -35,10 +35,29 @@ header() {
     divider
 }
 
-# Helper: get OAuth token from Keychain
+# Helper: get OAuth token from Keychain.
+# A home's credential lives in "Claude Code-credentials-<sha256(dir)[:8]>" when
+# CLAUDE_CONFIG_DIR is set explicitly (remote logins always are) and in the
+# plain "Claude Code-credentials" item when it is unset, so try both in order.
 get_token() {
-    security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null | \
-        python3 -c "import sys,json; print(json.loads(sys.stdin.read().strip())['claudeAiOauth']['accessToken'])" 2>/dev/null
+    local services service token
+    services=$(python3 - <<'PY'
+import hashlib, os
+default_dir = os.path.join(os.path.expanduser("~"), ".claude")
+print("Claude Code-credentials-" + hashlib.sha256(default_dir.encode()).hexdigest()[:8])
+print("Claude Code-credentials")
+PY
+)
+    while IFS= read -r service; do
+        [ -z "$service" ] && continue
+        token=$(security find-generic-password -s "$service" -w 2>/dev/null | \
+            python3 -c "import sys,json; print(json.loads(sys.stdin.read().strip())['claudeAiOauth']['accessToken'])" 2>/dev/null)
+        if [ -n "$token" ]; then
+            echo "$token"
+            return 0
+        fi
+    done <<< "$services"
+    return 1
 }
 
 # Helper: call Anthropic OAuth API

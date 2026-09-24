@@ -311,14 +311,29 @@ def claude_account_label(config_json_path):
     return None
 
 
-def discover_claude_accounts():
-    """Return the default login and valid extra Claude config-dir logins.
+def claude_home_services(config_dir):
+    """Keychain services that can hold one Claude home's login, current first.
 
-    Claude Code stores the default login in ``Claude Code-credentials`` and
-    derives each ``CLAUDE_CONFIG_DIR`` login's Keychain service from the first
-    eight hex characters of that config directory's SHA-256 hash.
+    Claude Code keeps a home's OAuth credential in ``Claude Code-credentials``
+    when ``CLAUDE_CONFIG_DIR`` is unset, and in
+    ``Claude Code-credentials-<first 8 hex of sha256(dir path)>`` when the
+    variable is set explicitly. Remote logins are always driven with the
+    variable set, so that hashed item is the current location for every home —
+    including ``~/.claude``, whose plain item stays as the legacy fallback.
     """
-    accounts = [("Claude Code-credentials", "Personal", "~/.claude")]
+    hashed = "Claude Code-credentials-" + hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
+    if config_dir == Path.home() / ".claude":
+        return [hashed, "Claude Code-credentials"]
+    return [hashed]
+
+
+def discover_claude_accounts():
+    """Return each Claude login as ``(services, label, dir_hint)``.
+
+    ``services`` is ordered by preference so callers can fall back to the
+    legacy Keychain item when the current one is absent.
+    """
+    accounts = [(claude_home_services(Path.home() / ".claude"), "Personal", "~/.claude")]
     try:
         home = Path.home()
         config_dirs = sorted(home.glob(".claude-*"))
@@ -334,10 +349,9 @@ def discover_claude_accounts():
         label = claude_account_label(config_dir / ".claude.json")
         if not label:
             continue
-        suffix = hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
         accounts.append(
             (
-                f"Claude Code-credentials-{suffix}",
+                claude_home_services(config_dir),
                 label,
                 f"~/{config_dir.name}",
             )
@@ -345,8 +359,14 @@ def discover_claude_accounts():
     return accounts
 
 
-def get_claude_account_stats(base_url, service, label, dir_hint, missing_message=None):
-    oauth = _read_oauth_credential(service)
+def get_claude_account_stats(base_url, services, label, dir_hint, missing_message=None):
+    if isinstance(services, str):
+        services = [services]
+    oauth = None
+    for service in services:
+        oauth = _read_oauth_credential(service)
+        if oauth:
+            break
     if not oauth:
         return missing_message
 
@@ -403,11 +423,11 @@ def _claude_relogin_block(label, dir_hint):
     return f"**{label}**\n*Needs re-login: `{command}`*"
 
 
-def get_claude_oauth_stats(base_url):
+def get_claude_oauth_stats(base_url, services=None):
     """Return the default Claude OAuth account block."""
     return get_claude_account_stats(
         base_url,
-        "Claude Code-credentials",
+        services if services else claude_home_services(Path.home() / ".claude"),
         "Personal",
         "~/.claude",
         missing_message="**Personal**\n*Could not get OAuth token*",
@@ -1033,9 +1053,17 @@ def get_codex_stats(registry):
 
 
 def get_claude_stats(config):
-    blocks = [get_claude_oauth_stats(config["anthropic_base_url"])]
-    for service, label, dir_hint in discover_claude_accounts()[1:]:
-        block = get_claude_account_stats(config["anthropic_base_url"], service, label, dir_hint)
+    blocks = []
+    for services, label, dir_hint in discover_claude_accounts():
+        block = get_claude_account_stats(
+            config["anthropic_base_url"],
+            services,
+            label,
+            dir_hint,
+            missing_message=(
+                "**Personal**\n*Could not get OAuth token*" if dir_hint == "~/.claude" else None
+            ),
+        )
         if block:
             blocks.append(block)
     for account in config["claude_api_accounts"]:
@@ -1069,7 +1097,7 @@ def _normalise_reset_timestamp(value):
     return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _collect_claude_oauth_metric(base_url, service, label, dir_hint):
+def _collect_claude_oauth_metric(base_url, services, label, dir_hint):
     """Collect a credential-free, renderer-friendly Claude account metric.
 
     The returned object intentionally contains only display labels, rate-limit
@@ -1078,7 +1106,13 @@ def _collect_claude_oauth_metric(base_url, service, label, dir_hint):
     writer.
     """
     metric = {"provider": "claude", "account": label, "limits": []}
-    oauth = _read_oauth_credential(service)
+    if isinstance(services, str):
+        services = [services]
+    oauth = None
+    for service in services:
+        oauth = _read_oauth_credential(service)
+        if oauth:
+            break
     if not oauth:
         metric["status"] = "unavailable"
         metric["reason"] = "Could not get OAuth token"
@@ -1166,8 +1200,8 @@ def _collect_claude_oauth_metric(base_url, service, label, dir_hint):
 def collect_claude_metrics(config):
     """Return structured current Claude metrics for history and rendering."""
     metrics = []
-    for index, (service, label, dir_hint) in enumerate(discover_claude_accounts()):
-        metric = _collect_claude_oauth_metric(config["anthropic_base_url"], service, label, dir_hint)
+    for index, (services, label, dir_hint) in enumerate(discover_claude_accounts()):
+        metric = _collect_claude_oauth_metric(config["anthropic_base_url"], services, label, dir_hint)
         if index > 0 and metric.get("missing_oauth"):
             metric["text"] = None
         metrics.append(metric)
