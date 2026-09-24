@@ -5,6 +5,11 @@ triggers:
   - "Codex usage investigation"
   - "account consumption"
   - "historical token analysis"
+edges:
+  - target: context/architecture.md
+    condition: always before locating Codex homes and rollouts
+  - target: context/session-management.md
+    condition: when conversations were copied or resumed across homes/accounts
 last_updated: 2026-09-24
 ---
 
@@ -12,7 +17,7 @@ last_updated: 2026-09-24
 
 ## Context
 
-Load architecture context. Use the OpenAI Docs skill for current product/rate claims. Account aliases and physical homes are different concepts: conversations can be copied and resumed under another account.
+Load `context/architecture.md`. Use current official OpenAI documentation (via a docs skill if one is available) for product and rate claims. Account aliases and physical homes are different concepts: conversations can be copied and resumed under another account.
 
 ## Steps
 
@@ -52,4 +57,5 @@ Unexpected spikes: inspect token-event timestamp clusters, multiple session meta
 
 ## Update Scaffold
 
-Record reusable counting/schema gotchas here, not private account statistics. Update architecture/router state only if operational behavior changes.
+- [ ] Record reusable counting/schema gotchas here, not private account statistics
+- [ ] Update `.mex/context/architecture.md` or `.mex/ROUTER.md` state only if operational behavior changed
