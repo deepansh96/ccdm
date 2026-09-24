@@ -21,7 +21,7 @@ EVENTS_PATH = Path(__file__).with_name("conversation-reminder-events.py")
 SPEC = importlib.util.spec_from_file_location("ccdm_conversation_events", EVENTS_PATH)
 EVENTS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(EVENTS)
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 STATES = {"closed", "open-paused", "awaiting-owner"}
 
 
@@ -45,7 +45,7 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
     db.execute("PRAGMA synchronous=FULL")
     db.execute("PRAGMA secure_delete=ON")
     version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version not in (0, 1, SCHEMA_VERSION) or (version == 0 and existed):
+    if version not in (0, 1, 2, SCHEMA_VERSION) or (version == 0 and existed):
         db.close()
         raise ValueError("conversation store schema is unsupported")
     if version == 0:
@@ -123,10 +123,37 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
                 WHERE state IN ('sending','uncertain');
             PRAGMA user_version=2;
         """)
-    expected_intent = {"nonce", "project", "assignment_generation", "revision", "state",
-                       "message_id", "claimed_at", "retry_at"}
-    if ("delivery_intents" not in {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            or {row[1] for row in db.execute("PRAGMA table_info(delivery_intents)")} != expected_intent):
+    if db.execute("PRAGMA user_version").fetchone()[0] == 2:
+        # A retired assignment keeps its own cleanup identity, and its unresolved
+        # intents never block delivery for the replacement generation.
+        db.executescript("""
+            BEGIN IMMEDIATE;
+            CREATE TABLE retired_assignments (
+                project TEXT NOT NULL, assignment_generation TEXT NOT NULL,
+                channel_id TEXT NOT NULL, bot_id TEXT NOT NULL,
+                reason TEXT NOT NULL, retired_at TEXT NOT NULL,
+                PRIMARY KEY(project,assignment_generation)
+            );
+            CREATE TABLE retired_leftovers (
+                action_id TEXT PRIMARY KEY, project TEXT NOT NULL, assignment_generation TEXT NOT NULL,
+                message_id TEXT NOT NULL, reason TEXT NOT NULL
+            );
+            DROP INDEX active_delivery_intent;
+            CREATE UNIQUE INDEX active_delivery_intent ON delivery_intents(project,assignment_generation)
+                WHERE state IN ('sending','uncertain');
+            PRAGMA user_version=3;
+            COMMIT;
+        """)
+    expected = {
+        "delivery_intents": {"nonce", "project", "assignment_generation", "revision", "state",
+                             "message_id", "claimed_at", "retry_at"},
+        "retired_assignments": {"project", "assignment_generation", "channel_id", "bot_id",
+                                "reason", "retired_at"},
+        "retired_leftovers": {"action_id", "project", "assignment_generation", "message_id", "reason"},
+    }
+    tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if any(table not in tables or {row[1] for row in db.execute(f"PRAGMA table_info({table})")} != columns
+           for table, columns in expected.items()):
         db.close()
         raise ValueError("conversation store schema is unsupported")
     os.chmod(path, 0o600)
@@ -159,6 +186,52 @@ def event_rows(state_dir: Path) -> list[sqlite3.Row]:
         return source.execute("SELECT commit_order, event_id, payload_json FROM events ORDER BY commit_order").fetchall()
 
 
+def usable_assignment(registry: dict, name: str) -> dict | None:
+    """Return the project's assignment only when it is complete and unambiguous."""
+    assignment = EVENTS.assignment_for(registry, name)
+    same_channel = [item for item in registry["projects"].values() if isinstance(item, dict)
+                    and str(item.get("channel_id")) == assignment["channel_id"]]
+    return assignment if len(same_channel) == 1 and assignment["bot"].get("token") else None
+
+
+def retire_conversation(db: sqlite3.Connection, row: sqlite3.Row, reason: str) -> None:
+    """Stop an obsolete assignment and keep only cleanup bound to its own identity."""
+    project, generation = row["project"], row["assignment_generation"]
+    db.execute("INSERT OR IGNORE INTO retired_assignments VALUES (?,?,?,?,?,?)",
+               (project, generation, row["channel_id"], row["bot_id"], reason, stamp(clock_now())))
+    if row["reminder_message_id"]:
+        db.execute("""INSERT OR IGNORE INTO pending_actions
+            (action_id,project,kind,message_id,assignment_generation) VALUES (?,?,?,?,?)""",
+            ("delete:" + row["reminder_message_id"], project, "delete", row["reminder_message_id"], generation))
+    # A ✅ acknowledgment is not cleanup; never act for the obsolete assignment.
+    db.execute("""UPDATE pending_actions SET completed=2
+        WHERE project=? AND assignment_generation=? AND kind='ack' AND completed=0""", (project, generation))
+    db.execute("DELETE FROM conversations WHERE project=?", (project,))
+
+
+def current_conversation(db: sqlite3.Connection, name: str, assignment: dict) -> sqlite3.Row:
+    """Return the row for the current assignment, retiring any other generation first."""
+    current = db.execute("SELECT * FROM conversations WHERE project=?", (name,)).fetchone()
+    if current is not None and (current["assignment_generation"], current["channel_id"], current["bot_id"],
+                                current["owner_id"]) != (assignment["generation"], assignment["channel_id"],
+                                                         assignment["bot_id"], assignment["owner_id"]):
+        retire_conversation(db, current, "reassigned")
+        current = None
+    if current is None:
+        # Re-registration must receive a new generation; never revive retired timers.
+        reused = db.execute("SELECT 1 FROM retired_assignments WHERE project=? AND assignment_generation=?",
+                            (name, assignment["generation"])).fetchone()
+        db.execute("""INSERT INTO conversations
+            (project,channel_id,bot_id,assignment_generation,owner_id,state,revision,
+             cleanup_message_ids,reconciliation_status,checkpoint)
+            VALUES (?,?,?,?,?,'open-paused',0,'[]',?,0)""",
+            (name, assignment["channel_id"], assignment["bot_id"], assignment["generation"],
+             assignment["owner_id"],
+             "blocked-retired-generation" if reused else "suspended-incomplete-discovery"))
+        current = db.execute("SELECT * FROM conversations WHERE project=?", (name,)).fetchone()
+    return current
+
+
 def apply_event(db: sqlite3.Connection, registry: dict, row: sqlite3.Row) -> str:
     event = EVENTS.validate_event(json.loads(row["payload_json"]))
     if db.execute("SELECT 1 FROM applied_events WHERE event_id=?", (event["event_id"],)).fetchone():
@@ -166,22 +239,13 @@ def apply_event(db: sqlite3.Connection, registry: dict, row: sqlite3.Row) -> str
     status, _ = EVENTS._assignment_result(registry, event)
     if status:
         return status
-    assignment = EVENTS.assignment_for(registry, event["project"])
-    projects = registry.get("projects") or {}
-    channel_matches = [item for item in projects.values() if isinstance(item, dict)
-                       and str(item.get("channel_id")) == assignment["channel_id"]]
-    if len(channel_matches) != 1 or not assignment["bot"].get("token"):
+    if db.execute("SELECT 1 FROM retired_assignments WHERE project=? AND assignment_generation=?",
+                  (event["project"], event["assignment_generation"])).fetchone():
         return "stale"
-    current = db.execute("SELECT * FROM conversations WHERE project=?", (event["project"],)).fetchone()
-    if current is None or current["assignment_generation"] != event["assignment_generation"]:
-        db.execute("""INSERT OR REPLACE INTO conversations
-            (project,channel_id,bot_id,assignment_generation,owner_id,state,revision,
-             cleanup_message_ids,reconciliation_status,checkpoint)
-            VALUES (?,?,?,?,?,'open-paused',0,'[]','suspended-incomplete-discovery',0)""",
-            (event["project"], event["channel_id"], event["bot_id"],
-             event["assignment_generation"], assignment["owner_id"]),
-        )
-        current = db.execute("SELECT * FROM conversations WHERE project=?", (event["project"],)).fetchone()
+    assignment = usable_assignment(registry, event["project"])
+    if assignment is None:
+        return "stale"
+    current = current_conversation(db, event["project"], assignment)
     changes = {"checkpoint": row["commit_order"], "last_event_order": event["event_order"]}
     kind = event["event_type"]
     occurred = event["event_time"]
@@ -271,24 +335,20 @@ def sync(project_root: Path, state_dir: Path) -> dict:
         projects = registry.get("projects")
         if not isinstance(projects, dict):
             raise ValueError("registry project assignments are invalid")
+        for row in db.execute("SELECT * FROM conversations").fetchall():
+            if row["project"] not in projects:
+                retire_conversation(db, row, "deregistered")
         for name in projects:
             try:
-                assignment = EVENTS.assignment_for(registry, name)
+                assignment = usable_assignment(registry, name)
             except (KeyError, ValueError):
+                assignment = None
+            if assignment is None:
+                # Ambiguous or missing configuration suspends rather than guesses.
+                db.execute("""UPDATE conversations SET reconciliation_status='suspended-assignment'
+                    WHERE project=? AND reconciliation_status='ready'""", (name,))
                 continue
-            same_channel = [item for item in projects.values() if isinstance(item, dict)
-                            and str(item.get("channel_id")) == assignment["channel_id"]]
-            if len(same_channel) != 1 or not assignment["bot"].get("token"):
-                continue
-            current = db.execute("SELECT assignment_generation FROM conversations WHERE project=?", (name,)).fetchone()
-            if current is None or current["assignment_generation"] != assignment["generation"]:
-                db.execute("""INSERT OR REPLACE INTO conversations
-                    (project,channel_id,bot_id,assignment_generation,owner_id,state,revision,
-                     cleanup_message_ids,reconciliation_status,checkpoint)
-                    VALUES (?,?,?,?,?,'open-paused',0,'[]','suspended-incomplete-discovery',0)""",
-                    (name, assignment["channel_id"], assignment["bot_id"],
-                     assignment["generation"], assignment["owner_id"]),
-                )
+            current_conversation(db, name, assignment)
         for row in rows:
             if apply_event(db, registry, row) == "applied":
                 count += 1
@@ -300,6 +360,62 @@ def sync(project_root: Path, state_dir: Path) -> dict:
     finally:
         db.close()
     return {"status": "synced", "applied": count, "delivery_enabled": False}
+
+
+def assignment_changed(project_root: Path, state_dir: Path, name: str) -> dict:
+    """Generation contract for registration workflows that polling cannot fully observe.
+
+    Retire every known generation for the project, then issue a fresh generation in
+    the registry so an identical delete/re-add can never revive old timers or events.
+    """
+    registry_path = project_root / "registry.json"
+    db = connect(state_dir, create=True)
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        registry = EVENTS.load_registry(project_root)
+        projects = registry.get("projects")
+        if not isinstance(projects, dict):
+            raise ValueError("registry project assignments are invalid")
+        retired = []
+        row = db.execute("SELECT * FROM conversations WHERE project=?", (name,)).fetchone()
+        if row is not None:
+            retire_conversation(db, row, "assignment-changed")
+            retired.append(row["assignment_generation"])
+        generation = None
+        if isinstance(projects.get(name), dict):
+            try:
+                assignment = EVENTS.assignment_for(registry, name)
+            except (KeyError, ValueError):
+                assignment = None
+            if assignment and assignment["generation"] not in retired:
+                db.execute("INSERT OR IGNORE INTO retired_assignments VALUES (?,?,?,?,?,?)",
+                           (name, assignment["generation"], assignment["channel_id"], assignment["bot_id"],
+                            "assignment-changed", stamp(clock_now())))
+                retired.append(assignment["generation"])
+            generation = "gen-" + uuid.uuid4().hex
+            projects[name]["assignment_generation"] = generation
+            mode = stat.S_IMODE(registry_path.stat().st_mode)
+            temporary = registry_path.with_name(f".registry.json.{os.getpid()}.tmp")
+            with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode), "w") as target:
+                json.dump(registry, target, indent=2)
+                target.write("\n")
+            os.chmod(temporary, mode)
+            os.replace(temporary, registry_path)
+            try:
+                renewed = usable_assignment(registry, name)
+            except (KeyError, ValueError):
+                renewed = None
+            if renewed:
+                current_conversation(db, name, renewed)
+        db.execute("COMMIT")
+        return {"status": "changed", "project": name, "retired_generations": retired,
+                "assignment_generation": generation}
+    except Exception:
+        if db.in_transaction:
+            db.execute("ROLLBACK")
+        raise
+    finally:
+        db.close()
 
 
 def status(state_dir: Path) -> dict:
@@ -348,14 +464,38 @@ def status(state_dir: Path) -> dict:
                 "cleanup_message_ids": json.loads(row["cleanup_message_ids"]),
                 "reconciliation_status": row["reconciliation_status"], "checkpoint": row["checkpoint"],
             }
+        blocked = [name for name, row in conversations.items()
+                   if row["reconciliation_status"] == "blocked-retired-generation"]
         unresolved = [dict(row) for row in db.execute("""SELECT nonce,project,state,claimed_at
             FROM delivery_intents WHERE state IN ('sending','uncertain') ORDER BY claimed_at LIMIT 100""")]
         pending = [dict(row) for row in db.execute("""SELECT project,kind,message_id FROM pending_actions
             WHERE completed=0 ORDER BY rowid LIMIT 100""")]
+        retired = []
+        for row in db.execute("SELECT * FROM retired_assignments ORDER BY retired_at DESC LIMIT 100").fetchall():
+            key = (row["project"], row["assignment_generation"])
+            actions = db.execute("""SELECT message_id,completed FROM pending_actions
+                WHERE project=? AND assignment_generation=? AND kind='delete' ORDER BY rowid""", key).fetchall()
+            retired.append({
+                "project": row["project"], "assignment_generation": row["assignment_generation"],
+                "channel_id": row["channel_id"], "bot_id": row["bot_id"],
+                "reason": row["reason"], "retired_at": row["retired_at"],
+                "cleanup": {
+                    "pending": [a["message_id"] for a in actions if a["completed"] == 0],
+                    "completed": [a["message_id"] for a in actions if a["completed"] == 1],
+                    "inaccessible": [dict(a) for a in db.execute("""SELECT message_id,reason FROM retired_leftovers
+                        WHERE project=? AND assignment_generation=? ORDER BY rowid""", key)],
+                },
+                "unresolved_nonces": [r[0] for r in db.execute("""SELECT nonce FROM delivery_intents
+                    WHERE project=? AND assignment_generation=? AND state IN ('sending','uncertain')""", key)],
+            })
         return {"status": "ok", "disabled": disabled["value"] == "1", "worker_running": running,
                 "observer_channels": observer_channels, "delivery_enabled": False,
                 "conversations": conversations, "unresolved_intents": unresolved,
-                "pending_actions": pending,
+                "pending_actions": pending, "retired_assignments": retired,
+                "assignment_guidance": ("Blocked projects reuse a retired assignment generation. After confirming "
+                                        "the registration, run scripts/conversation-reminder-service.py "
+                                        "assignment-changed --project " + ", ".join(sorted(blocked)) + "."
+                                        if blocked else None),
                 "recovery_guidance": ("Run recover after restoring assigned bot access. If intent identity remains "
                                       "unresolved, do not resend or delete by emoji; retain state and investigate "
                                       "the listed nonce. Observation/history gaps remain a separate delivery gate."
@@ -387,10 +527,15 @@ def pending_actions(state_dir: Path) -> dict:
     if db is None:
         return {"actions": []}
     try:
-        rows = db.execute("""SELECT a.action_id,a.project,a.kind,a.message_id,a.assignment_generation,c.channel_id
-            FROM pending_actions a JOIN conversations c ON c.project=a.project
-            WHERE a.completed=0 ORDER BY a.rowid LIMIT 100""").fetchall()
-        return {"actions": [dict(row) for row in rows]}
+        rows = db.execute("""SELECT a.action_id,a.project,a.kind,a.message_id,a.assignment_generation,
+                COALESCE(c.channel_id,r.channel_id) AS channel_id, COALESCE(c.bot_id,r.bot_id) AS bot_id,
+                r.project IS NOT NULL AS retired
+            FROM pending_actions a
+            LEFT JOIN conversations c ON c.project=a.project AND c.assignment_generation=a.assignment_generation
+            LEFT JOIN retired_assignments r ON r.project=a.project AND r.assignment_generation=a.assignment_generation
+            WHERE a.completed=0 AND (c.project IS NOT NULL OR r.project IS NOT NULL)
+            ORDER BY a.rowid LIMIT 100""").fetchall()
+        return {"actions": [{**dict(row), "retired": bool(row["retired"])} for row in rows]}
     finally:
         db.close()
 
@@ -401,7 +546,8 @@ def uncertain_intents(state_dir: Path) -> dict:
         return {"intents": []}
     try:
         rows = db.execute("""SELECT i.nonce,i.project,i.assignment_generation,i.claimed_at,
-            c.channel_id,c.bot_id FROM delivery_intents i JOIN conversations c ON c.project=i.project
+            c.channel_id,c.bot_id FROM delivery_intents i JOIN conversations c
+              ON c.project=i.project AND c.assignment_generation=i.assignment_generation
             WHERE i.state='uncertain' ORDER BY i.claimed_at LIMIT 100""").fetchall()
         return {"intents": [dict(row) for row in rows]}
     finally:
@@ -430,6 +576,49 @@ def complete_action(state_dir: Path, action_id: str) -> dict:
         db.close()
 
 
+SUSPENSIONS = {"suspended-assignment", "suspended-adapter-capability", "suspended-observation-access",
+               "suspended-delivery-access"}
+
+
+def suspend_assignment(state_dir: Path, project: str, generation: str, reason: str) -> dict:
+    """Durably stop delivery for one assignment after lost access or capability."""
+    if reason not in SUSPENSIONS:
+        raise ValueError("unsupported suspension reason")
+    db = connect(state_dir)
+    if db is None:
+        return {"status": "uninitialized"}
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("""UPDATE conversations SET reconciliation_status=?
+            WHERE project=? AND assignment_generation=? AND reconciliation_status='ready'""",
+                   (reason, project, generation))
+        db.execute("COMMIT")
+        return {"status": "suspended"}
+    finally:
+        db.close()
+
+
+def record_leftover(state_dir: Path, action_id: str, reason: str) -> dict:
+    """Report retired cleanup that cannot be done with the retired bot's own credentials."""
+    db = connect(state_dir)
+    if db is None:
+        raise ValueError("conversation store is not initialized")
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        action = db.execute("""SELECT a.* FROM pending_actions a JOIN retired_assignments r
+            ON r.project=a.project AND r.assignment_generation=a.assignment_generation
+            WHERE a.action_id=? AND a.completed=0""", (action_id,)).fetchone()
+        if action is None:
+            raise ValueError("pending retired cleanup does not exist")
+        db.execute("UPDATE pending_actions SET completed=2 WHERE action_id=?", (action_id,))
+        db.execute("INSERT OR REPLACE INTO retired_leftovers VALUES (?,?,?,?,?)",
+                   (action_id, action["project"], action["assignment_generation"], action["message_id"], reason))
+        db.execute("COMMIT")
+        return {"status": "inaccessible"}
+    finally:
+        db.close()
+
+
 def claim_due(project_root: Path, state_dir: Path) -> dict:
     # Apply committed observations before inspecting a due row. The transaction
     # then binds the intent to the exact assignment and conversation revision.
@@ -447,11 +636,13 @@ def claim_due(project_root: Path, state_dir: Path) -> dict:
                 continue
             if not row["due_at"] or iso(row["due_at"]) > now or json.loads(row["cleanup_message_ids"]):
                 continue
-            if db.execute("""SELECT 1 FROM delivery_intents WHERE project=? AND state IN ('sending','uncertain')""",
-                          (row["project"],)).fetchone():
+            if db.execute("""SELECT 1 FROM delivery_intents WHERE project=? AND assignment_generation=?
+                    AND state IN ('sending','uncertain')""",
+                          (row["project"], row["assignment_generation"])).fetchone():
                 continue
-            previous = db.execute("""SELECT retry_at FROM delivery_intents WHERE project=? AND state='failed'
-                ORDER BY rowid DESC LIMIT 1""", (row["project"],)).fetchone()
+            previous = db.execute("""SELECT retry_at FROM delivery_intents WHERE project=?
+                AND assignment_generation=? AND state='failed'
+                ORDER BY rowid DESC LIMIT 1""", (row["project"], row["assignment_generation"])).fetchone()
             if previous and previous["retry_at"] and iso(previous["retry_at"]) > now:
                 continue
             try:
@@ -548,6 +739,13 @@ def record_result(project_root: Path, state_dir: Path, nonce: str, outcome: str,
                 if intent["state"] == "uncertain" and row["reconciliation_status"] == "suspended-uncertain-send":
                     db.execute("""UPDATE conversations SET reconciliation_status='suspended-restart-reconciliation'
                         WHERE project=?""", (intent["project"],))
+            else:
+                # The assignment changed while the request was in flight. Remove the
+                # late reminder only through the retired assignment's own identity.
+                db.execute("""INSERT OR IGNORE INTO pending_actions
+                    (action_id,project,kind,message_id,assignment_generation) VALUES (?,?,?,?,?)""",
+                    ("delete:" + message_id, intent["project"], "delete", message_id,
+                     intent["assignment_generation"]))
             # The exclusion list includes every delivered reminder identity, even
             # after deletion, so a late reaction never reaches a coding agent.
             ids = [r[0] for r in db.execute("SELECT message_id FROM delivery_intents WHERE state='sent' AND message_id IS NOT NULL")]
@@ -604,7 +802,8 @@ def suspend_interrupted_sends(state_dir: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("sync", "status", "disable", "enable", "run", "recover",
-                                            "actions", "done", "intents", "claim", "validate", "result"))
+                                            "actions", "done", "leftover", "intents", "claim", "validate",
+                                            "result", "assignment-changed", "suspend"))
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--state-dir", type=Path, default=EVENTS.default_state_dir())
     parser.add_argument("--action-id")
@@ -613,6 +812,9 @@ def main() -> int:
     parser.add_argument("--message-id")
     parser.add_argument("--sent-at")
     parser.add_argument("--retry-after", type=float)
+    parser.add_argument("--reason")
+    parser.add_argument("--project")
+    parser.add_argument("--generation")
     args = parser.parse_args()
     try:
         if args.command == "status":
@@ -631,6 +833,18 @@ def main() -> int:
             if not args.action_id:
                 raise ValueError("--action-id is required")
             result = complete_action(args.state_dir, args.action_id)
+        elif args.command == "assignment-changed":
+            if not args.project:
+                raise ValueError("--project is required")
+            result = assignment_changed(args.project_root, args.state_dir, args.project)
+        elif args.command == "suspend":
+            if not args.project or not args.generation or not args.reason:
+                raise ValueError("--project, --generation, and --reason are required")
+            result = suspend_assignment(args.state_dir, args.project, args.generation, args.reason)
+        elif args.command == "leftover":
+            if not args.action_id or not args.reason:
+                raise ValueError("--action-id and --reason are required")
+            result = record_leftover(args.state_dir, args.action_id, args.reason)
         elif args.command == "claim":
             result = claim_due(args.project_root, args.state_dir)
         elif args.command == "validate":

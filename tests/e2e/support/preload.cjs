@@ -93,7 +93,7 @@ function formBodyFields(body) {
   return fields;
 }
 
-function takeRestFailure(method, url) {
+function takeRestFailure(method, url, init = {}) {
   const state = readState();
   const failures = state.fixtures?.discord?.restFailures;
   if (!Array.isArray(failures) || failures.length === 0) return null;
@@ -113,7 +113,7 @@ function takeRestFailure(method, url) {
       const parts = url.pathname.split("/");
       nextState.fixtures.discord.deletes ||= [];
       nextState.fixtures.discord.deletes.push({ method, channelId: parts[4], messageId: parts[6],
-        status: failure.status ?? 500 });
+        authorization: headerValue(init.headers, "Authorization"), status: failure.status ?? 500 });
       nextState.fixtures.discord.reminderRequests ||= [];
       nextState.fixtures.discord.reminderRequests.push({ method: "DELETE", messageId: parts[6] });
     }
@@ -127,7 +127,7 @@ function takeRestFailure(method, url) {
 function routeDiscordApi(url, init = {}) {
   const method = (init.method || "GET").toUpperCase();
   if (url.hostname === "discord.com") {
-    const failure = takeRestFailure(method, url);
+    const failure = takeRestFailure(method, url, init);
     if (failure) return failure;
   }
 

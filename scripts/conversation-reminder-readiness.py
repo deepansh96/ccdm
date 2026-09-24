@@ -48,9 +48,11 @@ def build_readiness(project_name: str, project_root: Path, state_dir: Path) -> d
         }
         if provider not in {"codex", "claude"}:
             unsupported_capabilities.append(f"provider {provider} has no reminder adapter")
+        if str(project.get("path") or "").startswith("remote:") and provider in {"codex", "claude"}:
+            # Local events cannot prove an authenticated adapter on the remote host.
+            unsupported_capabilities.append(
+                f"remote {provider.capitalize()} adapter deployment is not verified by local readiness")
         if provider == "claude":
-            if str(project.get("path") or "").startswith("remote:"):
-                unsupported_capabilities.append("remote Claude adapter deployment is not verified by local readiness")
             try:
                 capability = json.loads((state_dir / "capabilities" / f"{project_name}.json").read_text())
             except (OSError, json.JSONDecodeError):

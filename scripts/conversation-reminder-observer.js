@@ -34,8 +34,21 @@ async function retryClockMs() {
   return value;
 }
 
-async function markHealth(project, state) {
+const SUSPENSIONS = {
+  "blocked-assignment": "suspended-assignment",
+  "blocked-adapter-capability": "suspended-adapter-capability",
+  "blocked-observation-access": "suspended-observation-access",
+  "blocked-assigned-bot-permissions": "suspended-delivery-access",
+};
+let registryFingerprint = null;
+
+async function markHealth(project, state, generation) {
   if (health[project] === state) return;
+  // Lost access or capability durably stops delivery for that assignment only.
+  if (generation && SUSPENSIONS[state]) {
+    await exec(process.env.CCDM_REMINDER_PYTHON || "python3", [script, "suspend", "--state-dir", stateDir,
+      "--project", project, "--generation", generation, "--reason", SUSPENSIONS[state]]);
+  }
   health[project] = state;
   healthWrite = healthWrite.then(async () => {
     await mkdir(stateDir, { recursive: true, mode: 0o700 });
@@ -76,41 +89,67 @@ async function assignment(channelId) {
   const data = await registry();
   const bot = data.pool?.filter(row => row?.id === found.bot_id);
   if (bot?.length !== 1 || !bot[0].token || bot[0].assigned_to && bot[0].assigned_to !== found.project) {
-    await markHealth(found.project, "blocked-assignment");
+    await markHealth(found.project, "blocked-assignment", found.assignment_generation);
     return null;
   }
   const readiness = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
     [path.join(__dirname, "conversation-reminder-readiness.py"), found.project, "--json",
-      "--project-root", projectRoot, "--state-dir", stateDir]).then(result => JSON.parse(result.stdout)).catch(() => null);
+      "--project-root", projectRoot, "--state-dir", stateDir]).then(result => JSON.parse(result.stdout))
+    // A blocked readiness report exits nonzero but still explains its cause.
+    .catch(error => { try { return JSON.parse(error.stdout); } catch { return null; } });
   if (!readiness?.ready) {
-    await markHealth(found.project, "blocked-adapter-capability");
+    const assignmentProblem = readiness?.assignment_mismatches?.length || readiness?.missing_credentials?.length;
+    await markHealth(found.project, assignmentProblem ? "blocked-assignment" : "blocked-adapter-capability",
+      found.assignment_generation);
     return null;
   }
   const channel = await client.channels.fetch(channelId).catch(() => null);
   if (!channel?.permissionsFor) {
-    await markHealth(found.project, "blocked-observation-access");
+    await markHealth(found.project, "blocked-observation-access", found.assignment_generation);
     return null;
   }
   let botMember = found.bot_app_id;
   if (channel.guild?.members?.fetch) {
     botMember = await channel.guild.members.fetch(found.bot_app_id).catch(() => null);
     if (!botMember) {
-      await markHealth(found.project, "blocked-assigned-bot-permissions");
+      await markHealth(found.project, "blocked-assigned-bot-permissions", found.assignment_generation);
       return null;
     }
   }
   const rootPermissions = channel.permissionsFor(client.user);
   const botPermissions = channel.permissionsFor(botMember);
   if (!rootPermissions || !["ViewChannel", "ReadMessageHistory"].every(flag => rootPermissions.has(flag))) {
-    await markHealth(found.project, "blocked-observation-access");
+    await markHealth(found.project, "blocked-observation-access", found.assignment_generation);
     return null;
   }
   if (!botPermissions || !["ViewChannel", "ReadMessageHistory", "SendMessages", "AddReactions"].every(flag => botPermissions.has(flag))) {
-    await markHealth(found.project, "blocked-assigned-bot-permissions");
+    await markHealth(found.project, "blocked-assigned-bot-permissions", found.assignment_generation);
     return null;
   }
   await markHealth(found.project, "ready-observe-only");
   return { ...found, bot_token: bot[0].token };
+}
+
+// Retired cleanup may use only the bot that served the retired assignment, and
+// only while that bot is not authorized for a different channel.
+async function retiredCredentials(action) {
+  const data = await registry();
+  const bots = Array.isArray(data.pool) ? data.pool.filter(row => row?.id === action.bot_id) : [];
+  if (bots.length !== 1 || !bots[0].token) return { reason: "retired bot credentials are no longer available" };
+  const projects = data.projects && typeof data.projects === "object" ? data.projects : {};
+  const assignedTo = bots[0].assigned_to;
+  const channels = Object.values(projects).filter(project => project?.bot_id === action.bot_id)
+    .map(project => String(project.channel_id));
+  if (assignedTo) channels.push(String(projects[assignedTo]?.channel_id));
+  if (channels.some(channel => channel !== action.channel_id)) {
+    return { reason: "retired bot is now authorized for another assignment" };
+  }
+  return { token: bots[0].token };
+}
+
+async function reportLeftover(action, reason) {
+  await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+    [script, "leftover", "--state-dir", stateDir, "--action-id", action.action_id, "--reason", reason]);
 }
 
 async function observeMessage(message) {
@@ -218,22 +257,40 @@ async function sideEffects(recoveryOnly = false) {
   if (busy) return;
   busy = true;
   try {
+    if (!recoveryOnly) await revalidate();
     const recovery = recoveryOnly ? await recoverIntents() : null;
     const pending = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
       [script, "actions", "--project-root", projectRoot, "--state-dir", stateDir]);
     for (const action of JSON.parse(pending.stdout).actions) {
       if ((nextActionAttempt.get(action.action_id) || 0) > await retryClockMs()) continue;
-      const found = await assignment(action.channel_id);
-      if (!found || found.project !== action.project ||
-          found.assignment_generation !== action.assignment_generation) continue;
+      let token;
+      if (action.retired) {
+        if (action.kind !== "delete") continue;
+        const credentials = await retiredCredentials(action);
+        if (!credentials.token) {
+          await reportLeftover(action, credentials.reason);
+          continue;
+        }
+        token = credentials.token;
+      } else {
+        const found = await assignment(action.channel_id);
+        if (!found || found.project !== action.project ||
+            found.assignment_generation !== action.assignment_generation) continue;
+        token = found.bot_token;
+      }
       const messageUrl = `https://discord.com/api/v10/channels/${encodeURIComponent(action.channel_id)}` +
         `/messages/${encodeURIComponent(action.message_id)}`;
       const url = action.kind === "ack" ?
         `${messageUrl}/reactions/${encodeURIComponent("✅")}/@me` : messageUrl;
       const response = await fetch(url, {
         method: action.kind === "ack" ? "PUT" : "DELETE",
-        headers: { Authorization: `Bot ${found.bot_token}` },
+        headers: { Authorization: `Bot ${token}` },
       });
+      if (action.retired && (response.status === 401 || response.status === 403)) {
+        await reportLeftover(action, response.status === 401
+          ? "retired bot credentials were rejected" : "retired bot no longer has access to the channel");
+        continue;
+      }
       if (!response.ok && !(action.kind === "delete" && response.status === 404)) {
         let delay = 1000;
         if (response.status === 429) {
@@ -316,13 +373,21 @@ client.on("messageCreate", message => observeMessage(message).catch(error =>
   process.stderr.write(`Conversation observer message failed: ${error.message}\n`)));
 client.on("messageReactionAdd", (reaction, user) => observeReaction(reaction, user).catch(error =>
   process.stderr.write(`Conversation observer reaction failed: ${error.message}\n`)));
-client.on("ready", async () => {
-  const data = await registry();
-  for (const [name, project] of Object.entries(data.projects || {})) {
+// Revalidate owner, uniqueness, access, and capability for every registered
+// project whenever the registry changes.
+async function revalidate() {
+  const source = await readFile(path.join(projectRoot, "registry.json"), "utf8");
+  if (source === registryFingerprint) return;
+  for (const [name, project] of Object.entries(JSON.parse(source).projects || {})) {
     if (!project?.channel_id || !(await assignment(project.channel_id))) {
       if (!health[name]) await markHealth(name, "blocked-assignment");
     }
   }
+  registryFingerprint = source;
+}
+
+client.on("ready", async () => {
+  await revalidate();
   if (recoverOnce) {
     try {
       const result = await sideEffects(true);
