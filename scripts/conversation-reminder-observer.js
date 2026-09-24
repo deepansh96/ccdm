@@ -52,6 +52,11 @@ async function markHealth(project, state, generation) {
   if (generation && SUSPENSIONS[state]) {
     await exec(process.env.CCDM_REMINDER_PYTHON || "python3", [script, "suspend", "--state-dir", stateDir,
       "--project", project, "--generation", generation, "--reason", SUSPENSIONS[state]]);
+  } else if (generation && state === "ready-observe-only" && SUSPENSIONS[health[project]]) {
+    // Access or adapter capability returned (for example a Claude session
+    // restarted with its adapter); reconcile what was missed before any send.
+    await exec(process.env.CCDM_REMINDER_PYTHON || "python3", [script, "resume", "--state-dir", stateDir,
+      "--project", project, "--generation", generation]);
   }
   health[project] = state;
   healthWrite = healthWrite.then(async () => {
@@ -130,7 +135,7 @@ async function assignment(channelId) {
     await markHealth(found.project, "blocked-assigned-bot-permissions", found.assignment_generation);
     return null;
   }
-  await markHealth(found.project, "ready-observe-only");
+  await markHealth(found.project, "ready-observe-only", found.assignment_generation);
   return { ...found, bot_token: bot[0].token };
 }
 
@@ -191,24 +196,45 @@ async function observeReaction(reaction, user) {
   });
 }
 
-async function recoverIntents() {
+// Discord does not return a message nonce on a later read, so a lost send is
+// identified by what the assigned bot itself posted around the claim: its own
+// exact reminder emoji, not yet recorded, inside a bounded window. The scan
+// stops at the claim time instead of walking to the start of the channel.
+const IDENTITY_SKEW_MS = 2 * 60000;
+const IDENTITY_WINDOW_MS = 5 * 60000;
+const IDENTITY_PAGES = 5;
+
+async function recoverIntents(scheduled = false) {
   const listed = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
     [script, "intents", "--state-dir", stateDir]);
   let recovered = 0;
+  let released = 0;
   const unresolved = [];
-  for (const intent of JSON.parse(listed.stdout).intents) {
+  const intents = JSON.parse(listed.stdout).intents;
+  for (const nonce of intentBackoff.keys()) {
+    if (!intents.some(intent => intent.nonce === nonce)) intentBackoff.delete(nonce);
+  }
+  for (const intent of intents) {
+    const backoff = intentBackoff.get(intent.nonce);
+    if (scheduled && backoff && backoff.at > performance.now()) continue;
+    const delay = Math.min(INTENT_BACKOFF_MAX_MS, backoff ? backoff.delay * 2 : INTENT_RECOVERY_MS);
+    intentBackoff.set(intent.nonce, { at: performance.now() + delay, delay });
     const found = await assignment(intent.channel_id);
     if (!found || found.project !== intent.project ||
         found.assignment_generation !== intent.assignment_generation || found.bot_id !== intent.bot_id) {
       unresolved.push({ project: intent.project, nonce: intent.nonce, reason: "assignment or credentials unavailable" });
       continue;
     }
+    const claimed = Date.parse(intent.claimed_at);
+    const lower = claimed - IDENTITY_SKEW_MS;
+    const upper = claimed + IDENTITY_WINDOW_MS;
+    const recorded = new Set(intent.recorded_message_ids || []);
     const base = `https://discord.com/api/v10/channels/${encodeURIComponent(intent.channel_id)}/messages`;
     let before;
-    let match;
+    const matches = [];
     let complete = false;
-    let reason = "intent identity absent from bounded history; do not resend or delete by emoji";
-    for (let page = 0; page < 3; page++) {
+    let reason = "bounded history did not reach the claim time; identity remains unresolved";
+    for (let page = 0; page < IDENTITY_PAGES && !complete; page++) {
       const url = `${base}?limit=100${before ? `&before=${encodeURIComponent(before)}` : ""}`;
       let response;
       try {
@@ -225,37 +251,84 @@ async function recoverIntents() {
         break;
       }
       const messages = await response.json().catch(() => null);
-      if (!Array.isArray(messages) || messages.some(message => !message || typeof message.id !== "string")) {
+      if (!Array.isArray(messages) || messages.some(message => !message || typeof message.id !== "string" ||
+          typeof message.timestamp !== "string" || !Number.isFinite(Date.parse(message.timestamp)))) {
         reason = "Discord history is malformed; identity remains unresolved";
         break;
       }
-      const matches = messages.filter(message => String(message.nonce) === intent.nonce &&
-        String(message.author?.id) === String(found.bot_app_id) && message.content === "👀" &&
-        typeof message.timestamp === "string" && Number.isFinite(Date.parse(message.timestamp)));
-      if (matches.length > 1 || (match && matches.length)) {
-        match = null;
-        reason = "multiple messages carry the intent identity; manual investigation required";
-        break;
+      for (const message of messages) {
+        const at = Date.parse(message.timestamp);
+        if (String(message.author?.id) === String(found.bot_app_id) && message.content === "👀" &&
+            at >= lower && at <= upper && !recorded.has(message.id)) matches.push(message);
       }
-      if (matches.length === 1) match = matches[0];
-      if (messages.length < 100) {
-        complete = true;
-        break;
-      }
-      before = messages[messages.length - 1].id;
-      if (page === 2) reason = "bounded history did not cover the intent; identity remains unresolved";
+      // Newest first: a page reaching past the window's start, or the start of
+      // the channel, covers every message the claim could have produced.
+      complete = messages.length < 100 || messages.some(message => Date.parse(message.timestamp) < lower);
+      if (messages.length) before = messages[messages.length - 1].id;
     }
-    if (!match || !complete) {
-      unresolved.push({ project: intent.project, nonce: intent.nonce, reason });
+    if (complete && matches.length > 1) {
+      reason = "multiple unrecorded reminders from the assigned bot match the claim; manual investigation required";
+    } else if (complete && matches.length === 1) {
+      await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+        [script, "result", "--project-root", projectRoot, "--state-dir", stateDir,
+          "--nonce", intent.nonce, "--outcome", "sent", "--message-id", matches[0].id,
+          "--sent-at", matches[0].timestamp]);
+      recovered++;
       continue;
+    } else if (complete && await retryClockMs() > upper) {
+      // The whole window is visible and the bot posted nothing: the request
+      // never created a reminder, so the channel may reconcile and send again.
+      await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+        [script, "result", "--project-root", projectRoot, "--state-dir", stateDir,
+          "--nonce", intent.nonce, "--outcome", "absent"]);
+      released++;
+      continue;
+    } else if (complete) {
+      reason = "no reminder is visible yet; retry after the identity window closes";
     }
-    await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
-      [script, "result", "--project-root", projectRoot, "--state-dir", stateDir,
-        "--nonce", intent.nonce, "--outcome", "sent", "--message-id", match.id,
-        "--sent-at", match.timestamp]);
-    recovered++;
+    unresolved.push({ project: intent.project, nonce: intent.nonce, reason });
   }
-  return { recovered, unresolved };
+  return { recovered, released, unresolved };
+}
+
+const INTENT_RECOVERY_MS = 5000;
+const INTENT_BACKOFF_MAX_MS = 300000;
+let nextIntentRecovery = 0;
+// Unresolved intents back off per nonce so a stuck lookup never polls Discord hard.
+const intentBackoff = new Map();
+const SEND_ATTEMPTS = 3;
+const SEND_RETRY_MS = [1000, 3000];
+// Connection failures before any request byte was sent; nothing reached Discord.
+const UNSENT_ERRORS = new Set(["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH",
+  "EADDRNOTAVAIL", "UND_ERR_CONNECT_TIMEOUT"]);
+
+async function sendReminder(url, token, nonce) {
+  let response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: `Bot ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ content: "👀", allowed_mentions: { parse: [] }, nonce, enforce_nonce: true }),
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch (error) {
+    const code = error?.cause?.code || error?.code;
+    return { outcome: UNSENT_ERRORS.has(code) ? "failed" : "ambiguous" };
+  }
+  if (response.ok) {
+    const payload = await response.json().catch(() => null);
+    const messageId = typeof payload?.id === "string" ? payload.id : null;
+    const sentAt = typeof payload?.timestamp === "string" && !Number.isNaN(Date.parse(payload.timestamp))
+      ? payload.timestamp : null;
+    return messageId && sentAt ? { outcome: "sent", messageId, sentAt } : { outcome: "ambiguous" };
+  }
+  if (response.status === 429) {
+    const body = await response.json().catch(() => ({}));
+    return { outcome: "failed", retryAfter: Number(body.retry_after ?? response.headers.get("Retry-After")) };
+  }
+  // A server error may follow a created message; only the same nonce can tell.
+  if (response.status >= 500) return { outcome: "ambiguous" };
+  return { outcome: "access" };
 }
 
 async function sideEffects(recoveryOnly = false) {
@@ -273,6 +346,12 @@ async function sideEffects(recoveryOnly = false) {
       });
     }
     const recovery = recoveryOnly ? await recoverIntents() : null;
+    if (!recoveryOnly && performance.now() >= nextIntentRecovery) {
+      // A lost response or network blip resolves itself once history shows
+      // whether the reminder exists; it never waits on an operator.
+      nextIntentRecovery = performance.now() + INTENT_RECOVERY_MS;
+      await recoverIntents(true);
+    }
     const pending = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
       [script, "actions", "--project-root", projectRoot, "--state-dir", stateDir]);
     for (const action of JSON.parse(pending.stdout).actions) {
@@ -342,33 +421,22 @@ async function sideEffects(recoveryOnly = false) {
     let messageId;
     let sentAt;
     let retryAfter;
-    try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { Authorization: `Bot ${found.bot_token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ content: "👀", allowed_mentions: { parse: [] },
-          nonce: claim.nonce, enforce_nonce: true }),
-        signal: AbortSignal.timeout(10000),
-      });
-      if (response.ok) {
-        const payload = await response.json();
-        messageId = typeof payload.id === "string" ? payload.id : null;
-        sentAt = typeof payload.timestamp === "string" && !Number.isNaN(Date.parse(payload.timestamp))
-          ? payload.timestamp : null;
-        outcome = messageId && sentAt ? "sent" : "uncertain";
-      } else if (response.status === 401 || response.status === 403) {
-        outcome = "access";
-      } else if (response.status === 429) {
-        outcome = "failed";
-        const body = await response.json().catch(() => ({}));
-        retryAfter = Number(body.retry_after ?? response.headers.get("Retry-After"));
-      } else if (response.status >= 500) {
-        outcome = "failed";
-      } else {
-        outcome = "access";
+    // Every attempt reuses the claim's nonce with enforce_nonce, so Discord
+    // returns the reminder an earlier ambiguous attempt created instead of
+    // posting a second, untracked one.
+    let ambiguous = false;
+    for (let attempt = 0; attempt < SEND_ATTEMPTS; attempt++) {
+      if (attempt) await new Promise(resolve => setTimeout(resolve, SEND_RETRY_MS[attempt - 1]));
+      const result = await sendReminder(url, found.bot_token, claim.nonce);
+      if (result.outcome === "ambiguous") {
+        ambiguous = true;
+        if (stopping) break;
+        continue;
       }
-    } catch {
-      outcome = "uncertain";
+      ({ messageId, sentAt, retryAfter } = result);
+      // A definite refusal proves only that this attempt created nothing.
+      outcome = result.outcome !== "sent" && ambiguous ? "uncertain" : result.outcome;
+      break;
     }
     const resultArgs = [...args, "--outcome", outcome];
     if (messageId) resultArgs.push("--message-id", messageId);
@@ -389,10 +457,14 @@ client.on("messageCreate", message => observeMessage(message).catch(error =>
 client.on("messageReactionAdd", (reaction, user) => observeReaction(reaction, user).catch(error =>
   process.stderr.write(`Conversation observer reaction failed: ${error.message}\n`)));
 // Revalidate owner, uniqueness, access, and capability for every registered
-// project whenever the registry changes.
+// project whenever the registry changes, and periodically so a stopped or
+// restarted Claude adapter is noticed without other channel traffic.
+const REVALIDATE_MS = 30000;
+let lastRevalidation = 0;
 async function revalidate() {
   const source = await readFile(path.join(projectRoot, "registry.json"), "utf8");
-  if (source === registryFingerprint) return;
+  if (source === registryFingerprint && performance.now() - lastRevalidation < REVALIDATE_MS) return;
+  lastRevalidation = performance.now();
   for (const [name, project] of Object.entries(JSON.parse(source).projects || {})) {
     if (!project?.channel_id || !(await assignment(project.channel_id))) {
       if (!health[name]) await markHealth(name, "blocked-assignment");
@@ -404,8 +476,10 @@ async function revalidate() {
 // Any disconnect, resume, or new session may have dropped events. Durably send
 // every ready channel back through restart reconciliation before further sends.
 let gapChain = Promise.resolve();
+let gapSequence = 0;
 function observationGap(connectedNow) {
   connected = false;
+  gapSequence++;
   gapChain = gapChain.then(async () => {
     await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
       [script, "observation-gap", "--project-root", projectRoot, "--state-dir", stateDir]);
@@ -423,6 +497,39 @@ client.on("shardResume", () => observationGap(true));
 // The first shardReady precedes "ready"; any later one is a new Gateway session.
 client.on("shardReady", () => { if (readyOnce) observationGap(true); });
 
+// Timers stop while the machine sleeps but the wall clock keeps going, and the
+// Gateway socket can look connected until a missed heartbeat is noticed. A tick
+// whose wall-clock gap disagrees with its monotonic gap, or that arrives far too
+// late, is treated like a restart: nothing sends before restart reconciliation,
+// and overdue channels get spaced catch-ups.
+const WAKE_GAP_MS = 30000;
+// Long enough for discord.js to notice a dead socket (about one heartbeat).
+const WAKE_SETTLE_MS = Number(process.env.CCDM_REMINDER_WAKE_SETTLE_MS) || 45000;
+let lastTick = null;
+function wakeDetected() {
+  const wall = Date.now();
+  const monotonic = performance.now();
+  const previous = lastTick;
+  lastTick = { wall, monotonic };
+  if (!previous) return false;
+  const monotonicGap = monotonic - previous.monotonic;
+  return monotonicGap > WAKE_GAP_MS || Math.abs(wall - previous.wall - monotonicGap) > WAKE_GAP_MS;
+}
+
+function tick() {
+  if (wakeDetected()) {
+    process.stderr.write("Conversation observer resumed after sleep or a clock jump; reconciling before any send\n");
+    observationGap(false);
+    const sequence = gapSequence;
+    // Reconnect events supersede this hold; otherwise resume once the socket
+    // has had time to prove itself or be replaced.
+    gapChain.then(() => setTimeout(() => {
+      if (gapSequence === sequence && !stopping) connected = true;
+    }, WAKE_SETTLE_MS));
+  }
+  sideEffects(false);
+}
+
 client.on("ready", async () => {
   connected = true;
   readyOnce = true;
@@ -439,7 +546,7 @@ client.on("ready", async () => {
       process.exit(2);
     }
   }
-  setInterval(() => sideEffects(false), 250);
+  setInterval(tick, 250);
 });
 // Disable stops new work, but an in-flight Discord request finishes and its
 // result is recorded, so it never becomes an uncertain send.

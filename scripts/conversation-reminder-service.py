@@ -927,7 +927,13 @@ def uncertain_intents(state_dir: Path) -> dict:
             c.channel_id,c.bot_id FROM delivery_intents i JOIN conversations c
               ON c.project=i.project AND c.assignment_generation=i.assignment_generation
             WHERE i.state='uncertain' ORDER BY i.claimed_at LIMIT 100""").fetchall()
-        return {"intents": [dict(row) for row in rows]}
+        intents = []
+        for row in rows:
+            # Already recorded reminders can never be the lost send's identity.
+            recorded = [r[0] for r in db.execute("""SELECT message_id FROM delivery_intents
+                WHERE project=? AND state='sent' AND message_id IS NOT NULL""", (row["project"],))]
+            intents.append({**dict(row), "recorded_message_ids": recorded})
+        return {"intents": intents}
     finally:
         db.close()
 
@@ -973,6 +979,23 @@ def suspend_assignment(state_dir: Path, project: str, generation: str, reason: s
                    (reason, project, generation))
         db.execute("COMMIT")
         return {"status": "suspended"}
+    finally:
+        db.close()
+
+
+def resume_assignment(state_dir: Path, project: str, generation: str) -> dict:
+    """Return a revalidated assignment to restart reconciliation before any send."""
+    db = connect(state_dir)
+    if db is None:
+        return {"status": "uninitialized"}
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        changed = db.execute(f"""UPDATE conversations SET reconciliation_status='{DISCOVERY.RESTART}'
+            WHERE project=? AND assignment_generation=?
+              AND reconciliation_status IN ({",".join("?" * len(SUSPENSIONS))})""",
+                             (project, generation, *sorted(SUSPENSIONS))).rowcount
+        db.execute("COMMIT")
+        return {"status": "reconciling" if changed else "unchanged"}
     finally:
         db.close()
 
@@ -1096,10 +1119,20 @@ def record_result(project_root: Path, state_dir: Path, nonce: str, outcome: str,
         intent = db.execute("SELECT * FROM delivery_intents WHERE nonce=?", (nonce,)).fetchone()
         if intent is None or intent["state"] not in {"sending", "uncertain"}:
             raise ValueError("delivery intent is not active")
-        if intent["state"] == "uncertain" and outcome != "sent":
+        if intent["state"] == "uncertain" and outcome not in {"sent", "absent"}:
             raise ValueError("uncertain delivery requires identity-verifiable confirmation")
+        if outcome == "absent" and intent["state"] != "uncertain":
+            raise ValueError("only an uncertain delivery can be proven absent")
         row = db.execute("SELECT * FROM conversations WHERE project=?", (intent["project"],)).fetchone()
-        if outcome == "sent":
+        if outcome == "absent":
+            # History covering the whole claim window shows no reminder from the
+            # assigned bot: nothing was created, so reconcile and allow a new send.
+            db.execute("UPDATE delivery_intents SET state='failed', retry_at=NULL WHERE nonce=?", (nonce,))
+            if (row and row["assignment_generation"] == intent["assignment_generation"] and
+                    row["reconciliation_status"] == "suspended-uncertain-send"):
+                db.execute("""UPDATE conversations SET reconciliation_status='suspended-restart-reconciliation'
+                    WHERE project=?""", (intent["project"],))
+        elif outcome == "sent":
             if not message_id or not sent_at:
                 raise ValueError("successful delivery requires a message identity and timestamp")
             delivery_time = iso(sent_at)
@@ -1204,13 +1237,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("sync", "status", "preflight", "disable", "enable", "run", "recover",
                                             "actions", "done", "leftover", "intents", "claim", "validate",
-                                            "result", "assignment-changed", "suspend", "discover",
+                                            "result", "assignment-changed", "suspend", "resume", "discover",
                                             "discovery-next", "discovery-result", "observation-gap"))
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--state-dir", type=Path, default=EVENTS.default_state_dir())
     parser.add_argument("--action-id")
     parser.add_argument("--nonce")
-    parser.add_argument("--outcome", choices=("sent", "failed", "access", "uncertain"))
+    parser.add_argument("--outcome", choices=("sent", "failed", "access", "uncertain", "absent"))
     parser.add_argument("--message-id")
     parser.add_argument("--sent-at")
     parser.add_argument("--retry-after", type=float)
@@ -1262,6 +1295,10 @@ def main() -> int:
             if not args.project or not args.generation or not args.reason:
                 raise ValueError("--project, --generation, and --reason are required")
             result = suspend_assignment(args.state_dir, args.project, args.generation, args.reason)
+        elif args.command == "resume":
+            if not args.project or not args.generation:
+                raise ValueError("--project and --generation are required")
+            result = resume_assignment(args.state_dir, args.project, args.generation)
         elif args.command == "leftover":
             if not args.action_id or not args.reason:
                 raise ValueError("--action-id and --reason are required")

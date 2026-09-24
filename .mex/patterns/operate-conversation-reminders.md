@@ -25,12 +25,14 @@ Read `docs/conversation-reminders.md`. The service runs independently of coding 
 3. Inspect with `status`. Each `readiness.projects.<project>.blockers` entry names the fix.
 4. To stop, run `disable`. The supervised worker exits successfully and launchd does not relaunch it.
 5. To re-enable, run `enable`, then rerun the installer to start the supervised worker. Channels reconcile before sending.
-6. For uncertain sends or stuck cleanup, run `disable`, wait for `worker_running: false`, then `enable` and `recover`. Then rerun the installer.
+6. The running worker resolves uncertain sends from history by itself. If one stays unresolved, or cleanup is stuck, run `disable`, wait for `worker_running: false`, then `enable` and `recover`. Then rerun the installer.
 7. After registration or deregistration, run `assignment-changed --project <project>`.
 
 ## Gotchas
 - Never edit or delete the private databases to clear state; a new owner message reopens a closed conversation.
-- A reaction can pause a conversation indefinitely until the next qualifying agent response; this is expected.
+- A reaction, including one on a reminder, can pause a conversation indefinitely until the next qualifying agent response; this is expected.
+- A Claude channel is ready only while its adapter launch runs. A plain `scripts/start-session.sh <project>` restart without `CCDM_CLAUDE_REMINDER_ADAPTER=1` leaves it blocked.
+- Sleep or a clock jump is handled like a restart: channels reconcile before any send, and overdue channels get spaced catch-ups.
 - Do not run live Discord or launchd checks as part of default tests; the Live Smoke Suite is separately gated.
 - The installer never touches the Usage Stats Poster LaunchAgent or its storage.
 

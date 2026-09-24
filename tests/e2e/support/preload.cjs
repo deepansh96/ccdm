@@ -10,6 +10,24 @@ const originalHttpsRequest = https.request.bind(https);
 const originalHttpsGet = https.get.bind(https);
 const originalSetInterval = globalThis.setInterval.bind(globalThis);
 
+// Simulated sleep: the wall clock jumps by the file's offset while monotonic
+// timers do not, as when a Mac wakes.
+if (process.env.CCDM_TEST_WALL_OFFSET_FILE) {
+  const realNow = Date.now.bind(Date);
+  let cached = { at: -Infinity, offset: 0 };
+  Date.now = () => {
+    const now = realNow();
+    if (now - cached.at > 100) {
+      let offset = 0;
+      try {
+        offset = Number(fs.readFileSync(process.env.CCDM_TEST_WALL_OFFSET_FILE, "utf8").trim()) || 0;
+      } catch { /* No offset yet. */ }
+      cached = { at: now, offset };
+    }
+    return now + cached.offset;
+  };
+}
+
 const stateDir = process.env.CCDM_TEST_STATE;
 const stateFile = stateDir ? path.join(stateDir, "state.json") : null;
 
@@ -124,6 +142,28 @@ function takeRestFailure(method, url, init = {}) {
   });
 }
 
+// Discord knows a created message's author from the token that created it.
+function authorForToken(authorization) {
+  try {
+    const root = process.env.CCDM_REMINDER_PROJECT_ROOT;
+    const registry = JSON.parse(fs.readFileSync(path.join(root, "registry.json"), "utf8"));
+    const bot = (registry.pool ?? []).find(entry => `Bot ${entry.token}` === authorization);
+    if (bot?.app_id) return String(bot.app_id);
+  } catch { /* Fall back to the single-bot fixture identity. */ }
+  return "app";
+}
+
+// Reminders the fake created, as a history read returns them: no nonce.
+function createdReminders(state, channelId) {
+  if (state.fixtures?.discord?.includeSentInHistory === false) return [];
+  return (state.fixtures.discord.messages ?? [])
+    .filter(message => !message.deleted && message.requestBody?.nonce && message.channelId === channelId)
+    .map(message => ({ id: message.id, channel_id: message.channelId, content: message.content, type: 0,
+      attachments: [], author: { id: authorForToken(message.authorization), bot: true },
+      timestamp: message.timestamp }))
+    .reverse();
+}
+
 // Stateful per-channel history (newest first) with Discord's before/after
 // pagination and reaction membership. Kept apart from `restMessages`, which
 // other scenarios use as one shared recent-history page.
@@ -133,8 +173,14 @@ function routeChannelHistory(url, method, init) {
   const reactionMatch = /^\/api\/v10\/channels\/([^/]+)\/messages\/([^/]+)\/reactions\/([^/]+)$/.exec(url.pathname);
   const channelId = listMatch?.[1] ?? reactionMatch?.[1];
   const state = readState();
-  const history = state.fixtures?.discord?.history?.[channelId];
-  if (!Array.isArray(history)) return null;
+  const seeded = state.fixtures?.discord?.history?.[channelId];
+  if (!Array.isArray(seeded)) return null;
+  // Created reminders join the seeded history in timestamp order.
+  const history = [...seeded];
+  for (const reminder of createdReminders(state, channelId).reverse()) {
+    const index = history.findIndex(message => Date.parse(message.timestamp) <= Date.parse(reminder.timestamp));
+    history.splice(index < 0 ? history.length : index, 0, reminder);
+  }
   const json = (body, status = 200) => response(JSON.stringify(body), {
     headers: { "content-type": "application/json" }, status,
   });
@@ -374,13 +420,9 @@ function routeDiscordApi(url, init = {}) {
         status: 400,
       });
     }
-    const sent = state.fixtures?.discord?.includeSentInHistory
-      ? (state.fixtures.discord.messages ?? []).filter(message => !message.deleted && message.requestBody?.nonce)
-        .map(message => ({ id: message.id, channel_id: message.channelId,
-          content: message.content, nonce: message.requestBody.nonce,
-          author: { id: "app", bot: true }, timestamp: message.timestamp }))
-        .reverse()
-      : [];
+    // Like Discord, created reminders stay in channel history, and a history
+    // read never returns the create-time nonce.
+    const sent = createdReminders(state, listMessagesMatch[1]);
     const messages = [...sent, ...(state.fixtures?.discord?.restMessages ?? [])];
     const beforeIndex = before ? messages.findIndex((message) => message.id === before) : -1;
     const page = beforeIndex >= 0 ? messages.slice(beforeIndex + 1) : messages;
@@ -429,6 +471,18 @@ function routeDiscordApi(url, init = {}) {
       }
     });
     if (crashAfterAccept) process.exit(86);
+    // Discord accepted the reminder, then the gateway failed the response.
+    let acceptedFailure = null;
+    if (parsedBody.content === "👀") {
+      updateState((state) => {
+        acceptedFailure = state.fixtures.discord.restAcceptedFailures?.shift() ?? null;
+      });
+    }
+    if (acceptedFailure) {
+      return response(JSON.stringify({ message: `status ${acceptedFailure.status}` }), {
+        headers: { "content-type": "application/json" }, status: acceptedFailure.status,
+      });
+    }
     const sentResponse = response(JSON.stringify({ id: created.id, content: created.content, timestamp: created.timestamp }), {
       headers: { "content-type": "application/json" },
     });
@@ -567,13 +621,26 @@ function routeDiscordCdn(url) {
 
 async function guardedFetch(input, init = {}) {
   const url = new URL(typeof input === "string" ? input : input.url);
+  if ((init.method || "GET").toUpperCase() === "POST" && url.hostname === "discord.com" &&
+      /^\/api\/v10\/channels\/[^/]+\/messages$/.test(url.pathname) &&
+      readState().fixtures?.discord?.restConnectFailures > 0) {
+    // The connection is refused before any request reaches Discord.
+    updateState(state => {
+      state.fixtures.discord.restConnectFailures -= 1;
+      state.fixtures.discord.connectFailureUses = (state.fixtures.discord.connectFailureUses || 0) + 1;
+    });
+    const cause = Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" });
+    throw Object.assign(new TypeError("fetch failed"), { cause });
+  }
   const routed = routeDiscordApi(url, init) ?? routeDiscordCdn(url, init);
   if (routed) {
     if ((init.method || "GET").toUpperCase() === "POST" &&
         /^\/api\/v10\/channels\/[^/]+\/messages$/.test(url.pathname) &&
         readState().fixtures?.discord?.restLoseResponse) {
       updateState(state => {
-        state.fixtures.discord.restLoseResponse = false;
+        // true loses one response; a number loses that many consecutive responses.
+        const remaining = Number(state.fixtures.discord.restLoseResponse) - 1;
+        state.fixtures.discord.restLoseResponse = remaining > 0 ? remaining : false;
         state.fixtures.discord.lostResponseUses = (state.fixtures.discord.lostResponseUses || 0) + 1;
       });
       throw new Error("Local Fake lost the accepted Discord response");

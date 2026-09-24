@@ -146,6 +146,53 @@ test("downtime catch-up sends one reminder per overdue channel, spaced globally,
   await stopWorker(workspace, context, second);
 });
 
+test("waking from sleep reconciles missed replies before any send and spaces overdue catch-ups", async () => {
+  const workspace = createWorkspace();
+  const context = setup(workspace, { alpha: "alpha-channel", beta: "beta-channel", gamma: "gamma-channel" });
+  const wallOffset = path.join(workspace.tmpDir, "wall-offset");
+  context.env = { ...context.env, CCDM_TEST_WALL_OFFSET_FILE: wallOffset, CCDM_REMINDER_WAKE_SETTLE_MS: "4000" };
+  seedHistory(workspace, {
+    "alpha-channel": answered("alpha"),
+    "beta-channel": answered("beta"),
+    "gamma-channel": answered("gamma"),
+  });
+  await command(workspace, context, "enable");
+  context.setClock("2026-09-20T08:30:00Z");
+  const running = startWorker(workspace, context);
+  const names = ["alpha", "beta", "gamma"];
+  await waitForStatus(workspace, context, current => names.every(name =>
+    current.conversations[name]?.reconciliation_status === "ready"));
+  await settle();
+  assert.equal(reminders(readState(workspace.stateDir)).length, 0);
+
+  // The Mac sleeps for seven hours. Gamma's owner replies from a phone; the
+  // Gateway never delivers it and the socket still looks connected on wake.
+  missed(workspace, "gamma-channel", message("gamma-3", "2026-09-20T10:00:00Z", "owner", "Next step"));
+  fs.writeFileSync(wallOffset, String(7 * 3600000));
+  await waitForStatus(workspace, context, current => names.every(name =>
+    current.conversations[name].reconciliation_status === "suspended-restart-reconciliation"));
+  context.setClock("2026-09-20T15:20:00Z");
+  await settle(1000);
+  assert.equal(reminders(readState(workspace.stateDir)).length, 0, "nothing sends before restart reconciliation");
+
+  const first = await waitForState(workspace, state => reminders(state).length === 1, 20000);
+  assert.equal(reminders(first)[0].channelId, "alpha-channel");
+  context.setClock("2026-09-20T15:20:04Z");
+  await settle();
+  assert.equal(reminders(readState(workspace.stateDir)).length, 1, "catch-up sends are spaced five seconds apart");
+  context.setClock("2026-09-20T15:20:05Z");
+  const both = await waitForState(workspace, state => reminders(state).length === 2, 20000);
+  assert.equal(reminders(both)[1].channelId, "beta-channel");
+  const woke = await waitForStatus(workspace, context, current =>
+    current.conversations.beta.due_at === "2026-09-20T16:20:05Z");
+  assert.deepEqual(names.map(name => woke.conversations[name].discovery.mode), ["restart", "restart", "restart"]);
+  assert.deepEqual([woke.conversations.gamma.state, woke.conversations.gamma.last_ack_message_id],
+    ["open-paused", "gamma-3"]);
+  await settle();
+  assert.equal(reminders(readState(workspace.stateDir)).length, 2);
+  await stopWorker(workspace, context, running);
+});
+
 async function adapterEvent(workspace, context, project, type, id, time, fields = {}) {
   const value = {
     schema_version: 1, event_id: id, event_type: type, project, channel_id: `${project}-channel`,
@@ -440,7 +487,7 @@ test("a catch-up waits for the cleanup backlog left before downtime", async () =
   await stopWorker(workspace, context, second);
 });
 
-test("an unresolved delivery intent stays gated through restart until recovery confirms it", async () => {
+test("an uncertain delivery stays gated through restart until history resolves its identity", async () => {
   const workspace = createWorkspace();
   const context = setup(workspace, { alpha: "alpha-channel", beta: "beta-channel" });
   seedHistory(workspace, { "alpha-channel": answered("alpha"),
@@ -452,42 +499,44 @@ test("an unresolved delivery intent stays gated through restart until recovery c
     current.conversations[name]?.reconciliation_status === "ready"));
   const seed = readState(workspace.stateDir);
   seed.fixtures.discord.crashAfterReminderAccept = true;
+  // History briefly lags the accepted reminder.
+  seed.fixtures.discord.includeSentInHistory = false;
   writeState(seed, workspace.stateDir);
   context.setClock("2026-09-20T09:05:00Z");
   assert.equal((await first).exitCode, 2);
   assert.equal(reminders(readState(workspace.stateDir)).length, 1);
 
+  // Within the claim's identity window an empty history proves nothing: alpha
+  // stays gated while beta reconciles normally.
   await command(workspace, context, "enable");
-  context.setClock("2026-09-20T15:20:00Z");
+  context.setClock("2026-09-20T09:06:00Z");
   const second = startWorker(workspace, context);
   const gated = await waitForStatus(workspace, context, current =>
     current.conversations.beta.reconciliation_status === "ready" &&
     current.conversations.alpha.reconciliation_status === "suspended-uncertain-send");
   assert.match(gated.readiness.projects.alpha.blockers.join("\n"), /uncertain delivery: run recover/);
   assert.equal(gated.readiness.projects.alpha.uncertain_delivery.length, 1);
-  const beta = await waitForState(workspace, state => reminders(state).length === 2, 20000);
-  assert.equal(reminders(beta)[1].channelId, "beta-channel");
   await settle();
-  assert.equal(reminders(readState(workspace.stateDir)).length, 2, "the uncertain channel is never resent");
-  await stopWorker(workspace, context, second);
+  assert.equal(reminders(readState(workspace.stateDir)).length, 1, "the uncertain channel is never resent");
 
-  const accepted = readState(workspace.stateDir);
-  const lost = accepted.fixtures.discord.messages[0];
-  accepted.fixtures.discord.history["alpha-channel"].unshift(message(lost.id, lost.timestamp, "app-alpha", "👀",
-    { nonce: lost.requestBody.nonce }));
-  writeState(accepted, workspace.stateDir);
-  await command(workspace, context, "enable");
-  const recovered = await command(workspace, context, "recover");
-  assert.equal(recovered.recovered, 1);
-  assert.equal(recovered.readiness.projects.alpha.history, "suspended-restart-reconciliation");
+  // Once history shows the assigned bot's own reminder, the worker adopts it
+  // and reconciles; it never duplicates the 09:05 reminder.
+  const visible = readState(workspace.stateDir);
+  visible.fixtures.discord.includeSentInHistory = true;
+  writeState(visible, workspace.stateDir);
+  const adopted = await waitForStatus(workspace, context, current =>
+    current.conversations.alpha.reminder_message_id === "fake-message-1" &&
+    current.conversations.alpha.reconciliation_status === "ready");
+  assert.equal(adopted.conversations.alpha.due_at, "2026-09-20T10:05:00Z");
+  assert.deepEqual(adopted.unresolved_intents, []);
   context.setClock("2026-09-20T15:30:00Z");
-  const third = startWorker(workspace, context);
   const resumed = await waitForState(workspace, state => reminders(state).length === 3, 20000);
-  assert.equal(reminders(resumed)[2].channelId, "alpha-channel");
+  assert.deepEqual(reminders(resumed).map(row => row.channelId).sort(),
+    ["alpha-channel", "alpha-channel", "beta-channel"]);
   await waitForStatus(workspace, context, current => current.conversations.alpha.due_at === "2026-09-20T16:30:00Z");
   await settle();
   assert.equal(reminders(readState(workspace.stateDir)).length, 3);
-  await stopWorker(workspace, context, third);
+  await stopWorker(workspace, context, second);
 });
 
 test("an interrupted restart scan resumes from its checkpoint before releasing the channel", async () => {
