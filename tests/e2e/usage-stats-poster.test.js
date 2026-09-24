@@ -15,6 +15,10 @@ test.afterEach(async () => {
   await cleanup();
 });
 
+function serviceFor(configDir) {
+  return `Claude Code-credentials-${crypto.createHash("sha256").update(configDir).digest("hex").slice(0, 8)}`;
+}
+
 async function startPosterApi({ organization = { organization_type: "pro" }, unauthorizedTokens = [], acceptDashboard = false, usage = {} } = {}) {
   const requests = [];
   const unauthorized = new Set(unauthorizedTokens);
@@ -192,16 +196,7 @@ test("poster posts a Claude usage embed through the configured Discord endpoint"
     ],
   );
   assert.deepEqual(readState(workspace.stateDir).fixtures.security.invocations.map((entry) => entry.args), [
-    [
-      "find-generic-password",
-      "-s",
-      `Claude Code-credentials-${crypto
-        .createHash("sha256")
-        .update(path.join(workspace.homeDir, ".claude"))
-        .digest("hex")
-        .slice(0, 8)}`,
-      "-w",
-    ],
+    ["find-generic-password", "-s", serviceFor(path.join(workspace.homeDir, ".claude")), "-w"],
     ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
   ]);
 });
@@ -521,11 +516,6 @@ test("poster discovers labeled extra Claude OAuth config directories with derive
   fs.writeFileSync(path.join(workspace.homeDir, ".claude-not-a-directory"), "fixture\n");
   seedPosterWorkspace(workspace, api.baseUrl);
 
-  const serviceFor = (configDir) => `Claude Code-credentials-${crypto
-    .createHash("sha256")
-    .update(configDir)
-    .digest("hex")
-    .slice(0, 8)}`;
   const emailService = serviceFor(emailDir);
   const organizationService = serviceFor(organizationDir);
   const state = readState(workspace.stateDir);
@@ -581,11 +571,6 @@ test("poster gives each Claude OAuth HTTP 401 an account-specific login action",
     `${JSON.stringify({ oauthAccount: { organizationName: "Fixture Refresh" } })}\n`,
   );
   seedPosterWorkspace(workspace, api.baseUrl);
-  const serviceFor = (configDir) => `Claude Code-credentials-${crypto
-    .createHash("sha256")
-    .update(configDir)
-    .digest("hex")
-    .slice(0, 8)}`;
   const loginService = serviceFor(loginDir);
   const refreshService = serviceFor(refreshDir);
   const state = readState(workspace.stateDir);
@@ -622,11 +607,7 @@ async function runPosterWithDefaultHomeCredentials(credentialsFor) {
   const workspace = createWorkspace();
   const api = await startPosterApi();
   seedPosterWorkspace(workspace, api.baseUrl);
-  const hashedService = `Claude Code-credentials-${crypto
-    .createHash("sha256")
-    .update(path.join(workspace.homeDir, ".claude"))
-    .digest("hex")
-    .slice(0, 8)}`;
+  const hashedService = serviceFor(path.join(workspace.homeDir, ".claude"));
   const state = readState(workspace.stateDir);
   state.fixtures.security.credentials = credentialsFor(hashedService);
   writeState(state, workspace.stateDir);
@@ -677,6 +658,34 @@ test("poster uses whichever default-home Keychain item expires last", async () =
     "Claude Code-credentials": { claudeAiOauth: { accessToken: "fixture-other-token" } },
   }));
   assert.deepEqual(oauthAuthorizations, ["Bearer fixture-oauth-token", "Bearer fixture-oauth-token"]);
+});
+
+test("poster falls back to the other unexpired Keychain item when the API rejects a token", async () => {
+  const revoked = {
+    claudeAiOauth: { accessToken: "fixture-revoked-token", expiresAt: Date.now() + 2 * 60 * 60 * 1000 },
+  };
+  const fallback = await runPosterWithDefaultHomeCredentials((hashedService) => ({
+    [hashedService]: revoked,
+    "Claude Code-credentials": {
+      claudeAiOauth: { accessToken: "fixture-oauth-token", expiresAt: Date.now() + 60 * 60 * 1000 },
+    },
+  }));
+  assert.match(fallback.claudeValue, /\*\*Personal\*\* \(Pro\)/);
+  assert.deepEqual(fallback.oauthAuthorizations, [
+    "Bearer fixture-revoked-token",
+    "Bearer fixture-oauth-token",
+    "Bearer fixture-oauth-token",
+  ]);
+
+  // An expired fallback is not tried; the rejected token's own action is reported.
+  const noFallback = await runPosterWithDefaultHomeCredentials((hashedService) => ({
+    [hashedService]: revoked,
+    "Claude Code-credentials": {
+      claudeAiOauth: { accessToken: "fixture-oauth-token", expiresAt: Date.now() - 60 * 60 * 1000 },
+    },
+  }));
+  assert.match(noFallback.claudeValue, /\*\*Personal\*\*[\s\S]*Needs re-login: `CLAUDE_CONFIG_DIR=~\/\.claude claude \/login`/);
+  assert.deepEqual(noFallback.oauthAuthorizations, ["Bearer fixture-revoked-token"]);
 });
 
 test("poster uses N/A when the Claude organization value is malformed", async () => {

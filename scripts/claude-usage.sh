@@ -35,14 +35,15 @@ header() {
     divider
 }
 
-# Helper: get OAuth token from Keychain.
+# Helper: list the default home's OAuth tokens from Keychain, one per line.
 # A home's credential lives in "Claude Code-credentials-<sha256(dir)[:8]>" when
 # CLAUDE_CONFIG_DIR is set explicitly (remote logins always are) and in the
 # plain "Claude Code-credentials" item when it is unset. Default sessions only
-# refresh the plain item, so either can be stale: use the one that expires last.
-get_token() {
+# refresh the plain item, so either can be stale: the token that expires last
+# comes first, followed by any other unexpired token to fall back on.
+get_tokens() {
     python3 - <<'PY' 2>/dev/null
-import hashlib, json, os, subprocess, sys
+import hashlib, json, os, subprocess, time
 
 default_dir = os.path.join(os.path.expanduser("~"), ".claude")
 services = [
@@ -56,45 +57,69 @@ def expiry(oauth):
     except (TypeError, ValueError):
         return float("-inf")
 
-freshest = None
+credentials = []
 for service in services:
-    result = subprocess.run(
-        ["security", "find-generic-password", "-s", service, "-w"],
-        capture_output=True, text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-w"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        continue
     if result.returncode != 0:
         continue
     try:
         oauth = json.loads(result.stdout.strip())["claudeAiOauth"]
     except (ValueError, KeyError, TypeError):
         continue
-    if not isinstance(oauth, dict) or not isinstance(oauth.get("accessToken"), str) or not oauth["accessToken"]:
-        continue
-    if freshest is None or expiry(oauth) > expiry(freshest):
-        freshest = oauth
+    if isinstance(oauth, dict) and isinstance(oauth.get("accessToken"), str) and oauth["accessToken"]:
+        credentials.append(oauth)
 
-if freshest is None:
-    sys.exit(1)
-print(freshest["accessToken"])
+credentials.sort(key=expiry, reverse=True)
+for index, oauth in enumerate(credentials):
+    if index == 0 or not oauth.get("expiresAt") or expiry(oauth) / 1000 >= time.time():
+        print(oauth["accessToken"])
 PY
 }
+
+CLAUDE_VERSION=$(claude --version 2>/dev/null | head -1 || echo "unknown")
 
 # Helper: call Anthropic OAuth API
 api_call() {
     local endpoint="$1"
-    local token
-    token=$(get_token)
-    if [ -z "$token" ]; then
-        echo ""
-        return 1
-    fi
-    local version
-    version=$(claude --version 2>/dev/null | head -1 || echo "unknown")
+    local token="$2"
     curl -s "https://api.anthropic.com/api/oauth/${endpoint}" \
         -H "Authorization: Bearer $token" \
         -H "anthropic-beta: oauth-2025-04-20" \
-        -H "User-Agent: claude-code/${version}"
+        -H "User-Agent: claude-code/${CLAUDE_VERSION}"
 }
+
+# Helper: succeed when an API response is an authentication error.
+is_auth_error() {
+    echo "$1" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+error = data.get('error') if isinstance(data, dict) else None
+sys.exit(0 if isinstance(error, dict) and error.get('type') == 'authentication_error' else 1)
+" 2>/dev/null
+}
+
+# Use the first token the API accepts; if none is accepted, report the first.
+TOKEN=""
+PROFILE=""
+while IFS= read -r candidate; do
+    [ -z "$candidate" ] && continue
+    response=$(api_call "profile" "$candidate")
+    if [ -z "$TOKEN" ]; then
+        TOKEN="$candidate"
+        PROFILE="$response"
+    fi
+    if ! is_auth_error "$response"; then
+        TOKEN="$candidate"
+        PROFILE="$response"
+        break
+    fi
+done <<< "$(get_tokens)"
 
 # ══════════════════════════════════════════════════════════
 # SECTION 1: LIVE API DATA
@@ -105,7 +130,6 @@ echo -e "  Generated: ${BOLD}$(date '+%Y-%m-%d %H:%M:%S')${RESET}"
 
 # ── Account Profile ──
 header "ACCOUNT PROFILE"
-PROFILE=$(api_call "profile")
 if [ -n "$PROFILE" ] && echo "$PROFILE" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
     echo "$PROFILE" | python3 -c "
 import sys, json
@@ -129,7 +153,8 @@ fi
 
 # ── Live Usage Limits ──
 header "LIVE USAGE LIMITS"
-USAGE=$(api_call "usage")
+USAGE=""
+[ -n "$TOKEN" ] && USAGE=$(api_call "usage" "$TOKEN")
 if [ -n "$USAGE" ] && echo "$USAGE" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
     echo "$USAGE" | python3 -c "
 import sys, json

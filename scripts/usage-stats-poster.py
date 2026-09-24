@@ -318,19 +318,25 @@ def _oauth_expiry(oauth):
         return float("-inf")
 
 
-def _read_freshest_oauth_credential(services):
-    """Return the readable OAuth credential among ``services`` that expires last.
+def _oauth_expired(oauth):
+    expires_at = oauth.get("expiresAt")
+    if not expires_at:
+        return False
+    try:
+        return float(expires_at) / 1000 < datetime.now(timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return False
+
+
+def _read_oauth_credentials(services):
+    """Return the readable OAuth credentials among ``services``, freshest first.
 
     A home can hold both its hashed and its plain Keychain item, and only the
     one its sessions run under keeps being refreshed, so the first readable
     item can be a stale leftover. Ties keep the ``services`` order.
     """
-    freshest = None
-    for service in services:
-        oauth = _read_oauth_credential(service)
-        if oauth and (freshest is None or _oauth_expiry(oauth) > _oauth_expiry(freshest)):
-            freshest = oauth
-    return freshest
+    credentials = [oauth for oauth in map(_read_oauth_credential, services) if oauth]
+    return sorted(credentials, key=_oauth_expiry, reverse=True)
 
 
 def claude_home_services(config_dir):
@@ -354,7 +360,7 @@ def discover_claude_accounts():
 
     The first entry is always the default ``~/.claude`` home. ``services``
     lists every Keychain item that can hold that home's login; callers read
-    them with ``_read_freshest_oauth_credential``.
+    them with ``_read_oauth_credentials``.
     """
     accounts = [(claude_home_services(Path.home() / ".claude"), "Personal", "~/.claude")]
     try:
@@ -1025,6 +1031,39 @@ def _normalise_reset_timestamp(value):
     return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _request_claude_usage_once(base_url, oauth):
+    headers = {
+        "Authorization": f"Bearer {oauth['accessToken']}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-code/usage-stats-poster",
+    }
+    profile = _request_json(base_url, "/api/oauth/profile", headers, "Anthropic profile")
+    usage = _request_json(base_url, "/api/oauth/usage", headers, "Anthropic usage")
+    return profile, usage
+
+
+def _request_claude_usage(base_url, oauth, fallbacks=()):
+    """Return ``(profile, usage)`` for ``oauth``.
+
+    A 401 can come from a revoked login whose ``expiresAt`` is still in the
+    future, so each unexpired fallback credential of the same home is tried
+    before the original error is raised.
+    """
+    try:
+        return _request_claude_usage_once(base_url, oauth)
+    except PosterHTTPError as error:
+        if error.status != 401:
+            raise
+        for fallback in fallbacks:
+            if _oauth_expired(fallback):
+                continue
+            try:
+                return _request_claude_usage_once(base_url, fallback)
+            except PosterError:
+                continue
+        raise error
+
+
 def _collect_claude_oauth_metric(base_url, services, label, dir_hint):
     """Collect a credential-free, renderer-friendly Claude account metric.
 
@@ -1034,36 +1073,26 @@ def _collect_claude_oauth_metric(base_url, services, label, dir_hint):
     writer.
     """
     metric = {"provider": "claude", "account": label, "limits": []}
-    oauth = _read_freshest_oauth_credential(services)
-    if not oauth:
+    credentials = _read_oauth_credentials(services)
+    if not credentials:
         metric["status"] = "unavailable"
         metric["reason"] = "Could not get OAuth token"
         metric["missing_oauth"] = True
         metric["text"] = f"**{label}**\n*Could not get OAuth token*"
         return metric
-    expires_at = oauth.get("expiresAt")
-    if expires_at:
-        try:
-            if float(expires_at) / 1000 < datetime.now(timezone.utc).timestamp():
-                metric["status"] = "unavailable"
-                metric["reason"] = "OAuth token expired"
-                metric["text"] = (
-                    f"**{label}**\n*OAuth token expired — start a session on this account to refresh*"
-                    if oauth.get("refreshToken")
-                    else _claude_relogin_block(label, dir_hint)
-                )
-                return metric
-        except (TypeError, ValueError):
-            pass
+    oauth = credentials[0]
+    if _oauth_expired(oauth):
+        metric["status"] = "unavailable"
+        metric["reason"] = "OAuth token expired"
+        metric["text"] = (
+            f"**{label}**\n*OAuth token expired — start a session on this account to refresh*"
+            if oauth.get("refreshToken")
+            else _claude_relogin_block(label, dir_hint)
+        )
+        return metric
 
-    headers = {
-        "Authorization": f"Bearer {oauth['accessToken']}",
-        "anthropic-beta": "oauth-2025-04-20",
-        "User-Agent": "claude-code/usage-stats-poster",
-    }
     try:
-        profile = _request_json(base_url, "/api/oauth/profile", headers, "Anthropic profile")
-        usage = _request_json(base_url, "/api/oauth/usage", headers, "Anthropic usage")
+        profile, usage = _request_claude_usage(base_url, oauth, credentials[1:])
     except PosterHTTPError as error:
         metric["status"] = "unavailable"
         metric["reason"] = "Auth expired" if error.status == 401 else "Anthropic usage unavailable"
