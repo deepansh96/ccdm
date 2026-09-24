@@ -1,6 +1,6 @@
 # Codex Conversation Reminder adapter v1
 
-This milestone observes a registered Codex Project Conversation. It does not schedule or send Conversation Reminders, close conversation state, or acknowledge `/close` with a checkmark. Claude support and reminder delivery require later milestones.
+This adapter observes a registered Codex Project Conversation. It does not schedule or send Conversation Reminders, close conversation state, or acknowledge `/close` with a checkmark; the [Conversation Reminder service](conversation-reminders.md) does that for both Claude and Codex channels.
 
 ## Readiness
 
@@ -18,4 +18,4 @@ The bridge consumes an exact trimmed `/close`, or that command preceded by a per
 
 ## Tested runtime and boundaries
 
-Verified locally on 2026-09-24 with Node 22.20.0, Python 3.10.4, and `codex-cli 0.155.1`. The default E2E suite used its fake Codex app-server and fake Discord boundary; it did not invoke a real Codex model or send a real Discord message. The Codex contract is app-server JSON-RPC `thread/start`, `turn/start`, `turn/steer`, `turn/started`, and `turn/completed`; the scoped Discord MCP contract is `tools/call` for `reply`, with the bridge grant and, for root routing, the channel scope grant. Only a successful Discord POST or upload response with a message ID creates a receipt. The inbound contract is Discord `messageCreate` and `messageReactionAdd` filtered to the current assignment and registered owner; `/close` is intercepted before normal routing. The fake suite proves these shapes, while a real provider/Discord compatibility check remains separately gated. Reminder delivery stays disabled until both provider adapters and the later conversation consumer are complete.
+Verified locally on 2026-09-24 with Node 22.20.0, Python 3.10.4, and `codex-cli 0.155.1`. The default E2E suite used its fake Codex app-server and fake Discord boundary; it did not invoke a real Codex model or send a real Discord message. The Codex contract is app-server JSON-RPC `thread/start`, `turn/start`, `turn/steer`, `turn/started`, and `turn/completed`; the scoped Discord MCP contract is `tools/call` for `reply`, with the bridge grant and, for root routing, the channel scope grant. Only a successful Discord POST or upload response with a message ID creates a receipt. The inbound contract is Discord `messageCreate` and `messageReactionAdd` filtered to the current assignment and registered owner; `/close` is intercepted before normal routing. The fake suite proves these shapes, while a real provider/Discord compatibility check remains separately gated. Reminder delivery is performed by the separate [Conversation Reminder service](conversation-reminders.md), and only after `enable` confirms that both provider adapters are installed.

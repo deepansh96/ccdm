@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+<key>Label</key>
+<string>com.discord.conversation-reminders</string>
+<key>ProgramArguments</key>
+<array>
+<string>__PYTHON_PATH__</string>
+<string>__SERVICE_PATH__</string>
+<string>run</string>
+<string>--project-root</string>
+<string>__PROJECT_ROOT__</string>
+<string>--state-dir</string>
+<string>__STATE_DIR__</string>
+</array>
+<key>WorkingDirectory</key>
+<string>__PROJECT_ROOT__</string>
+<key>RunAtLoad</key>
+<true/>
+<key>KeepAlive</key>
+<dict>
+<key>SuccessfulExit</key>
+<false/>
+</dict>
+<key>ThrottleInterval</key>
+<integer>30</integer>
+<key>Umask</key>
+<integer>63</integer>
+<key>EnvironmentVariables</key>
+<dict>
+<key>CCDM_REMINDER_NODE</key>
+<string>__NODE_PATH__</string>
+<key>CCDM_REMINDER_PYTHON</key>
+<string>__PYTHON_PATH__</string>
+<key>PATH</key>
+<string>__NODE_BIN_DIR__:/usr/bin:/bin</string>
+<key>ROOT_DISCORD_STATE_DIR</key>
+<string>__ROOT_STATE_DIR__</string>
+</dict>
+<key>StandardOutPath</key>
+<string>__STDOUT_PATH__</string>
+<key>StandardErrorPath</key>
+<string>__STDERR_PATH__</string>
+</dict>
+</plist>

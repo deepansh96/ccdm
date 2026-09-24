@@ -483,8 +483,11 @@ def root_credentials_present() -> bool:
     return bool(token) and not any(character.isspace() for character in token)
 
 
-def enablement_checks(project_root: Path, state_dir: Path) -> dict:
-    """Foreground opt-in checks. Discord permissions are verified per channel by the worker."""
+def enablement_checks(project_root: Path, state_dir: Path, prepare: bool = True) -> dict:
+    """Foreground opt-in checks. Discord permissions are verified per channel by the worker.
+
+    With ``prepare`` false nothing is created or re-permissioned, so a failed
+    supervisor preflight leaves an existing installation untouched."""
     blockers = []
     prerequisites = provider_prerequisites(project_root)
     if not prerequisites["met"]:
@@ -504,11 +507,30 @@ def enablement_checks(project_root: Path, state_dir: Path) -> dict:
     credentials = root_credentials_present()
     if not credentials:
         blockers.append("root Discord credentials are unavailable (ROOT_DISCORD_STATE_DIR/.env)")
-    EVENTS.private_directory(state_dir)
+    if prepare:
+        EVENTS.private_directory(state_dir)
+    private = state_dir.is_dir() and stat.S_IMODE(state_dir.stat().st_mode) & 0o077 == 0
+    if not prepare and state_dir.exists() and not private:
+        blockers.append("the reminder state directory is not private (expected mode 0700)")
     return {"blockers": blockers, "provider_prerequisites": prerequisites, "owner_configured": owner,
             "root_credentials": "present" if credentials else "missing",
-            "state_dir_private": stat.S_IMODE(state_dir.stat().st_mode) & 0o077 == 0,
+            "state_dir_private": private,
             "channel_permissions": "verified per channel by the running worker; see status readiness"}
+
+
+def preflight(project_root: Path, state_dir: Path) -> dict:
+    """Read-only supervisor checks: configuration, adapters, credentials, and an intact store."""
+    checks = enablement_checks(project_root, state_dir, prepare=False)
+    blockers = list(checks["blockers"])
+    current = None
+    if not blockers:
+        try:
+            current = status(state_dir, project_root)
+        except (OSError, ValueError, sqlite3.Error, json.JSONDecodeError) as error:
+            blockers.append(f"the conversation store cannot be used: {error}")
+    return {"status": "blocked" if blockers else "ok", "blockers": blockers, "preflight": checks,
+            "disabled": bool(current and current["disabled"]),
+            "discovery_requested": bool(current and current["discovery_requested"])}
 
 
 def readiness_report(project_root: Path, state_dir: Path, db: sqlite3.Connection, conversations: dict,
@@ -539,7 +561,8 @@ def readiness_report(project_root: Path, state_dir: Path, db: sqlite3.Connection
         if issues:
             blockers.append("adapter: " + "; ".join(issues))
         if not running:
-            blockers.append("foreground worker is not running")
+            blockers.append("foreground worker is not running; start `run` or rerun "
+                            "scripts/install-conversation-reminder-service.sh to relaunch the LaunchAgent")
         elif observation != "ready-observe-only":
             blockers.append("observation: " + observation)
         if history != "ready":
@@ -1175,7 +1198,7 @@ def suspend_interrupted_sends(state_dir: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("sync", "status", "disable", "enable", "run", "recover",
+    parser.add_argument("command", choices=("sync", "status", "preflight", "disable", "enable", "run", "recover",
                                             "actions", "done", "leftover", "intents", "claim", "validate",
                                             "result", "assignment-changed", "suspend", "discover",
                                             "discovery-next", "discovery-result", "observation-gap"))
@@ -1195,6 +1218,11 @@ def main() -> int:
     try:
         if args.command == "status":
             result = status(args.state_dir, args.project_root)
+        elif args.command == "preflight":
+            result = preflight(args.project_root, args.state_dir)
+            if result["status"] == "blocked":
+                print(json.dumps(result, sort_keys=True))
+                return 2
         elif args.command == "disable":
             result = set_disabled(args.project_root, args.state_dir)
         elif args.command == "enable":

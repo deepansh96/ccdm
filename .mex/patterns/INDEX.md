@@ -20,3 +20,4 @@ Lookup table for all pattern files in this directory. Check here before starting
 | [setup-chatgpt-codex-account.md](setup-chatgpt-codex-account.md) | Adding or authenticating another ChatGPT subscription Codex Account Alias |
 | [setup-mimo-codex.md](setup-mimo-codex.md) | Preparing or rotating an isolated MiMo home for Codex sessions |
 | [setup-deepseek-codex.md](setup-deepseek-codex.md) | Preparing or rotating an isolated DeepSeek Flash home for Codex sessions |
+| [operate-conversation-reminders.md](operate-conversation-reminders.md) | Installing, enabling, inspecting, disabling, or recovering the Conversation Reminder service and its LaunchAgent |

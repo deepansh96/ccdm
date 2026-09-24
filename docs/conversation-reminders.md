@@ -1,6 +1,6 @@
 # Project Conversation state service
 
-This foreground service records owner acknowledgment, `/close`, reopening, and qualifying Claude or Codex responses, and sends hourly Conversation Reminders. It runs independently of coding sessions: stopping or restarting a project or root agent does not stop it or change conversation state. Reminders are opt-in. A registered channel reports `suspended-incomplete-discovery` and sends nothing until `enable` has run and discovery marks it `ready`.
+This service records owner acknowledgment, `/close`, reopening, and qualifying Claude or Codex responses, and sends hourly Conversation Reminders. Run it in the foreground, or supervise the same worker with the opt-in macOS LaunchAgent described below. It runs independently of coding sessions: stopping or restarting a project or root agent does not stop it or change conversation state. Reminders are opt-in. A registered channel reports `suspended-incomplete-discovery` and sends nothing until `enable` has run and discovery marks it `ready`.
 
 ## Requirements
 
@@ -8,6 +8,7 @@ This foreground service records owner acknowledgment, `/close`, reopening, and q
 - The root Discord bot token must be in `ROOT_DISCORD_STATE_DIR/.env` as `DISCORD_BOT_TOKEN`; the default root state directory is `~/.claude/channels/discord`.
 - The root bot must be able to view and read project channels. Assigned project bots need view, history, send, and reaction permissions in their own channels. The service checks these permissions and does not change them.
 - Claude projects require the verified launch-scoped reminder adapter and its capability marker. Codex projects require the current bridge adapter. Unsupported and remote Claude assignments remain excluded.
+- Python 3 and Node 22 or newer. The supervised worker uses the interpreters the installer resolved, not the login shell's `PATH`.
 - Both provider adapters must be installed: `scripts/codex-bridge.js`, `scripts/discord-mcp-server.js`, `scripts/claude-reminder-channel.js`, `scripts/claude-reminder-hook.js`, and `scripts/conversation-reminder-adapter.js`. If any is missing, no channel receives reminders, including Codex channels. There is no Codex-only override.
 
 ## Enabling reminders
@@ -20,6 +21,45 @@ scripts/conversation-reminder-service.py run
 ```
 
 `enable` is the manual opt-in. It checks the provider prerequisites, the registry owner, and that root Discord credentials are present. It also creates the private state directory with mode `0700`. If a check fails, it exits with status 2, lists the blockers under `preflight`, and changes nothing. It never prints tokens. On success it clears `disabled`, requests discovery of older conversations, and sends every previously ready channel back through restart reconciliation. `run` starts the foreground worker. The worker verifies each channel's Discord permissions when it connects and records failures per channel.
+
+## Supervised LaunchAgent (macOS)
+
+The LaunchAgent is optional. It runs the same `conversation-reminder-service.py run` worker as the foreground command, so it uses the same single-worker lock, reconciliation, and catch-up rules. Install it from the repository root:
+
+```sh
+scripts/install-conversation-reminder-service.sh
+scripts/conversation-reminder-service.py enable
+scripts/conversation-reminder-service.py status
+```
+
+The installer validates everything before it touches launchd. It checks for `python3` and Node 22 or newer (`CCDM_REMINDER_NODE` or `node` on `PATH`), the plist template and service script, and both provider adapters. It also runs the read-only `conversation-reminder-service.py preflight`, which checks the registry owner and project assignments, root Discord credentials, a private state directory, and a usable conversation store. If any check fails, the installer exits with status 2 and lists the blockers. It does not create or change the plist, launchd, the state directory, or file permissions, and it leaves a working installation loaded. It never changes Discord permissions.
+
+On success, it renders `~/Library/LaunchAgents/com.discord.conversation-reminders.plist` and loads it. The plist holds only absolute paths: the Python interpreter, the service script, the repository, the state directory, Node, and the root state directory. It holds no tokens, registry values, or channel IDs. The worker reads credentials from their existing private files. `RunAtLoad` starts the worker at login. `KeepAlive` relaunches it only after an unsuccessful exit, with a 30-second throttle; a crash or a lost lock race is retried. The worker's umask is `077`. Standard output and errors go to `service.log` and `service.err` in the private state directory. Those logs contain status JSON, never credentials or conversation bodies.
+
+Running the installer again gives the same plist and reloads it. If launchd rejects the replacement, the installer restores the previous plist and reloads the previous service. The installer does not change the Usage Stats Poster, its schedule, its LaunchAgent, or its storage.
+
+Only one worker runs at a time. If a foreground `run` holds the lock when launchd starts the worker, such as at login, the supervised launch exits with status 2. launchd retries it every 30 seconds, and it takes over once the foreground worker exits. A foreground `run` started while the supervised worker holds the lock is refused the same way.
+
+Operating the supervised worker:
+
+- **Status:** `scripts/conversation-reminder-service.py status`. Each project's `readiness` lists its `blockers` with the action that clears them. See [Foreground commands](#foreground-commands).
+- **Stop or disable:** `scripts/conversation-reminder-service.py disable`. The worker finishes any in-flight Discord request and exits successfully, so launchd does not relaunch it. At the next login the worker starts, sees `disabled`, and exits without observing or sending. Closures, history, due times, and delivery state are kept.
+- **Re-enable:** `scripts/conversation-reminder-service.py enable`, then rerun `scripts/install-conversation-reminder-service.sh` to start the worker. Every previously ready channel reconciles before its next send.
+- **Foreground start:** `scripts/conversation-reminder-service.py run`. If the supervised worker is running, stop it first with `disable` and wait for `worker_running: false`. Then run `enable` and `run`. launchd does not restart the supervised worker until its next load, such as a login or rerunning the installer.
+- **Recovery:** `disable`, wait until `status` shows `worker_running: false`, then `enable` and `recover`. Afterwards rerun the installer. See uncertain-send recovery below.
+- **Remove:** `disable`, then `launchctl unload ~/Library/LaunchAgents/com.discord.conversation-reminders.plist` and delete that file. Keep the state directory. Deleting it does not clear a closure and discards delivery history.
+
+## Readiness and deployment
+
+- **First enablement:** install the LaunchAgent (or start `run`), then run `enable`. `enable` requests discovery of older conversations. The worker scans each channel's history, then marks it `ready`. Until then, `status` shows `history: discovering` or `suspended-incomplete-discovery`, and nothing is sent. A discovered channel that is already overdue gets one globally spaced catch-up. See [History discovery](#history-discovery).
+- **State location:** `~/.local/state/ccdm/conversation-reminders/`, or `CCDM_REMINDER_STATE_DIR` when it is set at install time. The directory is mode `0700`. The databases, worker lock, and service logs are `0600`, and the supervised worker's umask keeps new files private. It holds the event and conversation databases, the worker lock, Claude receipts, and the service logs. Keep it across restarts and upgrades.
+- **Provider and version readiness:** `status` reports each project's provider and adapter status. Claude channels need the launch-scoped adapter at the pinned versions in the [Claude adapter guide](conversation-reminder-claude-adapter.md). Codex channels need the bridge adapter described in the [Codex adapter guide](conversation-reminder-codex-adapter.md). A channel whose adapter is blocked stays `suspended-adapter-capability` or `blocked-adapter-capability`. It does not fall back to guessing from silence.
+- **Remote projects:** the operator deploys and verifies the authenticated, assignment-bound adapter on each remote host. Nothing here installs it remotely. A remote channel without it stays `blocked-adapter-capability`.
+- **No live test required:** the default `npm test` suite proves the installer, the supervised and foreground worker, and both providers' reply, reminder, and reply-or-close workflows with Local Fakes. It does not use Discord, Claude, Codex, launchd, or credentials. Real Discord and provider checks belong to the opt-in Live Smoke Suite behind its Live Gate. Enabling reminders does not require one.
+- **Cleanup and uncertain deliveries:** failed deletions stay pending by recorded message ID. An uncertain send suspends its channel as `suspended-uncertain-send` until `recover` confirms or rejects the nonce. See the recovery notes below.
+- **Assignment retirement:** after any registration or deregistration, run `assignment-changed --project <project>`. See [Assignment changes](#assignment-changes).
+- **History and reaction limits:** discovery and reconciliation cannot see deleted messages or reactions removed while nothing was observing. They cannot tell when an old reaction was added either. See [Time, order, and reaction limits](#time-order-and-reaction-limits).
+- **Indefinite pauses:** any Conversation Reply, including a reaction, pauses the conversation until the agent next finishes a turn or asks for input. If no qualifying response follows, the conversation stays paused indefinitely. This is expected. Send a new message to restart the exchange.
 
 ## Foreground commands
 
