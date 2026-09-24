@@ -18,7 +18,7 @@ const MANAGEMENT_COMMANDS = new Set(["/compact", "/clear", "/pause", "/unpause",
 const USER_MESSAGE_TYPES = new Set([0, 19]);
 
 function mentions(content, id) {
-  return Boolean(id) && [`<@${id}>`, `<@!${id}>`].some(value => content.startsWith(value));
+  return Boolean(id) && [`<@${id}>`, `<@!${id}>`].some(value => content.includes(value));
 }
 
 function classify(message, found, rootUserId, isClose) {
@@ -32,7 +32,8 @@ function classify(message, found, rootUserId, isClose) {
     else if (MANAGEMENT_COMMANDS.has(content) || mentions(content, rootUserId)) kind = "owner-command";
     else if (content || message.attachments?.length) kind = "owner-message";
   } else if (author === String(found.bot_app_id)) {
-    kind = COMMAND_OUTPUTS.has(content) || /^\*\*Error:\*\* Failed to (clear|restart)/.test(content)
+    kind = COMMAND_OUTPUTS.has(content) ||
+      /^\*\*Error:\*\* Failed to (clear|restart|compact|send message to Codex)\b/.test(content)
       ? "command-output" : "bot";
   } else if (author && !message.author?.bot) {
     kind = "guest";

@@ -1522,7 +1522,8 @@ function startDiscordBot() {
       ...(!ROOT_MULTI_CHANNEL && BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
     }).catch(() => null);
     const recordedReminder = await reminderAdapter.isRecordedReminderMessage(reaction.message.id);
-    if (recordedReminder) return;
+    // An owner reaction, including one on a recorded reminder, acknowledges the
+    // conversation; a reminder reaction never enters a coding turn.
     if (assignment && user.id === assignment.owner_id) {
       await reminderAdapter.emitEvent("owner_activity", reminderEventContext(assignment), {
         actor_id: user.id,
@@ -1530,6 +1531,7 @@ function startDiscordBot() {
         activity_kind: "reaction",
       });
     }
+    if (recordedReminder) return;
     if (!FORWARDED_REACTIONS.has(reaction.emoji.name) || reaction.message.author?.id !== client.user.id) return;
 
     const { input, channelId, channelScopeToken } = buildReactionInput(reaction, user);
@@ -1539,8 +1541,10 @@ function startDiscordBot() {
 
   client.on("messageCreate", async (msg) => {
     if (!msg.author.bot && isCloseCommand(msg.content)) {
+      // Root management routing reserves /close in every registered project
+      // channel, whichever provider serves it; a project bridge only its own.
       const assignment = await reminderAdapter.resolveAssignmentForChannel(msg.channel.id, {
-        requireCodex: true,
+        requireCodex: !ROOT_MULTI_CHANNEL,
         ...(!ROOT_MULTI_CHANNEL && BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
       }).catch(() => null);
       if (assignment) {
@@ -1694,7 +1698,7 @@ function startDiscordBot() {
         source_message_id: msg.id,
         activity_kind: ROOT_MULTI_CHANNEL && [
           `<@${ROOT_BOT_APP_ID}>`, `<@!${ROOT_BOT_APP_ID}>`,
-        ].some(mention => ROOT_BOT_APP_ID && msg.content.trim().startsWith(mention))
+        ].some(mention => ROOT_BOT_APP_ID && msg.content.includes(mention))
           ? "management-command"
           : msg.attachments.size > 0 && !text ? "attachment" : "message",
       });

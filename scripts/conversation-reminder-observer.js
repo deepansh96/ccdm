@@ -170,7 +170,8 @@ async function observeMessage(message) {
     return;
   }
   const content = String(message.content || "").trim();
-  const rootMention = [`<@${client.user.id}>`, `<@!${client.user.id}>`].some(value => content.startsWith(value));
+  // Root-management traffic never reopens a conversation, wherever the mention sits.
+  const rootMention = [`<@${client.user.id}>`, `<@!${client.user.id}>`].some(value => content.includes(value));
   const managedCommand = ["/compact", "/clear", "/pause", "/unpause", "/restart"].includes(content);
   if (!content && !message.attachments?.size) return;
   const kind = managedCommand || rootMention ? "management-command"
@@ -184,7 +185,7 @@ async function observeReaction(reaction, user) {
   if (user?.bot) return;
   const found = await assignment(reaction.message?.channel?.id || reaction.message?.channelId);
   if (!found || user.id !== found.owner_id) return;
-  if (await reminder.isRecordedReminderMessage(reaction.message.id)) return;
+  // Any owner reaction acknowledges, including one on a recorded reminder.
   await reminder.emitEvent("owner_activity", { ...found, provider: "ccdm-root" }, {
     actor_id: user.id, source_message_id: reaction.message.id, activity_kind: "reaction",
   });

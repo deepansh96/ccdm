@@ -849,7 +849,7 @@ test("manual deletion does not acknowledge or accelerate a reminder and ordinary
   assert.equal((await running).exitCode, 0);
 });
 
-test("an owner reaction on a recorded Conversation Reminder neither acknowledges nor starts coding", async () => {
+test("an owner reaction on a recorded Conversation Reminder acknowledges without starting coding", async () => {
   const workspace = createWorkspace();
   const stateDir = setup(workspace);
   await reconciledExchange(workspace, stateDir);
@@ -871,10 +871,16 @@ test("an owner reaction on a recorded Conversation Reminder neither acknowledges
     messageId: "fake-message-1", emoji: "👍", user: { id: "owner" } });
   await waitForState(workspace, state => state.fixtures.discord.deliveredReactions.some(row =>
     row.id === "reaction-on-reminder"));
-  await new Promise(resolve => setTimeout(resolve, 450));
-  const current = (await command(workspace, stateDir, "status")).conversations.demo;
-  assert.equal(current.state, "awaiting-owner");
-  assert.equal(current.reminder_message_id, "fake-message-1");
+  const current = (await waitForConversation(workspace, stateDir, row =>
+    row?.state === "open-paused" && row.cleanup_message_ids.length === 0)).conversations.demo;
+  assert.equal(current.reminder_message_id, null);
+  assert.equal(current.due_at, null);
+  assert.equal(current.last_ack_message_id, "fake-message-1");
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.deletes.map(row => row.messageId),
+    ["fake-message-1"]);
+  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
+  await new Promise(resolve => setTimeout(resolve, 600));
+  assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 1, "no further reminder");
   assert.equal(readState(workspace.stateDir).fixtures.codex.appServerInvocations.length, 0);
   await command(workspace, stateDir, "disable");
   assert.equal((await running).exitCode, 0);
@@ -1015,7 +1021,11 @@ test("the independent root observer consumes owner close and arbitrary reaction 
   assert.equal(readState(workspace.stateDir).fixtures.codex.appServerInvocations.length, 0);
   injectDiscordMessage(workspace, { channelId: "channel", id: "root-management", author: { id: "owner" },
     content: "<@fixture-bot-user-id> status" });
-  await waitForState(workspace, state => state.fixtures.discord.deliveredMessages.some(row => row.id === "root-management"));
+  // A root mention later in the text is still root-management traffic.
+  injectDiscordMessage(workspace, { channelId: "channel", id: "root-management-inline", author: { id: "owner" },
+    content: "please ask <@!fixture-bot-user-id> for status" });
+  await waitForState(workspace, state => state.fixtures.discord.deliveredMessages.some(row =>
+    row.id === "root-management-inline"));
   await new Promise(resolve => setTimeout(resolve, 500));
   assert.equal((await command(workspace, stateDir, "status")).conversations.demo.state, "closed");
   injectDiscordMessage(workspace, { channelId: "channel", id: "new-normal", author: { id: "owner" }, content: "/note" });
@@ -1072,6 +1082,50 @@ test("acknowledgment and a reopened exchange defeat delayed completion, while re
   const status = await command(workspace, stateDir, "status");
   assert.equal(status.conversations.demo.state, "open-paused");
   assert.equal(status.conversations.demo.due_at, null);
+});
+
+test("an acknowledgment of mid-turn progress still arms a fresh hour for the turn's final answer", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  const turn = { provider_session_id: "session", provider_turn_id: "turn", interaction_id: "question" };
+  // 10:00 the owner asks; 10:05 progress; 10:06 the owner reacts to it; 10:30 the final answer.
+  await event(workspace, stateDir, "owner_activity", "ask", "2026-09-24T10:00:00Z", {
+    actor_id: "owner", source_message_id: "question", activity_kind: "message",
+  });
+  await event(workspace, stateDir, "response_delivered", "progress-receipt", "2026-09-24T10:05:00Z", {
+    ...turn, message_id: "progress", disposition: "progress",
+  });
+  await event(workspace, stateDir, "owner_activity", "progress-reaction", "2026-09-24T10:06:00Z", {
+    actor_id: "owner", source_message_id: "progress", activity_kind: "reaction",
+  });
+  await event(workspace, stateDir, "response_delivered", "final-receipt", "2026-09-24T10:30:00Z", {
+    ...turn, message_id: "final", disposition: "progress",
+  });
+  await event(workspace, stateDir, "turn_completed", "completion", "2026-09-24T10:30:00Z", {
+    ...turn, delivered_message_ids: ["progress", "final"],
+  });
+  await command(workspace, stateDir, "sync");
+  const armed = (await command(workspace, stateDir, "status")).conversations.demo;
+  assert.deepEqual([armed.state, armed.response_message_id, armed.due_at],
+    ["awaiting-owner", "final", "2026-09-24T11:30:00Z"]);
+
+  // An acknowledgment of the final answer still wins over a completion that arrives later.
+  await event(workspace, stateDir, "owner_activity", "ask-2", "2026-09-24T12:00:00Z", {
+    actor_id: "owner", source_message_id: "question-2", activity_kind: "message",
+  });
+  const second = { provider_session_id: "session", provider_turn_id: "turn-2", interaction_id: "question-2" };
+  await event(workspace, stateDir, "response_delivered", "final-2-receipt", "2026-09-24T12:10:00Z", {
+    ...second, message_id: "final-2", disposition: "progress",
+  });
+  await event(workspace, stateDir, "owner_activity", "final-2-reaction", "2026-09-24T12:11:00Z", {
+    actor_id: "owner", source_message_id: "final-2", activity_kind: "reaction",
+  });
+  await event(workspace, stateDir, "turn_completed", "completion-2", "2026-09-24T12:12:00Z", {
+    ...second, delivered_message_ids: ["final-2"],
+  });
+  await command(workspace, stateDir, "sync");
+  const acknowledged = (await command(workspace, stateDir, "status")).conversations.demo;
+  assert.deepEqual([acknowledged.state, acknowledged.due_at], ["open-paused", null]);
 });
 
 test("closure ignores an older owner message that arrives late from another adapter", async () => {

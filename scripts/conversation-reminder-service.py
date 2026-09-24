@@ -344,7 +344,11 @@ def apply_payload(db: sqlite3.Connection, registry: dict, event: dict, commit_or
                          event.get("provider_turn_id"), interaction, message_id)).fetchone()
                 if receipt:
                     receipts.append(receipt["event_time"])
-            if len(receipts) == len(ids) and all(not current["last_ack_at"] or iso(t) > iso(current["last_ack_at"]) for t in receipts):
+            # An acknowledgment of earlier progress in the same turn never suppresses
+            # its final answer: the qualifying receipt alone must postdate the last
+            # acknowledgment, which then arms a fresh hour.
+            final_receipt = receipts[-1] if len(receipts) == len(ids) else None
+            if final_receipt and (not current["last_ack_at"] or iso(final_receipt) > iso(current["last_ack_at"])):
                 signal_time = max([iso(occurred), *map(iso, receipts)])
                 changes.update(state="awaiting-owner", response_message_id=ids[-1],
                                response_at=stamp(signal_time), due_at=stamp(signal_time + timedelta(hours=1)))

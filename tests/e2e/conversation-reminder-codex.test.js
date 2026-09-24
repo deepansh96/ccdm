@@ -262,7 +262,7 @@ test("failed Codex turns do not send or record optional fallback text", async ()
   await bridge.stop();
 });
 
-test("owner reactions are activity, while recorded reminder reactions do not reach Codex", async () => {
+test("owner reactions, including one on a recorded reminder, are activity but reminder reactions do not reach Codex", async () => {
   const workspace = createBridgeWorkspace();
   writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
   const codex = await startFakeCodexServer(workspace);
@@ -277,8 +277,8 @@ test("owner reactions are activity, while recorded reminder reactions do not rea
   await new Promise((resolve) => setTimeout(resolve, 150));
   const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
   const events = JSON.parse(result.stdout).events;
-  assert.deepEqual(events.map((event) => event.event_type), ["owner_activity"]);
-  assert.equal(events[0].source_message_id, "ordinary-message");
+  assert.deepEqual(events.map((event) => [event.event_type, event.activity_kind, event.source_message_id]), [
+    ["owner_activity", "reaction", "ordinary-message"], ["owner_activity", "reaction", "reminder-1"]]);
   assert.equal(codex.clientMessages.filter((message) => message.method === "turn/start").length, 1);
   await bridge.stop();
 });
@@ -423,6 +423,46 @@ test("exact mention forms of /close are consumed, including a guest command", as
   assert.deepEqual(events.map((event) => event.source_message_id), ["assigned-mention-close", "root-mention-close"]);
   assert.deepEqual(events.map((event) => event.event_type), ["close_requested", "close_requested"]);
   assert.equal(codex.clientMessages.filter((message) => message.method === "turn/start").length, 1);
+  await bridge.stop();
+});
+
+test("a Codex root consumes a root-mention /close in a Claude project channel without a model turn", async () => {
+  const workspace = createBridgeWorkspace();
+  writeRegistry(workspace, {
+    discord_user_id: "allowed-user-id",
+    pool: [{ id: "claude-bot", app_id: "claude-app", token: "fixture-claude-token" }],
+    projects: { "claude-demo": { type: "claude", path: workspace.repoDir, screen_name: "claude-demo_claude",
+      bot_id: "claude-bot", channel_id: "project-channel", assignment_generation: "claude-generation-1" } },
+  });
+  const accessFile = path.join(workspace.tmpDir, "root-access.json");
+  fs.writeFileSync(accessFile, `${JSON.stringify({ allowFrom: ["allowed-user-id"], groups: {
+    "root-channel": { requireMention: false, allowFrom: ["allowed-user-id"] },
+    "project-channel": { requireMention: true, allowFrom: ["allowed-user-id"] },
+  } })}\n`);
+  const codex = await startFakeCodexServer(workspace, { channelId: "root-channel", turns: [{ complete: true }] });
+  const bridge = startBridge(workspace, { botAppId: "root-bot-id", rootBotAppId: "root-bot-id",
+    channelId: "root-channel", port: codex.port,
+    env: { ROOT_ACCESS_FILE: accessFile, ROOT_MULTI_CHANNEL: "1" } });
+  await bridge.waitForOutput(/Root routing active for 2 configured channel\(s\)/, 7000);
+  const userTurns = () => codex.clientMessages.filter((message) => message.method === "turn/start" &&
+    !message.params?.input?.[0]?.text?.startsWith("You are communicating with the user via Discord"));
+  injectDiscordMessage(workspace, { id: "root-close", channelId: "project-channel", content: "<@root-bot-id> /close" });
+  // A later root-management request proves the close was consumed rather than queued.
+  injectDiscordMessage(workspace, { id: "root-status", channelId: "project-channel", content: "<@root-bot-id> status" });
+  for (let attempt = 0; attempt < 200 && userTurns().length === 0; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(userTurns().length, 1);
+  assert.doesNotMatch(JSON.stringify(userTurns()[0].params.input), /\/close/);
+  const status = await runScript(workspace, "scripts/conversation-reminder-events.py", {
+    args: ["status", "--project", "claude-demo", "--state-dir",
+      path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders")],
+  });
+  assert.equal(status.exitCode, 0, status.stderr);
+  const events = JSON.parse(status.stdout).events;
+  assert.deepEqual(events.filter((event) => event.event_type === "close_requested")
+    .map((event) => [event.source_message_id, event.provider]), [["root-close", "ccdm-root"]]);
   await bridge.stop();
 });
 

@@ -155,7 +155,8 @@ def _valid_messages(payload: dict, recorded_reminders: set[str]) -> list[dict] |
             return None
         if message["id"] in recorded_reminders:
             # Recorded Conversation Reminders are identified by ID, never by text.
-            message = {**message, "kind": "other", "reactions": []}
+            # They never anchor an answer, but an owner reaction on one still counts.
+            message = {**message, "kind": "other"}
         clean.append(message)
     return clean
 
@@ -314,8 +315,7 @@ def record_result(db: sqlite3.Connection, payload: dict, now: datetime, recorded
             candidate = restart or (summary["reply"] and not summary["closed"] and summary["anchor"] and
                                     not (summary["normal"] and summary["normal"]["id"] in adapter_interactions))
             summary["queue"] = [{"id": item["id"], "at": item["at"], "emoji": emoji}
-                                for item in summary["tail"] for emoji in item["emojis"]
-                                if item["id"] not in recorded_reminders] if candidate else []
+                                for item in summary["tail"] for emoji in item["emojis"]] if candidate else []
             if candidate and summary["tail_overflow"]:
                 summary.update(outcome="reaction-ordering-unresolved", reaction_unresolved=True, queue=[])
     else:

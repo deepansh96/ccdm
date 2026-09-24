@@ -87,7 +87,7 @@ function isClose(text) {
 function isManagement(text) {
   const trimmed = String(text || "").trim();
   return ["/compact", "/clear", "/pause", "/unpause", "/restart"].includes(trimmed) || [rootAppId].filter(Boolean).some(id =>
-    [`<@${id}>`, `<@!${id}>`].some(mention => trimmed.startsWith(mention)),
+    [`<@${id}>`, `<@!${id}>`].some(mention => trimmed.includes(mention)),
   );
 }
 
