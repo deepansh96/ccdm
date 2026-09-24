@@ -21,8 +21,7 @@ function updateState(updater) {
   const state = readState();
   state.fixtures ||= {};
   state.fixtures.discord ||= {};
-  updater(state);
-  writeState(state);
+  if (updater(state) !== false) writeState(state);
 }
 
 function fixtureChannel(id) {
@@ -218,7 +217,7 @@ class Client extends EventEmitter {
         }
         const reactions = state.fixtures?.discord?.injectedReactions ?? [];
         const nextReaction = reactions.find((reaction) => !reaction.delivered);
-        if (!nextReaction) return;
+        if (!nextReaction) return false;
         nextReaction.delivered = true;
         state.fixtures.discord.deliveredReactions ||= [];
         state.fixtures.discord.deliveredReactions.push({ id: nextReaction.id });

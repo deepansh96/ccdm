@@ -110,6 +110,7 @@ let pendingInputNeededResumeTurnId = null;
 let rootAccess = null;
 let rootChannelAccess = new Map();
 let bridgeStopping = false;
+let sessionTerminationPromise = null;
 let discordChannelScopeDir = null;
 let discordChannelScopeFile = null;
 const NICKNAME_INTERVAL = 60000;
@@ -544,19 +545,26 @@ async function sendToDiscord(text, channelId = activeOutputChannelId || CHANNEL_
   return sent;
 }
 
-async function recordSessionTermination() {
-  if (!threadId || ROOT_MULTI_CHANNEL) return;
-  const assignment = await reminderAdapter.resolveAssignmentForChannel(CHANNEL_ID, {
-    requireCodex: true,
-    ...(BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
-  }).catch(() => null);
-  if (!assignment) return;
-  await reminderAdapter.emitEvent("session_terminated", {
-    ...assignment,
-    provider: "codex",
-    provider_session_id: threadId,
-    ...(activeTurnId ? { provider_turn_id: activeTurnId } : {}),
-  }).catch((error) => console.error(`Conversation termination event failed: ${error.message || error}`));
+function recordSessionTermination() {
+  if (!threadId || ROOT_MULTI_CHANNEL) return Promise.resolve();
+  if (!sessionTerminationPromise) {
+    const endingThreadId = threadId;
+    const endingTurnId = activeTurnId;
+    sessionTerminationPromise = (async () => {
+      const assignment = await reminderAdapter.resolveAssignmentForChannel(CHANNEL_ID, {
+        requireCodex: true,
+        ...(BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
+      }).catch(() => null);
+      if (!assignment) return;
+      await reminderAdapter.emitEvent("session_terminated", {
+        ...assignment,
+        provider: "codex",
+        provider_session_id: endingThreadId,
+        ...(endingTurnId ? { provider_turn_id: endingTurnId } : {}),
+      }).catch((error) => console.error(`Conversation termination event failed: ${error.message || error}`));
+    })();
+  }
+  return sessionTerminationPromise;
 }
 
 async function exitAfterRuntimeLoss(reason) {

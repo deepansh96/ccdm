@@ -348,9 +348,18 @@ def status(state_dir: Path) -> dict:
                 "cleanup_message_ids": json.loads(row["cleanup_message_ids"]),
                 "reconciliation_status": row["reconciliation_status"], "checkpoint": row["checkpoint"],
             }
+        unresolved = [dict(row) for row in db.execute("""SELECT nonce,project,state,claimed_at
+            FROM delivery_intents WHERE state IN ('sending','uncertain') ORDER BY claimed_at LIMIT 100""")]
+        pending = [dict(row) for row in db.execute("""SELECT project,kind,message_id FROM pending_actions
+            WHERE completed=0 ORDER BY rowid LIMIT 100""")]
         return {"status": "ok", "disabled": disabled["value"] == "1", "worker_running": running,
                 "observer_channels": observer_channels, "delivery_enabled": False,
-                "conversations": conversations}
+                "conversations": conversations, "unresolved_intents": unresolved,
+                "pending_actions": pending,
+                "recovery_guidance": ("Run recover after restoring assigned bot access. If intent identity remains "
+                                      "unresolved, do not resend or delete by emoji; retain state and investigate "
+                                      "the listed nonce. Observation/history gaps remain a separate delivery gate."
+                                      if unresolved else "No unresolved delivery intents.")}
     finally:
         db.close()
 
@@ -380,8 +389,21 @@ def pending_actions(state_dir: Path) -> dict:
     try:
         rows = db.execute("""SELECT a.action_id,a.project,a.kind,a.message_id,a.assignment_generation,c.channel_id
             FROM pending_actions a JOIN conversations c ON c.project=a.project
-            WHERE a.completed=0 ORDER BY a.rowid""").fetchall()
+            WHERE a.completed=0 ORDER BY a.rowid LIMIT 100""").fetchall()
         return {"actions": [dict(row) for row in rows]}
+    finally:
+        db.close()
+
+
+def uncertain_intents(state_dir: Path) -> dict:
+    db = connect(state_dir)
+    if db is None:
+        return {"intents": []}
+    try:
+        rows = db.execute("""SELECT i.nonce,i.project,i.assignment_generation,i.claimed_at,
+            c.channel_id,c.bot_id FROM delivery_intents i JOIN conversations c ON c.project=i.project
+            WHERE i.state='uncertain' ORDER BY i.claimed_at LIMIT 100""").fetchall()
+        return {"intents": [dict(row) for row in rows]}
     finally:
         db.close()
 
@@ -492,8 +514,10 @@ def record_result(project_root: Path, state_dir: Path, nonce: str, outcome: str,
     try:
         db.execute("BEGIN IMMEDIATE")
         intent = db.execute("SELECT * FROM delivery_intents WHERE nonce=?", (nonce,)).fetchone()
-        if intent is None or intent["state"] != "sending":
+        if intent is None or intent["state"] not in {"sending", "uncertain"}:
             raise ValueError("delivery intent is not active")
+        if intent["state"] == "uncertain" and outcome != "sent":
+            raise ValueError("uncertain delivery requires identity-verifiable confirmation")
         row = db.execute("SELECT * FROM conversations WHERE project=?", (intent["project"],)).fetchone()
         if outcome == "sent":
             if not message_id or not sent_at:
@@ -501,8 +525,10 @@ def record_result(project_root: Path, state_dir: Path, nonce: str, outcome: str,
             delivery_time = iso(sent_at)
             db.execute("UPDATE delivery_intents SET state='sent', message_id=? WHERE nonce=?", (message_id, nonce))
             if row and row["assignment_generation"] == intent["assignment_generation"]:
+                eligible_recovery = (intent["state"] == "uncertain" and
+                                     row["reconciliation_status"] == "suspended-uncertain-send")
                 canceled = (row["revision"] != intent["revision"] or row["state"] != "awaiting-owner" or
-                            row["reconciliation_status"] != "ready")
+                            row["reconciliation_status"] != "ready" and not eligible_recovery)
                 old_id = row["reminder_message_id"]
                 to_delete = [message_id] if canceled else ([old_id] if old_id else [])
                 cleanup = json.loads(row["cleanup_message_ids"])
@@ -519,6 +545,9 @@ def record_result(project_root: Path, state_dir: Path, nonce: str, outcome: str,
                     db.execute("""UPDATE conversations SET reminder_message_id=?, cleanup_message_ids=?,
                         due_at=?, revision=revision+1 WHERE project=?""",
                         (message_id, json.dumps(cleanup), stamp(delivery_time + timedelta(hours=1)), intent["project"]))
+                if intent["state"] == "uncertain" and row["reconciliation_status"] == "suspended-uncertain-send":
+                    db.execute("""UPDATE conversations SET reconciliation_status='suspended-restart-reconciliation'
+                        WHERE project=?""", (intent["project"],))
             # The exclusion list includes every delivered reminder identity, even
             # after deletion, so a late reaction never reaches a coding agent.
             ids = [r[0] for r in db.execute("SELECT message_id FROM delivery_intents WHERE state='sent' AND message_id IS NOT NULL")]
@@ -574,7 +603,8 @@ def suspend_interrupted_sends(state_dir: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("sync", "status", "disable", "enable", "run", "actions", "done", "claim", "validate", "result"))
+    parser.add_argument("command", choices=("sync", "status", "disable", "enable", "run", "recover",
+                                            "actions", "done", "intents", "claim", "validate", "result"))
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--state-dir", type=Path, default=EVENTS.default_state_dir())
     parser.add_argument("--action-id")
@@ -595,6 +625,8 @@ def main() -> int:
             result = sync(args.project_root, args.state_dir)
         elif args.command == "actions":
             result = pending_actions(args.state_dir)
+        elif args.command == "intents":
+            result = uncertain_intents(args.state_dir)
         elif args.command == "done":
             if not args.action_id:
                 raise ValueError("--action-id is required")
@@ -625,10 +657,22 @@ def main() -> int:
                 suspend_interrupted_sends(args.state_dir)
                 observer_env = {**os.environ, "CCDM_REMINDER_PROJECT_ROOT": str(args.project_root),
                                 "CCDM_REMINDER_STATE_DIR": str(args.state_dir)}
-                observer = subprocess.Popen([os.environ.get("CCDM_REMINDER_NODE", "node"),
+                observer_args = [os.environ.get("CCDM_REMINDER_NODE", "node"),
                                              str(Path(__file__).with_name("conversation-reminder-observer.js")),
-                                             "--project-root", str(args.project_root), "--state-dir", str(args.state_dir)],
-                                            env=observer_env)
+                                             "--project-root", str(args.project_root), "--state-dir", str(args.state_dir)]
+                if args.command == "recover":
+                    sync(args.project_root, args.state_dir)
+                    try:
+                        completed = subprocess.run([*observer_args, "--recover-once"], env=observer_env,
+                                                   capture_output=True, text=True, timeout=30)
+                    except subprocess.TimeoutExpired as error:
+                        raise ValueError("recovery timed out; retry after checking Discord access") from error
+                    if completed.returncode:
+                        raise ValueError("recovery could not inspect Discord; check assignment, credentials, and channel access")
+                    result = json.loads(completed.stdout)
+                    print(json.dumps(result, sort_keys=True))
+                    return 0
+                observer = subprocess.Popen(observer_args, env=observer_env)
                 try:
                     while not status(args.state_dir)["disabled"]:
                         sync(args.project_root, args.state_dir)

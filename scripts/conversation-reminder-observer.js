@@ -14,6 +14,7 @@ const exec = promisify(execFile);
 const script = path.join(__dirname, "conversation-reminder-service.py");
 const projectRoot = process.argv[process.argv.indexOf("--project-root") + 1] || path.resolve(__dirname, "..");
 const stateDir = process.argv[process.argv.indexOf("--state-dir") + 1] || path.join(os.homedir(), ".local/state/ccdm/conversation-reminders");
+const recoverOnce = process.argv.includes("--recover-once");
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildMessageReactions, GatewayIntentBits.MessageContent],
@@ -146,10 +147,78 @@ async function observeReaction(reaction, user) {
   });
 }
 
-async function sideEffects() {
+async function recoverIntents() {
+  const listed = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+    [script, "intents", "--state-dir", stateDir]);
+  let recovered = 0;
+  const unresolved = [];
+  for (const intent of JSON.parse(listed.stdout).intents) {
+    const found = await assignment(intent.channel_id);
+    if (!found || found.project !== intent.project ||
+        found.assignment_generation !== intent.assignment_generation || found.bot_id !== intent.bot_id) {
+      unresolved.push({ project: intent.project, nonce: intent.nonce, reason: "assignment or credentials unavailable" });
+      continue;
+    }
+    const base = `https://discord.com/api/v10/channels/${encodeURIComponent(intent.channel_id)}/messages`;
+    let before;
+    let match;
+    let complete = false;
+    let reason = "intent identity absent from bounded history; do not resend or delete by emoji";
+    for (let page = 0; page < 3; page++) {
+      const url = `${base}?limit=100${before ? `&before=${encodeURIComponent(before)}` : ""}`;
+      let response;
+      try {
+        response = await fetch(url, { headers: { Authorization: `Bot ${found.bot_token}` },
+          signal: AbortSignal.timeout(10000) });
+      } catch {
+        reason = "Discord identity lookup unavailable; retry recovery after access returns";
+        break;
+      }
+      if (!response.ok) {
+        reason = response.status === 401 || response.status === 403
+          ? "Discord identity lookup denied; restore assigned bot access before retrying"
+          : "Discord identity lookup failed; retry recovery without resending";
+        break;
+      }
+      const messages = await response.json().catch(() => null);
+      if (!Array.isArray(messages) || messages.some(message => !message || typeof message.id !== "string")) {
+        reason = "Discord history is malformed; identity remains unresolved";
+        break;
+      }
+      const matches = messages.filter(message => String(message.nonce) === intent.nonce &&
+        String(message.author?.id) === String(found.bot_app_id) && message.content === "👀" &&
+        typeof message.timestamp === "string" && Number.isFinite(Date.parse(message.timestamp)));
+      if (matches.length > 1 || (match && matches.length)) {
+        match = null;
+        reason = "multiple messages carry the intent identity; manual investigation required";
+        break;
+      }
+      if (matches.length === 1) match = matches[0];
+      if (messages.length < 100) {
+        complete = true;
+        break;
+      }
+      before = messages[messages.length - 1].id;
+      if (page === 2) reason = "bounded history did not cover the intent; identity remains unresolved";
+    }
+    if (!match || !complete) {
+      unresolved.push({ project: intent.project, nonce: intent.nonce, reason });
+      continue;
+    }
+    await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+      [script, "result", "--project-root", projectRoot, "--state-dir", stateDir,
+        "--nonce", intent.nonce, "--outcome", "sent", "--message-id", match.id,
+        "--sent-at", match.timestamp]);
+    recovered++;
+  }
+  return { recovered, unresolved };
+}
+
+async function sideEffects(recoveryOnly = false) {
   if (busy) return;
   busy = true;
   try {
+    const recovery = recoveryOnly ? await recoverIntents() : null;
     const pending = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
       [script, "actions", "--project-root", projectRoot, "--state-dir", stateDir]);
     for (const action of JSON.parse(pending.stdout).actions) {
@@ -180,6 +249,7 @@ async function sideEffects() {
       await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
         [script, "done", "--state-dir", stateDir, "--action-id", action.action_id]);
     }
+    if (recoveryOnly) return { status: "recovery-complete", ...recovery };
     const due = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
       [script, "claim", "--project-root", projectRoot, "--state-dir", stateDir]);
     const claim = JSON.parse(due.stdout).claim;
@@ -235,6 +305,7 @@ async function sideEffects() {
     if (Number.isFinite(retryAfter)) resultArgs.push("--retry-after", String(retryAfter));
     await exec(process.env.CCDM_REMINDER_PYTHON || "python3", resultArgs);
   } catch (error) {
+    if (recoveryOnly) throw error;
     process.stderr.write(`Conversation observer side effect pending: ${error.message}\n`);
   } finally {
     busy = false;
@@ -252,7 +323,19 @@ client.on("ready", async () => {
       if (!health[name]) await markHealth(name, "blocked-assignment");
     }
   }
-  setInterval(sideEffects, 250);
+  if (recoverOnce) {
+    try {
+      const result = await sideEffects(true);
+      process.stdout.write(`${JSON.stringify(result)}\n`);
+      client.destroy();
+      process.exit(0);
+    } catch (error) {
+      process.stderr.write(`Conversation recovery unavailable: ${error.message}\n`);
+      client.destroy();
+      process.exit(2);
+    }
+  }
+  setInterval(() => sideEffects(false), 250);
 });
 process.on("SIGTERM", () => { client.destroy(); process.exit(0); });
 process.on("SIGINT", () => { client.destroy(); process.exit(0); });

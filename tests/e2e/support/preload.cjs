@@ -313,7 +313,14 @@ function routeDiscordApi(url, init = {}) {
         status: 400,
       });
     }
-    const messages = state.fixtures?.discord?.restMessages ?? [];
+    const sent = state.fixtures?.discord?.includeSentInHistory
+      ? (state.fixtures.discord.messages ?? []).filter(message => !message.deleted && message.requestBody?.nonce)
+        .map(message => ({ id: message.id, channel_id: message.channelId,
+          content: message.content, nonce: message.requestBody.nonce,
+          author: { id: "app", bot: true }, timestamp: message.timestamp }))
+        .reverse()
+      : [];
+    const messages = [...sent, ...(state.fixtures?.discord?.restMessages ?? [])];
     const beforeIndex = before ? messages.findIndex((message) => message.id === before) : -1;
     const page = beforeIndex >= 0 ? messages.slice(beforeIndex + 1) : messages;
     return response(JSON.stringify(page.slice(0, limit)), {
@@ -328,6 +335,8 @@ function routeDiscordApi(url, init = {}) {
       return response(JSON.stringify({ message: "nonce required" }), { status: 400 });
     }
     let created;
+    let crashAfterAccept = false;
+    let crashAfterResponseParsed = false;
     updateState((state) => {
       state.fixtures.discord.messages ||= [];
       state.fixtures.discord.reminderRequests ||= [];
@@ -349,15 +358,33 @@ function routeDiscordApi(url, init = {}) {
         } : {}),
       };
       state.fixtures.discord.messages.push(created);
+      if (parsedBody.content === "👀" && state.fixtures.discord.crashAfterReminderAccept) {
+        crashAfterAccept = true;
+        state.fixtures.discord.crashAfterReminderAccept = false;
+      }
+      if (parsedBody.content === "👀" && state.fixtures.discord.crashAfterReminderResponseParsed) {
+        crashAfterResponseParsed = true;
+        state.fixtures.discord.crashAfterReminderResponseParsed = false;
+      }
     });
-    return response(JSON.stringify({ id: created.id, content: created.content, timestamp: created.timestamp }), {
+    if (crashAfterAccept) process.exit(86);
+    const sentResponse = response(JSON.stringify({ id: created.id, content: created.content, timestamp: created.timestamp }), {
       headers: { "content-type": "application/json" },
     });
+    if (crashAfterResponseParsed) {
+      const parse = sentResponse.json.bind(sentResponse);
+      sentResponse.json = async () => {
+        await parse();
+        process.exit(86);
+      };
+    }
+    return sentResponse;
   }
 
   const getMessageMatch = /^\/api\/v10\/channels\/([^/]+)\/messages\/([^/]+)$/.exec(url.pathname);
   if (url.hostname === "discord.com" && getMessageMatch && method === "DELETE") {
     let exists = false;
+    let crashAfterDelete = false;
     updateState((state) => {
       state.fixtures.discord.deletes ||= [];
       state.fixtures.discord.reminderRequests ||= [];
@@ -367,7 +394,12 @@ function routeDiscordApi(url, init = {}) {
       const message = state.fixtures.discord.messages?.find(entry => entry.id === getMessageMatch[2]);
       exists = Boolean(message && !message.deleted);
       if (exists) message.deleted = true;
+      if (exists && state.fixtures.discord.crashAfterReminderDelete) {
+        crashAfterDelete = true;
+        state.fixtures.discord.crashAfterReminderDelete = false;
+      }
     });
+    if (crashAfterDelete) process.exit(86);
     return exists ? response("", { status: 204 }) :
       response(JSON.stringify({ message: "Unknown Message" }), { status: 404 });
   }
