@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 
@@ -17,6 +18,26 @@ if _SPEC is None or _SPEC.loader is None:
     raise RuntimeError("Conversation Reminder event receiver is unavailable")
 _EVENTS = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_EVENTS)
+
+
+def adapter_process_live(pid: object) -> bool:
+    """True only while the recorded launch-scoped Claude channel adapter is running."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    try:
+        ps = "/bin/ps" if os.path.exists("/bin/ps") else "ps"
+        command = subprocess.run([ps, "-p", str(pid), "-ww", "-o", "command="], capture_output=True,
+                                 text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    # A reused PID belongs to some other program, never the adapter.
+    return "claude-reminder-channel.js" in command
 
 
 def build_readiness(project_name: str, project_root: Path, state_dir: Path) -> dict:
@@ -68,6 +89,10 @@ def build_readiness(project_name: str, project_root: Path, state_dir: Path) -> d
             )
             if not verified:
                 unsupported_capabilities.append("Claude launch-scoped transport is not verified for this assignment")
+            elif not adapter_process_live(capability.get("pid")):
+                # A plain restart runs the unfiltered official plugin; an exited
+                # adapter launch no longer filters /close or records completions.
+                unsupported_capabilities.append("Claude launch-scoped transport is not running for this assignment")
         if not assignment["bot"].get("token"):
             missing_credentials.append("assigned_project_bot_token")
         if not assignment["bot"].get("app_id"):
@@ -132,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{readiness['provider'].capitalize()} Conversation Reminder adapter: {readiness['status']}")
         print(f"Project: {readiness['project']}")
         print(f"Event receiver: {'available' if readiness['event_receiver']['available'] else 'unavailable'}")
-        print("Reminder delivery: disabled")
+        print("Reminder delivery: see scripts/conversation-reminder-service.py status")
         if readiness["missing_credentials"]:
             print("Missing credentials: " + ", ".join(readiness["missing_credentials"]))
         if readiness["assignment_mismatches"]:

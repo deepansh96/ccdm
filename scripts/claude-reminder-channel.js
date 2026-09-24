@@ -6,6 +6,7 @@
 const { spawn } = require("node:child_process");
 const { randomUUID } = require("node:crypto");
 const { createInterface } = require("node:readline");
+const { readFileSync, rmSync } = require("node:fs");
 const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
@@ -27,6 +28,16 @@ const interactions = new Map();
 const pendingReplies = new Map();
 let inputNeededMarker = null;
 let supportedServerVersion = null;
+const capabilityPath = selectedProject ? path.join(stateDir, "capabilities", `${selectedProject}.json`) : null;
+
+// The capability marker proves only this live launch. Remove it when this
+// process exits, unless a newer launch has already replaced it.
+process.on("exit", () => {
+  if (!capabilityPath) return;
+  try {
+    if (JSON.parse(readFileSync(capabilityPath, "utf8")).pid === process.pid) rmSync(capabilityPath, { force: true });
+  } catch { /* Absent or replaced markers need no cleanup. */ }
+});
 
 async function hasCommandHooks() {
   const file = process.env.CCDM_CLAUDE_HOOK_SETTINGS;
@@ -129,7 +140,7 @@ async function handlePluginMessage(line) {
       line = JSON.stringify(message);
     }
     if (selectedProject && supportedServerVersion) {
-      const markerPath = path.join(stateDir, "capabilities", `${selectedProject}.json`);
+      const markerPath = capabilityPath;
       const assignment = await reminder.resolveAssignmentForChannel(selectedChannel, {
         registryPath: path.join(projectRoot, "registry.json"), botAppId: selectedAppId,
       }).catch(() => null);
@@ -147,6 +158,8 @@ async function handlePluginMessage(line) {
           transport: "official-discord-stdio-proxy",
           hooks_configured: await hasCommandHooks(),
           reply_tool_verified: true,
+          launch_id: launchId,
+          pid: process.pid,
         }) + "\n", { mode: 0o600 });
       } else {
         await fs.rm(markerPath, { force: true });
@@ -157,7 +170,7 @@ async function handlePluginMessage(line) {
     const capabilities = message.result.capabilities || {};
     if (message.result.serverInfo.name !== "discord" || message.result.serverInfo.version !== "1.0.0" ||
         !capabilities.experimental?.["claude/channel"] || !capabilities.tools) {
-      if (selectedProject) await fs.rm(path.join(stateDir, "capabilities", `${selectedProject}.json`), { force: true });
+      if (capabilityPath) await fs.rm(capabilityPath, { force: true });
       process.stderr.write("Claude reminder channel: unsupported official Discord transport contract\n");
       plugin.kill("SIGTERM");
       process.exitCode = 2;
@@ -165,7 +178,7 @@ async function handlePluginMessage(line) {
     }
     supportedServerVersion = message.result.serverInfo.version;
     if (selectedProject) {
-      await fs.rm(path.join(stateDir, "capabilities", `${selectedProject}.json`), { force: true });
+      await fs.rm(capabilityPath, { force: true });
       message.result.instructions = `${message.result.instructions || ""}\nFor every reply, pass conversation_interaction_id copied from the owner message_id being answered. Set conversation_disposition to input-needed only when the delivered reply explicitly asks the owner for input; otherwise use progress. A reply without a valid interaction ID is delivered normally but does not count as a confirmed Conversation Reminder response.`;
       line = JSON.stringify(message);
     }

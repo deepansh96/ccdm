@@ -113,6 +113,19 @@ for line in ps.splitlines():
 PY
 }
 
+clear_claude_capability_marker() {
+  python3 - "$PROJECT" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+project = sys.argv[1]
+state_dir = Path(os.environ.get("CCDM_REMINDER_STATE_DIR") or Path.home() / ".local" / "state" / "ccdm" / "conversation-reminders")
+if "/" not in project and project not in {"", ".", ".."}:
+    (state_dir / "capabilities" / f"{project}.json").unlink(missing_ok=True)
+PY
+}
+
 record_claude_pid() {
   local state_dir="$1"
   local claude_home="$2"
@@ -278,6 +291,9 @@ fi
 
 MCP_CONFIG="$STATE_DIR/ccdm-message-export-mcp.json"
 REMINDER_ADAPTER="${CCDM_CLAUDE_REMINDER_ADAPTER:-0}"
+# Only the adapter of this launch may prove a filtered Claude transport; a
+# plain launch runs the unfiltered official plugin and stays unsupported.
+clear_claude_capability_marker
 SETTINGS_FLAG=""
 CHANNEL_FLAG="--channels plugin:discord@claude-plugins-official"
 if [[ "$REMINDER_ADAPTER" == "1" ]]; then

@@ -10,7 +10,7 @@ import {
   bridgeChildEnv, createBridgeWorkspace, injectDiscordMessage, startBridge, startFakeCodexServer, waitForState,
 } from "./support/bridge.js";
 import { readState, writeState } from "./support/state.js";
-import { cleanup } from "./support/teardown.js";
+import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 
 test.afterEach(async () => cleanup());
 
@@ -361,7 +361,8 @@ function setupBothProviders(workspace) {
 
 // One Claude turn through the launch-scoped reminder channel around a Local
 // Fake of the official Discord plugin: the owner's message reaches Claude, and
-// Claude's reply asks for input and is confirmed by the plugin.
+// Claude's reply asks for input and is confirmed by the plugin. The launch
+// stays up until stopped, because readiness requires its live adapter.
 async function claudeTurn(workspace, context, { messageId, answerId }) {
   const fake = path.join(workspace.tmpDir, "fake-official-discord.cjs");
   fs.writeFileSync(fake, `
@@ -424,9 +425,12 @@ process.stdin.on("data", chunk => {
     text: "Which option?", conversation_interaction_id: messageId, conversation_disposition: "input-needed" } } });
   await until(answerId);
   await new Promise(resolve => setTimeout(resolve, 150));
-  // The coding agent stops: the reminder service must not depend on it.
-  child.kill();
-  await exited;
+  const stop = async (signal = "SIGTERM") => {
+    if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+    await exited;
+  };
+  registerTeardownCallback(() => stop("SIGKILL"));
+  return { stop };
 }
 
 // One Codex turn through the real bridge, a fake Codex app-server, and the
@@ -492,7 +496,7 @@ test("Claude and Codex complete reply, reminder, and reply or close through the 
 
   // First enablement: the Claude launch records its verified transport, then the
   // supervised worker discovers both (empty) channels before any delivery.
-  await claudeTurn(workspace, context, { messageId: "claude-warmup", answerId: "claude-warmup-answer" });
+  const warmup = await claudeTurn(workspace, context, { messageId: "claude-warmup", answerId: "claude-warmup-answer" });
   await service(workspace, context, "enable");
   context.setClock(at(-10 * 60000));
   let supervised = launchAsSupervisor(workspace, context);
@@ -501,8 +505,10 @@ test("Claude and Codex complete reply, reminder, and reply or close through the 
   await service(workspace, context, "disable");
   assert.equal((await supervised).exitCode, 0);
 
-  // Each provider answers its owner; both coding agents are then stopped.
-  await claudeTurn(workspace, context, { messageId: "claude-question", answerId: "claude-answer" });
+  // Each provider answers its owner. The Claude session is relaunched for its
+  // turn and keeps running; the Codex bridge is stopped after its turn.
+  await warmup.stop();
+  const claude = await claudeTurn(workspace, context, { messageId: "claude-question", answerId: "claude-answer" });
   const codex = await codexTurn(workspace, "codex-question");
   const history = readState(workspace.stateDir);
   history.fixtures.discord.history["claude-channel"].unshift(
@@ -572,4 +578,5 @@ test("Claude and Codex complete reply, reminder, and reply or close through the 
     .filter(row => row.content === "👀").length, 2, "no reminder is sent after reply or close");
   await service(workspace, context, "disable");
   assert.equal((await supervised).exitCode, 0);
+  await claude.stop();
 });

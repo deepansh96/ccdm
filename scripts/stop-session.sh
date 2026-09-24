@@ -277,6 +277,20 @@ if [[ -n "$ORPHAN_PIDS" ]]; then
   terminate_pids "${(@f)ORPHAN_PIDS}"
 fi
 
+if [[ "$SESSION_TYPE" != "codex" ]]; then
+  # The stopped launch no longer proves a filtered Claude transport.
+  python3 - "$PROJECT" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+project = sys.argv[1]
+state_dir = Path(os.environ.get("CCDM_REMINDER_STATE_DIR") or Path.home() / ".local" / "state" / "ccdm" / "conversation-reminders")
+if "/" not in project and project not in {"", ".", ".."}:
+    (state_dir / "capabilities" / f"{project}.json").unlink(missing_ok=True)
+PY
+fi
+
 python3 -c "
 import json
 path = '$REGISTRY'
