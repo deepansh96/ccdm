@@ -311,14 +311,58 @@ def claude_account_label(config_json_path):
     return None
 
 
-def discover_claude_accounts():
-    """Return the default login and valid extra Claude config-dir logins.
+def _oauth_expiry(oauth):
+    try:
+        return float(oauth.get("expiresAt"))
+    except (TypeError, ValueError):
+        return float("-inf")
 
-    Claude Code stores the default login in ``Claude Code-credentials`` and
-    derives each ``CLAUDE_CONFIG_DIR`` login's Keychain service from the first
-    eight hex characters of that config directory's SHA-256 hash.
+
+def _oauth_expired(oauth):
+    expires_at = oauth.get("expiresAt")
+    if not expires_at:
+        return False
+    try:
+        return float(expires_at) / 1000 < datetime.now(timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return False
+
+
+def _read_oauth_credentials(services):
+    """Return the readable OAuth credentials among ``services``, freshest first.
+
+    A home can hold both its hashed and its plain Keychain item, and only the
+    one its sessions run under keeps being refreshed, so the first readable
+    item can be a stale leftover. Ties keep the ``services`` order.
     """
-    accounts = [("Claude Code-credentials", "Personal", "~/.claude")]
+    credentials = [oauth for oauth in map(_read_oauth_credential, services) if oauth]
+    return sorted(credentials, key=_oauth_expiry, reverse=True)
+
+
+def claude_home_services(config_dir):
+    """Keychain services that can hold one Claude home's login, hashed first.
+
+    Claude Code keeps a home's OAuth credential in ``Claude Code-credentials``
+    when ``CLAUDE_CONFIG_DIR`` is unset, and in
+    ``Claude Code-credentials-<first 8 hex of sha256(dir path)>`` when the
+    variable is set explicitly. Remote logins always set the variable, even
+    for ``~/.claude``, while default sessions do not, so ``~/.claude`` can
+    have a live credential in either item.
+    """
+    hashed = "Claude Code-credentials-" + hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
+    if config_dir == Path.home() / ".claude":
+        return [hashed, "Claude Code-credentials"]
+    return [hashed]
+
+
+def discover_claude_accounts():
+    """Return each Claude login as ``(services, label, dir_hint)``.
+
+    The first entry is always the default ``~/.claude`` home. ``services``
+    lists every Keychain item that can hold that home's login; callers read
+    them with ``_read_oauth_credentials``.
+    """
+    accounts = [(claude_home_services(Path.home() / ".claude"), "Personal", "~/.claude")]
     try:
         home = Path.home()
         config_dirs = sorted(home.glob(".claude-*"))
@@ -334,10 +378,9 @@ def discover_claude_accounts():
         label = claude_account_label(config_dir / ".claude.json")
         if not label:
             continue
-        suffix = hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
         accounts.append(
             (
-                f"Claude Code-credentials-{suffix}",
+                claude_home_services(config_dir),
                 label,
                 f"~/{config_dir.name}",
             )
@@ -345,73 +388,9 @@ def discover_claude_accounts():
     return accounts
 
 
-def get_claude_account_stats(base_url, service, label, dir_hint, missing_message=None):
-    oauth = _read_oauth_credential(service)
-    if not oauth:
-        return missing_message
-
-    expires_at = oauth.get("expiresAt")
-    if expires_at:
-        try:
-            if float(expires_at) / 1000 < datetime.now(timezone.utc).timestamp():
-                if oauth.get("refreshToken"):
-                    return f"**{label}**\n*OAuth token expired — start a session on this account to refresh*"
-                return _claude_relogin_block(label, dir_hint)
-        except (TypeError, ValueError):
-            pass
-
-    headers = {
-        "Authorization": f"Bearer {oauth['accessToken']}",
-        "anthropic-beta": "oauth-2025-04-20",
-        "User-Agent": "claude-code/usage-stats-poster",
-    }
-    try:
-        profile = _request_json(base_url, "/api/oauth/profile", headers, "Anthropic profile")
-        usage = _request_json(base_url, "/api/oauth/usage", headers, "Anthropic usage")
-    except PosterHTTPError as error:
-        if error.status == 401:
-            if oauth.get("refreshToken"):
-                return f"**{label}**\n*Auth expired — start a session on this account to refresh*"
-            return _claude_relogin_block(label, dir_hint)
-        return f"**{label}**\n*Anthropic usage is temporarily unavailable*"
-    except PosterError:
-        return f"**{label}**\n*Anthropic usage is temporarily unavailable*"
-
-    organization = profile.get("organization") if isinstance(profile, dict) else None
-    organization_type = organization.get("organization_type") if isinstance(organization, dict) else None
-    if isinstance(organization_type, str) and organization_type.strip():
-        plan = organization_type.strip().replace("_", " ").title()
-    else:
-        plan = "N/A"
-    now = datetime.now(timezone.utc)
-    lines = [f"**{label}** ({plan})"]
-    for key, limit_label in (("five_hour", "5-Hour"), ("seven_day", "7-Day")):
-        data = usage.get(key) if isinstance(usage, dict) else None
-        if not isinstance(data, dict):
-            continue
-        reset = fmt_reset(data.get("resets_at"), now)
-        reset_part = f"  resets in {reset}" if reset else ""
-        lines.append(f"{limit_label}: {text_bar(data.get('utilization', 0) or 0)}{reset_part}")
-    extra_usage = usage.get("extra_usage", {}) if isinstance(usage, dict) else {}
-    if isinstance(extra_usage, dict) and extra_usage.get("is_enabled"):
-        lines.append(f"Extra usage: **${_safe_int(extra_usage.get('used_credits')) / 100:.2f}** spent")
-    return "\n".join(lines)
-
-
 def _claude_relogin_block(label, dir_hint):
     command = f"CLAUDE_CONFIG_DIR={dir_hint} claude /login"
     return f"**{label}**\n*Needs re-login: `{command}`*"
-
-
-def get_claude_oauth_stats(base_url):
-    """Return the default Claude OAuth account block."""
-    return get_claude_account_stats(
-        base_url,
-        "Claude Code-credentials",
-        "Personal",
-        "~/.claude",
-        missing_message="**Personal**\n*Could not get OAuth token*",
-    )
 
 
 def _parse_url(value, field):
@@ -1032,23 +1011,6 @@ def get_codex_stats(registry):
     return value or None
 
 
-def get_claude_stats(config):
-    blocks = [get_claude_oauth_stats(config["anthropic_base_url"])]
-    for service, label, dir_hint in discover_claude_accounts()[1:]:
-        block = get_claude_account_stats(config["anthropic_base_url"], service, label, dir_hint)
-        if block:
-            blocks.append(block)
-    for account in config["claude_api_accounts"]:
-        if account["path"].is_dir():
-            blocks.append(get_claude_api_stats(account["path"], account["label"]))
-        else:
-            blocks.append(f"**{account['label']}** (API key)\n*Config directory unavailable*")
-    value = "\n\n".join(blocks)
-    if len(value) > 1024:
-        value = value[:1000].rstrip() + "\n*truncated*"
-    return value
-
-
 def _normalise_reset_timestamp(value):
     """Return a stable UTC timestamp, or ``None`` for malformed input."""
     try:
@@ -1069,7 +1031,40 @@ def _normalise_reset_timestamp(value):
     return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _collect_claude_oauth_metric(base_url, service, label, dir_hint):
+def _request_claude_usage_once(base_url, oauth):
+    headers = {
+        "Authorization": f"Bearer {oauth['accessToken']}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-code/usage-stats-poster",
+    }
+    profile = _request_json(base_url, "/api/oauth/profile", headers, "Anthropic profile")
+    usage = _request_json(base_url, "/api/oauth/usage", headers, "Anthropic usage")
+    return profile, usage
+
+
+def _request_claude_usage(base_url, oauth, fallbacks=()):
+    """Return ``(profile, usage)`` for ``oauth``.
+
+    A 401 can come from a revoked login whose ``expiresAt`` is still in the
+    future, so each unexpired fallback credential of the same home is tried
+    before the original error is raised.
+    """
+    try:
+        return _request_claude_usage_once(base_url, oauth)
+    except PosterHTTPError as error:
+        if error.status != 401:
+            raise
+        for fallback in fallbacks:
+            if _oauth_expired(fallback):
+                continue
+            try:
+                return _request_claude_usage_once(base_url, fallback)
+            except PosterError:
+                continue
+        raise error
+
+
+def _collect_claude_oauth_metric(base_url, services, label, dir_hint):
     """Collect a credential-free, renderer-friendly Claude account metric.
 
     The returned object intentionally contains only display labels, rate-limit
@@ -1078,36 +1073,26 @@ def _collect_claude_oauth_metric(base_url, service, label, dir_hint):
     writer.
     """
     metric = {"provider": "claude", "account": label, "limits": []}
-    oauth = _read_oauth_credential(service)
-    if not oauth:
+    credentials = _read_oauth_credentials(services)
+    if not credentials:
         metric["status"] = "unavailable"
         metric["reason"] = "Could not get OAuth token"
         metric["missing_oauth"] = True
         metric["text"] = f"**{label}**\n*Could not get OAuth token*"
         return metric
-    expires_at = oauth.get("expiresAt")
-    if expires_at:
-        try:
-            if float(expires_at) / 1000 < datetime.now(timezone.utc).timestamp():
-                metric["status"] = "unavailable"
-                metric["reason"] = "OAuth token expired"
-                metric["text"] = (
-                    f"**{label}**\n*OAuth token expired — start a session on this account to refresh*"
-                    if oauth.get("refreshToken")
-                    else _claude_relogin_block(label, dir_hint)
-                )
-                return metric
-        except (TypeError, ValueError):
-            pass
+    oauth = credentials[0]
+    if _oauth_expired(oauth):
+        metric["status"] = "unavailable"
+        metric["reason"] = "OAuth token expired"
+        metric["text"] = (
+            f"**{label}**\n*OAuth token expired — start a session on this account to refresh*"
+            if oauth.get("refreshToken")
+            else _claude_relogin_block(label, dir_hint)
+        )
+        return metric
 
-    headers = {
-        "Authorization": f"Bearer {oauth['accessToken']}",
-        "anthropic-beta": "oauth-2025-04-20",
-        "User-Agent": "claude-code/usage-stats-poster",
-    }
     try:
-        profile = _request_json(base_url, "/api/oauth/profile", headers, "Anthropic profile")
-        usage = _request_json(base_url, "/api/oauth/usage", headers, "Anthropic usage")
+        profile, usage = _request_claude_usage(base_url, oauth, credentials[1:])
     except PosterHTTPError as error:
         metric["status"] = "unavailable"
         metric["reason"] = "Auth expired" if error.status == 401 else "Anthropic usage unavailable"
@@ -1166,8 +1151,8 @@ def _collect_claude_oauth_metric(base_url, service, label, dir_hint):
 def collect_claude_metrics(config):
     """Return structured current Claude metrics for history and rendering."""
     metrics = []
-    for index, (service, label, dir_hint) in enumerate(discover_claude_accounts()):
-        metric = _collect_claude_oauth_metric(config["anthropic_base_url"], service, label, dir_hint)
+    for index, (services, label, dir_hint) in enumerate(discover_claude_accounts()):
+        metric = _collect_claude_oauth_metric(config["anthropic_base_url"], services, label, dir_hint)
         if index > 0 and metric.get("missing_oauth"):
             metric["text"] = None
         metrics.append(metric)
