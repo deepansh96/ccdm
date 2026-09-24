@@ -97,7 +97,10 @@ function takeRestFailure(method, url) {
   const state = readState();
   const failures = state.fixtures?.discord?.restFailures;
   if (!Array.isArray(failures) || failures.length === 0) return null;
-  const [failure, ...remaining] = failures;
+  const failure = failures[0];
+  if (failure.method && failure.method !== method) return null;
+  if (failure.path && failure.path !== url.pathname) return null;
+  const remaining = failures.slice(1);
   updateState((nextState) => {
     nextState.fixtures.discord.restFailures = remaining;
     nextState.fixtures.discord.restFailureUses ||= [];
@@ -106,6 +109,14 @@ function takeRestFailure(method, url) {
       path: url.pathname,
       status: failure.status ?? 500,
     });
+    if (method === "DELETE" && /^\/api\/v10\/channels\/[^/]+\/messages\/[^/]+$/.test(url.pathname)) {
+      const parts = url.pathname.split("/");
+      nextState.fixtures.discord.deletes ||= [];
+      nextState.fixtures.discord.deletes.push({ method, channelId: parts[4], messageId: parts[6],
+        status: failure.status ?? 500 });
+      nextState.fixtures.discord.reminderRequests ||= [];
+      nextState.fixtures.discord.reminderRequests.push({ method: "DELETE", messageId: parts[6] });
+    }
   });
   return response(JSON.stringify(failure.body ?? { message: `status ${failure.status ?? 500}` }), {
     headers: { "content-type": "application/json" },
@@ -313,24 +324,53 @@ function routeDiscordApi(url, init = {}) {
   const createMessageMatch = /^\/api\/v10\/channels\/([^/]+)\/messages$/.exec(url.pathname);
   if (url.hostname === "discord.com" && createMessageMatch && method === "POST") {
     const parsedBody = init.body ? JSON.parse(String(init.body)) : {};
+    if (parsedBody.enforce_nonce && (!parsedBody.nonce || typeof parsedBody.nonce !== "string")) {
+      return response(JSON.stringify({ message: "nonce required" }), { status: 400 });
+    }
     let created;
     updateState((state) => {
       state.fixtures.discord.messages ||= [];
+      state.fixtures.discord.reminderRequests ||= [];
+      if (parsedBody.content === "👀") state.fixtures.discord.reminderRequests.push({ method: "POST" });
+      created = parsedBody.enforce_nonce && state.fixtures.discord.messages.find(entry =>
+        entry.channelId === createMessageMatch[1] && entry.requestBody?.nonce === parsedBody.nonce);
+      if (created) return;
       created = {
         authorization: headerValue(init.headers, "Authorization"),
         channelId: createMessageMatch[1],
         content: parsedBody.content ?? "",
         id: `fake-message-${state.fixtures.discord.messages.length + 1}`,
         messageReference: parsedBody.message_reference,
+        ...(parsedBody.enforce_nonce ? {
+          requestBody: parsedBody,
+          timestamp: process.env.CCDM_REMINDER_CLOCK_FILE
+            ? fs.readFileSync(process.env.CCDM_REMINDER_CLOCK_FILE, "utf8").trim()
+            : new Date().toISOString(),
+        } : {}),
       };
       state.fixtures.discord.messages.push(created);
     });
-    return response(JSON.stringify({ id: created.id, content: created.content }), {
+    return response(JSON.stringify({ id: created.id, content: created.content, timestamp: created.timestamp }), {
       headers: { "content-type": "application/json" },
     });
   }
 
   const getMessageMatch = /^\/api\/v10\/channels\/([^/]+)\/messages\/([^/]+)$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && getMessageMatch && method === "DELETE") {
+    let exists = false;
+    updateState((state) => {
+      state.fixtures.discord.deletes ||= [];
+      state.fixtures.discord.reminderRequests ||= [];
+      state.fixtures.discord.deletes.push({ authorization: headerValue(init.headers, "Authorization"),
+        channelId: getMessageMatch[1], messageId: getMessageMatch[2] });
+      state.fixtures.discord.reminderRequests.push({ method: "DELETE", messageId: getMessageMatch[2] });
+      const message = state.fixtures.discord.messages?.find(entry => entry.id === getMessageMatch[2]);
+      exists = Boolean(message && !message.deleted);
+      if (exists) message.deleted = true;
+    });
+    return exists ? response("", { status: 204 }) :
+      response(JSON.stringify({ message: "Unknown Message" }), { status: 404 });
+  }
   if (url.hostname === "discord.com" && getMessageMatch && method === "GET") {
     const state = readState();
     const message = (state.fixtures?.discord?.restMessages ?? []).find((entry) => entry.id === getMessageMatch[2]);
@@ -435,7 +475,25 @@ function routeDiscordCdn(url) {
 async function guardedFetch(input, init = {}) {
   const url = new URL(typeof input === "string" ? input : input.url);
   const routed = routeDiscordApi(url, init) ?? routeDiscordCdn(url, init);
-  if (routed) return routed;
+  if (routed) {
+    if ((init.method || "GET").toUpperCase() === "POST" &&
+        /^\/api\/v10\/channels\/[^/]+\/messages$/.test(url.pathname) &&
+        readState().fixtures?.discord?.restLoseResponse) {
+      updateState(state => {
+        state.fixtures.discord.restLoseResponse = false;
+        state.fixtures.discord.lostResponseUses = (state.fixtures.discord.lostResponseUses || 0) + 1;
+      });
+      throw new Error("Local Fake lost the accepted Discord response");
+    }
+    const delay = readState().fixtures?.discord?.restResponseDelayMs || 0;
+    if (delay && (init.method || "GET").toUpperCase() === "POST" &&
+        /^\/api\/v10\/channels\/[^/]+\/messages$/.test(url.pathname)) {
+      updateState(state => { state.fixtures.discord.responsePending = true; });
+      await new Promise(resolve => setTimeout(resolve, delay));
+      updateState(state => { state.fixtures.discord.responsePending = false; });
+    }
+    return routed;
+  }
   recordBlocked("fetch", url.href);
   throw new Error(`Blocked unexpected fetch egress: ${url.href}`);
 }

@@ -51,6 +51,550 @@ async function waitForConversation(workspace, stateDir, predicate) {
   throw new Error("Timed out waiting for conversation state");
 }
 
+async function reconciledExchange(workspace, stateDir) {
+  await event(workspace, stateDir, "owner_activity", "delivery-owner", "2026-09-24T09:00:00Z", {
+    actor_id: "owner", source_message_id: "delivery-question", activity_kind: "message",
+  });
+  await event(workspace, stateDir, "response_delivered", "delivery-receipt", "2026-09-24T10:00:00Z", {
+    provider_session_id: "session", provider_turn_id: "turn", interaction_id: "delivery-question",
+    message_id: "delivery-answer", disposition: "progress",
+  });
+  await event(workspace, stateDir, "turn_completed", "delivery-completion", "2026-09-24T10:00:00Z", {
+    provider_session_id: "session", provider_turn_id: "turn", interaction_id: "delivery-question",
+    delivered_message_ids: ["delivery-answer"],
+  });
+  await command(workspace, stateDir, "sync");
+  // A later discovery slice will establish this state through reconciliation.
+  // Seed only the prerequisite; drive and assert delivery through executable surfaces.
+  const database = path.join(stateDir, "conversations.sqlite3");
+  const seeded = spawnSync("python3", ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute(\"UPDATE conversations SET reconciliation_status='ready' WHERE project='demo'\"); db.commit()", database], { encoding: "utf8" });
+  assert.equal(seeded.status, 0, seeded.stderr);
+}
+
+test("a reconciled Project Conversation gets its first emoji only after a full hour", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const rootState = path.join(workspace.homeDir, "root-discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  fs.writeFileSync(clockFile, "2026-09-24T10:59:59Z");
+  const running = runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir],
+    env: bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
+      CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile }),
+    timeoutMs: 10000,
+  });
+  await waitForState(workspace, state => state.fixtures.discord.logins.length === 1);
+  await new Promise(resolve => setTimeout(resolve, 600));
+  assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 0);
+  fs.writeFileSync(clockFile, "2026-09-24T11:00:00Z");
+  const sent = await waitForState(workspace, state => state.fixtures.discord.messages.length === 1);
+  assert.equal(sent.fixtures.discord.messages[0].content, "👀");
+  assert.equal(sent.fixtures.discord.messages[0].authorization, "Bot fixture-token");
+  assert.equal(sent.fixtures.codex.appServerInvocations.length, 0);
+  await command(workspace, stateDir, "disable");
+  assert.equal((await running).exitCode, 0);
+});
+
+test("hourly replacement sends the exact emoji before deleting only the recorded reminder", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const rootState = path.join(workspace.homeDir, "root-discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  fs.writeFileSync(clockFile, "2026-09-24T11:00:00Z");
+  const running = runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir],
+    env: bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
+      CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile }),
+    timeoutMs: 10000,
+  });
+  await waitForState(workspace, state => state.fixtures.discord.messages.length === 1);
+  await waitForConversation(workspace, stateDir, current => current?.due_at === "2026-09-24T12:00:00Z");
+  fs.writeFileSync(clockFile, "2026-09-24T11:59:59Z");
+  await new Promise(resolve => setTimeout(resolve, 600));
+  assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 1);
+  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
+  const observed = await waitForState(workspace, state => state.fixtures.discord.deletes?.length === 1);
+  assert.deepEqual(observed.fixtures.discord.messages.map(row => row.requestBody), [
+    { content: "👀", allowed_mentions: { parse: [] }, nonce: observed.fixtures.discord.messages[0].requestBody.nonce,
+      enforce_nonce: true },
+    { content: "👀", allowed_mentions: { parse: [] }, nonce: observed.fixtures.discord.messages[1].requestBody.nonce,
+      enforce_nonce: true },
+  ]);
+  assert.notEqual(observed.fixtures.discord.messages[0].requestBody.nonce,
+    observed.fixtures.discord.messages[1].requestBody.nonce);
+  assert.deepEqual(observed.fixtures.discord.deletes.map(row => row.messageId), ["fake-message-1"]);
+  assert.deepEqual(observed.fixtures.discord.reminderRequests.map(row => row.method), ["POST", "POST", "DELETE"]);
+  await waitForConversation(workspace, stateDir, current => current?.due_at === "2026-09-24T13:00:00Z");
+  await command(workspace, stateDir, "disable");
+  assert.equal((await running).exitCode, 0);
+});
+
+test("a delayed Discord response anchors the next hour to message creation", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.restResponseDelayMs = 800;
+  writeState(seed, workspace.stateDir);
+  const rootState = path.join(workspace.homeDir, "root-discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  fs.writeFileSync(clockFile, "2026-09-24T11:00:00Z");
+  const running = runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir],
+    env: bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
+      CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile }),
+    timeoutMs: 10000,
+  });
+  await waitForState(workspace, state => state.fixtures.discord.responsePending === true);
+  fs.writeFileSync(clockFile, "2026-09-24T11:02:00Z");
+  const sent = await waitForConversation(workspace, stateDir, current =>
+    current?.reminder_message_id === "fake-message-1");
+  assert.equal(sent.conversations.demo.due_at, "2026-09-24T12:00:00Z");
+  await command(workspace, stateDir, "disable");
+  assert.equal((await running).exitCode, 0);
+});
+
+test("a Conversation Reply after a delivery claim invalidates it before the Discord request", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  fs.writeFileSync(clockFile, "2026-09-24T11:00:00Z");
+  const env = { CCDM_REMINDER_CLOCK_FILE: clockFile };
+  const claimed = await command(workspace, stateDir, "claim", { env });
+  assert.equal(typeof claimed.claim.nonce, "string");
+  await event(workspace, stateDir, "owner_activity", "reply-before-request", "2026-09-24T11:00:00Z", {
+    actor_id: "owner", source_message_id: "reply-before-request", activity_kind: "message",
+  });
+  const checked = await runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["validate", "--project-root", workspace.repoDir, "--state-dir", stateDir,
+      "--nonce", claimed.claim.nonce], env,
+  });
+  assert.equal(checked.exitCode, 0, checked.stderr || checked.stdout);
+  assert.equal(JSON.parse(checked.stdout).valid, false);
+  assert.equal((await command(workspace, stateDir, "status")).conversations.demo.state, "open-paused");
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.messages, []);
+});
+
+test("a Conversation Reply during the Discord request removes its returned reminder", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.restResponseDelayMs = 800;
+  writeState(seed, workspace.stateDir);
+  const rootState = path.join(workspace.homeDir, "root-discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  fs.writeFileSync(clockFile, "2026-09-24T11:00:00Z");
+  const running = runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir],
+    env: bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
+      CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile }),
+    timeoutMs: 10000,
+  });
+  await waitForState(workspace, state => state.fixtures.discord.responsePending === true);
+  await event(workspace, stateDir, "owner_activity", "during-request", "2026-09-24T11:00:01Z", {
+    actor_id: "owner", source_message_id: "owner-during-request", activity_kind: "message",
+  });
+  const observed = await waitForState(workspace, state => state.fixtures.discord.deletes?.length === 1);
+  assert.deepEqual(observed.fixtures.discord.deletes.map(row => row.messageId), ["fake-message-1"]);
+  const state = await waitForConversation(workspace, stateDir, current =>
+    current?.state === "open-paused" && current?.cleanup_message_ids.length === 0);
+  assert.equal(state.conversations.demo.reminder_message_id, null);
+  assert.equal(state.conversations.demo.due_at, null);
+  assert.equal(observed.fixtures.codex.appServerInvocations.length, 0);
+  await command(workspace, stateDir, "disable");
+  assert.equal((await running).exitCode, 0);
+});
+
+test("owner closure during the Discord request deletes its returned reminder and confirms closure", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.restResponseDelayMs = 800;
+  writeState(seed, workspace.stateDir);
+  const rootState = path.join(workspace.homeDir, "root-discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  fs.writeFileSync(clockFile, "2026-09-24T11:00:00Z");
+  const running = runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir],
+    env: bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
+      CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile }),
+    timeoutMs: 10000,
+  });
+  await waitForState(workspace, state => state.fixtures.discord.responsePending === true);
+  await event(workspace, stateDir, "close_requested", "close-during-request", "2026-09-24T11:00:01Z", {
+    actor_id: "owner", source_message_id: "owner-close-during-request", command: "/close",
+  });
+  await waitForState(workspace, state => state.fixtures.discord.deletes?.length === 1 &&
+    state.fixtures.discord.reactions.some(row => row.messageId === "owner-close-during-request"));
+  const closed = await waitForConversation(workspace, stateDir, current =>
+    current?.state === "closed" && current?.cleanup_message_ids.length === 0);
+  assert.equal(closed.conversations.demo.reminder_message_id, null);
+  assert.equal(closed.conversations.demo.due_at, null);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.deletes.map(row => row.messageId),
+    ["fake-message-1"]);
+  assert.equal(readState(workspace.stateDir).fixtures.codex.appServerInvocations.length, 0);
+  await command(workspace, stateDir, "disable");
+  assert.equal((await running).exitCode, 0);
+});
+
+test("failed cleanup blocks another replacement until deletion succeeds", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const rootState = path.join(workspace.homeDir, "root-discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  fs.writeFileSync(clockFile, "2026-09-24T11:00:00Z");
+  const running = runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir],
+    env: bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
+      CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile }),
+    timeoutMs: 10000,
+  });
+  await waitForConversation(workspace, stateDir, current => current?.reminder_message_id === "fake-message-1");
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.restFailures = Array.from({ length: 20 }, () => ({ method: "DELETE", status: 503 }));
+  writeState(seed, workspace.stateDir);
+  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
+  await waitForState(workspace, state => state.fixtures.discord.deletes?.length === 1);
+  assert.deepEqual((await command(workspace, stateDir, "status")).conversations.demo.cleanup_message_ids,
+    ["fake-message-1"]);
+  fs.writeFileSync(clockFile, "2026-09-24T13:00:00Z");
+  await new Promise(resolve => setTimeout(resolve, 450));
+  assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 2);
+  const recovery = readState(workspace.stateDir);
+  recovery.fixtures.discord.restFailures = [];
+  writeState(recovery, workspace.stateDir);
+  fs.writeFileSync(clockFile, "2026-09-24T13:00:01Z");
+  await waitForState(workspace, state => state.fixtures.discord.deletes?.length >= 2);
+  await waitForState(workspace, state => state.fixtures.discord.messages.length === 3);
+  await command(workspace, stateDir, "disable");
+  assert.equal((await running).exitCode, 0);
+});
+
+test("cleanup waits for Discord's full 429 retry window before deleting by ID", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const rootState = path.join(workspace.homeDir, "root-discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  fs.writeFileSync(clockFile, "2026-09-24T11:00:00Z");
+  const running = runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir],
+    env: bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
+      CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile }),
+    timeoutMs: 10000,
+  });
+  await waitForConversation(workspace, stateDir, current => current?.reminder_message_id === "fake-message-1");
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.restFailures = [{ method: "DELETE", status: 429, body: { retry_after: 360 } }];
+  writeState(seed, workspace.stateDir);
+  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
+  await waitForState(workspace, state => state.fixtures.discord.restFailureUses.length === 1);
+  assert.deepEqual((await command(workspace, stateDir, "status")).conversations.demo.cleanup_message_ids,
+    ["fake-message-1"]);
+  fs.writeFileSync(clockFile, "2026-09-24T12:05:59Z");
+  await new Promise(resolve => setTimeout(resolve, 600));
+  assert.equal(readState(workspace.stateDir).fixtures.discord.deletes.length, 1);
+  fs.writeFileSync(clockFile, "2026-09-24T12:06:00Z");
+  await waitForState(workspace, state => state.fixtures.discord.deletes.length === 2);
+  await waitForConversation(workspace, stateDir, current => current?.cleanup_message_ids.length === 0);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.deletes.map(row => row.messageId),
+    ["fake-message-1", "fake-message-1"]);
+  await command(workspace, stateDir, "disable");
+  assert.equal((await running).exitCode, 0);
+});
+
+test("Discord 429 preserves the prior reminder and waits for the advertised retry time", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const rootState = path.join(workspace.homeDir, "root-discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  fs.writeFileSync(clockFile, "2026-09-24T11:00:00Z");
+  const running = runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir],
+    env: bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
+      CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile }),
+    timeoutMs: 10000,
+  });
+  await waitForConversation(workspace, stateDir, current => current?.reminder_message_id === "fake-message-1");
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.restFailures = [{ method: "POST", status: 429, body: { retry_after: 360 } }];
+  writeState(seed, workspace.stateDir);
+  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
+  await waitForState(workspace, state => state.fixtures.discord.restFailureUses.length === 1);
+  assert.equal((await command(workspace, stateDir, "status")).conversations.demo.reminder_message_id,
+    "fake-message-1");
+  assert.equal(readState(workspace.stateDir).fixtures.discord.deletes?.length || 0, 0);
+  fs.writeFileSync(clockFile, "2026-09-24T12:05:59Z");
+  await new Promise(resolve => setTimeout(resolve, 650));
+  assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 1);
+  fs.writeFileSync(clockFile, "2026-09-24T12:06:00Z");
+  await waitForState(workspace, state => state.fixtures.discord.messages.length === 2);
+  await waitForConversation(workspace, stateDir, current => current?.due_at === "2026-09-24T13:06:00Z");
+  await command(workspace, stateDir, "disable");
+  assert.equal((await running).exitCode, 0);
+});
+
+test("a bot access failure suspends delivery without deleting the prior reminder", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const rootState = path.join(workspace.homeDir, "root-discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  fs.writeFileSync(clockFile, "2026-09-24T11:00:00Z");
+  const running = runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir],
+    env: bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
+      CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile }),
+    timeoutMs: 10000,
+  });
+  await waitForConversation(workspace, stateDir, current => current?.reminder_message_id === "fake-message-1");
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.restFailures = [{ method: "POST", status: 403 }];
+  writeState(seed, workspace.stateDir);
+  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
+  await waitForState(workspace, state => state.fixtures.discord.restFailureUses.length === 1);
+  const suspended = await waitForConversation(workspace, stateDir, current =>
+    current?.reconciliation_status === "suspended-delivery-access");
+  assert.equal(suspended.conversations.demo.reminder_message_id, "fake-message-1");
+  assert.equal(readState(workspace.stateDir).fixtures.discord.deletes?.length || 0, 0);
+  fs.writeFileSync(clockFile, "2026-09-24T13:00:00Z");
+  await new Promise(resolve => setTimeout(resolve, 600));
+  assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 1);
+  await command(workspace, stateDir, "disable");
+  assert.equal((await running).exitCode, 0);
+});
+
+test("a lost send response suspends the Project Conversation instead of risking a duplicate", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const rootState = path.join(workspace.homeDir, "root-discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  fs.writeFileSync(clockFile, "2026-09-24T11:00:00Z");
+  const env = bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
+    CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile });
+  const args = ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir];
+  const running = runScript(workspace, "scripts/conversation-reminder-service.py", { args, env, timeoutMs: 10000 });
+  await waitForConversation(workspace, stateDir, current => current?.reminder_message_id === "fake-message-1");
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.restLoseResponse = true;
+  writeState(seed, workspace.stateDir);
+  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
+  await waitForState(workspace, state => state.fixtures.discord.lostResponseUses === 1);
+  const suspended = await waitForConversation(workspace, stateDir, current =>
+    current?.reconciliation_status === "suspended-uncertain-send");
+  assert.equal(suspended.conversations.demo.reminder_message_id, "fake-message-1");
+  assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 2);
+  assert.equal(readState(workspace.stateDir).fixtures.discord.deletes?.length || 0, 0);
+  fs.writeFileSync(clockFile, "2026-09-24T13:00:00Z");
+  await new Promise(resolve => setTimeout(resolve, 600));
+  assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 2);
+  await command(workspace, stateDir, "disable");
+  assert.equal((await running).exitCode, 0);
+  await command(workspace, stateDir, "enable");
+  const restarted = runScript(workspace, "scripts/conversation-reminder-service.py", { args, env, timeoutMs: 10000 });
+  await waitForState(workspace, state => state.fixtures.discord.logins.length === 2);
+  await new Promise(resolve => setTimeout(resolve, 600));
+  assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 2);
+  await command(workspace, stateDir, "disable");
+  assert.equal((await restarted).exitCode, 0);
+});
+
+test("a restarted worker pauses a previously ready channel until observations are reconciled", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const rootState = path.join(workspace.homeDir, "root-discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  fs.writeFileSync(clockFile, "2026-09-24T11:00:00Z");
+  const env = bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
+    CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile });
+  const args = ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir];
+  const first = runScript(workspace, "scripts/conversation-reminder-service.py", { args, env, timeoutMs: 10000 });
+  await waitForConversation(workspace, stateDir, current => current?.reminder_message_id === "fake-message-1");
+  await command(workspace, stateDir, "disable");
+  assert.equal((await first).exitCode, 0);
+  await command(workspace, stateDir, "enable");
+  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
+  const second = runScript(workspace, "scripts/conversation-reminder-service.py", { args, env, timeoutMs: 10000 });
+  await waitForState(workspace, state => state.fixtures.discord.logins.length === 2);
+  const paused = await waitForConversation(workspace, stateDir, current =>
+    current?.reconciliation_status === "suspended-restart-reconciliation");
+  assert.equal(paused.conversations.demo.reminder_message_id, "fake-message-1");
+  await new Promise(resolve => setTimeout(resolve, 600));
+  assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 1);
+  await command(workspace, stateDir, "disable");
+  assert.equal((await second).exitCode, 0);
+});
+
+test("manual deletion does not acknowledge or accelerate a reminder and ordinary emoji survives", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const rootState = path.join(workspace.homeDir, "root-discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  fs.writeFileSync(clockFile, "2026-09-24T11:00:00Z");
+  const running = runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir],
+    env: bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
+      CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile }),
+    timeoutMs: 10000,
+  });
+  await waitForConversation(workspace, stateDir, current => current?.reminder_message_id === "fake-message-1");
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.messages[0].deleted = true;
+  seed.fixtures.discord.restMessages = [{ id: "ordinary-eye", content: "👀" }];
+  writeState(seed, workspace.stateDir);
+  fs.writeFileSync(clockFile, "2026-09-24T11:30:00Z");
+  await new Promise(resolve => setTimeout(resolve, 600));
+  assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 1);
+  assert.equal((await command(workspace, stateDir, "status")).conversations.demo.state, "awaiting-owner");
+  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
+  await waitForState(workspace, state => state.fixtures.discord.deletes?.length === 1);
+  const after = await waitForConversation(workspace, stateDir, current =>
+    current?.reminder_message_id === "fake-message-2" && current?.cleanup_message_ids.length === 0);
+  assert.equal(after.conversations.demo.state, "awaiting-owner");
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.deletes.map(row => row.messageId),
+    ["fake-message-1"]);
+  assert.equal(readState(workspace.stateDir).fixtures.discord.restMessages[0].id, "ordinary-eye");
+  await command(workspace, stateDir, "disable");
+  assert.equal((await running).exitCode, 0);
+});
+
+test("an owner reaction on a recorded Conversation Reminder neither acknowledges nor starts coding", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const rootState = path.join(workspace.homeDir, "root-discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  fs.writeFileSync(clockFile, "2026-09-24T11:00:00Z");
+  const running = runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir],
+    env: bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
+      CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile }),
+    timeoutMs: 10000,
+  });
+  await waitForConversation(workspace, stateDir, current => current?.reminder_message_id === "fake-message-1");
+  const excluded = JSON.parse(fs.readFileSync(path.join(stateDir, "recorded-reminder-message-ids.json"), "utf8"));
+  assert.deepEqual(excluded.message_ids, ["fake-message-1"]);
+  injectDiscordReaction(workspace, { channelId: "channel", id: "reaction-on-reminder",
+    messageId: "fake-message-1", emoji: "👍", user: { id: "owner" } });
+  await waitForState(workspace, state => state.fixtures.discord.deliveredReactions.some(row =>
+    row.id === "reaction-on-reminder"));
+  await new Promise(resolve => setTimeout(resolve, 450));
+  const current = (await command(workspace, stateDir, "status")).conversations.demo;
+  assert.equal(current.state, "awaiting-owner");
+  assert.equal(current.reminder_message_id, "fake-message-1");
+  assert.equal(readState(workspace.stateDir).fixtures.codex.appServerInvocations.length, 0);
+  await command(workspace, stateDir, "disable");
+  assert.equal((await running).exitCode, 0);
+});
+
+test("a new qualifying response resets the first hour after a Conversation Reply", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const rootState = path.join(workspace.homeDir, "root-discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  fs.writeFileSync(clockFile, "2026-09-24T11:00:00Z");
+  const running = runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir],
+    env: bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
+      CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile }),
+    timeoutMs: 10000,
+  });
+  await waitForConversation(workspace, stateDir, current => current?.reminder_message_id === "fake-message-1");
+  await event(workspace, stateDir, "owner_activity", "second-owner", "2026-09-24T11:05:00Z", {
+    actor_id: "owner", source_message_id: "second-question", activity_kind: "message",
+  });
+  await waitForConversation(workspace, stateDir, current => current?.state === "open-paused");
+  await event(workspace, stateDir, "response_delivered", "second-receipt", "2026-09-24T11:10:00Z", {
+    provider_session_id: "session", provider_turn_id: "turn-2", interaction_id: "second-question",
+    message_id: "second-answer", disposition: "progress",
+  });
+  await event(workspace, stateDir, "turn_completed", "second-completion", "2026-09-24T11:10:00Z", {
+    provider_session_id: "session", provider_turn_id: "turn-2", interaction_id: "second-question",
+    delivered_message_ids: ["second-answer"],
+  });
+  await waitForConversation(workspace, stateDir, current => current?.due_at === "2026-09-24T12:10:00Z");
+  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
+  await new Promise(resolve => setTimeout(resolve, 600));
+  assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 1);
+  fs.writeFileSync(clockFile, "2026-09-24T12:10:00Z");
+  await waitForState(workspace, state => state.fixtures.discord.messages.length === 2);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.deletes.map(row => row.messageId),
+    ["fake-message-1"]);
+  await command(workspace, stateDir, "disable");
+  assert.equal((await running).exitCode, 0);
+});
+
+test("transient send failures back off with a finite increasing delay", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const rootState = path.join(workspace.homeDir, "root-discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  fs.writeFileSync(clockFile, "2026-09-24T11:00:00Z");
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.restFailures = [{ method: "POST", status: 503 }, { method: "POST", status: 503 }];
+  writeState(seed, workspace.stateDir);
+  const running = runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir],
+    env: bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
+      CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile }),
+    timeoutMs: 10000,
+  });
+  await waitForState(workspace, state => state.fixtures.discord.restFailureUses.length === 1);
+  await new Promise(resolve => setTimeout(resolve, 250));
+  fs.writeFileSync(clockFile, "2026-09-24T11:00:05Z");
+  await waitForState(workspace, state => state.fixtures.discord.restFailureUses.length === 2);
+  await new Promise(resolve => setTimeout(resolve, 250));
+  fs.writeFileSync(clockFile, "2026-09-24T11:00:14Z");
+  await new Promise(resolve => setTimeout(resolve, 600));
+  assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 0);
+  fs.writeFileSync(clockFile, "2026-09-24T11:00:15Z");
+  await waitForState(workspace, state => state.fixtures.discord.messages.length === 1);
+  await command(workspace, stateDir, "disable");
+  assert.equal((await running).exitCode, 0);
+});
+
 test("owner closure persists, normal owner message reopens, and a confirmed completion exposes its due time", async () => {
   const workspace = createWorkspace();
   const stateDir = setup(workspace);

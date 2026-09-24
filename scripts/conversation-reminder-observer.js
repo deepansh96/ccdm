@@ -20,9 +20,18 @@ const client = new Client({
   partials: [Partials.Message, Partials.Reaction, Partials.User],
 });
 let busy = false;
+const nextActionAttempt = new Map();
 const healthPath = path.join(stateDir, "observer-health.json");
 const health = {};
 let healthWrite = Promise.resolve();
+
+async function retryClockMs() {
+  const file = process.env.CCDM_REMINDER_CLOCK_FILE;
+  if (!file) return Date.now();
+  const value = Date.parse((await readFile(file, "utf8")).trim());
+  if (!Number.isFinite(value)) throw new Error("invalid reminder clock");
+  return value;
+}
 
 async function markHealth(project, state) {
   if (health[project] === state) return;
@@ -144,6 +153,7 @@ async function sideEffects() {
     const pending = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
       [script, "actions", "--project-root", projectRoot, "--state-dir", stateDir]);
     for (const action of JSON.parse(pending.stdout).actions) {
+      if ((nextActionAttempt.get(action.action_id) || 0) > await retryClockMs()) continue;
       const found = await assignment(action.channel_id);
       if (!found || found.project !== action.project ||
           found.assignment_generation !== action.assignment_generation) continue;
@@ -155,10 +165,75 @@ async function sideEffects() {
         method: action.kind === "ack" ? "PUT" : "DELETE",
         headers: { Authorization: `Bot ${found.bot_token}` },
       });
-      if (!response.ok && !(action.kind === "delete" && response.status === 404)) continue;
+      if (!response.ok && !(action.kind === "delete" && response.status === 404)) {
+        let delay = 1000;
+        if (response.status === 429) {
+          const body = await response.json().catch(() => ({}));
+          const seconds = Number(body.retry_after ?? response.headers.get("Retry-After"));
+          if (Number.isFinite(seconds) && seconds >= 0) delay = Math.max(1000, seconds * 1000);
+        }
+        nextActionAttempt.set(action.action_id, await retryClockMs() +
+          (response.status === 429 ? delay : Math.min(300000, delay)));
+        continue;
+      }
+      nextActionAttempt.delete(action.action_id);
       await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
         [script, "done", "--state-dir", stateDir, "--action-id", action.action_id]);
     }
+    const due = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+      [script, "claim", "--project-root", projectRoot, "--state-dir", stateDir]);
+    const claim = JSON.parse(due.stdout).claim;
+    if (!claim) return;
+    const found = await assignment(claim.channel_id);
+    const args = [script, "result", "--project-root", projectRoot, "--state-dir", stateDir,
+      "--nonce", claim.nonce];
+    if (!found || found.project !== claim.project ||
+        found.assignment_generation !== claim.assignment_generation) {
+      await exec(process.env.CCDM_REMINDER_PYTHON || "python3", [...args, "--outcome", "access"]);
+      return;
+    }
+    const checked = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+      [script, "validate", "--project-root", projectRoot, "--state-dir", stateDir,
+        "--nonce", claim.nonce]);
+    if (!JSON.parse(checked.stdout).valid) return;
+    const url = `https://discord.com/api/v10/channels/${encodeURIComponent(claim.channel_id)}/messages`;
+    let outcome = "uncertain";
+    let messageId;
+    let sentAt;
+    let retryAfter;
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { Authorization: `Bot ${found.bot_token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "👀", allowed_mentions: { parse: [] },
+          nonce: claim.nonce, enforce_nonce: true }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (response.ok) {
+        const payload = await response.json();
+        messageId = typeof payload.id === "string" ? payload.id : null;
+        sentAt = typeof payload.timestamp === "string" && !Number.isNaN(Date.parse(payload.timestamp))
+          ? payload.timestamp : null;
+        outcome = messageId && sentAt ? "sent" : "uncertain";
+      } else if (response.status === 401 || response.status === 403) {
+        outcome = "access";
+      } else if (response.status === 429) {
+        outcome = "failed";
+        const body = await response.json().catch(() => ({}));
+        retryAfter = Number(body.retry_after ?? response.headers.get("Retry-After"));
+      } else if (response.status >= 500) {
+        outcome = "failed";
+      } else {
+        outcome = "access";
+      }
+    } catch {
+      outcome = "uncertain";
+    }
+    const resultArgs = [...args, "--outcome", outcome];
+    if (messageId) resultArgs.push("--message-id", messageId);
+    if (sentAt) resultArgs.push("--sent-at", sentAt);
+    if (Number.isFinite(retryAfter)) resultArgs.push("--retry-after", String(retryAfter));
+    await exec(process.env.CCDM_REMINDER_PYTHON || "python3", resultArgs);
   } catch (error) {
     process.stderr.write(`Conversation observer side effect pending: ${error.message}\n`);
   } finally {

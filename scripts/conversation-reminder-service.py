@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Foreground, delivery-disabled Project Conversation observer and state service."""
+"""Foreground Project Conversation observer and delivery state service."""
 
 from __future__ import annotations
 
@@ -14,13 +14,14 @@ import sqlite3
 import stat
 import subprocess
 import time
+import uuid
 
 
 EVENTS_PATH = Path(__file__).with_name("conversation-reminder-events.py")
 SPEC = importlib.util.spec_from_file_location("ccdm_conversation_events", EVENTS_PATH)
 EVENTS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(EVENTS)
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 STATES = {"closed", "open-paused", "awaiting-owner"}
 
 
@@ -44,7 +45,7 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
     db.execute("PRAGMA synchronous=FULL")
     db.execute("PRAGMA secure_delete=ON")
     version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version not in (0, SCHEMA_VERSION) or (version == 0 and existed):
+    if version not in (0, 1, SCHEMA_VERSION) or (version == 0 and existed):
         db.close()
         raise ValueError("conversation store schema is unsupported")
     if version == 0:
@@ -78,7 +79,14 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
                 message_id TEXT NOT NULL, assignment_generation TEXT NOT NULL,
                 completed INTEGER NOT NULL DEFAULT 0
             );
-            PRAGMA user_version=1;
+            CREATE TABLE IF NOT EXISTS delivery_intents (
+                nonce TEXT PRIMARY KEY, project TEXT NOT NULL, assignment_generation TEXT NOT NULL,
+                revision INTEGER NOT NULL, state TEXT NOT NULL, message_id TEXT,
+                claimed_at TEXT NOT NULL, retry_at TEXT
+            );
+            CREATE UNIQUE INDEX active_delivery_intent ON delivery_intents(project)
+                WHERE state IN ('sending','uncertain');
+            PRAGMA user_version=2;
         """)
         db.execute("INSERT OR IGNORE INTO settings VALUES ('disabled','0')")
     required = {"settings", "conversations", "applied_events", "owner_sources", "qualifications", "pending_actions"}
@@ -104,6 +112,23 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
            for table, expected in columns.items()):
         db.close()
         raise ValueError("conversation store schema is unsupported")
+    if version == 1:
+        db.executescript("""
+            CREATE TABLE delivery_intents (
+                nonce TEXT PRIMARY KEY, project TEXT NOT NULL, assignment_generation TEXT NOT NULL,
+                revision INTEGER NOT NULL, state TEXT NOT NULL, message_id TEXT,
+                claimed_at TEXT NOT NULL, retry_at TEXT
+            );
+            CREATE UNIQUE INDEX active_delivery_intent ON delivery_intents(project)
+                WHERE state IN ('sending','uncertain');
+            PRAGMA user_version=2;
+        """)
+    expected_intent = {"nonce", "project", "assignment_generation", "revision", "state",
+                       "message_id", "claimed_at", "retry_at"}
+    if ("delivery_intents" not in {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            or {row[1] for row in db.execute("PRAGMA table_info(delivery_intents)")} != expected_intent):
+        db.close()
+        raise ValueError("conversation store schema is unsupported")
     os.chmod(path, 0o600)
     return db
 
@@ -116,6 +141,11 @@ def stamp(value: datetime) -> str:
     utc = value.astimezone(timezone.utc)
     precision = "seconds" if utc.microsecond == 0 else "milliseconds" if utc.microsecond % 1000 == 0 else "microseconds"
     return utc.isoformat(timespec=precision).replace("+00:00", "Z")
+
+
+def clock_now() -> datetime:
+    clock_file = os.environ.get("CCDM_REMINDER_CLOCK_FILE")
+    return iso(Path(clock_file).read_text(encoding="utf-8").strip()) if clock_file else datetime.now(timezone.utc)
 
 
 def event_rows(state_dir: Path) -> list[sqlite3.Row]:
@@ -378,12 +408,181 @@ def complete_action(state_dir: Path, action_id: str) -> dict:
         db.close()
 
 
+def claim_due(project_root: Path, state_dir: Path) -> dict:
+    # Apply committed observations before inspecting a due row. The transaction
+    # then binds the intent to the exact assignment and conversation revision.
+    sync(project_root, state_dir)
+    registry = EVENTS.load_registry(project_root)
+    db = connect(state_dir)
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        if db.execute("SELECT value FROM settings WHERE key='disabled'").fetchone()[0] == "1":
+            db.execute("COMMIT")
+            return {"claim": None}
+        now = clock_now()
+        for row in db.execute("SELECT * FROM conversations ORDER BY project").fetchall():
+            if row["state"] != "awaiting-owner" or row["reconciliation_status"] != "ready":
+                continue
+            if not row["due_at"] or iso(row["due_at"]) > now or json.loads(row["cleanup_message_ids"]):
+                continue
+            if db.execute("""SELECT 1 FROM delivery_intents WHERE project=? AND state IN ('sending','uncertain')""",
+                          (row["project"],)).fetchone():
+                continue
+            previous = db.execute("""SELECT retry_at FROM delivery_intents WHERE project=? AND state='failed'
+                ORDER BY rowid DESC LIMIT 1""", (row["project"],)).fetchone()
+            if previous and previous["retry_at"] and iso(previous["retry_at"]) > now:
+                continue
+            try:
+                assignment = EVENTS.assignment_for(registry, row["project"])
+            except (KeyError, ValueError):
+                continue
+            if (assignment["generation"] != row["assignment_generation"] or
+                    assignment["channel_id"] != row["channel_id"] or assignment["bot_id"] != row["bot_id"] or
+                    not assignment["bot"].get("token")):
+                continue
+            nonce = uuid.uuid4().hex[:24]
+            db.execute("""INSERT INTO delivery_intents
+                (nonce,project,assignment_generation,revision,state,claimed_at)
+                VALUES (?,?,?,?,'sending',?)""",
+                (nonce, row["project"], row["assignment_generation"], row["revision"], stamp(now)))
+            db.execute("COMMIT")
+            return {"claim": {"nonce": nonce, "project": row["project"],
+                              "channel_id": row["channel_id"],
+                              "assignment_generation": row["assignment_generation"]}}
+        db.execute("COMMIT")
+        return {"claim": None}
+    finally:
+        db.close()
+
+
+def validate_claim(project_root: Path, state_dir: Path, nonce: str) -> dict:
+    sync(project_root, state_dir)
+    registry = EVENTS.load_registry(project_root)
+    db = connect(state_dir)
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        intent = db.execute("SELECT * FROM delivery_intents WHERE nonce=?", (nonce,)).fetchone()
+        row = db.execute("SELECT * FROM conversations WHERE project=?", (intent["project"],)).fetchone() if intent else None
+        disabled = db.execute("SELECT value FROM settings WHERE key='disabled'").fetchone()[0] == "1"
+        valid = bool(intent and intent["state"] == "sending" and row and not disabled and
+                     row["state"] == "awaiting-owner" and row["reconciliation_status"] == "ready" and
+                     row["assignment_generation"] == intent["assignment_generation"] and
+                     row["revision"] == intent["revision"] and row["due_at"] and
+                     iso(row["due_at"]) <= clock_now() and not json.loads(row["cleanup_message_ids"]))
+        if valid:
+            try:
+                assignment = EVENTS.assignment_for(registry, intent["project"])
+                valid = (assignment["generation"] == intent["assignment_generation"] and
+                         assignment["channel_id"] == row["channel_id"] and
+                         assignment["bot_id"] == row["bot_id"] and bool(assignment["bot"].get("token")))
+            except (KeyError, ValueError):
+                valid = False
+        if not valid and intent and intent["state"] == "sending":
+            db.execute("UPDATE delivery_intents SET state='canceled' WHERE nonce=?", (nonce,))
+        db.execute("COMMIT")
+        return {"valid": valid}
+    finally:
+        db.close()
+
+
+def record_result(project_root: Path, state_dir: Path, nonce: str, outcome: str,
+                  message_id: str | None, sent_at: str | None, retry_after: float | None) -> dict:
+    sync(project_root, state_dir)
+    db = connect(state_dir)
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        intent = db.execute("SELECT * FROM delivery_intents WHERE nonce=?", (nonce,)).fetchone()
+        if intent is None or intent["state"] != "sending":
+            raise ValueError("delivery intent is not active")
+        row = db.execute("SELECT * FROM conversations WHERE project=?", (intent["project"],)).fetchone()
+        if outcome == "sent":
+            if not message_id or not sent_at:
+                raise ValueError("successful delivery requires a message identity and timestamp")
+            delivery_time = iso(sent_at)
+            db.execute("UPDATE delivery_intents SET state='sent', message_id=? WHERE nonce=?", (message_id, nonce))
+            if row and row["assignment_generation"] == intent["assignment_generation"]:
+                canceled = (row["revision"] != intent["revision"] or row["state"] != "awaiting-owner" or
+                            row["reconciliation_status"] != "ready")
+                old_id = row["reminder_message_id"]
+                to_delete = [message_id] if canceled else ([old_id] if old_id else [])
+                cleanup = json.loads(row["cleanup_message_ids"])
+                for old in to_delete:
+                    db.execute("""INSERT OR IGNORE INTO pending_actions
+                        (action_id,project,kind,message_id,assignment_generation) VALUES (?,?,?,?,?)""",
+                        ("delete:" + old, intent["project"], "delete", old, intent["assignment_generation"]))
+                    if old not in cleanup:
+                        cleanup.append(old)
+                if canceled:
+                    db.execute("UPDATE conversations SET cleanup_message_ids=? WHERE project=?",
+                               (json.dumps(cleanup), intent["project"]))
+                else:
+                    db.execute("""UPDATE conversations SET reminder_message_id=?, cleanup_message_ids=?,
+                        due_at=?, revision=revision+1 WHERE project=?""",
+                        (message_id, json.dumps(cleanup), stamp(delivery_time + timedelta(hours=1)), intent["project"]))
+            # The exclusion list includes every delivered reminder identity, even
+            # after deletion, so a late reaction never reaches a coding agent.
+            ids = [r[0] for r in db.execute("SELECT message_id FROM delivery_intents WHERE state='sent' AND message_id IS NOT NULL")]
+            exclusion = state_dir / "recorded-reminder-message-ids.json"
+            temporary = state_dir / f"recorded-reminder-message-ids.{os.getpid()}.tmp"
+            temporary.write_text(json.dumps({"schema_version": 1, "message_ids": ids}), encoding="utf-8")
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, exclusion)
+        else:
+            if outcome not in {"failed", "access", "uncertain"}:
+                raise ValueError("invalid delivery result")
+            retry_at = None
+            if outcome == "failed":
+                failures = db.execute("""SELECT COUNT(*) FROM delivery_intents
+                    WHERE project=? AND assignment_generation=? AND state='failed'""",
+                    (intent["project"], intent["assignment_generation"])).fetchone()[0]
+                delay = max(min(300, 5 * (2 ** min(failures, 6))), retry_after or 0)
+                retry_at = stamp(clock_now() + timedelta(seconds=delay))
+            db.execute("UPDATE delivery_intents SET state=?, retry_at=? WHERE nonce=?",
+                       (outcome, retry_at, nonce))
+            if row and row["assignment_generation"] == intent["assignment_generation"] and outcome != "failed":
+                db.execute("UPDATE conversations SET reconciliation_status=? WHERE project=?",
+                           ("suspended-uncertain-send" if outcome == "uncertain" else "suspended-delivery-access",
+                            intent["project"]))
+        db.execute("COMMIT")
+        return {"status": outcome}
+    except Exception:
+        if db.in_transaction:
+            db.execute("ROLLBACK")
+        raise
+    finally:
+        db.close()
+
+
+def suspend_interrupted_sends(state_dir: Path) -> None:
+    db = connect(state_dir, create=True)
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        started = db.execute("SELECT value FROM settings WHERE key='worker_started'").fetchone()
+        if started:
+            db.execute("""UPDATE conversations SET reconciliation_status='suspended-restart-reconciliation'
+                WHERE reconciliation_status='ready'""")
+        db.execute("INSERT OR REPLACE INTO settings VALUES ('worker_started','1')")
+        for intent in db.execute("SELECT * FROM delivery_intents WHERE state='sending'").fetchall():
+            db.execute("UPDATE delivery_intents SET state='uncertain' WHERE nonce=?", (intent["nonce"],))
+            db.execute("""UPDATE conversations SET reconciliation_status='suspended-uncertain-send'
+                WHERE project=? AND assignment_generation=?""",
+                (intent["project"], intent["assignment_generation"]))
+        db.execute("COMMIT")
+    finally:
+        db.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("sync", "status", "disable", "enable", "run", "actions", "done"))
+    parser.add_argument("command", choices=("sync", "status", "disable", "enable", "run", "actions", "done", "claim", "validate", "result"))
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--state-dir", type=Path, default=EVENTS.default_state_dir())
     parser.add_argument("--action-id")
+    parser.add_argument("--nonce")
+    parser.add_argument("--outcome", choices=("sent", "failed", "access", "uncertain"))
+    parser.add_argument("--message-id")
+    parser.add_argument("--sent-at")
+    parser.add_argument("--retry-after", type=float)
     args = parser.parse_args()
     try:
         if args.command == "status":
@@ -400,6 +599,17 @@ def main() -> int:
             if not args.action_id:
                 raise ValueError("--action-id is required")
             result = complete_action(args.state_dir, args.action_id)
+        elif args.command == "claim":
+            result = claim_due(args.project_root, args.state_dir)
+        elif args.command == "validate":
+            if not args.nonce:
+                raise ValueError("--nonce is required")
+            result = validate_claim(args.project_root, args.state_dir, args.nonce)
+        elif args.command == "result":
+            if not args.nonce or not args.outcome:
+                raise ValueError("--nonce and --outcome are required")
+            result = record_result(args.project_root, args.state_dir, args.nonce, args.outcome,
+                                   args.message_id, args.sent_at, args.retry_after)
         else:
             if status(args.state_dir)["disabled"]:
                 print(json.dumps(status(args.state_dir), sort_keys=True))
@@ -412,6 +622,7 @@ def main() -> int:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
                     raise ValueError("conversation observer is already running")
+                suspend_interrupted_sends(args.state_dir)
                 observer_env = {**os.environ, "CCDM_REMINDER_PROJECT_ROOT": str(args.project_root),
                                 "CCDM_REMINDER_STATE_DIR": str(args.state_dir)}
                 observer = subprocess.Popen([os.environ.get("CCDM_REMINDER_NODE", "node"),
