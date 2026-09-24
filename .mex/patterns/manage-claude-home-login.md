@@ -49,6 +49,11 @@ one-time sign-in URL belong in a reply.
   with the variable set therefore lands in the hashed item while env-less
   launches read the plain one, so one home can silently hold two different
   logins. Check both items before concluding a home is logged out.
+- The usage reports (`scripts/usage-stats-poster.py`, `scripts/claude-usage.sh`)
+  read both `~/.claude` items and use the one whose `expiresAt` is latest; if
+  the API rejects it with 401, they retry the other item when it is unexpired.
+  A report showing the home as expired or needing re-login therefore means
+  neither item works, not just the one sessions use.
 - `claude auth status` reported `loggedIn: false` for a home whose live sessions
   were authenticating fine, and reported a home as usable before a real turn
   succeeded. Always finish with an actual `-p` call.
