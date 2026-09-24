@@ -38,26 +38,45 @@ header() {
 # Helper: get OAuth token from Keychain.
 # A home's credential lives in "Claude Code-credentials-<sha256(dir)[:8]>" when
 # CLAUDE_CONFIG_DIR is set explicitly (remote logins always are) and in the
-# plain "Claude Code-credentials" item when it is unset, so try both in order.
+# plain "Claude Code-credentials" item when it is unset. Default sessions only
+# refresh the plain item, so either can be stale: use the one that expires last.
 get_token() {
-    local services service token
-    services=$(python3 - <<'PY'
-import hashlib, os
+    python3 - <<'PY' 2>/dev/null
+import hashlib, json, os, subprocess, sys
+
 default_dir = os.path.join(os.path.expanduser("~"), ".claude")
-print("Claude Code-credentials-" + hashlib.sha256(default_dir.encode()).hexdigest()[:8])
-print("Claude Code-credentials")
+services = [
+    "Claude Code-credentials-" + hashlib.sha256(default_dir.encode()).hexdigest()[:8],
+    "Claude Code-credentials",
+]
+
+def expiry(oauth):
+    try:
+        return float(oauth.get("expiresAt"))
+    except (TypeError, ValueError):
+        return float("-inf")
+
+freshest = None
+for service in services:
+    result = subprocess.run(
+        ["security", "find-generic-password", "-s", service, "-w"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        continue
+    try:
+        oauth = json.loads(result.stdout.strip())["claudeAiOauth"]
+    except (ValueError, KeyError, TypeError):
+        continue
+    if not isinstance(oauth, dict) or not isinstance(oauth.get("accessToken"), str) or not oauth["accessToken"]:
+        continue
+    if freshest is None or expiry(oauth) > expiry(freshest):
+        freshest = oauth
+
+if freshest is None:
+    sys.exit(1)
+print(freshest["accessToken"])
 PY
-)
-    while IFS= read -r service; do
-        [ -z "$service" ] && continue
-        token=$(security find-generic-password -s "$service" -w 2>/dev/null | \
-            python3 -c "import sys,json; print(json.loads(sys.stdin.read().strip())['claudeAiOauth']['accessToken'])" 2>/dev/null)
-        if [ -n "$token" ]; then
-            echo "$token"
-            return 0
-        fi
-    done <<< "$services"
-    return 1
 }
 
 # Helper: call Anthropic OAuth API

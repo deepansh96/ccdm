@@ -214,6 +214,42 @@ test("claude usage report reads live OAuth data and local history from fixtures"
   assert.deepEqual(state.fixtures.network.blocked, []);
 });
 
+test("claude usage report uses whichever default-home Keychain item expires last", async () => {
+  const hashedService = (workspace) => `Claude Code-credentials-${crypto
+    .createHash("sha256")
+    .update(path.join(workspace.homeDir, ".claude"))
+    .digest("hex")
+    .slice(0, 8)}`;
+  const stale = {
+    claudeAiOauth: { accessToken: "fixture-stale-token", expiresAt: Date.now() - 60 * 60 * 1000 },
+  };
+  const fresh = {
+    claudeAiOauth: { accessToken: "fixture-oauth-token", expiresAt: Date.now() + 60 * 60 * 1000 },
+  };
+
+  for (const credentialsFor of [
+    (workspace) => ({ [hashedService(workspace)]: stale, "Claude Code-credentials": fresh }),
+    (workspace) => ({ [hashedService(workspace)]: fresh, "Claude Code-credentials": stale }),
+    (workspace) => ({ [hashedService(workspace)]: fresh }),
+  ]) {
+    const workspace = createWorkspace();
+    seedMinimalStats(workspace);
+    seedAnthropicRoutes(workspace);
+    const state = readState(workspace.stateDir);
+    state.fixtures.security.credentials = credentialsFor(workspace);
+    writeState(state, workspace.stateDir);
+
+    const result = await runScript(workspace, "scripts/claude-usage.sh");
+
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /Fixture User \(Fixture Example\)/);
+    assert.deepEqual(
+      readState(workspace.stateDir).fixtures.curl.requests.map((entry) => entry.headers.Authorization),
+      ["Bearer fixture-oauth-token", "Bearer fixture-oauth-token"],
+    );
+  }
+});
+
 test("security and curl fixtures enforce route contracts and block unapproved targets", async () => {
   const workspace = createWorkspace();
   seedSecurityCredential(workspace);

@@ -618,6 +618,67 @@ test("poster gives each Claude OAuth HTTP 401 an account-specific login action",
   assert.equal(api.requests.filter((request) => request.method === "GET").length, 3);
 });
 
+async function runPosterWithDefaultHomeCredentials(credentialsFor) {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  seedPosterWorkspace(workspace, api.baseUrl);
+  const hashedService = `Claude Code-credentials-${crypto
+    .createHash("sha256")
+    .update(path.join(workspace.homeDir, ".claude"))
+    .digest("hex")
+    .slice(0, 8)}`;
+  const state = readState(workspace.stateDir);
+  state.fixtures.security.credentials = credentialsFor(hashedService);
+  writeState(state, workspace.stateDir);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const post = api.requests.find((request) => request.method === "POST");
+  assert.ok(post);
+  return {
+    claudeValue: JSON.parse(post.body).embeds[0].fields[0].value,
+    oauthAuthorizations: api.requests
+      .filter((request) => request.method === "GET")
+      .map((request) => request.authorization),
+  };
+}
+
+test("poster reads a default-home login saved only in the hashed Keychain item", async () => {
+  const { claudeValue, oauthAuthorizations } = await runPosterWithDefaultHomeCredentials((hashedService) => ({
+    [hashedService]: { claudeAiOauth: { accessToken: "fixture-oauth-token" } },
+  }));
+
+  assert.match(claudeValue, /\*\*Personal\*\* \(Pro\)/);
+  assert.deepEqual(oauthAuthorizations, ["Bearer fixture-oauth-token", "Bearer fixture-oauth-token"]);
+});
+
+test("poster uses whichever default-home Keychain item expires last", async () => {
+  const past = Date.now() - 60 * 60 * 1000;
+  const future = Date.now() + 60 * 60 * 1000;
+  const stale = {
+    claudeAiOauth: { accessToken: "fixture-stale-token", refreshToken: "fixture-refresh-token", expiresAt: past },
+  };
+  const fresh = { claudeAiOauth: { accessToken: "fixture-oauth-token", expiresAt: future } };
+
+  for (const credentialsFor of [
+    (hashedService) => ({ [hashedService]: stale, "Claude Code-credentials": fresh }),
+    (hashedService) => ({ [hashedService]: fresh, "Claude Code-credentials": stale }),
+  ]) {
+    const { claudeValue, oauthAuthorizations } = await runPosterWithDefaultHomeCredentials(credentialsFor);
+    assert.match(claudeValue, /\*\*Personal\*\* \(Pro\)/);
+    assert.doesNotMatch(claudeValue, /expired/);
+    assert.deepEqual(oauthAuthorizations, ["Bearer fixture-oauth-token", "Bearer fixture-oauth-token"]);
+  }
+
+  // Without expiry data neither item is known to be fresher, so the hashed one wins.
+  const { oauthAuthorizations } = await runPosterWithDefaultHomeCredentials((hashedService) => ({
+    [hashedService]: { claudeAiOauth: { accessToken: "fixture-oauth-token" } },
+    "Claude Code-credentials": { claudeAiOauth: { accessToken: "fixture-other-token" } },
+  }));
+  assert.deepEqual(oauthAuthorizations, ["Bearer fixture-oauth-token", "Bearer fixture-oauth-token"]);
+});
+
 test("poster uses N/A when the Claude organization value is malformed", async () => {
   const workspace = createWorkspace();
   const api = await startPosterApi({ organization: ["not", "an", "object"] });
