@@ -581,7 +581,7 @@ Ask the root agent for a usage report by messaging `usage`, `limits`, or `how mu
 
 ## Project Conversation state
 
-The opt-in foreground [Project Conversation state service](docs/conversation-reminders.md) records owner replies, `/close`, reopening, and due times for registered Claude and Codex channels. Its hourly emoji delivery worker is implemented, while public delivery remains gated until discovery and restart reconciliation are available.
+The opt-in foreground [Project Conversation state service](docs/conversation-reminders.md) records owner replies, `/close`, reopening, and due times for registered Claude and Codex channels. Its hourly emoji delivery worker and bounded history discovery of older conversations are implemented, while public delivery remains gated until restart reconciliation and catch-up are available.
 
 ## Scheduled Usage Stats Poster
 

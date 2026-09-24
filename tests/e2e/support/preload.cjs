@@ -124,6 +124,64 @@ function takeRestFailure(method, url, init = {}) {
   });
 }
 
+// Stateful per-channel history (newest first) with Discord's before/after
+// pagination and reaction membership. Kept apart from `restMessages`, which
+// other scenarios use as one shared recent-history page.
+function routeChannelHistory(url, method, init) {
+  if (url.hostname !== "discord.com" || method !== "GET") return null;
+  const listMatch = /^\/api\/v10\/channels\/([^/]+)\/messages$/.exec(url.pathname);
+  const reactionMatch = /^\/api\/v10\/channels\/([^/]+)\/messages\/([^/]+)\/reactions\/([^/]+)$/.exec(url.pathname);
+  const channelId = listMatch?.[1] ?? reactionMatch?.[1];
+  const state = readState();
+  const history = state.fixtures?.discord?.history?.[channelId];
+  if (!Array.isArray(history)) return null;
+  const json = (body, status = 200) => response(JSON.stringify(body), {
+    headers: { "content-type": "application/json" }, status,
+  });
+  const limit = Number(url.searchParams.get("limit") || "50");
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    return json({ message: `Invalid limit: ${url.searchParams.get("limit")}` }, 400);
+  }
+  const authorization = headerValue(init.headers, "Authorization");
+  if (reactionMatch) {
+    const emoji = decodeURIComponent(reactionMatch[3]);
+    updateState((nextState) => {
+      nextState.fixtures.discord.reactionFetches ||= [];
+      nextState.fixtures.discord.reactionFetches.push({ authorization, channelId, emoji,
+        messageId: reactionMatch[2], limit });
+    });
+    if (!history.some(message => message.id === reactionMatch[2])) return json({ message: "Unknown Message" }, 404);
+    const users = state.fixtures.discord.reactionUsers?.[`${reactionMatch[2]}|${emoji}`] ?? [];
+    return json(users.slice(0, limit).map(id => ({ id, bot: false })));
+  }
+  const before = url.searchParams.get("before");
+  const after = url.searchParams.get("after");
+  if (before && after) return json({ message: "before and after are exclusive" }, 400);
+  let page = history.slice(0, limit);
+  if (before) {
+    const index = history.findIndex(message => message.id === before);
+    if (index < 0) return json({ message: "Unknown cursor" }, 400);
+    page = history.slice(index + 1, index + 1 + limit);
+  } else if (after) {
+    const index = after === "0" ? history.length : history.findIndex(message => message.id === after);
+    if (index < 0) return json({ message: "Unknown cursor" }, 400);
+    page = history.slice(Math.max(0, index - limit), index);
+  }
+  let crash = false;
+  updateState((nextState) => {
+    nextState.fixtures.discord.historyFetches ||= [];
+    nextState.fixtures.discord.historyFetches.push({ authorization, channelId, limit,
+      ...(before ? { before } : {}), ...(after ? { after } : {}) });
+    if (nextState.fixtures.discord.crashAfterHistoryPages > 0) {
+      nextState.fixtures.discord.crashAfterHistoryPages -= 1;
+      crash = nextState.fixtures.discord.crashAfterHistoryPages === 0;
+      if (crash) delete nextState.fixtures.discord.crashAfterHistoryPages;
+    }
+  });
+  if (crash) process.exit(86);
+  return json(page);
+}
+
 function routeDiscordApi(url, init = {}) {
   const method = (init.method || "GET").toUpperCase();
   if (url.hostname === "discord.com") {
@@ -292,6 +350,9 @@ function routeDiscordApi(url, init = {}) {
       headers: { "content-type": "application/json" },
     });
   }
+
+  const historyRoute = routeChannelHistory(url, method, init);
+  if (historyRoute) return historyRoute;
 
   const listMessagesMatch = /^\/api\/v10\/channels\/([^/]+)\/messages$/.exec(url.pathname);
   if (url.hostname === "discord.com" && listMessagesMatch && method === "GET") {

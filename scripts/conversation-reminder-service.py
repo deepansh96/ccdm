@@ -21,7 +21,11 @@ EVENTS_PATH = Path(__file__).with_name("conversation-reminder-events.py")
 SPEC = importlib.util.spec_from_file_location("ccdm_conversation_events", EVENTS_PATH)
 EVENTS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(EVENTS)
-SCHEMA_VERSION = 3
+DISCOVERY_PATH = Path(__file__).with_name("conversation-reminder-discovery.py")
+DISCOVERY_SPEC = importlib.util.spec_from_file_location("ccdm_conversation_discovery", DISCOVERY_PATH)
+DISCOVERY = importlib.util.module_from_spec(DISCOVERY_SPEC)
+DISCOVERY_SPEC.loader.exec_module(DISCOVERY)
+SCHEMA_VERSION = 4
 STATES = {"closed", "open-paused", "awaiting-owner"}
 
 
@@ -45,7 +49,7 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
     db.execute("PRAGMA synchronous=FULL")
     db.execute("PRAGMA secure_delete=ON")
     version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version not in (0, 1, 2, SCHEMA_VERSION) or (version == 0 and existed):
+    if version not in (0, 1, 2, 3, SCHEMA_VERSION) or (version == 0 and existed):
         db.close()
         raise ValueError("conversation store schema is unsupported")
     if version == 0:
@@ -144,12 +148,16 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
             PRAGMA user_version=3;
             COMMIT;
         """)
+    if db.execute("PRAGMA user_version").fetchone()[0] == 3:
+        # Checkpointed history discovery; live events buffer while a scan is active.
+        db.executescript("BEGIN IMMEDIATE;" + DISCOVERY.SCHEMA + "PRAGMA user_version=4; COMMIT;")
     expected = {
         "delivery_intents": {"nonce", "project", "assignment_generation", "revision", "state",
                              "message_id", "claimed_at", "retry_at"},
         "retired_assignments": {"project", "assignment_generation", "channel_id", "bot_id",
                                 "reason", "retired_at"},
         "retired_leftovers": {"action_id", "project", "assignment_generation", "message_id", "reason"},
+        "discoveries": DISCOVERY.COLUMNS,
     }
     tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if any(table not in tables or {row[1] for row in db.execute(f"PRAGMA table_info({table})")} != columns
@@ -206,6 +214,7 @@ def retire_conversation(db: sqlite3.Connection, row: sqlite3.Row, reason: str) -
     # A ✅ acknowledgment is not cleanup; never act for the obsolete assignment.
     db.execute("""UPDATE pending_actions SET completed=2
         WHERE project=? AND assignment_generation=? AND kind='ack' AND completed=0""", (project, generation))
+    db.execute("DELETE FROM discoveries WHERE project=? AND assignment_generation=?", (project, generation))
     db.execute("DELETE FROM conversations WHERE project=?", (project,))
 
 
@@ -246,6 +255,9 @@ def apply_event(db: sqlite3.Connection, registry: dict, row: sqlite3.Row) -> str
     if assignment is None:
         return "stale"
     current = current_conversation(db, event["project"], assignment)
+    if current["reconciliation_status"] in DISCOVERY.ACTIVE:
+        # Left unapplied in the durable event ledger until the history baseline commits.
+        return "buffered"
     changes = {"checkpoint": row["commit_order"], "last_event_order": event["event_order"]}
     kind = event["event_type"]
     occurred = event["event_time"]
@@ -444,6 +456,7 @@ def status(state_dir: Path) -> dict:
     db = connect(state_dir)
     if db is None:
         return {"status": "uninitialized", "disabled": False, "worker_running": running,
+                "discovery_requested": False,
                 "observer_channels": observer_channels, "delivery_enabled": False, "conversations": {}}
     try:
         disabled = db.execute("SELECT value FROM settings WHERE key='disabled'").fetchone()
@@ -463,6 +476,7 @@ def status(state_dir: Path) -> dict:
                 "reminder_message_id": row["reminder_message_id"],
                 "cleanup_message_ids": json.loads(row["cleanup_message_ids"]),
                 "reconciliation_status": row["reconciliation_status"], "checkpoint": row["checkpoint"],
+                "discovery": DISCOVERY.status_for(db, row["project"], row["assignment_generation"]),
             }
         blocked = [name for name, row in conversations.items()
                    if row["reconciliation_status"] == "blocked-retired-generation"]
@@ -488,7 +502,9 @@ def status(state_dir: Path) -> dict:
                 "unresolved_nonces": [r[0] for r in db.execute("""SELECT nonce FROM delivery_intents
                     WHERE project=? AND assignment_generation=? AND state IN ('sending','uncertain')""", key)],
             })
+        requested = db.execute("SELECT value FROM settings WHERE key='discovery_requested'").fetchone()
         return {"status": "ok", "disabled": disabled["value"] == "1", "worker_running": running,
+                "discovery_requested": bool(requested and requested["value"] == "1"),
                 "observer_channels": observer_channels, "delivery_enabled": False,
                 "conversations": conversations, "unresolved_intents": unresolved,
                 "pending_actions": pending, "retired_assignments": retired,
@@ -520,6 +536,83 @@ def set_enabled(state_dir: Path) -> dict:
     db.execute("COMMIT")
     db.close()
     return status(state_dir)
+
+
+def request_discovery(state_dir: Path) -> dict:
+    """Persist the operator's discovery request; the foreground worker performs bounded passes."""
+    db = connect(state_dir, create=True)
+    db.execute("BEGIN IMMEDIATE")
+    db.execute("INSERT OR REPLACE INTO settings VALUES ('discovery_requested','1')")
+    db.execute("COMMIT")
+    db.close()
+    return status(state_dir)
+
+
+def discovery_next(project_root: Path, state_dir: Path) -> dict:
+    sync(project_root, state_dir)
+    registry = EVENTS.load_registry(project_root)
+    usable = {}
+    for name in registry.get("projects") or {}:
+        try:
+            usable[name] = usable_assignment(registry, name)
+        except (KeyError, ValueError):
+            usable[name] = None
+    db = connect(state_dir, create=True)
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        request = DISCOVERY.next_request(db, usable, clock_now())
+        db.execute("COMMIT")
+        return {"request": request}
+    except Exception:
+        if db.in_transaction:
+            db.execute("ROLLBACK")
+        raise
+    finally:
+        db.close()
+
+
+def discovery_result(project_root: Path, state_dir: Path, payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("discovery result payload is invalid")
+    registry = EVENTS.load_registry(project_root)
+    rows = event_rows(state_dir)
+    project, generation = payload.get("project"), payload.get("assignment_generation")
+    adapter_interactions = {row["interaction_id"] for row in rows_matching(state_dir, project, generation,
+        "event_type IN ('response_delivered','turn_completed','input_needed','work_resumed')")}
+
+    def reaction_times(message_id: str) -> list[str]:
+        return [row["event_time"] for row in rows_matching(state_dir, project, generation,
+                "event_type='owner_activity' AND activity_kind='reaction'")
+                if row["source_message_id"] == message_id]
+
+    db = connect(state_dir)
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        recorded = {r[0] for r in db.execute(
+            "SELECT message_id FROM delivery_intents WHERE state='sent' AND message_id IS NOT NULL")}
+        outcome = DISCOVERY.record_result(db, payload, clock_now(), recorded, adapter_interactions, reaction_times)
+        if outcome == "committed":
+            # Reconcile forward: newer durable events win over the historical baseline.
+            for row in rows:
+                apply_event(db, registry, row)
+        db.execute("COMMIT")
+        return {"status": outcome}
+    except Exception:
+        if db.in_transaction:
+            db.execute("ROLLBACK")
+        raise
+    finally:
+        db.close()
+
+
+def rows_matching(state_dir: Path, project: str, generation: str, condition: str) -> list[sqlite3.Row]:
+    path = EVENTS.database_path(state_dir)
+    if not path.exists():
+        return []
+    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as source:
+        source.row_factory = sqlite3.Row
+        return source.execute(f"""SELECT interaction_id,source_message_id,event_time FROM events
+            WHERE project=? AND assignment_generation=? AND {condition}""", (project, generation)).fetchall()
 
 
 def pending_actions(state_dir: Path) -> dict:
@@ -803,7 +896,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("sync", "status", "disable", "enable", "run", "recover",
                                             "actions", "done", "leftover", "intents", "claim", "validate",
-                                            "result", "assignment-changed", "suspend"))
+                                            "result", "assignment-changed", "suspend", "discover",
+                                            "discovery-next", "discovery-result"))
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--state-dir", type=Path, default=EVENTS.default_state_dir())
     parser.add_argument("--action-id")
@@ -815,6 +909,7 @@ def main() -> int:
     parser.add_argument("--reason")
     parser.add_argument("--project")
     parser.add_argument("--generation")
+    parser.add_argument("--payload")
     args = parser.parse_args()
     try:
         if args.command == "status":
@@ -823,6 +918,14 @@ def main() -> int:
             result = set_disabled(args.state_dir)
         elif args.command == "enable":
             result = set_enabled(args.state_dir)
+        elif args.command == "discover":
+            result = request_discovery(args.state_dir)
+        elif args.command == "discovery-next":
+            result = discovery_next(args.project_root, args.state_dir)
+        elif args.command == "discovery-result":
+            if not args.payload:
+                raise ValueError("--payload is required")
+            result = discovery_result(args.project_root, args.state_dir, json.loads(args.payload))
         elif args.command == "sync":
             result = sync(args.project_root, args.state_dir)
         elif args.command == "actions":

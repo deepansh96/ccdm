@@ -9,6 +9,7 @@ const path = require("node:path");
 const { promisify } = require("node:util");
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const reminder = require("./conversation-reminder-adapter.js");
+const discovery = require("./conversation-reminder-discovery.js");
 
 const exec = promisify(execFile);
 const script = path.join(__dirname, "conversation-reminder-service.py");
@@ -257,7 +258,14 @@ async function sideEffects(recoveryOnly = false) {
   if (busy) return;
   busy = true;
   try {
-    if (!recoveryOnly) await revalidate();
+    if (!recoveryOnly) {
+      await revalidate();
+      await discovery.runPass({
+        service: async args => JSON.parse((await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+          [script, ...args, "--project-root", projectRoot, "--state-dir", stateDir])).stdout),
+        assignment, rootToken, rootUserId: client.user.id, isClose: closeCommand,
+      });
+    }
     const recovery = recoveryOnly ? await recoverIntents() : null;
     const pending = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
       [script, "actions", "--project-root", projectRoot, "--state-dir", stateDir]);

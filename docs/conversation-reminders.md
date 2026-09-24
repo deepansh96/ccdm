@@ -1,6 +1,6 @@
 # Project Conversation state service
 
-This foreground service records owner acknowledgment, `/close`, reopening, and qualifying Claude or Codex responses. It runs independently of coding sessions. Its delivery worker is implemented, but public enablement remains gated by incomplete discovery and restart reconciliation. A fresh registered channel reports `suspended-incomplete-discovery` and will not send even when a due time appears in status.
+This foreground service records owner acknowledgment, `/close`, reopening, and qualifying Claude or Codex responses. It runs independently of coding sessions. Its delivery worker and initial history discovery are implemented, but public enablement remains gated by restart reconciliation and catch-up scheduling. A fresh registered channel reports `suspended-incomplete-discovery` and will not send until discovery marks it `ready`.
 
 ## Requirements
 
@@ -18,13 +18,14 @@ scripts/conversation-reminder-service.py status
 scripts/conversation-reminder-service.py run
 scripts/conversation-reminder-service.py disable
 scripts/conversation-reminder-service.py enable
+scripts/conversation-reminder-service.py discover
 scripts/conversation-reminder-service.py recover
 scripts/conversation-reminder-service.py assignment-changed --project <project>
 ```
 
 `run` is the foreground observer and delivery worker. One worker may run at a time. It checks due work every half second while healthy. `disable` stops it after its current pass and persists the disabled setting; `enable` clears that setting but does not start a worker or bypass reconciliation. Use `status` to inspect the worker lock, channel access/capability status, each conversation's state and due time, unresolved intent nonces, and pending cleanup or ✅ actions. The output contains no conversation bodies or credentials. `sync` performs one foreground pass over committed adapter events for diagnosis.
 
-`recover` is a bounded, one-pass operator command. Stop the foreground worker with `disable`, wait for it to exit, then `enable` and run `recover`. It takes the same exclusive worker lock, so a concurrent manual or supervised worker cannot be taken over. It first applies committed events, looks for uncertain sends in up to three pages of recent Discord history per intent, then retries known cleanup and ✅ actions by their recorded IDs. It never starts a new reminder send. Run `status` afterward; repeat `recover` after fixing a transient lookup or cleanup failure. A dead worker releases the lock and can be recovered without removing the store. Keep the observer stopped until the separate observation/history reconciliation gate is resolved.
+`recover` is a bounded, one-pass operator command. Stop the foreground worker with `disable`, wait for it to exit, then `enable` and run `recover`. It takes the same exclusive worker lock, so a concurrent manual or supervised worker cannot be taken over. It first applies committed events, looks for uncertain sends in up to three pages of recent Discord history per intent, then retries known cleanup and ✅ actions by their recorded IDs. It never starts a new reminder send. Run `status` afterward; repeat `recover` after fixing a transient lookup or cleanup failure. A dead worker releases the lock and can be recovered without removing the store. After a restart, previously ready channels remain gated by the separate restart reconciliation workflow.
 
 Recovery confirms a reminder only when the assigned bot's message has the original durable nonce, exact `👀` content, a valid send timestamp, and a unique identity in the bounded history window. Discord documents `enforce_nonce` uniqueness for only the [past few minutes](https://docs.discord.com/developers/resources/message#create-message); recovery does not retry a POST, even during that window. A missing nonce, denied history lookup, multiple matches, or incomplete bounded history leaves `suspended-uncertain-send` and the original intent in `status`. Do not delete a matching emoji by eye, force a new send, or reset the database. Restore bot access and retry; if identity remains unavailable, investigate the listed nonce and keep delivery suspended. An observation/history gap remains a separate gate, and a confirmed recovered send remains `suspended-restart-reconciliation` until that gate is cleared by the later reconciliation workflow.
 
@@ -32,7 +33,28 @@ State is stored privately under `~/.local/state/ccdm/conversation-reminders/` by
 
 For a reconciled channel, the assigned bot sends exactly `👀` with mentions disabled one hour after a qualifying response, then replaces the recorded message hourly. Each successful send starts a new hour from its actual send time. An owner Conversation Reply or `/close` cancels due work and queues deletion by recorded message ID; an accepted send that returns after cancellation is also queued for deletion. A failed send keeps the previous reminder. Discord 429 timing and bounded transient retries are respected; 401/403 suspends delivery. A lost response or interrupted send suspends as `suspended-uncertain-send` instead of risking a duplicate. Failed deletions remain pending and block replacement; Discord 404 completes cleanup. The private recorded-ID list excludes reactions on reminders from coding turns.
 
-Discovery and observation-gap recovery are not implemented yet. New channels stay `suspended-incomplete-discovery`; a previously ready channel is set to `suspended-restart-reconciliation` on worker restart. `recover` only resolves delivery identities and known side effects; it cannot promote either observation state. The Local Fake E2E tests seed a reconciled prerequisite and drive the real foreground service with an external clock to demonstrate delivery. Do not edit the private database to enable production delivery. If access is lost, restore the assigned bot and channel permissions and inspect status.
+Observation-gap recovery after a restart is not implemented yet: a previously ready channel is set to `suspended-restart-reconciliation` on worker restart. `recover` only resolves delivery identities and known side effects; it cannot promote an observation state. Do not edit the private database to enable production delivery. If access is lost, restore the assigned bot and channel permissions and inspect status.
+
+## History discovery
+
+`discover` persists the operator's request to discover older Project Conversations. It does not read Discord itself: the foreground `run` worker performs the scan while its observer is live, so owner activity during the scan is not missed. The request stays set, so a channel registered later is also discovered. `disable` stops scanning with the worker; progress is kept.
+
+For each undiscovered channel, the worker records the newest message as an observation watermark and marks the channel `discovering`. Committed events for that assignment then stay unapplied in the event ledger until the scan commits. The worker pages backward with the root bot, up to 100 messages per page, until it finds the owner's latest normal message or `/close`, or reaches the start of the channel. There is no fixed recent-history cutoff. It then pages forward from the watermark to the newest message and checks reaction membership. Each channel gets at most 10 history pages and 10 reaction lookups per 30-second pass. The least-served channel goes next, so a long channel cannot starve others. Cursors are saved after every page, so a crash or restart resumes where the scan stopped. Discord 429 responses pause that channel for the advertised time. Other failures retry after 30 seconds.
+
+A channel becomes eligible only when the owner's latest Conversation Reply is followed by a message from the currently assigned bot. The answer must come before any guest message that follows the reply. The first reminder is due one hour after that answer's Discord timestamp. Historical messages carry no turn-completion metadata, so status labels this basis `historical-owner-then-bot-approximation`. It is used only for discovery. Live completion and input-needed still require confirmed adapter receipts. These channels stay `open-paused`:
+
+- no owner participation, such as a guest-only exchange;
+- no bot answer after the owner's latest reply, which means the channel is waiting for the agent;
+- a management command whose only follow-up is fixed CCDM command output, such as `Compaction queued.`;
+- an interaction with recorded adapter lifecycle events (`active-turn`), which waits for the live completion.
+
+A `/close` with no later normal owner message is `closed`. A closure already recorded by the service stays closed unless history shows a later normal owner message. Reminders are identified only by recorded message IDs; any other bot `👀` is an ordinary answer.
+
+When the scan commits, the service writes this baseline, applies the buffered events on top of it, and then marks the channel `ready`. Newer owner messages, reactions, `/close`, and resumed work therefore win over the historical result. A live owner message that the scan already saw is not counted twice. The worker checks the assignment generation and conversation revision before committing. An assignment change discards the old scan, and the new generation is scanned from the start.
+
+`status` shows `discovery_requested` and, for each conversation, a `discovery` object. It includes the phase, basis, pages scanned, passes, cursors, retry time, and reason. Denied or missing history, including a 403 on reaction lookup, suspends the channel as `suspended-discovery-history`. Delivery stays blocked, and the scan retries from its saved cursor after five minutes. Restore the root bot's View Channel and Read Message History access. Do not reset state.
+
+Limitations: discovery cannot see deleted messages. It cannot see reactions that were added and removed before the scan, or reactions on messages older than the owner's latest reply. Reaction membership shows who reacted, not when. An owner reaction on the answer, or on a later message, acknowledges it. A reaction on an earlier message counts only when a recorded reaction event dates it. Otherwise the channel pauses as `reaction-ordering-unresolved`, which may last until the next qualifying bot response. A reaction list with 100 or more users is treated the same way. Discovery uses no model inference. Initial and catch-up reminder staggering is part of the later restart/catch-up work.
 
 ## Assignment changes
 
