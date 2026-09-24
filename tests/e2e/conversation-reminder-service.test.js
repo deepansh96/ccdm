@@ -418,7 +418,7 @@ test("a lost send response suspends the Project Conversation instead of risking 
   assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 2);
   await command(workspace, stateDir, "disable");
   assert.equal((await running).exitCode, 0);
-  await command(workspace, stateDir, "enable");
+  await command(workspace, stateDir, "enable", { env });
   const restarted = runScript(workspace, "scripts/conversation-reminder-service.py", { args, env, timeoutMs: 10000 });
   await waitForState(workspace, state => state.fixtures.discord.logins.length === 2);
   await new Promise(resolve => setTimeout(resolve, 600));
@@ -449,7 +449,7 @@ test("operator recovery finds a lost reminder by its original nonce after restar
     current?.reconciliation_status === "suspended-uncertain-send");
   await command(workspace, stateDir, "disable");
   assert.equal((await running).exitCode, 0);
-  await command(workspace, stateDir, "enable");
+  await command(workspace, stateDir, "enable", { env });
 
   const visible = readState(workspace.stateDir);
   visible.fixtures.discord.includeSentInHistory = true;
@@ -675,7 +675,7 @@ test("operator recovery cannot take over a live foreground worker", async () => 
   assert.equal((await command(workspace, stateDir, "status")).worker_running, true);
   await command(workspace, stateDir, "disable");
   assert.equal((await running).exitCode, 0);
-  await command(workspace, stateDir, "enable");
+  await command(workspace, stateDir, "enable", { env });
   assert.equal((await command(workspace, stateDir, "recover", { env })).recovered, 0);
   assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 0);
 });
@@ -779,7 +779,7 @@ test("a crash after durable claim but before Discord request stays unresolved wi
     "suspended-uncertain-send");
 });
 
-test("a restarted worker pauses a previously ready channel until observations are reconciled", async () => {
+test("a restarted worker reconciles history before a previously ready channel sends again", async () => {
   const workspace = createWorkspace();
   const stateDir = setup(workspace);
   await reconciledExchange(workspace, stateDir);
@@ -795,15 +795,20 @@ test("a restarted worker pauses a previously ready channel until observations ar
   await waitForConversation(workspace, stateDir, current => current?.reminder_message_id === "fake-message-1");
   await command(workspace, stateDir, "disable");
   assert.equal((await first).exitCode, 0);
-  await command(workspace, stateDir, "enable");
+  const enabled = await command(workspace, stateDir, "enable", { env });
+  assert.equal(enabled.conversations.demo.reconciliation_status, "suspended-restart-reconciliation");
+  assert.equal(readState(workspace.stateDir).fixtures.discord.fetches?.length ?? 0, 0);
   fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
   const second = runScript(workspace, "scripts/conversation-reminder-service.py", { args, env, timeoutMs: 10000 });
-  await waitForState(workspace, state => state.fixtures.discord.logins.length === 2);
-  const paused = await waitForConversation(workspace, stateDir, current =>
-    current?.reconciliation_status === "suspended-restart-reconciliation");
-  assert.equal(paused.conversations.demo.reminder_message_id, "fake-message-1");
+  const sent = await waitForState(workspace, state => state.fixtures.discord.messages.length === 2);
+  assert.ok(sent.fixtures.discord.fetches.some(row => row.channelId === "channel" &&
+    row.authorization === "Bot fixture-root-token"), "history is read before the channel is released");
+  const released = await waitForConversation(workspace, stateDir, current =>
+    current?.due_at === "2026-09-24T13:00:00Z");
+  assert.deepEqual([released.conversations.demo.discovery.mode, released.conversations.demo.discovery.basis],
+    ["restart", "no-missed-activity"]);
   await new Promise(resolve => setTimeout(resolve, 600));
-  assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 1);
+  assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 2);
   await command(workspace, stateDir, "disable");
   assert.equal((await second).exitCode, 0);
 });
@@ -1141,7 +1146,11 @@ test("disable survives restart and explicit enable preserves a closed conversati
   const disabled = await command(workspace, stateDir, "status");
   assert.equal(disabled.conversations.demo.state, "closed");
   assert.equal(disabled.disabled, true);
-  const enabled = await command(workspace, stateDir, "enable");
+  const rootState = path.join(workspace.homeDir, "root-discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const enabled = await command(workspace, stateDir, "enable", { env: bridgeChildEnv(workspace, {
+    ROOT_DISCORD_STATE_DIR: rootState }) });
   assert.equal(enabled.disabled, false);
   assert.equal(enabled.conversations.demo.state, "closed");
 });

@@ -581,7 +581,7 @@ Ask the root agent for a usage report by messaging `usage`, `limits`, or `how mu
 
 ## Project Conversation state
 
-The opt-in foreground [Project Conversation state service](docs/conversation-reminders.md) records owner replies, `/close`, reopening, and due times for registered Claude and Codex channels. Its hourly emoji delivery worker and bounded history discovery of older conversations are implemented, while public delivery remains gated until restart reconciliation and catch-up are available.
+The opt-in foreground [Project Conversation state service](docs/conversation-reminders.md) records owner replies, `/close`, reopening, and due times for registered Claude and Codex channels. It sends an hourly `👀` from each channel's assigned bot while a conversation awaits the owner. Run `scripts/conversation-reminder-service.py enable` to check prerequisites and opt in, then `run` to start the worker. After a restart, reconnect, or re-enable, the service reconciles missed activity before sending. Each overdue channel then gets at most one catch-up, spaced at least five seconds apart.
 
 ## Scheduled Usage Stats Poster
 

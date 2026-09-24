@@ -127,7 +127,7 @@ test("discovery arms an old completed-looking answer from its answer time, then 
   assert.equal(demo.response_at, "2026-09-20T08:05:00Z");
   assert.equal(demo.due_at, "2026-09-20T09:05:00Z");
   assert.equal(demo.discovery.basis, "historical-owner-then-bot-approximation");
-  assert.equal(ready.delivery_enabled, false);
+  assert.equal(ready.delivery_enabled, true);
   assert.ok(readState(workspace.stateDir).fixtures.discord.historyFetches.every(row =>
     row.authorization === "Bot fixture-root-token" && row.limit === 100));
 

@@ -5,7 +5,8 @@ import path from "node:path";
 import test from "node:test";
 
 import { createWorkspace, runNodeEntrypoint, runScript } from "./support/runner.js";
-import { seedRegistry } from "./support/state.js";
+import { bridgeChildEnv, waitForState } from "./support/bridge.js";
+import { readState, seedRegistry, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => { await cleanup(); });
@@ -594,4 +595,77 @@ test("Claude launcher, filtered channel, command hooks and readiness share one l
   const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
   assert.equal(readiness.exitCode, 0, readiness.stderr);
   assert.deepEqual(JSON.parse(readiness.stdout).events.map(event => event.event_type), ["owner_activity", "response_delivered", "turn_completed"]);
+});
+
+test("a Claude input-needed receipt replayed after downtime gets one catch-up from the Claude bot", async () => {
+  const workspace = createWorkspace();
+  seedClaudeAssignment(workspace);
+  const rootState = path.join(workspace.homeDir, "root-discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const stateDir = path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders");
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  const env = bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
+    CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile });
+  const service = async (name, expected = 0) => {
+    const result = await runScript(workspace, "scripts/conversation-reminder-service.py", {
+      args: [name, "--project-root", workspace.repoDir, "--state-dir", stateDir], env });
+    assert.equal(result.exitCode, expected, result.stderr || result.stdout);
+    return JSON.parse(result.stdout);
+  };
+  const worker = () => runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir], env, timeoutMs: 30000 });
+  const at = offset => new Date(now + offset).toISOString();
+  const message = (id, timestamp, author) => ({ id, timestamp, content: "text", type: 0, attachments: [],
+    author: { id: author, bot: author === "app-1" } });
+  const waitForStatus = async predicate => {
+    for (let attempt = 0; attempt < 200; attempt++) {
+      const current = await service("status");
+      if (predicate(current)) return current;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    throw new Error(JSON.stringify(await service("status")));
+  };
+  const now = Date.now();
+  // Before downtime the owner thanked the bot, so the conversation is paused.
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.history = { "channel-1": [message("old-3", at(-2 * 3600000), "owner-id"),
+    message("old-2", at(-3 * 3600000 + 300000), "app-1"), message("old-1", at(-3 * 3600000), "owner-id")] };
+  writeState(seed, workspace.stateDir);
+  // The launch-scoped adapter records its verified transport on first launch.
+  await runChannel(workspace, { content: "warm up", meta: { chat_id: "channel-1", message_id: "old-3",
+    user_id: "owner-id" } }, { expectNotification: true });
+  await service("enable");
+  fs.writeFileSync(clockFile, at(-90 * 60000));
+  let running = worker();
+  const paused = await waitForStatus(current => current.conversations.demo?.reconciliation_status === "ready");
+  assert.deepEqual([paused.conversations.demo.state, paused.readiness.projects.demo.provider,
+    paused.readiness.projects.demo.adapter], ["open-paused", "claude", "ready-observe-only"]);
+  await service("disable");
+  assert.equal((await running).exitCode, 0);
+
+  // Downtime: the stopped service misses a Claude question the adapter durably recorded.
+  const history = readState(workspace.stateDir);
+  history.fixtures.discord.history["channel-1"].unshift(message("fake-message-1", at(0), "app-1"),
+    message("owner-message-1", at(-1000), "owner-id"));
+  writeState(history, workspace.stateDir);
+  await runChannel(workspace, { content: "choose an option",
+    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" } }, { reply: true });
+  await service("enable");
+  fs.writeFileSync(clockFile, at(2 * 3600000));
+  running = worker();
+  const sent = await waitForState(workspace, state =>
+    (state.fixtures.discord.messages ?? []).some(row => row.content === "👀"), 20000);
+  const reminder = sent.fixtures.discord.messages.find(row => row.content === "👀");
+  assert.deepEqual([reminder.channelId, reminder.authorization], ["channel-1", "Bot fixture-token"]);
+  const released = await waitForStatus(current => current.conversations.demo.reminder_message_id);
+  assert.equal(released.conversations.demo.state, "awaiting-owner");
+  assert.equal(released.conversations.demo.response_message_id, "fake-message-1");
+  // The catch-up anchors the next hour to its own send time, not to the missed interval.
+  assert.equal(released.conversations.demo.due_at, at(3 * 3600000).replace(".000Z", "Z"));
+  assert.equal(released.readiness.projects.demo.delivery_ready, true);
+  await new Promise(resolve => setTimeout(resolve, 700));
+  assert.equal(readState(workspace.stateDir).fixtures.discord.messages.filter(row => row.content === "👀").length, 1);
+  await service("disable");
+  assert.equal((await running).exitCode, 0);
 });

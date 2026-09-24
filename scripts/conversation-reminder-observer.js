@@ -22,6 +22,9 @@ const client = new Client({
   partials: [Partials.Message, Partials.Reaction, Partials.User],
 });
 let busy = false;
+let stopping = false;
+let connected = false;
+let readyOnce = false;
 const nextActionAttempt = new Map();
 const healthPath = path.join(stateDir, "observer-health.json");
 const health = {};
@@ -255,7 +258,9 @@ async function recoverIntents() {
 }
 
 async function sideEffects(recoveryOnly = false) {
-  if (busy) return;
+  // While the Gateway is down no owner activity can be observed, so neither
+  // reconciliation nor delivery may run until the reconnect gap is recorded.
+  if (busy || stopping || (!recoveryOnly && !connected)) return;
   busy = true;
   try {
     if (!recoveryOnly) {
@@ -374,6 +379,7 @@ async function sideEffects(recoveryOnly = false) {
     process.stderr.write(`Conversation observer side effect pending: ${error.message}\n`);
   } finally {
     busy = false;
+    if (stopping) shutdown();
   }
 }
 
@@ -394,7 +400,31 @@ async function revalidate() {
   registryFingerprint = source;
 }
 
+// Any disconnect, resume, or new session may have dropped events. Durably send
+// every ready channel back through restart reconciliation before further sends.
+let gapChain = Promise.resolve();
+function observationGap(connectedNow) {
+  connected = false;
+  gapChain = gapChain.then(async () => {
+    await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+      [script, "observation-gap", "--project-root", projectRoot, "--state-dir", stateDir]);
+    connected = connectedNow;
+  }).catch(error => {
+    process.stderr.write(`Conversation observer could not record an observation gap: ${error.message}\n`);
+    process.exit(2);
+  });
+  return gapChain;
+}
+for (const name of ["shardDisconnect", "shardReconnecting", "invalidated"]) {
+  client.on(name, () => observationGap(false));
+}
+client.on("shardResume", () => observationGap(true));
+// The first shardReady precedes "ready"; any later one is a new Gateway session.
+client.on("shardReady", () => { if (readyOnce) observationGap(true); });
+
 client.on("ready", async () => {
+  connected = true;
+  readyOnce = true;
   await revalidate();
   if (recoverOnce) {
     try {
@@ -410,8 +440,16 @@ client.on("ready", async () => {
   }
   setInterval(() => sideEffects(false), 250);
 });
-process.on("SIGTERM", () => { client.destroy(); process.exit(0); });
-process.on("SIGINT", () => { client.destroy(); process.exit(0); });
+// Disable stops new work, but an in-flight Discord request finishes and its
+// result is recorded, so it never becomes an uncertain send.
+function shutdown() {
+  stopping = true;
+  if (busy) return;
+  client.destroy();
+  process.exit(0);
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
 rootToken().then(token => client.login(token)).catch(error => {
   process.stderr.write(`Conversation observer unavailable: ${error.message}\n`);
   process.exit(2);

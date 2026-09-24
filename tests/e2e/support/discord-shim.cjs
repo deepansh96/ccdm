@@ -205,6 +205,7 @@ class Client extends EventEmitter {
     this._poller = setInterval(() => {
       let delivered = null;
       let deliveredReaction = null;
+      let deliveredGateway = null;
       updateState((state) => {
         const messages = state.fixtures?.discord?.injectedMessages ?? [];
         const next = messages.find((message) => !message.delivered);
@@ -217,7 +218,14 @@ class Client extends EventEmitter {
         }
         const reactions = state.fixtures?.discord?.injectedReactions ?? [];
         const nextReaction = reactions.find((reaction) => !reaction.delivered);
-        if (!nextReaction) return false;
+        if (!nextReaction) {
+          // Scripted Gateway lifecycle events, such as a disconnect and a new session.
+          const gateway = (state.fixtures?.discord?.injectedGatewayEvents ?? []).find((event) => !event.delivered);
+          if (!gateway) return false;
+          gateway.delivered = true;
+          deliveredGateway = gateway.event;
+          return;
+        }
         nextReaction.delivered = true;
         state.fixtures.discord.deliveredReactions ||= [];
         state.fixtures.discord.deliveredReactions.push({ id: nextReaction.id });
@@ -228,6 +236,8 @@ class Client extends EventEmitter {
       } else if (deliveredReaction) {
         const { reaction, user } = fixtureReaction(this, deliveredReaction);
         this.emit("messageReactionAdd", reaction, user);
+      } else if (deliveredGateway) {
+        this.emit(deliveredGateway, 0);
       }
     }, 25);
     this._poller.unref();

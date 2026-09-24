@@ -25,8 +25,20 @@ DISCOVERY_PATH = Path(__file__).with_name("conversation-reminder-discovery.py")
 DISCOVERY_SPEC = importlib.util.spec_from_file_location("ccdm_conversation_discovery", DISCOVERY_PATH)
 DISCOVERY = importlib.util.module_from_spec(DISCOVERY_SPEC)
 DISCOVERY_SPEC.loader.exec_module(DISCOVERY)
-SCHEMA_VERSION = 4
+READINESS_PATH = Path(__file__).with_name("conversation-reminder-readiness.py")
+READINESS_SPEC = importlib.util.spec_from_file_location("ccdm_conversation_readiness", READINESS_PATH)
+READINESS = importlib.util.module_from_spec(READINESS_SPEC)
+READINESS_SPEC.loader.exec_module(READINESS)
+SCHEMA_VERSION = 5
+CATCH_UP_SPACING = timedelta(seconds=5)
 STATES = {"closed", "open-paused", "awaiting-owner"}
+# Both provider adapters must be installed before any channel may receive a
+# reminder; there is no Codex-only release.
+PROVIDER_COMPONENTS = {
+    "codex": ("scripts/codex-bridge.js", "scripts/discord-mcp-server.js", "scripts/conversation-reminder-adapter.js"),
+    "claude": ("scripts/claude-reminder-channel.js", "scripts/claude-reminder-hook.js",
+               "scripts/conversation-reminder-adapter.js"),
+}
 
 
 def store_path(state_dir: Path) -> Path:
@@ -49,7 +61,7 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
     db.execute("PRAGMA synchronous=FULL")
     db.execute("PRAGMA secure_delete=ON")
     version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version not in (0, 1, 2, 3, SCHEMA_VERSION) or (version == 0 and existed):
+    if version not in (0, 1, 2, 3, 4, SCHEMA_VERSION) or (version == 0 and existed):
         db.close()
         raise ValueError("conversation store schema is unsupported")
     if version == 0:
@@ -151,6 +163,18 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
     if db.execute("PRAGMA user_version").fetchone()[0] == 3:
         # Checkpointed history discovery; live events buffer while a scan is active.
         db.executescript("BEGIN IMMEDIATE;" + DISCOVERY.SCHEMA + "PRAGMA user_version=4; COMMIT;")
+    if db.execute("PRAGMA user_version").fetchone()[0] == 4:
+        # Overdue channels released by discovery or restart reconciliation receive
+        # at most one globally spaced catch-up reminder.
+        db.executescript("""
+            BEGIN IMMEDIATE;
+            CREATE TABLE catch_ups (
+                project TEXT NOT NULL, assignment_generation TEXT NOT NULL, marked_at TEXT NOT NULL,
+                PRIMARY KEY(project,assignment_generation)
+            );
+            PRAGMA user_version=5;
+            COMMIT;
+        """)
     expected = {
         "delivery_intents": {"nonce", "project", "assignment_generation", "revision", "state",
                              "message_id", "claimed_at", "retry_at"},
@@ -158,6 +182,7 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
                                 "reason", "retired_at"},
         "retired_leftovers": {"action_id", "project", "assignment_generation", "message_id", "reason"},
         "discoveries": DISCOVERY.COLUMNS,
+        "catch_ups": {"project", "assignment_generation", "marked_at"},
     }
     tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if any(table not in tables or {row[1] for row in db.execute(f"PRAGMA table_info({table})")} != columns
@@ -215,6 +240,7 @@ def retire_conversation(db: sqlite3.Connection, row: sqlite3.Row, reason: str) -
     db.execute("""UPDATE pending_actions SET completed=2
         WHERE project=? AND assignment_generation=? AND kind='ack' AND completed=0""", (project, generation))
     db.execute("DELETE FROM discoveries WHERE project=? AND assignment_generation=?", (project, generation))
+    db.execute("DELETE FROM catch_ups WHERE project=? AND assignment_generation=?", (project, generation))
     db.execute("DELETE FROM conversations WHERE project=?", (project,))
 
 
@@ -242,7 +268,10 @@ def current_conversation(db: sqlite3.Connection, name: str, assignment: dict) ->
 
 
 def apply_event(db: sqlite3.Connection, registry: dict, row: sqlite3.Row) -> str:
-    event = EVENTS.validate_event(json.loads(row["payload_json"]))
+    return apply_payload(db, registry, EVENTS.validate_event(json.loads(row["payload_json"])), row["commit_order"])
+
+
+def apply_payload(db: sqlite3.Connection, registry: dict, event: dict, commit_order: int | None) -> str:
     if db.execute("SELECT 1 FROM applied_events WHERE event_id=?", (event["event_id"],)).fetchone():
         return "duplicate"
     status, _ = EVENTS._assignment_result(registry, event)
@@ -255,10 +284,12 @@ def apply_event(db: sqlite3.Connection, registry: dict, row: sqlite3.Row) -> str
     if assignment is None:
         return "stale"
     current = current_conversation(db, event["project"], assignment)
-    if current["reconciliation_status"] in DISCOVERY.ACTIVE:
-        # Left unapplied in the durable event ledger until the history baseline commits.
+    if current["reconciliation_status"] in DISCOVERY.ACTIVE or current["reconciliation_status"] == DISCOVERY.RESTART:
+        # Left unapplied in the durable event ledger until the history baseline or
+        # restart reconciliation commits.
         return "buffered"
-    changes = {"checkpoint": row["commit_order"], "last_event_order": event["event_order"]}
+    changes = {"checkpoint": current["checkpoint"] if commit_order is None else commit_order,
+               "last_event_order": event["event_order"]}
     kind = event["event_type"]
     occurred = event["event_time"]
     duplicate_source = False
@@ -331,6 +362,9 @@ def apply_event(db: sqlite3.Connection, registry: dict, row: sqlite3.Row) -> str
         changes.update(reminder_message_id=None, cleanup_message_ids=json.dumps([*cleanup_ids, recorded_id]))
     if "state" in changes or "due_at" in changes:
         changes["revision"] = current["revision"] + 1
+        # A fresh arming or acknowledgment replaces any queued catch-up.
+        db.execute("DELETE FROM catch_ups WHERE project=? AND assignment_generation=?",
+                   (event["project"], event["assignment_generation"]))
     columns = ",".join(f"{key}=?" for key in changes)
     db.execute(f"UPDATE conversations SET {columns} WHERE project=?", (*changes.values(), event["project"]))
     db.execute("INSERT INTO applied_events VALUES (?)", (event["event_id"],))
@@ -430,7 +464,112 @@ def assignment_changed(project_root: Path, state_dir: Path, name: str) -> dict:
         db.close()
 
 
-def status(state_dir: Path) -> dict:
+def provider_prerequisites(project_root: Path) -> dict:
+    providers = {}
+    for provider, components in PROVIDER_COMPONENTS.items():
+        missing = [name for name in components if not (project_root / name).is_file()]
+        providers[provider] = {"met": not missing, "missing": missing}
+    return {"met": all(row["met"] for row in providers.values()), "providers": providers}
+
+
+def root_credentials_present() -> bool:
+    directory = Path(os.environ.get("ROOT_DISCORD_STATE_DIR") or Path.home() / ".claude" / "channels" / "discord")
+    try:
+        lines = (directory / ".env").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    token = next((line[len("DISCORD_BOT_TOKEN="):].strip().strip("'\"") for line in lines
+                  if line.startswith("DISCORD_BOT_TOKEN=")), "")
+    return bool(token) and not any(character.isspace() for character in token)
+
+
+def enablement_checks(project_root: Path, state_dir: Path) -> dict:
+    """Foreground opt-in checks. Discord permissions are verified per channel by the worker."""
+    blockers = []
+    prerequisites = provider_prerequisites(project_root)
+    if not prerequisites["met"]:
+        blockers.append("provider prerequisites are unmet: " + ", ".join(
+            f"{provider} missing {', '.join(row['missing'])}"
+            for provider, row in prerequisites["providers"].items() if not row["met"]))
+    try:
+        registry = EVENTS.load_registry(project_root)
+    except (OSError, ValueError, json.JSONDecodeError):
+        registry = {}
+        blockers.append("registry.json is unavailable or invalid")
+    owner = bool(registry.get("discord_user_id"))
+    if registry and not owner:
+        blockers.append("registry.json has no CCDM owner (discord_user_id)")
+    if registry and not isinstance(registry.get("projects"), dict):
+        blockers.append("registry project assignments are invalid")
+    credentials = root_credentials_present()
+    if not credentials:
+        blockers.append("root Discord credentials are unavailable (ROOT_DISCORD_STATE_DIR/.env)")
+    EVENTS.private_directory(state_dir)
+    return {"blockers": blockers, "provider_prerequisites": prerequisites, "owner_configured": owner,
+            "root_credentials": "present" if credentials else "missing",
+            "state_dir_private": stat.S_IMODE(state_dir.stat().st_mode) & 0o077 == 0,
+            "channel_permissions": "verified per channel by the running worker; see status readiness"}
+
+
+def readiness_report(project_root: Path, state_dir: Path, db: sqlite3.Connection, conversations: dict,
+                     observer_channels: dict, running: bool, disabled: bool, requested: bool) -> dict:
+    """Per-project delivery readiness across adapters, observation, history, assignments, and intents."""
+    prerequisites = provider_prerequisites(project_root)
+    try:
+        projects = EVENTS.load_registry(project_root).get("projects")
+    except (OSError, ValueError, json.JSONDecodeError):
+        projects = None
+    report = {}
+    for name in sorted(projects if isinstance(projects, dict) else {}):
+        adapter = READINESS.build_readiness(name, project_root, state_dir)
+        conversation = conversations.get(name)
+        history = conversation["reconciliation_status"] if conversation else "untracked"
+        observation = observer_channels.get(name, "awaiting-validation") if running else "worker-not-running"
+        uncertain = [r[0] for r in db.execute("""SELECT nonce FROM delivery_intents WHERE project=?
+            AND assignment_generation=? AND state IN ('sending','uncertain')""",
+            (name, conversation["assignment_generation"]))] if conversation else []
+        blockers = []
+        if disabled:
+            blockers.append("service is disabled; run enable")
+        elif not requested:
+            blockers.append("reminders are not enabled; run enable")
+        if not prerequisites["met"]:
+            blockers.append("provider prerequisites are unmet")
+        issues = adapter["missing_credentials"] + adapter["assignment_mismatches"] + adapter["unsupported_capabilities"]
+        if issues:
+            blockers.append("adapter: " + "; ".join(issues))
+        if not running:
+            blockers.append("foreground worker is not running")
+        elif observation != "ready-observe-only":
+            blockers.append("observation: " + observation)
+        if history != "ready":
+            reason = (conversation.get("discovery") or {}).get("reason") if conversation else None
+            blockers.append("history: " + history + (f" ({reason})" if reason else ""))
+        if uncertain:
+            blockers.append("uncertain delivery: run recover")
+        report[name] = {
+            "provider": adapter["provider"], "adapter": adapter["status"], "observation": observation,
+            "history": history, "assignment": adapter["assignment_mismatches"] or "ok",
+            "uncertain_delivery": uncertain,
+            "pending_cleanup": conversation["cleanup_message_ids"] if conversation else [],
+            "catch_up_queued": bool(conversation and conversation["catch_up_queued"]),
+            "delivery_ready": not blockers, "blockers": blockers,
+        }
+    return {"provider_prerequisites": prerequisites, "projects": report}
+
+
+def is_disabled(state_dir: Path) -> bool:
+    db = connect(state_dir)
+    if db is None:
+        return False
+    try:
+        row = db.execute("SELECT value FROM settings WHERE key='disabled'").fetchone()
+        return bool(row and row["value"] == "1")
+    finally:
+        db.close()
+
+
+def status(state_dir: Path, project_root: Path | None = None) -> dict:
     lock_path = state_dir / "worker.lock"
     running = False
     if lock_path.exists():
@@ -477,6 +616,9 @@ def status(state_dir: Path) -> dict:
                 "cleanup_message_ids": json.loads(row["cleanup_message_ids"]),
                 "reconciliation_status": row["reconciliation_status"], "checkpoint": row["checkpoint"],
                 "discovery": DISCOVERY.status_for(db, row["project"], row["assignment_generation"]),
+                "catch_up_queued": db.execute("""SELECT 1 FROM catch_ups WHERE project=?
+                    AND assignment_generation=?""", (row["project"], row["assignment_generation"])).fetchone()
+                is not None,
             }
         blocked = [name for name, row in conversations.items()
                    if row["reconciliation_status"] == "blocked-retired-generation"]
@@ -503,9 +645,16 @@ def status(state_dir: Path) -> dict:
                     WHERE project=? AND assignment_generation=? AND state IN ('sending','uncertain')""", key)],
             })
         requested = db.execute("SELECT value FROM settings WHERE key='discovery_requested'").fetchone()
+        requested = bool(requested and requested["value"] == "1")
+        gate = db.execute("SELECT value FROM settings WHERE key='catch_up_next_at'").fetchone()
+        readiness = (readiness_report(project_root, state_dir, db, conversations, observer_channels, running,
+                                      disabled["value"] == "1", requested) if project_root else None)
         return {"status": "ok", "disabled": disabled["value"] == "1", "worker_running": running,
-                "discovery_requested": bool(requested and requested["value"] == "1"),
-                "observer_channels": observer_channels, "delivery_enabled": False,
+                "discovery_requested": requested,
+                "observer_channels": observer_channels,
+                "delivery_enabled": bool(disabled["value"] != "1" and requested and readiness and
+                                         readiness["provider_prerequisites"]["met"]),
+                "readiness": readiness, "catch_up_next_at": gate[0] if gate else None,
                 "conversations": conversations, "unresolved_intents": unresolved,
                 "pending_actions": pending, "retired_assignments": retired,
                 "assignment_guidance": ("Blocked projects reuse a retired assignment generation. After confirming "
@@ -520,32 +669,61 @@ def status(state_dir: Path) -> dict:
         db.close()
 
 
-def set_disabled(state_dir: Path) -> dict:
+def set_disabled(project_root: Path, state_dir: Path) -> dict:
+    """Stop sends without deleting closures, history, or delivery state."""
     db = connect(state_dir, create=True)
     db.execute("BEGIN IMMEDIATE")
     db.execute("INSERT OR REPLACE INTO settings VALUES ('disabled','1')")
     db.execute("COMMIT")
     db.close()
-    return status(state_dir)
+    return status(state_dir, project_root)
 
 
-def set_enabled(state_dir: Path) -> dict:
+def set_enabled(project_root: Path, state_dir: Path) -> dict:
+    """Manual foreground opt-in: check prerequisites, request discovery, and reconcile first."""
+    checks = enablement_checks(project_root, state_dir)
+    if checks["blockers"]:
+        return {"status": "blocked", "reason": "; ".join(checks["blockers"]), "preflight": checks}
     db = connect(state_dir, create=True)
-    db.execute("BEGIN IMMEDIATE")
-    db.execute("INSERT OR REPLACE INTO settings VALUES ('disabled','0')")
-    db.execute("COMMIT")
-    db.close()
-    return status(state_dir)
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("INSERT OR REPLACE INTO settings VALUES ('disabled','0')")
+        db.execute("INSERT OR REPLACE INTO settings VALUES ('discovery_requested','1')")
+        # Observations may have been missed while disabled; nothing sends before reconciliation.
+        db.execute("""UPDATE conversations SET reconciliation_status='suspended-restart-reconciliation'
+            WHERE reconciliation_status='ready'""")
+        db.execute("COMMIT")
+    finally:
+        db.close()
+    return {**status(state_dir, project_root), "preflight": checks}
 
 
-def request_discovery(state_dir: Path) -> dict:
+def request_discovery(project_root: Path, state_dir: Path) -> dict:
     """Persist the operator's discovery request; the foreground worker performs bounded passes."""
     db = connect(state_dir, create=True)
     db.execute("BEGIN IMMEDIATE")
     db.execute("INSERT OR REPLACE INTO settings VALUES ('discovery_requested','1')")
     db.execute("COMMIT")
     db.close()
-    return status(state_dir)
+    return status(state_dir, project_root)
+
+
+def observation_gap(state_dir: Path) -> dict:
+    """A Gateway disconnect or reconnect may have missed events: reconcile before any send."""
+    db = connect(state_dir)
+    if db is None:
+        return {"status": "uninitialized"}
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        for row in db.execute("SELECT project,assignment_generation FROM conversations "
+                              "WHERE reconciliation_status='reconciling'").fetchall():
+            db.execute("DELETE FROM discoveries WHERE project=? AND assignment_generation=?", tuple(row))
+        changed = db.execute("""UPDATE conversations SET reconciliation_status='suspended-restart-reconciliation'
+            WHERE reconciliation_status IN ('ready','reconciling')""").rowcount
+        db.execute("COMMIT")
+        return {"status": "reconciling", "channels": changed}
+    finally:
+        db.close()
 
 
 def discovery_next(project_root: Path, state_dir: Path) -> dict:
@@ -590,11 +768,16 @@ def discovery_result(project_root: Path, state_dir: Path, payload: dict) -> dict
         db.execute("BEGIN IMMEDIATE")
         recorded = {r[0] for r in db.execute(
             "SELECT message_id FROM delivery_intents WHERE state='sent' AND message_id IS NOT NULL")}
-        outcome = DISCOVERY.record_result(db, payload, clock_now(), recorded, adapter_interactions, reaction_times)
+        now = clock_now()
+        outcome = DISCOVERY.record_result(db, payload, now, recorded, adapter_interactions, reaction_times)
         if outcome == "committed":
             # Reconcile forward: newer durable events win over the historical baseline.
             for row in rows:
                 apply_event(db, registry, row)
+        elif outcome == "reconciled":
+            reconcile_restart(db, registry, rows, project, generation, now, reaction_times)
+        if outcome in {"committed", "reconciled"}:
+            mark_catch_up(db, project, generation, now)
         db.execute("COMMIT")
         return {"status": outcome}
     except Exception:
@@ -603,6 +786,81 @@ def discovery_result(project_root: Path, state_dir: Path, payload: dict) -> dict
         raise
     finally:
         db.close()
+
+
+def reconcile_restart(db: sqlite3.Connection, registry: dict, rows: list[sqlite3.Row], project: str,
+                      generation: str, now: datetime, reaction_times) -> None:
+    """Merge a restart scan onto persisted state, then release the channel for sends.
+
+    Missed owner messages, /close, and management commands apply at their Discord
+    times through the live state machine, followed by durable provider replay.
+    History never arms a reminder by itself. Owner reactions that cannot be dated
+    after the current response pause conservatively.
+    """
+    found = db.execute("SELECT summary_json FROM discoveries WHERE project=? AND assignment_generation=?",
+                       (project, generation)).fetchone()
+    summary = json.loads(found["summary_json"])
+    row = db.execute("SELECT * FROM conversations WHERE project=?", (project,)).fetchone()
+    db.execute("UPDATE conversations SET reconciliation_status='ready' WHERE project=?", (project,))
+    missed = {}
+    for ref, kind in ((summary["normal"], "message"), (summary["close"], "close"),
+                      (summary["reply"], "management-command")):
+        if ref and (kind != "management-command" or ref["kind"] == "owner-command"):
+            missed.setdefault(ref["id"], (ref, kind))
+    applied = 0
+    for ref, kind in sorted(missed.values(), key=lambda item: (iso(item[0]["at"]), len(item[0]["id"]), item[0]["id"])):
+        event = {"schema_version": 1, "event_id": f"history:{generation}:{ref['id']}", "project": project,
+                 "channel_id": row["channel_id"], "bot_id": row["bot_id"], "assignment_generation": generation,
+                 "provider": "ccdm-root", "event_time": ref["at"], "event_order": f"{ref['at']}:history:{ref['id']}",
+                 "adapter_instance_id": "restart-reconciliation", "actor_id": row["owner_id"],
+                 "source_message_id": ref["id"]}
+        if kind == "close":
+            event.update(event_type="close_requested", command="/close")
+        else:
+            event.update(event_type="owner_activity", activity_kind=kind)
+        before = db.execute("SELECT revision FROM conversations WHERE project=?", (project,)).fetchone()[0]
+        apply_payload(db, registry, EVENTS.validate_event(event), None)
+        after = db.execute("SELECT revision,last_ack_message_id FROM conversations WHERE project=?",
+                           (project,)).fetchone()
+        applied += after["revision"] != before or after["last_ack_message_id"] == ref["id"] != row["last_ack_message_id"]
+    for event_row in rows:
+        apply_event(db, registry, event_row)
+    basis = "missed-owner-activity" if applied else "no-missed-activity"
+    current = db.execute("SELECT * FROM conversations WHERE project=?", (project,)).fetchone()
+    seen = {r[0] for r in db.execute("""SELECT source_message_id FROM owner_sources
+        WHERE project=? AND assignment_generation=?""", (project, generation))}
+    if current["state"] == "awaiting-owner" and current["response_at"]:
+        answered = iso(current["response_at"])
+        pause = "reaction-ordering-unresolved" if summary["reaction_unresolved"] else None
+        for item in summary["reacted"]:
+            if pause:
+                break
+            if iso(item["at"]) >= answered:
+                pause = "owner-reaction-after-answer"
+            elif "reaction:" + item["id"] not in seen and not reaction_times(item["id"]):
+                # Membership cannot date a reaction on an earlier message.
+                pause = "reaction-ordering-unresolved"
+        if pause:
+            source = next((item["id"] for item in summary["reacted"]), current["response_message_id"])
+            apply_payload(db, registry, EVENTS.validate_event({
+                "schema_version": 1, "event_id": f"history-reaction:{generation}:{uuid.uuid4().hex}",
+                "event_type": "owner_activity", "project": project, "channel_id": row["channel_id"],
+                "bot_id": row["bot_id"], "assignment_generation": generation, "provider": "ccdm-root",
+                "event_time": stamp(now), "event_order": f"{stamp(now)}:history-reaction",
+                "adapter_instance_id": "restart-reconciliation", "actor_id": row["owner_id"],
+                "source_message_id": source, "activity_kind": "reaction"}), None)
+            basis = pause
+    DISCOVERY.mark_reactions_seen(db, project, generation, summary["reacted"])
+    db.execute("UPDATE discoveries SET basis=? WHERE project=? AND assignment_generation=?",
+               (basis, project, generation))
+
+
+def mark_catch_up(db: sqlite3.Connection, project: str, generation: str, now: datetime) -> None:
+    """Queue one catch-up for a channel released while already overdue."""
+    row = db.execute("SELECT * FROM conversations WHERE project=?", (project,)).fetchone()
+    if (row and row["assignment_generation"] == generation and row["reconciliation_status"] == "ready" and
+            row["state"] == "awaiting-owner" and row["due_at"] and iso(row["due_at"]) <= now):
+        db.execute("INSERT OR IGNORE INTO catch_ups VALUES (?,?,?)", (project, generation, stamp(now)))
 
 
 def rows_matching(state_dir: Path, project: str, generation: str, condition: str) -> list[sqlite3.Row]:
@@ -683,7 +941,8 @@ def suspend_assignment(state_dir: Path, project: str, generation: str, reason: s
     try:
         db.execute("BEGIN IMMEDIATE")
         db.execute("""UPDATE conversations SET reconciliation_status=?
-            WHERE project=? AND assignment_generation=? AND reconciliation_status='ready'""",
+            WHERE project=? AND assignment_generation=?
+              AND reconciliation_status IN ('ready','suspended-restart-reconciliation','reconciling')""",
                    (reason, project, generation))
         db.execute("COMMIT")
         return {"status": "suspended"}
@@ -720,7 +979,8 @@ def claim_due(project_root: Path, state_dir: Path) -> dict:
     db = connect(state_dir)
     try:
         db.execute("BEGIN IMMEDIATE")
-        if db.execute("SELECT value FROM settings WHERE key='disabled'").fetchone()[0] == "1":
+        if (db.execute("SELECT value FROM settings WHERE key='disabled'").fetchone()[0] == "1" or
+                not provider_prerequisites(project_root)["met"]):
             db.execute("COMMIT")
             return {"claim": None}
         now = clock_now()
@@ -746,6 +1006,15 @@ def claim_due(project_root: Path, state_dir: Path) -> dict:
                     assignment["channel_id"] != row["channel_id"] or assignment["bot_id"] != row["bot_id"] or
                     not assignment["bot"].get("token")):
                 continue
+            if db.execute("SELECT 1 FROM catch_ups WHERE project=? AND assignment_generation=?",
+                          (row["project"], row["assignment_generation"])).fetchone():
+                # Initial and catch-up sends share one durable global spacing gate,
+                # so neither a restart nor a second channel can bypass it.
+                gate = db.execute("SELECT value FROM settings WHERE key='catch_up_next_at'").fetchone()
+                if gate and iso(gate[0]) > now:
+                    continue
+                db.execute("INSERT OR REPLACE INTO settings VALUES ('catch_up_next_at',?)",
+                           (stamp(now + CATCH_UP_SPACING),))
             nonce = uuid.uuid4().hex[:24]
             db.execute("""INSERT INTO delivery_intents
                 (nonce,project,assignment_generation,revision,state,claimed_at)
@@ -808,6 +1077,8 @@ def record_result(project_root: Path, state_dir: Path, nonce: str, outcome: str,
                 raise ValueError("successful delivery requires a message identity and timestamp")
             delivery_time = iso(sent_at)
             db.execute("UPDATE delivery_intents SET state='sent', message_id=? WHERE nonce=?", (message_id, nonce))
+            db.execute("DELETE FROM catch_ups WHERE project=? AND assignment_generation=?",
+                       (intent["project"], intent["assignment_generation"]))
             if row and row["assignment_generation"] == intent["assignment_generation"]:
                 eligible_recovery = (intent["state"] == "uncertain" and
                                      row["reconciliation_status"] == "suspended-uncertain-send")
@@ -857,6 +1128,13 @@ def record_result(project_root: Path, state_dir: Path, nonce: str, outcome: str,
                     (intent["project"], intent["assignment_generation"])).fetchone()[0]
                 delay = max(min(300, 5 * (2 ** min(failures, 6))), retry_after or 0)
                 retry_at = stamp(clock_now() + timedelta(seconds=delay))
+                if retry_after and db.execute("SELECT 1 FROM catch_ups WHERE project=? AND assignment_generation=?",
+                                              (intent["project"], intent["assignment_generation"])).fetchone():
+                    # Discord's rate limit takes precedence over catch-up spacing.
+                    gate = db.execute("SELECT value FROM settings WHERE key='catch_up_next_at'").fetchone()
+                    limited = clock_now() + timedelta(seconds=retry_after)
+                    if not gate or iso(gate[0]) < limited:
+                        db.execute("INSERT OR REPLACE INTO settings VALUES ('catch_up_next_at',?)", (stamp(limited),))
             db.execute("UPDATE delivery_intents SET state=?, retry_at=? WHERE nonce=?",
                        (outcome, retry_at, nonce))
             if row and row["assignment_generation"] == intent["assignment_generation"] and outcome != "failed":
@@ -879,8 +1157,11 @@ def suspend_interrupted_sends(state_dir: Path) -> None:
         db.execute("BEGIN IMMEDIATE")
         started = db.execute("SELECT value FROM settings WHERE key='worker_started'").fetchone()
         if started:
+            # Observations may have been missed while no worker ran. Access and
+            # assignment suspensions are revalidated by the new observer.
             db.execute("""UPDATE conversations SET reconciliation_status='suspended-restart-reconciliation'
-                WHERE reconciliation_status='ready'""")
+                WHERE reconciliation_status IN ('ready','suspended-assignment','suspended-adapter-capability',
+                                                'suspended-observation-access','suspended-delivery-access')""")
         db.execute("INSERT OR REPLACE INTO settings VALUES ('worker_started','1')")
         for intent in db.execute("SELECT * FROM delivery_intents WHERE state='sending'").fetchall():
             db.execute("UPDATE delivery_intents SET state='uncertain' WHERE nonce=?", (intent["nonce"],))
@@ -897,7 +1178,7 @@ def main() -> int:
     parser.add_argument("command", choices=("sync", "status", "disable", "enable", "run", "recover",
                                             "actions", "done", "leftover", "intents", "claim", "validate",
                                             "result", "assignment-changed", "suspend", "discover",
-                                            "discovery-next", "discovery-result"))
+                                            "discovery-next", "discovery-result", "observation-gap"))
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--state-dir", type=Path, default=EVENTS.default_state_dir())
     parser.add_argument("--action-id")
@@ -913,13 +1194,18 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command == "status":
-            result = status(args.state_dir)
+            result = status(args.state_dir, args.project_root)
         elif args.command == "disable":
-            result = set_disabled(args.state_dir)
+            result = set_disabled(args.project_root, args.state_dir)
         elif args.command == "enable":
-            result = set_enabled(args.state_dir)
+            result = set_enabled(args.project_root, args.state_dir)
+            if result["status"] == "blocked":
+                print(json.dumps(result, sort_keys=True))
+                return 2
         elif args.command == "discover":
-            result = request_discovery(args.state_dir)
+            result = request_discovery(args.project_root, args.state_dir)
+        elif args.command == "observation-gap":
+            result = observation_gap(args.state_dir)
         elif args.command == "discovery-next":
             result = discovery_next(args.project_root, args.state_dir)
         elif args.command == "discovery-result":
@@ -960,8 +1246,8 @@ def main() -> int:
             result = record_result(args.project_root, args.state_dir, args.nonce, args.outcome,
                                    args.message_id, args.sent_at, args.retry_after)
         else:
-            if status(args.state_dir)["disabled"]:
-                print(json.dumps(status(args.state_dir), sort_keys=True))
+            if is_disabled(args.state_dir):
+                print(json.dumps(status(args.state_dir, args.project_root), sort_keys=True))
                 return 0
             lock_path = args.state_dir / "worker.lock"
             EVENTS.private_directory(args.state_dir)
@@ -987,19 +1273,26 @@ def main() -> int:
                     if completed.returncode:
                         raise ValueError("recovery could not inspect Discord; check assignment, credentials, and channel access")
                     result = json.loads(completed.stdout)
+                    result["readiness"] = status(args.state_dir, args.project_root)["readiness"]
                     print(json.dumps(result, sort_keys=True))
                     return 0
                 observer = subprocess.Popen(observer_args, env=observer_env)
                 try:
-                    while not status(args.state_dir)["disabled"]:
+                    while not is_disabled(args.state_dir):
                         sync(args.project_root, args.state_dir)
                         if observer.poll() is not None:
                             raise ValueError("conversation observer stopped")
                         time.sleep(0.5)
                 finally:
+                    # The observer finishes an in-flight request (bounded by its
+                    # 10-second Discord timeout) before exiting.
                     observer.terminate()
-                    observer.wait(timeout=5)
-            result = status(args.state_dir)
+                    try:
+                        observer.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        observer.kill()
+                        observer.wait()
+            result = status(args.state_dir, args.project_root)
         print(json.dumps(result, sort_keys=True))
         return 0
     except (OSError, ValueError, sqlite3.Error, json.JSONDecodeError) as error:
