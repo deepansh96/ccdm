@@ -1,6 +1,6 @@
 ---
 name: manage-claude-home-login
-description: Check, restore, or remotely complete a Claude home login (the default home or any extra CLAUDE_CONFIG_DIR home).
+description: Check, restore, or remotely complete a Claude home login (default, claude-af, claude-t4d-api and any future home).
 triggers:
   - "claude login"
   - "logged out"
@@ -18,11 +18,10 @@ last_updated: 2026-09-24
 
 ## Context
 Claude credentials are per `CLAUDE_CONFIG_DIR` home (data + config together), and
-they expire on idle. A machine has `~/.claude` as the default home (used when a
-project has no `claude_home`) plus any `~/.claude-<alias>` homes created for
-extra logins, which may bill a subscription or an API key helper. Never print
-credentials or keychain contents; only auth metadata and the one-time sign-in
-URL belong in a reply.
+they expire on idle. Homes in use: `~/.claude` (default when `claude_home` is
+unset), `~/.claude-af`, `~/.claude-t4d-api` (api_key_helper, API billing).
+Never print credentials or keychain contents; only auth metadata and the
+one-time sign-in URL belong in a reply.
 
 ## Steps
 1. Status only, no mutation: `CLAUDE_CONFIG_DIR=<home> claude auth status`. It
@@ -59,10 +58,14 @@ URL belong in a reply.
   challenge. Send it only to the requesting user's channel and regenerate rather
   than reusing an expired one.
 - Signing in with the wrong browser session silently attaches the wrong account
-  (a personal subscription vs an organization plan). Report back the email, org,
-  and plan that landed and let the user correct it.
+  (personal gmail/max vs org/team). Report back the email + org + plan that
+  landed and let the user correct it.
 - A home can be logged out while its already-running sessions keep working on
   tokens held in memory; they only fail on the next start.
+- A home that has never opened a project starts with an interactive "Is this a
+  project you trust?" prompt that blocks the session, so the bot silently
+  answers nothing. Check the tmux pane for it on the first launch after a login
+  change and answer it before reporting success.
 
 ## Verify
 - [ ] `claude auth status` for the home shows `loggedIn: true` and the intended email/org.
