@@ -491,7 +491,8 @@ def enablement_checks(project_root: Path, state_dir: Path, prepare: bool = True)
     """Foreground opt-in checks. Discord permissions are verified per channel by the worker.
 
     With ``prepare`` false nothing is created or re-permissioned, so a failed
-    supervisor preflight leaves an existing installation untouched."""
+    supervisor preflight leaves an existing installation untouched. With
+    ``prepare`` true the state directory is prepared only when no check fails."""
     blockers = []
     prerequisites = provider_prerequisites(project_root)
     if not prerequisites["met"]:
@@ -510,8 +511,11 @@ def enablement_checks(project_root: Path, state_dir: Path, prepare: bool = True)
         blockers.append("registry project assignments are invalid")
     credentials = root_credentials_present()
     if not credentials:
-        blockers.append("root Discord credentials are unavailable (ROOT_DISCORD_STATE_DIR/.env)")
-    if prepare:
+        blockers.append("root Discord credentials are unavailable: set DISCORD_BOT_TOKEN in "
+                        "ROOT_DISCORD_STATE_DIR/.env (default ~/.claude/channels/discord/.env)")
+    # Validation never mutates: the private state directory is created or
+    # re-permissioned only after every other blocker has cleared.
+    if prepare and not blockers:
         EVENTS.private_directory(state_dir)
     private = state_dir.is_dir() and stat.S_IMODE(state_dir.stat().st_mode) & 0o077 == 0
     if not prepare and state_dir.exists() and not private:
@@ -569,8 +573,13 @@ def readiness_report(project_root: Path, state_dir: Path, db: sqlite3.Connection
                             "scripts/install-conversation-reminder-service.sh to relaunch the LaunchAgent")
         elif observation != "ready-observe-only":
             blockers.append("observation: " + observation)
-        if history != "ready":
-            reason = (conversation.get("discovery") or {}).get("reason") if conversation else None
+        if not conversation:
+            blockers.append("history: untracked; no conversation state exists for this project yet. Clear the "
+                            "adapter and assignment blockers, then start the worker (`run`, or rerun "
+                            "scripts/install-conversation-reminder-service.sh) so it records and discovers the "
+                            "channel; after a registration change run assignment-changed --project " + name)
+        elif history != "ready":
+            reason = (conversation.get("discovery") or {}).get("reason")
             blockers.append("history: " + history + (f" ({reason})" if reason else ""))
         if uncertain:
             blockers.append("uncertain delivery: run recover")

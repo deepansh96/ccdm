@@ -87,12 +87,16 @@ def build_readiness(project_name: str, project_root: Path, state_dir: Path) -> d
                 and capability.get("hooks_configured") is True
                 and capability.get("reply_tool_verified") is True
             )
+            relaunch = (f"; restart the session with CCDM_CLAUDE_REMINDER_ADAPTER=1 "
+                        f"scripts/start-session.sh {project_name}")
             if not verified:
-                unsupported_capabilities.append("Claude launch-scoped transport is not verified for this assignment")
+                unsupported_capabilities.append(
+                    "Claude launch-scoped transport is not verified for this assignment" + relaunch)
             elif not adapter_process_live(capability.get("pid")):
                 # A plain restart runs the unfiltered official plugin; an exited
                 # adapter launch no longer filters /close or records completions.
-                unsupported_capabilities.append("Claude launch-scoped transport is not running for this assignment")
+                unsupported_capabilities.append(
+                    "Claude launch-scoped transport is not running for this assignment" + relaunch)
         if not assignment["bot"].get("token"):
             missing_credentials.append("assigned_project_bot_token")
         if not assignment["bot"].get("app_id"):

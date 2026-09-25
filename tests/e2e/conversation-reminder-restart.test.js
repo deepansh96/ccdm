@@ -634,11 +634,36 @@ test("enable refuses without root observation credentials or an owner, and never
   assert.equal(refused.exitCode, 2);
   const blocked = JSON.parse(refused.stdout);
   assert.match(blocked.reason, /no CCDM owner/);
-  assert.match(blocked.reason, /root Discord credentials are unavailable/);
+  assert.match(blocked.reason, /root Discord credentials are unavailable: set DISCORD_BOT_TOKEN in ROOT_DISCORD_STATE_DIR\/\.env/);
   assert.doesNotMatch(refused.stdout, /token-alpha/);
+  // A refused enable validates without side effects: no state directory exists.
+  assert.equal(fs.existsSync(context.stateDir), false);
   const current = await command(workspace, context, "status");
   assert.equal(current.discovery_requested, false);
   assert.equal(current.delivery_enabled, false);
+  assert.equal(fs.existsSync(context.stateDir), false);
+});
+
+test("a refused enable leaves an existing state directory's permissions unchanged", async () => {
+  const workspace = createWorkspace();
+  const context = setup(workspace, { alpha: "alpha-channel" });
+  fs.mkdirSync(context.stateDir, { recursive: true, mode: 0o755 });
+  fs.chmodSync(context.stateDir, 0o755);
+  fs.rmSync(path.join(workspace.homeDir, "root-discord", ".env"));
+  const refused = await runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["enable", "--project-root", workspace.repoDir, "--state-dir", context.stateDir], env: context.env,
+  });
+  assert.equal(refused.exitCode, 2);
+  assert.match(JSON.parse(refused.stdout).reason, /set DISCORD_BOT_TOKEN/);
+  assert.equal(fs.statSync(context.stateDir).mode & 0o777, 0o755);
+  assert.deepEqual(fs.readdirSync(context.stateDir), []);
+
+  // Once every blocker clears, enable prepares the private directory itself.
+  fs.writeFileSync(path.join(workspace.homeDir, "root-discord", ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n",
+    { mode: 0o600 });
+  const enabled = await command(workspace, context, "enable");
+  assert.deepEqual(enabled.preflight.blockers, []);
+  assert.equal(fs.statSync(context.stateDir).mode & 0o777, 0o700);
 });
 
 test("a generation change during downtime rediscovers the new assignment and shares the catch-up spacing", async () => {

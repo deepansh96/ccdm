@@ -1422,6 +1422,14 @@ test("an idle registered project is visible as suspended until discovery is impl
   const status = await command(workspace, stateDir, "status");
   assert.equal(status.conversations.demo.reconciliation_status, "suspended-incomplete-discovery");
   assert.equal(status.conversations.demo.state, "open-paused");
+  // A project the service has not recorded yet explains how to start tracking it.
+  const registryPath = path.join(workspace.repoDir, "registry.json");
+  const registry = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+  registry.projects.later = { type: "codex", bot_id: "bot", channel_id: "later-channel" };
+  fs.writeFileSync(registryPath, JSON.stringify(registry), { mode: 0o600 });
+  const untracked = (await command(workspace, stateDir, "status")).readiness.projects.later;
+  assert.equal(untracked.history, "untracked");
+  assert.match(untracked.blockers.join("\n"), /history: untracked; .*start the worker \(`run`.*assignment-changed --project later/);
 });
 
 test("a subsecond completion never gets an early due time", async () => {

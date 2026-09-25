@@ -646,6 +646,7 @@ test("a plain Claude restart after an adapter launch never reports a stale ready
   const dead = await readiness();
   assert.equal(dead.exitCode, 2);
   assert.match(dead.unsupported, /Claude launch-scoped transport is not running/);
+  assert.match(dead.unsupported, /restart the session with CCDM_CLAUDE_REMINDER_ADAPTER=1 scripts\/start-session\.sh demo/);
 
   // The documented plain restart runs the unfiltered official plugin.
   const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"] });
@@ -658,6 +659,7 @@ test("a plain Claude restart after an adapter launch never reports a stale ready
   const unfiltered = await readiness();
   assert.equal(unfiltered.exitCode, 2);
   assert.match(unfiltered.unsupported, /Claude launch-scoped transport is not verified/);
+  assert.match(unfiltered.unsupported, /CCDM_CLAUDE_REMINDER_ADAPTER=1 scripts\/start-session\.sh demo/);
 });
 
 test("a Claude input-needed receipt replayed after downtime gets one catch-up from the Claude bot", async () => {
