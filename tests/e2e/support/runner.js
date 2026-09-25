@@ -350,17 +350,19 @@ function spawnPlaceholder(readyFile = "") {
 
 function parseClaudeLaunch(shellCommand) {
   const quoted =
-    /^cd '([\\s\\S]*)' && DISCORD_STATE_DIR='([\\s\\S]*?)'(?: CLAUDE_CONFIG_DIR='([\\s\\S]*?)')? claude ([\\s\\S]+)$/.exec(shellCommand);
+    /^cd '([\\s\\S]*)' && ([\\s\\S]*?) claude ([\\s\\S]+)$/.exec(shellCommand);
   const unquoted = quoted ? null : /^cd ([^&]+) && DISCORD_STATE_DIR=([^\\s]+) claude ([\\s\\S]+)$/.exec(shellCommand);
   if (!quoted && !unquoted) {
     throw new Error(\`unsupported tmux launch command: \${shellCommand}\`);
   }
-  const configDir = quoted ? quoted[3] : undefined;
-  const env = { DISCORD_STATE_DIR: quoted ? quoted[2] : unquoted[2] };
-  if (configDir) {
-    env.CLAUDE_CONFIG_DIR = configDir;
+  const env = {};
+  if (quoted) {
+    const envRe = /([A-Z_]+)=(?:'([^']*)'|([^\\s]+))/g;
+    for (const match of quoted[2].matchAll(envRe)) env[match[1]] = match[2] ?? match[3];
+  } else {
+    env.DISCORD_STATE_DIR = unquoted[2];
   }
-  const claudeArgs = (quoted ? quoted[4] : unquoted[3]).trim().split(/\\s+/);
+  const claudeArgs = (quoted ? quoted[3] : unquoted[3]).trim().split(/\\s+/);
   validateClaudeInvocation(claudeArgs, env);
   return {
     cwd: quoted ? quoted[1] : unquoted[1],
@@ -413,8 +415,12 @@ function parseTmuxLaunch(shellCommand) {
 
 function validateClaudeInvocation(claudeArgs, env) {
   const channelsIndex = claudeArgs.indexOf("--channels");
-  if (channelsIndex === -1 || !claudeArgs[channelsIndex + 1]?.startsWith("plugin:discord")) {
-    throw new Error("claude listener must use --channels plugin:discord...");
+  const developmentIndex = claudeArgs.indexOf("--dangerously-load-development-channels");
+  if (!(
+    (channelsIndex !== -1 && claudeArgs[channelsIndex + 1]?.startsWith("plugin:discord")) ||
+    (developmentIndex !== -1 && claudeArgs[developmentIndex + 1] === "server:discord")
+  )) {
+    throw new Error("claude listener must use the official or filtered Discord channel");
   }
   if (!claudeArgs.includes("--dangerously-skip-permissions")) {
     throw new Error("claude listener must use --dangerously-skip-permissions");
@@ -660,7 +666,8 @@ function runPkill() {
 
 function runClaude() {
   if (args.length === 1 && args[0] === "--version") {
-    console.log("Claude Code fixture 1.0.0");
+    console.log(process.env.CCDM_FIXTURE_CLAUDE_VERSION ||
+      (process.env.CCDM_CLAUDE_REMINDER_ADAPTER === "1" ? "2.1.281 (Claude Code fixture)" : "Claude Code fixture 1.0.0"));
     return;
   }
   try {

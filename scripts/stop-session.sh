@@ -114,15 +114,22 @@ def is_listener(command: str) -> bool:
     if exe in {"tmux", "zsh", "bash", "sh", "fish", "login"}:
         return False
 
-    if exe == "claude" and "--channels" in argv and any(
-        arg.startswith("plugin:discord") for arg in argv
+    if exe == "claude" and (
+        ("--channels" in argv and any(arg.startswith("plugin:discord") for arg in argv))
+        or ("--dangerously-load-development-channels" in argv and "server:discord" in argv)
     ):
+        return True
+    if exe == "node" and any(os.path.basename(arg) == "claude-reminder-channel.js" for arg in argv[1:]):
         return True
     if exe == "claude-channel-discord":
         return True
     if exe == "bun" and "run" in argv and has_claude_discord_cwd(argv):
         return True
-    if exe == "bun" and any(os.path.basename(arg) == "server.ts" for arg in argv[1:]) and has_claude_discord_plugin_root(command):
+    if exe == "bun" and any(
+        os.path.basename(arg) == "server.ts" and
+        (is_discord_plugin_path(arg) or has_claude_discord_plugin_root(command))
+        for arg in argv[1:]
+    ):
         return True
     return False
 
@@ -268,6 +275,20 @@ if [[ -n "$ORPHAN_PIDS" ]]; then
   echo "Cleaning remaining listener process(es):"
   echo "$ORPHAN_PIDS" | sed 's/^/  /'
   terminate_pids "${(@f)ORPHAN_PIDS}"
+fi
+
+if [[ "$SESSION_TYPE" != "codex" ]]; then
+  # The stopped launch no longer proves a filtered Claude transport.
+  python3 - "$PROJECT" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+project = sys.argv[1]
+state_dir = Path(os.environ.get("CCDM_REMINDER_STATE_DIR") or Path.home() / ".local" / "state" / "ccdm" / "conversation-reminders")
+if "/" not in project and project not in {"", ".", ".."}:
+    (state_dir / "capabilities" / f"{project}.json").unlink(missing_ok=True)
+PY
 fi
 
 python3 -c "

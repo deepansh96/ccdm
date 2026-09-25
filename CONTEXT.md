@@ -4,6 +4,22 @@ CCDM manages Discord-connected coding-agent sessions by assigning project bots, 
 
 ## Language
 
+**Project Conversation**:
+The ongoing exchange in one registered project channel, whether served by Claude or Codex. Each project channel has at most one open conversation; root channels are excluded.
+_Avoid_: message thread, agent session when referring to the conversation
+
+**Conversation Reminder**:
+A standalone emoji message that draws attention to an open **Project Conversation** awaiting the CCDM owner's reply, recurring hourly while due without an @mention. Reading the channel does not acknowledge the reminder or reset its timing.
+_Avoid_: mark unread, read receipt
+
+**Conversation Reply**:
+An acknowledgment by the CCDM owner in an open **Project Conversation**, including text, voice messages, attachments, emoji reactions, and management commands. It clears the current reminder and pauses reminders until the agent next finishes its turn or asks for input; guest activity does not count.
+_Avoid_: read receipt, channel view
+
+**Closed Conversation**:
+A **Project Conversation** whose reminders the CCDM owner has ended with `/close`, independently of whether its coding agent is running. Only a new normal message from the owner reopens it; bot or guest activity does not.
+_Avoid_: stopped session, archived channel
+
 **End-to-End Test Suite**:
 Tests that execute CCDM's real command and bridge surfaces across realistic workflows, while replacing external services with local fakes by default.
 _Avoid_: unit coverage, atomic tests, coverage target

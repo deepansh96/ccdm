@@ -187,6 +187,12 @@ The stop/restart surfaces add these process-safety assumptions:
 - Signal ordering is asserted by observable outcomes: owned processes are gone after stop/restart. Exact shell builtin `kill -TERM` versus `kill -KILL` call ordering is intentionally not intercepted in the black-box harness.
 - General command teardown also sweeps detached process groups created by `runScript()` and waits up to 5 seconds after SIGTERM before SIGKILL, which covers background shell/curl/sleep/npx work left by statusline and restart-style scripts.
 
+The Conversation Reminder scenarios drive `scripts/conversation-reminder-service.py`, its provider adapters, and `scripts/install-conversation-reminder-service.sh` as Executable Surfaces:
+
+- The foreground worker runs against the stateful Discord fake in `preload.cjs`. That fake provides per-channel `history` with pagination, reaction membership, nonce-checked sends, deletions, and scripted failures. `CCDM_REMINDER_CLOCK_FILE` is a controllable clock, so expected times come from literal timelines instead of hour-long sleeps.
+- The fake Gateway hands each injected message to only one client. Scenarios that need both a coding adapter and the root observer run the adapter while the worker is stopped. The durable event ledger carries its events into the worker's restart reconciliation.
+- `conversation-reminder-launchagent.test.js` installs through the `launchctl` fixture, then launches the rendered plist's `ProgramArguments` with its rendered environment. It keeps the harness fixture `PATH` so the worker cannot fall through to host tools. It proves the single-worker lock across supervised and foreground launches, disable and re-enable, private state, and the both-provider reply, reminder, and reply-or-close workflow with stopped coding agents. No scenario loads a real LaunchAgent or contacts Discord.
+
 ## Diagnostics
 
 Command results include command metadata, cwd, redacted environment, stdout, stderr, exit code, signal, fixture state, and file snapshots. Diagnostics redact env values, headers, registry values, `.env` files, command lines, request bodies, OAuth tokens, Discord bot tokens, token-shaped strings, and `Authorization` headers before attaching failure context.

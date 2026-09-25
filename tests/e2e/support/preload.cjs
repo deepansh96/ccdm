@@ -10,6 +10,24 @@ const originalHttpsRequest = https.request.bind(https);
 const originalHttpsGet = https.get.bind(https);
 const originalSetInterval = globalThis.setInterval.bind(globalThis);
 
+// Simulated sleep: the wall clock jumps by the file's offset while monotonic
+// timers do not, as when a Mac wakes.
+if (process.env.CCDM_TEST_WALL_OFFSET_FILE) {
+  const realNow = Date.now.bind(Date);
+  let cached = { at: -Infinity, offset: 0 };
+  Date.now = () => {
+    const now = realNow();
+    if (now - cached.at > 100) {
+      let offset = 0;
+      try {
+        offset = Number(fs.readFileSync(process.env.CCDM_TEST_WALL_OFFSET_FILE, "utf8").trim()) || 0;
+      } catch { /* No offset yet. */ }
+      cached = { at: now, offset };
+    }
+    return now + cached.offset;
+  };
+}
+
 const stateDir = process.env.CCDM_TEST_STATE;
 const stateFile = stateDir ? path.join(stateDir, "state.json") : null;
 
@@ -93,11 +111,14 @@ function formBodyFields(body) {
   return fields;
 }
 
-function takeRestFailure(method, url) {
+function takeRestFailure(method, url, init = {}) {
   const state = readState();
   const failures = state.fixtures?.discord?.restFailures;
   if (!Array.isArray(failures) || failures.length === 0) return null;
-  const [failure, ...remaining] = failures;
+  const failure = failures[0];
+  if (failure.method && failure.method !== method) return null;
+  if (failure.path && failure.path !== url.pathname) return null;
+  const remaining = failures.slice(1);
   updateState((nextState) => {
     nextState.fixtures.discord.restFailures = remaining;
     nextState.fixtures.discord.restFailureUses ||= [];
@@ -106,6 +127,14 @@ function takeRestFailure(method, url) {
       path: url.pathname,
       status: failure.status ?? 500,
     });
+    if (method === "DELETE" && /^\/api\/v10\/channels\/[^/]+\/messages\/[^/]+$/.test(url.pathname)) {
+      const parts = url.pathname.split("/");
+      nextState.fixtures.discord.deletes ||= [];
+      nextState.fixtures.discord.deletes.push({ method, channelId: parts[4], messageId: parts[6],
+        authorization: headerValue(init.headers, "Authorization"), status: failure.status ?? 500 });
+      nextState.fixtures.discord.reminderRequests ||= [];
+      nextState.fixtures.discord.reminderRequests.push({ method: "DELETE", messageId: parts[6] });
+    }
   });
   return response(JSON.stringify(failure.body ?? { message: `status ${failure.status ?? 500}` }), {
     headers: { "content-type": "application/json" },
@@ -113,10 +142,96 @@ function takeRestFailure(method, url) {
   });
 }
 
+// Discord knows a created message's author from the token that created it.
+function authorForToken(authorization) {
+  try {
+    const root = process.env.CCDM_REMINDER_PROJECT_ROOT;
+    const registry = JSON.parse(fs.readFileSync(path.join(root, "registry.json"), "utf8"));
+    const bot = (registry.pool ?? []).find(entry => `Bot ${entry.token}` === authorization);
+    if (bot?.app_id) return String(bot.app_id);
+  } catch { /* Fall back to the single-bot fixture identity. */ }
+  return "app";
+}
+
+// Reminders the fake created, as a history read returns them: no nonce.
+function createdReminders(state, channelId) {
+  if (state.fixtures?.discord?.includeSentInHistory === false) return [];
+  return (state.fixtures.discord.messages ?? [])
+    .filter(message => !message.deleted && message.requestBody?.nonce && message.channelId === channelId)
+    .map(message => ({ id: message.id, channel_id: message.channelId, content: message.content, type: 0,
+      attachments: [], author: { id: authorForToken(message.authorization), bot: true },
+      timestamp: message.timestamp }))
+    .reverse();
+}
+
+// Stateful per-channel history (newest first) with Discord's before/after
+// pagination and reaction membership. Kept apart from `restMessages`, which
+// other scenarios use as one shared recent-history page.
+function routeChannelHistory(url, method, init) {
+  if (url.hostname !== "discord.com" || method !== "GET") return null;
+  const listMatch = /^\/api\/v10\/channels\/([^/]+)\/messages$/.exec(url.pathname);
+  const reactionMatch = /^\/api\/v10\/channels\/([^/]+)\/messages\/([^/]+)\/reactions\/([^/]+)$/.exec(url.pathname);
+  const channelId = listMatch?.[1] ?? reactionMatch?.[1];
+  const state = readState();
+  const seeded = state.fixtures?.discord?.history?.[channelId];
+  if (!Array.isArray(seeded)) return null;
+  // Created reminders join the seeded history in timestamp order.
+  const history = [...seeded];
+  for (const reminder of createdReminders(state, channelId).reverse()) {
+    const index = history.findIndex(message => Date.parse(message.timestamp) <= Date.parse(reminder.timestamp));
+    history.splice(index < 0 ? history.length : index, 0, reminder);
+  }
+  const json = (body, status = 200) => response(JSON.stringify(body), {
+    headers: { "content-type": "application/json" }, status,
+  });
+  const limit = Number(url.searchParams.get("limit") || "50");
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    return json({ message: `Invalid limit: ${url.searchParams.get("limit")}` }, 400);
+  }
+  const authorization = headerValue(init.headers, "Authorization");
+  if (reactionMatch) {
+    const emoji = decodeURIComponent(reactionMatch[3]);
+    updateState((nextState) => {
+      nextState.fixtures.discord.reactionFetches ||= [];
+      nextState.fixtures.discord.reactionFetches.push({ authorization, channelId, emoji,
+        messageId: reactionMatch[2], limit });
+    });
+    if (!history.some(message => message.id === reactionMatch[2])) return json({ message: "Unknown Message" }, 404);
+    const users = state.fixtures.discord.reactionUsers?.[`${reactionMatch[2]}|${emoji}`] ?? [];
+    return json(users.slice(0, limit).map(id => ({ id, bot: false })));
+  }
+  const before = url.searchParams.get("before");
+  const after = url.searchParams.get("after");
+  if (before && after) return json({ message: "before and after are exclusive" }, 400);
+  let page = history.slice(0, limit);
+  if (before) {
+    const index = history.findIndex(message => message.id === before);
+    if (index < 0) return json({ message: "Unknown cursor" }, 400);
+    page = history.slice(index + 1, index + 1 + limit);
+  } else if (after) {
+    const index = after === "0" ? history.length : history.findIndex(message => message.id === after);
+    if (index < 0) return json({ message: "Unknown cursor" }, 400);
+    page = history.slice(Math.max(0, index - limit), index);
+  }
+  let crash = false;
+  updateState((nextState) => {
+    nextState.fixtures.discord.historyFetches ||= [];
+    nextState.fixtures.discord.historyFetches.push({ authorization, channelId, limit,
+      ...(before ? { before } : {}), ...(after ? { after } : {}) });
+    if (nextState.fixtures.discord.crashAfterHistoryPages > 0) {
+      nextState.fixtures.discord.crashAfterHistoryPages -= 1;
+      crash = nextState.fixtures.discord.crashAfterHistoryPages === 0;
+      if (crash) delete nextState.fixtures.discord.crashAfterHistoryPages;
+    }
+  });
+  if (crash) process.exit(86);
+  return json(page);
+}
+
 function routeDiscordApi(url, init = {}) {
   const method = (init.method || "GET").toUpperCase();
   if (url.hostname === "discord.com") {
-    const failure = takeRestFailure(method, url);
+    const failure = takeRestFailure(method, url, init);
     if (failure) return failure;
   }
 
@@ -282,6 +397,9 @@ function routeDiscordApi(url, init = {}) {
     });
   }
 
+  const historyRoute = routeChannelHistory(url, method, init);
+  if (historyRoute) return historyRoute;
+
   const listMessagesMatch = /^\/api\/v10\/channels\/([^/]+)\/messages$/.exec(url.pathname);
   if (url.hostname === "discord.com" && listMessagesMatch && method === "GET") {
     const limit = Number(url.searchParams.get("limit") || "20");
@@ -302,7 +420,10 @@ function routeDiscordApi(url, init = {}) {
         status: 400,
       });
     }
-    const messages = state.fixtures?.discord?.restMessages ?? [];
+    // Like Discord, created reminders stay in channel history, and a history
+    // read never returns the create-time nonce.
+    const sent = createdReminders(state, listMessagesMatch[1]);
+    const messages = [...sent, ...(state.fixtures?.discord?.restMessages ?? [])];
     const beforeIndex = before ? messages.findIndex((message) => message.id === before) : -1;
     const page = beforeIndex >= 0 ? messages.slice(beforeIndex + 1) : messages;
     return response(JSON.stringify(page.slice(0, limit)), {
@@ -313,24 +434,96 @@ function routeDiscordApi(url, init = {}) {
   const createMessageMatch = /^\/api\/v10\/channels\/([^/]+)\/messages$/.exec(url.pathname);
   if (url.hostname === "discord.com" && createMessageMatch && method === "POST") {
     const parsedBody = init.body ? JSON.parse(String(init.body)) : {};
+    if (parsedBody.enforce_nonce && (!parsedBody.nonce || typeof parsedBody.nonce !== "string")) {
+      return response(JSON.stringify({ message: "nonce required" }), { status: 400 });
+    }
     let created;
+    let crashAfterAccept = false;
+    let crashAfterResponseParsed = false;
     updateState((state) => {
       state.fixtures.discord.messages ||= [];
+      state.fixtures.discord.reminderRequests ||= [];
+      if (parsedBody.content === "👀") state.fixtures.discord.reminderRequests.push({ method: "POST" });
+      // Like Discord, enforce_nonce returns the same author's earlier message
+      // only within a few minutes of its creation; afterwards it creates anew.
+      const now = Date.parse(process.env.CCDM_REMINDER_CLOCK_FILE
+        ? fs.readFileSync(process.env.CCDM_REMINDER_CLOCK_FILE, "utf8").trim() : new Date().toISOString());
+      created = parsedBody.enforce_nonce && state.fixtures.discord.messages.find(entry =>
+        entry.channelId === createMessageMatch[1] && entry.requestBody?.nonce === parsedBody.nonce &&
+        entry.authorization === headerValue(init.headers, "Authorization") &&
+        now - Date.parse(entry.timestamp) <= 3 * 60000);
+      if (created) return;
       created = {
         authorization: headerValue(init.headers, "Authorization"),
         channelId: createMessageMatch[1],
         content: parsedBody.content ?? "",
         id: `fake-message-${state.fixtures.discord.messages.length + 1}`,
         messageReference: parsedBody.message_reference,
+        ...(parsedBody.enforce_nonce ? {
+          requestBody: parsedBody,
+          timestamp: process.env.CCDM_REMINDER_CLOCK_FILE
+            ? fs.readFileSync(process.env.CCDM_REMINDER_CLOCK_FILE, "utf8").trim()
+            : new Date().toISOString(),
+        } : {}),
       };
       state.fixtures.discord.messages.push(created);
+      if (parsedBody.content === "👀" && state.fixtures.discord.crashAfterReminderAccept) {
+        crashAfterAccept = true;
+        state.fixtures.discord.crashAfterReminderAccept = false;
+      }
+      if (parsedBody.content === "👀" && state.fixtures.discord.crashAfterReminderResponseParsed) {
+        crashAfterResponseParsed = true;
+        state.fixtures.discord.crashAfterReminderResponseParsed = false;
+      }
     });
-    return response(JSON.stringify({ id: created.id, content: created.content }), {
+    if (crashAfterAccept) process.exit(86);
+    // Discord accepted the reminder, then the gateway failed the response.
+    let acceptedFailure = null;
+    if (parsedBody.content === "👀") {
+      updateState((state) => {
+        acceptedFailure = state.fixtures.discord.restAcceptedFailures?.shift() ?? null;
+      });
+    }
+    if (acceptedFailure) {
+      return response(JSON.stringify({ message: `status ${acceptedFailure.status}` }), {
+        headers: { "content-type": "application/json" }, status: acceptedFailure.status,
+      });
+    }
+    const sentResponse = response(JSON.stringify({ id: created.id, content: created.content, timestamp: created.timestamp }), {
       headers: { "content-type": "application/json" },
     });
+    if (crashAfterResponseParsed) {
+      const parse = sentResponse.json.bind(sentResponse);
+      sentResponse.json = async () => {
+        await parse();
+        process.exit(86);
+      };
+    }
+    return sentResponse;
   }
 
   const getMessageMatch = /^\/api\/v10\/channels\/([^/]+)\/messages\/([^/]+)$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && getMessageMatch && method === "DELETE") {
+    let exists = false;
+    let crashAfterDelete = false;
+    updateState((state) => {
+      state.fixtures.discord.deletes ||= [];
+      state.fixtures.discord.reminderRequests ||= [];
+      state.fixtures.discord.deletes.push({ authorization: headerValue(init.headers, "Authorization"),
+        channelId: getMessageMatch[1], messageId: getMessageMatch[2] });
+      state.fixtures.discord.reminderRequests.push({ method: "DELETE", messageId: getMessageMatch[2] });
+      const message = state.fixtures.discord.messages?.find(entry => entry.id === getMessageMatch[2]);
+      exists = Boolean(message && !message.deleted);
+      if (exists) message.deleted = true;
+      if (exists && state.fixtures.discord.crashAfterReminderDelete) {
+        crashAfterDelete = true;
+        state.fixtures.discord.crashAfterReminderDelete = false;
+      }
+    });
+    if (crashAfterDelete) process.exit(86);
+    return exists ? response("", { status: 204 }) :
+      response(JSON.stringify({ message: "Unknown Message" }), { status: 404 });
+  }
   if (url.hostname === "discord.com" && getMessageMatch && method === "GET") {
     const state = readState();
     const message = (state.fixtures?.discord?.restMessages ?? []).find((entry) => entry.id === getMessageMatch[2]);
@@ -434,8 +627,39 @@ function routeDiscordCdn(url) {
 
 async function guardedFetch(input, init = {}) {
   const url = new URL(typeof input === "string" ? input : input.url);
+  if ((init.method || "GET").toUpperCase() === "POST" && url.hostname === "discord.com" &&
+      /^\/api\/v10\/channels\/[^/]+\/messages$/.test(url.pathname) &&
+      readState().fixtures?.discord?.restConnectFailures > 0) {
+    // The connection is refused before any request reaches Discord.
+    updateState(state => {
+      state.fixtures.discord.restConnectFailures -= 1;
+      state.fixtures.discord.connectFailureUses = (state.fixtures.discord.connectFailureUses || 0) + 1;
+    });
+    const cause = Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" });
+    throw Object.assign(new TypeError("fetch failed"), { cause });
+  }
   const routed = routeDiscordApi(url, init) ?? routeDiscordCdn(url, init);
-  if (routed) return routed;
+  if (routed) {
+    if ((init.method || "GET").toUpperCase() === "POST" &&
+        /^\/api\/v10\/channels\/[^/]+\/messages$/.test(url.pathname) &&
+        readState().fixtures?.discord?.restLoseResponse) {
+      updateState(state => {
+        // true loses one response; a number loses that many consecutive responses.
+        const remaining = Number(state.fixtures.discord.restLoseResponse) - 1;
+        state.fixtures.discord.restLoseResponse = remaining > 0 ? remaining : false;
+        state.fixtures.discord.lostResponseUses = (state.fixtures.discord.lostResponseUses || 0) + 1;
+      });
+      throw new Error("Local Fake lost the accepted Discord response");
+    }
+    const delay = readState().fixtures?.discord?.restResponseDelayMs || 0;
+    if (delay && (init.method || "GET").toUpperCase() === "POST" &&
+        /^\/api\/v10\/channels\/[^/]+\/messages$/.test(url.pathname)) {
+      updateState(state => { state.fixtures.discord.responsePending = true; });
+      await new Promise(resolve => setTimeout(resolve, delay));
+      updateState(state => { state.fixtures.discord.responsePending = false; });
+    }
+    return routed;
+  }
   recordBlocked("fetch", url.href);
   throw new Error(`Blocked unexpected fetch egress: ${url.href}`);
 }
