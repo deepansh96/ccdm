@@ -624,9 +624,13 @@ Claude OAuth accounts are discovered from the default `~/.claude` login and
 valid extra `~/.claude-*` config directories. Each extra directory must have a
 `.claude.json` with an OAuth organization name or email address; that label is
 used in the report. Its Keychain service is derived from the first eight hex
-characters of the SHA-256 hash of the config-directory path, while the default
-login uses `Claude Code-credentials`. No account names or local paths are
-hardcoded in the poster.
+characters of the SHA-256 hash of the config-directory path. The default
+`~/.claude` login can be in that hashed item (written when `CLAUDE_CONFIG_DIR`
+is set, as remote logins do) or in the plain `Claude Code-credentials` item
+(used by sessions without it), so the poster and `scripts/claude-usage.sh` read
+both and use the one that expires last, falling back to the other unexpired
+item if the API rejects it. No account names or local paths are hardcoded in
+the poster.
 
 Named and legacy Codex selectors may be mixed across configuration scopes. The
 poster preserves named-account default-first ordering, adds selected/configured

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -10,6 +11,10 @@ import { cleanup } from "./support/teardown.js";
 test.afterEach(async () => {
   await cleanup();
 });
+
+function serviceFor(configDir) {
+  return `Claude Code-credentials-${crypto.createHash("sha256").update(configDir).digest("hex").slice(0, 8)}`;
+}
 
 function localDateOffset(days) {
   const date = new Date();
@@ -164,7 +169,7 @@ test("claude usage report reads live OAuth data and local history from fixtures"
   assert.deepEqual(
     state.fixtures.security.invocations.map((entry) => entry.args),
     [
-      ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
+      ["find-generic-password", "-s", serviceFor(path.join(workspace.homeDir, ".claude")), "-w"],
       ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
     ],
   );
@@ -191,6 +196,74 @@ test("claude usage report reads live OAuth data and local history from fixtures"
     ],
   );
   assert.deepEqual(state.fixtures.network.blocked, []);
+});
+
+test("claude usage report uses whichever default-home Keychain item expires last", async () => {
+  const hashedService = (workspace) => serviceFor(path.join(workspace.homeDir, ".claude"));
+  const stale = {
+    claudeAiOauth: { accessToken: "fixture-stale-token", expiresAt: Date.now() - 60 * 60 * 1000 },
+  };
+  const fresh = {
+    claudeAiOauth: { accessToken: "fixture-oauth-token", expiresAt: Date.now() + 60 * 60 * 1000 },
+  };
+
+  for (const credentialsFor of [
+    (workspace) => ({ [hashedService(workspace)]: stale, "Claude Code-credentials": fresh }),
+    (workspace) => ({ [hashedService(workspace)]: fresh, "Claude Code-credentials": stale }),
+    (workspace) => ({ [hashedService(workspace)]: fresh }),
+  ]) {
+    const workspace = createWorkspace();
+    seedMinimalStats(workspace);
+    seedAnthropicRoutes(workspace);
+    const state = readState(workspace.stateDir);
+    state.fixtures.security.credentials = credentialsFor(workspace);
+    writeState(state, workspace.stateDir);
+
+    const result = await runScript(workspace, "scripts/claude-usage.sh");
+
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /Fixture User \(Fixture Example\)/);
+    assert.deepEqual(
+      readState(workspace.stateDir).fixtures.curl.requests.map((entry) => entry.headers.Authorization),
+      ["Bearer fixture-oauth-token", "Bearer fixture-oauth-token"],
+    );
+  }
+});
+
+test("claude usage report falls back to the other Keychain item when the API rejects a token", async () => {
+  const workspace = createWorkspace();
+  seedMinimalStats(workspace);
+  seedAnthropicRoutes(workspace);
+  const state = readState(workspace.stateDir);
+  state.fixtures.security.credentials = {
+    [serviceFor(path.join(workspace.homeDir, ".claude"))]: {
+      claudeAiOauth: { accessToken: "fixture-revoked-token", expiresAt: Date.now() + 2 * 60 * 60 * 1000 },
+    },
+    "Claude Code-credentials": {
+      claudeAiOauth: { accessToken: "fixture-oauth-token", expiresAt: Date.now() + 60 * 60 * 1000 },
+    },
+  };
+  state.fixtures.curl.routes.unshift({
+    method: "GET",
+    path: "/api/oauth/profile",
+    headers: { Authorization: "Bearer fixture-revoked-token" },
+    json: { type: "error", error: { type: "authentication_error", message: "Invalid bearer token" } },
+  });
+  writeState(state, workspace.stateDir);
+
+  const result = await runScript(workspace, "scripts/claude-usage.sh");
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /Fixture User \(Fixture Example\)/);
+  assert.match(result.stdout, /5-Hour Session:/);
+  assert.deepEqual(
+    readState(workspace.stateDir).fixtures.curl.requests.map((entry) => [entry.path, entry.headers.Authorization]),
+    [
+      ["/api/oauth/profile", "Bearer fixture-revoked-token"],
+      ["/api/oauth/profile", "Bearer fixture-oauth-token"],
+      ["/api/oauth/usage", "Bearer fixture-oauth-token"],
+    ],
+  );
 });
 
 test("security and curl fixtures enforce route contracts and block unapproved targets", async () => {

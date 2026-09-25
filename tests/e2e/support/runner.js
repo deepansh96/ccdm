@@ -861,6 +861,9 @@ function routeMatches(route, request) {
   if (route.hostname && route.hostname !== request.parsedUrl.hostname) return false;
   if (route.path && route.path !== request.parsedUrl.pathname) return false;
   if (route.url && route.url !== request.parsedUrl.href) return false;
+  if (route.headers && Object.entries(route.headers).some(([name, value]) => request.headers[name] !== value)) {
+    return false;
+  }
   return true;
 }
 
