@@ -31,6 +31,10 @@ READINESS = importlib.util.module_from_spec(READINESS_SPEC)
 READINESS_SPEC.loader.exec_module(READINESS)
 SCHEMA_VERSION = 5
 CATCH_UP_SPACING = timedelta(seconds=5)
+# The root observer and a Codex bridge each report one Discord reaction with
+# their own event IDs, moments apart. Copies of the same reaction identity
+# inside this window are one acknowledgment; a later re-add is a new one.
+REACTION_DUPLICATE_WINDOW = timedelta(minutes=2)
 STATES = {"closed", "open-paused", "awaiting-owner"}
 # Both provider adapters must be installed before any channel may receive a
 # reminder; there is no Codex-only release.
@@ -302,6 +306,17 @@ def apply_payload(db: sqlite3.Connection, registry: dict, event: dict, commit_or
         if not duplicate_source:
             db.execute("INSERT INTO owner_sources VALUES (?,?,?,?)",
                        (event["project"], event["assignment_generation"], source, kind))
+    elif kind == "owner_activity" and event.get("reaction_emoji"):
+        # Discord gives a reaction no ID of its own: identify it by the reacted
+        # message, the reacting owner, and the emoji, stamped with its time.
+        prefix = f"reaction-add:{event['source_message_id']}:{event['actor_id']}:{event['reaction_emoji']}@"
+        seen = [iso(row[0][len(prefix):]) for row in db.execute("""SELECT source_message_id FROM owner_sources
+            WHERE project=? AND assignment_generation=? AND substr(source_message_id,1,?)=?""",
+            (event["project"], event["assignment_generation"], len(prefix), prefix))]
+        duplicate_source = any(abs(iso(occurred) - at) <= REACTION_DUPLICATE_WINDOW for at in seen)
+        if not duplicate_source:
+            db.execute("INSERT OR IGNORE INTO owner_sources VALUES (?,?,?,?)",
+                       (event["project"], event["assignment_generation"], prefix + occurred, "reaction"))
     stale_owner_event = (kind in {"close_requested", "owner_activity"} and current["last_ack_at"]
                          and iso(occurred) < iso(current["last_ack_at"]))
     if stale_owner_event or duplicate_source:

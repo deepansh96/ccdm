@@ -595,3 +595,105 @@ test("a completion notification without a turn ID cannot end the active Codex ex
   assert.deepEqual(JSON.parse(result.stdout).events.map((event) => event.event_type), ["owner_activity", "response_delivered", "turn_completed"]);
   await bridge.stop();
 });
+
+test("an owner reaction that starts a Codex turn keeps its reminder correlation", async () => {
+  const workspace = createBridgeWorkspace();
+  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  const codex = await startFakeCodexServer(workspace, {
+    turns: [
+      { turnId: "answer-turn", status: "completed", completedItem: { type: "agentMessage", text: "first answer" } },
+      { turnId: "reaction-turn", status: "completed", completedItem: { type: "agentMessage", text: "reaction answer" } },
+    ],
+  });
+  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app", env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" } });
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  injectDiscordMessage(workspace, { id: "owner-question", content: "answer this" });
+  await waitForState(workspace, (state) => state.fixtures.discord.sends?.some((row) => row.content === "first answer"));
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
+    if (JSON.parse(result.stdout).events.some((event) => event.event_type === "turn_completed")) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  injectDiscordReaction(workspace, { id: "owner-thumbs", emoji: "👍", messageId: "bot-answer" });
+  await waitForState(workspace, (state) => state.fixtures.discord.sends?.some((row) => row.content === "reaction answer"));
+  let events = [];
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
+    events = JSON.parse(result.stdout).events;
+    if (events.some((event) => event.event_type === "turn_completed" && event.provider_turn_id === "reaction-turn")) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const reaction = events.find((event) => event.event_type === "owner_activity" && event.activity_kind === "reaction");
+  assert.deepEqual([reaction.source_message_id, reaction.reaction_emoji], ["bot-answer", "👍"]);
+  // The reaction-started turn continues the owner's current interaction, so its
+  // confirmed reply and completion can re-arm a reminder.
+  const receipt = events.find((event) => event.event_type === "response_delivered" && event.provider_turn_id === "reaction-turn");
+  assert.equal(receipt?.interaction_id, "owner-question");
+  const completed = events.find((event) => event.event_type === "turn_completed" && event.provider_turn_id === "reaction-turn");
+  assert.equal(completed?.interaction_id, "owner-question");
+  assert.deepEqual(completed.delivered_message_ids, [receipt.message_id]);
+  await bridge.stop();
+});
+
+test("the automatic terminal retry keeps the owner's reminder correlation on its new turn", async () => {
+  const workspace = createBridgeWorkspace();
+  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  const codex = await startFakeCodexServer(workspace, {
+    turns: [
+      { turnId: "failed-turn", error: "stream disconnected before completion: response.failed event received" },
+      { turnId: "retry-turn", status: "completed", completedItem: { type: "agentMessage", text: "Recovered response" } },
+    ],
+  });
+  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app", env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" } });
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  injectDiscordMessage(workspace, { id: "owner-retry", content: "recover this turn" });
+  await waitForState(workspace, (state) => state.fixtures.discord.sends?.some((row) => row.content === "Recovered response"));
+  await bridge.waitForOutput(/Retrying terminal response\.failed turn once/, 5000);
+  let events = [];
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
+    events = JSON.parse(result.stdout).events;
+    if (events.some((event) => event.event_type === "turn_completed")) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const receipt = events.find((event) => event.event_type === "response_delivered");
+  assert.deepEqual([receipt?.provider_turn_id, receipt?.interaction_id], ["retry-turn", "owner-retry"]);
+  const completed = events.find((event) => event.event_type === "turn_completed");
+  assert.deepEqual([completed?.provider_turn_id, completed?.interaction_id, completed?.delivered_message_ids],
+    ["retry-turn", "owner-retry", [receipt.message_id]]);
+  assert.equal(events.some((event) => event.provider_turn_id === "failed-turn" && event.event_type !== "owner_activity"), false);
+  await bridge.stop();
+});
+
+test("a delivered scoped reply stays successful when its reminder receipt cannot be recorded", async () => {
+  const workspace = createBridgeWorkspace();
+  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  const codex = await startFakeCodexServer(workspace, {
+    turns: [{ turnId: "answer-turn", status: "completed", waitForRelease: true, mcpReply: true }],
+  });
+  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app" });
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  injectDiscordMessage(workspace, { id: "owner-message-1", content: "answer this" });
+  const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
+  const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
+  for (let attempt = 0; attempt < 100 && !fs.existsSync(contextFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.ok(fs.existsSync(contextFile));
+  // Receipt storage fails locally after Discord has accepted the reply.
+  const blocked = path.join(workspace.tmpDir, "receipts-are-a-file");
+  fs.writeFileSync(blocked, "not a directory");
+  const reply = await runNodeEntrypoint(workspace, "scripts/discord-mcp-server.js", {
+    env: bridgeChildEnv(workspace, { ...config.params.value.env, CCDM_REMINDER_RECEIPTS_DIR: blocked }),
+    input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "reply", arguments: { text: "Here is the answer", scope_token: config.params.value.env.DISCORD_REPLY_TOKEN } } }) + "\n",
+  });
+  const response = JSON.parse(reply.stdout);
+  assert.equal(response.result.isError, undefined, reply.stdout);
+  assert.equal(response.result.content[0].text, "sent (id: fake-message-1)");
+  assert.match(reply.stderr, /reply fake-message-1 was delivered but its Conversation Reminder receipt was not recorded/);
+  assert.equal(readState(workspace.stateDir).fixtures.discord.messages.filter((row) => row.content === "Here is the answer").length, 1);
+  codex.releaseTurn("answer-turn");
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  // Without a confirmed receipt the turn cannot qualify a reminder.
+  const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
+  assert.equal(JSON.parse(result.stdout).events.some((event) => event.event_type === "turn_completed"), false);
+  await bridge.stop();
+});

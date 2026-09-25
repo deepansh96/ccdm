@@ -409,7 +409,13 @@ async function handleToolCall(name, args) {
         result = await discordPost(`/channels/${channelId}/messages`, body);
       }
       if (reminderContext) {
-        await reminderAdapter.recordDeliveredReply(reminderContext, result.id, conversation_disposition);
+        // Discord already accepted the reply. A local receipt failure only
+        // leaves this reply unable to qualify a reminder; reporting it as a
+        // tool error would invite a duplicate send.
+        await reminderAdapter.recordDeliveredReply(reminderContext, result.id, conversation_disposition)
+          .catch((error) => {
+            process.stderr.write(`Discord MCP: reply ${result.id} was delivered but its Conversation Reminder receipt was not recorded: ${error.message}\n`);
+          });
       }
       return `sent (id: ${result.id})`;
     }

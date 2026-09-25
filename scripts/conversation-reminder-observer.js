@@ -186,13 +186,20 @@ async function observeMessage(message) {
   });
 }
 
+function reactionEmoji(reaction) {
+  return String(reaction.emoji?.id || reaction.emoji?.name || "") || undefined;
+}
+
 async function observeReaction(reaction, user) {
   if (user?.bot) return;
   const found = await assignment(reaction.message?.channel?.id || reaction.message?.channelId);
   if (!found || user.id !== found.owner_id) return;
   // Any owner reaction acknowledges, including one on a recorded reminder.
+  // The stable reaction identity lets the service merge this copy with the
+  // Codex bridge's copy of the same Discord reaction.
   await reminder.emitEvent("owner_activity", { ...found, provider: "ccdm-root" }, {
     actor_id: user.id, source_message_id: reaction.message.id, activity_kind: "reaction",
+    reaction_emoji: reactionEmoji(reaction),
   });
 }
 

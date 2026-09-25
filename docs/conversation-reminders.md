@@ -128,6 +128,7 @@ A channel released while overdue, either by initial discovery or by reconciliati
 - History cannot show deleted messages. A reaction that was added and then removed while nothing was observing cannot be seen either. Both may be unrecoverable.
 - Reaction membership shows who reacted, not when. Each message's first accounted owner reaction is remembered. A later owner reaction on that same earlier message, added while disconnected, is not detected.
 - A reaction acknowledges the conversation and pauses it until the agent next finishes a turn or asks for input. If no qualifying response follows, the conversation stays paused indefinitely. Send a new message to restart the exchange.
+- The root observer and a Codex bridge both report a live owner reaction. The service counts copies of the same reaction (the same message, owner, and emoji within two minutes) once, so a delayed copy cannot clear a later reminder. Re-adding that emoji later is a new acknowledgment.
 
 ## History discovery
 

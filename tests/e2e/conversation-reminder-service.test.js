@@ -1313,6 +1313,47 @@ test("duplicate owner observations from root and project adapters do not cancel 
   assert.equal((await command(workspace, stateDir, "status")).conversations.demo.state, "awaiting-owner");
 });
 
+test("a delayed copy of an owner reaction cannot clear a later arm, but a distinct later reaction does", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  const turn = { provider_session_id: "session", provider_turn_id: "turn", interaction_id: "question" };
+  const thumbs = { actor_id: "owner", source_message_id: "progress", activity_kind: "reaction", reaction_emoji: "👍" };
+  await event(workspace, stateDir, "owner_activity", "ask", "2026-09-24T10:00:00Z", {
+    actor_id: "owner", source_message_id: "question", activity_kind: "message",
+  });
+  await event(workspace, stateDir, "response_delivered", "progress-receipt", "2026-09-24T10:05:00Z", {
+    ...turn, message_id: "progress", disposition: "progress",
+  });
+  // The root observer commits its copy of the owner's reaction promptly.
+  await event(workspace, stateDir, "owner_activity", "root-reaction", "2026-09-24T10:06:00Z", {
+    ...thumbs, provider: "ccdm-root",
+  });
+  await event(workspace, stateDir, "response_delivered", "final-receipt", "2026-09-24T10:30:00Z", {
+    ...turn, message_id: "final", disposition: "progress",
+  });
+  await event(workspace, stateDir, "turn_completed", "completion", "2026-09-24T10:30:00Z", {
+    ...turn, delivered_message_ids: ["progress", "final"],
+  });
+  await command(workspace, stateDir, "sync");
+  const armed = (await command(workspace, stateDir, "status")).conversations.demo;
+  assert.deepEqual([armed.state, armed.due_at], ["awaiting-owner", "2026-09-24T11:30:00Z"]);
+
+  // The Codex bridge's copy of that same reaction arrives only after the arm.
+  await event(workspace, stateDir, "owner_activity", "bridge-reaction", "2026-09-24T10:06:02Z", thumbs);
+  await command(workspace, stateDir, "sync");
+  const kept = (await command(workspace, stateDir, "status")).conversations.demo;
+  assert.deepEqual([kept.state, kept.due_at], ["awaiting-owner", "2026-09-24T11:30:00Z"]);
+
+  // Re-adding the same emoji later is a new acknowledgment.
+  await event(workspace, stateDir, "owner_activity", "readded-reaction", "2026-09-24T10:45:00Z", {
+    ...thumbs, provider: "ccdm-root",
+  });
+  await command(workspace, stateDir, "sync");
+  const acknowledged = (await command(workspace, stateDir, "status")).conversations.demo;
+  assert.deepEqual([acknowledged.state, acknowledged.due_at, acknowledged.last_ack_at],
+    ["open-paused", null, "2026-09-24T10:45:00Z"]);
+});
+
 test("disable survives restart and explicit enable preserves a closed conversation", async () => {
   const workspace = createWorkspace();
   const stateDir = setup(workspace);

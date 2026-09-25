@@ -45,6 +45,7 @@ ALLOWED_FIELDS = {
     "interaction_id",
     "actor_id",
     "activity_kind",
+    "reaction_emoji",
     "disposition",
     "delivered_message_ids",
     "resumed_from_turn_id",
@@ -233,6 +234,11 @@ def validate_event(event: object) -> dict:
             raise ValueError(f"{event_type} requires actor_id")
     if event_type == "owner_activity" and normalized.get("activity_kind") not in {"message", "attachment", "reaction", "management-command"}:
         raise ValueError("owner_activity requires a supported activity_kind")
+    if "reaction_emoji" in normalized and (
+        event_type != "owner_activity" or normalized.get("activity_kind") != "reaction"
+        or not isinstance(normalized["reaction_emoji"], str) or not normalized["reaction_emoji"]
+    ):
+        raise ValueError("reaction_emoji identifies only an owner reaction")
     if event_type == "close_requested" and normalized.get("command") != "/close":
         raise ValueError("close_requested requires the exact /close command")
     if event_type == "turn_completed":
@@ -376,7 +382,7 @@ def _event_summary(row: sqlite3.Row) -> dict:
     }
     for field in (
         "provider_session_id", "provider_turn_id", "message_id", "source_message_id",
-        "interaction_id", "activity_kind", "disposition", "delivered_message_ids",
+        "interaction_id", "activity_kind", "reaction_emoji", "disposition", "delivered_message_ids",
         "resumed_from_turn_id", "command",
     ):
         if field in event:

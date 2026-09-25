@@ -105,6 +105,9 @@ let activeTurnHadProgress = false;
 let activeTurnRecoveryAttempt = 0;
 let activeTurnChannelScopeToken = null;
 let activeReminderContext = null;
+// The owner's latest normal message is the Project Conversation's current
+// interaction; a reaction-started turn continues that interaction.
+let lastOwnerInteraction = null;
 let lastResumedInputReceiptId = null;
 let pendingInputNeededResumeTurnId = null;
 let rootAccess = null;
@@ -889,11 +892,22 @@ async function onTurnCompleted(turn = {}) {
   }
   if (terminalError?.recover) {
     console.log("Retrying terminal response.failed turn once");
+    // The retry answers the same owner interaction; sendTurn binds it to the
+    // retry's own turn ID so its reply and completion stay correlated.
+    const retrySource = completedContext
+      ? {
+        id: completedContext.interaction_id,
+        author: { id: completedContext.initiator_id },
+        reminderAssignment: completedContext,
+        synthetic: true,
+      }
+      : null;
     await sendTurn(
       [{ type: "text", text: STREAM_RECOVERY_PROMPT }],
       channelId,
       channelScopeToken,
-      recoveryAttempt + 1
+      recoveryAttempt + 1,
+      retrySource
     );
     return;
   }
@@ -916,7 +930,7 @@ async function onTurnCompleted(turn = {}) {
 async function processQueue() {
   if (bridgePaused || threadResetting || turnActive || !threadId || messageQueue.length === 0) return;
   const { input, msg: queuedMsg, channelId, channelScopeToken } = messageQueue.shift();
-  if (queuedMsg) {
+  if (queuedMsg && !queuedMsg.synthetic) {
     queuedMsg.reactions.cache.get("⏳")?.users.remove(queuedMsg.client.user.id).catch(() => {});
   }
   await sendTurn(input, channelId, channelScopeToken, 0, queuedMsg);
@@ -937,7 +951,7 @@ function canSteerRootScope(channelId, token) {
 async function routeInput(input, msg, channelId, channelScopeToken) {
   const queueInput = async () => {
     messageQueue.push({ input, msg, channelId, channelScopeToken });
-    if (msg) await msg.react("⏳");
+    if (msg && !msg.synthetic) await msg.react("⏳");
   };
 
   const rootScopeMatches = ROOT_MULTI_CHANNEL && canSteerRootScope(channelId, channelScopeToken);
@@ -1529,6 +1543,8 @@ function startDiscordBot() {
         actor_id: user.id,
         source_message_id: reaction.message.id,
         activity_kind: "reaction",
+        // Shared with the root observer's copy so the service counts it once.
+        reaction_emoji: String(reaction.emoji.id || reaction.emoji.name || "") || undefined,
       });
     }
     if (recordedReminder) return;
@@ -1536,7 +1552,14 @@ function startDiscordBot() {
 
     const { input, channelId, channelScopeToken } = buildReactionInput(reaction, user);
     console.log(`[discord] ${user.username}: ${reaction.emoji.name} on ${reaction.message.id}`);
-    await routeInput(input, null, channelId, channelScopeToken);
+    // A synthetic source message carries the reminder assignment and the
+    // conversation's current interaction, so the reaction-started turn's reply
+    // and completion re-arm reminders like any other owner exchange.
+    const reactionSource = assignment && user.id === assignment.owner_id && !ROOT_MULTI_CHANNEL &&
+      lastOwnerInteraction?.assignment_generation === assignment.assignment_generation
+      ? { id: lastOwnerInteraction.id, author: user, reminderAssignment: assignment, synthetic: true }
+      : null;
+    await routeInput(input, reactionSource, channelId, channelScopeToken);
   });
 
   client.on("messageCreate", async (msg) => {
@@ -1692,7 +1715,10 @@ function startDiscordBot() {
       ...(!ROOT_MULTI_CHANNEL && BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
     }).catch(() => null);
     if (assignment && msg.author.id === assignment.owner_id) {
-      if (!ROOT_MULTI_CHANNEL) msg.reminderAssignment = assignment;
+      if (!ROOT_MULTI_CHANNEL) {
+        msg.reminderAssignment = assignment;
+        lastOwnerInteraction = { id: msg.id, assignment_generation: assignment.assignment_generation };
+      }
       await reminderAdapter.emitEvent("owner_activity", reminderEventContext(assignment), {
         actor_id: msg.author.id,
         source_message_id: msg.id,
