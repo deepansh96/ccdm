@@ -729,8 +729,9 @@ test("a Claude input-needed receipt replayed after downtime gets one catch-up fr
   const released = await waitForStatus(current => current.conversations.demo.reminder_message_id);
   assert.equal(released.conversations.demo.state, "awaiting-owner");
   assert.equal(released.conversations.demo.response_message_id, "fake-message-1");
-  // The catch-up anchors the next hour to its own send time, not to the missed interval.
-  assert.equal(released.conversations.demo.due_at, at(3 * 3600000).replace(".000Z", "Z"));
+  // The catch-up anchors the next gap (two hours after one reminder) to its own
+  // send time, not to the missed interval.
+  assert.equal(released.conversations.demo.due_at, at(4 * 3600000).replace(".000Z", "Z"));
   assert.equal(released.readiness.projects.demo.delivery_ready, true);
   await new Promise(resolve => setTimeout(resolve, 700));
   assert.equal(readState(workspace.stateDir).fixtures.discord.messages.filter(row => row.content === "👀").length, 1);

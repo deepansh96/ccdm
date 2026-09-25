@@ -29,13 +29,22 @@ READINESS_PATH = Path(__file__).with_name("conversation-reminder-readiness.py")
 READINESS_SPEC = importlib.util.spec_from_file_location("ccdm_conversation_readiness", READINESS_PATH)
 READINESS = importlib.util.module_from_spec(READINESS_SPEC)
 READINESS_SPEC.loader.exec_module(READINESS)
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+# The first reminder follows a qualifying response by an hour; each further
+# ignored reminder waits longer, up to a daily reminder.
+FIRST_REMINDER_GAP = timedelta(hours=1)
+MAX_REMINDER_GAP = timedelta(hours=24)
 CATCH_UP_SPACING = timedelta(seconds=5)
 # The root observer and a Codex bridge each report one Discord reaction with
 # their own event IDs, moments apart. Copies of the same reaction identity
 # inside this window are one acknowledgment; a later re-add is a new one.
 REACTION_DUPLICATE_WINDOW = timedelta(minutes=2)
 STATES = {"closed", "open-paused", "awaiting-owner"}
+CONVERSATION_COLUMNS = {"project", "channel_id", "bot_id", "assignment_generation", "owner_id",
+                        "state", "revision", "last_ack_at", "last_ack_message_id",
+                        "current_interaction_id", "response_message_id", "response_at", "due_at",
+                        "reminder_message_id", "cleanup_message_ids", "last_event_order",
+                        "reconciliation_status", "checkpoint"}
 # Both provider adapters must be installed before any channel may receive a
 # reminder; there is no Codex-only release.
 PROVIDER_COMPONENTS = {
@@ -43,6 +52,11 @@ PROVIDER_COMPONENTS = {
     "claude": ("scripts/claude-reminder-channel.js", "scripts/claude-reminder-hook.js",
                "scripts/conversation-reminder-adapter.js"),
 }
+
+
+def reminder_gap(sent: int) -> timedelta:
+    """Return the wait before the next reminder after `sent` consecutive ignored ones."""
+    return FIRST_REMINDER_GAP if sent <= 0 else min(timedelta(hours=2 * sent), MAX_REMINDER_GAP)
 
 
 def store_path(state_dir: Path) -> Path:
@@ -65,7 +79,7 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
     db.execute("PRAGMA synchronous=FULL")
     db.execute("PRAGMA secure_delete=ON")
     version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version not in (0, 1, 2, 3, 4, SCHEMA_VERSION) or (version == 0 and existed):
+    if version not in (0, 1, 2, 3, 4, 5, SCHEMA_VERSION) or (version == 0 and existed):
         db.close()
         raise ValueError("conversation store schema is unsupported")
     if version == 0:
@@ -116,11 +130,8 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
         raise ValueError("conversation store is corrupt or unsupported")
     columns = {
         "settings": {"key", "value"},
-        "conversations": {"project", "channel_id", "bot_id", "assignment_generation", "owner_id",
-                          "state", "revision", "last_ack_at", "last_ack_message_id",
-                          "current_interaction_id", "response_message_id", "response_at", "due_at",
-                          "reminder_message_id", "cleanup_message_ids", "last_event_order",
-                          "reconciliation_status", "checkpoint"},
+        # The v6 reminder streak column is validated with the full schema after migrating.
+        "conversations": CONVERSATION_COLUMNS | ({"consecutive_reminders"} if version >= 6 else set()),
         "applied_events": {"event_id"},
         "owner_sources": {"project", "assignment_generation", "source_message_id", "kind"},
         "qualifications": {"project", "assignment_generation", "provider_session_id",
@@ -179,7 +190,19 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
             PRAGMA user_version=5;
             COMMIT;
         """)
+    if db.execute("PRAGMA user_version").fetchone()[0] == 5:
+        # Consecutive ignored reminders drive the backoff. A recorded reminder in an
+        # awaiting conversation has already been sent once; its pending due time stays.
+        db.executescript("""
+            BEGIN IMMEDIATE;
+            ALTER TABLE conversations ADD COLUMN consecutive_reminders INTEGER NOT NULL DEFAULT 0;
+            UPDATE conversations SET consecutive_reminders=1
+                WHERE reminder_message_id IS NOT NULL AND state='awaiting-owner';
+            PRAGMA user_version=6;
+            COMMIT;
+        """)
     expected = {
+        "conversations": CONVERSATION_COLUMNS | {"consecutive_reminders"},
         "delivery_intents": {"nonce", "project", "assignment_generation", "revision", "state",
                              "message_id", "claimed_at", "retry_at"},
         "retired_assignments": {"project", "assignment_generation", "channel_id", "bot_id",
@@ -365,8 +388,9 @@ def apply_payload(db: sqlite3.Connection, registry: dict, event: dict, commit_or
             final_receipt = receipts[-1] if len(receipts) == len(ids) else None
             if final_receipt and (not current["last_ack_at"] or iso(final_receipt) > iso(current["last_ack_at"])):
                 signal_time = max([iso(occurred), *map(iso, receipts)])
-                changes.update(state="awaiting-owner", response_message_id=ids[-1],
-                               response_at=stamp(signal_time), due_at=stamp(signal_time + timedelta(hours=1)))
+                # A fresh response starts a new streak, even while already awaiting.
+                changes.update(state="awaiting-owner", response_message_id=ids[-1], consecutive_reminders=0,
+                               response_at=stamp(signal_time), due_at=stamp(signal_time + reminder_gap(0)))
                 db.execute("INSERT INTO qualifications VALUES (?,?,?,?,?,?)", qualification)
     elif kind == "work_resumed" and current["state"] == "awaiting-owner":
         if event.get("interaction_id") == current["current_interaction_id"]:
@@ -379,6 +403,9 @@ def apply_payload(db: sqlite3.Connection, registry: dict, event: dict, commit_or
              event["assignment_generation"]))
         cleanup_ids = json.loads(current["cleanup_message_ids"])
         changes.update(reminder_message_id=None, cleanup_message_ids=json.dumps([*cleanup_ids, recorded_id]))
+    if "state" in changes and changes["state"] != "awaiting-owner":
+        # Any exit from awaiting the owner ends the ignored-reminder streak.
+        changes["consecutive_reminders"] = 0
     if "state" in changes or "due_at" in changes:
         changes["revision"] = current["revision"] + 1
         # A fresh arming or acknowledgment replaces any queued catch-up.
@@ -703,6 +730,7 @@ def status(state_dir: Path, project_root: Path | None = None) -> dict:
                 "current_interaction_id": row["current_interaction_id"],
                 "response_message_id": row["response_message_id"],
                 "response_at": row["response_at"], "due_at": row["due_at"],
+                "consecutive_reminders": row["consecutive_reminders"],
                 "reminder_message_id": row["reminder_message_id"],
                 "cleanup_message_ids": json.loads(row["cleanup_message_ids"]),
                 "reconciliation_status": row["reconciliation_status"], "checkpoint": row["checkpoint"],
@@ -1228,9 +1256,12 @@ def record_result(project_root: Path, state_dir: Path, nonce: str, outcome: str,
                     db.execute("UPDATE conversations SET cleanup_message_ids=? WHERE project=?",
                                (json.dumps(cleanup), intent["project"]))
                 else:
+                    # The next gap starts from the actual send and grows with the streak.
+                    sent = row["consecutive_reminders"] + 1
                     db.execute("""UPDATE conversations SET reminder_message_id=?, cleanup_message_ids=?,
-                        due_at=?, revision=revision+1 WHERE project=?""",
-                        (message_id, json.dumps(cleanup), stamp(delivery_time + timedelta(hours=1)), intent["project"]))
+                        due_at=?, consecutive_reminders=?, revision=revision+1 WHERE project=?""",
+                        (message_id, json.dumps(cleanup), stamp(delivery_time + reminder_gap(sent)), sent,
+                         intent["project"]))
                 if intent["state"] == "uncertain" and row["reconciliation_status"] == "suspended-uncertain-send":
                     db.execute("""UPDATE conversations SET reconciliation_status='suspended-restart-reconciliation'
                         WHERE project=?""", (intent["project"],))

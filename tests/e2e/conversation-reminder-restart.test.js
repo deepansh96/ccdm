@@ -131,17 +131,22 @@ test("downtime catch-up sends one reminder per overdue channel, spaced globally,
   const both = await waitForState(workspace, state => reminders(state).length === 2, 20000);
   assert.equal(reminders(both)[1].channelId, "beta-channel");
   const anchored = await waitForStatus(workspace, context, current =>
-    current.conversations.beta.due_at === "2026-09-20T16:20:05Z");
-  assert.equal(anchored.conversations.alpha.due_at, "2026-09-20T16:20:00Z");
+    current.conversations.beta.due_at === "2026-09-20T17:20:05Z");
+  // A catch-up is a real send: the streak grows and the next gap is two hours.
+  assert.deepEqual([anchored.conversations.alpha.due_at, anchored.conversations.alpha.consecutive_reminders],
+    ["2026-09-20T17:20:00Z", 1]);
   assert.deepEqual([anchored.conversations.gamma.state, anchored.conversations.gamma.last_ack_message_id],
     ["open-paused", "gamma-3"]);
 
-  context.setClock("2026-09-20T16:19:59Z");
+  context.setClock("2026-09-20T17:19:59Z");
   await settle();
-  assert.equal(reminders(readState(workspace.stateDir)).length, 2, "missed hourly intervals are never replayed");
-  context.setClock("2026-09-20T16:20:00Z");
-  const hourly = await waitForState(workspace, state => reminders(state).length === 3, 20000);
-  assert.equal(reminders(hourly)[2].channelId, "alpha-channel");
+  assert.equal(reminders(readState(workspace.stateDir)).length, 2, "missed intervals are never replayed");
+  context.setClock("2026-09-20T17:20:00Z");
+  const next = await waitForState(workspace, state => reminders(state).length === 3, 20000);
+  assert.equal(reminders(next)[2].channelId, "alpha-channel");
+  const backedOff = await waitForStatus(workspace, context, current =>
+    current.conversations.alpha.due_at === "2026-09-20T21:20:00Z");
+  assert.equal(backedOff.conversations.alpha.consecutive_reminders, 2);
   assert.equal(readState(workspace.stateDir).fixtures.codex.appServerInvocations.length, 0);
   await stopWorker(workspace, context, second);
 });
@@ -184,7 +189,7 @@ test("waking from sleep reconciles missed replies before any send and spaces ove
   const both = await waitForState(workspace, state => reminders(state).length === 2, 20000);
   assert.equal(reminders(both)[1].channelId, "beta-channel");
   const woke = await waitForStatus(workspace, context, current =>
-    current.conversations.beta.due_at === "2026-09-20T16:20:05Z");
+    current.conversations.beta.due_at === "2026-09-20T17:20:05Z");
   assert.deepEqual(names.map(name => woke.conversations[name].discovery.mode), ["restart", "restart", "restart"]);
   assert.deepEqual([woke.conversations.gamma.state, woke.conversations.gamma.last_ack_message_id],
     ["open-paused", "gamma-3"]);
@@ -300,7 +305,7 @@ test("a rate limit outranks catch-up spacing, and a restart during catch-up cann
   context.setClock("2026-09-20T15:21:00Z");
   const first = await waitForState(workspace, state => reminders(state).length === 1, 20000);
   assert.equal(reminders(first)[0].channelId, "alpha-channel");
-  await waitForStatus(workspace, context, current => current.conversations.alpha.due_at === "2026-09-20T16:21:00Z");
+  await waitForStatus(workspace, context, current => current.conversations.alpha.due_at === "2026-09-20T17:21:00Z");
   // Restart two seconds later: every channel reconciles again, yet the durable gate holds.
   await stopWorker(workspace, context, worker);
   await command(workspace, context, "enable");
@@ -325,8 +330,8 @@ test("a rate limit outranks catch-up spacing, and a restart during catch-up cann
   const gamma = await waitForState(workspace, state => reminders(state).length === 3, 20000);
   assert.equal(reminders(gamma)[2].channelId, "gamma-channel");
   assert.deepEqual((await waitForStatus(workspace, context, current =>
-    current.conversations.gamma.due_at === "2026-09-20T16:21:10Z")).conversations.beta.due_at,
-  "2026-09-20T16:21:05Z");
+    current.conversations.gamma.due_at === "2026-09-20T17:21:10Z")).conversations.beta.due_at,
+  "2026-09-20T17:21:05Z");
   await stopWorker(workspace, context, worker);
 });
 
@@ -421,7 +426,7 @@ test("disable lets an in-flight send finish, keeps closures, and re-enable recon
 
   const stopped = await command(workspace, context, "status");
   assert.equal(stopped.conversations.alpha.reminder_message_id, "fake-message-1", "the in-flight send was recorded");
-  assert.equal(stopped.conversations.alpha.due_at, "2026-09-20T16:20:00Z");
+  assert.equal(stopped.conversations.alpha.due_at, "2026-09-20T17:20:00Z");
   assert.deepEqual(stopped.unresolved_intents, []);
   assert.equal(stopped.conversations.beta.catch_up_queued, true);
   assert.equal(stopped.conversations.shut.state, "closed");
@@ -437,13 +442,13 @@ test("disable lets an in-flight send finish, keeps closures, and re-enable recon
     Array(3).fill("suspended-restart-reconciliation"));
   assert.equal(enabled.conversations.shut.state, "closed");
   assert.match(enabled.readiness.projects.alpha.blockers.join("\n"), /foreground worker is not running/);
-  context.setClock("2026-09-20T16:20:00Z");
+  context.setClock("2026-09-20T17:20:00Z");
   const again = startWorker(workspace, context);
   const reconciled = await waitForStatus(workspace, context, current => names.every(name =>
     current.conversations[name].reconciliation_status === "ready"));
   assert.deepEqual(names.map(name => reconciled.conversations[name].state), ["awaiting-owner", "open-paused", "closed"]);
-  const hourly = await waitForState(workspace, state => reminders(state).length === 2, 20000);
-  assert.equal(reminders(hourly)[1].channelId, "alpha-channel");
+  const next = await waitForState(workspace, state => reminders(state).length === 2, 20000);
+  assert.equal(reminders(next)[1].channelId, "alpha-channel");
   await settle();
   assert.equal(reminders(readState(workspace.stateDir)).length, 2);
   await stopWorker(workspace, context, again);
@@ -459,12 +464,12 @@ test("a catch-up waits for the cleanup backlog left before downtime", async () =
   await waitForStatus(workspace, context, current => current.conversations.alpha?.reconciliation_status === "ready");
   context.setClock("2026-09-20T09:05:00Z");
   await waitForState(workspace, state => reminders(state).length === 1, 20000);
-  await waitForStatus(workspace, context, current => current.conversations.alpha.due_at === "2026-09-20T10:05:00Z");
+  await waitForStatus(workspace, context, current => current.conversations.alpha.due_at === "2026-09-20T11:05:00Z");
   const seed = readState(workspace.stateDir);
   const failure = { method: "DELETE", path: "/api/v10/channels/alpha-channel/messages/fake-message-1", status: 500 };
   seed.fixtures.discord.restFailures = [failure, failure];
   writeState(seed, workspace.stateDir);
-  context.setClock("2026-09-20T10:05:00Z");
+  context.setClock("2026-09-20T11:05:00Z");
   await waitForState(workspace, state => state.fixtures.discord.restFailureUses?.length === 1, 20000);
   await stopWorker(workspace, context, first);
   const backlog = await command(workspace, context, "status");
@@ -482,8 +487,9 @@ test("a catch-up waits for the cleanup backlog left before downtime", async () =
   assert.deepEqual(sent.fixtures.discord.reminderRequests.slice(0, 6).map(row => row.method),
     ["POST", "POST", "DELETE", "DELETE", "DELETE", "POST"]);
   const anchored = await waitForStatus(workspace, context, current =>
-    current.conversations.alpha.due_at === "2026-09-20T16:20:01Z");
+    current.conversations.alpha.due_at === "2026-09-20T21:20:01Z");
   assert.equal(anchored.conversations.alpha.catch_up_queued, false);
+  assert.equal(anchored.conversations.alpha.consecutive_reminders, 3);
   await stopWorker(workspace, context, second);
 });
 
@@ -530,13 +536,13 @@ test("an uncertain delivery stays gated through restart until its nonce replay r
   const adopted = await waitForStatus(workspace, context, current =>
     current.conversations.alpha.reminder_message_id === "fake-message-1" &&
     current.conversations.alpha.reconciliation_status === "ready", 800);
-  assert.equal(adopted.conversations.alpha.due_at, "2026-09-20T10:05:00Z");
+  assert.equal(adopted.conversations.alpha.due_at, "2026-09-20T11:05:00Z");
   assert.deepEqual(adopted.unresolved_intents, []);
   context.setClock("2026-09-20T15:30:00Z");
   const resumed = await waitForState(workspace, state => reminders(state).length === 3, 20000);
   assert.deepEqual(reminders(resumed).map(row => row.channelId).sort(),
     ["alpha-channel", "alpha-channel", "beta-channel"]);
-  await waitForStatus(workspace, context, current => current.conversations.alpha.due_at === "2026-09-20T16:30:00Z");
+  await waitForStatus(workspace, context, current => current.conversations.alpha.due_at === "2026-09-20T19:30:00Z");
   await settle();
   assert.equal(reminders(readState(workspace.stateDir)).length, 3);
   await stopWorker(workspace, context, second);
@@ -617,7 +623,7 @@ test("unmet Claude prerequisites block enablement and cannot be bypassed into Co
   const sent = await waitForState(workspace, state => reminders(state).length === 1, 20000);
   assert.equal(reminders(sent)[0].authorization, "Bot token-alpha");
   const released = await waitForStatus(workspace, context, current =>
-    current.conversations.alpha.due_at === "2026-09-20T16:20:00Z");
+    current.conversations.alpha.due_at === "2026-09-20T17:20:00Z");
   assert.deepEqual([released.readiness.projects.alpha.delivery_ready, released.readiness.projects.alpha.blockers],
     [true, []]);
   await stopWorker(workspace, context, again);

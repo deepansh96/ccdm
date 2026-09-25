@@ -9,7 +9,7 @@ The ongoing exchange in one registered project channel, whether served by Claude
 _Avoid_: message thread, agent session when referring to the conversation
 
 **Conversation Reminder**:
-A standalone emoji message that draws attention to an open **Project Conversation** awaiting the CCDM owner's reply, recurring hourly while due without an @mention. Reading the channel does not acknowledge the reminder or reset its timing.
+A standalone emoji message that draws attention to an open **Project Conversation** awaiting the CCDM owner's reply, recurring without an @mention after one hour, then 2, 4, 6 … up to 24 hours between ignored reminders. Reading the channel does not acknowledge the reminder or reset its timing.
 _Avoid_: mark unread, read receipt
 
 **Conversation Reply**:
