@@ -1789,6 +1789,7 @@ print(json.dumps([db.execute('PRAGMA user_version').fetchone()[0],
       args: ["status", "--project-root", copy.repoDir, "--state-dir", copyDir],
     });
     assert.equal(result.exitCode, 2, script);
-    assert.equal(JSON.parse(result.stdout).status, "blocked");
+    assert.deepEqual(JSON.parse(result.stdout),
+      { status: "blocked", reason: "conversation store schema is unsupported" }, script);
   }
 });

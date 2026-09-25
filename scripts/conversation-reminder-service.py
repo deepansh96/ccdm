@@ -131,7 +131,9 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
     columns = {
         "settings": {"key", "value"},
         # The v6 reminder streak column is validated with the full schema after migrating.
-        "conversations": CONVERSATION_COLUMNS | ({"consecutive_reminders"} if version >= 6 else set()),
+        # Before v6 it may already exist if a concurrent open finished the migration.
+        "conversations": (CONVERSATION_COLUMNS | {"consecutive_reminders"},) + (
+            (CONVERSATION_COLUMNS,) if version < 6 else ()),
         "applied_events": {"event_id"},
         "owner_sources": {"project", "assignment_generation", "source_message_id", "kind"},
         "qualifications": {"project", "assignment_generation", "provider_session_id",
@@ -139,7 +141,8 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
         "pending_actions": {"action_id", "project", "kind", "message_id",
                             "assignment_generation", "completed"},
     }
-    if any({row[1] for row in db.execute(f"PRAGMA table_info({table})")} != expected
+    if any({row[1] for row in db.execute(f"PRAGMA table_info({table})")} not in
+           (expected if isinstance(expected, tuple) else (expected,))
            for table, expected in columns.items()):
         db.close()
         raise ValueError("conversation store schema is unsupported")
@@ -193,14 +196,14 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
     if db.execute("PRAGMA user_version").fetchone()[0] == 5:
         # Consecutive ignored reminders drive the backoff. A recorded reminder in an
         # awaiting conversation has already been sent once; its pending due time stays.
-        db.executescript("""
-            BEGIN IMMEDIATE;
-            ALTER TABLE conversations ADD COLUMN consecutive_reminders INTEGER NOT NULL DEFAULT 0;
-            UPDATE conversations SET consecutive_reminders=1
-                WHERE reminder_message_id IS NOT NULL AND state='awaiting-owner';
-            PRAGMA user_version=6;
-            COMMIT;
-        """)
+        # Re-read the version under the write lock: a concurrent open may have migrated.
+        db.execute("BEGIN IMMEDIATE")
+        if db.execute("PRAGMA user_version").fetchone()[0] == 5:
+            db.execute("ALTER TABLE conversations ADD COLUMN consecutive_reminders INTEGER NOT NULL DEFAULT 0")
+            db.execute("""UPDATE conversations SET consecutive_reminders=1
+                WHERE reminder_message_id IS NOT NULL AND state='awaiting-owner'""")
+            db.execute("PRAGMA user_version=6")
+        db.execute("COMMIT")
     expected = {
         "conversations": CONVERSATION_COLUMNS | {"consecutive_reminders"},
         "delivery_intents": {"nonce", "project", "assignment_generation", "revision", "state",
