@@ -420,7 +420,7 @@ test("a lost send response is resolved with the same nonce instead of risking a 
   assert.equal((await running).exitCode, 0);
 });
 
-test("a persistently lost response suspends until the running worker finds the reminder in history", async () => {
+test("a persistently lost response is recovered by replaying its nonce, never adopted from history", async () => {
   const workspace = createWorkspace();
   const stateDir = setup(workspace);
   await reconciledExchange(workspace, stateDir);
@@ -432,9 +432,10 @@ test("a persistently lost response suspends until the running worker finds the r
   const env = bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
     CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile });
   const seed = readState(workspace.stateDir);
-  // Discord accepts the first attempt, but every response is lost and the
-  // history the worker reads first does not yet show the reminder.
-  seed.fixtures.discord.restLoseResponse = 3;
+  // Discord accepts the first attempt, but every send response and the first
+  // nonce replays are lost. History never shows the reminder, so only the
+  // intent's own nonce can identify it.
+  seed.fixtures.discord.restLoseResponse = 30;
   seed.fixtures.discord.includeSentInHistory = false;
   writeState(seed, workspace.stateDir);
   const args = ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir];
@@ -442,28 +443,25 @@ test("a persistently lost response suspends until the running worker finds the r
   const suspended = await waitForConversation(workspace, stateDir, current =>
     current?.reconciliation_status === "suspended-uncertain-send");
   assert.equal(suspended.conversations.demo.reminder_message_id, null);
+  await waitForState(workspace, state => (state.fixtures.discord.lostResponseUses ?? 0) >= 4, 20000);
   const lost = readState(workspace.stateDir).fixtures.discord;
-  assert.equal(lost.messages.length, 1, "every retry reused the nonce, so Discord kept one reminder");
-  assert.equal(lost.reminderRequests.filter(row => row.method === "POST").length, 3);
-  // Inside the identity window an empty history proves nothing, so the send
-  // stays suspended rather than being retried.
-  await new Promise(resolve => setTimeout(resolve, 6000));
+  assert.equal(lost.messages.length, 1, "every attempt and replay reused the nonce, so Discord kept one reminder");
   assert.equal((await command(workspace, stateDir, "status")).conversations.demo.reconciliation_status,
     "suspended-uncertain-send");
 
-  // Once history shows the assigned bot's own emoji, the worker records it
-  // without an operator and reconciles before releasing the channel.
-  const visible = readState(workspace.stateDir);
-  visible.fixtures.discord.includeSentInHistory = true;
-  writeState(visible, workspace.stateDir);
+  // The next replay inside Discord's duplicate-check window returns the
+  // reminder the lost request created; the worker records it without an operator.
+  const answering = readState(workspace.stateDir);
+  answering.fixtures.discord.restLoseResponse = false;
+  writeState(answering, workspace.stateDir);
   let found;
-  for (let attempt = 0; attempt < 60 && !found; attempt++) {
+  for (let attempt = 0; attempt < 160 && !found; attempt++) {
     const current = await command(workspace, stateDir, "status");
     if (current.conversations.demo.reminder_message_id === "fake-message-1" &&
         current.conversations.demo.reconciliation_status === "ready") found = current;
     else await new Promise(resolve => setTimeout(resolve, 250));
   }
-  assert.ok(found, "the worker resolved the lost reminder from history");
+  assert.ok(found, "the worker resolved the lost reminder through its nonce");
   assert.equal(found.conversations.demo.due_at, "2026-09-24T12:00:00Z");
   assert.deepEqual(found.unresolved_intents, []);
   await command(workspace, stateDir, "disable");
@@ -483,7 +481,10 @@ test("server errors that never created a reminder release the channel once the i
   const env = bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
     CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile });
   const seed = readState(workspace.stateDir);
-  seed.fixtures.discord.restFailures = [503, 502, 504].map(status => ({ method: "POST", status }));
+  // Every send attempt and nonce replay inside the duplicate-check window fails
+  // before Discord creates anything.
+  seed.fixtures.discord.restFailures = Array.from({ length: 30 }, (_, index) =>
+    ({ method: "POST", status: [503, 502, 504][index % 3] }));
   writeState(seed, workspace.stateDir);
   const running = runScript(workspace, "scripts/conversation-reminder-service.py", {
     args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir], env, timeoutMs: 60000 });
@@ -493,6 +494,9 @@ test("server errors that never created a reminder release the channel once the i
   // After the window closes, history covering it shows no reminder: the
   // channel reconciles and sends once more instead of waiting on an operator.
   fs.writeFileSync(clockFile, "2026-09-24T11:06:00Z");
+  const recovered = readState(workspace.stateDir);
+  recovered.fixtures.discord.restFailures = [];
+  writeState(recovered, workspace.stateDir);
   const sent = await waitForState(workspace, state => (state.fixtures.discord.messages ?? []).length === 1, 20000);
   assert.equal(sent.fixtures.discord.messages[0].content, "👀");
   const released = await waitForConversation(workspace, stateDir, current =>
@@ -503,7 +507,7 @@ test("server errors that never created a reminder release the channel once the i
   assert.equal((await running).exitCode, 0);
 });
 
-test("operator recovery finds a lost reminder by its bot, emoji, and claim time after restart", async () => {
+test("operator recovery replays the claim's nonce after restart instead of matching history", async () => {
   const workspace = createWorkspace();
   const stateDir = setup(workspace);
   await reconciledExchange(workspace, stateDir);
@@ -518,7 +522,7 @@ test("operator recovery finds a lost reminder by its bot, emoji, and claim time 
   const running = runScript(workspace, "scripts/conversation-reminder-service.py", { args, env, timeoutMs: 10000 });
   await waitForConversation(workspace, stateDir, current => current?.reminder_message_id === "fake-message-1");
   const seed = readState(workspace.stateDir);
-  seed.fixtures.discord.restLoseResponse = 3;
+  seed.fixtures.discord.restLoseResponse = 30;
   seed.fixtures.discord.includeSentInHistory = false;
   writeState(seed, workspace.stateDir);
   fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
@@ -528,20 +532,18 @@ test("operator recovery finds a lost reminder by its bot, emoji, and claim time 
   assert.equal((await running).exitCode, 0);
   await command(workspace, stateDir, "enable", { env });
 
-  const visible = readState(workspace.stateDir);
-  visible.fixtures.discord.includeSentInHistory = true;
-  writeState(visible, workspace.stateDir);
+  const answering = readState(workspace.stateDir);
+  answering.fixtures.discord.restLoseResponse = false;
+  writeState(answering, workspace.stateDir);
 
   const recovered = await command(workspace, stateDir, "recover", { env });
   assert.equal(recovered.recovered, 1);
   const observed = readState(workspace.stateDir).fixtures.discord;
-  assert.equal(observed.messages.length, 2);
+  assert.equal(observed.messages.length, 2, "the replay returned the accepted reminder instead of posting another");
   assert.equal(observed.messages[0].deleted, true);
   assert.equal(observed.messages[1].deleted, undefined);
   assert.equal((await command(workspace, stateDir, "status")).conversations.demo.due_at,
     "2026-09-24T13:00:00Z");
-  // One hourly send, then three same-nonce attempts that Discord deduplicated.
-  assert.equal(observed.reminderRequests.filter(row => row.method === "POST").length, 4);
   assert.equal(readState(workspace.stateDir).fixtures.codex.appServerInvocations.length, 0);
 });
 
@@ -567,7 +569,9 @@ test("an interrupted claim never adopts an unrelated emoji and is released once 
   ];
   writeState(fixture, workspace.stateDir);
 
-  // Inside the identity window, an empty result proves nothing.
+  // Past the nonce replay window but inside the identity window, an empty
+  // result proves nothing.
+  fs.writeFileSync(clockFile, "2026-09-24T11:03:00Z");
   const early = await command(workspace, stateDir, "recover", { env });
   assert.deepEqual([early.recovered, early.released], [0, 0]);
   assert.match(early.unresolved[0].reason, /identity window/);
@@ -589,7 +593,7 @@ test("an interrupted claim never adopts an unrelated emoji and is released once 
   assert.equal(discord.restMessages[0].content, "👀");
 });
 
-test("recovery refuses duplicate candidate identities across bounded history pages", async () => {
+test("recovery never adopts an unbound bot emoji in the claim window and keeps the intent suspended", async () => {
   const workspace = createWorkspace();
   const stateDir = setup(workspace);
   await reconciledExchange(workspace, stateDir);
@@ -602,16 +606,36 @@ test("recovery refuses duplicate candidate identities across bounded history pag
     CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile });
   const nonce = (await command(workspace, stateDir, "claim", { env })).claim.nonce;
   const fixture = readState(workspace.stateDir);
+  // One ordinary bare-emoji bot reply inside the window, on the second history
+  // page, as history returns it: no nonce, nothing that ties it to the claim.
   fixture.fixtures.discord.restMessages = Array.from({ length: 101 }, (_, index) => ({
-    id: `history-${index}`, content: index === 0 || index === 100 ? "👀" : "other",
-    author: { id: "app", bot: true }, timestamp: "2026-09-24T11:00:00Z",
+    id: `history-${index}`, content: index === 100 ? "👀" : "other",
+    author: { id: "app", bot: true }, timestamp: "2026-09-24T11:00:10Z",
   }));
   writeState(fixture, workspace.stateDir);
 
-  const recovered = await command(workspace, stateDir, "recover", { env });
-  assert.equal(recovered.recovered, 0);
-  assert.match(recovered.unresolved[0].reason, /multiple unrecorded reminders/);
-  assert.equal((await command(workspace, stateDir, "status")).unresolved_intents[0].nonce, nonce);
+  for (const clock of ["2026-09-24T11:03:00Z", "2026-09-24T12:10:00Z"]) {
+    fs.writeFileSync(clockFile, clock);
+    const recovered = await command(workspace, stateDir, "recover", { env });
+    assert.deepEqual([recovered.recovered, recovered.released], [0, 0]);
+    assert.deepEqual(recovered.unresolved[0].candidates, ["history-100"]);
+    assert.match(recovered.unresolved[0].reason, /no evidence binds them to this intent, so none was adopted/);
+    assert.match(recovered.unresolved[0].reason, /assignment-changed --project demo/);
+    const current = await command(workspace, stateDir, "status");
+    assert.equal(current.unresolved_intents[0].nonce, nonce);
+    assert.equal(current.conversations.demo.reconciliation_status, "suspended-uncertain-send");
+    assert.equal(current.conversations.demo.reminder_message_id, null);
+  }
+  const untouched = readState(workspace.stateDir).fixtures.discord;
+  assert.equal(untouched.deletes?.length || 0, 0);
+  assert.equal(untouched.messages?.length || 0, 0);
+
+  // Once the operator removes stray emoji, history proves nothing was sent.
+  const cleared = readState(workspace.stateDir);
+  cleared.fixtures.discord.restMessages = cleared.fixtures.discord.restMessages.filter(row => row.content !== "👀");
+  writeState(cleared, workspace.stateDir);
+  const released = await command(workspace, stateDir, "recover", { env });
+  assert.deepEqual([released.recovered, released.released, released.unresolved], [0, 1, []]);
 });
 
 test("a crash after Discord accepts a reminder recovers one identity without resending", async () => {
@@ -635,7 +659,8 @@ test("a crash after Discord accepts a reminder recovers one identity without res
   assert.equal(crashed.exitCode, 2);
   const afterCrash = readState(workspace.stateDir);
   assert.equal(afterCrash.fixtures.discord.messages.length, 1);
-  afterCrash.fixtures.discord.includeSentInHistory = true;
+  // Identity comes from the nonce replay, not from history.
+  afterCrash.fixtures.discord.includeSentInHistory = false;
   writeState(afterCrash, workspace.stateDir);
   const recovered = await command(workspace, stateDir, "recover", { env });
   assert.equal(recovered.recovered, 1);
@@ -663,9 +688,9 @@ test("a crash after receiving the Discord response still reconciles the durable 
     args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir], env, timeoutMs: 5000,
   });
   assert.equal(crashed.exitCode, 2);
-  const visible = readState(workspace.stateDir);
-  visible.fixtures.discord.includeSentInHistory = true;
-  writeState(visible, workspace.stateDir);
+  const hidden = readState(workspace.stateDir);
+  hidden.fixtures.discord.includeSentInHistory = false;
+  writeState(hidden, workspace.stateDir);
   const recovered = await command(workspace, stateDir, "recover", { env });
   assert.equal(recovered.recovered, 1);
   assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 1);
@@ -695,7 +720,6 @@ test("closure during a lost send keeps the conversation closed and replays clean
     actor_id: "owner", source_message_id: "close-after-send", command: "/close",
   });
   const visible = readState(workspace.stateDir);
-  visible.fixtures.discord.includeSentInHistory = true;
   visible.fixtures.discord.restFailures = [{ method: "DELETE", status: 503 }];
   writeState(visible, workspace.stateDir);
 
@@ -713,7 +737,8 @@ test("closure during a lost send keeps the conversation closed and replays clean
   const discord = readState(workspace.stateDir).fixtures.discord;
   assert.equal(discord.messages.length, 1);
   assert.equal(discord.messages[0].deleted, true);
-  assert.equal(discord.reminderRequests.filter(row => row.method === "POST").length, 1);
+  // The original send and one nonce replay, which returned the same reminder.
+  assert.equal(discord.reminderRequests.filter(row => row.method === "POST").length, 2);
   assert.equal(readState(workspace.stateDir).fixtures.codex.appServerInvocations.length, 0);
 });
 
@@ -729,6 +754,14 @@ test("denied identity lookup leaves an uncertain reminder suspended without anot
   const env = bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
     CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile });
   const nonce = (await command(workspace, stateDir, "claim", { env })).claim.nonce;
+  const refusing = readState(workspace.stateDir);
+  refusing.fixtures.discord.restFailures = [{ method: "POST", status: 403 }];
+  writeState(refusing, workspace.stateDir);
+  const replay = await command(workspace, stateDir, "recover", { env });
+  assert.equal(replay.recovered, 0);
+  assert.match(replay.unresolved[0].reason, /refused the nonce replay; restore assigned bot access/);
+
+  fs.writeFileSync(clockFile, "2026-09-24T11:03:00Z");
   const fixture = readState(workspace.stateDir);
   fixture.fixtures.discord.restFailures = [{ method: "GET", path: "/api/v10/channels/channel/messages",
     status: 403 }];

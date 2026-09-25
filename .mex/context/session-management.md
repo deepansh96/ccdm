@@ -16,7 +16,7 @@ edges:
     condition: when performing a start, stop, or restart
   - target: patterns/register-project.md
     condition: when assigning or releasing a project bot
-last_updated: 2026-09-24
+last_updated: 2026-09-25
 ---
 
 # Session Management
@@ -57,6 +57,6 @@ For an explicit history-preserving restart, use `scripts/start-codex-session.sh 
 
 ## Registration
 
-Registration claims the first free pool bot, writes a project entry, applies Discord channel isolation, writes bot/root access files, and starts the selected session. Deregistration performs full teardown, removes overrides/roles/access entries, resets the bot name, releases the pool record, and deletes the project entry. Both workflows then run `scripts/conversation-reminder-service.py assignment-changed --project <project>`, which retires the old reminder generation and writes a fresh `assignment_generation` for a registered project; see `docs/conversation-reminders.md`.
+Registration claims the first free pool bot, writes a project entry, applies Discord channel isolation, writes bot/root access files, and starts the selected session. Deregistration performs full teardown, removes overrides/roles/access entries, resets the bot name, releases the pool record, and deletes the project entry. Both workflows then run `scripts/conversation-reminder-service.py assignment-changed --project <project>`, which retires the old reminder generation, deletes its recorded reminders at once with the retired bot (reporting any it cannot delete as inaccessible), and writes a fresh `assignment_generation` for a registered project; see `docs/conversation-reminders.md`.
 
 Codex startup enumerates all MCP status pages (`data`, with legacy `servers`/`items` compatibility) and waits for the scoped Discord `reply` tool before creating/resuming the thread. `CODEX_MCP_READY_TIMEOUT_MS` defaults to 30000. Bootstrap is configuration-only and explicitly forbids tools or Discord writes. It stays tracked until completion; `CODEX_BOOTSTRAP_TIMEOUT_MS` defaults to 60000, after which the bridge pauses, requests interruption, and fails startup rather than declaring a still-running turn idle. Failed bootstrap completions also fail startup. Discord transport must use exposed MCP tools, never shell-launched replacements.

@@ -487,7 +487,7 @@ test("a catch-up waits for the cleanup backlog left before downtime", async () =
   await stopWorker(workspace, context, second);
 });
 
-test("an uncertain delivery stays gated through restart until history resolves its identity", async () => {
+test("an uncertain delivery stays gated through restart until its nonce replay resolves its identity", async () => {
   const workspace = createWorkspace();
   const context = setup(workspace, { alpha: "alpha-channel", beta: "beta-channel" });
   seedHistory(workspace, { "alpha-channel": answered("alpha"),
@@ -506,8 +506,11 @@ test("an uncertain delivery stays gated through restart until history resolves i
   assert.equal((await first).exitCode, 2);
   assert.equal(reminders(readState(workspace.stateDir)).length, 1);
 
-  // Within the claim's identity window an empty history proves nothing: alpha
-  // stays gated while beta reconciles normally.
+  // Until a nonce replay returns the accepted reminder, alpha stays gated while
+  // beta reconciles normally. History never shows the reminder here.
+  const losing = readState(workspace.stateDir);
+  losing.fixtures.discord.restLoseResponse = 30;
+  writeState(losing, workspace.stateDir);
   await command(workspace, context, "enable");
   context.setClock("2026-09-20T09:06:00Z");
   const second = startWorker(workspace, context);
@@ -519,14 +522,14 @@ test("an uncertain delivery stays gated through restart until history resolves i
   await settle();
   assert.equal(reminders(readState(workspace.stateDir)).length, 1, "the uncertain channel is never resent");
 
-  // Once history shows the assigned bot's own reminder, the worker adopts it
-  // and reconciles; it never duplicates the 09:05 reminder.
-  const visible = readState(workspace.stateDir);
-  visible.fixtures.discord.includeSentInHistory = true;
-  writeState(visible, workspace.stateDir);
+  // Once a replay inside Discord's duplicate-check window is answered, it
+  // returns the 09:05 reminder itself; the worker records it and reconciles.
+  const answering = readState(workspace.stateDir);
+  answering.fixtures.discord.restLoseResponse = false;
+  writeState(answering, workspace.stateDir);
   const adopted = await waitForStatus(workspace, context, current =>
     current.conversations.alpha.reminder_message_id === "fake-message-1" &&
-    current.conversations.alpha.reconciliation_status === "ready");
+    current.conversations.alpha.reconciliation_status === "ready", 800);
   assert.equal(adopted.conversations.alpha.due_at, "2026-09-20T10:05:00Z");
   assert.deepEqual(adopted.unresolved_intents, []);
   context.setClock("2026-09-20T15:30:00Z");

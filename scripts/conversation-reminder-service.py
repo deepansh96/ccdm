@@ -483,6 +483,46 @@ def assignment_changed(project_root: Path, state_dir: Path, name: str) -> dict:
         db.close()
 
 
+def pending_retired_cleanup(state_dir: Path, name: str) -> list[str]:
+    db = connect(state_dir)
+    if db is None:
+        return []
+    try:
+        return [row[0] for row in db.execute("""SELECT a.message_id FROM pending_actions a
+            JOIN retired_assignments r ON r.project=a.project AND r.assignment_generation=a.assignment_generation
+            WHERE a.project=? AND a.kind='delete' AND a.completed=0 ORDER BY a.rowid""", (name,))]
+    finally:
+        db.close()
+
+
+def cleanup_retired_now(project_root: Path, state_dir: Path, name: str) -> dict:
+    """Delete a retired assignment's recorded reminders at once, with its own bot.
+
+    The worker may be stopped, so the assignment-change workflow performs this
+    REST-only cleanup itself. Whatever cannot be deleted with the retired bot is
+    reported inaccessible; nothing waits silently for a future worker."""
+    if not pending_retired_cleanup(state_dir, name):
+        return {"completed": [], "inaccessible": [], "pending": []}
+    env = {**os.environ, "CCDM_REMINDER_PROJECT_ROOT": str(project_root), "CCDM_REMINDER_STATE_DIR": str(state_dir)}
+    outcome = {}
+    try:
+        completed = subprocess.run([os.environ.get("CCDM_REMINDER_NODE", "node"),
+                                    str(Path(__file__).with_name("conversation-reminder-observer.js")),
+                                    "--project-root", str(project_root), "--state-dir", str(state_dir),
+                                    "--cleanup-retired-once", "--project", name],
+                                   env=env, capture_output=True, text=True, timeout=120)
+        if completed.returncode == 0:
+            outcome = json.loads(completed.stdout)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        outcome = {}
+    result = {"completed": outcome.get("completed", []), "inaccessible": outcome.get("inaccessible", []),
+              "pending": pending_retired_cleanup(state_dir, name)}
+    if result["pending"]:
+        result["guidance"] = ("Retired cleanup could not run now. Start the worker, or run recover with the worker "
+                              "stopped, to retry it with the retired bot; or delete the listed messages in Discord.")
+    return result
+
+
 def provider_prerequisites(project_root: Path) -> dict:
     providers = {}
     for provider, components in PROVIDER_COMPONENTS.items():
@@ -712,10 +752,17 @@ def status(state_dir: Path, project_root: Path | None = None) -> dict:
                                         "the registration, run scripts/conversation-reminder-service.py "
                                         "assignment-changed --project " + ", ".join(sorted(blocked)) + "."
                                         if blocked else None),
-                "recovery_guidance": ("Run recover after restoring assigned bot access. If intent identity remains "
-                                      "unresolved, do not resend or delete by emoji; retain state and investigate "
-                                      "the listed nonce. Observation/history gaps remain a separate delivery gate."
-                                      if unresolved else "No unresolved delivery intents.")}
+                "recovery_guidance": ("Run recover after restoring assigned bot access. Recovery identifies a lost "
+                                      "reminder only by replaying its nonce inside Discord's duplicate-check window; "
+                                      "it never adopts or deletes a bot emoji found in history. If recover lists "
+                                      "unbound candidates, delete a stray reminder in Discord and run recover again, "
+                                      "or run assignment-changed --project <project> to retire the intent. Do not "
+                                      "resend or reset state. Observation/history gaps remain a separate delivery gate."
+                                      if unresolved else "No unresolved delivery intents."),
+                "retired_cleanup_guidance": ("Messages under retired_assignments[].cleanup.inaccessible could not be "
+                                             "deleted with the retired assignment's own bot. CCDM never borrows "
+                                             "another bot or widens permissions; delete them manually in Discord."
+                                             if any(row["cleanup"]["inaccessible"] for row in retired) else None)}
     finally:
         db.close()
 
@@ -1315,6 +1362,7 @@ def main() -> int:
             if not args.project:
                 raise ValueError("--project is required")
             result = assignment_changed(args.project_root, args.state_dir, args.project)
+            result["retired_cleanup"] = cleanup_retired_now(args.project_root, args.state_dir, args.project)
         elif args.command == "suspend":
             if not args.project or not args.generation or not args.reason:
                 raise ValueError("--project, --generation, and --reason are required")

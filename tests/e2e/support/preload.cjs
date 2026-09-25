@@ -444,8 +444,14 @@ function routeDiscordApi(url, init = {}) {
       state.fixtures.discord.messages ||= [];
       state.fixtures.discord.reminderRequests ||= [];
       if (parsedBody.content === "👀") state.fixtures.discord.reminderRequests.push({ method: "POST" });
+      // Like Discord, enforce_nonce returns the same author's earlier message
+      // only within a few minutes of its creation; afterwards it creates anew.
+      const now = Date.parse(process.env.CCDM_REMINDER_CLOCK_FILE
+        ? fs.readFileSync(process.env.CCDM_REMINDER_CLOCK_FILE, "utf8").trim() : new Date().toISOString());
       created = parsedBody.enforce_nonce && state.fixtures.discord.messages.find(entry =>
-        entry.channelId === createMessageMatch[1] && entry.requestBody?.nonce === parsedBody.nonce);
+        entry.channelId === createMessageMatch[1] && entry.requestBody?.nonce === parsedBody.nonce &&
+        entry.authorization === headerValue(init.headers, "Authorization") &&
+        now - Date.parse(entry.timestamp) <= 3 * 60000);
       if (created) return;
       created = {
         authorization: headerValue(init.headers, "Authorization"),

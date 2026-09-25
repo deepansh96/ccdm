@@ -264,6 +264,83 @@ test("a retired bot now serving another channel is not used for old cleanup", as
   await stopWorker(workspace, context, running);
 });
 
+// A stopped worker cannot clean up, so the assignment-change workflow removes
+// the retired reminder itself, with the retired bot, or reports it inaccessible.
+async function stoppedAfterReminder(workspace, context) {
+  await awaitingExchange(workspace, context.stateDir);
+  markReconciled(context.stateDir);
+  const running = startWorker(workspace, context);
+  await waitForStatus(workspace, context.stateDir, current =>
+    current.conversations.demo?.reminder_message_id === "fake-message-1");
+  await stopWorker(workspace, context, running);
+}
+
+test("assignment-changed deletes a retired reminder at once with the retired bot while the worker is stopped", async () => {
+  const workspace = createWorkspace();
+  const context = setup(workspace);
+  await stoppedAfterReminder(workspace, context);
+  const registry = readRegistry(workspace);
+  registry.projects.demo.bot_id = "bot2";
+  registry.pool[0].assigned_to = null;
+  registry.pool[1].assigned_to = "demo";
+  writeRegistry(workspace, registry);
+
+  const changed = await command(workspace, context.stateDir, "assignment-changed",
+    { args: ["--project", "demo"], env: context.env });
+  assert.deepEqual(changed.retired_cleanup, { completed: ["fake-message-1"], inaccessible: [], pending: [] });
+  assert.doesNotMatch(JSON.stringify(changed), /fixture-token/);
+  const discord = readState(workspace.stateDir).fixtures.discord;
+  assert.deepEqual(discord.deletes.map(row => [row.messageId, row.authorization]),
+    [["fake-message-1", "Bot fixture-token"]]);
+  assert.equal(discord.messages[0].deleted, true);
+  const current = await command(workspace, context.stateDir, "status");
+  assert.equal(current.worker_running, false);
+  assert.deepEqual(current.retired_assignments[0].cleanup,
+    { pending: [], completed: ["fake-message-1"], inaccessible: [] });
+  assert.equal(current.retired_cleanup_guidance, null);
+  assert.deepEqual(current.pending_actions, []);
+});
+
+test("assignment-changed reports a retired reminder it cannot delete as inaccessible, never pending", async () => {
+  for (const scenario of [
+    { name: "revoked", reason: "retired bot credentials were rejected",
+      prepare: workspace => {
+        const failing = readState(workspace.stateDir);
+        failing.fixtures.discord.restFailures = [{ method: "DELETE", status: 401 }];
+        writeState(failing, workspace.stateDir);
+      } },
+    { name: "reassigned", reason: "retired bot is now authorized for another assignment",
+      prepare: (workspace, registry) => {
+        registry.projects.other = { type: "codex", bot_id: "bot", channel_id: "other-channel",
+          assignment_generation: "other-generation" };
+        registry.pool[0].assigned_to = "other";
+      } },
+  ]) {
+    const workspace = createWorkspace();
+    const context = setup(workspace);
+    await stoppedAfterReminder(workspace, context);
+    const registry = readRegistry(workspace);
+    registry.projects.demo.bot_id = "bot2";
+    registry.pool[0].assigned_to = null;
+    registry.pool[1].assigned_to = "demo";
+    scenario.prepare(workspace, registry);
+    writeRegistry(workspace, registry);
+
+    const changed = await command(workspace, context.stateDir, "assignment-changed",
+      { args: ["--project", "demo"], env: context.env });
+    assert.deepEqual(changed.retired_cleanup, { completed: [], pending: [],
+      inaccessible: [{ message_id: "fake-message-1", reason: scenario.reason }] }, scenario.name);
+    const current = await command(workspace, context.stateDir, "status");
+    assert.deepEqual(current.retired_assignments[0].cleanup, { pending: [], completed: [],
+      inaccessible: [{ message_id: "fake-message-1", reason: scenario.reason }] }, scenario.name);
+    assert.match(current.retired_cleanup_guidance, /delete them manually in Discord/);
+    const discord = readState(workspace.stateDir).fixtures.discord;
+    assert.equal(discord.messages[0].deleted, undefined, scenario.name);
+    assert.ok((discord.deletes ?? []).every(row => row.authorization === "Bot fixture-token"), scenario.name);
+    await cleanup();
+  }
+});
+
 test("the generation contract gives an identical re-registration a new generation and rejects old events", async () => {
   const workspace = createWorkspace();
   const context = setup(workspace);

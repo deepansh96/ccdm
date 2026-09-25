@@ -16,6 +16,9 @@ const script = path.join(__dirname, "conversation-reminder-service.py");
 const projectRoot = process.argv[process.argv.indexOf("--project-root") + 1] || path.resolve(__dirname, "..");
 const stateDir = process.argv[process.argv.indexOf("--state-dir") + 1] || path.join(os.homedir(), ".local/state/ccdm/conversation-reminders");
 const recoverOnce = process.argv.includes("--recover-once");
+// REST-only retired cleanup for assignment-changed; it never logs in to the Gateway.
+const cleanupRetiredOnce = process.argv.includes("--cleanup-retired-once");
+const cleanupProject = cleanupRetiredOnce ? process.argv[process.argv.indexOf("--project") + 1] : null;
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildMessageReactions, GatewayIntentBits.MessageContent],
@@ -161,6 +164,70 @@ async function reportLeftover(action, reason) {
     [script, "leftover", "--state-dir", stateDir, "--action-id", action.action_id, "--reason", reason]);
 }
 
+// The assignment-change workflow removes a retired assignment's reminders at
+// once, with that assignment's own bot, instead of leaving them pending until
+// a worker runs. Anything it cannot remove is reported as inaccessible.
+const RETIRED_CLEANUP_ATTEMPTS = 3;
+
+async function cleanupRetired(project) {
+  const pending = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+    [script, "actions", "--project-root", projectRoot, "--state-dir", stateDir]);
+  const result = { completed: [], inaccessible: [] };
+  for (const action of JSON.parse(pending.stdout).actions) {
+    if (!action.retired || action.kind !== "delete" || action.project !== project) continue;
+    const credentials = await retiredCredentials(action);
+    let reason = credentials.reason;
+    if (credentials.token) {
+      const url = `https://discord.com/api/v10/channels/${encodeURIComponent(action.channel_id)}` +
+        `/messages/${encodeURIComponent(action.message_id)}`;
+      for (let attempt = 0; attempt < RETIRED_CLEANUP_ATTEMPTS; attempt++) {
+        let response;
+        try {
+          response = await fetch(url, { method: "DELETE", headers: { Authorization: `Bot ${credentials.token}` },
+            signal: AbortSignal.timeout(10000) });
+        } catch {
+          reason = "Discord did not answer the retired cleanup request; delete the message in Discord";
+          await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+          continue;
+        }
+        if (response.ok || response.status === 404) {
+          reason = null;
+          break;
+        }
+        if (response.status === 401 || response.status === 403) {
+          reason = response.status === 401
+            ? "retired bot credentials were rejected" : "retired bot no longer has access to the channel";
+          break;
+        }
+        reason = `Discord did not delete the retired reminder (HTTP ${response.status}); delete the message in Discord`;
+        let wait = 1000 * (attempt + 1);
+        if (response.status === 429) {
+          const body = await response.json().catch(() => ({}));
+          const seconds = Number(body.retry_after ?? response.headers.get("Retry-After"));
+          if (Number.isFinite(seconds) && seconds >= 0) wait = Math.max(wait, seconds * 1000);
+        } else if (response.status < 500) {
+          break;
+        }
+        if (wait > 10000) break;
+        await new Promise(resolve => setTimeout(resolve, wait));
+      }
+    }
+    try {
+      if (reason) {
+        await reportLeftover(action, reason);
+        result.inaccessible.push({ message_id: action.message_id, reason });
+      } else {
+        await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+          [script, "done", "--state-dir", stateDir, "--action-id", action.action_id]);
+        result.completed.push(action.message_id);
+      }
+    } catch {
+      // A running worker recorded this action first; its status is authoritative.
+    }
+  }
+  return result;
+}
+
 async function observeMessage(message) {
   if (message.author?.bot) return;
   const found = await assignment(message.channel?.id);
@@ -203,13 +270,25 @@ async function observeReaction(reaction, user) {
   });
 }
 
-// Discord does not return a message nonce on a later read, so a lost send is
-// identified by what the assigned bot itself posted around the claim: its own
-// exact reminder emoji, not yet recorded, inside a bounded window. The scan
-// stops at the claim time instead of walking to the start of the channel.
+// A lost reminder is identified only by evidence bound to its durable intent.
+// Discord deduplicates an enforce_nonce create for "the past few minutes" and
+// then returns the message the nonce already created. Inside a conservative
+// part of that window, recovery repeats the claim's exact create: the answer
+// is the reminder the lost request created, or the only one this nonce can
+// create. A later history read carries no nonce, so after the window history
+// can only prove that nothing was created. A bot 👀 found there is never
+// adopted, because nothing ties it to the intent.
+const NONCE_REPLAY_MS = 2 * 60000;
 const IDENTITY_SKEW_MS = 2 * 60000;
 const IDENTITY_WINDOW_MS = 5 * 60000;
 const IDENTITY_PAGES = 5;
+
+async function recordRecoveredSend(intent, result) {
+  await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+    [script, "result", "--project-root", projectRoot, "--state-dir", stateDir,
+      "--nonce", intent.nonce, "--outcome", "sent", "--message-id", result.messageId,
+      "--sent-at", result.sentAt]);
+}
 
 async function recoverIntents(scheduled = false) {
   const listed = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
@@ -233,12 +312,24 @@ async function recoverIntents(scheduled = false) {
       continue;
     }
     const claimed = Date.parse(intent.claimed_at);
+    const base = `https://discord.com/api/v10/channels/${encodeURIComponent(intent.channel_id)}/messages`;
+    if (await retryClockMs() <= claimed + NONCE_REPLAY_MS) {
+      const replay = await sendReminder(base, found.bot_token, intent.nonce);
+      if (replay.outcome === "sent") {
+        await recordRecoveredSend(intent, replay);
+        recovered++;
+        continue;
+      }
+      unresolved.push({ project: intent.project, nonce: intent.nonce, reason: replay.outcome === "access"
+        ? "Discord refused the nonce replay; restore assigned bot access, then retry recover"
+        : "the nonce replay got no usable answer; retrying while Discord's duplicate check still applies" });
+      continue;
+    }
     const lower = claimed - IDENTITY_SKEW_MS;
     const upper = claimed + IDENTITY_WINDOW_MS;
     const recorded = new Set(intent.recorded_message_ids || []);
-    const base = `https://discord.com/api/v10/channels/${encodeURIComponent(intent.channel_id)}/messages`;
     let before;
-    const matches = [];
+    const candidates = [];
     let complete = false;
     let reason = "bounded history did not reach the claim time; identity remains unresolved";
     for (let page = 0; page < IDENTITY_PAGES && !complete; page++) {
@@ -266,23 +357,22 @@ async function recoverIntents(scheduled = false) {
       for (const message of messages) {
         const at = Date.parse(message.timestamp);
         if (String(message.author?.id) === String(found.bot_app_id) && message.content === "👀" &&
-            at >= lower && at <= upper && !recorded.has(message.id)) matches.push(message);
+            at >= lower && at <= upper && !recorded.has(message.id)) candidates.push(message.id);
       }
       // Newest first: a page reaching past the window's start, or the start of
       // the channel, covers every message the claim could have produced.
       complete = messages.length < 100 || messages.some(message => Date.parse(message.timestamp) < lower);
       if (messages.length) before = messages[messages.length - 1].id;
     }
-    if (complete && matches.length > 1) {
-      reason = "multiple unrecorded reminders from the assigned bot match the claim; manual investigation required";
-    } else if (complete && matches.length === 1) {
-      await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
-        [script, "result", "--project-root", projectRoot, "--state-dir", stateDir,
-          "--nonce", intent.nonce, "--outcome", "sent", "--message-id", matches[0].id,
-          "--sent-at", matches[0].timestamp]);
-      recovered++;
+    if (complete && candidates.length) {
+      unresolved.push({ project: intent.project, nonce: intent.nonce, candidates,
+        reason: `${candidates.length} unrecorded 👀 message(s) from the assigned bot fall in the claim window, ` +
+          "but no evidence binds them to this intent, so none was adopted. If a listed message is a stray " +
+          "reminder, delete it in Discord and run recover; if it is an ordinary bot message, run " +
+          `assignment-changed --project ${intent.project} to retire the unresolved intent` });
       continue;
-    } else if (complete && await retryClockMs() > upper) {
+    }
+    if (complete && await retryClockMs() > upper) {
       // The whole window is visible and the bot posted nothing: the request
       // never created a reminder, so the channel may reconcile and send again.
       await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
@@ -290,9 +380,8 @@ async function recoverIntents(scheduled = false) {
           "--nonce", intent.nonce, "--outcome", "absent"]);
       released++;
       continue;
-    } else if (complete) {
-      reason = "no reminder is visible yet; retry after the identity window closes";
     }
+    if (complete) reason = "no reminder is visible yet; retry after the identity window closes";
     unresolved.push({ project: intent.project, nonce: intent.nonce, reason });
   }
   return { recovered, released, unresolved };
@@ -565,7 +654,17 @@ function shutdown() {
 }
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
-rootToken().then(token => client.login(token)).catch(error => {
-  process.stderr.write(`Conversation observer unavailable: ${error.message}\n`);
-  process.exit(2);
-});
+if (cleanupRetiredOnce) {
+  cleanupRetired(cleanupProject).then(result => {
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    process.exit(0);
+  }).catch(error => {
+    process.stderr.write(`Retired reminder cleanup unavailable: ${error.message}\n`);
+    process.exit(2);
+  });
+} else {
+  rootToken().then(token => client.login(token)).catch(error => {
+    process.stderr.write(`Conversation observer unavailable: ${error.message}\n`);
+    process.exit(2);
+  });
+}
