@@ -464,6 +464,29 @@ test("lost root observation access found at a registry change suspends delivery 
   await stopWorker(workspace, context, running);
 });
 
+test("an unavailable guild at startup blocks observation without crashing, and recovers", async () => {
+  const workspace = createWorkspace();
+  const context = setup(workspace);
+  fs.writeFileSync(context.clockFile, "2026-09-24T10:59:00Z");
+  await awaitingExchange(workspace, context.stateDir);
+  markReconciled(context.stateDir);
+  const outage = readState(workspace.stateDir);
+  outage.fixtures.discord.guildUnavailable = true;
+  writeState(outage, workspace.stateDir);
+  const running = startWorker(workspace, context);
+
+  await waitForStatus(workspace, context.stateDir, current =>
+    current.worker_running && current.observer_channels.demo === "blocked-observation-access");
+  const restored = readState(workspace.stateDir);
+  delete restored.fixtures.discord.guildUnavailable;
+  writeState(restored, workspace.stateDir);
+  // A registry change triggers revalidation at once instead of after the periodic interval.
+  writeRegistry(workspace, { ...readRegistry(workspace), revalidate: true });
+  await waitForStatus(workspace, context.stateDir, current =>
+    current.worker_running && current.observer_channels.demo === "ready-observe-only");
+  await stopWorker(workspace, context, running);
+});
+
 test("project stop and root restart keep the independent service and closed state", async () => {
   const workspace = createWorkspace();
   const context = setup(workspace);
