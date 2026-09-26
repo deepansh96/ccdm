@@ -327,8 +327,12 @@ config = {
 }
 if adapter_enabled == "1":
     version = subprocess.run(["claude", "--version"], capture_output=True, text=True)
-    if version.returncode != 0 or not re.match(r"^2\.1\.281(?:\s|$)", version.stdout.strip()):
-        sys.exit("Claude reminder adapter: unsupported Claude Code version (tested: 2.1.281)")
+    # Claude Code auto-updates, so accept any 2.x release from the first tested one;
+    # the MCP proxy still rejects a changed plugin server identity or capabilities.
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:\s|$)", version.stdout.strip())
+    parsed = tuple(int(part) for part in match.groups()) if match else None
+    if version.returncode != 0 or not parsed or parsed[0] != 2 or parsed < (2, 1, 281):
+        sys.exit("Claude reminder adapter: unsupported Claude Code version (requires 2.x from 2.1.281)")
     registry = json.loads((Path(root_dir) / "registry.json").read_text())
     bot_id = registry["projects"][project]["bot_id"]
     bots = [bot for bot in registry["pool"] if bot.get("id") == bot_id]

@@ -216,7 +216,7 @@ test("Claude reminder launch derives root mention identity from root state", asy
   assert.equal(mcp.mcpServers.discord.env.CCDM_CLAUDE_ROOT_APP_ID, "12345678");
 });
 
-test("Claude reminder launch rejects an unproven Claude Code version before tmux", async () => {
+async function adapterLaunchWithVersion(version) {
   const workspace = createWorkspace();
   const registry = buildClaudeRegistry(workspace);
   registry.root_bot_app_id = "root-app";
@@ -224,14 +224,28 @@ test("Claude reminder launch rejects an unproven Claude Code version before tmux
   const pluginDir = path.join(workspace.homeDir, ".claude", "plugins", "cache", "claude-plugins-official", "discord", "0.0.4");
   fs.mkdirSync(pluginDir, { recursive: true });
   fs.writeFileSync(path.join(pluginDir, "server.ts"), "// fixture official plugin\n");
-
   const result = await runScript(workspace, "scripts/start-session.sh", {
     args: ["alpha"],
-    env: { CCDM_CLAUDE_REMINDER_ADAPTER: "1", CCDM_FIXTURE_CLAUDE_VERSION: "1.0.0 (Claude Code fixture)" },
+    env: { CCDM_CLAUDE_REMINDER_ADAPTER: "1", CCDM_FIXTURE_CLAUDE_VERSION: `${version} (Claude Code fixture)` },
   });
-  assert.equal(result.exitCode, 1);
-  assert.match(result.stderr, /unsupported Claude Code version/);
-  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session, undefined);
+  return { result, session: readState(workspace.stateDir).fixtures.tmux?.sessions?.alpha_session };
+}
+
+test("Claude reminder launch rejects an unproven Claude Code version before tmux", async () => {
+  for (const version of ["1.0.0", "2.1.280", "3.0.0"]) {
+    const { result, session } = await adapterLaunchWithVersion(version);
+    assert.equal(result.exitCode, 1, version);
+    assert.match(result.stderr, /unsupported Claude Code version \(requires 2\.x from 2\.1\.281\)/, version);
+    assert.equal(session, undefined, version);
+  }
+});
+
+test("Claude reminder launch accepts auto-updated 2.x Claude Code versions", async () => {
+  for (const version of ["2.1.283", "2.1.300", "2.2.0"]) {
+    const { result, session } = await adapterLaunchWithVersion(version);
+    assert.equal(result.exitCode, 0, `${version}: ${result.stderr || result.stdout}`);
+    assert.ok(session, version);
+  }
 });
 
 test("start-session honors Claude model and effort overrides", async () => {
