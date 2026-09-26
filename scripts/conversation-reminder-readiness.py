@@ -138,7 +138,7 @@ def build_readiness(project_name: str, project_root: Path, state_dir: Path) -> d
         "events": receiver.get("events", []),
         "tested_runtime": {
             "bridge_contract": (
-                "Claude Code 2.1.281 command hooks and official Discord plugin 0.0.4 MCP stdio; local fake in the default E2E suite"
+                "Claude Code 2.x from 2.1.281 command hooks and official Discord plugin 0.0.4 MCP stdio; local fake in the default E2E suite"
                 if provider == "claude" else
                 "Codex app-server JSON-RPC over WebSocket; local fake in the default E2E suite"
             ),

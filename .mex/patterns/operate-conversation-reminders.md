@@ -33,6 +33,8 @@ Read `docs/conversation-reminders.md`. The service runs independently of coding 
 - Recovery never adopts or deletes a bot `👀` found in history; only a nonce replay or a recorded message ID identifies a reminder.
 - A reaction, including one on a reminder, can pause a conversation indefinitely until the next qualifying agent response; this is expected.
 - A Claude channel is ready only while its adapter launch runs. A plain `scripts/start-session.sh <project>` restart without `CCDM_CLAUDE_REMINDER_ADAPTER=1` leaves it blocked.
+- An adapter launch requires Claude Code 2.x from `2.1.281`, so auto-updates within 2.x keep working. After an update, confirm one adapter launch reaches `ready-observe-only`; if the plugin contract changed, the MCP proxy blocks it.
+- `--dangerously-load-development-channels server:discord` asks for first-use consent in the tmux pane ("I am using this for local development"). Send Enter to confirm; the session sits at the prompt until then. The startup notice "server:discord · no MCP server configured with that name" is stale — the capability marker written after the official plugin handshake is the real proof.
 - Sleep or a clock jump is handled like a restart: channels reconcile before any send, and overdue channels get spaced catch-ups.
 - Do not run live Discord or launchd checks as part of default tests; the Live Smoke Suite is separately gated.
 - The installer never touches the Usage Stats Poster LaunchAgent or its storage.

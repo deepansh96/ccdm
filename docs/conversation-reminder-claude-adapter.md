@@ -4,7 +4,7 @@ This prerequisite observes Claude Project Conversations and filters `/close` bef
 
 ## Launch
 
-The supported local combination tested on 2026-09-24 is Claude Code `2.1.281`, official `discord@claude-plugins-official` plugin `0.0.4` (its MCP server reports `1.0.0`), Bun `1.3.11`, Node `22.20.0`, and Python `3.10.4`. `start-session.sh` rejects other Claude Code versions or a missing pinned plugin before tmux starts. The MCP proxy rejects a changed server identity or missing channel/reply capabilities. The default E2E proof uses protocol fakes; it does not log in to Claude or Discord.
+The adapter accepts Claude Code 2.x from `2.1.281` (launches verified with `2.1.281` on 2026-09-24, `2.1.282` on 2026-09-25, and `2.1.283` on 2026-09-26), so Claude Code auto-updates keep working, with the official `discord@claude-plugins-official` plugin `0.0.4` (its MCP server reports `1.0.0`), Bun `1.3.11`, Node `22.20.0`, and Python `3.10.4`. `start-session.sh` rejects an older Claude Code, a different major version, or a missing pinned plugin before tmux starts. The MCP proxy rejects a changed server identity or missing channel/reply capabilities. The default E2E proof uses protocol fakes; it does not log in to Claude or Discord. If an update changes the plugin contract, the MCP proxy rejects the launch and readiness stays blocked; pin or fix it then.
 
 For a registered local Claude project, install the official plugin in the selected Claude home, then start the opt-in launch:
 
