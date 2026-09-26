@@ -10,7 +10,7 @@ edges:
     condition: for registry and lifecycle invariants
   - target: context/discord-security.md
     condition: for permissions, roles, tokens, and allowlists
-last_updated: 2026-09-24
+last_updated: 2026-09-25
 ---
 
 # Register Or Deregister A Project
@@ -26,6 +26,7 @@ last_updated: 2026-09-24
 
 ## Gotchas
 - One bot cannot serve two projects.
+- Reset the bot name with the bot's own token (`PATCH /users/@me {"username": "<botN>"}`). The root token can only change the guild nickname, not another bot's global username. Discord rate-limits username changes (roughly twice per hour), so rename one bot at a time and do not retry in a loop. Deleting the bot's member overwrite (`DELETE /channels/<channel>/permissions/<app_id>`) removes its access to its old channel; the `project-bot` role and the bot's own managed integration role stay on unassigned pool bots.
 - Never substitute a different Discord MCP for an authorized administration workflow; keep REST mutations limited to the exact guild, category, channel, bot, and permissions the user requested.
 - Update JSON structurally and preserve optional account/model fields.
 - Never assign a bot to Plan A general unless explicitly requested.
