@@ -98,7 +98,7 @@ test("a reconciled Project Conversation gets its first emoji only after a full h
   assert.equal((await running).exitCode, 0);
 });
 
-test("hourly replacement sends the exact emoji before deleting only the recorded reminder", async () => {
+test("ignored reminders back off 1h, 2h, 4h, 6h, 8h and each replacement posts before deleting the recorded one", async () => {
   const workspace = createWorkspace();
   const stateDir = setup(workspace);
   await reconciledExchange(workspace, stateDir);
@@ -111,31 +111,40 @@ test("hourly replacement sends the exact emoji before deleting only the recorded
     args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir],
     env: bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
       CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile }),
-    timeoutMs: 10000,
+    timeoutMs: 20000,
   });
   await waitForState(workspace, state => state.fixtures.discord.messages.length === 1);
-  await waitForConversation(workspace, stateDir, current => current?.due_at === "2026-09-24T12:00:00Z");
-  fs.writeFileSync(clockFile, "2026-09-24T11:59:59Z");
-  await new Promise(resolve => setTimeout(resolve, 600));
-  assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 1);
-  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
-  const observed = await waitForState(workspace, state => state.fixtures.discord.deletes?.length === 1);
-  assert.deepEqual(observed.fixtures.discord.messages.map(row => row.requestBody), [
-    { content: "👀", allowed_mentions: { parse: [] }, nonce: observed.fixtures.discord.messages[0].requestBody.nonce,
-      enforce_nonce: true },
-    { content: "👀", allowed_mentions: { parse: [] }, nonce: observed.fixtures.discord.messages[1].requestBody.nonce,
-      enforce_nonce: true },
-  ]);
-  assert.notEqual(observed.fixtures.discord.messages[0].requestBody.nonce,
-    observed.fixtures.discord.messages[1].requestBody.nonce);
-  assert.deepEqual(observed.fixtures.discord.deletes.map(row => row.messageId), ["fake-message-1"]);
-  assert.deepEqual(observed.fixtures.discord.reminderRequests.map(row => row.method), ["POST", "POST", "DELETE"]);
-  await waitForConversation(workspace, stateDir, current => current?.due_at === "2026-09-24T13:00:00Z");
+  let current = (await waitForConversation(workspace, stateDir, row =>
+    row?.due_at === "2026-09-24T13:00:00Z")).conversations.demo;
+  assert.equal(current.consecutive_reminders, 1);
+  // The response was at 10:00: reminders follow at 11:00, 13:00, 17:00, 23:00 and 07:00.
+  const schedule = [["2026-09-24T12:59:59Z", "2026-09-24T13:00:00Z", "2026-09-24T17:00:00Z"],
+    ["2026-09-24T16:59:59Z", "2026-09-24T17:00:00Z", "2026-09-24T23:00:00Z"],
+    ["2026-09-24T22:59:59Z", "2026-09-24T23:00:00Z", "2026-09-25T07:00:00Z"],
+    ["2026-09-25T06:59:59Z", "2026-09-25T07:00:00Z", "2026-09-25T17:00:00Z"]];
+  for (const [index, [early, due, next]] of schedule.entries()) {
+    fs.writeFileSync(clockFile, early);
+    await new Promise(resolve => setTimeout(resolve, 600));
+    assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, index + 1, `nothing before ${due}`);
+    fs.writeFileSync(clockFile, due);
+    await waitForState(workspace, state => state.fixtures.discord.deletes?.length === index + 1);
+    current = (await waitForConversation(workspace, stateDir, row => row?.due_at === next)).conversations.demo;
+    assert.equal(current.consecutive_reminders, index + 2);
+    assert.equal(current.reminder_message_id, `fake-message-${index + 2}`);
+  }
+  const observed = readState(workspace.stateDir).fixtures.discord;
+  assert.deepEqual(observed.messages.map(row => row.requestBody), observed.messages.map(row => ({
+    content: "👀", allowed_mentions: { parse: [] }, nonce: row.requestBody.nonce, enforce_nonce: true })));
+  assert.equal(new Set(observed.messages.map(row => row.requestBody.nonce)).size, 5);
+  assert.deepEqual(observed.deletes.map(row => row.messageId),
+    ["fake-message-1", "fake-message-2", "fake-message-3", "fake-message-4"]);
+  assert.deepEqual(observed.reminderRequests.map(row => row.method),
+    ["POST", "POST", "DELETE", "POST", "DELETE", "POST", "DELETE", "POST", "DELETE"]);
   await command(workspace, stateDir, "disable");
   assert.equal((await running).exitCode, 0);
 });
 
-test("a delayed Discord response anchors the next hour to message creation", async () => {
+test("a delayed Discord response anchors the next gap to message creation", async () => {
   const workspace = createWorkspace();
   const stateDir = setup(workspace);
   await reconciledExchange(workspace, stateDir);
@@ -157,7 +166,7 @@ test("a delayed Discord response anchors the next hour to message creation", asy
   fs.writeFileSync(clockFile, "2026-09-24T11:02:00Z");
   const sent = await waitForConversation(workspace, stateDir, current =>
     current?.reminder_message_id === "fake-message-1");
-  assert.equal(sent.conversations.demo.due_at, "2026-09-24T12:00:00Z");
+  assert.equal(sent.conversations.demo.due_at, "2026-09-24T13:00:00Z");
   await command(workspace, stateDir, "disable");
   assert.equal((await running).exitCode, 0);
 });
@@ -271,17 +280,17 @@ test("failed cleanup blocks another replacement until deletion succeeds", async 
   const seed = readState(workspace.stateDir);
   seed.fixtures.discord.restFailures = Array.from({ length: 20 }, () => ({ method: "DELETE", status: 503 }));
   writeState(seed, workspace.stateDir);
-  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
+  fs.writeFileSync(clockFile, "2026-09-24T13:00:00Z");
   await waitForState(workspace, state => state.fixtures.discord.deletes?.length === 1);
   assert.deepEqual((await command(workspace, stateDir, "status")).conversations.demo.cleanup_message_ids,
     ["fake-message-1"]);
-  fs.writeFileSync(clockFile, "2026-09-24T13:00:00Z");
+  fs.writeFileSync(clockFile, "2026-09-24T17:00:00Z");
   await new Promise(resolve => setTimeout(resolve, 450));
   assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 2);
   const recovery = readState(workspace.stateDir);
   recovery.fixtures.discord.restFailures = [];
   writeState(recovery, workspace.stateDir);
-  fs.writeFileSync(clockFile, "2026-09-24T13:00:01Z");
+  fs.writeFileSync(clockFile, "2026-09-24T17:00:01Z");
   await waitForState(workspace, state => state.fixtures.discord.deletes?.length >= 2);
   await waitForState(workspace, state => state.fixtures.discord.messages.length === 3);
   await command(workspace, stateDir, "disable");
@@ -307,14 +316,14 @@ test("cleanup waits for Discord's full 429 retry window before deleting by ID", 
   const seed = readState(workspace.stateDir);
   seed.fixtures.discord.restFailures = [{ method: "DELETE", status: 429, body: { retry_after: 360 } }];
   writeState(seed, workspace.stateDir);
-  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
+  fs.writeFileSync(clockFile, "2026-09-24T13:00:00Z");
   await waitForState(workspace, state => state.fixtures.discord.restFailureUses.length === 1);
   assert.deepEqual((await command(workspace, stateDir, "status")).conversations.demo.cleanup_message_ids,
     ["fake-message-1"]);
-  fs.writeFileSync(clockFile, "2026-09-24T12:05:59Z");
+  fs.writeFileSync(clockFile, "2026-09-24T13:05:59Z");
   await new Promise(resolve => setTimeout(resolve, 600));
   assert.equal(readState(workspace.stateDir).fixtures.discord.deletes.length, 1);
-  fs.writeFileSync(clockFile, "2026-09-24T12:06:00Z");
+  fs.writeFileSync(clockFile, "2026-09-24T13:06:00Z");
   await waitForState(workspace, state => state.fixtures.discord.deletes.length === 2);
   await waitForConversation(workspace, stateDir, current => current?.cleanup_message_ids.length === 0);
   assert.deepEqual(readState(workspace.stateDir).fixtures.discord.deletes.map(row => row.messageId),
@@ -342,17 +351,17 @@ test("Discord 429 preserves the prior reminder and waits for the advertised retr
   const seed = readState(workspace.stateDir);
   seed.fixtures.discord.restFailures = [{ method: "POST", status: 429, body: { retry_after: 360 } }];
   writeState(seed, workspace.stateDir);
-  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
+  fs.writeFileSync(clockFile, "2026-09-24T13:00:00Z");
   await waitForState(workspace, state => state.fixtures.discord.restFailureUses.length === 1);
   assert.equal((await command(workspace, stateDir, "status")).conversations.demo.reminder_message_id,
     "fake-message-1");
   assert.equal(readState(workspace.stateDir).fixtures.discord.deletes?.length || 0, 0);
-  fs.writeFileSync(clockFile, "2026-09-24T12:05:59Z");
+  fs.writeFileSync(clockFile, "2026-09-24T13:05:59Z");
   await new Promise(resolve => setTimeout(resolve, 650));
   assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 1);
-  fs.writeFileSync(clockFile, "2026-09-24T12:06:00Z");
+  fs.writeFileSync(clockFile, "2026-09-24T13:06:00Z");
   await waitForState(workspace, state => state.fixtures.discord.messages.length === 2);
-  await waitForConversation(workspace, stateDir, current => current?.due_at === "2026-09-24T13:06:00Z");
+  await waitForConversation(workspace, stateDir, current => current?.due_at === "2026-09-24T17:06:00Z");
   await command(workspace, stateDir, "disable");
   assert.equal((await running).exitCode, 0);
 });
@@ -376,13 +385,13 @@ test("a bot access failure suspends delivery without deleting the prior reminder
   const seed = readState(workspace.stateDir);
   seed.fixtures.discord.restFailures = [{ method: "POST", status: 403 }];
   writeState(seed, workspace.stateDir);
-  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
+  fs.writeFileSync(clockFile, "2026-09-24T13:00:00Z");
   await waitForState(workspace, state => state.fixtures.discord.restFailureUses.length === 1);
   const suspended = await waitForConversation(workspace, stateDir, current =>
     current?.reconciliation_status === "suspended-delivery-access");
   assert.equal(suspended.conversations.demo.reminder_message_id, "fake-message-1");
   assert.equal(readState(workspace.stateDir).fixtures.discord.deletes?.length || 0, 0);
-  fs.writeFileSync(clockFile, "2026-09-24T13:00:00Z");
+  fs.writeFileSync(clockFile, "2026-09-24T17:00:00Z");
   await new Promise(resolve => setTimeout(resolve, 600));
   assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 1);
   await command(workspace, stateDir, "disable");
@@ -406,11 +415,12 @@ test("a lost send response is resolved with the same nonce instead of risking a 
   const seed = readState(workspace.stateDir);
   seed.fixtures.discord.restLoseResponse = true;
   writeState(seed, workspace.stateDir);
-  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
+  fs.writeFileSync(clockFile, "2026-09-24T13:00:00Z");
   const replaced = await waitForConversation(workspace, stateDir, current =>
     current?.reminder_message_id === "fake-message-2" && current.cleanup_message_ids.length === 0);
   assert.equal(replaced.conversations.demo.reconciliation_status, "ready");
-  assert.equal(replaced.conversations.demo.due_at, "2026-09-24T13:00:00Z");
+  assert.equal(replaced.conversations.demo.due_at, "2026-09-24T17:00:00Z");
+  assert.equal(replaced.conversations.demo.consecutive_reminders, 2);
   const discord = readState(workspace.stateDir).fixtures.discord;
   assert.equal(discord.lostResponseUses, 1);
   assert.equal(discord.messages.length, 2, "the retry returned the created reminder instead of posting another");
@@ -462,7 +472,9 @@ test("a persistently lost response is recovered by replaying its nonce, never ad
     else await new Promise(resolve => setTimeout(resolve, 250));
   }
   assert.ok(found, "the worker resolved the lost reminder through its nonce");
-  assert.equal(found.conversations.demo.due_at, "2026-09-24T12:00:00Z");
+  // The recovered send counts as the first reminder in the streak.
+  assert.equal(found.conversations.demo.due_at, "2026-09-24T13:00:00Z");
+  assert.equal(found.conversations.demo.consecutive_reminders, 1);
   assert.deepEqual(found.unresolved_intents, []);
   await command(workspace, stateDir, "disable");
   assert.equal((await running).exitCode, 0);
@@ -501,7 +513,7 @@ test("server errors that never created a reminder release the channel once the i
   assert.equal(sent.fixtures.discord.messages[0].content, "👀");
   const released = await waitForConversation(workspace, stateDir, current =>
     current?.reminder_message_id === "fake-message-1");
-  assert.equal(released.conversations.demo.due_at, "2026-09-24T12:06:00Z");
+  assert.equal(released.conversations.demo.due_at, "2026-09-24T13:06:00Z");
   assert.equal(released.conversations.demo.discovery.mode, "restart");
   await command(workspace, stateDir, "disable");
   assert.equal((await running).exitCode, 0);
@@ -525,7 +537,7 @@ test("operator recovery replays the claim's nonce after restart instead of match
   seed.fixtures.discord.restLoseResponse = 30;
   seed.fixtures.discord.includeSentInHistory = false;
   writeState(seed, workspace.stateDir);
-  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
+  fs.writeFileSync(clockFile, "2026-09-24T13:00:00Z");
   await waitForConversation(workspace, stateDir, current =>
     current?.reconciliation_status === "suspended-uncertain-send");
   await command(workspace, stateDir, "disable");
@@ -542,8 +554,8 @@ test("operator recovery replays the claim's nonce after restart instead of match
   assert.equal(observed.messages.length, 2, "the replay returned the accepted reminder instead of posting another");
   assert.equal(observed.messages[0].deleted, true);
   assert.equal(observed.messages[1].deleted, undefined);
-  assert.equal((await command(workspace, stateDir, "status")).conversations.demo.due_at,
-    "2026-09-24T13:00:00Z");
+  const recoveredRow = (await command(workspace, stateDir, "status")).conversations.demo;
+  assert.deepEqual([recoveredRow.due_at, recoveredRow.consecutive_reminders], ["2026-09-24T17:00:00Z", 2]);
   assert.equal(readState(workspace.stateDir).fixtures.codex.appServerInvocations.length, 0);
 });
 
@@ -666,7 +678,7 @@ test("a crash after Discord accepts a reminder recovers one identity without res
   assert.equal(recovered.recovered, 1);
   assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 1);
   assert.equal((await command(workspace, stateDir, "status")).conversations.demo.due_at,
-    "2026-09-24T12:00:00Z");
+    "2026-09-24T13:00:00Z");
 });
 
 test("a crash after receiving the Discord response still reconciles the durable intent", async () => {
@@ -695,7 +707,7 @@ test("a crash after receiving the Discord response still reconciles the durable 
   assert.equal(recovered.recovered, 1);
   assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 1);
   assert.equal((await command(workspace, stateDir, "status")).conversations.demo.due_at,
-    "2026-09-24T12:00:00Z");
+    "2026-09-24T13:00:00Z");
 });
 
 test("closure during a lost send keeps the conversation closed and replays cleanup and acknowledgment", async () => {
@@ -820,7 +832,7 @@ test("recovery completes cleanup after Discord deleted the prior reminder but th
   const fixture = readState(workspace.stateDir);
   fixture.fixtures.discord.crashAfterReminderDelete = true;
   writeState(fixture, workspace.stateDir);
-  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
+  fs.writeFileSync(clockFile, "2026-09-24T13:00:00Z");
   const crashed = await running;
   assert.equal(crashed.exitCode, 2);
   assert.deepEqual((await command(workspace, stateDir, "status")).conversations.demo.cleanup_message_ids,
@@ -831,7 +843,7 @@ test("recovery completes cleanup after Discord deleted the prior reminder but th
   assert.equal(recovered.recovered, 0);
   const current = (await command(workspace, stateDir, "status")).conversations.demo;
   assert.deepEqual(current.cleanup_message_ids, []);
-  assert.equal(current.due_at, "2026-09-24T13:00:00Z");
+  assert.equal(current.due_at, "2026-09-24T17:00:00Z");
   const discord = readState(workspace.stateDir).fixtures.discord;
   assert.equal(discord.messages.length, 2);
   assert.deepEqual(discord.deletes.map(row => row.messageId), ["fake-message-1", "fake-message-1"]);
@@ -856,11 +868,11 @@ test("recovery deletes the prior reminder after a crash following local send con
     args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir], env, timeoutMs: 7000,
   });
   await waitForConversation(workspace, stateDir, current => current?.reminder_message_id === "fake-message-1");
-  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
+  fs.writeFileSync(clockFile, "2026-09-24T13:00:00Z");
   assert.equal((await running).exitCode, 2);
   const pending = (await command(workspace, stateDir, "status")).conversations.demo;
   assert.deepEqual(pending.cleanup_message_ids, ["fake-message-1"]);
-  assert.equal(pending.due_at, "2026-09-24T13:00:00Z");
+  assert.equal(pending.due_at, "2026-09-24T17:00:00Z");
   assert.equal(readState(workspace.stateDir).fixtures.discord.deletes?.length || 0, 0);
 
   const cleanEnv = bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
@@ -920,13 +932,13 @@ test("a restarted worker reconciles history before a previously ready channel se
   const enabled = await command(workspace, stateDir, "enable", { env });
   assert.equal(enabled.conversations.demo.reconciliation_status, "suspended-restart-reconciliation");
   assert.equal(readState(workspace.stateDir).fixtures.discord.fetches?.length ?? 0, 0);
-  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
+  fs.writeFileSync(clockFile, "2026-09-24T13:00:00Z");
   const second = runScript(workspace, "scripts/conversation-reminder-service.py", { args, env, timeoutMs: 10000 });
   const sent = await waitForState(workspace, state => state.fixtures.discord.messages.length === 2);
   assert.ok(sent.fixtures.discord.fetches.some(row => row.channelId === "channel" &&
     row.authorization === "Bot fixture-root-token"), "history is read before the channel is released");
   const released = await waitForConversation(workspace, stateDir, current =>
-    current?.due_at === "2026-09-24T13:00:00Z");
+    current?.due_at === "2026-09-24T17:00:00Z");
   assert.deepEqual([released.conversations.demo.discovery.mode, released.conversations.demo.discovery.basis],
     ["restart", "no-missed-activity"]);
   await new Promise(resolve => setTimeout(resolve, 600));
@@ -959,7 +971,7 @@ test("manual deletion does not acknowledge or accelerate a reminder and ordinary
   await new Promise(resolve => setTimeout(resolve, 600));
   assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 1);
   assert.equal((await command(workspace, stateDir, "status")).conversations.demo.state, "awaiting-owner");
-  fs.writeFileSync(clockFile, "2026-09-24T12:00:00Z");
+  fs.writeFileSync(clockFile, "2026-09-24T13:00:00Z");
   await waitForState(workspace, state => state.fixtures.discord.deletes?.length === 1);
   const after = await waitForConversation(workspace, stateDir, current =>
     current?.reminder_message_id === "fake-message-2" && current?.cleanup_message_ids.length === 0);
@@ -1106,7 +1118,7 @@ test("server errors retry the same nonce, so an accepted reminder is neither dup
   const recorded = await waitForConversation(workspace, stateDir, current =>
     current?.reminder_message_id === "fake-message-1");
   assert.equal(recorded.conversations.demo.reconciliation_status, "ready");
-  assert.equal(recorded.conversations.demo.due_at, "2026-09-24T12:00:00Z");
+  assert.equal(recorded.conversations.demo.due_at, "2026-09-24T13:00:00Z");
   const discord = readState(workspace.stateDir).fixtures.discord;
   assert.equal(discord.messages.length, 1, "one reminder exists and it is the recorded one");
   assert.equal(discord.reminderRequests.filter(row => row.method === "POST").length, 2);
@@ -1564,4 +1576,220 @@ test("a duplicate completion for the same visible answer cannot postpone its due
   await command(workspace, stateDir, "sync");
   assert.equal((await command(workspace, stateDir, "status")).conversations.demo.due_at,
     "2026-09-24T11:00:00Z");
+});
+
+// Drive reminder sends through the claim/result surface without a worker.
+// Queued cleanup is completed first so it never blocks the next claim.
+async function cli(workspace, stateDir, name, args = [], env = {}) {
+  const result = await runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: [name, "--project-root", workspace.repoDir, "--state-dir", stateDir, ...args], env,
+  });
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  return JSON.parse(result.stdout);
+}
+
+async function claimAt(workspace, stateDir, clockFile, at) {
+  fs.writeFileSync(clockFile, at);
+  for (const action of (await cli(workspace, stateDir, "actions")).actions) {
+    await cli(workspace, stateDir, "done", ["--action-id", action.action_id]);
+  }
+  return (await cli(workspace, stateDir, "claim", [], { CCDM_REMINDER_CLOCK_FILE: clockFile })).claim;
+}
+
+async function sendAt(workspace, stateDir, clockFile, at, messageId) {
+  const claim = await claimAt(workspace, stateDir, clockFile, at);
+  assert.ok(claim?.nonce, `a reminder is due at ${at}`);
+  await cli(workspace, stateDir, "result", ["--nonce", claim.nonce, "--outcome", "sent",
+    "--message-id", messageId, "--sent-at", at], { CCDM_REMINDER_CLOCK_FILE: clockFile });
+  return (await cli(workspace, stateDir, "status")).conversations.demo;
+}
+
+async function freshCompletion(workspace, stateDir, turn, interaction, time) {
+  await event(workspace, stateDir, "response_delivered", `${turn}-receipt`, time, {
+    provider_session_id: "session", provider_turn_id: turn, interaction_id: interaction,
+    message_id: `${turn}-answer`, disposition: "progress",
+  });
+  await event(workspace, stateDir, "turn_completed", `${turn}-completion`, time, {
+    provider_session_id: "session", provider_turn_id: turn, interaction_id: interaction,
+    delivered_message_ids: [`${turn}-answer`],
+  });
+  await cli(workspace, stateDir, "sync");
+  return (await cli(workspace, stateDir, "status")).conversations.demo;
+}
+
+function streak(row) {
+  return [row.state, row.due_at, row.consecutive_reminders];
+}
+
+function sql(database, script) {
+  const result = spawnSync("python3", ["-c", `import sqlite3,sys
+db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()`, database, script], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+}
+
+test("the reminder gap follows 1h, then 2h per ignored reminder, capped at 24h", async () => {
+  const workspace = createWorkspace();
+  const script = path.join(workspace.repoDir, "scripts", "conversation-reminder-service.py");
+  const probe = spawnSync("python3", ["-c", `import importlib.util,json,sys
+spec=importlib.util.spec_from_file_location("service", sys.argv[1]); service=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(service)
+print(json.dumps([service.reminder_gap(k).total_seconds() / 3600 for k in [*range(16), 1000]]))`, script],
+  { encoding: "utf8" });
+  assert.equal(probe.status, 0, probe.stderr);
+  assert.deepEqual(JSON.parse(probe.stdout),
+    [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 24, 24, 24, 24]);
+});
+
+test("a long ignored streak settles on one reminder a day", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  sql(path.join(stateDir, "conversations.sqlite3"),
+    "UPDATE conversations SET consecutive_reminders=11 WHERE project='demo'");
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  assert.deepEqual(streak(await sendAt(workspace, stateDir, clockFile, "2026-09-24T11:00:00Z", "r-12")),
+    ["awaiting-owner", "2026-09-25T11:00:00Z", 12]);
+  assert.equal(await claimAt(workspace, stateDir, clockFile, "2026-09-25T10:59:59Z"), null);
+  assert.deepEqual(streak(await sendAt(workspace, stateDir, clockFile, "2026-09-25T11:00:00Z", "r-13")),
+    ["awaiting-owner", "2026-09-26T11:00:00Z", 13]);
+});
+
+test("an owner reply ends the ignored streak, so the next response starts again at one hour", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  await sendAt(workspace, stateDir, clockFile, "2026-09-24T11:00:00Z", "r-1");
+  assert.deepEqual(streak(await sendAt(workspace, stateDir, clockFile, "2026-09-24T13:00:00Z", "r-2")),
+    ["awaiting-owner", "2026-09-24T17:00:00Z", 2]);
+  await event(workspace, stateDir, "owner_activity", "reply-owner", "2026-09-24T14:00:00Z", {
+    actor_id: "owner", source_message_id: "reply-question", activity_kind: "message",
+  });
+  await cli(workspace, stateDir, "sync");
+  const paused = (await cli(workspace, stateDir, "status")).conversations.demo;
+  assert.deepEqual([...streak(paused), paused.reminder_message_id], ["open-paused", null, 0, null]);
+  assert.ok(paused.cleanup_message_ids.includes("r-2"), "the ignored reminder is queued for deletion");
+  assert.deepEqual(streak(await freshCompletion(workspace, stateDir, "turn-2", "reply-question", "2026-09-24T15:00:00Z")),
+    ["awaiting-owner", "2026-09-24T16:00:00Z", 0]);
+  assert.deepEqual(streak(await sendAt(workspace, stateDir, clockFile, "2026-09-24T16:00:00Z", "r-3")),
+    ["awaiting-owner", "2026-09-24T18:00:00Z", 1]);
+});
+
+test("a fresh qualifying response while awaiting the owner resets the streak to one hour", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  await sendAt(workspace, stateDir, clockFile, "2026-09-24T11:00:00Z", "r-1");
+  await sendAt(workspace, stateDir, clockFile, "2026-09-24T13:00:00Z", "r-2");
+  const rearmed = await freshCompletion(workspace, stateDir, "turn-2", "delivery-question", "2026-09-24T14:00:00Z");
+  assert.deepEqual([...streak(rearmed), rearmed.reminder_message_id],
+    ["awaiting-owner", "2026-09-24T15:00:00Z", 0, "r-2"]);
+  assert.equal(await claimAt(workspace, stateDir, clockFile, "2026-09-24T14:59:59Z"), null);
+  assert.deepEqual(streak(await sendAt(workspace, stateDir, clockFile, "2026-09-24T15:00:00Z", "r-3")),
+    ["awaiting-owner", "2026-09-24T17:00:00Z", 1]);
+});
+
+test("closing and reopening a conversation starts its next streak at one hour", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  await sendAt(workspace, stateDir, clockFile, "2026-09-24T11:00:00Z", "r-1");
+  await sendAt(workspace, stateDir, clockFile, "2026-09-24T13:00:00Z", "r-2");
+  await event(workspace, stateDir, "close_requested", "streak-close", "2026-09-24T14:00:00Z", {
+    actor_id: "owner", source_message_id: "streak-close-message", command: "/close",
+  });
+  await cli(workspace, stateDir, "sync");
+  assert.deepEqual(streak((await cli(workspace, stateDir, "status")).conversations.demo), ["closed", null, 0]);
+  await event(workspace, stateDir, "owner_activity", "reopen-owner", "2026-09-24T15:00:00Z", {
+    actor_id: "owner", source_message_id: "reopen-question", activity_kind: "message",
+  });
+  assert.deepEqual(streak(await freshCompletion(workspace, stateDir, "turn-2", "reopen-question", "2026-09-24T16:00:00Z")),
+    ["awaiting-owner", "2026-09-24T17:00:00Z", 0]);
+  assert.deepEqual(streak(await sendAt(workspace, stateDir, clockFile, "2026-09-24T17:00:00Z", "r-3")),
+    ["awaiting-owner", "2026-09-24T19:00:00Z", 1]);
+});
+
+test("a canceled send and a late send after reassignment never grow the streak", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  const env = { CCDM_REMINDER_CLOCK_FILE: clockFile };
+  await sendAt(workspace, stateDir, clockFile, "2026-09-24T11:00:00Z", "r-1");
+  // A fresh response lands after the claim: the returned reminder is canceled.
+  const canceledClaim = await claimAt(workspace, stateDir, clockFile, "2026-09-24T13:00:00Z");
+  await freshCompletion(workspace, stateDir, "turn-2", "delivery-question", "2026-09-24T13:00:30Z");
+  await cli(workspace, stateDir, "result", ["--nonce", canceledClaim.nonce, "--outcome", "sent",
+    "--message-id", "r-canceled", "--sent-at", "2026-09-24T13:00:00Z"], env);
+  const canceled = (await cli(workspace, stateDir, "status")).conversations.demo;
+  assert.deepEqual([...streak(canceled), canceled.reminder_message_id],
+    ["awaiting-owner", "2026-09-24T14:00:30Z", 0, "r-1"]);
+  assert.deepEqual(canceled.cleanup_message_ids, ["r-canceled"]);
+
+  // The assignment changes while the next request is in flight: the late send
+  // belongs to the retired generation and the new conversation starts at zero.
+  const lateClaim = await claimAt(workspace, stateDir, clockFile, "2026-09-24T14:00:30Z");
+  assert.ok(lateClaim?.nonce);
+  const registryPath = path.join(workspace.repoDir, "registry.json");
+  const registry = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+  registry.projects.demo.assignment_generation = "generation-2";
+  fs.writeFileSync(registryPath, JSON.stringify(registry), { mode: 0o600 });
+  await cli(workspace, stateDir, "result", ["--nonce", lateClaim.nonce, "--outcome", "sent",
+    "--message-id", "r-late", "--sent-at", "2026-09-24T14:00:30Z"], env);
+  const replaced = (await cli(workspace, stateDir, "status")).conversations.demo;
+  assert.deepEqual([replaced.assignment_generation, replaced.consecutive_reminders, replaced.reminder_message_id],
+    ["generation-2", 0, null]);
+});
+
+test("a v5 store upgrades to v6, keeping a recorded reminder's pending due time", async () => {
+  const downgrade = `ALTER TABLE conversations DROP COLUMN consecutive_reminders; PRAGMA user_version=5;`;
+  const withReminder = createWorkspace();
+  const stateDir = setup(withReminder);
+  await reconciledExchange(withReminder, stateDir);
+  const clockFile = path.join(withReminder.tmpDir, "reminder-clock");
+  await sendAt(withReminder, stateDir, clockFile, "2026-09-24T11:00:00Z", "r-1");
+  const database = path.join(stateDir, "conversations.sqlite3");
+  sql(database, downgrade);
+  const upgraded = (await cli(withReminder, stateDir, "status")).conversations.demo;
+  assert.deepEqual([...streak(upgraded), upgraded.reminder_message_id],
+    ["awaiting-owner", "2026-09-24T13:00:00Z", 1, "r-1"]);
+  const version = spawnSync("python3", ["-c", "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('PRAGMA user_version').fetchone()[0])", database], { encoding: "utf8" });
+  assert.equal(version.stdout.trim(), "6");
+  assert.deepEqual(streak(await sendAt(withReminder, stateDir, clockFile, "2026-09-24T13:00:00Z", "r-2")),
+    ["awaiting-owner", "2026-09-24T17:00:00Z", 2]);
+
+  const withoutReminder = createWorkspace();
+  const otherDir = setup(withoutReminder);
+  await reconciledExchange(withoutReminder, otherDir);
+  sql(path.join(otherDir, "conversations.sqlite3"), downgrade);
+  assert.deepEqual(streak((await cli(withoutReminder, otherDir, "status")).conversations.demo),
+    ["awaiting-owner", "2026-09-24T11:00:00Z", 0]);
+});
+
+test("a fresh store is created at v6, and a v6 store without the streak or a future version fails closed", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  await cli(workspace, stateDir, "sync");
+  const database = path.join(stateDir, "conversations.sqlite3");
+  const shape = spawnSync("python3", ["-c", `import json,sqlite3,sys
+db=sqlite3.connect(sys.argv[1])
+print(json.dumps([db.execute('PRAGMA user_version').fetchone()[0],
+  'consecutive_reminders' in [row[1] for row in db.execute('PRAGMA table_info(conversations)')]]))`, database],
+  { encoding: "utf8" });
+  assert.deepEqual(JSON.parse(shape.stdout), [6, true]);
+  for (const script of ["PRAGMA user_version=7;",
+    "PRAGMA user_version=6; ALTER TABLE conversations DROP COLUMN consecutive_reminders;"]) {
+    const copy = createWorkspace();
+    const copyDir = setup(copy);
+    await cli(copy, copyDir, "sync");
+    sql(path.join(copyDir, "conversations.sqlite3"), script);
+    const result = await runScript(copy, "scripts/conversation-reminder-service.py", {
+      args: ["status", "--project-root", copy.repoDir, "--state-dir", copyDir],
+    });
+    assert.equal(result.exitCode, 2, script);
+    assert.deepEqual(JSON.parse(result.stdout),
+      { status: "blocked", reason: "conversation store schema is unsupported" }, script);
+  }
 });

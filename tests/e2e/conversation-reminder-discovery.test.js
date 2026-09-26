@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -118,6 +119,10 @@ test("discovery arms an old completed-looking answer from its answer time, then 
   ] });
   const requested = await command(workspace, stateDir, "discover");
   assert.equal(requested.discovery_requested, true);
+  // History cannot identify earlier reminders, so the baseline starts a fresh streak.
+  await command(workspace, stateDir, "sync");
+  const seeded = spawnSync("python3", ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute(\"UPDATE conversations SET consecutive_reminders=5 WHERE project='demo'\"); db.commit(); print(db.total_changes)", path.join(stateDir, "conversations.sqlite3")], { encoding: "utf8" });
+  assert.equal(seeded.stdout.trim(), "1", seeded.stderr);
   const worker = startWorker(workspace, stateDir, "2026-09-20T08:30:00Z");
   const ready = await waitForStatus(workspace, stateDir, current =>
     current.conversations.demo?.reconciliation_status === "ready");
@@ -126,6 +131,7 @@ test("discovery arms an old completed-looking answer from its answer time, then 
   assert.equal(demo.response_message_id, "1003");
   assert.equal(demo.response_at, "2026-09-20T08:05:00Z");
   assert.equal(demo.due_at, "2026-09-20T09:05:00Z");
+  assert.equal(demo.consecutive_reminders, 0);
   assert.equal(demo.discovery.basis, "historical-owner-then-bot-approximation");
   assert.equal(ready.delivery_enabled, true);
   assert.ok(readState(workspace.stateDir).fixtures.discord.historyFetches.every(row =>
@@ -138,7 +144,8 @@ test("discovery arms an old completed-looking answer from its answer time, then 
   const sent = await waitForState(workspace, state => state.fixtures.discord.messages?.length === 1);
   assert.equal(sent.fixtures.discord.messages[0].content, "👀");
   assert.equal(sent.fixtures.discord.messages[0].authorization, "Bot token-demo");
-  await waitForStatus(workspace, stateDir, current => current.conversations.demo.due_at === "2026-09-20T10:05:00Z");
+  await waitForStatus(workspace, stateDir, current => current.conversations.demo.due_at === "2026-09-20T11:05:00Z" &&
+    current.conversations.demo.consecutive_reminders === 1);
   assert.equal(readState(workspace.stateDir).fixtures.codex.appServerInvocations.length, 0);
   await stop(workspace, stateDir, worker);
 });

@@ -381,8 +381,10 @@ def _commit(db: sqlite3.Connection, row: sqlite3.Row, summary: dict, active_turn
     else:
         if state == "awaiting-owner" and persisted_ack and persisted_ack >= _iso(anchor["at"]):
             state, basis = "open-paused", "recorded-acknowledgment"
+        # History cannot identify earlier reminders, so a baseline starts a fresh streak.
         changes = {"state": state, "due_at": None, "response_message_id": None, "response_at": None,
-                   "current_interaction_id": normal["id"] if normal and state != "closed" else None}
+                   "current_interaction_id": normal["id"] if normal and state != "closed" else None,
+                   "consecutive_reminders": 0}
         if reply is not None and (persisted_ack is None or _iso(reply["at"]) > persisted_ack):
             changes.update(last_ack_at=reply["at"], last_ack_message_id=reply["id"])
         if state == "awaiting-owner":
