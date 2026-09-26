@@ -29,6 +29,11 @@ function fixtureChannel(id) {
     id,
     name: `channel-${id}`,
     permissionsFor(member) {
+      const discord = readState().fixtures?.discord || {};
+      if (discord.guildUnavailable) {
+        // Mirrors discord.js when the guild's roles are not cached.
+        throw new TypeError("Cannot read properties of undefined (reading 'permissions')");
+      }
       const userId = typeof member === "string" ? member : member?.id;
       return { has(permission) {
         return !(readState().fixtures?.discord?.permissionDenials?.[userId] || []).includes(permission);

@@ -120,6 +120,12 @@ async function assignment(channelId) {
     await markHealth(found.project, "blocked-observation-access", found.assignment_generation);
     return null;
   }
+  // During a Discord outage a guild can be unavailable, with no roles cached;
+  // treat that as lost access and retry on the next revalidation.
+  if (channel.guild && channel.guild.available === false) {
+    await markHealth(found.project, "blocked-observation-access", found.assignment_generation);
+    return null;
+  }
   let botMember = found.bot_app_id;
   if (channel.guild?.members?.fetch) {
     botMember = await channel.guild.members.fetch(found.bot_app_id).catch(() => null);
@@ -128,8 +134,15 @@ async function assignment(channelId) {
       return null;
     }
   }
-  const rootPermissions = channel.permissionsFor(client.user);
-  const botPermissions = channel.permissionsFor(botMember);
+  let rootPermissions, botPermissions;
+  try {
+    rootPermissions = channel.permissionsFor(client.user);
+    botPermissions = channel.permissionsFor(botMember);
+  } catch {
+    // A partially cached guild cannot resolve permissions yet.
+    await markHealth(found.project, "blocked-observation-access", found.assignment_generation);
+    return null;
+  }
   if (!rootPermissions || !["ViewChannel", "ReadMessageHistory"].every(flag => rootPermissions.has(flag))) {
     await markHealth(found.project, "blocked-observation-access", found.assignment_generation);
     return null;
