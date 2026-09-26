@@ -1,6 +1,9 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
+
+const { withStateLock } = createRequire(import.meta.url)("./state-lock.cjs");
 
 export const STATE_SCHEMA_VERSION = 1;
 
@@ -236,9 +239,11 @@ export function writeState(nextState, explicitStateDir) {
 }
 
 function updateState(explicitStateDir, updater) {
-  const current = readState(explicitStateDir);
-  const next = updater(current) ?? current;
-  return writeState(next, explicitStateDir);
+  return withStateLock(stateDir(explicitStateDir), () => {
+    const current = readState(explicitStateDir);
+    const next = updater(current) ?? current;
+    return writeState(next, explicitStateDir);
+  });
 }
 
 export function seedRegistry(workspaceOrRegistry, maybeRegistry) {

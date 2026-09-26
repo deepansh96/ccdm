@@ -384,7 +384,8 @@ test("a queued catch-up honors an owner reply and a deregistration before its tu
   context.setClock("2026-09-20T15:20:00Z");
   const worker = startWorker(workspace, context);
   await waitForState(workspace, state => reminders(state).length === 1, 20000);
-  const queued = await command(workspace, context, "status");
+  // The fake records the send before the worker commits it, so wait for the commit.
+  const queued = await waitForStatus(workspace, context, current => current.conversations.alpha.reminder_message_id);
   assert.deepEqual(names.map(name => queued.conversations[name].catch_up_queued), [false, true, true]);
 
   const state = readState(workspace.stateDir);

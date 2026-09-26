@@ -2,6 +2,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { PassThrough } = require("node:stream");
 
+const { withStateLock } = require("./state-lock.cjs");
+
 const stateDir = process.env.CCDM_TEST_STATE;
 const stateFile = stateDir ? path.join(stateDir, "state.json") : null;
 
@@ -18,12 +20,14 @@ function writeState(state) {
 }
 
 function updateState(updater) {
-  const state = readState();
-  state.fixtures ||= {};
-  state.fixtures.discord ||= {};
-  state.fixtures.network ||= { blocked: [] };
-  updater(state);
-  writeState(state);
+  withStateLock(stateDir, () => {
+    const state = readState();
+    state.fixtures ||= {};
+    state.fixtures.discord ||= {};
+    state.fixtures.network ||= { blocked: [] };
+    updater(state);
+    writeState(state);
+  });
 }
 
 function targetFromOptions(options = {}) {

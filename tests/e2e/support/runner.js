@@ -127,12 +127,15 @@ function hostCommandPath(name) {
 
 function createFixtureRuntime(fixtureDir) {
   const runtime = path.join(fixtureDir, "fixture-runtime.cjs");
+  fs.copyFileSync(new URL("./state-lock.cjs", import.meta.url), path.join(fixtureDir, "state-lock.cjs"));
   writeExecutable(
     runtime,
     `#!/usr/bin/env node
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
+
+const { withStateLock } = require("./state-lock.cjs");
 
 const tool = process.argv[2];
 const args = process.argv.slice(3);
@@ -307,8 +310,10 @@ function writeState(nextState) {
 }
 
 function updateState(updater) {
-  const current = readState();
-  writeState(updater(current) || current);
+  withStateLock(stateDir, () => {
+    const current = readState();
+    writeState(updater(current) || current);
+  });
   return readState();
 }
 

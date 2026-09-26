@@ -4,6 +4,8 @@ const https = require("node:https");
 const net = require("node:net");
 const path = require("node:path");
 
+const { withStateLock } = require("./state-lock.cjs");
+
 const originalHttpRequest = http.request.bind(http);
 const originalHttpGet = http.get.bind(http);
 const originalHttpsRequest = https.request.bind(https);
@@ -70,12 +72,14 @@ function writeState(state) {
 }
 
 function updateState(updater) {
-  const state = readState();
-  state.fixtures ||= {};
-  state.fixtures.discord ||= {};
-  state.fixtures.network ||= { blocked: [] };
-  updater(state);
-  writeState(state);
+  withStateLock(stateDir, () => {
+    const state = readState();
+    state.fixtures ||= {};
+    state.fixtures.discord ||= {};
+    state.fixtures.network ||= { blocked: [] };
+    updater(state);
+    writeState(state);
+  });
 }
 
 function recordBlocked(kind, target) {

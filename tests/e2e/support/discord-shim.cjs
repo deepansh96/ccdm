@@ -2,6 +2,8 @@ const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const path = require("node:path");
 
+const { withStateLock } = require("./state-lock.cjs");
+
 const stateDir = process.env.CCDM_TEST_STATE;
 const stateFile = stateDir ? path.join(stateDir, "state.json") : null;
 
@@ -18,10 +20,12 @@ function writeState(state) {
 }
 
 function updateState(updater) {
-  const state = readState();
-  state.fixtures ||= {};
-  state.fixtures.discord ||= {};
-  if (updater(state) !== false) writeState(state);
+  withStateLock(stateDir, () => {
+    const state = readState();
+    state.fixtures ||= {};
+    state.fixtures.discord ||= {};
+    if (updater(state) !== false) writeState(state);
+  });
 }
 
 function fixtureChannel(id) {
