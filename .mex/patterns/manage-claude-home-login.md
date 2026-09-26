@@ -76,11 +76,13 @@ sign-in URL, and the user's pasted code belong in the flow.
   and without the variable. If the item itself must be inspected, use
   `security find-generic-password -s "<service>"` for metadata only; never pass
   `-w` or `-g`, which print the secret.
-- The usage reports (`scripts/usage-stats-poster.py`, `scripts/claude-usage.sh`)
-  read both `~/.claude` items, prefer the one whose `expiresAt` is latest, and
-  retry the other when it is unexpired and the first is rejected. An auth failure
-  in either report therefore means neither item has a usable access token right
-  now, not just the one sessions use.
+- The plain item belongs to whichever account last logged in without the
+  variable (for example the AF work account), not necessarily to `~/.claude`.
+  `scripts/usage-stats-poster.py` tries each home's hashed item and the plain
+  item, freshest first, and keeps only a login whose profile email matches the
+  home's `.claude.json`, so a re-login prompt there means no item holds a usable
+  token for that account. `scripts/claude-usage.sh` still reads both `~/.claude`
+  items and prefers the one whose `expiresAt` is latest, without the email check.
 - `claude auth status` reported `loggedIn: false` for a home whose live sessions
   were authenticating fine, and reported a home as usable before a real turn
   succeeded. Always finish with an actual `-p` call.

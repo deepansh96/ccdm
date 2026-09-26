@@ -621,16 +621,18 @@ entries. Direct `~/.codex` and `~/.codex-api` session paths are legacy
 compatibility examples, not the recommended configuration.
 
 Claude OAuth accounts are discovered from the default `~/.claude` login and
-valid extra `~/.claude-*` config directories. Each extra directory must have a
-`.claude.json` with an OAuth organization name or email address; that label is
-used in the report. Its Keychain service is derived from the first eight hex
-characters of the SHA-256 hash of the config-directory path. The default
-`~/.claude` login can be in that hashed item (written when `CLAUDE_CONFIG_DIR`
-is set, as remote logins do) or in the plain `Claude Code-credentials` item
-(used by sessions without it), so the poster and `scripts/claude-usage.sh` read
-both and use the one that expires last, falling back to the other unexpired
-item if the API rejects it. No account names or local paths are hardcoded in
-the poster.
+valid extra `~/.claude-*` config directories. The report labels them by
+directory: `~/.claude` is **claude-p** and `~/.claude-<name>` is
+**claude-<name>** (for example **claude-af**). Each extra directory must have a
+`.claude.json` with an `oauthAccount`, which also records the email the home is
+logged in to. Its Keychain service is derived from the first eight hex
+characters of the SHA-256 hash of the config-directory path. The plain
+`Claude Code-credentials` item holds whichever account a session without
+`CLAUDE_CONFIG_DIR` last logged in to, so it can belong to any home. The poster
+therefore tries a home's hashed item and the plain item, freshest first, and
+reports only a login whose profile email matches that home's `.claude.json`;
+when none matches it shows that home's re-login command instead of another
+account's usage. No account names or local paths are hardcoded in the poster.
 
 Named and legacy Codex selectors may be mixed across configuration scopes. The
 poster preserves named-account default-first ordering, adds selected/configured
