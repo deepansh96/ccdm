@@ -19,7 +19,8 @@ function serviceFor(configDir) {
   return `Claude Code-credentials-${crypto.createHash("sha256").update(configDir).digest("hex").slice(0, 8)}`;
 }
 
-async function startPosterApi({ organization = { organization_type: "pro" }, unauthorizedTokens = [], acceptDashboard = false, usage = {} } = {}) {
+async function startPosterApi({ organization = { organization_type: "pro" }, unauthorizedTokens = [], acceptDashboard = false, usage = {}, accounts = {} } = {}) {
+  const emails = { "fixture-oauth-token": "fixture@example.test", ...accounts };
   const requests = [];
   const unauthorized = new Set(unauthorizedTokens);
   const server = http.createServer((request, response) => {
@@ -44,7 +45,7 @@ async function startPosterApi({ organization = { organization_type: "pro" }, una
           response.end();
           return;
         }
-        if (request.headers.authorization !== "Bearer fixture-oauth-token") {
+        if (!Object.hasOwn(emails, request.headers.authorization?.replace(/^Bearer /, "") ?? "")) {
           response.statusCode = 401;
           response.end();
           return;
@@ -53,7 +54,7 @@ async function startPosterApi({ organization = { organization_type: "pro" }, una
         response.end(JSON.stringify({
           account: {
             display_name: "Fixture User",
-            email: "fixture@example.test",
+            email: emails[request.headers.authorization.replace(/^Bearer /, "")],
           },
           organization,
         }));
@@ -65,7 +66,7 @@ async function startPosterApi({ organization = { organization_type: "pro" }, una
           response.end();
           return;
         }
-        if (request.headers.authorization !== "Bearer fixture-oauth-token") {
+        if (!Object.hasOwn(emails, request.headers.authorization?.replace(/^Bearer /, "") ?? "")) {
           response.statusCode = 401;
           response.end();
           return;
@@ -73,7 +74,7 @@ async function startPosterApi({ organization = { organization_type: "pro" }, una
         response.setHeader("content-type", "application/json");
         response.end(JSON.stringify({
           extra_usage: { is_enabled: true, used_credits: 1250 },
-          five_hour: { utilization: 37 },
+          five_hour: { utilization: request.headers.authorization === "Bearer fixture-oauth-token" ? 37 : 5 },
           seven_day: { utilization: 62 },
           ...usage,
         }));
@@ -183,7 +184,7 @@ test("poster posts a Claude usage embed through the configured Discord endpoint"
   assert.deepEqual(payload.embeds[0].fields, [
     {
       name: "Claude Code",
-      value: "**Personal** (Pro)\n5-Hour: `[######.........]` **37%**\n7-Day: `[#########......]` **62%**\nExtra usage: **$12.50** spent",
+      value: "**claude-p** (Pro)\n5-Hour: `[######.........]` **37%**\n7-Day: `[#########......]` **62%**\nExtra usage: **$12.50** spent",
       inline: true,
     },
   ]);
@@ -505,7 +506,7 @@ test("poster discovers labeled extra Claude OAuth config directories with derive
   fs.mkdirSync(organizationDir);
   fs.writeFileSync(
     path.join(emailDir, ".claude.json"),
-    `${JSON.stringify({ oauthAccount: { emailAddress: "fixture-email@example.test" } })}\n`,
+    `${JSON.stringify({ oauthAccount: { emailAddress: "Fixture@Example.test" } })}\n`,
   );
   fs.writeFileSync(
     path.join(organizationDir, ".claude.json"),
@@ -533,9 +534,9 @@ test("poster discovers labeled extra Claude OAuth config directories with derive
   const post = api.requests.find((request) => request.method === "POST");
   assert.ok(post);
   const claudeValue = JSON.parse(post.body).embeds[0].fields[0].value;
-  assert.match(claudeValue, /\*\*Personal\*\* \(Pro\)/);
-  assert.match(claudeValue, /\*\*fixture-email@example\.test\*\* \(Pro\)/);
-  assert.match(claudeValue, /\*\*Fixture Organization\*\* \(Pro\)/);
+  assert.match(claudeValue, /\*\*claude-p\*\* \(Pro\)/);
+  assert.match(claudeValue, /\*\*claude-email\*\* \(Pro\)/);
+  assert.match(claudeValue, /\*\*claude-organization\*\* \(Pro\)/);
   assert.deepEqual(
     readState(workspace.stateDir).fixtures.security.invocations.map((entry) => entry.service),
     [serviceFor(path.join(workspace.homeDir, ".claude")), "Claude Code-credentials", emailService, organizationService],
@@ -593,9 +594,9 @@ test("poster gives each Claude OAuth HTTP 401 an account-specific login action",
   const post = api.requests.find((request) => request.method === "POST");
   assert.ok(post);
   const claudeValue = JSON.parse(post.body).embeds[0].fields[0].value;
-  assert.match(claudeValue, /\*\*Personal\*\*[\s\S]*Needs re-login: `CLAUDE_CONFIG_DIR=~\/\.claude claude \/login`/);
-  assert.match(claudeValue, /\*\*Fixture Login\*\*[\s\S]*Needs re-login: `CLAUDE_CONFIG_DIR=~\/\.claude-login claude \/login`/);
-  assert.match(claudeValue, /\*\*Fixture Refresh\*\*[\s\S]*Auth expired — start a session on this account to refresh/);
+  assert.match(claudeValue, /\*\*claude-p\*\*[\s\S]*Needs re-login: `CLAUDE_CONFIG_DIR=~\/\.claude claude \/login`/);
+  assert.match(claudeValue, /\*\*claude-login\*\*[\s\S]*Needs re-login: `CLAUDE_CONFIG_DIR=~\/\.claude-login claude \/login`/);
+  assert.match(claudeValue, /\*\*claude-refresh\*\*[\s\S]*Auth expired — start a session on this account to refresh/);
   assert.deepEqual(
     readState(workspace.stateDir).fixtures.security.invocations.map((entry) => entry.service),
     [serviceFor(path.join(workspace.homeDir, ".claude")), "Claude Code-credentials", loginService, refreshService],
@@ -630,7 +631,7 @@ test("poster reads a default-home login saved only in the hashed Keychain item",
     [hashedService]: { claudeAiOauth: { accessToken: "fixture-oauth-token" } },
   }));
 
-  assert.match(claudeValue, /\*\*Personal\*\* \(Pro\)/);
+  assert.match(claudeValue, /\*\*claude-p\*\* \(Pro\)/);
   assert.deepEqual(oauthAuthorizations, ["Bearer fixture-oauth-token", "Bearer fixture-oauth-token"]);
 });
 
@@ -647,7 +648,7 @@ test("poster uses whichever default-home Keychain item expires last", async () =
     (hashedService) => ({ [hashedService]: fresh, "Claude Code-credentials": stale }),
   ]) {
     const { claudeValue, oauthAuthorizations } = await runPosterWithDefaultHomeCredentials(credentialsFor);
-    assert.match(claudeValue, /\*\*Personal\*\* \(Pro\)/);
+    assert.match(claudeValue, /\*\*claude-p\*\* \(Pro\)/);
     assert.doesNotMatch(claudeValue, /expired/);
     assert.deepEqual(oauthAuthorizations, ["Bearer fixture-oauth-token", "Bearer fixture-oauth-token"]);
   }
@@ -670,7 +671,7 @@ test("poster falls back to the other unexpired Keychain item when the API reject
       claudeAiOauth: { accessToken: "fixture-oauth-token", expiresAt: Date.now() + 60 * 60 * 1000 },
     },
   }));
-  assert.match(fallback.claudeValue, /\*\*Personal\*\* \(Pro\)/);
+  assert.match(fallback.claudeValue, /\*\*claude-p\*\* \(Pro\)/);
   assert.deepEqual(fallback.oauthAuthorizations, [
     "Bearer fixture-revoked-token",
     "Bearer fixture-oauth-token",
@@ -684,8 +685,48 @@ test("poster falls back to the other unexpired Keychain item when the API reject
       claudeAiOauth: { accessToken: "fixture-oauth-token", expiresAt: Date.now() - 60 * 60 * 1000 },
     },
   }));
-  assert.match(noFallback.claudeValue, /\*\*Personal\*\*[\s\S]*Needs re-login: `CLAUDE_CONFIG_DIR=~\/\.claude claude \/login`/);
+  assert.match(noFallback.claudeValue, /\*\*claude-p\*\*[\s\S]*Needs re-login: `CLAUDE_CONFIG_DIR=~\/\.claude claude \/login`/);
   assert.deepEqual(noFallback.oauthAuthorizations, ["Bearer fixture-revoked-token"]);
+});
+
+test("poster reports each Claude home only with a login that belongs to its account", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi({ accounts: { "fixture-work-token": "work@example.test" } });
+  const future = Date.now() + 60 * 60 * 1000;
+  const defaultDir = path.join(workspace.homeDir, ".claude");
+  const workDir = path.join(workspace.homeDir, ".claude-work");
+  const otherDir = path.join(workspace.homeDir, ".claude-other");
+  for (const [dir, email] of [[defaultDir, "fixture@example.test"], [workDir, "Work@Example.test"], [otherDir, "other@example.test"]]) {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, ".claude.json"), `${JSON.stringify({ oauthAccount: { emailAddress: email } })}\n`);
+  }
+  seedPosterWorkspace(workspace, api.baseUrl);
+  const state = readState(workspace.stateDir);
+  // The plain item holds the work login and expires last; the work home's own item has expired.
+  state.fixtures.security.credentials = {
+    [serviceFor(defaultDir)]: { claudeAiOauth: { accessToken: "fixture-oauth-token", expiresAt: future } },
+    "Claude Code-credentials": { claudeAiOauth: { accessToken: "fixture-work-token", expiresAt: future + 60_000 } },
+    [serviceFor(workDir)]: {
+      claudeAiOauth: { accessToken: "fixture-expired-token", refreshToken: "fixture-refresh-token", expiresAt: Date.now() - 1000 },
+    },
+    [serviceFor(otherDir)]: { claudeAiOauth: { accessToken: "fixture-oauth-token", expiresAt: future } },
+  };
+  writeState(state, workspace.stateDir);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const post = api.requests.find((request) => request.method === "POST");
+  assert.ok(post);
+  const claudeValue = JSON.parse(post.body).embeds[0].fields[0].value;
+  assert.match(claudeValue, /\*\*claude-p\*\* \(Pro\)\n5-Hour: `[^`]*` \*\*37%\*\*/);
+  assert.match(claudeValue, /\*\*claude-work\*\* \(Pro\)\n5-Hour: `[^`]*` \*\*5%\*\*/);
+  // A home whose account has no readable login is never shown another account's usage.
+  assert.match(claudeValue, /\*\*claude-other\*\*\n\*Needs re-login: `CLAUDE_CONFIG_DIR=~\/\.claude-other claude \/login`\*/);
+  assert.doesNotMatch(claudeValue, /Personal|@example/);
+  // The shared plain item is read from the Keychain once per run.
+  const reads = readState(workspace.stateDir).fixtures.security.invocations.map((entry) => entry.service);
+  assert.equal(reads.filter((service) => service === "Claude Code-credentials").length, 1);
 });
 
 test("poster uses N/A when the Claude organization value is malformed", async () => {
@@ -698,7 +739,7 @@ test("poster uses N/A when the Claude organization value is malformed", async ()
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const post = api.requests.find((request) => request.method === "POST");
   assert.ok(post);
-  assert.match(JSON.parse(post.body).embeds[0].fields[0].value, /^\*\*Personal\*\* \(N\/A\)/);
+  assert.match(JSON.parse(post.body).embeds[0].fields[0].value, /^\*\*claude-p\*\* \(N\/A\)/);
 });
 
 test("poster falls back when Codex JSON-RPC returns a non-object response", async () => {
@@ -1589,7 +1630,7 @@ test("scheduled poster posts the original text report once per 30-minute slot wi
   assert.equal(dashboardPayload.embeds.length, 1);
   assert.equal(dashboardPayload.embeds[0].title, "Usage Report");
   assert.deepEqual(dashboardPayload.embeds[0].fields.map(({ name }) => name), ["Claude Code", "Codex"]);
-  assert.match(dashboardPayload.embeds[0].fields[0].value, /\*\*Personal\*\* \(Pro\)/);
+  assert.match(dashboardPayload.embeds[0].fields[0].value, /\*\*claude-p\*\* \(Pro\)/);
   assert.match(dashboardPayload.embeds[0].fields[0].value, /5-Hour:/);
   assert.match(dashboardPayload.embeds[0].fields[0].value, /7-Day:/);
   assert.match(dashboardPayload.embeds[0].fields[1].value, /\*\*codex-scheduled\*\* \(ChatGPT\)/);

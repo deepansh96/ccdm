@@ -28,6 +28,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
 DEFAULT_CONFIG_PATH = ROOT_DIR / ".usage-stats-poster.json"
 REGISTRY_PATH = ROOT_DIR / "registry.json"
+PLAIN_CLAUDE_SERVICE = "Claude Code-credentials"
 DEFAULT_HISTORY_DB_PATH = Path.home() / "Library" / "Application Support" / "CCDM" / "usage-stats" / "history.sqlite3"
 HISTORY_RETENTION_DAYS = 365
 HISTORY_WARNING_BYTES = 5 * 1024 * 1024 * 1024
@@ -293,8 +294,8 @@ def _request_json(base_url, endpoint, headers, label):
         raise PosterError(f"{label} request failed; check the endpoint and try again") from None
 
 
-def claude_account_label(config_json_path):
-    """Return the account label stored by Claude Code, if it is usable."""
+def claude_oauth_account(config_json_path):
+    """Return the ``oauthAccount`` Claude Code stored for a home, if any."""
     try:
         data = json.loads(Path(config_json_path).read_text())
     except (OSError, UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError):
@@ -302,13 +303,13 @@ def claude_account_label(config_json_path):
     if not isinstance(data, dict):
         return None
     oauth_account = data.get("oauthAccount")
-    if not isinstance(oauth_account, dict):
-        return None
-    for key in ("organizationName", "emailAddress"):
-        label = oauth_account.get(key)
-        if isinstance(label, str) and label.strip():
-            return label.strip()
-    return None
+    return oauth_account if isinstance(oauth_account, dict) else None
+
+
+def claude_account_email(oauth_account):
+    """Return the lower-cased login email of ``oauth_account``, if usable."""
+    email = oauth_account.get("emailAddress") if isinstance(oauth_account, dict) else None
+    return email.strip().lower() if isinstance(email, str) and email.strip() else None
 
 
 def _oauth_expiry(oauth):
@@ -328,14 +329,19 @@ def _oauth_expired(oauth):
         return False
 
 
-def _read_oauth_credentials(services):
+def _read_oauth_credentials(services, cache=None):
     """Return the readable OAuth credentials among ``services``, freshest first.
 
     A home can hold both its hashed and its plain Keychain item, and only the
     one its sessions run under keeps being refreshed, so the first readable
-    item can be a stale leftover. Ties keep the ``services`` order.
+    item can be a stale leftover. Ties keep the ``services`` order. ``cache``
+    lets one collection run read each shared Keychain item only once.
     """
-    credentials = [oauth for oauth in map(_read_oauth_credential, services) if oauth]
+    cache = {} if cache is None else cache
+    for service in services:
+        if service not in cache:
+            cache[service] = _read_oauth_credential(service)
+    credentials = [cache[service] for service in services if cache[service]]
     return sorted(credentials, key=_oauth_expiry, reverse=True)
 
 
@@ -349,22 +355,30 @@ def claude_home_services(config_dir):
     for ``~/.claude``, while default sessions do not, so ``~/.claude`` can
     have a live credential in either item.
     """
-    hashed = "Claude Code-credentials-" + hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
+    hashed = f"{PLAIN_CLAUDE_SERVICE}-" + hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
     if config_dir == Path.home() / ".claude":
-        return [hashed, "Claude Code-credentials"]
+        return [hashed, PLAIN_CLAUDE_SERVICE]
     return [hashed]
 
 
 def discover_claude_accounts():
-    """Return each Claude login as ``(services, label, dir_hint)``.
+    """Return each Claude login as ``(services, label, dir_hint, email)``.
 
-    The first entry is always the default ``~/.claude`` home. ``services``
-    lists every Keychain item that can hold that home's login; callers read
-    them with ``_read_oauth_credentials``.
+    The first entry is always the default ``~/.claude`` home, labelled
+    ``claude-p``; every other OAuth home ``~/.claude-<name>`` is labelled
+    ``claude-<name>``. ``services`` lists every Keychain item that can hold
+    that home's login, and ``email`` is the account the home is logged in to
+    (``None`` when unknown); callers read them with ``_read_oauth_credentials``
+    and keep only a credential whose profile matches ``email``.
+
+    The plain ``Claude Code-credentials`` item belongs to whichever account
+    the last session without ``CLAUDE_CONFIG_DIR`` logged in to, so it is a
+    candidate for every home whose account is known and never trusted blindly.
     """
-    accounts = [(claude_home_services(Path.home() / ".claude"), "Personal", "~/.claude")]
+    home = Path.home()
+    default_email = claude_account_email(claude_oauth_account(home / ".claude" / ".claude.json"))
+    accounts = [(claude_home_services(home / ".claude"), "claude-p", "~/.claude", default_email)]
     try:
-        home = Path.home()
         config_dirs = sorted(home.glob(".claude-*"))
     except (OSError, RuntimeError, ValueError):
         return accounts
@@ -375,16 +389,14 @@ def discover_claude_accounts():
                 continue
         except OSError:
             continue
-        label = claude_account_label(config_dir / ".claude.json")
-        if not label:
+        oauth_account = claude_oauth_account(config_dir / ".claude.json")
+        if not oauth_account:
             continue
-        accounts.append(
-            (
-                claude_home_services(config_dir),
-                label,
-                f"~/{config_dir.name}",
-            )
-        )
+        email = claude_account_email(oauth_account)
+        services = claude_home_services(config_dir)
+        if email:
+            services.append(PLAIN_CLAUDE_SERVICE)
+        accounts.append((services, config_dir.name.lstrip("."), f"~/{config_dir.name}", email))
     return accounts
 
 
@@ -1031,40 +1043,57 @@ def _normalise_reset_timestamp(value):
     return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _request_claude_usage_once(base_url, oauth):
-    headers = {
+class ClaudeAccountMismatch(PosterError):
+    """No readable credential belongs to the account a Claude home is logged in to."""
+
+
+def _claude_headers(oauth):
+    return {
         "Authorization": f"Bearer {oauth['accessToken']}",
         "anthropic-beta": "oauth-2025-04-20",
         "User-Agent": "claude-code/usage-stats-poster",
     }
-    profile = _request_json(base_url, "/api/oauth/profile", headers, "Anthropic profile")
-    usage = _request_json(base_url, "/api/oauth/usage", headers, "Anthropic usage")
-    return profile, usage
 
 
-def _request_claude_usage(base_url, oauth, fallbacks=()):
-    """Return ``(profile, usage)`` for ``oauth``.
+def _profile_email(profile):
+    account = profile.get("account") if isinstance(profile, dict) else None
+    return claude_account_email({"emailAddress": account.get("email")}) if isinstance(account, dict) else None
+
+
+def _request_claude_usage(base_url, oauth, fallbacks=(), email=None):
+    """Return ``(profile, usage)`` for the first credential that is ``email``'s.
 
     A 401 can come from a revoked login whose ``expiresAt`` is still in the
-    future, so each unexpired fallback credential of the same home is tried
-    before the original error is raised.
+    future, and a shared Keychain item can hold another account's login, so
+    each unexpired fallback credential is tried in turn. When ``email`` is
+    known, a credential whose profile belongs to another account is skipped
+    rather than reported under this home's label.
     """
-    try:
-        return _request_claude_usage_once(base_url, oauth)
-    except PosterHTTPError as error:
-        if error.status != 401:
-            raise
-        for fallback in fallbacks:
-            if _oauth_expired(fallback):
-                continue
-            try:
-                return _request_claude_usage_once(base_url, fallback)
-            except PosterError:
-                continue
-        raise error
+    rejected = None
+    for index, candidate in enumerate((oauth, *fallbacks)):
+        if index and _oauth_expired(candidate):
+            continue
+        headers = _claude_headers(candidate)
+        try:
+            profile = _request_json(base_url, "/api/oauth/profile", headers, "Anthropic profile")
+        except PosterHTTPError as error:
+            if error.status != 401 and not index:
+                raise
+            rejected = rejected or error
+            continue
+        except PosterError:
+            if not index:
+                raise
+            continue
+        if email and _profile_email(profile) != email:
+            continue
+        return profile, _request_json(base_url, "/api/oauth/usage", headers, "Anthropic usage")
+    if rejected:
+        raise rejected
+    raise ClaudeAccountMismatch("no Keychain login matches this Claude home's account")
 
 
-def _collect_claude_oauth_metric(base_url, services, label, dir_hint):
+def _collect_claude_oauth_metric(base_url, services, label, dir_hint, email=None, cache=None):
     """Collect a credential-free, renderer-friendly Claude account metric.
 
     The returned object intentionally contains only display labels, rate-limit
@@ -1073,7 +1102,7 @@ def _collect_claude_oauth_metric(base_url, services, label, dir_hint):
     writer.
     """
     metric = {"provider": "claude", "account": label, "limits": []}
-    credentials = _read_oauth_credentials(services)
+    credentials = _read_oauth_credentials(services, cache)
     if not credentials:
         metric["status"] = "unavailable"
         metric["reason"] = "Could not get OAuth token"
@@ -1092,7 +1121,12 @@ def _collect_claude_oauth_metric(base_url, services, label, dir_hint):
         return metric
 
     try:
-        profile, usage = _request_claude_usage(base_url, oauth, credentials[1:])
+        profile, usage = _request_claude_usage(base_url, oauth, credentials[1:], email)
+    except ClaudeAccountMismatch:
+        metric["status"] = "unavailable"
+        metric["reason"] = "No login for this account"
+        metric["text"] = _claude_relogin_block(label, dir_hint)
+        return metric
     except PosterHTTPError as error:
         metric["status"] = "unavailable"
         metric["reason"] = "Auth expired" if error.status == 401 else "Anthropic usage unavailable"
@@ -1151,8 +1185,9 @@ def _collect_claude_oauth_metric(base_url, services, label, dir_hint):
 def collect_claude_metrics(config):
     """Return structured current Claude metrics for history and rendering."""
     metrics = []
-    for index, (services, label, dir_hint) in enumerate(discover_claude_accounts()):
-        metric = _collect_claude_oauth_metric(config["anthropic_base_url"], services, label, dir_hint)
+    cache = {}
+    for index, (services, label, dir_hint, email) in enumerate(discover_claude_accounts()):
+        metric = _collect_claude_oauth_metric(config["anthropic_base_url"], services, label, dir_hint, email, cache)
         if index > 0 and metric.get("missing_oauth"):
             metric["text"] = None
         metrics.append(metric)
