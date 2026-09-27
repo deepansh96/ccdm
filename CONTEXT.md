@@ -5,8 +5,16 @@ CCDM manages Discord-connected coding-agent sessions by assigning project bots, 
 ## Language
 
 **Project Conversation**:
-The ongoing exchange in one registered project channel, whether served by Claude or Codex. Each project channel has at most one open conversation; root channels are excluded.
+The ongoing exchange with a project's coding agent, whether served by Claude or Codex: either a **Channel Conversation** or a **Thread Conversation**. Root channels are excluded.
 _Avoid_: message thread, agent session when referring to the conversation
+
+**Channel Conversation**:
+The **Project Conversation** held directly in a registered project channel. Each project channel has at most one.
+_Avoid_: main thread, project session
+
+**Thread Conversation**:
+A **Project Conversation** held in one Discord thread under a registered project channel, with its own agent conversation and optional provider, account, model, and effort overrides. It is independent of its channel's **Channel Conversation** and of sibling threads.
+_Avoid_: sub-session, child channel, Codex thread
 
 **Conversation Reminder**:
 A standalone emoji message that draws attention to an open **Project Conversation** awaiting the CCDM owner's reply, recurring without an @mention after one hour, then 2, 4, 6 … up to 24 hours between ignored reminders. Reading the channel does not acknowledge the reminder or reset its timing.
@@ -122,6 +130,9 @@ _Avoid_: local poster script, usage daemon
 
 ## Relationships
 
+- A registered project channel hosts at most one **Channel Conversation** and any number of **Thread Conversations**, all served by the project's assigned bot.
+- A **Thread Conversation** inherits the project's provider, account, model, and effort unless the thread overrides them.
+
 - The **End-to-End Test Suite** uses **Local Fakes** by default.
 - The **Live Smoke Suite** verifies a narrow subset of workflows against real external services.
 - The **End-to-End Test Suite** drives **Executable Surfaces** directly by default.
@@ -193,6 +204,8 @@ _Avoid_: local poster script, usage daemon
 > **Domain expert:** "It meets the **Default Acceptance Bar**: isolated local-fake execution, phase-one workflow coverage, diagnostics, CI, and gated live smoke."
 
 ## Flagged Ambiguities
+
+- "Thread" could mean a Discord thread or a Codex conversation (`thread_uuid`). Resolved: a Discord thread hosts a **Thread Conversation**; the Codex identifier stays a provider conversation id.
 
 - "End-to-end" could mean real third-party services for every run or real CCDM workflows with fake external boundaries. Resolved: default E2E uses real CCDM scripts and bridges with **Local Fakes**, while **Live Smoke Suite** is opt-in.
 - "Command" could mean an executable script or a natural-language Discord request handled by the root agent. Resolved: default E2E targets **Executable Surfaces**; conversational behavior is smoke-tested.
