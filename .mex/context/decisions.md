@@ -16,7 +16,7 @@ edges:
     condition: when changing lifecycle or process ownership
   - target: context/discord-security.md
     condition: when changing channel isolation or reply authority
-last_updated: 2026-09-07
+last_updated: 2026-09-27
 ---
 
 # Decisions
@@ -71,7 +71,7 @@ last_updated: 2026-09-07
 ### Export long Discord history through a shared, read-only MCP tool
 **Date:** 2026-07-24
 **Status:** Active
-**Decision:** Reuse the repository's range exporter through the Codex Discord MCP and an export-only MCP config generated for local Claude sessions.
+**Decision:** Reuse the repository's range exporter through the Codex Discord MCP and a read-only MCP config generated for local Claude sessions. That config also exposes `read_last_x_messages_in_channel` (added 2026-09-27, when Claude sessions were found to lack it), because the official plugin's `fetch_messages` stops at 100.
 **Reasoning:** Temporary transcripts keep large ranges out of MCP responses, and a separate helper avoids modifying Anthropic's update-managed Discord plugin.
 **Alternatives considered:** Expand `fetch_messages` responses or patch the official Claude plugin; rejected because large results consume model context and plugin updates overwrite local edits.
 **Consequences:** Local Claude sessions receive a token-free generated MCP config, Codex uses its existing scoped server, and remote Claude hosts require the helper to be deployed separately.

@@ -16,7 +16,7 @@ edges:
     condition: when granting, syncing, listing, or revoking guest access
   - target: patterns/debug-discord-session.md
     condition: when a bot cannot read or reply in its assigned channel
-last_updated: 2026-09-07
+last_updated: 2026-09-27
 ---
 
 # Discord Security
@@ -33,7 +33,7 @@ Guest management and usage reporting read `DISCORD_BOT_TOKEN` from `ROOT_DISCORD
 
 Bot tokens live only in ignored `registry.json` and per-bot `.env` state files. Claude and Codex auth live under their configured account homes. Never include token values, `auth.json`, Keychain data, or the current bridge scope token in logs, docs, tests, or delegated prompts.
 
-Claude's generated message-export MCP config contains only the assigned channel and state-directory path. The export helper reads the bot token from the existing ignored state `.env`; export-only mode does not expose Discord write tools.
+Claude's generated message-export MCP config contains only the assigned channel and state-directory path. The export helper and the recent-message reader read the bot token from the existing ignored state `.env`; read-only mode exposes only those two channel-scoped read tools and rejects every Discord write.
 
 ## Codex Replies
 

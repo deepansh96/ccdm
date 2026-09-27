@@ -15,9 +15,12 @@ const EXPORT_SCRIPT = path.resolve(__dirname, "export-discord-range.js");
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const DISCORD_REPLY_TOKEN = process.env.DISCORD_REPLY_TOKEN;
-const EXPORT_ONLY = ["1", "true", "yes", "on"].includes(
+// Claude sessions get replies and writes from the official plugin; this mode
+// adds only the channel-scoped read tools that plugin lacks.
+const READ_ONLY = ["1", "true", "yes", "on"].includes(
   (process.env.DISCORD_MCP_EXPORT_ONLY || "").toLowerCase()
 );
+const READ_ONLY_TOOLS = new Set(["read_last_x_messages_in_channel", "export_message_range"]);
 const DISCORD_CHANNEL_OVERRIDE = ["1", "true", "yes", "on"].includes(
   (process.env.DISCORD_CHANNEL_OVERRIDE || "").toLowerCase()
 );
@@ -31,8 +34,8 @@ const DISCORD_GLOBAL_USER_IDS = new Set(
     .filter(Boolean)
 );
 
-if ((!BOT_TOKEN && !EXPORT_ONLY) || !CHANNEL_ID) {
-  process.stderr.write(`Missing ${EXPORT_ONLY ? "CHANNEL_ID" : "BOT_TOKEN or CHANNEL_ID"}\n`);
+if ((!BOT_TOKEN && !READ_ONLY) || !CHANNEL_ID) {
+  process.stderr.write(`Missing ${READ_ONLY ? "CHANNEL_ID" : "BOT_TOKEN or CHANNEL_ID"}\n`);
   process.exit(1);
 }
 
@@ -47,10 +50,27 @@ function makeError(id, code, message) {
   return { jsonrpc: "2.0", id, error: { code, message } };
 }
 
+// Read-only configs carry no token; like the range exporter, read it from the
+// bot's ignored state .env so the generated MCP config stays secret-free.
+async function readToken() {
+  if (BOT_TOKEN) return BOT_TOKEN;
+  if (process.env.DISCORD_STATE_DIR) {
+    try {
+      const env = await readFile(path.join(process.env.DISCORD_STATE_DIR, ".env"), "utf8");
+      const match = env.match(/^DISCORD_BOT_TOKEN=(.+)$/m);
+      if (match) return match[1].trim();
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  throw new Error("No bot token found; set BOT_TOKEN or DISCORD_STATE_DIR");
+}
+
 async function discordGet(endpoint, retryRateLimits = false) {
+  const token = await readToken();
   for (let attempt = 0; attempt < 5; attempt++) {
     const res = await fetch(`${API_BASE}${endpoint}`, {
-      headers: { Authorization: `Bot ${BOT_TOKEN}` },
+      headers: { Authorization: `Bot ${token}` },
     });
     if (res.ok) return res.json();
 
@@ -380,13 +400,13 @@ const ALL_TOOLS = [
     },
   },
 ];
-const TOOLS = EXPORT_ONLY
-  ? ALL_TOOLS.filter((tool) => tool.name === "export_message_range")
+const TOOLS = READ_ONLY
+  ? ALL_TOOLS.filter((tool) => READ_ONLY_TOOLS.has(tool.name))
   : ALL_TOOLS;
 
 async function handleToolCall(name, args) {
-  if (EXPORT_ONLY && name !== "export_message_range") {
-    throw new Error(`Tool unavailable in export-only mode: ${name}`);
+  if (READ_ONLY && !READ_ONLY_TOOLS.has(name)) {
+    throw new Error(`Tool unavailable in read-only mode: ${name}`);
   }
 
   switch (name) {
