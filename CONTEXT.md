@@ -16,6 +16,10 @@ _Avoid_: main thread, project session
 A **Project Conversation** held in one Discord thread under a registered project channel, with its own agent conversation and optional provider, account, model, and effort overrides. It is independent of its channel's **Channel Conversation** and of sibling threads.
 _Avoid_: sub-session, child channel, Codex thread
 
+**Thread Supervisor**:
+The single root-level CCDM service that turns Discord thread events in registered project channels into **Thread Conversation** lifecycle: start, stop, resume, close, and the live-session cap.
+_Avoid_: thread hub, thread listener, per-project hub
+
 **Conversation Reminder**:
 A standalone emoji message that draws attention to an open **Project Conversation** awaiting the CCDM owner's reply, recurring without an @mention after one hour, then 2, 4, 6 … up to 24 hours between ignored reminders. Reading the channel does not acknowledge the reminder or reset its timing.
 _Avoid_: mark unread, read receipt
@@ -132,6 +136,7 @@ _Avoid_: local poster script, usage daemon
 
 - A registered project channel hosts at most one **Channel Conversation** and any number of **Thread Conversations**, all served by the project's assigned bot.
 - A **Thread Conversation** inherits the project's provider, account, model, and effort unless the thread overrides them.
+- The **Thread Supervisor** manages every project's **Thread Conversations** independently of whether the project's **Channel Conversation** is running.
 
 - The **End-to-End Test Suite** uses **Local Fakes** by default.
 - The **Live Smoke Suite** verifies a narrow subset of workflows against real external services.
