@@ -107,3 +107,11 @@ test("e2e README records the named-account setup and documentation scenarios", (
 test("scenario matrix records the channel bridge's thread-message filtering", () => {
   assert.match(matrix, /\| Codex bridge \| Thread message filtering \| Covered \| .*type 11.*parentId/);
 });
+
+test("scenario matrix records the always-on Claude conversation-scoped proxy", () => {
+  assert.match(matrix, /\| Claude start \| Always-on conversation-scoped proxy \| Covered \| .*--dangerously-load-development-channels server:discord/);
+  assert.match(matrix, /\| Claude start \| Proxy Claude Code version gate \| Covered \| .*2\.1\.281/);
+  assert.match(matrix, /\| Claude proxy \| Channel Conversation scoping \| Covered \| .*\/thread.*\/config.*\/close/);
+  assert.match(matrix, /\| Claude proxy \| Thread Conversation scoping and bootstrap \| Covered \| .*exactly once/);
+  assert.match(matrix, /\| Claude proxy \| Fail closed on plugin tool contract \| Covered \|/);
+});

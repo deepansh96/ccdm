@@ -16,7 +16,7 @@ edges:
     condition: when performing a start, stop, or restart
   - target: patterns/register-project.md
     condition: when assigning or releasing a project bot
-last_updated: 2026-09-25
+last_updated: 2026-09-28
 ---
 
 # Session Management
@@ -30,6 +30,10 @@ Never print tokens. Treat missing project `type` as `claude`. Use exact tmux tar
 ## Claude Lifecycle
 
 Use `scripts/start-session.sh <project>`. It resolves the assigned state directory, rejects duplicate tmux/listener processes, launches Claude through `zsh -ic`, and records PID/session ID. Optional `claude_home` selects `CLAUDE_CONFIG_DIR`; `model` and `claude_effort` set the listener's `--model` and `--effort` flags. Supported effort values are `low`, `medium`, `high`, `xhigh`, and `max`. Missing, null, or empty effort uses the default; other values are rejected before field splitting, MCP config creation, or launch.
+
+Every Claude Channel Conversation runs behind the conversation-scoped proxy `scripts/claude-reminder-channel.js`, launched with `--dangerously-load-development-channels server:discord`. It is always on, whether or not `CCDM_CLAUDE_REMINDER_ADAPTER=1` is set. The proxy delivers only the project channel's messages, never those of threads under it, and refuses Discord tools aimed at any other channel. It drops the reserved `/thread`, `/config`, and `/close` commands before they reach the model. A launch settings file disables the official plugin's own unscoped listener. Plain launches use the highest installed official plugin release; only the reminder adapter pins `0.0.4`, and only it adds command hooks and the capability marker. If the plugin lacks any of `reply`, `react`, `edit_message`, `download_attachment`, or `fetch_messages`, the proxy fails closed with no tools and no messages. Claude Code older than `2.1.281` (or outside 2.x) fails the launch before tmux creation or registry changes. Each project needs a one-time development-channel consent in its tmux pane at its next restart after this change; accept it once in the pane.
+
+The proxy also has a thread mode (`CCDM_CLAUDE_THREAD_ID`) that admits only its thread. It refuses tools aimed at the parent channel or sibling threads. With `CCDM_CLAUDE_BOOTSTRAP_FILE`, it holds live messages until the launcher atomically writes one synthetic bootstrap notification (`content`, `meta` with the thread `chat_id`, and `included_message_ids`). It delivers that bootstrap once, removes the file, and drops later live copies of the included messages. No launcher uses thread mode yet.
 
 Claude slash commands from project channels are relayed by the root bot through `scripts/send-claude-command.sh`; they are tmux keystrokes, not protocol calls.
 

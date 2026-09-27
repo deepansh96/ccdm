@@ -17,7 +17,19 @@ const selectedProject = process.env.CCDM_CLAUDE_PROJECT || "";
 const selectedChannel = process.env.CCDM_CLAUDE_CHANNEL_ID || "";
 const selectedAppId = process.env.CCDM_CLAUDE_BOT_APP_ID || "";
 const rootAppId = process.env.CCDM_CLAUDE_ROOT_APP_ID || "";
-const assignmentFields = [selectedProject, selectedChannel, selectedAppId];
+// A Thread Conversation is pinned to one thread under the project channel;
+// its reminder capability is per conversation and not proven here.
+const selectedThread = process.env.CCDM_CLAUDE_THREAD_ID || "";
+if (selectedThread && (!selectedProject || !selectedChannel)) {
+  process.stderr.write("Claude reminder channel: a thread conversation needs its project channel\n");
+  process.exit(2);
+}
+const conversationChat = selectedThread || selectedChannel;
+// Transport scoping is always on; reminder markers, events, and reply metadata
+// run only for a reminder-adapter launch (and for root launches, which predate
+// the split and never set this flag).
+const remindersEnabled = process.env.CCDM_CLAUDE_REMINDER_ADAPTER !== "0" && !selectedThread;
+const assignmentFields = remindersEnabled ? [selectedProject, selectedChannel, selectedAppId] : [selectedProject, selectedChannel];
 if (assignmentFields.some(Boolean) && !assignmentFields.every(Boolean)) {
   process.stderr.write("Claude reminder channel: incomplete Claude project assignment\n");
   process.exit(2);
@@ -28,7 +40,7 @@ const interactions = new Map();
 const pendingReplies = new Map();
 let inputNeededMarker = null;
 let supportedServerVersion = null;
-const capabilityPath = selectedProject ? path.join(stateDir, "capabilities", `${selectedProject}.json`) : null;
+const capabilityPath = remindersEnabled && selectedProject ? path.join(stateDir, "capabilities", `${selectedProject}.json`) : null;
 
 // The capability marker proves only this live launch. Remove it when this
 // process exits, unless a newer launch has already replaced it.
@@ -83,16 +95,28 @@ plugin.on("exit", async code => {
 process.on("SIGTERM", () => plugin.kill("SIGTERM"));
 process.on("SIGINT", () => plugin.kill("SIGINT"));
 
-function isClose(text) {
+// Matches a plain-text command, optionally addressed to the project or root bot.
+function isCommand(text, pattern) {
   const trimmed = String(text || "").trim();
-  if (trimmed === "/close") return true;
+  if (pattern.test(trimmed)) return true;
   for (const appId of [selectedAppId, rootAppId]) {
     if (!appId) continue;
     for (const mention of [`<@${appId}>`, `<@!${appId}>`]) {
-      if (trimmed.startsWith(mention) && /^\s+\/close$/.test(trimmed.slice(mention.length))) return true;
+      if (trimmed.startsWith(mention) && /^\s/.test(trimmed.slice(mention.length)) &&
+          pattern.test(trimmed.slice(mention.length).trim())) return true;
     }
   }
   return false;
+}
+
+function isClose(text) {
+  return isCommand(text, /^\/close$/);
+}
+
+// /thread and /config belong to the Thread Supervisor, never to a Channel
+// Conversation's model.
+function isReservedChannelCommand(text) {
+  return isCommand(text, /^\/(?:thread|config)(?:\s[\s\S]*)?$/);
 }
 
 function isManagement(text) {
@@ -100,6 +124,61 @@ function isManagement(text) {
   return ["/compact", "/clear", "/pause", "/unpause", "/restart"].includes(trimmed) || [rootAppId].filter(Boolean).some(id =>
     [`<@${id}>`, `<@!${id}>`].some(mention => trimmed.includes(mention)),
   );
+}
+
+// The scoped transport knows how to target each official plugin tool. If any
+// is missing the plugin contract has changed, so no Discord tool is exposed and
+// no message reaches the model. Messages wait until the tool list is verified.
+const EXPECTED_TOOLS = ["reply", "react", "edit_message", "download_attachment", "fetch_messages"];
+let toolsVerified = false;
+let failedClosed = false;
+
+// A thread launcher hands over the thread's first prompt by atomically writing
+// one synthetic channel notification to this file once Claude is ready. Live
+// thread messages wait until then, and those the bootstrap already carries are
+// never delivered twice.
+const bootstrapFile = selectedThread ? process.env.CCDM_CLAUDE_BOOTSTRAP_FILE || "" : "";
+let bootstrapPending = Boolean(bootstrapFile);
+let bootstrapTimer = null;
+const bootstrapIncluded = new Set();
+const heldNotifications = [];
+
+function watchBootstrap() {
+  if (!bootstrapPending || bootstrapTimer) return;
+  bootstrapTimer = setInterval(() => {
+    pluginQueue = pluginQueue.then(deliverBootstrap).catch(error => {
+      process.stderr.write(`Claude reminder channel: bootstrap failed: ${error.message}\n`);
+    });
+  }, 100);
+}
+
+async function deliverBootstrap() {
+  if (!bootstrapPending) return;
+  let raw;
+  try { raw = await fs.readFile(bootstrapFile, "utf8"); } catch { return; }
+  bootstrapPending = false;
+  clearInterval(bootstrapTimer);
+  await fs.rm(bootstrapFile, { force: true });
+  let bootstrap = null;
+  try { bootstrap = JSON.parse(raw); } catch { /* Rejected below. */ }
+  const meta = bootstrap?.meta;
+  const included = bootstrap?.included_message_ids;
+  if (typeof bootstrap?.content === "string" && bootstrap.content && meta?.chat_id === selectedThread &&
+      typeof meta.message_id === "string" && meta.message_id &&
+      (included === undefined || (Array.isArray(included) && included.every(id => typeof id === "string")))) {
+    for (const id of [...(included || []), meta.message_id]) bootstrapIncluded.add(id);
+    process.stdout.write(JSON.stringify({
+      jsonrpc: "2.0", method: "notifications/claude/channel", params: { content: bootstrap.content, meta },
+    }) + "\n");
+  } else {
+    process.stderr.write("Claude reminder channel: ignored an invalid thread bootstrap\n");
+  }
+  await releaseHeldNotifications();
+}
+
+async function releaseHeldNotifications() {
+  if (!toolsVerified || bootstrapPending) return;
+  for (const line of heldNotifications.splice(0)) await handlePluginMessage(line);
 }
 
 async function handlePluginMessage(line) {
@@ -123,12 +202,23 @@ async function handlePluginMessage(line) {
     }
   }
   if (message.result?.tools) {
+    const names = new Set(message.result.tools.map(tool => tool?.name));
+    const missing = EXPECTED_TOOLS.filter(name => !names.has(name));
+    if (missing.length) {
+      failedClosed = true;
+      process.stderr.write(`Claude reminder channel: official Discord tools are missing: ${missing.join(", ")}\n`);
+      message.result.tools = [];
+      line = JSON.stringify(message);
+      heldNotifications.length = 0;
+    } else {
+      toolsVerified = true;
+    }
     const replyTool = message.result.tools.find(tool => tool.name === "reply");
     const replySchema = replyTool?.inputSchema;
     const replyVerified = replySchema?.properties?.chat_id?.type === "string" &&
       replySchema.properties.text?.type === "string" &&
       ["chat_id", "text"].every(field => replySchema.required?.includes(field));
-    if (replyVerified) {
+    if (replyVerified && remindersEnabled) {
       replyTool.inputSchema.properties.conversation_interaction_id = {
         type: "string", description: "Required for Conversation Reminder readiness: copy message_id from the owner channel message being answered.",
       };
@@ -139,7 +229,7 @@ async function handlePluginMessage(line) {
       replyTool.inputSchema.required = [...new Set([...(replyTool.inputSchema.required || []), "conversation_interaction_id"])];
       line = JSON.stringify(message);
     }
-    if (selectedProject && supportedServerVersion) {
+    if (capabilityPath && supportedServerVersion) {
       const markerPath = capabilityPath;
       const assignment = await reminder.resolveAssignmentForChannel(selectedChannel, {
         registryPath: path.join(projectRoot, "registry.json"), botAppId: selectedAppId,
@@ -168,7 +258,7 @@ async function handlePluginMessage(line) {
   }
   if (message.result?.serverInfo) {
     const capabilities = message.result.capabilities || {};
-    if (message.result.serverInfo.name !== "discord" || message.result.serverInfo.version !== "1.0.0" ||
+    if (message.result.serverInfo.name !== "discord" || (remindersEnabled && message.result.serverInfo.version !== "1.0.0") ||
         !capabilities.experimental?.["claude/channel"] || !capabilities.tools) {
       if (capabilityPath) await fs.rm(capabilityPath, { force: true });
       process.stderr.write("Claude reminder channel: unsupported official Discord transport contract\n");
@@ -177,7 +267,7 @@ async function handlePluginMessage(line) {
       return;
     }
     supportedServerVersion = message.result.serverInfo.version;
-    if (selectedProject) {
+    if (capabilityPath) {
       await fs.rm(capabilityPath, { force: true });
       message.result.instructions = `${message.result.instructions || ""}\nFor every reply, pass conversation_interaction_id copied from the owner message_id being answered. Set conversation_disposition to input-needed only when the delivered reply explicitly asks the owner for input; otherwise use progress. A reply without a valid interaction ID is delivered normally but does not count as a confirmed Conversation Reminder response.`;
       line = JSON.stringify(message);
@@ -185,12 +275,20 @@ async function handlePluginMessage(line) {
   }
   if (message.method !== "notifications/claude/channel") {
     process.stdout.write(`${line}\n`);
+    if (message.result?.tools) await releaseHeldNotifications();
     return;
   }
+  if (failedClosed) return;
   const meta = message.params?.meta || {};
-  if (selectedChannel && meta.chat_id !== selectedChannel) return;
+  if (conversationChat && meta.chat_id !== conversationChat) return;
+  if (selectedProject && !selectedThread && isReservedChannelCommand(message.params?.content)) return;
+  if (!toolsVerified || bootstrapPending) {
+    heldNotifications.push(line);
+    return;
+  }
+  if (bootstrapIncluded.has(meta.message_id)) return;
   if (!isClose(message.params?.content)) {
-    if (meta.chat_id && meta.message_id && meta.user_id && (!selectedChannel || meta.chat_id === selectedChannel)) {
+    if (remindersEnabled && meta.chat_id && meta.message_id && meta.user_id && (!selectedChannel || meta.chat_id === selectedChannel)) {
       const assignment = await reminder.resolveAssignmentForChannel(meta.chat_id, {
         registryPath: path.join(projectRoot, "registry.json"),
         ...(selectedProject ? { botAppId: selectedAppId } : {}),
@@ -231,6 +329,7 @@ async function handlePluginMessage(line) {
   }
   // A filtered command is never relayed to a model even if registration has
   // changed while the provider was running.
+  if (!remindersEnabled) return;
   if (!meta.chat_id || !meta.message_id || !meta.user_id) return;
   if (selectedChannel && meta.chat_id !== selectedChannel) return;
   const assignment = await reminder.resolveAssignmentForChannel(meta.chat_id, {
@@ -247,7 +346,7 @@ async function handlePluginMessage(line) {
   }
 }
 
-let pluginQueue = reminder.drainOutbox();
+let pluginQueue = remindersEnabled ? reminder.drainOutbox() : Promise.resolve();
 createInterface({ input: plugin.stdout }).on("line", line => {
   pluginQueue = pluginQueue.then(() => handlePluginMessage(line)).catch(error => {
     process.stderr.write(`Claude reminder channel: filter failed: ${error.message}\n`);
@@ -257,13 +356,21 @@ createInterface({ input: process.stdin }).on("line", line => {
   let outgoing = line;
   try {
     const request = JSON.parse(line);
-    if (selectedChannel && request.method === "tools/call") {
+    if (request.method === "notifications/initialized") watchBootstrap();
+    if (failedClosed && request.method === "tools/call") {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: "2.0", id: request.id,
+        result: { isError: true, content: [{ type: "text", text: "Discord tools unavailable" }] },
+      }) + "\n");
+      return;
+    }
+    if (conversationChat && request.method === "tools/call") {
       const name = request.params?.name;
       const argumentsValue = request.params?.arguments || {};
       const target = name === "fetch_messages" ? argumentsValue.channel
         : ["reply", "react", "edit_message", "download_attachment"].includes(name) ? argumentsValue.chat_id
         : null;
-      if (target !== selectedChannel) {
+      if (target !== conversationChat) {
         process.stdout.write(JSON.stringify({
           jsonrpc: "2.0", id: request.id,
           result: { isError: true, content: [{ type: "text", text: "channel not assigned" }] },

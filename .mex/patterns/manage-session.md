@@ -8,7 +8,7 @@ triggers:
 edges:
   - target: context/session-management.md
     condition: always before changing session state
-last_updated: 2026-09-22
+last_updated: 2026-09-28
 ---
 
 # Manage A Session
@@ -24,6 +24,7 @@ last_updated: 2026-09-22
 - Never launch the bridge/plugin manually; the scripts provide required environment and duplicate-listener checks.
 - A tmux session being absent does not prove the listener is stopped.
 - Remote projects cannot be controlled through local tmux.
+- Claude project launches always run behind the conversation-scoped proxy (`--dangerously-load-development-channels server:discord`), with or without the reminder adapter. The first launch of each project after this change stops at a one-time development-channel consent prompt in the tmux pane. Accept it once, then confirm the listener banner. A launch fails before tmux when Claude Code is older than 2.1.281 or the official Discord plugin is not installed in the selected Claude home.
 - Codex starts fresh unless explicitly launched with `--resume <thread_uuid>`. For account/home migration, follow the history-preserving restart procedure in `context/session-management.md`; verify the saved rollout before stopping and retain the source for recovery.
 
 ## Verify

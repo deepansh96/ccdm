@@ -62,7 +62,7 @@ process.stdin.on('data', chunk => {
       ${options.noNotification ? "" : `process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'notifications/claude/channel',params:${JSON.stringify(notification)}})+'\\n');`}
     }
     if (request.method === 'tools/list') {
-      process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{tools:${options.noReplyTool ? "[]" : "[{name:'reply',inputSchema:{type:'object',properties:{chat_id:{type:'string'},text:{type:'string'}},required:['chat_id','text']}}]"}}})+'\\n');
+      process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{tools:${options.noReplyTool ? "[]" : "[{name:'reply',inputSchema:{type:'object',properties:{chat_id:{type:'string'},text:{type:'string'}},required:['chat_id','text']}}, ...['react','edit_message','download_attachment','fetch_messages'].map(name => ({name,inputSchema:{type:'object',properties:{}}}))]"}}})+'\\n');
     }
     if (request.method === 'tools/call') {
       const unexpectedMetadata = 'conversation_disposition' in request.params.arguments || 'conversation_interaction_id' in request.params.arguments;
@@ -648,12 +648,15 @@ test("a plain Claude restart after an adapter launch never reports a stale ready
   assert.match(dead.unsupported, /Claude launch-scoped transport is not running/);
   assert.match(dead.unsupported, /restart the session with CCDM_CLAUDE_REMINDER_ADAPTER=1 scripts\/start-session\.sh demo/);
 
-  // The documented plain restart runs the unfiltered official plugin.
+  // The documented plain restart still scopes the transport through the proxy,
+  // but without the reminder adapter it proves no reminder capability.
   const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"] });
   assert.equal(stopped.exitCode, 0, stopped.stderr || stopped.stdout);
   assert.equal(fs.existsSync(marker), false, "stop-session removes the launch's capability marker");
   fs.writeFileSync(marker, JSON.stringify({ stale: true }), { mode: 0o600 });
-  const plain = await runScript(workspace, "scripts/start-session.sh", { args: ["demo"] });
+  const plain = await runScript(workspace, "scripts/start-session.sh", {
+    args: ["demo"], env: { CCDM_FIXTURE_CLAUDE_VERSION: "2.1.281 (Claude Code)" },
+  });
   assert.equal(plain.exitCode, 0, plain.stderr || plain.stdout);
   assert.equal(fs.existsSync(marker), false, "a plain launch clears any earlier capability marker");
   const unfiltered = await readiness();

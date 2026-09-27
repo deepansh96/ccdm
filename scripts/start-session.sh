@@ -291,16 +291,20 @@ fi
 
 MCP_CONFIG="$STATE_DIR/ccdm-message-export-mcp.json"
 REMINDER_ADAPTER="${CCDM_CLAUDE_REMINDER_ADAPTER:-0}"
-# Only the adapter of this launch may prove a filtered Claude transport; a
-# plain launch runs the unfiltered official plugin and stays unsupported.
+# Only the adapter of this launch may prove Conversation Reminder support; a
+# plain launch is scoped by the same proxy but stays unsupported.
 clear_claude_capability_marker
-SETTINGS_FLAG=""
-CHANNEL_FLAG="--channels plugin:discord@claude-plugins-official"
+# Every Channel Conversation runs behind the conversation-scoped proxy so that
+# thread traffic never reaches it. The settings disable the official plugin's
+# own unscoped listener; reminder launches add their command hooks there.
+CHANNEL_FLAG="--dangerously-load-development-channels server:discord"
 if [[ "$REMINDER_ADAPTER" == "1" ]]; then
-  CHANNEL_FLAG="--dangerously-load-development-channels server:discord"
-  SETTINGS_FLAG=" --settings '$STATE_DIR/ccdm-conversation-reminder-hooks.json'"
+  CLAUDE_SETTINGS="$STATE_DIR/ccdm-conversation-reminder-hooks.json"
+else
+  CLAUDE_SETTINGS="$STATE_DIR/ccdm-claude-channel-settings.json"
 fi
-python3 - "$MCP_CONFIG" "$SCRIPT_DIR/discord-mcp-server.js" "$CHANNEL_ID" "$STATE_DIR" "$REMINDER_ADAPTER" "$ROOT_DIR" "$PROJECT" "$CLAUDE_HOME" <<'PY'
+SETTINGS_FLAG=" --settings '$CLAUDE_SETTINGS'"
+python3 - "$MCP_CONFIG" "$SCRIPT_DIR/discord-mcp-server.js" "$CHANNEL_ID" "$STATE_DIR" "$REMINDER_ADAPTER" "$ROOT_DIR" "$PROJECT" "$CLAUDE_HOME" "$CLAUDE_SETTINGS" <<'PY'
 import json
 import os
 import sys
@@ -310,7 +314,7 @@ import subprocess
 from pathlib import Path
 from uuid import uuid4
 
-config_path, server_script, channel_id, state_dir, adapter_enabled, root_dir, project, claude_home = sys.argv[1:9]
+config_path, server_script, channel_id, state_dir, adapter_enabled, root_dir, project, claude_home, settings_file = sys.argv[1:10]
 os.makedirs(os.path.dirname(config_path), exist_ok=True)
 config = {
     "mcpServers": {
@@ -325,69 +329,87 @@ config = {
         },
     },
 }
+version = subprocess.run(["claude", "--version"], capture_output=True, text=True)
+# Claude Code auto-updates, so accept any 2.x release from the first tested one;
+# the MCP proxy still rejects a changed plugin tool contract.
+match = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:\s|$)", version.stdout.strip())
+parsed = tuple(int(part) for part in match.groups()) if match else None
+if version.returncode != 0 or not parsed or parsed[0] != 2 or parsed < (2, 1, 281):
+    sys.exit("Claude Discord proxy: unsupported Claude Code version (requires 2.x from 2.1.281)")
+registry = json.loads((Path(root_dir) / "registry.json").read_text())
+bot_id = registry["projects"][project]["bot_id"]
+bots = [bot for bot in registry["pool"] if bot.get("id") == bot_id]
+bot_app_id = str(bots[0].get("app_id") or "") if len(bots) == 1 else ""
+if adapter_enabled == "1" and not bot_app_id:
+    sys.exit("Claude reminder adapter requires an unambiguous assigned bot app ID")
+root_app_id = registry.get("root_bot_app_id") or ""
+root_env = Path(os.environ.get("ROOT_DISCORD_STATE_DIR") or Path.home() / ".claude" / "channels" / "discord") / ".env"
+if root_env.is_file():
+    match = re.search(r"^DISCORD_BOT_TOKEN=(\S+)", root_env.read_text(), re.MULTILINE)
+    if match:
+        encoded_id = match.group(1).split(".")[0]
+        try:
+            root_app_id = base64.urlsafe_b64decode(encoded_id + "=" * (-len(encoded_id) % 4)).decode("ascii")
+        except (ValueError, UnicodeDecodeError):
+            pass
+if adapter_enabled == "1" and not root_app_id:
+    sys.exit("Claude reminder adapter requires root bot identity")
+selected_home = Path(claude_home) if claude_home else Path.home() / ".claude"
+plugin_cache = selected_home / "plugins" / "cache" / "claude-plugins-official" / "discord"
 if adapter_enabled == "1":
-    version = subprocess.run(["claude", "--version"], capture_output=True, text=True)
-    # Claude Code auto-updates, so accept any 2.x release from the first tested one;
-    # the MCP proxy still rejects a changed plugin server identity or capabilities.
-    match = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:\s|$)", version.stdout.strip())
-    parsed = tuple(int(part) for part in match.groups()) if match else None
-    if version.returncode != 0 or not parsed or parsed[0] != 2 or parsed < (2, 1, 281):
-        sys.exit("Claude reminder adapter: unsupported Claude Code version (requires 2.x from 2.1.281)")
-    registry = json.loads((Path(root_dir) / "registry.json").read_text())
-    bot_id = registry["projects"][project]["bot_id"]
-    bots = [bot for bot in registry["pool"] if bot.get("id") == bot_id]
-    if len(bots) != 1 or not bots[0].get("app_id"):
-        sys.exit("Claude reminder adapter requires an unambiguous assigned bot app ID")
-    root_app_id = registry.get("root_bot_app_id") or ""
-    root_env = Path(os.environ.get("ROOT_DISCORD_STATE_DIR") or Path.home() / ".claude" / "channels" / "discord") / ".env"
-    if root_env.is_file():
-        match = re.search(r"^DISCORD_BOT_TOKEN=(\S+)", root_env.read_text(), re.MULTILINE)
-        if match:
-            encoded_id = match.group(1).split(".")[0]
-            try:
-                root_app_id = base64.urlsafe_b64decode(encoded_id + "=" * (-len(encoded_id) % 4)).decode("ascii")
-            except (ValueError, UnicodeDecodeError):
-                pass
-    if not root_app_id:
-        sys.exit("Claude reminder adapter requires root bot identity")
-    selected_home = Path(claude_home) if claude_home else Path.home() / ".claude"
-    plugin_dir = selected_home / "plugins" / "cache" / "claude-plugins-official" / "discord" / "0.0.4"
+    # The reminder capability is pinned to the tested plugin release.
+    plugin_dir = plugin_cache / "0.0.4"
     if not (plugin_dir / "server.ts").is_file():
         sys.exit("Claude reminder adapter requires installed official Discord plugin 0.0.4")
+else:
+    installed = []
+    for candidate in plugin_cache.glob("*/server.ts"):
+        release = candidate.parent.name
+        if re.fullmatch(r"\d+(?:\.\d+)*", release):
+            installed.append((tuple(int(part) for part in release.split(".")), candidate.parent))
+    if not installed:
+        sys.exit("Claude Discord proxy requires the installed official Discord plugin")
+    plugin_dir = max(installed)[1]
+env = {
+    "CCDM_REMINDER_PROJECT_ROOT": root_dir,
+    "CCDM_CLAUDE_REMINDER_ADAPTER": "1" if adapter_enabled == "1" else "0",
+    "CCDM_CLAUDE_PROJECT": project,
+    "CCDM_CLAUDE_CHANNEL_ID": channel_id,
+    "CCDM_CLAUDE_BOT_APP_ID": bot_app_id,
+    "CCDM_CLAUDE_ROOT_APP_ID": str(root_app_id),
+    "CCDM_CLAUDE_PLUGIN_ROOT": str(plugin_dir),
+}
+settings = {"enabledPlugins": {"discord@claude-plugins-official": False}}
+if adapter_enabled == "1":
     reminder_dir = Path(os.environ.get("CCDM_REMINDER_STATE_DIR") or Path.home() / ".local" / "state" / "ccdm" / "conversation-reminders")
-    launch_id = str(uuid4())
-    env = {
-        "CCDM_REMINDER_PROJECT_ROOT": root_dir,
+    env.update({
         "CCDM_REMINDER_STATE_DIR": str(reminder_dir),
         "CCDM_REMINDER_RECEIPTS_DIR": str(reminder_dir / "claude-receipts"),
-        "CCDM_CLAUDE_PROJECT": project,
-        "CCDM_CLAUDE_CHANNEL_ID": channel_id,
-        "CCDM_CLAUDE_BOT_APP_ID": str(bots[0]["app_id"]),
-        "CCDM_CLAUDE_ROOT_APP_ID": str(root_app_id),
-        "CCDM_CLAUDE_PLUGIN_ROOT": str(plugin_dir),
-        "CCDM_CLAUDE_LAUNCH_ID": launch_id,
-        "CCDM_CLAUDE_HOOK_SETTINGS": str(Path(state_dir) / "ccdm-conversation-reminder-hooks.json"),
-    }
-    config["mcpServers"]["discord"] = {
-        "command": "node",
-        "args": [str(Path(root_dir) / "scripts" / "claude-reminder-channel.js")],
-        "env": env,
-    }
+        "CCDM_CLAUDE_LAUNCH_ID": str(uuid4()),
+        "CCDM_CLAUDE_HOOK_SETTINGS": settings_file,
+    })
     # Hook commands are command hooks: no prompt/agent hook can invoke a model.
     hook = str(Path(root_dir) / "scripts" / "claude-reminder-hook.js")
-    settings = {"enabledPlugins": {"discord@claude-plugins-official": False},
-                "hooks": {event: [{"hooks": [{"type": "command", "command": f"node '{hook}'"}]}]
-                          for event in ("SessionStart", "Stop", "StopFailure", "SessionEnd")}}
-    settings_path = Path(state_dir) / "ccdm-conversation-reminder-hooks.json"
-    with settings_path.open("w") as f:
-        json.dump(settings, f, indent=2)
-        f.write("\n")
-    os.chmod(settings_path, 0o600)
+    settings["hooks"] = {event: [{"hooks": [{"type": "command", "command": f"node '{hook}'"}]}]
+                         for event in ("SessionStart", "Stop", "StopFailure", "SessionEnd")}
     # The Claude process inherits launch-scoped context, including the same ID
     # as its channel server and its command hooks.
     with (Path(state_dir) / "ccdm-conversation-reminder-env.json").open("w") as f:
         json.dump(env, f)
     os.chmod(Path(state_dir) / "ccdm-conversation-reminder-env.json", 0o600)
+else:
+    # A plain launch leaves no reminder hooks or context behind from an earlier one.
+    for stale in ("ccdm-conversation-reminder-hooks.json", "ccdm-conversation-reminder-env.json"):
+        (Path(state_dir) / stale).unlink(missing_ok=True)
+config["mcpServers"]["discord"] = {
+    "command": "node",
+    "args": [str(Path(root_dir) / "scripts" / "claude-reminder-channel.js")],
+    "env": env,
+}
+with open(settings_file, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+os.chmod(settings_file, 0o600)
 with open(config_path, "w") as f:
     json.dump(config, f, indent=2)
     f.write("\n")

@@ -12,7 +12,7 @@ edges:
     condition: when specific technology details are needed
   - target: context/decisions.md
     condition: when understanding why the architecture is structured this way
-last_updated: 2026-09-27
+last_updated: 2026-09-28
 ---
 
 # Architecture
@@ -32,7 +32,7 @@ The root agent coordinates lifecycle and access. Each project agent works only i
 ## Key Components
 - **`registry.json`** - source of truth for bot pool, project assignments, channels, tmux names, account homes, and runtime PIDs; local and untracked because it contains secrets.
 - **Session scripts** - `start-session.sh`, `start-codex-session.sh`, and `stop-session.sh` enforce one listener per assignment and maintain registry runtime state.
-- **Claude reminder adapter** - opt-in `claude-reminder-channel.js` relays the official Discord plugin through a launch-scoped MCP filter; command hooks and the shared durable receiver record reply and lifecycle events. The foreground service owns reminder delivery, bounded history discovery, restart/reconnect reconciliation, and globally spaced catch-up; `enable` opts in only when both provider adapters are installed.
+- **Claude conversation proxy and reminder adapter** - `claude-reminder-channel.js` always relays the official Discord plugin for Claude Channel Conversations. It is an MCP filter scoped to one conversation that keeps thread traffic and other channels out and drops reserved `/thread`, `/config`, and `/close`. With the opt-in reminder adapter, command hooks and the shared durable receiver record reply and lifecycle events. The foreground service owns reminder delivery, bounded history discovery, restart/reconnect reconciliation, and globally spaced catch-up; `enable` opts in only when both provider adapters are installed.
 - **Conversation Reminder service** - `conversation-reminder-service.py run` observes project channels with root credentials and sends through assigned bots. It runs in the foreground or under the opt-in `com.discord.conversation-reminders` LaunchAgent from `install-conversation-reminder-service.sh`. Both launches share one worker lock and the same reconciliation, independently of project and root coding sessions.
 - **`scripts/codex-bridge.js`** - connects Discord to `codex app-server`, injects mid-turn messages, handles attachments/audio, and exposes channel-scoped MCP tools.
 - **Discord range export** - `export-discord-range.js` paginates an inclusive message range into a temporary transcript; Codex exposes it through the bridge MCP, while `start-session.sh` adds the same MCP to local Claude sessions in read-only mode, exposing only `read_last_x_messages_in_channel` and `export_message_range` beside the official plugin's tools.

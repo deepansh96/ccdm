@@ -383,7 +383,8 @@ process.stdin.on("data", chunk => {
         user_id: "owner-id" } } });
     if (request.method === "tools/list") write({ jsonrpc: "2.0", id: request.id, result: { tools: [{ name: "reply",
       inputSchema: { type: "object", properties: { chat_id: { type: "string" }, text: { type: "string" } },
-        required: ["chat_id", "text"] } }] } });
+        required: ["chat_id", "text"] } }, ...["react", "edit_message", "download_attachment", "fetch_messages"]
+        .map(name => ({ name, inputSchema: { type: "object", properties: {} } }))] } });
     if (request.method === "tools/call") write({ jsonrpc: "2.0", id: request.id,
       result: { content: [{ type: "text", text: ${JSON.stringify(`sent (id: ${answerId})`)} }] } });
   }

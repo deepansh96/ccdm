@@ -61,6 +61,16 @@ function buildClaudeRegistry(workspace, options = {}) {
   };
 }
 
+function installOfficialPlugin(workspace, version = "0.0.4", home = path.join(workspace.homeDir, ".claude")) {
+  const pluginDir = path.join(home, "plugins", "cache", "claude-plugins-official", "discord", version);
+  fs.mkdirSync(pluginDir, { recursive: true });
+  fs.writeFileSync(path.join(pluginDir, "server.ts"), "// fixture official plugin\n");
+  return pluginDir;
+}
+
+// Every Claude launch runs behind the proxy, which needs Claude Code 2.1.281+.
+const SUPPORTED_CLAUDE = { CCDM_FIXTURE_CLAUDE_VERSION: "2.1.281 (Claude Code)" };
+
 function readRegistry(workspace) {
   return JSON.parse(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"));
 }
@@ -134,8 +144,9 @@ test("start-session starts a Claude project through tmux and records PID/session
   const stateDir = registrySeed.pool[0].state_dir;
   seedRegistry(workspace, registrySeed);
 
+  installOfficialPlugin(workspace);
   const result = await runScript(workspace, "scripts/start-session.sh", {
-    args: ["alpha"],
+    env: SUPPORTED_CLAUDE, args: ["alpha"],
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
@@ -153,17 +164,13 @@ test("start-session starts a Claude project through tmux and records PID/session
   assert.equal(state.fixtures.tmux.sessions.alpha_session.sendKeys, undefined);
   const mcpConfigPath = path.join(stateDir, "ccdm-message-export-mcp.json");
   const mcpConfig = JSON.parse(fs.readFileSync(mcpConfigPath, "utf8"));
-  assert.deepEqual(mcpConfig, {
-    mcpServers: {
-      "discord-message-export": {
-        command: "node",
-        args: [path.join(workspace.repoDir, "scripts", "discord-mcp-server.js")],
-        env: {
-          CHANNEL_ID: "channel-1",
-          DISCORD_STATE_DIR: stateDir,
-          DISCORD_MCP_EXPORT_ONLY: "1",
-        },
-      },
+  assert.deepEqual(mcpConfig.mcpServers["discord-message-export"], {
+    command: "node",
+    args: [path.join(workspace.repoDir, "scripts", "discord-mcp-server.js")],
+    env: {
+      CHANNEL_ID: "channel-1",
+      DISCORD_STATE_DIR: stateDir,
+      DISCORD_MCP_EXPORT_ONLY: "1",
     },
   });
   assert.equal(fs.statSync(mcpConfigPath).mode & 0o777, 0o600);
@@ -216,6 +223,68 @@ test("Claude reminder launch derives root mention identity from root state", asy
   assert.equal(mcp.mcpServers.discord.env.CCDM_CLAUDE_ROOT_APP_ID, "12345678");
 });
 
+test("a plain Claude launch still runs the Channel Conversation behind the scoped proxy without reminder state", async () => {
+  const workspace = createWorkspace();
+  const registry = buildClaudeRegistry(workspace);
+  seedRegistry(workspace, registry);
+  const stateDir = registry.pool[0].state_dir;
+  // The reminder pin is 0.0.4; transport scoping does not depend on it.
+  const pluginDir = installOfficialPlugin(workspace, "0.0.5");
+  const markerPath = path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders", "capabilities", "alpha.json");
+  fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+  fs.writeFileSync(markerPath, "{}\n");
+
+  const result = await runScript(workspace, "scripts/start-session.sh", {
+    args: ["alpha"], env: SUPPORTED_CLAUDE,
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const state = readState(workspace.stateDir);
+  const session = state.fixtures.tmux.sessions.alpha_session;
+  assert.match(session.shellCommand, / claude --dangerously-load-development-channels server:discord /);
+  assert.doesNotMatch(session.shellCommand, /--channels plugin:discord/);
+  assert.doesNotMatch(session.shellCommand, /CCDM_CLAUDE_/);
+  const invocation = state.fixtures.claude.invocations.at(-1);
+  assert.equal(invocation.args[invocation.args.indexOf("--dangerously-load-development-channels") + 1], "server:discord");
+  const mcp = JSON.parse(fs.readFileSync(path.join(stateDir, "ccdm-message-export-mcp.json"), "utf8"));
+  assert.deepEqual(mcp.mcpServers.discord, {
+    command: "node",
+    args: [path.join(workspace.repoDir, "scripts", "claude-reminder-channel.js")],
+    env: {
+      CCDM_REMINDER_PROJECT_ROOT: workspace.repoDir,
+      CCDM_CLAUDE_REMINDER_ADAPTER: "0",
+      CCDM_CLAUDE_PROJECT: "alpha",
+      CCDM_CLAUDE_CHANNEL_ID: "channel-1",
+      CCDM_CLAUDE_BOT_APP_ID: "app-2",
+      CCDM_CLAUDE_ROOT_APP_ID: "",
+      CCDM_CLAUDE_PLUGIN_ROOT: pluginDir,
+    },
+  });
+  // The official plugin must not start a second, unscoped Gateway client.
+  const settingsPath = /--settings '([^']+)'/.exec(session.shellCommand)?.[1];
+  assert.ok(settingsPath, session.shellCommand);
+  assert.deepEqual(JSON.parse(fs.readFileSync(settingsPath, "utf8")), { enabledPlugins: { "discord@claude-plugins-official": false } });
+  assert.equal(fs.existsSync(path.join(stateDir, "ccdm-conversation-reminder-hooks.json")), false);
+  assert.equal(fs.existsSync(path.join(stateDir, "ccdm-conversation-reminder-env.json")), false);
+  assert.equal(fs.existsSync(markerPath), false);
+});
+
+test("a Claude Code release older than 2.1.281 fails a plain launch before tmux or registry changes", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, buildClaudeRegistry(workspace));
+  installOfficialPlugin(workspace);
+  const registryBefore = fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8");
+
+  const result = await runScript(workspace, "scripts/start-session.sh", {
+    args: ["alpha"], env: { CCDM_FIXTURE_CLAUDE_VERSION: "2.1.280 (Claude Code)" },
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.stderr.trim(), "Claude Discord proxy: unsupported Claude Code version (requires 2.x from 2.1.281)");
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session, undefined);
+  assert.equal(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"), registryBefore);
+});
+
 async function adapterLaunchWithVersion(version) {
   const workspace = createWorkspace();
   const registry = buildClaudeRegistry(workspace);
@@ -255,8 +324,9 @@ test("start-session honors Claude model and effort overrides", async () => {
   registrySeed.projects.alpha.claude_effort = "high";
   seedRegistry(workspace, registrySeed);
 
+  installOfficialPlugin(workspace);
   const result = await runScript(workspace, "scripts/start-session.sh", {
-    args: ["alpha"],
+    env: SUPPORTED_CLAUDE, args: ["alpha"],
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
@@ -295,7 +365,8 @@ for (const effort of [undefined, null, "", "low", "medium", "high", "xhigh", "ma
     registrySeed.projects.alpha.claude_home = "~/.claude-work";
     seedRegistry(workspace, registrySeed);
 
-    const result = await runScript(workspace, "scripts/start-session.sh", { args: ["alpha"] });
+    installOfficialPlugin(workspace, "0.0.4", path.join(workspace.homeDir, ".claude-work"));
+    const result = await runScript(workspace, "scripts/start-session.sh", { env: SUPPORTED_CLAUDE, args: ["alpha"] });
 
     assert.equal(result.exitCode, 0, result.stderr || result.stdout);
     const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session;
@@ -314,8 +385,9 @@ test("start-session honors claude_home: launches with CLAUDE_CONFIG_DIR and reco
   registrySeed.projects.alpha.claude_home = "~/.claude-work";
   seedRegistry(workspace, registrySeed);
 
+  installOfficialPlugin(workspace, "0.0.4", claudeHome);
   const result = await runScript(workspace, "scripts/start-session.sh", {
-    args: ["alpha"],
+    env: SUPPORTED_CLAUDE, args: ["alpha"],
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
@@ -435,8 +507,9 @@ test("start-session updates only the requested Claude project in a multi-project
     }),
   );
 
+  installOfficialPlugin(workspace);
   const result = await runScript(workspace, "scripts/start-session.sh", {
-    args: ["alpha"],
+    env: SUPPORTED_CLAUDE, args: ["alpha"],
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
