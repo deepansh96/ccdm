@@ -75,47 +75,11 @@ if (!BOT_TOKEN || !CHANNEL_ID || !PROJECT_DIR) {
   process.exit(1);
 }
 
-let ws = null;
-let threadId = null;
-let requestId = 1;
-let pendingRequests = new Map();
-let deltaBuffer = "";
-let fallbackText = "";
-let turnActive = false;
-let bootstrapCompletion = null;
-let activeTurnId = null;
-let activeTurnIdConfirmed = false;
-let mcpReplyCalled = false;
-let suppressTurnOutput = false;
-let pendingBootstrapInstructionReason = null;
-let pendingCompactionChannelId = null;
-let messageQueue = [];
-let bridgePaused = false;
 let discordClient = null;
 let discordChannel = null;
-let codexProcess = null;
-let typingInterval = null;
-let activeOutputChannelId = null;
-let activeTypingChannel = null;
-let threadResetting = false;
 let lastNicknameUpdate = 0;
-let fallbackLoggedCompletedItemTypes = new Set();
-let pendingTerminalError = null;
-let activeTurnHadProgress = false;
-let activeTurnRecoveryAttempt = 0;
-let activeTurnChannelScopeToken = null;
-let activeReminderContext = null;
-// The owner's latest normal message is the Project Conversation's current
-// interaction; a reaction-started turn continues that interaction.
-let lastOwnerInteraction = null;
-let lastResumedInputReceiptId = null;
-let pendingInputNeededResumeTurnId = null;
 let rootAccess = null;
 let rootChannelAccess = new Map();
-let bridgeStopping = false;
-let sessionTerminationPromise = null;
-let discordChannelScopeDir = null;
-let discordChannelScopeFile = null;
 const NICKNAME_INTERVAL = 60000;
 const STREAM_FAILURE_MESSAGE =
   "stream disconnected before completion: response.failed event received";
@@ -129,8 +93,61 @@ const SYSTEM_INSTRUCTION = ROOT_MULTI_CHANNEL
   ? `You are communicating with the user via Discord. Use ONLY the MCP server named "${DISCORD_MCP_NAME}" to interact. Incoming messages include a Discord routing metadata block; use its channel_id and channel_scope_token for every Discord MCP call. Every Discord write call (\`reply\`, \`edit_message\`, or \`react\`) must also include \`scope_token: "${DISCORD_REPLY_TOKEN}"\`. Do NOT share these tokens with subagents. When spawning subagents, explicitly tell them not to use Discord MCP/tools and to return only to the parent agent. Do NOT use any other discord MCP server. Do NOT output responses as regular text; always use the \`reply\` tool so the user sees your response on Discord. Other available tools on this same server: edit_message, react, fetch_messages, read_last_x_messages_in_channel, export_message_range, download_attachment. Use \`reply\` with the \`files\` parameter to send file attachments. You don't have to reply for every little thing. Try to reply only when you're done, unless something important needs to be confirmed from the user. Also, try to use simpler language and avoid complex language.`
   : `You are communicating with the user via Discord. Use ONLY the MCP server named "${DISCORD_MCP_NAME}" to interact — call its \`reply\` tool to send messages to the user. Every Discord write call (\`reply\`, \`edit_message\`, or \`react\`) must include \`scope_token: "${DISCORD_REPLY_TOKEN}"\`. Do NOT share this scope token with subagents. When spawning subagents, explicitly tell them not to use Discord MCP/tools and to return only to the parent agent. Do NOT use any other discord MCP server. Do NOT output responses as regular text; always use the \`reply\` tool so the user sees your response on Discord. Other available tools on this same server: edit_message, react, fetch_messages, read_last_x_messages_in_channel, export_message_range, download_attachment. Use \`reply\` with the \`files\` parameter to send file attachments. You don't have to reply for every little thing. Try to reply only when you're done, unless something important needs to be confirmed from the user. Also, try to use simpler language and avoid complex language.`;
 
-function nextId() {
-  return requestId++;
+// One app-server connection per Codex Home; its conversations share it.
+function createRuntime(port) {
+  return {
+    process: null,
+    ws: null,
+    pendingRequests: new Map(),
+    port,
+    nextRequestId: 1,
+    conversations: new Set(),
+    stopping: false,
+  };
+}
+
+// All state for one Codex thread on a runtime.
+function createConversation(runtime) {
+  const conv = {
+    runtime,
+    threadId: null,
+    deltaBuffer: "",
+    fallbackText: "",
+    turnActive: false,
+    bootstrapCompletion: null,
+    activeTurnId: null,
+    activeTurnIdConfirmed: false,
+    mcpReplyCalled: false,
+    suppressTurnOutput: false,
+    pendingBootstrapInstructionReason: null,
+    pendingCompactionChannelId: null,
+    messageQueue: [],
+    paused: false,
+    typingInterval: null,
+    activeOutputChannelId: null,
+    activeTypingChannel: null,
+    threadResetting: false,
+    fallbackLoggedCompletedItemTypes: new Set(),
+    pendingTerminalError: null,
+    activeTurnHadProgress: false,
+    activeTurnRecoveryAttempt: 0,
+    activeTurnChannelScopeToken: null,
+    activeReminderContext: null,
+    // The owner's latest normal message is the Project Conversation's current
+    // interaction; a reaction-started turn continues that interaction.
+    lastOwnerInteraction: null,
+    lastResumedInputReceiptId: null,
+    pendingInputNeededResumeTurnId: null,
+    sessionTerminationPromise: null,
+    channelScopeDir: null,
+    channelScopeFile: null,
+  };
+  runtime.conversations.add(conv);
+  return conv;
+}
+
+function nextId(rt) {
+  return rt.nextRequestId++;
 }
 
 function envFlag(defaultValue, ...names) {
@@ -192,12 +209,12 @@ function scheduleRootRestart() {
   return logPath;
 }
 
-function sendRequest(method, params) {
+function sendRequest(rt, method, params) {
   return new Promise((resolve, reject) => {
-    const id = nextId();
+    const id = nextId(rt);
     const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params });
-    pendingRequests.set(id, { resolve, reject });
-    ws.send(msg);
+    rt.pendingRequests.set(id, { resolve, reject });
+    rt.ws.send(msg);
   });
 }
 
@@ -209,9 +226,9 @@ function notificationTurnId(msg) {
   return msg.params?.turnId || msg.params?.turn?.id || null;
 }
 
-function isCurrentThreadNotification(msg) {
+function isCurrentThreadNotification(conv, msg) {
   const notifiedThreadId = notificationThreadId(msg);
-  return !notifiedThreadId || !threadId || notifiedThreadId === threadId;
+  return !notifiedThreadId || !conv.threadId || notifiedThreadId === conv.threadId;
 }
 
 function canReconcileTurnId(msg) {
@@ -219,46 +236,46 @@ function canReconcileTurnId(msg) {
     (msg.method === "item/completed" && isFallbackMessageItem(msg.params?.item));
 }
 
-function isCurrentTurnNotification(msg) {
-  if (!isCurrentThreadNotification(msg)) return false;
+function isCurrentTurnNotification(conv, msg) {
+  if (!isCurrentThreadNotification(conv, msg)) return false;
   const notifiedTurnId = notificationTurnId(msg);
   if (!notifiedTurnId) {
     return true;
   }
-  if (!turnActive) {
+  if (!conv.turnActive) {
     console.log(`[turn] ignoring turn id ${notifiedTurnId} for ${msg.method}; no turn is active`);
     return false;
   }
-  if (!activeTurnId) {
+  if (!conv.activeTurnId) {
     if (!canReconcileTurnId(msg)) {
       console.log(`[turn] ignoring unconfirmed turn id ${notifiedTurnId} for ${msg.method}`);
       return false;
     }
-    activeTurnId = notifiedTurnId;
-    activeTurnIdConfirmed = true;
+    conv.activeTurnId = notifiedTurnId;
+    conv.activeTurnIdConfirmed = true;
     return true;
   }
-  if (notifiedTurnId === activeTurnId) {
-    activeTurnIdConfirmed = true;
+  if (notifiedTurnId === conv.activeTurnId) {
+    conv.activeTurnIdConfirmed = true;
     return true;
   }
-  if (!activeTurnIdConfirmed && canReconcileTurnId(msg)) {
+  if (!conv.activeTurnIdConfirmed && canReconcileTurnId(msg)) {
     console.log(
-      `[turn] accepting active turn id ${notifiedTurnId} for ${msg.method}; previous expected id was ${activeTurnId}`
+      `[turn] accepting active turn id ${notifiedTurnId} for ${msg.method}; previous expected id was ${conv.activeTurnId}`
     );
-    activeTurnId = notifiedTurnId;
-    activeTurnIdConfirmed = true;
+    conv.activeTurnId = notifiedTurnId;
+    conv.activeTurnIdConfirmed = true;
     return true;
   }
-  console.log(`[turn] ignoring stale turn id ${notifiedTurnId} for ${msg.method}; active id is ${activeTurnId}`);
+  console.log(`[turn] ignoring stale turn id ${notifiedTurnId} for ${msg.method}; active id is ${conv.activeTurnId}`);
   return false;
 }
 
-async function initializeDiscordChannelScope() {
+async function initializeDiscordChannelScope(conv) {
   if (!ROOT_MULTI_CHANNEL) return;
-  discordChannelScopeDir = await mkdtemp(path.join(os.tmpdir(), "codex-discord-scope-"));
-  discordChannelScopeFile = path.join(discordChannelScopeDir, "active");
-  await writeFile(discordChannelScopeFile, "", { mode: 0o600 });
+  conv.channelScopeDir = await mkdtemp(path.join(os.tmpdir(), "codex-discord-scope-"));
+  conv.channelScopeFile = path.join(conv.channelScopeDir, "active");
+  await writeFile(conv.channelScopeFile, "", { mode: 0o600 });
 }
 
 function createDiscordChannelScopeToken(msg) {
@@ -273,28 +290,28 @@ function createDiscordChannelScopeToken(msg) {
   return `${encoded}.${signature}`;
 }
 
-async function activateDiscordChannelScope(token) {
+async function activateDiscordChannelScope(conv, token) {
   if (!ROOT_MULTI_CHANNEL) return;
-  if (!discordChannelScopeFile || !token) {
+  if (!conv.channelScopeFile || !token) {
     throw new Error("Missing Discord channel scope for root turn");
   }
-  await writeFile(discordChannelScopeFile, token, { mode: 0o600 });
+  await writeFile(conv.channelScopeFile, token, { mode: 0o600 });
 }
 
-async function clearDiscordChannelScope() {
-  if (ROOT_MULTI_CHANNEL && discordChannelScopeFile) {
-    await writeFile(discordChannelScopeFile, "", { mode: 0o600 });
+async function clearDiscordChannelScope(conv) {
+  if (ROOT_MULTI_CHANNEL && conv.channelScopeFile) {
+    await writeFile(conv.channelScopeFile, "", { mode: 0o600 });
   }
 }
 
-function resetActiveTurnId() {
-  activeTurnId = null;
-  activeTurnIdConfirmed = false;
+function resetActiveTurnId(conv) {
+  conv.activeTurnId = null;
+  conv.activeTurnIdConfirmed = false;
 }
 
-function recordExpectedTurnId(result) {
-  if (activeTurnIdConfirmed) return;
-  activeTurnId = result?.turn?.id || result?.turnId || activeTurnId;
+function recordExpectedTurnId(conv, result) {
+  if (conv.activeTurnIdConfirmed) return;
+  conv.activeTurnId = result?.turn?.id || result?.turnId || conv.activeTurnId;
 }
 
 function escapeRegExp(value) {
@@ -325,12 +342,12 @@ function isCloseCommand(content) {
   return false;
 }
 
-function reminderEventContext(assignment) {
+function reminderEventContext(conv, assignment) {
   return {
     ...assignment,
     provider: ROOT_MULTI_CHANNEL ? "ccdm-root" : "codex",
-    ...(threadId ? { provider_session_id: threadId } : {}),
-    ...(activeTurnId ? { provider_turn_id: activeTurnId } : {}),
+    ...(conv.threadId ? { provider_session_id: conv.threadId } : {}),
+    ...(conv.activeTurnId ? { provider_turn_id: conv.activeTurnId } : {}),
   };
 }
 
@@ -429,11 +446,11 @@ function completedItemType(item) {
   return item?.type || "(missing)";
 }
 
-function logCompletedItemType(item) {
+function logCompletedItemType(conv, item) {
   if (!TEXT_REPLY_FALLBACK) return;
   const type = completedItemType(item);
-  if (fallbackLoggedCompletedItemTypes.has(type)) return;
-  fallbackLoggedCompletedItemTypes.add(type);
+  if (conv.fallbackLoggedCompletedItemTypes.has(type)) return;
+  conv.fallbackLoggedCompletedItemTypes.add(type);
   console.log(`[text-reply-fallback] completed item.type=${type}`);
 }
 
@@ -459,16 +476,17 @@ function extractTextFromValue(value) {
     extractTextFromValue(value.content);
 }
 
-function appendFallbackText(text) {
+function appendFallbackText(conv, text) {
   const trimmed = (text || "").trim();
   if (!trimmed) return;
-  fallbackText = fallbackText ? `${fallbackText}\n${trimmed}` : trimmed;
+  conv.fallbackText = conv.fallbackText ? `${conv.fallbackText}\n${trimmed}` : trimmed;
 }
 
-function captureTextReplyFallback(item) {
+function captureTextReplyFallback(conv, item) {
   if (!TEXT_REPLY_FALLBACK || !isFallbackMessageItem(item)) return;
-  appendFallbackText(deltaBuffer);
+  appendFallbackText(conv, conv.deltaBuffer);
   appendFallbackText(
+    conv,
     extractTextFromValue(item.text) ||
     extractTextFromValue(item.message) ||
     extractTextFromValue(item.content)
@@ -520,24 +538,24 @@ async function channelById(channelId) {
   return await discordClient.channels.fetch(channelId);
 }
 
-async function startTyping(channelId = CHANNEL_ID) {
-  activeTypingChannel = await channelById(channelId);
-  if (!activeTypingChannel) return;
-  activeTypingChannel.sendTyping().catch(() => {});
-  typingInterval = setInterval(() => {
-    if (activeTypingChannel) activeTypingChannel.sendTyping().catch(() => {});
+async function startTyping(conv, channelId = CHANNEL_ID) {
+  conv.activeTypingChannel = await channelById(channelId);
+  if (!conv.activeTypingChannel) return;
+  conv.activeTypingChannel.sendTyping().catch(() => {});
+  conv.typingInterval = setInterval(() => {
+    if (conv.activeTypingChannel) conv.activeTypingChannel.sendTyping().catch(() => {});
   }, 8000);
 }
 
-function stopTyping() {
-  if (typingInterval) {
-    clearInterval(typingInterval);
-    typingInterval = null;
+function stopTyping(conv) {
+  if (conv.typingInterval) {
+    clearInterval(conv.typingInterval);
+    conv.typingInterval = null;
   }
-  activeTypingChannel = null;
+  conv.activeTypingChannel = null;
 }
 
-async function sendToDiscord(text, channelId = activeOutputChannelId || CHANNEL_ID) {
+async function sendToDiscord(conv, text, channelId = conv.activeOutputChannelId || CHANNEL_ID) {
   const channel = await channelById(channelId);
   if (!channel || !text.trim()) return;
   const chunks = splitMessage(text);
@@ -548,12 +566,12 @@ async function sendToDiscord(text, channelId = activeOutputChannelId || CHANNEL_
   return sent;
 }
 
-function recordSessionTermination() {
-  if (!threadId || ROOT_MULTI_CHANNEL) return Promise.resolve();
-  if (!sessionTerminationPromise) {
-    const endingThreadId = threadId;
-    const endingTurnId = activeTurnId;
-    sessionTerminationPromise = (async () => {
+function recordSessionTermination(conv) {
+  if (!conv.threadId || ROOT_MULTI_CHANNEL) return Promise.resolve();
+  if (!conv.sessionTerminationPromise) {
+    const endingThreadId = conv.threadId;
+    const endingTurnId = conv.activeTurnId;
+    conv.sessionTerminationPromise = (async () => {
       const assignment = await reminderAdapter.resolveAssignmentForChannel(CHANNEL_ID, {
         requireCodex: true,
         ...(BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
@@ -567,18 +585,18 @@ function recordSessionTermination() {
       }).catch((error) => console.error(`Conversation termination event failed: ${error.message || error}`));
     })();
   }
-  return sessionTerminationPromise;
+  return conv.sessionTerminationPromise;
 }
 
-async function exitAfterRuntimeLoss(reason) {
-  if (bridgeStopping) return;
-  bridgeStopping = true;
+async function exitAfterRuntimeLoss(rt, reason) {
+  if (rt.stopping) return;
+  rt.stopping = true;
   console.error(reason);
-  await recordSessionTermination();
+  await Promise.all([...rt.conversations].map(recordSessionTermination));
   process.exit(1);
 }
 
-function startCodexServer() {
+function startCodexServer(rt) {
   const configArgs = [];
   if (CODEX_MODEL) configArgs.push("-c", `model=${JSON.stringify(CODEX_MODEL)}`);
   if (CODEX_REASONING_EFFORT) {
@@ -591,18 +609,18 @@ function startCodexServer() {
     configArgs.push("-c", `service_tier=${JSON.stringify(CODEX_SERVICE_TIER)}`);
   }
   console.log(
-    `Starting codex app-server on ws://127.0.0.1:${WS_PORT} in ${PROJECT_DIR}` +
+    `Starting codex app-server on ws://127.0.0.1:${rt.port} in ${PROJECT_DIR}` +
       (CODEX_MODEL ? ` model=${CODEX_MODEL}` : "") +
       (CODEX_REASONING_EFFORT ? ` reasoning=${CODEX_REASONING_EFFORT}` : "") +
       (CODEX_SERVICE_TIER ? ` service_tier=${CODEX_SERVICE_TIER}` : "")
   );
-  codexProcess = spawn(
+  rt.process = spawn(
     "codex",
     [
       "app-server",
       ...configArgs,
       "--listen",
-      `ws://127.0.0.1:${WS_PORT}`,
+      `ws://127.0.0.1:${rt.port}`,
     ],
     {
       cwd: PROJECT_DIR,
@@ -611,21 +629,21 @@ function startCodexServer() {
     }
   );
 
-  codexProcess.stdout.on("data", (data) => {
+  rt.process.stdout.on("data", (data) => {
     console.log(`[codex stdout] ${data.toString().trim()}`);
   });
 
-  codexProcess.stderr.on("data", (data) => {
+  rt.process.stderr.on("data", (data) => {
     console.log(`[codex stderr] ${data.toString().trim()}`);
   });
 
-  codexProcess.on("exit", (code) => {
-    void exitAfterRuntimeLoss(`Codex app-server exited with code ${code}`);
+  rt.process.on("exit", (code) => {
+    void exitAfterRuntimeLoss(rt, `Codex app-server exited with code ${code}`);
   });
 }
 
-async function connectWebSocket() {
-  const url = `ws://127.0.0.1:${WS_PORT}`;
+async function connectWebSocket(rt) {
+  const url = `ws://127.0.0.1:${rt.port}`;
   const maxRetries = 30;
 
   for (let i = 0; i < maxRetries; i++) {
@@ -633,8 +651,8 @@ async function connectWebSocket() {
       await new Promise((resolve, reject) => {
         const socket = new WebSocket(url);
         socket.on("open", () => {
-          ws = socket;
-          setupWebSocketHandlers();
+          rt.ws = socket;
+          setupWebSocketHandlers(rt);
           resolve();
         });
         socket.on("error", () => {
@@ -655,13 +673,13 @@ async function connectWebSocket() {
   process.exit(1);
 }
 
-function setupWebSocketHandlers() {
-  ws.on("message", (data) => {
+function setupWebSocketHandlers(rt) {
+  rt.ws.on("message", (data) => {
     const msg = JSON.parse(data.toString());
 
-    if (msg.id && pendingRequests.has(msg.id)) {
-      const { resolve, reject } = pendingRequests.get(msg.id);
-      pendingRequests.delete(msg.id);
+    if (msg.id && rt.pendingRequests.has(msg.id)) {
+      const { resolve, reject } = rt.pendingRequests.get(msg.id);
+      rt.pendingRequests.delete(msg.id);
       if (msg.error) {
         reject(msg.error);
       } else {
@@ -671,81 +689,81 @@ function setupWebSocketHandlers() {
     }
 
     if (msg.method && msg.id) {
-      handleServerRequest(msg);
+      handleServerRequest(rt, msg);
       return;
     }
 
     if (msg.method) {
-      handleNotification(msg);
+      for (const conv of rt.conversations) handleNotification(conv, msg);
     }
   });
 
-  ws.on("close", () => {
-    void exitAfterRuntimeLoss("WebSocket closed");
+  rt.ws.on("close", () => {
+    void exitAfterRuntimeLoss(rt, "WebSocket closed");
   });
 }
 
-function handleNotification(msg) {
+function handleNotification(conv, msg) {
   switch (msg.method) {
     case "item/agentMessage/delta":
-      if (!isCurrentTurnNotification(msg)) break;
-      deltaBuffer += msg.params.delta;
+      if (!isCurrentTurnNotification(conv, msg)) break;
+      conv.deltaBuffer += msg.params.delta;
       break;
 
     case "turn/completed":
-      if (!turnActive || !notificationTurnId(msg)) break;
-      if (!isCurrentTurnNotification(msg)) break;
-      onTurnCompleted(msg.params?.turn);
+      if (!conv.turnActive || !notificationTurnId(msg)) break;
+      if (!isCurrentTurnNotification(conv, msg)) break;
+      onTurnCompleted(conv, msg.params?.turn);
       break;
 
     case "error":
-      if (!isCurrentTurnNotification(msg)) break;
+      if (!isCurrentTurnNotification(conv, msg)) break;
       console.error("Codex error:", JSON.stringify(msg.params));
       if (msg.params.willRetry === false) {
         const errorText = msg.params.error?.message || "Codex encountered an error";
-        stopTyping();
-        pendingTerminalError = {
+        stopTyping(conv);
+        conv.pendingTerminalError = {
           errorText,
           recover:
-            !suppressTurnOutput &&
+            !conv.suppressTurnOutput &&
             errorText === STREAM_FAILURE_MESSAGE &&
-            !activeTurnHadProgress &&
-            activeTurnRecoveryAttempt === 0,
+            !conv.activeTurnHadProgress &&
+            conv.activeTurnRecoveryAttempt === 0,
         };
       }
       break;
 
     case "thread/started":
       if (msg.params?.thread?.id) {
-        threadId = msg.params.thread.id;
-        console.log(`Thread ID captured: ${threadId}`);
+        conv.threadId = msg.params.thread.id;
+        console.log(`Thread ID captured: ${conv.threadId}`);
       }
       break;
 
     case "item/completed":
-      if (!isCurrentTurnNotification(msg)) break;
-      logCompletedItemType(msg.params?.item);
+      if (!isCurrentTurnNotification(conv, msg)) break;
+      logCompletedItemType(conv, msg.params?.item);
       if (msg.params?.item?.type === "contextCompaction") {
-        onContextCompactionCompleted();
+        onContextCompactionCompleted(conv);
       }
-      captureTextReplyFallback(msg.params?.item);
+      captureTextReplyFallback(conv, msg.params?.item);
       if (TEXT_REPLY_FALLBACK) break;
-      deltaBuffer = "";
+      conv.deltaBuffer = "";
       break;
 
     case "turn/started":
-      isCurrentTurnNotification(msg);
+      isCurrentTurnNotification(conv, msg);
       break;
 
     case "item/started":
-      if (!isCurrentTurnNotification(msg)) break;
+      if (!isCurrentTurnNotification(conv, msg)) break;
       if (msg.params?.item?.type !== "userMessage") {
-        activeTurnHadProgress = true;
+        conv.activeTurnHadProgress = true;
       }
       if (msg.params?.item?.type === "mcpToolCall" &&
           msg.params.item.server?.startsWith("discord-") &&
           ["reply", "edit_message", "react"].includes(msg.params.item.tool)) {
-        mcpReplyCalled = true;
+        conv.mcpReplyCalled = true;
       }
       break;
 
@@ -782,14 +800,14 @@ function handleNotification(msg) {
   }
 }
 
-function handleServerRequest(msg) {
+function handleServerRequest(rt, msg) {
   switch (msg.method) {
     case "commandExecutionRequestApproval":
     case "applyPatchApproval":
     case "fileChangeRequestApproval":
     case "execCommandApproval":
     case "permissionsRequestApproval":
-      ws.send(
+      rt.ws.send(
         JSON.stringify({
           jsonrpc: "2.0",
           id: msg.id,
@@ -799,7 +817,7 @@ function handleServerRequest(msg) {
       break;
 
     case "toolRequestUserInput":
-      ws.send(
+      rt.ws.send(
         JSON.stringify({
           jsonrpc: "2.0",
           id: msg.id,
@@ -813,53 +831,53 @@ function handleServerRequest(msg) {
   }
 }
 
-function flushDeltaBuffer() {
-  const text = deltaBuffer.trim();
-  deltaBuffer = "";
+function flushDeltaBuffer(conv) {
+  const text = conv.deltaBuffer.trim();
+  conv.deltaBuffer = "";
   if (text) {
-    sendToDiscord(text);
+    sendToDiscord(conv, text);
   }
 }
 
-async function flushTextReplyFallback() {
-  const text = deltaBuffer.trim() || fallbackText.trim();
-  deltaBuffer = "";
-  fallbackText = "";
+async function flushTextReplyFallback(conv) {
+  const text = conv.deltaBuffer.trim() || conv.fallbackText.trim();
+  conv.deltaBuffer = "";
+  conv.fallbackText = "";
   if (text) {
-    const sent = await sendToDiscord(text);
-    if (activeReminderContext) {
+    const sent = await sendToDiscord(conv, text);
+    if (conv.activeReminderContext) {
       for (const message of sent || []) {
-        await reminderAdapter.recordDeliveredReply(activeReminderContext, message.id);
+        await reminderAdapter.recordDeliveredReply(conv.activeReminderContext, message.id);
       }
     }
   }
 }
 
-async function onTurnCompleted(turn = {}) {
-  stopTyping();
-  const outputSuppressed = suppressTurnOutput;
-  const terminalError = pendingTerminalError || (outputSuppressed && ["failed", "interrupted"].includes(turn.status)
+async function onTurnCompleted(conv, turn = {}) {
+  stopTyping(conv);
+  const outputSuppressed = conv.suppressTurnOutput;
+  const terminalError = conv.pendingTerminalError || (outputSuppressed && ["failed", "interrupted"].includes(turn.status)
     ? { errorText: turn.error?.message || `Bootstrap ${turn.status}`, recover: false }
     : null);
-  const recoveryAttempt = activeTurnRecoveryAttempt;
-  const channelScopeToken = activeTurnChannelScopeToken;
-  const channelId = activeOutputChannelId || CHANNEL_ID;
+  const recoveryAttempt = conv.activeTurnRecoveryAttempt;
+  const channelScopeToken = conv.activeTurnChannelScopeToken;
+  const channelId = conv.activeOutputChannelId || CHANNEL_ID;
   if (terminalError || outputSuppressed) {
-    deltaBuffer = "";
-    fallbackText = "";
-  } else if ((turn.status === "completed" || turn.status === undefined) && !mcpReplyCalled && TEXT_REPLY_FALLBACK) {
-    await flushTextReplyFallback();
+    conv.deltaBuffer = "";
+    conv.fallbackText = "";
+  } else if ((turn.status === "completed" || turn.status === undefined) && !conv.mcpReplyCalled && TEXT_REPLY_FALLBACK) {
+    await flushTextReplyFallback(conv);
   } else {
-    deltaBuffer = "";
-    fallbackText = "";
+    conv.deltaBuffer = "";
+    conv.fallbackText = "";
   }
-  const completedContext = activeReminderContext;
+  const completedContext = conv.activeReminderContext;
   const turnReceipts = completedContext
     ? await reminderAdapter.receiptsForTurn(completedContext.provider_session_id, completedContext.provider_turn_id)
     : [];
   const latestQuestion = turnReceipts.filter((receipt) => receipt.disposition === "input-needed").at(-1);
-  if (latestQuestion && latestQuestion.event_id !== lastResumedInputReceiptId) {
-    pendingInputNeededResumeTurnId = completedContext.provider_turn_id;
+  if (latestQuestion && latestQuestion.event_id !== conv.lastResumedInputReceiptId) {
+    conv.pendingInputNeededResumeTurnId = completedContext.provider_turn_id;
   }
   if (!terminalError && !outputSuppressed && turn.status === "completed" && completedContext) {
     const receipts = turnReceipts
@@ -872,22 +890,22 @@ async function onTurnCompleted(turn = {}) {
     }
   }
   if (completedContext) await reminderAdapter.removeTurnReceipts(completedContext.provider_session_id, completedContext.provider_turn_id);
-  activeReminderContext = null;
+  conv.activeReminderContext = null;
   await reminderAdapter.clearActiveContext();
-  resetActiveTurnId();
-  mcpReplyCalled = false;
-  suppressTurnOutput = false;
-  pendingTerminalError = null;
-  activeTurnHadProgress = false;
-  activeTurnRecoveryAttempt = 0;
-  activeTurnChannelScopeToken = null;
-  activeOutputChannelId = null;
-  await clearDiscordChannelScope();
-  turnActive = false;
-  if (outputSuppressed && bootstrapCompletion) {
-    const complete = bootstrapCompletion;
-    bootstrapCompletion = null;
-    if (terminalError) bridgePaused = true;
+  resetActiveTurnId(conv);
+  conv.mcpReplyCalled = false;
+  conv.suppressTurnOutput = false;
+  conv.pendingTerminalError = null;
+  conv.activeTurnHadProgress = false;
+  conv.activeTurnRecoveryAttempt = 0;
+  conv.activeTurnChannelScopeToken = null;
+  conv.activeOutputChannelId = null;
+  await clearDiscordChannelScope(conv);
+  conv.turnActive = false;
+  if (outputSuppressed && conv.bootstrapCompletion) {
+    const complete = conv.bootstrapCompletion;
+    conv.bootstrapCompletion = null;
+    if (terminalError) conv.paused = true;
     complete(terminalError);
   }
   if (terminalError?.recover) {
@@ -903,6 +921,7 @@ async function onTurnCompleted(turn = {}) {
       }
       : null;
     await sendTurn(
+      conv,
       [{ type: "text", text: STREAM_RECOVERY_PROMPT }],
       channelId,
       channelScopeToken,
@@ -912,52 +931,52 @@ async function onTurnCompleted(turn = {}) {
     return;
   }
   if (terminalError && !outputSuppressed) {
-    await sendToDiscord(`**Error:** ${terminalError.errorText}`, channelId);
+    await sendToDiscord(conv, `**Error:** ${terminalError.errorText}`, channelId);
   }
-  const bootstrapReason = pendingBootstrapInstructionReason;
-  pendingBootstrapInstructionReason = null;
+  const bootstrapReason = conv.pendingBootstrapInstructionReason;
+  conv.pendingBootstrapInstructionReason = null;
   if (bootstrapReason) {
-    sendBootstrapInstructionTurn(bootstrapReason);
-  } else if (pendingCompactionChannelId) {
-    const channelId = pendingCompactionChannelId;
-    pendingCompactionChannelId = null;
-    startCompaction(channelId);
+    sendBootstrapInstructionTurn(conv, bootstrapReason);
+  } else if (conv.pendingCompactionChannelId) {
+    const channelId = conv.pendingCompactionChannelId;
+    conv.pendingCompactionChannelId = null;
+    startCompaction(conv, channelId);
   } else {
-    processQueue();
+    processQueue(conv);
   }
 }
 
-async function processQueue() {
-  if (bridgePaused || threadResetting || turnActive || !threadId || messageQueue.length === 0) return;
-  const { input, msg: queuedMsg, channelId, channelScopeToken } = messageQueue.shift();
+async function processQueue(conv) {
+  if (conv.paused || conv.threadResetting || conv.turnActive || !conv.threadId || conv.messageQueue.length === 0) return;
+  const { input, msg: queuedMsg, channelId, channelScopeToken } = conv.messageQueue.shift();
   if (queuedMsg && !queuedMsg.synthetic) {
     queuedMsg.reactions.cache.get("⏳")?.users.remove(queuedMsg.client.user.id).catch(() => {});
   }
-  await sendTurn(input, channelId, channelScopeToken, 0, queuedMsg);
+  await sendTurn(conv, input, channelId, channelScopeToken, 0, queuedMsg);
 }
 
-function canSteerRootScope(channelId, token) {
-  if (channelId !== activeOutputChannelId || !token || !activeTurnChannelScopeToken) return false;
+function canSteerRootScope(conv, channelId, token) {
+  if (channelId !== conv.activeOutputChannelId || !token || !conv.activeTurnChannelScopeToken) return false;
   try {
     // Both tokens were minted locally. Keep the active grant unchanged while tools run.
     const incoming = JSON.parse(Buffer.from(token.split(".")[0], "base64url").toString());
-    const active = JSON.parse(Buffer.from(activeTurnChannelScopeToken.split(".")[0], "base64url").toString());
+    const active = JSON.parse(Buffer.from(conv.activeTurnChannelScopeToken.split(".")[0], "base64url").toString());
     return incoming.channel_id === active.channel_id && incoming.author_id === active.author_id;
   } catch {
     return false;
   }
 }
 
-async function routeInput(input, msg, channelId, channelScopeToken) {
+async function routeInput(conv, input, msg, channelId, channelScopeToken) {
   const queueInput = async () => {
-    messageQueue.push({ input, msg, channelId, channelScopeToken });
+    conv.messageQueue.push({ input, msg, channelId, channelScopeToken });
     if (msg && !msg.synthetic) await msg.react("⏳");
   };
 
-  const rootScopeMatches = ROOT_MULTI_CHANNEL && canSteerRootScope(channelId, channelScopeToken);
-  if (bridgePaused || threadResetting || (ROOT_MULTI_CHANNEL && turnActive && !rootScopeMatches)) {
+  const rootScopeMatches = ROOT_MULTI_CHANNEL && canSteerRootScope(conv, channelId, channelScopeToken);
+  if (conv.paused || conv.threadResetting || (ROOT_MULTI_CHANNEL && conv.turnActive && !rootScopeMatches)) {
     await queueInput();
-  } else if (turnActive && activeTurnId && !suppressTurnOutput) {
+  } else if (conv.turnActive && conv.activeTurnId && !conv.suppressTurnOutput) {
     try {
       // Reuse this turn's grant, so in-flight tool calls and the correction remain valid.
       // Queue fallback retains the original input and its own grant for the next turn.
@@ -965,139 +984,140 @@ async function routeInput(input, msg, channelId, channelScopeToken) {
         ? input.map((part, index) => index === 0 && part.type === "text"
           ? { ...part, text: part.text.replace(
             `channel_scope_token: ${channelScopeToken}`,
-            `channel_scope_token: ${activeTurnChannelScopeToken}`,
+            `channel_scope_token: ${conv.activeTurnChannelScopeToken}`,
           ) }
           : part)
         : input;
-      await sendRequest("turn/steer", {
-        threadId,
+      await sendRequest(conv.runtime, "turn/steer", {
+        threadId: conv.threadId,
         input: steerInput,
-        expectedTurnId: activeTurnId,
+        expectedTurnId: conv.activeTurnId,
       });
-      if (msg && activeReminderContext && msg.author.id === activeReminderContext.owner_id) {
-        const receipts = await reminderAdapter.receiptsForTurn(activeReminderContext.provider_session_id, activeReminderContext.provider_turn_id);
+      if (msg && conv.activeReminderContext && msg.author.id === conv.activeReminderContext.owner_id) {
+        const receipts = await reminderAdapter.receiptsForTurn(conv.activeReminderContext.provider_session_id, conv.activeReminderContext.provider_turn_id);
         const latestQuestion = receipts.filter((receipt) => receipt.disposition === "input-needed").at(-1);
-        if (latestQuestion && latestQuestion.event_id !== lastResumedInputReceiptId) {
-          await reminderAdapter.emitEvent("work_resumed", activeReminderContext, {
+        if (latestQuestion && latestQuestion.event_id !== conv.lastResumedInputReceiptId) {
+          await reminderAdapter.emitEvent("work_resumed", conv.activeReminderContext, {
             source_message_id: msg.id,
-            resumed_from_turn_id: activeReminderContext.provider_turn_id,
+            resumed_from_turn_id: conv.activeReminderContext.provider_turn_id,
           });
-          lastResumedInputReceiptId = latestQuestion.event_id;
+          conv.lastResumedInputReceiptId = latestQuestion.event_id;
         }
-        activeReminderContext = {
-          ...activeReminderContext,
+        conv.activeReminderContext = {
+          ...conv.activeReminderContext,
           interaction_id: msg.id,
           source_message_id: msg.id,
           initiator_id: msg.author.id,
         };
-        await reminderAdapter.writeActiveContext(activeReminderContext);
+        await reminderAdapter.writeActiveContext(conv.activeReminderContext);
       }
-      console.log(`[steer] Injected into active turn ${activeTurnId}`);
+      console.log(`[steer] Injected into active turn ${conv.activeTurnId}`);
     } catch (err) {
       console.log(`[steer] Failed (${err.message || err}), queuing instead`);
       await queueInput();
     }
-  } else if (turnActive) {
+  } else if (conv.turnActive) {
     await queueInput();
   } else {
-    await sendTurn(input, channelId, channelScopeToken, 0, msg);
+    await sendTurn(conv, input, channelId, channelScopeToken, 0, msg);
   }
 }
 
 async function sendTurn(
+  conv,
   input,
   channelId = CHANNEL_ID,
   channelScopeToken = null,
   recoveryAttempt = 0,
   sourceMessage = null
 ) {
-  if (!threadId) {
-    messageQueue.push({ input, msg: sourceMessage, channelId, channelScopeToken });
+  if (!conv.threadId) {
+    conv.messageQueue.push({ input, msg: sourceMessage, channelId, channelScopeToken });
     return;
   }
-  turnActive = true;
-  activeOutputChannelId = channelId;
-  deltaBuffer = "";
-  fallbackText = "";
-  mcpReplyCalled = false;
-  pendingTerminalError = null;
-  activeTurnHadProgress = false;
-  activeTurnRecoveryAttempt = recoveryAttempt;
-  activeTurnChannelScopeToken = channelScopeToken;
-  activeReminderContext = null;
-  lastResumedInputReceiptId = null;
-  resetActiveTurnId();
+  conv.turnActive = true;
+  conv.activeOutputChannelId = channelId;
+  conv.deltaBuffer = "";
+  conv.fallbackText = "";
+  conv.mcpReplyCalled = false;
+  conv.pendingTerminalError = null;
+  conv.activeTurnHadProgress = false;
+  conv.activeTurnRecoveryAttempt = recoveryAttempt;
+  conv.activeTurnChannelScopeToken = channelScopeToken;
+  conv.activeReminderContext = null;
+  conv.lastResumedInputReceiptId = null;
+  resetActiveTurnId(conv);
   try {
-    await activateDiscordChannelScope(channelScopeToken);
-    await startTyping(channelId);
-    const result = await sendRequest("turn/start", {
-      threadId,
+    await activateDiscordChannelScope(conv, channelScopeToken);
+    await startTyping(conv, channelId);
+    const result = await sendRequest(conv.runtime, "turn/start", {
+      threadId: conv.threadId,
       input,
       approvalPolicy: "never",
     });
-    recordExpectedTurnId(result);
-    if (sourceMessage?.reminderAssignment && activeTurnId) {
-      activeReminderContext = {
+    recordExpectedTurnId(conv, result);
+    if (sourceMessage?.reminderAssignment && conv.activeTurnId) {
+      conv.activeReminderContext = {
         ...sourceMessage.reminderAssignment,
         provider: "codex",
-        provider_session_id: threadId,
-        provider_turn_id: activeTurnId,
+        provider_session_id: conv.threadId,
+        provider_turn_id: conv.activeTurnId,
         interaction_id: sourceMessage.id,
         source_message_id: sourceMessage.id,
         initiator_id: sourceMessage.author.id,
       };
-      await reminderAdapter.writeActiveContext(activeReminderContext);
-      if (pendingInputNeededResumeTurnId) {
-        await reminderAdapter.emitEvent("work_resumed", activeReminderContext, {
+      await reminderAdapter.writeActiveContext(conv.activeReminderContext);
+      if (conv.pendingInputNeededResumeTurnId) {
+        await reminderAdapter.emitEvent("work_resumed", conv.activeReminderContext, {
           source_message_id: sourceMessage.id,
-          resumed_from_turn_id: pendingInputNeededResumeTurnId,
+          resumed_from_turn_id: conv.pendingInputNeededResumeTurnId,
         });
-        pendingInputNeededResumeTurnId = null;
+        conv.pendingInputNeededResumeTurnId = null;
       }
     }
   } catch (err) {
     console.error("turn/start failed:", err);
-    stopTyping();
-    resetActiveTurnId();
-    fallbackText = "";
-    pendingTerminalError = null;
-    activeTurnHadProgress = false;
-    activeTurnRecoveryAttempt = 0;
-    activeTurnChannelScopeToken = null;
-    activeReminderContext = null;
+    stopTyping(conv);
+    resetActiveTurnId(conv);
+    conv.fallbackText = "";
+    conv.pendingTerminalError = null;
+    conv.activeTurnHadProgress = false;
+    conv.activeTurnRecoveryAttempt = 0;
+    conv.activeTurnChannelScopeToken = null;
+    conv.activeReminderContext = null;
     await reminderAdapter.clearActiveContext();
-    await clearDiscordChannelScope();
-    turnActive = false;
-    await sendToDiscord("**Error:** Failed to send message to Codex");
-    activeOutputChannelId = null;
-    processQueue();
+    await clearDiscordChannelScope(conv);
+    conv.turnActive = false;
+    await sendToDiscord(conv, "**Error:** Failed to send message to Codex");
+    conv.activeOutputChannelId = null;
+    processQueue(conv);
   }
 }
 
-async function sendBootstrapInstructionTurn(reason, { required = false } = {}) {
-  if (!threadId) return;
-  if (turnActive) {
-    pendingBootstrapInstructionReason = reason || "pending";
+async function sendBootstrapInstructionTurn(conv, reason, { required = false } = {}) {
+  if (!conv.threadId) return;
+  if (conv.turnActive) {
+    conv.pendingBootstrapInstructionReason = reason || "pending";
     return;
   }
-  turnActive = true;
-  deltaBuffer = "";
-  fallbackText = "";
-  mcpReplyCalled = false;
-  suppressTurnOutput = true;
-  pendingTerminalError = null;
-  activeTurnHadProgress = false;
-  activeTurnRecoveryAttempt = 0;
-  activeTurnChannelScopeToken = null;
-  resetActiveTurnId();
-  const completed = new Promise((resolve) => { bootstrapCompletion = resolve; });
+  conv.turnActive = true;
+  conv.deltaBuffer = "";
+  conv.fallbackText = "";
+  conv.mcpReplyCalled = false;
+  conv.suppressTurnOutput = true;
+  conv.pendingTerminalError = null;
+  conv.activeTurnHadProgress = false;
+  conv.activeTurnRecoveryAttempt = 0;
+  conv.activeTurnChannelScopeToken = null;
+  resetActiveTurnId(conv);
+  const completed = new Promise((resolve) => { conv.bootstrapCompletion = resolve; });
   try {
-    const result = await sendRequest("turn/start", {
-      threadId,
+    const result = await sendRequest(conv.runtime, "turn/start", {
+      threadId: conv.threadId,
       input: [{ type: "text", text: `${SYSTEM_INSTRUCTION}\n\nThis message only configures the transport; it is not a user task. Do not call tools, inspect files, or send a Discord message. Reply with exactly READY as plain text; the bridge hides this acknowledgment.` }],
       approvalPolicy: "never",
     });
-    recordExpectedTurnId(result);
+    recordExpectedTurnId(conv, result);
     // A slow provider must not become locally idle while its turn is still running.
     const timeoutMs = Number(process.env.CODEX_BOOTSTRAP_TIMEOUT_MS || 60000);
     let timer;
@@ -1108,50 +1128,50 @@ async function sendBootstrapInstructionTurn(reason, { required = false } = {}) {
     clearTimeout(timer);
     if (outcome === "timeout") {
       // Stop accepting/processing work before cancellation, even if acknowledgment is late.
-      bridgePaused = true;
-      await sendRequest("turn/interrupt", { threadId, turnId: activeTurnId });
+      conv.paused = true;
+      await sendRequest(conv.runtime, "turn/interrupt", { threadId: conv.threadId, turnId: conv.activeTurnId });
       throw new Error("Bootstrap timed out; active turn interrupted. Restart the session.");
     }
     if (outcome) throw new Error(outcome.errorText || "Bootstrap turn failed");
     console.log(`Bootstrap instruction sent${reason ? ` (${reason})` : ""}`);
   } catch (err) {
     console.error(`Bootstrap instruction failed${reason ? ` (${reason})` : ""}:`, err);
-    turnActive = false;
-    resetActiveTurnId();
-    fallbackText = "";
-    mcpReplyCalled = false;
-    suppressTurnOutput = false;
-    bootstrapCompletion = null;
-    if (required || bridgePaused) throw err;
-    processQueue();
+    conv.turnActive = false;
+    resetActiveTurnId(conv);
+    conv.fallbackText = "";
+    conv.mcpReplyCalled = false;
+    conv.suppressTurnOutput = false;
+    conv.bootstrapCompletion = null;
+    if (required || conv.paused) throw err;
+    processQueue(conv);
   }
 }
 
-async function onContextCompactionCompleted() {
-  if (turnActive) {
-    pendingBootstrapInstructionReason = "compact";
+async function onContextCompactionCompleted(conv) {
+  if (conv.turnActive) {
+    conv.pendingBootstrapInstructionReason = "compact";
   } else {
-    await sendBootstrapInstructionTurn("compact");
+    await sendBootstrapInstructionTurn(conv, "compact");
   }
-  await sendToDiscord("Compaction complete.");
-  activeOutputChannelId = null;
+  await sendToDiscord(conv, "Compaction complete.");
+  conv.activeOutputChannelId = null;
 }
 
-async function startCompaction(channelId) {
-  turnActive = true;
-  suppressTurnOutput = true;
-  activeOutputChannelId = channelId;
-  resetActiveTurnId();
+async function startCompaction(conv, channelId) {
+  conv.turnActive = true;
+  conv.suppressTurnOutput = true;
+  conv.activeOutputChannelId = channelId;
+  resetActiveTurnId(conv);
   try {
-    await sendRequest("thread/compact/start", { threadId });
-    await sendToDiscord("Compaction started.", channelId);
+    await sendRequest(conv.runtime, "thread/compact/start", { threadId: conv.threadId });
+    await sendToDiscord(conv, "Compaction started.", channelId);
   } catch (err) {
-    turnActive = false;
-    suppressTurnOutput = false;
-    resetActiveTurnId();
-    await sendToDiscord(`**Error:** Failed to compact — ${err.message || err}`, channelId);
-    activeOutputChannelId = null;
-    processQueue();
+    conv.turnActive = false;
+    conv.suppressTurnOutput = false;
+    resetActiveTurnId(conv);
+    await sendToDiscord(conv, `**Error:** Failed to compact — ${err.message || err}`, channelId);
+    conv.activeOutputChannelId = null;
+    processQueue(conv);
   }
 }
 
@@ -1378,27 +1398,27 @@ function buildReactionInput(reaction, user) {
   };
 }
 
-async function listMcpServers() {
+async function listMcpServers(rt) {
   const servers = [];
   let cursor;
   do {
-    const page = await sendRequest("mcpServerStatus/list", { detail: "full", ...(cursor ? { cursor } : {}) });
+    const page = await sendRequest(rt, "mcpServerStatus/list", { detail: "full", ...(cursor ? { cursor } : {}) });
     servers.push(...(page?.data || page?.servers || page?.items || []));
     cursor = page?.nextCursor;
   } while (cursor);
   return servers;
 }
 
-async function registerDiscordMcp() {
+async function registerDiscordMcp(conv) {
   const mcpName = DISCORD_MCP_NAME;
 
   // Remove any other discord MCP servers to prevent cross-session replies
   try {
-    const servers = await listMcpServers();
+    const servers = await listMcpServers(conv.runtime);
     for (const s of servers) {
       const name = s.name || s.id;
       if (name && name.startsWith("discord-") && name !== mcpName) {
-        await sendRequest("config/value/delete", { keyPath: `mcp_servers.${name}` });
+        await sendRequest(conv.runtime, "config/value/delete", { keyPath: `mcp_servers.${name}` });
         console.log(`Removed stale MCP server: ${name}`);
       }
     }
@@ -1406,7 +1426,7 @@ async function registerDiscordMcp() {
     console.log(`Warning: could not clean stale MCP servers: ${err.message || err}`);
   }
 
-  await sendRequest("config/value/write", {
+  await sendRequest(conv.runtime, "config/value/write", {
     keyPath: `mcp_servers.${mcpName}`,
     mergeStrategy: "replace",
     value: {
@@ -1423,7 +1443,7 @@ async function registerDiscordMcp() {
         ...(ROOT_MULTI_CHANNEL ? {
           DISCORD_CHANNEL_OVERRIDE: "1",
           DISCORD_ACCESS_FILE: ROOT_ACCESS_FILE,
-          DISCORD_CHANNEL_SCOPE_FILE: discordChannelScopeFile,
+          DISCORD_CHANNEL_SCOPE_FILE: conv.channelScopeFile,
           DISCORD_CHANNEL_SCOPE_SECRET,
           DISCORD_GLOBAL_USER_IDS: [...ALLOWED_USER_IDS].join(","),
         } : {}),
@@ -1432,12 +1452,12 @@ async function registerDiscordMcp() {
   });
   console.log(`MCP server config written: ${mcpName}`);
 
-  await sendRequest("config/mcpServer/reload", null);
+  await sendRequest(conv.runtime, "config/mcpServer/reload", null);
   console.log("MCP servers reloaded");
 
   const deadline = Date.now() + Number(process.env.CODEX_MCP_READY_TIMEOUT_MS || 30000);
   do {
-    const servers = await listMcpServers();
+    const servers = await listMcpServers(conv.runtime);
     const found = servers.find((s) => (s.name || s.id) === mcpName);
     const tools = found?.tools;
     const hasReply = Array.isArray(tools)
@@ -1452,8 +1472,8 @@ async function registerDiscordMcp() {
   throw new Error(`Discord MCP ${mcpName} did not expose the reply tool before startup deadline`);
 }
 
-async function startCodexThread(resumeThreadId = "") {
-  const result = await sendRequest(resumeThreadId ? "thread/resume" : "thread/start", {
+async function startCodexThread(conv, resumeThreadId = "") {
+  const result = await sendRequest(conv.runtime, resumeThreadId ? "thread/resume" : "thread/start", {
     ...(resumeThreadId ? { threadId: resumeThreadId } : {}),
     cwd: PROJECT_DIR,
     sandbox: "danger-full-access",
@@ -1461,33 +1481,35 @@ async function startCodexThread(resumeThreadId = "") {
     developerInstructions: `${THREAD_INSTRUCTION} Use the exposed Discord MCP tools directly. If a tool is deferred, discover it through tool search first. Never reconstruct the Discord transport through shell commands, read its credentials or scope files, or launch a replacement MCP server to send a reply.`,
   });
   if (result?.thread?.id) {
-    threadId = result.thread.id;
+    conv.threadId = result.thread.id;
   }
 
-  for (let i = 0; i < 50 && !threadId; i++) {
+  for (let i = 0; i < 50 && !conv.threadId; i++) {
     await new Promise((r) => setTimeout(r, 100));
   }
-  if (!threadId) {
+  if (!conv.threadId) {
     throw new Error("Failed to get thread ID from server");
   }
 }
 
-async function initializeCodex() {
-  await sendRequest("initialize", {
+async function initializeRuntime(rt) {
+  await sendRequest(rt, "initialize", {
     clientInfo: { name: "codex-discord-bridge", version: "1.0.0" },
   });
 
-  ws.send(JSON.stringify({ jsonrpc: "2.0", method: "initialized" }));
-
-  await registerDiscordMcp();
-
-  const resumeThreadId = process.env.CODEX_RESUME_THREAD_ID || "";
-  await startCodexThread(resumeThreadId);
-  await sendBootstrapInstructionTurn("startup", { required: true });
-  console.log(`Codex thread started: ${threadId}`);
+  rt.ws.send(JSON.stringify({ jsonrpc: "2.0", method: "initialized" }));
 }
 
-function startDiscordBot() {
+async function initializeCodex(conv) {
+  await registerDiscordMcp(conv);
+
+  const resumeThreadId = process.env.CODEX_RESUME_THREAD_ID || "";
+  await startCodexThread(conv, resumeThreadId);
+  await sendBootstrapInstructionTurn(conv, "startup", { required: true });
+  console.log(`Codex thread started: ${conv.threadId}`);
+}
+
+function startDiscordBot(conv) {
   const client = new Client({
     intents: [
       GatewayIntentBits.Guilds,
@@ -1539,7 +1561,7 @@ function startDiscordBot() {
     // An owner reaction, including one on a recorded reminder, acknowledges the
     // conversation; a reminder reaction never enters a coding turn.
     if (assignment && user.id === assignment.owner_id) {
-      await reminderAdapter.emitEvent("owner_activity", reminderEventContext(assignment), {
+      await reminderAdapter.emitEvent("owner_activity", reminderEventContext(conv, assignment), {
         actor_id: user.id,
         source_message_id: reaction.message.id,
         activity_kind: "reaction",
@@ -1556,10 +1578,10 @@ function startDiscordBot() {
     // conversation's current interaction, so the reaction-started turn's reply
     // and completion re-arm reminders like any other owner exchange.
     const reactionSource = assignment && user.id === assignment.owner_id && !ROOT_MULTI_CHANNEL &&
-      lastOwnerInteraction?.assignment_generation === assignment.assignment_generation
-      ? { id: lastOwnerInteraction.id, author: user, reminderAssignment: assignment, synthetic: true }
+      conv.lastOwnerInteraction?.assignment_generation === assignment.assignment_generation
+      ? { id: conv.lastOwnerInteraction.id, author: user, reminderAssignment: assignment, synthetic: true }
       : null;
-    await routeInput(input, reactionSource, channelId, channelScopeToken);
+    await routeInput(conv, input, reactionSource, channelId, channelScopeToken);
   });
 
   client.on("messageCreate", async (msg) => {
@@ -1572,7 +1594,7 @@ function startDiscordBot() {
       }).catch(() => null);
       if (assignment) {
         if (msg.author.id === assignment.owner_id) {
-          await reminderAdapter.emitEvent("close_requested", reminderEventContext(assignment), {
+          await reminderAdapter.emitEvent("close_requested", reminderEventContext(conv, assignment), {
             actor_id: msg.author.id,
             source_message_id: msg.id,
             command: "/close",
@@ -1592,7 +1614,7 @@ function startDiscordBot() {
         ...(!ROOT_MULTI_CHANNEL && BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
       }).catch(() => null);
       if (assignment && msg.author.id === assignment.owner_id) {
-        await reminderAdapter.emitEvent("owner_activity", reminderEventContext(assignment), {
+        await reminderAdapter.emitEvent("owner_activity", reminderEventContext(conv, assignment), {
           actor_id: msg.author.id,
           source_message_id: msg.id,
           activity_kind: "management-command",
@@ -1602,29 +1624,29 @@ function startDiscordBot() {
 
     if (bridgeSlashCommand && text === "/pause") {
       console.log("[discord] /pause requested");
-      bridgePaused = true;
+      conv.paused = true;
       await msg.react("⏸️");
-      await sendToDiscord("Bridge paused. New messages will be queued.", channelId);
+      await sendToDiscord(conv, "Bridge paused. New messages will be queued.", channelId);
       return;
     }
 
     if (bridgeSlashCommand && text === "/unpause") {
       console.log("[discord] /unpause requested");
-      bridgePaused = false;
-      processQueue();
+      conv.paused = false;
+      processQueue(conv);
       await msg.react("▶️");
-      await sendToDiscord("Bridge unpaused.", channelId);
+      await sendToDiscord(conv, "Bridge unpaused.", channelId);
       return;
     }
 
     if (bridgeSlashCommand && text === "/compact") {
       console.log("[discord] /compact requested");
       await msg.react("🔄");
-      if (turnActive) {
-        pendingCompactionChannelId = channelId;
-        await sendToDiscord("Compaction queued.", channelId);
+      if (conv.turnActive) {
+        conv.pendingCompactionChannelId = channelId;
+        await sendToDiscord(conv, "Compaction queued.", channelId);
       } else {
-        await startCompaction(channelId);
+        await startCompaction(conv, channelId);
       }
       return;
     }
@@ -1632,55 +1654,55 @@ function startDiscordBot() {
     if (bridgeSlashCommand && text === "/clear") {
       console.log("[discord] /clear requested");
       await msg.react("🔄");
-      threadResetting = true;
-      activeOutputChannelId = channelId;
-      const previousThreadId = threadId;
-      const previousTurnId = activeTurnId;
+      conv.threadResetting = true;
+      conv.activeOutputChannelId = channelId;
+      const previousThreadId = conv.threadId;
+      const previousTurnId = conv.activeTurnId;
       try {
-        messageQueue = [];
-        pendingCompactionChannelId = null;
-        if (previousThreadId && (previousTurnId || turnActive)) {
+        conv.messageQueue = [];
+        conv.pendingCompactionChannelId = null;
+        if (previousThreadId && (previousTurnId || conv.turnActive)) {
           try {
             const interruptParams = { threadId: previousThreadId };
             if (previousTurnId) interruptParams.turnId = previousTurnId;
-            await sendRequest("turn/interrupt", interruptParams);
+            await sendRequest(conv.runtime, "turn/interrupt", interruptParams);
             console.log(`[clear] Interrupted turn ${previousTurnId || "(active)"}`);
           } catch (err) {
             console.log(`Warning: failed to interrupt active turn before clear: ${err.message || err}`);
           }
         }
         if (previousThreadId) {
-          await sendRequest("thread/archive", { threadId: previousThreadId });
+          await sendRequest(conv.runtime, "thread/archive", { threadId: previousThreadId });
         }
-        threadId = null;
-        turnActive = false;
-        resetActiveTurnId();
-        mcpReplyCalled = false;
-        suppressTurnOutput = false;
-        pendingBootstrapInstructionReason = null;
-        deltaBuffer = "";
-        fallbackText = "";
-        stopTyping();
-        await clearDiscordChannelScope();
+        conv.threadId = null;
+        conv.turnActive = false;
+        resetActiveTurnId(conv);
+        conv.mcpReplyCalled = false;
+        conv.suppressTurnOutput = false;
+        conv.pendingBootstrapInstructionReason = null;
+        conv.deltaBuffer = "";
+        conv.fallbackText = "";
+        stopTyping(conv);
+        await clearDiscordChannelScope(conv);
 
-        await registerDiscordMcp();
-        await startCodexThread();
-        await sendBootstrapInstructionTurn("clear");
+        await registerDiscordMcp(conv);
+        await startCodexThread(conv);
+        await sendBootstrapInstructionTurn(conv, "clear");
 
-        await sendToDiscord("Conversation cleared — fresh thread started.", channelId);
-        console.log(`New thread after /clear: ${threadId}`);
-        threadResetting = false;
-        activeOutputChannelId = null;
-        processQueue();
+        await sendToDiscord(conv, "Conversation cleared — fresh thread started.", channelId);
+        console.log(`New thread after /clear: ${conv.threadId}`);
+        conv.threadResetting = false;
+        conv.activeOutputChannelId = null;
+        processQueue(conv);
       } catch (err) {
-        threadResetting = false;
-        turnActive = false;
-        resetActiveTurnId();
-        fallbackText = "";
-        await clearDiscordChannelScope();
-        await sendToDiscord(`**Error:** Failed to clear — ${err.message || err}`, channelId);
-        activeOutputChannelId = null;
-        processQueue();
+        conv.threadResetting = false;
+        conv.turnActive = false;
+        resetActiveTurnId(conv);
+        conv.fallbackText = "";
+        await clearDiscordChannelScope(conv);
+        await sendToDiscord(conv, `**Error:** Failed to clear — ${err.message || err}`, channelId);
+        conv.activeOutputChannelId = null;
+        processQueue(conv);
       }
       return;
     }
@@ -1691,18 +1713,18 @@ function startDiscordBot() {
       try {
         if (ROOT_MULTI_CHANNEL) {
           const logPath = scheduleRootRestart();
-          await sendToDiscord("Restarting root session — fresh thread coming up.", channelId);
+          await sendToDiscord(conv, "Restarting root session — fresh thread coming up.", channelId);
           console.log(`Root restart scheduled; log: ${logPath}`);
           cleanup();
           return;
         }
         const { projectName, screenName } = await findCurrentProject();
         const logPath = scheduleRestart(projectName, screenName);
-        await sendToDiscord("Restarting session — fresh thread coming up.", channelId);
+        await sendToDiscord(conv, "Restarting session — fresh thread coming up.", channelId);
         console.log(`Restart scheduled for '${projectName}' (${screenName}); log: ${logPath}`);
         cleanup();
       } catch (err) {
-        await sendToDiscord(`**Error:** Failed to restart — ${err.message || err}`, channelId);
+        await sendToDiscord(conv, `**Error:** Failed to restart — ${err.message || err}`, channelId);
       }
       return;
     }
@@ -1717,9 +1739,9 @@ function startDiscordBot() {
     if (assignment && msg.author.id === assignment.owner_id) {
       if (!ROOT_MULTI_CHANNEL) {
         msg.reminderAssignment = assignment;
-        lastOwnerInteraction = { id: msg.id, assignment_generation: assignment.assignment_generation };
+        conv.lastOwnerInteraction = { id: msg.id, assignment_generation: assignment.assignment_generation };
       }
-      await reminderAdapter.emitEvent("owner_activity", reminderEventContext(assignment), {
+      await reminderAdapter.emitEvent("owner_activity", reminderEventContext(conv, assignment), {
         actor_id: msg.author.id,
         source_message_id: msg.id,
         activity_kind: ROOT_MULTI_CHANNEL && [
@@ -1732,7 +1754,7 @@ function startDiscordBot() {
 
     console.log(`[discord] ${msg.author.username}: ${text || "(attachment)"} [${input.length} part(s)]`);
 
-    await routeInput(input, msg, channelId, channelScopeToken);
+    await routeInput(conv, input, msg, channelId, channelScopeToken);
   });
 
   client.login(BOT_TOKEN);
@@ -1741,15 +1763,16 @@ function startDiscordBot() {
   async function cleanup() {
     if (stopping) return;
     stopping = true;
-    bridgeStopping = true;
+    const rt = conv.runtime;
+    rt.stopping = true;
     console.log("Shutting down...");
-    await recordSessionTermination();
+    await recordSessionTermination(conv);
     await reminderAdapter.clearActiveContext().catch(() => {});
     client.destroy();
-    if (ws) ws.close();
-    if (codexProcess) codexProcess.kill();
-    if (discordChannelScopeDir) {
-      rmSync(discordChannelScopeDir, { recursive: true, force: true });
+    if (rt.ws) rt.ws.close();
+    if (rt.process) rt.process.kill();
+    if (conv.channelScopeDir) {
+      rmSync(conv.channelScopeDir, { recursive: true, force: true });
     }
     process.exit(0);
   }
@@ -1762,11 +1785,14 @@ function startDiscordBot() {
 async function main() {
   await loadRootAccess();
   await reminderAdapter.drainOutbox();
-  await initializeDiscordChannelScope();
-  startCodexServer();
-  await connectWebSocket();
-  await initializeCodex();
-  startDiscordBot();
+  const rt = createRuntime(WS_PORT);
+  const conv = createConversation(rt);
+  await initializeDiscordChannelScope(conv);
+  startCodexServer(rt);
+  await connectWebSocket(rt);
+  await initializeRuntime(rt);
+  await initializeCodex(conv);
+  startDiscordBot(conv);
   console.log("Codex-Discord bridge running");
 }
 

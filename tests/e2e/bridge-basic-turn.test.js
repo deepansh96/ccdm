@@ -461,6 +461,46 @@ test("bridge covers channel fetch, filtering, fallback splitting, MCP reply supp
   await bridge.stop();
 });
 
+test("channel bridge ignores a message in a thread under its channel", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    channelId: "channel-id",
+    turns: [{ delta: "channel reply" }],
+  });
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const userTurnStarts = () => codex.clientMessages
+    .filter((m) => m.method === "turn/start")
+    .slice(1);
+  await injectMessageUntil(
+    workspace,
+    // Discord type 11 is a public thread; its parent is the project channel.
+    { channelId: "thread-id", channelType: 11, parentId: "channel-id", content: "thread message", id: "thread-message" },
+    (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === "thread-message"),
+    5000,
+  );
+  // A later channel message proves the bridge is live and the thread message was dropped, not delayed.
+  const state = await injectMessageUntil(
+    workspace,
+    { content: "channel message", id: "channel-message" },
+    (nextState) => nextState.fixtures.discord.sends.length === 1,
+    5000,
+  );
+
+  assert.deepEqual(userTurnStarts().map((m) => m.params.input[0].text), ["channel message"]);
+  assert.ok(!JSON.stringify(codex.clientMessages).includes("thread message"));
+  assert.deepEqual(state.fixtures.discord.sends.map(({ channelId, content }) => ({ channelId, content })), [
+    { channelId: "channel-id", content: "channel reply" },
+  ]);
+  assert.ok(!state.fixtures.discord.typing.some((entry) => entry.channelId === "thread-id"));
+  assert.ok(!(state.fixtures.discord.reactions || []).some((entry) => entry.messageId === "thread-message"));
+  await bridge.stop();
+});
+
 test("bridge text fallback is opt-in for completed assistant items without MCP reply", async () => {
   const flagged = createBridgeWorkspace();
   const flaggedCodex = await startFakeCodexServer(flagged, {

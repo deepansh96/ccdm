@@ -396,6 +396,8 @@ export function injectDiscordMessage(workspace, message = {}) {
   state.fixtures.discord.injectedMessages.push({
     author: { bot: false, id: "allowed-user-id", username: "Allowed User", ...(message.author ?? {}) },
     channelId: message.channelId ?? "channel-id",
+    ...(message.channelType !== undefined ? { channelType: message.channelType } : {}),
+    ...(message.parentId !== undefined ? { parentId: message.parentId } : {}),
     content: message.content ?? "hello",
     delivered: false,
     id: message.id ?? `message-${Date.now()}`,

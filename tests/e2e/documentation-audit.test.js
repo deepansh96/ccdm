@@ -103,3 +103,7 @@ test("e2e README records the named-account setup and documentation scenarios", (
     assert.match(readme, new RegExp(phrase, "i"));
   }
 });
+
+test("scenario matrix records the channel bridge's thread-message filtering", () => {
+  assert.match(matrix, /\| Codex bridge \| Thread message filtering \| Covered \| .*type 11.*parentId/);
+});

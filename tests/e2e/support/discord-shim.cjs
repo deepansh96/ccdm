@@ -84,7 +84,15 @@ function fixtureMessage(client, raw) {
       id: raw.author?.id ?? "allowed-user-id",
       username: raw.author?.username ?? "Allowed User",
     },
-    channel: { id: raw.channelId },
+    // A thread message's channel is the thread itself (type 11 for a public
+    // thread), with parentId naming the text channel it was created under.
+    channel: {
+      id: raw.channelId,
+      type: raw.channelType ?? 0,
+      parentId: raw.parentId ?? null,
+      isThread() { return [10, 11, 12].includes(this.type); },
+    },
+    channelId: raw.channelId,
     client,
     content: raw.content ?? "",
     id: raw.id,

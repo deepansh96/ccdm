@@ -69,6 +69,7 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Codex bridge | Login success/failure | Covered | Successful boot records Discord login/ready; configured login rejection exits the bridge. |
 | Codex bridge | Channel cache/fetch paths | Covered | Covers cache-hit boot and cache-miss fetch with recorded channel fetch state. |
 | Codex bridge | Filtering | Covered | Bot-authored, wrong-channel, and wrong-user injected messages do not start user turns or send replies. |
+| Codex bridge | Thread message filtering | Covered | A message in a thread under the project channel (Discord channel type 11, `parentId` = the project channel) reaches neither the fake Codex app-server nor Discord output; a later channel message still gets its turn. |
 | Codex bridge | One allowed text turn | Covered | Injected user text starts a Codex turn, records typing, gives only the top-level agent the reply scope token, keeps default agent deltas private, and covers opt-in fallback text. |
 | Codex bridge | Fallback splitting and MCP suppression | Covered | With `CODEX_BRIDGE_TEXT_REPLY_FALLBACK=1`, 2001-character fallback output splits into 2000/1 chunks; a detected Discord MCP reply suppresses fallback text. |
 | Codex bridge | Process exit paths | Covered | App-server exit, WebSocket close, and startup without thread id terminate the bridge with observable diagnostics. |
