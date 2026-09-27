@@ -18,7 +18,7 @@ edges:
     condition: when changing bot permissions, guest access, channel routing, or credentials
   - target: patterns/INDEX.md
     condition: when starting a task — check the pattern index for a matching pattern file
-last_updated: 2026-09-26
+last_updated: 2026-09-27
 ---
 
 # Session Bootstrap
@@ -37,7 +37,7 @@ Then read this file fully before doing anything else in this session.
 - The opt-in `scripts/install-conversation-reminder-service.sh` supervises that same worker as the `com.discord.conversation-reminders` LaunchAgent. The installer validates the interpreters, both provider adapters, the owner, root credentials, and the store with the read-only `preflight` before touching launchd. It renders a secret-free plist with private state and logs, and restores the prior plist and loaded service if a replacement load fails. The LaunchAgent relaunches only after an unsuccessful exit, so `disable` stays stopped. Supervised and foreground launches share one worker lock, and both providers' reply, reminder, and reply-or-close workflows are proven through it with Local Fakes.
 - Start, stop, registration, guest access, command relay, voice transcription, and local-fake E2E coverage are present.
 - Local Claude and Codex project bots can export an inclusive Discord message range to a temporary text file.
-- Codex Discord tools can read the last requested 1-10,000 messages in their scoped channel, returning larger reads as private temporary transcripts.
+- Codex and local Claude Discord tools can read the last requested 1-10,000 messages in their scoped channel, returning larger reads as private temporary transcripts; Claude gets the reader through its read-only supplementary MCP.
 - Per-project Claude and Codex account, model, and effort overrides are supported.
 - Named Codex Account aliases and `default_codex_account` select root and project Codex Homes, while legacy `codex_home` and root overrides remain supported.
 - `scripts/setup-codex-mimo.py` prepares isolated MiMo Codex homes with private file-backed provider authentication, validated vendor catalogs, and key rotation; existing named-account launchers select them without lifecycle changes.
