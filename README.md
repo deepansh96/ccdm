@@ -645,6 +645,14 @@ Archiving or deleting a thread stops its session. The supervisor reads who archi
 
 Live thread sessions are capped per provider by `thread_session_caps` in `registry.json` (default `{ "claude": 6, "codex": 12 }` when absent). Only Thread Conversations count, never a Channel Conversation: for Claude, the thread sessions that are booting or live; for Codex, the thread conversations loaded on every project's thread host together. The supervisor tracks each session's turn: a Claude turn starts when the thread proxy relays an inbound message and ends on Claude Code's `Stop` or `StopFailure` command hook (`scripts/claude-thread-turns.js`), and a Codex turn follows the host's `turn-started` and `turn-ended`; `status` shows `turn_running` for a session mid-turn. A session is idle when no turn is running and the owner has not written in its thread for 30 minutes. When a start would pass its provider's cap, the supervisor evicts the idle session with the oldest activity (the later of the owner's last message and its last turn end): it stops the session, marks the thread `stopped` / `evicted`, and posts `Paused to free a session slot; reply to resume.` in it. The owner's next message there resumes the same conversation under the same rules. A session mid-turn is never evicted. If no session is idle, the new thread is marked `queued` and the bot posts `Queued, N sessions busy.` in it; messages sent while it waits are held for its bootstrap. Queued threads start first-in, first-out per provider as soon as a slot frees: a session stops, closes, or is deleted, or a live session goes idle while others wait, in which case it is evicted for the oldest waiter.
 
+Every CCDM tool that takes a project channel id also takes one of its thread ids, through one shared conversation resolver:
+
+```bash
+scripts/resolve-conversation.py <channel_or_thread_id>   # {"project", "thread_id", "provider", "bot", "channel_id"}
+```
+
+It reads `registry.json` and the thread store read-only and never calls Discord. A project channel gives its project with `thread_id: null`; a thread the supervisor bound gives the parent project and the thread, with the thread's provider. An unknown id, or a channel two projects claim, exits nonzero with the reason. `scripts/send-claude-command.sh --channel <thread id> compact` types into that thread's own tmux session (`<screen_name>-t-<last 6 digits>`), never the Channel Conversation's. `scripts/guest-access.js` given a thread id grants, revokes, or lists on the parent project. `scripts/export-discord-range.js <thread id> …` exports the thread with the parent project bot's token. Root's Discord MCP in multi-channel mode and the Codex root bridge treat a thread under an allowed root `groups` channel as that channel, and refuse a thread under any other.
+
 ```bash
 scripts/thread-supervisor.py preflight   # read-only: owner, root credentials, store, View Audit Log
 scripts/thread-supervisor.py run         # foreground worker; Ctrl-C stops it
@@ -946,6 +954,7 @@ ccdm/
     cc-statusline-wrapper.sh # StatusLine script — nicknames + ccstatusline terminal UI
     claude-usage.sh          # Usage reporting script
     send-claude-command.sh   # Root relay helper — sends /compact or /clear into a Claude tmux session
+    resolve-conversation.py  # Maps a channel or thread id to its project and thread
     start-session.sh         # Generic script to start any registered project
     stop-session.sh          # Generic script to stop any registered project
   skills/

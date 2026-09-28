@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+const { execFileSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -79,11 +80,18 @@ function projectBot(registry, project) {
 function resolveProjects(registry, target) {
   const projects = Object.entries(registry.projects || {});
   if (!target) return projects;
-  const match = projects.filter(
-    ([name, project]) => name === target || String(project.channel_id || "") === target
-  );
-  if (match.length === 0) throw new Error(`No project registered for ${target}`);
-  return match;
+  const named = projects.filter(([name]) => name === target);
+  if (named.length > 0) return named;
+  // A project channel or one of its threads acts on the project, through the shared conversation resolver.
+  let conversation;
+  try {
+    conversation = JSON.parse(execFileSync(process.env.CCDM_THREAD_PYTHON || "python3",
+      [path.join(__dirname, "resolve-conversation.py"), target, "--project-root", ROOT_DIR],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }));
+  } catch (error) {
+    throw new Error(error.stderr?.trim() || `No project registered for ${target}`);
+  }
+  return projects.filter(([name]) => name === conversation.project);
 }
 
 function safeName(value) {

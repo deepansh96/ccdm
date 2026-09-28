@@ -300,3 +300,20 @@ test("operator documentation, example registry, and scenario matrix record threa
     assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-capacity\\.test\\.js`));
   }
 });
+
+test("operator documentation, root instructions, and scenario matrix record the shared conversation resolver", () => {
+  const section = operatorReadme.slice(operatorReadme.indexOf("## Thread Supervisor"));
+  for (const phrase of ["scripts/resolve-conversation.py <channel_or_thread_id>", "`thread_id: null`",
+    "never calls Discord", "send-claude-command.sh --channel <thread id> compact", "parent project bot's token"]) {
+    assert.ok(section.includes(phrase), phrase);
+  }
+  assert.ok(fs.readFileSync("CLAUDE.md.example", "utf8").includes("scripts/resolve-conversation.py <channel_or_thread_id>"));
+  for (const scenario of ["Channel and thread resolution", "Unknown or ambiguous id"]) {
+    assert.match(matrix, new RegExp(`\\| Conversation resolver \\| ${scenario} \\| Covered \\| .*conversation-resolver\\.test\\.js`));
+  }
+  assert.match(matrix, /\| Claude command relay \| Thread relay \| Covered \| .*claude-command-relay\.test\.js/);
+  assert.match(matrix, /\| Discord export \| Thread export \| Covered \| .*discord-export\.test\.js/);
+  assert.match(matrix, /\| Guest access \| Thread target \| Covered \| .*guest-access\.test\.js/);
+  assert.match(matrix, /\| Discord MCP \| Root thread access \| Covered \| .*discord-mcp\.test\.js/);
+  assert.match(matrix, /\| Codex bridge \| Root thread access \| Covered \| .*bridge-basic-turn\.test\.js/);
+});

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { createWorkspace, runNodeEntrypoint } from "./support/runner.js";
+import { createWorkspace, runNodeEntrypoint, runScript } from "./support/runner.js";
 import { readState, seedRegistry, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -194,6 +194,35 @@ test("guest invite configures role-gated channel access before returning the lin
   assert.equal(discord.invites[0].fields.target_users_file.name, "target_users.csv");
   assert.deepEqual(discord.inviteTargetJobFetches, [
     { authorization: "Bot root-token", code: "fake-invite-1" },
+  ]);
+});
+
+test("guest grant given one of a project's thread ids grants on the parent project", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, buildRegistry(workspace));
+  // A Discord thread snowflake under alpha's channel; Discord type 11 is a public thread.
+  const thread = "1500000000000123456";
+  const bound = await runScript(workspace, "scripts/thread-supervisor.py", {
+    args: ["bind", "--payload", JSON.stringify({ thread_id: thread, type: 11, parent_id: "channel-alpha",
+      creator_id: OWNER_ID, name: "Task", auto_archive_duration: 10080 })],
+  });
+  assert.equal(bound.exitCode, 0, bound.stderr || bound.stdout);
+
+  const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
+    args: ["grant", thread, GUEST_ID],
+    env: preloadEnv(workspace),
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /Granted 222222222222222222 guest access to alpha\./);
+  assert.deepEqual(readRegistry(workspace).projects.alpha.guest_user_ids, [GUEST_ID]);
+  assert.equal(readRegistry(workspace).projects.beta.guest_user_ids, undefined);
+  const allowed = readState(workspace.stateDir).fixtures.discord.permissionOverwrites
+    .filter((overwrite) => overwrite.allow === GUEST_ALLOW)
+    .map(({ channelId, overwriteId }) => ({ channelId, overwriteId }));
+  assert.deepEqual(allowed, [
+    { channelId: "channel-alpha", overwriteId: "fake-role-1" },
+    { channelId: "channel-alpha", overwriteId: GUEST_ID },
   ]);
 });
 

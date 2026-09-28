@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 
+const { execFile } = require("node:child_process");
 const { createWriteStream } = require("node:fs");
 const { mkdir, mkdtemp, readFile, writeFile } = require("node:fs/promises");
 const { tmpdir } = require("node:os");
 const path = require("node:path");
 const { Readable } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
+const { promisify } = require("node:util");
 
 const API_BASE = "https://discord.com/api/v10";
 const [channelId, startId, endId] = process.argv.slice(2);
@@ -37,8 +39,11 @@ async function botToken() {
     }
   }
   const registry = JSON.parse(await readFile(path.join(__dirname, "..", "registry.json"), "utf8"));
-  const project = Object.values(registry.projects || {}).find((entry) => String(entry.channel_id) === channelId);
-  const bot = (registry.pool || []).find((entry) => entry.id === project?.bot_id);
+  // A project channel or one of its threads is exported with the project bot's token.
+  const conversation = await promisify(execFile)(process.env.CCDM_THREAD_PYTHON || "python3",
+    [path.join(__dirname, "resolve-conversation.py"), channelId, "--project-root", path.join(__dirname, "..")])
+    .then((result) => JSON.parse(result.stdout), () => null);
+  const bot = (registry.pool || []).find((entry) => entry.id === conversation?.bot);
   if (!bot?.token) throw new Error("No bot token found; set DISCORD_BOT_TOKEN");
   return bot.token;
 }

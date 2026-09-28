@@ -13,6 +13,7 @@ const reminderAdapter = require("./conversation-reminder-adapter.js");
 const execFileAsync = promisify(execFile);
 const EXPORT_SCRIPT = path.resolve(__dirname, "export-discord-range.js");
 const THREAD_SUPERVISOR = path.resolve(__dirname, "thread-supervisor.py");
+const CONVERSATION_RESOLVER = path.resolve(__dirname, "resolve-conversation.py");
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const DISCORD_REPLY_TOKEN = process.env.DISCORD_REPLY_TOKEN;
@@ -229,6 +230,18 @@ function requireScopeToken(scopeToken) {
   }
 }
 
+// A root `groups` entry for a channel, or for a bound thread's parent channel:
+// a thread under an allowed channel is allowed as that channel.
+async function accessGroup(access, channelId) {
+  const groups = access.groups || {};
+  if (Object.hasOwn(groups, channelId)) return groups[channelId];
+  const conversation = await execFileAsync(process.env.CCDM_THREAD_PYTHON || "python3",
+    [CONVERSATION_RESOLVER, channelId, "--project-root", path.resolve(__dirname, "..")])
+    .then((result) => JSON.parse(result.stdout), () => null);
+  if (!conversation?.thread_id || !Object.hasOwn(groups, conversation.channel_id)) return null;
+  return groups[conversation.channel_id];
+}
+
 async function targetChannelId(args) {
   if (!DISCORD_CHANNEL_OVERRIDE) return CHANNEL_ID;
   if (!args.channel_id) {
@@ -262,7 +275,7 @@ async function targetChannelId(args) {
     throw new Error("Discord channel scope is missing, expired, or invalid");
   }
   const access = JSON.parse(await readFile(DISCORD_ACCESS_FILE, "utf8"));
-  if (!Object.hasOwn(access.groups || {}, args.channel_id)) {
+  if (!(await accessGroup(access, args.channel_id))) {
     throw new Error(`Discord channel ${args.channel_id} is not allowed`);
   }
   const globalUsers = new Set([
@@ -270,7 +283,7 @@ async function targetChannelId(args) {
     ...(access.allowFrom || []).map(String),
   ]);
   if (!globalUsers.has(String(scope.author_id))) {
-    const sourceConfig = access.groups?.[scope.channel_id];
+    const sourceConfig = await accessGroup(access, String(scope.channel_id));
     const sourceUsers = new Set((sourceConfig?.allowFrom || []).map(String));
     if (!sourceUsers.has(String(scope.author_id)) || args.channel_id !== scope.channel_id) {
       throw new Error(`Discord channel ${args.channel_id} is not allowed for this message`);

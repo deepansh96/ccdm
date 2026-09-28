@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
-const { spawn } = require("child_process");
+const { execFile, spawn } = require("child_process");
 const { createHmac, randomBytes } = require("crypto");
 const { writeFile, mkdir, mkdtemp, readFile, rm, rename } = require("fs/promises");
 const { rmSync } = require("fs");
+const { promisify } = require("util");
 const os = require("os");
 const path = require("path");
 const WebSocket = require("ws");
@@ -370,6 +371,17 @@ async function loadRootAccess(log = true) {
   }
 }
 
+// Root's `groups` entry for a channel. A thread under an allowed channel is
+// allowed as that channel, through the shared conversation resolver.
+async function rootChannelConfig(channel) {
+  const direct = rootChannelAccess.get(channel?.id);
+  if (direct || !channel?.isThread?.()) return direct;
+  const conversation = await promisify(execFile)(process.env.CCDM_THREAD_PYTHON || "python3",
+    [path.join(__dirname, "resolve-conversation.py"), channel.id, "--project-root", path.resolve(__dirname, "..")])
+    .then((result) => JSON.parse(result.stdout), () => null);
+  return conversation?.thread_id ? rootChannelAccess.get(conversation.channel_id) : undefined;
+}
+
 function allowedRootUsersFor(channelConfig) {
   const ids = [
     ...ALLOWED_USER_IDS,
@@ -395,7 +407,7 @@ async function shouldHandleDiscordMessage(msg) {
     return false;
   }
 
-  const channelConfig = rootChannelAccess.get(msg.channel.id);
+  const channelConfig = await rootChannelConfig(msg.channel);
   if (!channelConfig) return false;
   const allowed = allowedRootUsersFor(channelConfig);
   if (allowed.size > 0 && !allowed.has(msg.author.id)) return false;
@@ -419,7 +431,7 @@ async function shouldHandleDiscordReaction(reaction, user) {
     return false;
   }
 
-  const channelConfig = rootChannelAccess.get(channelId);
+  const channelConfig = await rootChannelConfig(reaction.message.channel || { id: channelId });
   if (!channelConfig) return false;
   const allowed = allowedRootUsersFor(channelConfig);
   return allowed.size === 0 || allowed.has(user.id);

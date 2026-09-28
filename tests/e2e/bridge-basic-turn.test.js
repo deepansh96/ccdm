@@ -14,6 +14,7 @@ import {
   startFakeCodexServer,
   waitForState,
 } from "./support/bridge.js";
+import { runScript } from "./support/runner.js";
 import { readState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -773,6 +774,61 @@ test("root bridge accepts root channels and mentioned project channels with rout
       !message.params?.input?.[0]?.text?.startsWith("You are communicating with the user via Discord")
     );
   assert.equal(finalUserTurns.length, 3);
+  await bridge.stop();
+});
+
+test("root bridge accepts a mentioned thread of an allowed channel and ignores one of a non-allowed channel", async () => {
+  const workspace = createBridgeWorkspace();
+  // Discord thread snowflakes (type 11, a public thread): one under the allowed
+  // project channel, one under a registered channel root is not configured for.
+  const allowedThread = "1500000000000123456";
+  const otherThread = "1500000000000654321";
+  fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), JSON.stringify({
+    discord_user_id: "allowed-user-id", guild_id: "guild-id",
+    pool: [{ id: "bot2", app_id: "alpha-app", token: "alpha-token" }, { id: "bot3", app_id: "gamma-app", token: "gamma-token" }],
+    projects: {
+      alpha: { type: "claude", path: "/work/alpha", bot_id: "bot2", channel_id: "project-channel" },
+      gamma: { type: "claude", path: "/work/gamma", bot_id: "bot3", channel_id: "gamma-channel" },
+    },
+  }), { mode: 0o600 });
+  for (const [threadId, parentId] of [[allowedThread, "project-channel"], [otherThread, "gamma-channel"]]) {
+    const bound = await runScript(workspace, "scripts/thread-supervisor.py", {
+      args: ["bind", "--payload", JSON.stringify({ thread_id: threadId, type: 11, parent_id: parentId,
+        creator_id: "allowed-user-id", name: "Task", auto_archive_duration: 10080 })],
+    });
+    assert.equal(bound.exitCode, 0, bound.stderr || bound.stdout);
+  }
+  const accessFile = path.join(workspace.tmpDir, "root-access.json");
+  fs.writeFileSync(accessFile, `${JSON.stringify({
+    allowFrom: ["allowed-user-id"],
+    groups: {
+      "root-channel": { requireMention: false, allowFrom: ["allowed-user-id"] },
+      "project-channel": { requireMention: true, allowFrom: ["allowed-user-id"] },
+    },
+  }, null, 2)}\n`);
+  const codex = await startFakeCodexServer(workspace, { channelId: "root-channel", turns: [{ complete: true }, { complete: true }] });
+  const bridge = startBridge(workspace, {
+    botAppId: "root-bot-id", channelId: "root-channel", port: codex.port, rootBotAppId: "root-bot-id",
+    env: { ROOT_ACCESS_FILE: accessFile, ROOT_MULTI_CHANNEL: "1" },
+  });
+  await bridge.waitForOutput(/Root routing active for 2 configured channel\(s\)/, 7000);
+  const userTurns = (state) => state.fixtures.codex.protocolEvents
+    .filter((event) => event.event === "client-message" && event.message.method === "turn/start")
+    .map((event) => event.message.params.input[0].text)
+    .filter((text) => !text.startsWith("You are communicating with the user via Discord"));
+
+  await injectMessageUntil(workspace, { channelId: otherThread, channelType: 11, parentId: "gamma-channel",
+    content: "<@root-bot-id> other thread", id: "other-thread-message" },
+  (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === "other-thread-message"));
+  // Messages are handled in order, so the allowed thread's turn shows the other thread's message was dropped.
+  const state = await injectMessageUntil(workspace, { channelId: allowedThread, channelType: 11,
+    parentId: "project-channel", content: "<@root-bot-id> status in thread", id: "allowed-thread-message" },
+  (nextState) => userTurns(nextState).length === 1);
+
+  assert.equal(userTurns(state).length, 1);
+  assert.match(userTurns(state)[0], /channel_id: 1500000000000123456/);
+  assert.match(userTurns(state)[0], /status in thread/);
+  assert.ok(!JSON.stringify(state.fixtures.codex.protocolEvents).includes("other thread"));
   await bridge.stop();
 });
 

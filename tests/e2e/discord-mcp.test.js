@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { bridgeChildEnv, createBridgeWorkspace, runPreloadProbe } from "./support/bridge.js";
-import { runNodeEntrypoint } from "./support/runner.js";
+import { runNodeEntrypoint, runScript } from "./support/runner.js";
 import { readState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -365,6 +365,66 @@ test("Discord MCP root override routes calls to the requested channel", async ()
   const globalOutput = responseById(globalResult);
   assert.equal(globalOutput.get(7).result.isError, undefined);
   assert.equal(globalOutput.get(8).result.isError, undefined);
+});
+
+test("Discord MCP root override accepts a thread of an allowed channel and rejects one of a non-allowed channel", async () => {
+  const workspace = createBridgeWorkspace();
+  // Discord thread snowflakes: one under the allowed project channel, one under a registered channel root may not use.
+  const allowedThread = "1500000000000123456";
+  const otherThread = "1500000000000654321";
+  fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), JSON.stringify({
+    discord_user_id: "global-user", guild_id: "guild",
+    pool: [{ id: "bot2", app_id: "alpha-app", token: "alpha-token" }, { id: "bot3", app_id: "gamma-app", token: "gamma-token" }],
+    projects: {
+      alpha: { type: "claude", path: "/work/alpha", bot_id: "bot2", channel_id: "project-channel", guest_user_ids: ["guest-user"] },
+      gamma: { type: "claude", path: "/work/gamma", bot_id: "bot3", channel_id: "gamma-channel" },
+    },
+  }), { mode: 0o600 });
+  for (const [threadId, parentId] of [[allowedThread, "project-channel"], [otherThread, "gamma-channel"]]) {
+    const bound = await runScript(workspace, "scripts/thread-supervisor.py", {
+      args: ["bind", "--payload", JSON.stringify({ thread_id: threadId, type: 11, parent_id: parentId,
+        creator_id: "global-user", name: "Task", auto_archive_duration: 10080 })],
+    });
+    assert.equal(bound.exitCode, 0, bound.stderr || bound.stdout);
+  }
+  const accessFile = path.join(workspace.tmpDir, "root-access.json");
+  const scopeFile = path.join(workspace.tmpDir, "active-scope");
+  const scopeSecret = "scope-secret";
+  fs.writeFileSync(accessFile, `${JSON.stringify({
+    allowFrom: ["global-user"],
+    groups: { "project-channel": { requireMention: true, allowFrom: ["guest-user"] } },
+  })}\n`);
+  const env = {
+    DISCORD_ACCESS_FILE: accessFile,
+    DISCORD_CHANNEL_OVERRIDE: "1",
+    DISCORD_CHANNEL_SCOPE_FILE: scopeFile,
+    DISCORD_CHANNEL_SCOPE_SECRET: scopeSecret,
+    DISCORD_GLOBAL_USER_IDS: "global-user",
+    DISCORD_REPLY_TOKEN: "secret-token",
+  };
+
+  const globalScope = channelScopeToken(scopeSecret, "global-user", allowedThread);
+  fs.writeFileSync(scopeFile, globalScope);
+  const globalResult = await runMcp(workspace, [
+    toolCall(1, "reply", { text: "in the thread", channel_id: allowedThread, channel_scope_token: globalScope, scope_token: "secret-token" }),
+    toolCall(2, "reply", { text: "denied", channel_id: otherThread, channel_scope_token: globalScope, scope_token: "secret-token" }),
+  ], { env });
+  const guestScope = channelScopeToken(scopeSecret, "guest-user", allowedThread);
+  fs.writeFileSync(scopeFile, guestScope);
+  const guestResult = await runMcp(workspace, [
+    toolCall(3, "reply", { text: "guest thread", channel_id: allowedThread, channel_scope_token: guestScope, scope_token: "secret-token" }),
+  ], { env });
+
+  const output = new Map([...responseById(globalResult), ...responseById(guestResult)]);
+  assert.deepEqual(output.get(1).result.content, [{ type: "text", text: "sent (id: fake-message-1)" }]);
+  assert.equal(output.get(2).result.isError, true);
+  assert.match(output.get(2).result.content[0].text, /Discord channel 1500000000000654321 is not allowed/);
+  assert.equal(output.get(3).result.isError, undefined, JSON.stringify(output.get(3)));
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.messages.map(({ channelId, content }) =>
+    ({ channelId, content })), [
+    { channelId: allowedThread, content: "in the thread" },
+    { channelId: allowedThread, content: "guest thread" },
+  ]);
 });
 
 test("Discord MCP reports JSON-RPC errors and drives edit, react, and fetch tools", async () => {

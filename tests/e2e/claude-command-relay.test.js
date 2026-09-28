@@ -72,6 +72,51 @@ test("send-claude-command resolves a project channel and relays /clear", async (
   assert.deepEqual(session.sendKeys, [["-l", "/clear"], ["Enter"]]);
 });
 
+// A Claude thread's tmux session is `<screen_name>-t-<last 6 digits of the thread id>`.
+const THREAD = "1500000000000123456";
+const THREAD_TMUX = "alpha_session-t-123456";
+
+// Binds a thread under alpha's channel the way the Thread Supervisor does when an owner creates one.
+async function bindThread(workspace, threadId) {
+  const result = await runScript(workspace, "scripts/thread-supervisor.py", {
+    args: ["bind", "--payload", JSON.stringify({ thread_id: threadId, type: 11, parent_id: "channel-alpha",
+      creator_id: "allowed-user-id", name: "Task", auto_archive_duration: 10080 })],
+  });
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+}
+
+test("send-claude-command relays into a bound thread's tmux session, not the channel's", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, buildRegistry(workspace));
+  await bindThread(workspace, THREAD);
+  seedTmuxSession("alpha_session", { paneOutput: "Listening\n" }, { stateDir: workspace.stateDir });
+  seedTmuxSession(THREAD_TMUX, { paneOutput: "Listening\n" }, { stateDir: workspace.stateDir });
+
+  const result = await runScript(workspace, "scripts/send-claude-command.sh", {
+    args: ["--channel", THREAD, "compact"],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /Sent \/compact to Claude project 'alpha' \(tmux session 'alpha_session-t-123456'/);
+  const sessions = readState(workspace.stateDir).fixtures.tmux.sessions;
+  assert.deepEqual(sessions[THREAD_TMUX].sendKeys, [["-l", "/compact"], ["Enter"]]);
+  assert.equal(sessions.alpha_session.sendKeys, undefined);
+});
+
+test("send-claude-command refuses an unknown channel with the resolver's reason", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, buildRegistry(workspace));
+  seedTmuxSession("alpha_session", { paneOutput: "Listening\n" }, { stateDir: workspace.stateDir });
+
+  const result = await runScript(workspace, "scripts/send-claude-command.sh", {
+    args: ["--channel", "1500000000000999999", "/compact"],
+  });
+
+  assert.equal(result.exitCode, 2);
+  assert.match(result.stderr, /No project channel or bound thread is registered for 1500000000000999999/);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session.sendKeys, undefined);
+});
+
 test("send-claude-command refuses non-Claude and remote targets", async () => {
   const codexWorkspace = createWorkspace();
   seedRegistry(

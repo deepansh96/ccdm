@@ -65,12 +65,13 @@ case "$REQUESTED_COMMAND" in
     ;;
 esac
 
-RESOLVED="$(python3 - "$REGISTRY" "$MODE" "$TARGET" <<'PY'
+RESOLVED="$(python3 - "$REGISTRY" "$MODE" "$TARGET" "$SCRIPT_DIR/resolve-conversation.py" <<'PY'
 import json
 import os
+import subprocess
 import sys
 
-registry_path, mode, target = sys.argv[1:4]
+registry_path, mode, target, resolver = sys.argv[1:5]
 
 try:
     with open(registry_path) as f:
@@ -86,28 +87,27 @@ projects = registry.get("projects", {})
 
 project_name = None
 project = None
+thread_id = None
+provider = None
 
 if mode in ("auto", "project") and target in projects:
     project_name = target
     project = projects[target]
 
-if project is None and mode in ("auto", "channel"):
-    matches = [(name, cfg) for name, cfg in projects.items() if str(cfg.get("channel_id", "")) == target]
-    if len(matches) == 1:
-        project_name, project = matches[0]
-    elif len(matches) > 1:
-        names = ", ".join(name for name, _ in matches)
-        print(f"Channel {target} matches multiple projects: {names}", file=sys.stderr)
-        sys.exit(2)
+if project is None and mode == "project":
+    print(f"Unknown project: {target}", file=sys.stderr)
+    sys.exit(2)
 
 if project is None:
-    if mode == "project":
-        print(f"Unknown project: {target}", file=sys.stderr)
-    elif mode == "channel":
-        print(f"No project is registered for channel: {target}", file=sys.stderr)
-    else:
-        print(f"Unknown project or channel: {target}", file=sys.stderr)
-    sys.exit(2)
+    # A project channel or one of its bound threads, through the shared conversation resolver.
+    found = subprocess.run([sys.executable, resolver, target, "--project-root", os.path.dirname(registry_path)],
+                           capture_output=True, text=True)
+    if found.returncode != 0:
+        print(found.stderr.strip(), file=sys.stderr)
+        sys.exit(2)
+    conversation = json.loads(found.stdout)
+    project_name, thread_id, provider = conversation["project"], conversation["thread_id"], conversation["provider"]
+    project = projects[project_name]
 
 screen_name = project.get("screen_name")
 if not screen_name:
@@ -116,10 +116,11 @@ if not screen_name:
 
 print("\t".join([
     project_name,
-    screen_name,
-    project.get("type", "claude"),
+    # A Claude thread runs in tmux `<screen_name>-t-<last 6 digits of the thread id>`.
+    f"{screen_name}-t-{thread_id[-6:]}" if thread_id else screen_name,
+    provider or project.get("type", "claude"),
     os.path.expanduser(project.get("path", "")),
-    str(project.get("channel_id", "")),
+    thread_id or str(project.get("channel_id", "")),
 ]))
 PY
 )"
