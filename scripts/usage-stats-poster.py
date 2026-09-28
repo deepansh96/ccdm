@@ -2531,10 +2531,10 @@ def main(argv=None):
                 print(f"Collected usage snapshot (UTC slot: {current_payload['generated_at']})")
                 return 0
             if scheduled:
+                # Any run inside the 30-minute slot may post until the ledger
+                # records it, so a skipped (sleep) or failed run is retried by
+                # the next 10-minute run instead of losing the whole slot.
                 post_slot = _floor_utc(now, 30)
-                if not args.post_now and now.minute % 30 >= 10:
-                    print(f"Collected usage snapshot (next post slot: {_iso_utc(post_slot + timedelta(minutes=30))})")
-                    return 0
                 if store.has_post(connection, post_slot):
                     print(f"Usage report already posted for UTC slot: {_iso_utc(post_slot)}")
                     return 0

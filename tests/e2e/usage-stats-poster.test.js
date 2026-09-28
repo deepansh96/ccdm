@@ -19,7 +19,8 @@ function serviceFor(configDir) {
   return `Claude Code-credentials-${crypto.createHash("sha256").update(configDir).digest("hex").slice(0, 8)}`;
 }
 
-async function startPosterApi({ organization = { organization_type: "pro" }, unauthorizedTokens = [], acceptDashboard = false, usage = {}, accounts = {} } = {}) {
+async function startPosterApi({ organization = { organization_type: "pro" }, unauthorizedTokens = [], acceptDashboard = false, usage = {}, accounts = {}, failedPosts = 0 } = {}) {
+  let remainingPostFailures = failedPosts;
   const emails = { "fixture-oauth-token": "fixture@example.test", ...accounts };
   const requests = [];
   const unauthorized = new Set(unauthorizedTokens);
@@ -81,6 +82,12 @@ async function startPosterApi({ organization = { organization_type: "pro" }, una
         return;
       }
       if (request.method === "POST" && request.url === "/api/v10/channels/fixture-channel/messages") {
+        if (remainingPostFailures > 0) {
+          remainingPostFailures -= 1;
+          response.statusCode = 503;
+          response.end();
+          return;
+        }
         if (acceptDashboard && request.headers["content-type"]?.startsWith("multipart/form-data;")) {
           if (
             request.headers.authorization !== "Bot fixture-root-token" ||
@@ -1611,11 +1618,6 @@ test("scheduled poster posts the original text report once per 30-minute slot wi
     },
   });
 
-  const collect = await run("2026-08-18T12:20:00Z");
-  assert.equal(collect.exitCode, 0, collect.stderr || collect.stdout);
-  assert.match(collect.stdout, /Collected usage snapshot/);
-  assert.equal(api.requests.filter((request) => request.method === "POST").length, 0);
-
   const posted = await run("2026-08-18T12:30:00Z");
   assert.equal(posted.exitCode, 0, posted.stderr || posted.stdout);
   assert.match(posted.stdout, /Posted usage report/);
@@ -1641,13 +1643,14 @@ test("scheduled poster posts the original text report once per 30-minute slot wi
   assert.equal(duplicate.exitCode, 0, duplicate.stderr || duplicate.stdout);
   assert.match(duplicate.stdout, /already posted/);
   assert.equal(api.requests.filter((request) => request.method === "POST").length, 1);
-  const finalMinuteInSlot = await run("2026-08-18T12:39:59Z");
+  const finalMinuteInSlot = await run("2026-08-18T12:59:59Z");
   assert.equal(finalMinuteInSlot.exitCode, 0, finalMinuteInSlot.stderr || finalMinuteInSlot.stdout);
   assert.match(finalMinuteInSlot.stdout, /already posted/);
-  const nextSlot = await run("2026-08-18T12:40:00Z");
-  assert.equal(nextSlot.exitCode, 0, nextSlot.stderr || nextSlot.stdout);
-  assert.match(nextSlot.stdout, /Collected usage snapshot/);
   assert.equal(api.requests.filter((request) => request.method === "POST").length, 1);
+  const nextSlot = await run("2026-08-18T13:00:00Z");
+  assert.equal(nextSlot.exitCode, 0, nextSlot.stderr || nextSlot.stdout);
+  assert.match(nextSlot.stdout, /Posted usage report .*2026-08-18T13:00:00Z/);
+  assert.equal(api.requests.filter((request) => request.method === "POST").length, 2);
 
   const query = (sql) => {
     const result = spawnSync("python3", ["-c", [
@@ -1660,7 +1663,7 @@ test("scheduled poster posts the original text report once per 30-minute slot wi
     return result.stdout.trim().split("\n").filter(Boolean);
   };
   assert.equal(query("select count(*) from snapshots")[0], "3");
-  assert.equal(query("select count(*) from posts")[0], "1");
+  assert.equal(query("select count(*) from posts")[0], "2");
   const payload = query("select payload_json from snapshots order by slot_utc").join("\n");
   assert.doesNotMatch(payload, /fixture-(oauth|root)-token|projects|history\.sqlite3/);
   assert.equal(fs.statSync(historyPath).mode & 0o777, 0o600);
@@ -1679,14 +1682,47 @@ test("scheduled poster posts the original text report once per 30-minute slot wi
   fs.writeFileSync(sourceLog, "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\"}}\n");
   const sourceLogContents = fs.readFileSync(sourceLog, "utf8");
   fs.truncateSync(historyPath, 5 * 1024 * 1024 * 1024 + 1);
-  const warning = await run("2026-08-18T12:50:00Z");
+  const warning = await run("2026-08-18T13:10:00Z");
   assert.equal(warning.exitCode, 0, warning.stderr || warning.stdout);
   assert.match(warning.stderr, /exceeds 5 GiB/);
   assert.equal(query("select count(*) from snapshots")[0], "4");
   assert.equal(fs.readFileSync(sourceLog, "utf8"), sourceLogContents);
-  const suppressed = await run("2026-08-18T12:55:00Z");
+  const suppressed = await run("2026-08-18T13:15:00Z");
   assert.equal(suppressed.exitCode, 0, suppressed.stderr || suppressed.stdout);
   assert.doesNotMatch(suppressed.stderr, /exceeds 5 GiB/);
+});
+
+test("scheduled poster retries a failed or skipped slot on any later run in that slot", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi({ failedPosts: 1 });
+  const historyPath = path.join(workspace.homeDir, "Library", "Application Support", "CCDM", "usage-stats", "history.sqlite3");
+  seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
+  const run = (now) => runScript(workspace, "scripts/usage-stats-poster.py", {
+    args: ["--scheduled"],
+    env: { CCDM_TEST_NOW: now, CCDM_USAGE_STATS_NOTIFY: "0" },
+  });
+  const posts = () => api.requests.filter((request) => request.method === "POST").length;
+
+  const failed = await run("2026-08-18T12:08:00Z");
+  assert.equal(failed.exitCode, 1, failed.stdout);
+  assert.match(failed.stderr, /Discord post failed \(HTTP 503\)/);
+  assert.equal(posts(), 1);
+
+  const retried = await run("2026-08-18T12:18:00Z");
+  assert.equal(retried.exitCode, 0, retried.stderr || retried.stdout);
+  assert.match(retried.stdout, /Posted usage report .*2026-08-18T12:00:00Z/);
+  assert.equal(posts(), 2);
+
+  const duplicate = await run("2026-08-18T12:28:00Z");
+  assert.equal(duplicate.exitCode, 0, duplicate.stderr || duplicate.stdout);
+  assert.match(duplicate.stdout, /already posted/);
+  assert.equal(posts(), 2);
+
+  // A slot whose first run lands late (for example after sleep) still posts.
+  const lateFirstRun = await run("2026-08-18T12:52:00Z");
+  assert.equal(lateFirstRun.exitCode, 0, lateFirstRun.stderr || lateFirstRun.stdout);
+  assert.match(lateFirstRun.stdout, /Posted usage report .*2026-08-18T12:30:00Z/);
+  assert.equal(posts(), 3);
 });
 
 test("malformed current-slot snapshots are replaced by the next sanitized collection", async () => {
