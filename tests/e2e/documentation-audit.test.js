@@ -120,6 +120,9 @@ test("scenario matrix records Thread Conversation reminders", () => {
     ["Thread close events", /`\/close`.*owner archive.*`conversation_closed`/],
     ["Thread deletion", /`conversation_deleted`.*deletes the thread's outstanding reminder/],
     ["Reminder into an auto-archived thread", /reopens it.*starts no session/],
+    ["Thread discovery on enable", /6-day-old archived thread.*8-day-old.*closed/],
+    ["Thread readiness in status", /readiness\.projects\.<project>\.threads\.<thread_id>.*blockers/],
+    ["Thread provider switch resets reminders", /`conversation_reset`.*outstanding reminder is deleted.*`\/clear` emits no reset/],
   ]) {
     const row = matrix.split("\n").find(line => line.startsWith(`| Conversation reminders | ${scenario} | Covered | `));
     assert.ok(row, scenario);
@@ -127,6 +130,7 @@ test("scenario matrix records Thread Conversation reminders", () => {
   }
   const guide = fs.readFileSync("docs/conversation-reminders.md", "utf8");
   for (const phrase of ["## Thread Conversations", "conversation_closed", "conversation_deleted",
+    "conversation_reset", "readiness.projects.<project>.threads.<thread_id>", "within 7 days",
     "capabilities/<project>/<conversation_id>.json", "--conversation <thread_id>"]) {
     assert.ok(guide.includes(phrase), phrase);
   }

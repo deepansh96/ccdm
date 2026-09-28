@@ -37,7 +37,7 @@ def bound_thread(state_dir: Path, thread_id: str) -> sqlite3.Row | None:
         return None
     with sqlite3.connect(f"file:{STORE.store_path(state_dir)}?mode=ro", uri=True) as db:
         db.row_factory = sqlite3.Row
-        return db.execute("SELECT project, provider, resolved_provider FROM threads WHERE thread_id=?",
+        return db.execute("SELECT project, provider, resolved_provider, state FROM threads WHERE thread_id=?",
                           (thread_id,)).fetchone()
 
 

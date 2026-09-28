@@ -1241,17 +1241,22 @@ def reaction(project_root: Path, state_dir: Path, event: dict) -> dict:
                   "provider_home": None}
         if row["state"] != "live":
             STORE.update(db, thread_id, **fields)
-            return {"result": "config-applied"}
-        trigger = {"id": pending["message_id"], "author_id": str(event["user_id"]), "author": "owner",
-                   "content": "", "timestamp": clock_now()}
-        return restart_thread(project_root, state_dir, db, row, trigger, **fields)
+            result = {"result": "config-applied"}
+        else:
+            trigger = {"id": pending["message_id"], "author_id": str(event["user_id"]), "author": "owner",
+                       "content": "", "timestamp": clock_now()}
+            result = restart_thread(project_root, state_dir, db, row, trigger, **fields)
+        # The fresh conversation's reminders start fresh too; `/clear` keeps them.
+        report_conversation(project_root, registry, row["project"], thread_id, "conversation_reset")
+        return result
     finally:
         db.close()
 
 
 def report_conversation(project_root: Path, registry: dict, project: str, thread_id: str, event_type: str) -> None:
     """Tell the Conversation Reminder service, through its event outbox, that a
-    Thread Conversation closed or its thread was deleted; nothing is reported
+    Thread Conversation closed, was reset by a provider or account switch, or
+    its thread was deleted; nothing is reported
     where reminders were never set up. A failed hand-off stays in the outbox."""
     state_dir = REMINDER_EVENTS.default_state_dir()
     if not state_dir.is_dir():

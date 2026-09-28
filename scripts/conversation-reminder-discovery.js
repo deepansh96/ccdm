@@ -76,6 +76,50 @@ async function read(request, found, token, rootUserId, isClose) {
   return { status: 200, messages: body.map(message => classify(message, found, rootUserId, isClose)) };
 }
 
+// Archived-thread pages read per project; Discord returns them newest archive first.
+const ARCHIVED_PAGES = 10;
+const ARCHIVED_PAGE = 100;
+
+async function get(url, token) {
+  let response;
+  try {
+    response = await fetch(url, { headers: { Authorization: `Bot ${token}` }, signal: AbortSignal.timeout(10000) });
+  } catch {
+    return { status: 0 };
+  }
+  if (response.status === 429) {
+    const body = await response.json().catch(() => ({}));
+    const seconds = Number(body.retry_after ?? response.headers.get("Retry-After"));
+    return { status: 429, ...(Number.isFinite(seconds) ? { retry_after: seconds } : {}) };
+  }
+  if (!response.ok) return { status: response.status };
+  const body = await response.json().catch(() => null);
+  return body && typeof body === "object" ? { status: 200, body } : { status: 0 };
+}
+
+// A project channel's active threads, plus its public archived threads back to
+// `archived_since`. The service decides which of them to track.
+async function listThreads(request, token) {
+  const api = "https://discord.com/api/v10";
+  const summary = thread => ({ id: String(thread.id), archived: Boolean(thread.thread_metadata?.archived),
+    archive_timestamp: thread.thread_metadata?.archive_timestamp ?? null });
+  const active = await get(`${api}/guilds/${encodeURIComponent(request.guild_id)}/threads/active`, token);
+  if (active.status !== 200) return active;
+  const threads = (active.body.threads ?? []).filter(thread => thread?.parent_id === request.channel_id).map(summary);
+  let before = null;
+  for (let page = 0; page < ARCHIVED_PAGES; page++) {
+    const listed = await get(`${api}/channels/${encodeURIComponent(request.channel_id)}/threads/archived/public` +
+      `?limit=${ARCHIVED_PAGE}${before ? `&before=${encodeURIComponent(before)}` : ""}`, token);
+    if (listed.status !== 200) return listed;
+    const found = (listed.body.threads ?? []).filter(thread => typeof thread?.id === "string");
+    threads.push(...found.map(summary));
+    const last = found.at(-1)?.thread_metadata?.archive_timestamp;
+    if (!listed.body.has_more || !last || Date.parse(last) < Date.parse(request.archived_since)) break;
+    before = last;
+  }
+  return { status: 200, threads };
+}
+
 // One bounded pass: the service stops issuing requests once every channel has
 // used its per-pass page and reaction budget, is backing off, or is resolved.
 async function runPass({ service, assignment, rootToken, rootUserId, isClose }) {
@@ -92,7 +136,8 @@ async function runPass({ service, assignment, rootToken, rootUserId, isClose }) 
       result = { status: 403, reason: "observation access, assignment, or adapter capability unavailable" };
     } else {
       token ||= await rootToken();
-      result = await read(request, found, token, rootUserId, isClose);
+      result = request.kind === "threads" ? await listThreads(request, token)
+        : await read(request, found, token, rootUserId, isClose);
     }
     await service(["discovery-result", "--payload", JSON.stringify({
       request_id: request.request_id, project: request.project,

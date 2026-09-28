@@ -26,9 +26,11 @@ EVENT_TYPES = {
     "session_terminated",
     "close_requested",
     # The Thread Supervisor's: a Thread Conversation closed by an owner or root
-    # archive or an in-thread /close, and a deleted thread.
+    # archive or an in-thread /close, a deleted thread, and a confirmed provider
+    # or account switch, which starts the thread's reminder tracking fresh.
     "conversation_closed",
     "conversation_deleted",
+    "conversation_reset",
 }
 ALLOWED_FIELDS = {
     "schema_version",
@@ -97,6 +99,16 @@ def thread_provider(project_name: str, project: dict, thread_id: str) -> str | N
     if row is None or row["project"] != project_name:
         return None
     return row["resolved_provider"] or row["provider"] or project.get("type") or "claude"
+
+
+def thread_discoverable(project_name: str, thread_id: str) -> bool:
+    """Whether ``thread_id`` is bound to ``project_name`` and not a Closed Conversation."""
+    resolver = _resolver()
+    try:
+        row = resolver.bound_thread(resolver.STORE.default_state_dir(), thread_id)
+    except (OSError, ValueError, sqlite3.Error):
+        return False
+    return row is not None and row["project"] == project_name and row["state"] != "closed"
 
 
 def default_state_dir() -> Path:
@@ -248,7 +260,7 @@ def validate_event(event: object) -> dict:
         raise ValueError("provider lifecycle events require a project adapter")
     if event_type in {"owner_activity", "close_requested"} and normalized["provider"] not in {"codex", "claude", "ccdm-root"}:
         raise ValueError("owner events require a registered CCDM adapter")
-    if event_type in {"conversation_closed", "conversation_deleted"}:
+    if event_type in {"conversation_closed", "conversation_deleted", "conversation_reset"}:
         if normalized["provider"] != "ccdm-root":
             raise ValueError(f"{event_type} comes only from the Thread Supervisor")
         if normalized.get("conversation_id", normalized["channel_id"]) == normalized["channel_id"]:

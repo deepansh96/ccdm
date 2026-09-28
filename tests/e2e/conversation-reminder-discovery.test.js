@@ -520,3 +520,83 @@ test("history keeps a persisted closure unless it shows a later normal owner mes
     ["awaiting-owner", "2026-09-20T10:30:00Z"]);
   await stop(workspace, stateDir, worker);
 });
+
+// Thread Conversations under `channel`, bound by the Thread Supervisor.
+const ACTIVE_THREAD = "1500000000000000011";
+const RECENT_THREAD = "1500000000000000022";
+const OLD_THREAD = "1500000000000000033";
+const CLOSED_THREAD = "1500000000000000044";
+// Discord's snowflake epoch; an id's top bits are milliseconds since it.
+const snowflake = iso => String((BigInt(Date.parse(iso)) - 1420070400000n) << 22n);
+
+async function bindThread(workspace, threadId) {
+  const result = await runScript(workspace, "scripts/thread-supervisor.py", { args: ["bind", "--project-root",
+    workspace.repoDir, "--payload", JSON.stringify({ thread_id: threadId, type: 11, parent_id: "channel",
+      parent_type: 0, name: `thread ${threadId}`, creator_id: "owner", auto_archive_duration: 10080 })] });
+  assert.equal(JSON.parse(result.stdout).result, "bound", result.stderr || result.stdout);
+}
+
+// An owner archive, read from audit-log action 111, closes the thread in the thread store.
+async function ownerArchive(workspace, threadId, archivedAt) {
+  const state = readState(workspace.stateDir);
+  (state.fixtures.discord.auditLogEntries ||= []).push({ id: snowflake(archivedAt), user_id: "owner",
+    target_id: threadId, action_type: 111, changes: [{ key: "archived", old_value: false, new_value: true }] });
+  writeState(state, workspace.stateDir);
+  const result = await runScript(workspace, "scripts/thread-supervisor.py", { args: ["archive", "--project-root",
+    workspace.repoDir, "--payload", JSON.stringify({ thread_id: threadId, archived_at: archivedAt })],
+    env: bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: path.join(workspace.homeDir, "root-discord"),
+      CCDM_THREAD_NODE: process.execPath }) });
+  assert.equal(JSON.parse(result.stdout || "{}").result, "closed", result.stderr || result.stdout);
+}
+
+test("enable discovers active threads and non-closed threads archived within 7 days, and status nests them under their project", async () => {
+  const workspace = createWorkspace();
+  const stateDir = setup(workspace);
+  for (const threadId of [ACTIVE_THREAD, RECENT_THREAD, OLD_THREAD, CLOSED_THREAD]) await bindThread(workspace, threadId);
+  await ownerArchive(workspace, CLOSED_THREAD, "2026-09-23T12:00:00.000Z");
+  // Archive times are relative to the injected clock, 2026-09-24T12:00:00Z.
+  const thread = (id, fields) => ({ id, type: 11, parentId: "channel", parentType: 0, name: `thread ${id}`,
+    ownerId: "owner", autoArchiveDuration: 10080, archived: false, ...fields });
+  seedHistory(workspace, {
+    channel: [],
+    [ACTIVE_THREAD]: [],
+    [RECENT_THREAD]: [message("3002", "2026-09-18T09:05:00Z", "app-demo", "Done — the fix is in."),
+      message("3001", "2026-09-18T09:00:00Z", "owner", "Please fix the login redirect")],
+    [OLD_THREAD]: [],
+    [CLOSED_THREAD]: [],
+  }, { threads: {
+    [ACTIVE_THREAD]: thread(ACTIVE_THREAD),
+    [RECENT_THREAD]: thread(RECENT_THREAD, { archived: true, archiveTimestamp: "2026-09-18T12:00:00.000Z" }),
+    [OLD_THREAD]: thread(OLD_THREAD, { archived: true, archiveTimestamp: "2026-09-16T12:00:00.000Z" }),
+    [CLOSED_THREAD]: thread(CLOSED_THREAD, { archived: true, archiveTimestamp: "2026-09-23T12:00:00.000Z" }),
+  } });
+  const env = bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: path.join(workspace.homeDir, "root-discord") });
+  await command(workspace, stateDir, "enable", { env });
+  const worker = startWorker(workspace, stateDir, "2026-09-24T12:00:00Z");
+  const threadsOf = current => current.readiness?.projects?.demo?.threads ?? {};
+  const ready = await waitForStatus(workspace, stateDir, current => {
+    const threads = threadsOf(current);
+    return [ACTIVE_THREAD, RECENT_THREAD].every(id => threads[id]?.history === "ready");
+  });
+  const threads = threadsOf(ready);
+  assert.deepEqual(Object.keys(threads).sort(), [ACTIVE_THREAD, RECENT_THREAD]);
+  // Each discovered thread runs the channel's history traversal in its own thread.
+  assert.deepEqual([threads[RECENT_THREAD].conversation.state, threads[RECENT_THREAD].conversation.response_message_id,
+    threads[RECENT_THREAD].conversation.discovery.basis],
+  ["awaiting-owner", "3002", "historical-owner-then-bot-approximation"]);
+  assert.deepEqual([threads[ACTIVE_THREAD].conversation.state, threads[ACTIVE_THREAD].conversation.discovery.basis],
+    ["open-paused", "no-owner-participation"]);
+  assert.deepEqual(threads[ACTIVE_THREAD].blockers, []);
+  const fetched = readState(workspace.stateDir).fixtures.discord;
+  assert.deepEqual([...new Set(fetched.historyFetches.map(row => row.channelId))].sort(),
+    ["channel", ACTIVE_THREAD, RECENT_THREAD].sort());
+  assert.ok(fetched.threadListFetches.every(row => row.authorization === "Bot fixture-root-token"));
+
+  // With the worker stopped, each thread names what blocks its delivery.
+  await stop(workspace, stateDir, worker);
+  const stopped = threadsOf(await command(workspace, stateDir, "status"));
+  assert.deepEqual(stopped[ACTIVE_THREAD].blockers, ["service is disabled; run enable",
+    "foreground worker is not running; start `run` or rerun scripts/install-conversation-reminder-service.sh to " +
+    "relaunch the LaunchAgent"]);
+  assert.equal(stopped[ACTIVE_THREAD].delivery_ready, false);
+});

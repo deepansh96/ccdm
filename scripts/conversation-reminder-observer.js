@@ -505,7 +505,9 @@ async function sideEffects(recoveryOnly = false) {
         }
         token = credentials.token;
       } else {
-        const found = await assignment(action.channel_id);
+        // A live thread acts through its own assignment; a deleted one through its channel's.
+        const found = (action.conversation_id && action.conversation_id !== action.channel_id &&
+          await assignment(action.conversation_id)) || await assignment(action.channel_id);
         if (!found || found.project !== action.project ||
             found.assignment_generation !== action.assignment_generation) continue;
         token = found.bot_token;

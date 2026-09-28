@@ -11,6 +11,13 @@ The same traversal runs in ``restart`` mode after a worker restart, Gateway
 reconnect, or re-enable. It stops at the persisted acknowledgment instead of
 building a baseline; the service then applies missed owner activity on top of
 the persisted state.
+
+Thread Conversations take the same traversal inside their own thread. Enable
+and restart reconciliation first list each project's threads: the active ones
+plus public archived ones archived within ``THREAD_WINDOW`` that the Thread
+Supervisor's store binds to the project and does not mark closed. A newly
+listed thread gets an initial scan; a tracked one is reconciled from its
+persisted acknowledgment.
 """
 
 from __future__ import annotations
@@ -26,6 +33,12 @@ PASS_SECONDS = 30
 TRANSIENT_RETRY_SECONDS = 30
 DENIED_RETRY_SECONDS = 300
 MAX_TAIL = 100
+# Archived threads older than this are not discovered.
+THREAD_WINDOW = timedelta(days=7)
+# Settings keys: a pending request to list every project's threads, and the
+# per-project listings still owed ({project: {"request_id", "retry_at"}}).
+LISTING_REQUESTED = "thread_listing_requested"
+LISTINGS = "thread_listings"
 # Channels whose live events are durably buffered until the scan commits.
 ACTIVE = {"discovering", "reconciling", "suspended-discovery-history"}
 RESTART = "suspended-restart-reconciliation"
@@ -162,21 +175,101 @@ def _valid_messages(payload: dict, recorded_reminders: set[str]) -> list[dict] |
     return clean
 
 
-def next_request(db: sqlite3.Connection, usable: dict, now: datetime) -> dict | None:
-    """Pick the least-served channel this pass and reserve one bounded request."""
+def request_thread_listing(db: sqlite3.Connection) -> None:
+    """Have the next discovery pass list every project's threads again."""
+    db.execute("INSERT OR REPLACE INTO settings VALUES (?,'1')", (LISTING_REQUESTED,))
+
+
+def _listing_request(db: sqlite3.Connection, settings: dict, usable: dict, now: datetime,
+                     guild_id: str | None) -> dict | None:
+    """The next project whose threads must be listed before their conversations are scanned."""
+    listings = json.loads(settings.get(LISTINGS) or "{}")
+    if settings.get(LISTING_REQUESTED) == "1":
+        listings = {name: {"request_id": None, "retry_at": None} for name in sorted(usable) if usable[name]}
+        db.execute("DELETE FROM settings WHERE key=?", (LISTING_REQUESTED,))
+    for name, listing in sorted(listings.items()):
+        assignment = usable.get(name)
+        if assignment is None:
+            continue
+        if listing["retry_at"] and _iso(listing["retry_at"]) > now:
+            continue
+        seq = db.execute("SELECT COALESCE(MAX(last_seq),0)+1 FROM discoveries").fetchone()[0]
+        listing.update(request_id=f"threads:{name}:{seq}:{int(now.timestamp())}", retry_at=None)
+        request = {"request_id": listing["request_id"], "kind": "threads", "project": name,
+                   "assignment_generation": assignment["generation"], "channel_id": assignment["channel_id"],
+                   "guild_id": guild_id or "", "archived_since": _stamp(now - THREAD_WINDOW)}
+        # One attempt per pass; a lost result is retried on the next one.
+        listing["retry_at"] = _stamp(now + timedelta(seconds=PASS_SECONDS))
+        db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (LISTINGS, json.dumps(listings)))
+        return request
+    db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (LISTINGS, json.dumps(listings)))
+    return None
+
+
+def record_listing(db: sqlite3.Connection, payload: dict, now: datetime, discoverable, track) -> str:
+    """Track each listed thread worth reminding, then scan it: a new one from
+    scratch, a tracked one from its persisted acknowledgment."""
+    listings = json.loads((db.execute("SELECT value FROM settings WHERE key=?", (LISTINGS,)).fetchone() or ["{}"])[0])
+    project = payload.get("project")
+    listing = listings.get(project)
+    if listing is None or listing["request_id"] != payload.get("request_id"):
+        return "ignored"
+    threads = payload.get("threads")
+    if payload.get("status") != 200 or not isinstance(threads, list) or not all(
+            isinstance(item, dict) and isinstance(item.get("id"), str) for item in threads):
+        retry = payload.get("retry_after")
+        delay = float(retry) if payload.get("status") == 429 and isinstance(retry, (int, float)) and retry >= 0 else (
+            DENIED_RETRY_SECONDS if payload.get("status") in (401, 403, 404) else TRANSIENT_RETRY_SECONDS)
+        listing.update(request_id=None, retry_at=_stamp(now + timedelta(seconds=max(1.0, delay))))
+        db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (LISTINGS, json.dumps(listings)))
+        return "backoff"
+    del listings[project]
+    db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (LISTINGS, json.dumps(listings)))
+    cutoff = now - THREAD_WINDOW
+    for item in threads:
+        if item.get("archived"):
+            try:
+                archived = _iso(str(item.get("archive_timestamp")))
+            except ValueError:
+                continue
+            if archived < cutoff:
+                continue
+        if not discoverable(project, item["id"]):
+            continue
+        row, created = track(project, item["id"])
+        if row is None or row["reconciliation_status"] == "blocked-retired-generation":
+            continue
+        key = (project, row["conversation_id"], row["assignment_generation"])
+        if created:
+            db.execute("""INSERT INTO discoveries
+                (project,conversation_id,assignment_generation,phase,started_revision,summary_json)
+                VALUES (?,?,?,'backward',?,?)""", (*key, row["revision"], json.dumps(_initial_summary())))
+            db.execute("UPDATE conversations SET reconciliation_status='discovering' WHERE project=? AND conversation_id=?",
+                       key[:2])
+        elif row["reconciliation_status"] in {"ready", "suspended-incomplete-discovery"}:
+            db.execute("DELETE FROM discoveries WHERE project=? AND conversation_id=? AND assignment_generation=?", key)
+            db.execute("UPDATE conversations SET reconciliation_status=? WHERE project=? AND conversation_id=?",
+                       (RESTART, *key[:2]))
+    return "listed"
+
+
+def next_request(db: sqlite3.Connection, usable: dict, now: datetime, guild_id: str | None = None) -> dict | None:
+    """Pick the least-served conversation this pass and reserve one bounded request."""
     settings = dict(db.execute("SELECT key,value FROM settings").fetchall())
     if settings.get("disabled") == "1":
         return None
     requested = settings.get("discovery_requested") == "1"
-    # Thread Conversations have no history scan: a thread is released at once,
-    # a new one only after reminders are enabled.
-    startable = ",".join("?" * len(STARTABLE))
-    db.execute(f"""UPDATE conversations SET reconciliation_status='ready'
-        WHERE conversation_id!=channel_id AND reconciliation_status IN ({startable})
-          AND (? OR reconciliation_status!='suspended-incomplete-discovery')""", (*sorted(STARTABLE), requested))
+    listing = _listing_request(db, settings, usable, now, guild_id)
+    if listing is not None:
+        return listing
+    # A thread first seen through its live events needs no history scan: it is
+    # released at once, once reminders are enabled. Listed threads are scanned.
+    db.execute("""UPDATE conversations SET reconciliation_status='ready'
+        WHERE conversation_id!=channel_id AND reconciliation_status='suspended-incomplete-discovery' AND ?""",
+               (requested,))
     pass_key = int(now.timestamp()) // PASS_SECONDS
     candidates = []
-    for row in db.execute("SELECT * FROM conversations WHERE conversation_id=channel_id ORDER BY project").fetchall():
+    for row in db.execute("SELECT * FROM conversations ORDER BY project,conversation_id").fetchall():
         assignment = usable.get(row["project"])
         status = row["reconciliation_status"]
         if status not in STARTABLE or assignment is None or (
@@ -202,10 +295,10 @@ def next_request(db: sqlite3.Connection, usable: dict, now: datetime) -> dict | 
                 phase != "reactions" and pages >= PAGES_PER_PASS):
             continue
         candidates.append((pages + reactions, found["last_seq"] if found is not None else 0,
-                           row["project"], row, found, fresh_restart))
+                           row["project"], row["conversation_id"], row, found, fresh_restart))
     if not candidates:
         return None
-    _, _, project, row, found, fresh_restart = min(candidates, key=lambda item: item[:3])
+    _, _, project, _, row, found, fresh_restart = min(candidates, key=lambda item: item[:4])
     generation = row["assignment_generation"]
     key = (project, row["conversation_id"], generation)
     if found is None:
@@ -219,8 +312,9 @@ def next_request(db: sqlite3.Connection, usable: dict, now: datetime) -> dict | 
                    ("reconciling" if fresh_restart else "discovering", *key[:2]))
         found = db.execute("SELECT * FROM discoveries WHERE project=? AND conversation_id=? AND assignment_generation=?", key).fetchone()
     seq = db.execute("SELECT COALESCE(MAX(last_seq),0)+1 FROM discoveries").fetchone()[0]
+    # A thread's history is read in the thread itself.
     request = {"request_id": f"{seq}", "project": project, "assignment_generation": generation,
-               "channel_id": row["channel_id"], "limit": PAGE_LIMIT}
+               "channel_id": row["conversation_id"], "limit": PAGE_LIMIT}
     if found["phase"] == "backward":
         request.update(kind="history", **({"before": found["before_id"]} if found["before_id"] else {}))
     elif found["phase"] == "forward":
@@ -253,16 +347,21 @@ def _evaluate(summary: dict, active_turn: bool) -> tuple[str, str]:
     return "awaiting-owner", APPROXIMATION
 
 
+def pending_scan(db: sqlite3.Connection, payload: dict) -> sqlite3.Row | None:
+    """The scan whose outstanding request this Discord read answers."""
+    return next((row for row in db.execute("""SELECT * FROM discoveries
+            WHERE project=? AND assignment_generation=? AND pending_request IS NOT NULL""",
+            (payload.get("project"), payload.get("assignment_generation"))).fetchall()
+            if json.loads(row["pending_request"])["request_id"] == payload.get("request_id")), None)
+
+
 def record_result(db: sqlite3.Connection, payload: dict, now: datetime, recorded_reminders: set[str],
                   adapter_interactions: set[str], reaction_times) -> str:
     """Apply one Discord read to the checkpointed scan; commit the baseline when resolved."""
-    found = db.execute("SELECT * FROM discoveries WHERE project=? AND assignment_generation=?",
-                       (payload.get("project"), payload.get("assignment_generation"))).fetchone()
-    if found is None or not found["pending_request"]:
+    found = pending_scan(db, payload)
+    if found is None:
         return "ignored"
     request = json.loads(found["pending_request"])
-    if request["request_id"] != payload.get("request_id"):
-        return "ignored"
     project, generation = found["project"], found["assignment_generation"]
     row = db.execute("SELECT * FROM conversations WHERE project=? AND conversation_id=?",
                      (project, found["conversation_id"])).fetchone()
