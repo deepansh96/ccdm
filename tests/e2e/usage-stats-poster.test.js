@@ -19,8 +19,9 @@ function serviceFor(configDir) {
   return `Claude Code-credentials-${crypto.createHash("sha256").update(configDir).digest("hex").slice(0, 8)}`;
 }
 
-async function startPosterApi({ organization = { organization_type: "pro" }, unauthorizedTokens = [], acceptDashboard = false, usage = {}, accounts = {}, failedPosts = 0 } = {}) {
+async function startPosterApi({ organization = { organization_type: "pro" }, unauthorizedTokens = [], acceptDashboard = false, usage = {}, accounts = {}, failedPosts = 0, droppedPosts = 0 } = {}) {
   let remainingPostFailures = failedPosts;
+  let remainingPostDrops = droppedPosts;
   const emails = { "fixture-oauth-token": "fixture@example.test", ...accounts };
   const requests = [];
   const unauthorized = new Set(unauthorizedTokens);
@@ -82,6 +83,12 @@ async function startPosterApi({ organization = { organization_type: "pro" }, una
         return;
       }
       if (request.method === "POST" && request.url === "/api/v10/channels/fixture-channel/messages") {
+        if (remainingPostDrops > 0) {
+          // The full request arrived but the reply is lost, as after a read timeout.
+          remainingPostDrops -= 1;
+          request.socket.destroy();
+          return;
+        }
         if (remainingPostFailures > 0) {
           remainingPostFailures -= 1;
           response.statusCode = 503;
@@ -1723,6 +1730,35 @@ test("scheduled poster retries a failed or skipped slot on any later run in that
   assert.equal(lateFirstRun.exitCode, 0, lateFirstRun.stderr || lateFirstRun.stdout);
   assert.match(lateFirstRun.stdout, /Posted usage report .*2026-08-18T12:30:00Z/);
   assert.equal(posts(), 3);
+});
+
+test("scheduled poster does not repost a slot whose Discord reply was lost", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi({ droppedPosts: 1 });
+  const historyPath = path.join(workspace.homeDir, "Library", "Application Support", "CCDM", "usage-stats", "history.sqlite3");
+  seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
+  const run = (now) => runScript(workspace, "scripts/usage-stats-poster.py", {
+    args: ["--scheduled"],
+    env: { CCDM_TEST_NOW: now, CCDM_USAGE_STATS_NOTIFY: "0" },
+  });
+  const posts = () => api.requests.filter((request) => request.method === "POST").length;
+
+  const lost = await run("2026-08-18T12:08:00Z");
+  assert.equal(lost.exitCode, 1, lost.stdout);
+  assert.match(lost.stderr, /reply was lost/);
+  assert.equal(posts(), 1);
+
+  const later = await run("2026-08-18T12:18:00Z");
+  assert.equal(later.exitCode, 0, later.stderr || later.stdout);
+  assert.match(later.stdout, /already posted/);
+  assert.equal(posts(), 1);
+
+  const ledger = spawnSync("python3", ["-c", [
+    "import sqlite3, sys",
+    "print(sqlite3.connect(sys.argv[1]).execute('select message_id from posts').fetchone()[0])",
+  ].join("\n"), historyPath], { encoding: "utf8" });
+  assert.equal(ledger.status, 0, ledger.stderr);
+  assert.equal(ledger.stdout.trim(), "uncertain");
 });
 
 test("malformed current-slot snapshots are replaced by the next sanitized collection", async () => {

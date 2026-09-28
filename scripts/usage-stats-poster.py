@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -71,6 +72,10 @@ CLAUDE_PRICES = {
 
 class PosterError(Exception):
     """An actionable, safe-to-display poster error."""
+
+
+class AmbiguousPostError(PosterError):
+    """Discord received the whole request but its reply was lost, so the post may exist."""
 
 
 class PosterHTTPError(PosterError):
@@ -1896,15 +1901,26 @@ def post_to_discord(config, bot_token, claude_value, codex_value=None):
         },
         method="POST",
     )
+    # urllib wraps connect/send failures in URLError, so Discord never saw a
+    # complete request and a retry cannot duplicate the post.  Failures while
+    # waiting for or reading the reply are ambiguous: Discord may already have
+    # created the message.
     try:
-        with urlopen(request, timeout=10) as response:
-            if not 200 <= response.status < 300:
-                raise PosterError(f"Discord post failed (HTTP {response.status})")
-            result = json.loads(response.read().decode("utf-8"))
+        response = urlopen(request, timeout=10)
     except HTTPError as error:
         raise PosterError(f"Discord post failed (HTTP {error.code})") from None
-    except (URLError, TimeoutError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+    except URLError:
         raise PosterError("Discord post failed; check the endpoint and try again") from None
+    except (OSError, http.client.HTTPException):
+        raise AmbiguousPostError("Discord post reply was lost; the report may have been posted") from None
+    with response:
+        if not 200 <= response.status < 300:
+            raise PosterError(f"Discord post failed (HTTP {response.status})")
+        try:
+            result = json.loads(response.read().decode("utf-8"))
+        except (OSError, http.client.HTTPException, UnicodeDecodeError, json.JSONDecodeError):
+            # A 2xx status means the message was created; only its id is unknown.
+            result = None
     message_id = result.get("id", "unknown") if isinstance(result, dict) else "unknown"
     return message_id
 
@@ -2481,7 +2497,7 @@ def build_parser():
     parser.add_argument(
         "--post-now",
         action="store_true",
-        help="manually force the text Usage Report post (still records a local post ledger entry)",
+        help="alias for --scheduled, kept for compatibility (the posts ledger still allows one post per slot)",
     )
     return parser
 
@@ -2542,7 +2558,13 @@ def main(argv=None):
                 # no trend PNGs are rendered and no multipart attachment is
                 # produced.  The retired renderer/upload helpers stay defined
                 # for API back-compat but are never invoked here.
-                message_id = post_to_discord(config, bot_token, claude_value, codex_value)
+                try:
+                    message_id = post_to_discord(config, bot_token, claude_value, codex_value)
+                except AmbiguousPostError:
+                    # Prefer a possibly missed slot over a duplicate report:
+                    # later runs in this slot must not post again.
+                    store.record_post(connection, post_slot, "uncertain", now)
+                    raise
                 store.record_post(connection, post_slot, message_id, now)
                 print(f"Posted usage report (message ID: {message_id}; UTC slot: {_iso_utc(post_slot)})")
                 return 0
