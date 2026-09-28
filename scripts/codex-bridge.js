@@ -1608,6 +1608,9 @@ function startDiscordBot(conv) {
     const channelId = msg.channel.id;
     const text = stripThisBotMention(msg.content.trim());
     const bridgeSlashCommand = !ROOT_MULTI_CHANNEL || channelId === CHANNEL_ID;
+    // /thread and /config belong to the Thread Supervisor, like /close to the
+    // reminder service: they never reach the Channel Conversation's model.
+    if (bridgeSlashCommand && /^\/(?:thread|config)(?:\s[\s\S]*)?$/.test(text)) return;
     if (bridgeSlashCommand && ["/pause", "/unpause", "/compact", "/clear", "/restart"].includes(text)) {
       const assignment = await reminderAdapter.resolveAssignmentForChannel(channelId, {
         requireCodex: true,

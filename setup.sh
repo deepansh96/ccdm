@@ -84,6 +84,7 @@ REGISTRY_CONTENT="{
   \"max_pool_size\": 50,
   \"codex_accounts\": {},
   \"default_codex_account\": null,
+  \"claude_accounts\": {},
   \"project_bot_role_id\": null,
   \"category_ids\": [],
   \"pool\": [],

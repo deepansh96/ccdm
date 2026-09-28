@@ -501,6 +501,39 @@ test("channel bridge ignores a message in a thread under its channel", async () 
   await bridge.stop();
 });
 
+test("channel bridge never passes the reserved /thread and /config commands to Codex", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, {
+    channelId: "channel-id",
+    turns: [{ delta: "channel reply" }],
+  });
+  const bridge = startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
+
+  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  for (const [id, content] of [["reserved-thread", "/thread fix-login --provider codex fix the login redirect"],
+    ["reserved-config", "/config"], ["reserved-config-args", "/config model=gpt-6-luna"]]) {
+    await injectMessageUntil(workspace, { content, id },
+      (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === id), 5000);
+  }
+  // A later channel message proves the bridge is live and the commands were dropped, not delayed.
+  const state = await injectMessageUntil(
+    workspace,
+    { content: "channel message", id: "channel-message" },
+    (nextState) => nextState.fixtures.discord.sends.length === 1,
+    5000,
+  );
+
+  const userTurns = codex.clientMessages.filter((m) => m.method === "turn/start").slice(1);
+  assert.deepEqual(userTurns.map((m) => m.params.input[0].text), ["channel message"]);
+  assert.ok(!JSON.stringify(codex.clientMessages).includes("/thread"));
+  assert.ok(!JSON.stringify(codex.clientMessages).includes("/config"));
+  assert.deepEqual(state.fixtures.discord.sends.map(({ content }) => content), ["channel reply"]);
+  await bridge.stop();
+});
+
 test("bridge text fallback is opt-in for completed assistant items without MCP reply", async () => {
   const flagged = createBridgeWorkspace();
   const flaggedCodex = await startFakeCodexServer(flagged, {

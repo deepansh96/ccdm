@@ -229,3 +229,18 @@ test("operator documentation and scenario matrix record the Codex Thread Convers
   assert.match(matrix, /\| Fixture contracts \| Codex thread host fakes \| Covered \| .*setHomeMcpServers/);
   assert.match(fs.readFileSync(".mex/context/session-management.md", "utf8"), /thread\/unsubscribe/);
 });
+
+test("operator documentation and scenario matrix record the /thread command and Claude account aliases", () => {
+  const section = operatorReadme.slice(operatorReadme.indexOf("## Thread Supervisor"));
+  for (const phrase of ["/thread <name> [--provider claude|codex] [--account X] [--model Y] [--effort Z] [first message…]",
+    "claude_accounts", "codex_accounts", "creation request", "/config"]) {
+    assert.ok(section.includes(phrase), phrase);
+  }
+  assert.ok(operatorReadme.includes("### Claude Accounts"));
+  for (const scenario of ["Thread command creation", "Cross-provider thread command", "Thread command validation",
+    "Thread command eligibility"]) {
+    assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-commands\\.test\\.js`));
+  }
+  assert.match(matrix, /\| Codex bridge \| Reserved thread commands \| Covered \| .*\/thread.*\/config/);
+  assert.match(matrix, /\| Fixture contracts \| Thread creation routes \| Covered \| .*threadCreates/);
+});

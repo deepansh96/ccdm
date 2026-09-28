@@ -89,6 +89,25 @@ async function threadMessage(message) {
   if (JSON.parse(stdout).result === "start") startSession(message.channelId);
 }
 
+// `/thread` and `/config` typed in a channel, optionally after a bot mention;
+// the service decides whether the channel is a registered project's.
+const CHANNEL_COMMAND = /^(?:<@!?[^>\s]+>\s+)?\/(?:thread|config)(?:\s|$)/;
+
+// Hands one channel command to the service, which answers `/config` with a
+// hint, or creates the `/thread` thread and asks for its session start when it
+// carries a first message.
+async function channelCommand(message) {
+  const payload = {
+    channel_id: message.channelId, message_id: message.id, author_id: message.author?.id ?? null,
+    author_name: message.author?.username ?? null, content: message.content ?? "",
+    timestamp: new Date(message.createdTimestamp ?? Date.now()).toISOString(),
+  };
+  const { stdout } = await exec(process.env.CCDM_THREAD_PYTHON || "python3", [service, "command",
+    "--project-root", projectRoot, "--state-dir", stateDir, "--payload", JSON.stringify(payload)]);
+  const result = JSON.parse(stdout);
+  if (result.result === "start") startSession(result.thread_id);
+}
+
 // Classifying an archive can wait up to a minute for its audit-log entry, so
 // it runs beside the event queue like a boot.
 function threadArchived(thread) {
@@ -114,7 +133,11 @@ function startSession(threadId) {
 }
 
 client.on("messageCreate", message => {
-  if (!message.channel?.isThread?.()) return;
+  if (!message.channel?.isThread?.()) {
+    if (message.author?.bot || !CHANNEL_COMMAND.test((message.content ?? "").trim())) return;
+    queue = queue.then(() => channelCommand(message)).catch(error => log(`channel ${message.channelId}: ${error.message}`));
+    return;
+  }
   // A bot's own posts never drive a thread; a starter reference is a system
   // message that may carry any author.
   if (message.author?.bot && message.type !== 21) return;

@@ -2,12 +2,16 @@
 "use strict";
 
 // Applies one Thread Supervisor Discord side effect with the owning project's
-// bot: add or remove a reaction, read a message, or post a one-line notice.
+// bot: add or remove a reaction, read a message, post a one-line notice, or
+// create a standalone public thread with the one-week auto-archive.
 // The bot token is read from the registry here, never passed on the command line.
 const { readFile } = require("node:fs/promises");
 const path = require("node:path");
 
 const API = "https://discord.com/api/v10";
+// A public thread, archived after a week of inactivity (Discord's longest).
+const PUBLIC_THREAD = 11;
+const AUTO_ARCHIVE_MINUTES = 10080;
 
 async function botToken(projectRoot, botId) {
   const registry = JSON.parse(await readFile(path.join(projectRoot, "registry.json"), "utf8"));
@@ -50,8 +54,13 @@ async function main() {
       method: "POST", json: { content: request.content, allowed_mentions: { parse: [] } },
     });
     result = { id: sent.id };
+  } else if (operation === "create-thread") {
+    const created = await discord(token, `/channels/${channel}/threads`, {
+      method: "POST", json: { name: request.name, type: PUBLIC_THREAD, auto_archive_duration: AUTO_ARCHIVE_MINUTES },
+    });
+    result = { id: created.id, owner_id: created.owner_id ?? null };
   } else {
-    throw new Error("usage: react|unreact|get-message|post <request JSON>");
+    throw new Error("usage: react|unreact|get-message|post|create-thread <request JSON>");
   }
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }

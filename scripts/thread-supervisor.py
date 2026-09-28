@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 
 def _load(name: str, filename: str):
@@ -50,6 +51,16 @@ ARCHIVE_ACTOR_RETRY_SECONDS = 0.5
 USER_MESSAGE_TYPES = {0, 19}
 # A thread's starter reference, carrying the parent-channel message it began from.
 THREAD_STARTER_MESSAGE = 21
+THREAD_USAGE = "/thread <name> [--provider claude|codex] [--account X] [--model Y] [--effort Z] [first message…]"
+THREAD_FLAGS = ("provider", "account", "model", "effort")
+# Discord's thread name limit.
+THREAD_NAME_LIMIT = 100
+PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex"}
+# The reasoning efforts each provider's channel launch accepts: Claude Code's
+# `--effort` values and Codex's `model_reasoning_effort` values.
+PROVIDER_EFFORTS = {"claude": LAUNCH.EFFORTS,
+                    "codex": ("none", "minimal", "low", "medium", "high", "xhigh")}
+CONFIG_HINT = "/config works inside a thread: send it in the thread whose settings you want to see or change."
 # Claude Code's startup screens, read from the tmux pane.
 READY_TEXT = "Listening for channel messages"
 STARTUP_PROMPTS = ("I am using this for local development", "trust the files in this folder", "trust this folder")
@@ -253,6 +264,12 @@ def status(state_dir: Path, project_root: Path | None = None) -> dict:
                 if row["state"] == "booting" and buffered.exists():
                     entry["buffered_messages"] = len(json.loads(buffered.read_text(encoding="utf-8")))
                 projects.setdefault(row["project"], {"threads": {}})["threads"][row["thread_id"]] = entry
+            for row in STORE.requests(db):
+                request = {"name": row["name"], "requester_kind": row["requester_kind"], "status": row["status"]}
+                if row["thread_id"] is not None:
+                    request["thread_id"] = row["thread_id"]
+                project = projects.setdefault(row["project"], {"threads": {}})
+                project.setdefault("creation_requests", {})[row["request_id"]] = request
         db.close()
     result = {"status": "ok", **worker(state_dir), "disabled": disabled_marker(state_dir).exists(),
               "state_dir": str(state_dir), "projects": projects}
@@ -283,19 +300,152 @@ def enable(project_root: Path, state_dir: Path) -> dict:
 
 
 def bind(project_root: Path, state_dir: Path, event: dict) -> dict:
-    decision = ROUTER.route_thread_create(load_registry(project_root), event)
-    if decision["route"] != "bind":
-        return {"result": "ignored", "reason": decision["reason"]}
+    """Bind a new thread. A thread created by the project's bot or root binds
+    only because it fulfils a pending creation request, whose overrides it takes."""
+    registry = load_registry(project_root)
     db = STORE.connect(state_dir, create=True)
     try:
+        request = STORE.pending_request(db, str(event.get("thread_id") or ""))
+        decision = ROUTER.route_thread_create(registry, event, request["project"] if request else None,
+                                              root_user_id(registry))
+        if decision["route"] != "bind":
+            return {"result": "ignored", "reason": decision["reason"]}
+        if request and request["project"] != decision["project"]:
+            request = None
         created = STORE.bind(db, str(event["thread_id"]), decision["project"], str(event.get("name") or ""),
-                             str(event["creator_id"]), clock_now())
+                             str(event["creator_id"]), clock_now(), request)
     finally:
         db.close()
     if not created:
         return {"result": "known", "project": decision["project"]}
     return {"result": "bound", "project": decision["project"], "bot_id": decision["bot_id"],
             "set_auto_archive": event.get("auto_archive_duration") != AUTO_ARCHIVE_MINUTES}
+
+
+class CommandError(ValueError):
+    """A `/thread` command the supervisor refuses, with its one-line reason."""
+
+
+def parse_thread_command(registry: dict, project: dict, arguments: str) -> dict:
+    """`<name> [--provider claude|codex] [--account X] [--model Y] [--effort Z] [first message…]`.
+    Flags come before the first message; each is validated against the provider
+    the thread will run."""
+    def token(text: str) -> tuple[str, str]:
+        parts = text.split(None, 1)
+        return (parts[0], parts[1] if len(parts) > 1 else "") if parts else ("", "")
+
+    name, rest = token(arguments)
+    if not name or name.startswith("--"):
+        raise CommandError(f"usage: {THREAD_USAGE}")
+    if len(name) > THREAD_NAME_LIMIT:
+        raise CommandError(f"a thread name has at most {THREAD_NAME_LIMIT} characters.")
+    overrides: dict = {}
+    while rest.startswith("--"):
+        flag, rest = token(rest)
+        value, rest = token(rest)
+        if flag[2:] not in THREAD_FLAGS:
+            raise CommandError(f"unknown option {flag}; use {THREAD_USAGE}")
+        if not value or value.startswith("--"):
+            raise CommandError(f"{flag} needs a value.")
+        overrides[flag[2:]] = value
+    project_provider = project.get("type") or "claude"
+    provider = overrides.get("provider", project_provider)
+    if provider not in PROVIDER_EFFORTS:
+        raise CommandError("--provider must be claude or codex.")
+    account = overrides.get("account")
+    if account is not None:
+        # Only a configured alias selects an account; a Discord message never names a directory (ADR 0003).
+        if "/" in account or account.startswith(("~", ".")):
+            raise CommandError("--account takes an account alias, not a path.")
+        aliases = registry.get("codex_accounts" if provider == "codex" else "claude_accounts")
+        if not isinstance(aliases, dict) or account not in aliases:
+            raise CommandError(f"--account {account} is not a configured {PROVIDER_LABELS[provider]} account alias.")
+    model = overrides.get("model")
+    if model is not None and not re.fullmatch(r"[A-Za-z0-9._:/\[\]-]+", model):
+        raise CommandError("--model has characters a model name never uses.")
+    effort = overrides.get("effort")
+    if effort is not None and effort not in PROVIDER_EFFORTS[provider]:
+        raise CommandError(f"--effort for {PROVIDER_LABELS[provider]} must be one of "
+                           f"{', '.join(PROVIDER_EFFORTS[provider])}.")
+    return {"name": name, "first_message": rest.strip() or None,
+            "overrides": {"provider": overrides.get("provider"), "account": account, "model": model, "effort": effort}}
+
+
+def channel_command(project_root: Path, state_dir: Path, event: dict) -> dict:
+    """Handle `/thread` or `/config` typed by the owner or a guest in a
+    registered project channel. `/thread` records a creation request, creates
+    the thread with the project bot, and binds it by fulfilling the request;
+    with a first message it also asks for the session start."""
+    registry = load_registry(project_root)
+    channel_id = str(event.get("channel_id") or "")
+    found = ROUTER.project_for_channel(registry, channel_id)
+    if not found:
+        return {"result": "ignored", "reason": "unregistered-channel"}
+    project_name, project = found
+    if str(project.get("path") or "").startswith("remote:"):
+        return {"result": "ignored", "reason": "remote-project"}
+    author = str(event.get("author_id") or "")
+    if not ROUTER.eligible_creator(registry, project, author):
+        return {"result": "ignored", "reason": "ineligible-author"}
+    text = str(event.get("content") or "").strip()
+    for app_id in (ROUTER.bot_user_id(registry, project), root_user_id(registry)):
+        for mention in (f"<@{app_id}>", f"<@!{app_id}>"):
+            if app_id and text.startswith(mention):
+                text = text[len(mention):].strip()
+    command = re.fullmatch(r"/(thread|config)(?:\s+([\s\S]*))?", text)
+    if not command:
+        return {"result": "ignored", "reason": "not-a-command"}
+    bot_id = project["bot_id"]
+
+    def say(line: str) -> None:
+        discord_request(project_root, "post", {"bot_id": bot_id, "channel_id": channel_id, "content": line})
+
+    if command.group(1) == "config":
+        say(CONFIG_HINT)
+        return {"result": "config-hint"}
+    try:
+        parsed = parse_thread_command(registry, project, command.group(2) or "")
+    except CommandError as error:
+        say(f"/thread: {error}")
+        return {"result": "rejected", "reason": str(error)}
+    request_id = str(uuid.uuid4())
+    kind = "owner" if author == str(registry.get("discord_user_id") or "") else "guest"
+    db = STORE.connect(state_dir, create=True)
+    try:
+        STORE.create_request(db, request_id, project_name, parsed["name"], parsed["overrides"],
+                             parsed["first_message"], author, kind, clock_now())
+        created = discord_request(project_root, "create-thread", {"bot_id": bot_id, "channel_id": channel_id,
+                                                                  "name": parsed["name"]})
+        if not created:
+            STORE.update_request(db, request_id, status="failed")
+            say("/thread: Discord did not create the thread; check the bot's Create Public Threads permission.")
+            return {"result": "failed", "request_id": request_id}
+        thread_id = str(created["id"])
+        STORE.update_request(db, request_id, thread_id=thread_id)
+    finally:
+        db.close()
+    bound = bind(project_root, state_dir, {"thread_id": thread_id, "type": ROUTER.PUBLIC_THREAD, "parent_id": channel_id,
+                                           "parent_type": 0, "name": parsed["name"],
+                                           "creator_id": str(created.get("owner_id") or ROUTER.bot_user_id(registry, project)),
+                                           "auto_archive_duration": AUTO_ARCHIVE_MINUTES})
+    if not parsed["first_message"]:
+        # The thread waits for the first owner or guest message in it.
+        return {"result": "created", "thread_id": thread_id, "bind": bound["result"]}
+    held = {"id": str(event.get("message_id") or ""), "channel_id": channel_id, "author_id": author,
+            "author": str(event.get("author_name") or author), "content": parsed["first_message"],
+            "timestamp": str(event.get("timestamp") or clock_now())}
+    db = STORE.connect(state_dir)
+    try:
+        with BootLock(state_dir):
+            row = STORE.thread(db, thread_id)
+            if not row or row["state"] != "registered":
+                return {"result": "created", "thread_id": thread_id, "bind": bound["result"]}
+            write_private(buffer_path(state_dir, thread_id), [held])
+            activity = {"last_owner_activity_at": clock_now()} if kind == "owner" else {}
+            STORE.update(db, thread_id, state="booting", **activity)
+    finally:
+        db.close()
+    return {"result": "start", "thread_id": thread_id}
 
 
 def boot_dir(state_dir: Path) -> Path:
@@ -587,16 +737,27 @@ def boot_failed(project_root: Path, state_dir: Path, db, thread_id: str, reactio
 
 def codex_settings(registry: dict, row) -> dict:
     """The Codex Home, model, effort, and sandbox a Codex thread runs with:
-    each thread override, else the project's value."""
+    each thread override, else the project's value. A Codex thread in a Claude
+    project inherits nothing Claude-specific: without an account it uses the
+    Default Codex Account, and without a model or effort, the home's own."""
     project = registry["projects"][row["project"]]
+    native = (project.get("type") or "claude") == "codex"
     if row["account"]:
         home = CODEX_HOME.resolve_account_home(CODEX_HOME.codex_accounts(registry), row["account"],
                                                f"thread {row['thread_id']} account")
-    else:
+    elif native:
         home = CODEX_HOME.resolve_codex_home(registry, row["project"])
-    return {"home": home, "model": row["model"] or project.get("codex_model") or project.get("model"),
-            "effort": row["effort"] or project.get("codex_reasoning_effort") or project.get("model_reasoning_effort"),
+    else:
+        home = CODEX_HOME.resolve_codex_home({**registry, "projects": {row["project"]: {}}}, row["project"])
+    inherited = project if native else {}
+    return {"home": home, "model": row["model"] or inherited.get("codex_model") or inherited.get("model"),
+            "effort": row["effort"] or inherited.get("codex_reasoning_effort") or inherited.get("model_reasoning_effort"),
             "sandbox": project.get("codex_sandbox") or "danger-full-access"}
+
+
+def claude_overrides(row) -> dict:
+    """A Claude thread's account, model, and effort overrides for `claude-launch.py`."""
+    return {field: row[field] for field in ("account", "model", "effort") if row[field]}
 
 
 def quoted(value) -> str:
@@ -663,7 +824,7 @@ def codex_boot(project_root: Path, state_dir: Path, db, row, registry: dict, rea
             opened = host_request(runtime_dir, {"op": "open", "thread": {
                 "thread_id": thread_id, "name": row["name"], **settings,
                 **({"conversation_id": resume} if resume else {})}, "starter": starter, "messages": held,
-                "trigger_message_id": reaction["message_id"]})
+                "trigger_message_id": reaction["message_id"], "trigger_channel_id": reaction["channel_id"]})
             if opened and opened.get("ok"):
                 # Handed off: the host's own Gateway delivers later messages.
                 buffered.unlink()
@@ -709,7 +870,8 @@ def host_event(project_root: Path, state_dir: Path, event: dict) -> dict:
             if row["state"] != "booting":
                 return {"result": "ignored", "reason": f"thread is {row['state']}"}
             reaction = {"bot_id": load_registry(project_root)["projects"][row["project"]]["bot_id"],
-                        "channel_id": thread_id, "message_id": str(event.get("trigger_message_id") or ""),
+                        "channel_id": str(event.get("trigger_channel_id") or thread_id),
+                        "message_id": str(event.get("trigger_message_id") or ""),
                         "emoji": BOOTING_EMOJI}
             if kind == "failed":
                 return boot_failed(project_root, state_dir, db, thread_id, reaction,
@@ -735,24 +897,32 @@ def boot(project_root: Path, state_dir: Path, thread_id: str) -> dict:
     registry = load_registry(project_root)
     bot_id = registry["projects"][row["project"]]["bot_id"]
     with BootLock(state_dir):
-        trigger = json.loads(buffer_path(state_dir, thread_id).read_text(encoding="utf-8"))[0]["id"]
-    reaction = {"bot_id": bot_id, "channel_id": thread_id, "message_id": trigger, "emoji": BOOTING_EMOJI}
+        trigger = json.loads(buffer_path(state_dir, thread_id).read_text(encoding="utf-8"))[0]
+    # A `/thread` first message is the command itself, in the parent channel.
+    reaction = {"bot_id": bot_id, "channel_id": trigger.get("channel_id") or thread_id, "message_id": trigger["id"],
+                "emoji": BOOTING_EMOJI}
     discord_request(project_root, "react", reaction)
     if thread_provider(registry, row) == "codex":
         return codex_boot(project_root, state_dir, db, row, registry, reaction, started)
-    resolved = LAUNCH.resolve(str(project_root / "registry.json"), row["project"], thread_id)
+    overrides = claude_overrides(row)
 
     def fail(reason: str) -> dict:
         result = boot_failed(project_root, state_dir, db, thread_id, reaction, reason)
         db.close()
         return result
 
+    try:
+        resolved = LAUNCH.resolve(str(project_root / "registry.json"), row["project"], thread_id, overrides)
+    except SystemExit as error:
+        return fail(str(error))
     # A thread with a stored conversation resumes it under the same Claude
     # home and cwd; an account change starts fresh.
     home = str(resolved["claude_home"] or Path.home() / ".claude")
     resume = row["provider_conversation_id"] if row["provider_home"] == home else None
     launched = subprocess.run([str(Path(__file__).with_name("start-thread-session.sh")), row["project"], thread_id,
-                               *([resume] if resume else [])], capture_output=True, text=True, timeout=120)
+                               *([resume] if resume else []),
+                               *(argument for field, value in overrides.items() for argument in (f"--{field}", value))],
+                              capture_output=True, text=True, timeout=120)
     if launched.returncode != 0:
         detail = (launched.stderr.strip() or launched.stdout.strip() or "the Claude thread launcher failed")
         return fail(detail.splitlines()[-1])
@@ -836,7 +1006,7 @@ def run(project_root: Path, state_dir: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("run", "status", "preflight", "disable", "enable", "bind", "message",
-                                            "archive", "delete", "boot", "host-event",
+                                            "archive", "delete", "boot", "host-event", "command",
                                             "grant-thread-permissions"))
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--state-dir", type=Path, default=None)
@@ -862,10 +1032,11 @@ def main() -> int:
             if not args.payload:
                 raise ValueError("--payload is required")
             result = bind(args.project_root, state_dir, json.loads(args.payload))
-        elif args.command in ("message", "archive", "delete", "host-event"):
+        elif args.command in ("message", "archive", "delete", "host-event", "command"):
             if not args.payload:
                 raise ValueError("--payload is required")
-            handler = {"message": message, "archive": archive, "delete": delete, "host-event": host_event}[args.command]
+            handler = {"message": message, "archive": archive, "delete": delete, "host-event": host_event,
+                       "command": channel_command}[args.command]
             result = handler(args.project_root, state_dir, json.loads(args.payload))
         elif args.command == "boot":
             if not args.thread_id:

@@ -13,7 +13,7 @@ test.afterEach(async () => {
   await cleanup();
 });
 
-test("registry example exposes generic named Codex account fields", () => {
+test("registry example exposes generic named Codex and Claude account fields", () => {
   const registryExample = JSON.parse(fs.readFileSync("registry.example.json", "utf8"));
 
   assert.deepEqual(registryExample.codex_accounts, {
@@ -21,6 +21,10 @@ test("registry example exposes generic named Codex account fields", () => {
   });
   assert.equal(registryExample.default_codex_account, "example-account");
   assert.equal("codex_home" in registryExample, false);
+  // Claude account aliases name Claude homes that a thread's --account may select.
+  assert.deepEqual(registryExample.claude_accounts, {
+    "example-claude": "~/.claude-example",
+  });
 });
 
 test("setup creates a first-run registry, state files, and executable scripts", async () => {
@@ -40,6 +44,7 @@ test("setup creates a first-run registry, state files, and executable scripts", 
     max_pool_size: 50,
     codex_accounts: {},
     default_codex_account: null,
+    claude_accounts: {},
     project_bot_role_id: null,
     category_ids: [],
     pool: [],
@@ -115,6 +120,7 @@ test("setup overwrites an existing registry when requested", async () => {
     max_pool_size: 50,
     codex_accounts: {},
     default_codex_account: null,
+    claude_accounts: {},
     project_bot_role_id: null,
     category_ids: [],
     pool: [],

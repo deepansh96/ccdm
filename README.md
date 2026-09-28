@@ -341,6 +341,23 @@ overrides when `scripts/start-codex-session.sh` launches the bridge. Fast mode
 is off unless `codex_service_tier` is set to a tier such as `"priority"`;
 Sol/Terra/Luna are model slugs.
 
+### Claude Accounts
+
+A Thread Conversation can run on another Claude home through a Claude account
+alias. Map each alias to its Claude home in the top level of `registry.json`:
+
+```json
+"claude_accounts": {
+  "work": "~/.claude-work"
+}
+```
+
+The map only names homes a thread may select with `/thread … --account work`;
+it does not change any project's `claude_home`. An absent key means no Claude
+aliases, so a Claude thread can use only its project's home, or `~/.claude` for
+a Claude thread in a Codex project. Each home needs the official Discord plugin
+installed, like any Claude project home.
+
 You also need:
 - A Discord account
 - A Discord server where you can add bots
@@ -386,6 +403,7 @@ If you prefer to set things up by hand:
      "max_pool_size": 50,
      "codex_accounts": {},
      "default_codex_account": null,
+     "claude_accounts": {},
      "project_bot_role_id": null,
      "category_ids": [],
      "pool": [],
@@ -590,6 +608,14 @@ The Thread Supervisor is a separate root-level service that watches Discord thre
 The first message from the owner or a guest in a bound thread of a Claude project starts that thread's own Claude session, whether or not the project's Channel Conversation is running. Strangers' messages start nothing. The supervisor reacts 👀 to the triggering message while the session boots and removes it once the session is ready. It launches `scripts/start-thread-session.sh <project> <thread_id>`, which shares its model, effort, and account mapping with `start-session.sh` through `scripts/claude-launch.py`. The session runs in tmux `<screen_name>-t-<last 6 digits of the thread id>`, from the project path, behind the conversation-scoped proxy pinned to the thread. Its private state dir `<bot state_dir>/threads/<thread_id>/` holds a symlink to the bot's `.env` (the token never enters the environment), an `access.json` that allows only the parent channel's group for the owner and guests, and its own launch files. It runs with `DISCORD_ACCESS_MODE=static`, and its read-only exporter's `CHANNEL_ID` is the thread id. The supervisor accepts the development-channel consent and workspace-trust prompts in the pane. The session's first prompt is a bootstrap naming the thread and carrying its starter message (for a thread started from a channel message) plus every owner or guest message sent during boot, each exactly once. `status` then shows the thread `live` with its Claude session id. If the session is not ready within 120 seconds, the supervisor posts a one-line reason in the thread and marks it `stopped` with `start-failed`; it never retries on its own, and the next owner message tries again. `scripts/stop-session.sh <project>` stops only the Channel Conversation and leaves thread sessions running.
 
 In a Codex project, the same first message opens the thread's own Codex conversation on the project's Codex thread host, `scripts/codex-thread-host.js`, with the same 👀, boot-time buffering, 120-second boot timeout, and failure line. The supervisor starts the host in tmux `<screen_name>-threads` when it is not running. The host logs into the project bot's Gateway, accepts messages and reactions only in the threads it hosts and only from the owner and the project's guests, and never changes the bot's nickname. It runs one `codex app-server` per Codex Home in use; the first listens on the project's `thread_ws_port` (default `ws_port + 1000`) and each further home on the next port. A thread uses the project's Codex Home (resolved like `start-codex-session.sh`), `codex_model`, `codex_reasoning_effort`, and the optional `codex_sandbox` (default `danger-full-access`); effort goes through `config.model_reasoning_effort` on `thread/start` and `effort` on every turn. Every `thread/start` carries a per-conversation `config.mcp_servers` override: a Discord server whose `CHANNEL_ID` is the thread id, with `default_tools_approval_mode: "approve"` unless the sandbox is `danger-full-access`, and `enabled: false` for every other `discord-*` server in the home. The host never calls `config/value/write` for `mcp_servers.*`, so no Discord credential reaches the home's `config.toml` or a rollout. The conversation gets the no-action bootstrap turn first, then one turn with the starter message and every message sent before the handoff, each exactly once. The supervisor drives the host through a private control socket, `control.sock` (`0600`) in `<state dir>/hosts/<project>/`, with `open`, `stop`, `config`, and `command`; the host reports `conversation-id`, `ready`, `failed`, `turn-started`, and `turn-ended` back through `scripts/thread-supervisor.py host-event`, and `status` shows the thread `live` with its Codex conversation id. Every `thread/resume` carries the same override, rebuilt. Before each turn the host re-reads the home's `discord-*` servers; if one was added or removed since the override was built, it unloads the conversation (`thread/unsubscribe`) and resumes it with a refreshed override before the turn runs.
+
+The owner or a guest can also open a thread from a project channel with one line:
+
+```text
+/thread <name> [--provider claude|codex] [--account X] [--model Y] [--effort Z] [first message…]
+```
+
+The supervisor handles it; the command never reaches the channel's model. It records a creation request, has the project bot create a standalone public thread named `<name>` with a one-week auto-archive, and binds that thread because it fulfils the request. A thread the project bot or root creates without a pending request is never bound. The overrides are stored on the thread: `--provider` picks `claude` or `codex` (default: the project's type), `--account` must be an alias in `codex_accounts` for Codex or in `claude_accounts` for Claude (a raw path is refused), `--model` picks the model, and `--effort` must be a value the provider's launch accepts (Claude: `low`, `medium`, `high`, `xhigh`, `max`; Codex: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`). Each option falls back to the project's setting. A thread that runs the other provider inherits nothing provider-specific from the project: with no `--account` it uses that provider's default account (the Default Codex Account, or the default `~/.claude` home), so a Claude project's thread can run on Codex through the project's Codex thread host (from `thread_ws_port`) and a Codex project's thread can run Claude. With a first message, the session starts at once with 👀 on the `/thread` message; without one, the thread waits for the first owner or guest message in it. An invalid option posts exactly one error line in the channel and creates no thread, request, or session. `/thread` from anyone but the owner or a guest does nothing, and `status` lists each project's creation requests under `creation_requests`. Both Channel Conversations drop `/thread` and `/config`; `/config` in a channel gets a one-line hint that it works inside threads.
 
 Archiving or deleting a thread stops its session. The supervisor reads who archived it from the root guild audit log (action 111). An archive by the owner or root closes the conversation (`closed`). Any other actor, or none, counts as Discord's inactivity auto-archive: the session stops (`stopped` / `auto-archive`) and the conversation stays open. If no audit-log entry appears within 60 seconds, or root cannot read the audit log, the archive is treated as an auto-archive and `status` shows `archive-actor-unknown` for the thread. Deleting a thread forgets it: its store row and runtime files are removed. Whenever a session stops, its per-thread runtime files (`<bot state_dir>/threads/<thread_id>/`: launch files, inbox, and bootstrap) are removed, while the row and the Claude conversation in the Claude home stay. The owner's next message in a stopped or closed thread resumes the same conversation with `claude --resume <session id>` under the same Claude home and project path, with 👀 while it boots. For a Codex thread, stopping unloads its conversation from the thread host with `thread/unsubscribe` and never calls `thread/archive`; once the last hosted thread of a project stops, the host stops its app-servers and exits, ending tmux `<screen_name>-threads`. The owner's next message relaunches the host, which calls `thread/resume` with the stored conversation id on the app-server for the stored Codex Home (after `thread/unarchive` if Codex reports the conversation archived), re-sends the bootstrap, and hands over the new message. A guest message never resumes a thread, and neither does a bot post that reopens an archived thread (Discord then re-sends the thread's creation event, which never binds it twice). The root bot therefore needs View Audit Log, which `preflight` checks.
 

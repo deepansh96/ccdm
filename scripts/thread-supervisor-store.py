@@ -138,20 +138,74 @@ def inspect(state_dir: Path) -> str:
 
 
 def bind(db: sqlite3.Connection, thread_id: str, project: str, name: str, creator_id: str,
-         created_at: str) -> bool:
-    """Insert a registered thread; return False when the thread is already known."""
+         created_at: str, request: sqlite3.Row | None = None) -> bool:
+    """Insert a registered thread; return False when the thread is already known.
+    A thread that fulfils a creation ``request`` takes its overrides and marks
+    the request fulfilled in the same transaction."""
+    overrides = {field: request[field] for field in ("provider", "account", "model", "effort")} if request else {}
     db.execute("BEGIN IMMEDIATE")
     try:
         if db.execute("SELECT 1 FROM threads WHERE thread_id=?", (thread_id,)).fetchone():
             db.execute("COMMIT")
             return False
-        db.execute("""INSERT INTO threads (thread_id, project, name, creator_id, state, created_at)
-            VALUES (?,?,?,?,'registered',?)""", (thread_id, project, name, creator_id, created_at))
+        db.execute("""INSERT INTO threads (thread_id, project, name, creator_id, provider, account, model, effort,
+            state, created_at) VALUES (?,?,?,?,?,?,?,?,'registered',?)""",
+                   (thread_id, project, name, creator_id, overrides.get("provider"), overrides.get("account"),
+                    overrides.get("model"), overrides.get("effort"), created_at))
+        if request:
+            db.execute("UPDATE creation_requests SET status='fulfilled', thread_id=? WHERE request_id=?",
+                       (thread_id, request["request_id"]))
         db.execute("COMMIT")
         return True
     except sqlite3.Error:
         db.execute("ROLLBACK")
         raise
+
+
+def create_request(db: sqlite3.Connection, request_id: str, project: str, name: str, overrides: dict,
+                   first_message: str | None, requester_id: str, requester_kind: str, created_at: str) -> None:
+    """Record a pending request to create a thread with the given overrides."""
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
+            first_message, requester_id, requester_kind, status, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,'pending',?)""",
+                   (request_id, project, name, overrides.get("provider"), overrides.get("account"),
+                    overrides.get("model"), overrides.get("effort"), first_message, requester_id, requester_kind,
+                    created_at))
+        db.execute("COMMIT")
+    except sqlite3.Error:
+        db.execute("ROLLBACK")
+        raise
+
+
+def update_request(db: sqlite3.Connection, request_id: str, **fields) -> None:
+    """Set the named columns on one creation request."""
+    unknown = set(fields) - COLUMNS["creation_requests"]
+    if unknown or not fields:
+        raise ValueError(f"unknown creation request columns: {sorted(unknown)}")
+    assignments = ", ".join(f"{name}=?" for name in fields)
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        db.execute(f"UPDATE creation_requests SET {assignments} WHERE request_id=?", (*fields.values(), request_id))
+        db.execute("COMMIT")
+    except sqlite3.Error:
+        db.execute("ROLLBACK")
+        raise
+
+
+def pending_request(db: sqlite3.Connection, thread_id: str) -> sqlite3.Row | None:
+    """The pending creation request whose thread Discord created as ``thread_id``."""
+    return db.execute("SELECT * FROM creation_requests WHERE status='pending' AND thread_id=?",
+                      (thread_id,)).fetchone()
+
+
+def request(db: sqlite3.Connection, request_id: str) -> sqlite3.Row | None:
+    return db.execute("SELECT * FROM creation_requests WHERE request_id=?", (request_id,)).fetchone()
+
+
+def requests(db: sqlite3.Connection) -> list[sqlite3.Row]:
+    return db.execute("SELECT * FROM creation_requests ORDER BY created_at, request_id").fetchall()
 
 
 def threads(db: sqlite3.Connection) -> list[sqlite3.Row]:

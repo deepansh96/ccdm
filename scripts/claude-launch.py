@@ -31,29 +31,48 @@ def valid_thread_id(value: str) -> str:
     return value
 
 
+def valid_override(value: str) -> str:
+    # Values end up inside single-quoted shell words of the launch command.
+    if not re.fullmatch(r"[A-Za-z0-9._:/\[\]-]+", value or ""):
+        raise argparse.ArgumentTypeError("an account alias or model has only letters, digits, and . _ : / [ ] -")
+    return value
+
+
 def valid_session_id(value: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9-]+", value or ""):
         raise argparse.ArgumentTypeError("a Claude session id has only letters, digits, and hyphens")
     return value
 
 
-def resolve(registry_path: str, project: str, thread_id: str | None = None) -> dict:
+def resolve(registry_path: str, project: str, thread_id: str | None = None, overrides: dict | None = None) -> dict:
+    """A project's Claude launch settings. A thread's ``overrides`` (account
+    alias, model, effort) replace the project's; a Claude thread in a Codex
+    project inherits no model, effort, or home, so it uses Claude's defaults."""
     registry = json.load(open(registry_path))
     entry = registry["projects"][project]
-    effort = entry.get("claude_effort")
+    inherited = entry if (entry.get("type") or "claude") == "claude" else {}
+    overrides = overrides or {}
+    effort = overrides.get("effort") or inherited.get("claude_effort")
     if effort is None or effort == "":
         effort = None
     elif not isinstance(effort, str) or effort not in EFFORTS:
         sys.exit("Invalid claude_effort (expected low, medium, high, xhigh, or max)")
+    claude_home = inherited.get("claude_home")
+    if overrides.get("account"):
+        # Only a configured `claude_accounts` alias selects a thread's Claude home.
+        accounts = registry.get("claude_accounts")
+        if not isinstance(accounts, dict) or not isinstance(accounts.get(overrides["account"]), str):
+            sys.exit(f"Unknown Claude account alias '{overrides['account']}' (configure it in claude_accounts)")
+        claude_home = accounts[overrides["account"]]
     bot = next(b for b in registry["pool"] if b["id"] == entry["bot_id"])
     bot_state_dir = os.path.expanduser(bot["state_dir"])
     resolved = {
         "path": os.path.expanduser(entry["path"]),
         "state_dir": bot_state_dir,
         "session_name": entry["screen_name"],
-        "model": entry.get("model") or None,
+        "model": overrides.get("model") or inherited.get("model") or None,
         "effort": effort,
-        "claude_home": os.path.expanduser(entry["claude_home"]) if entry.get("claude_home") else None,
+        "claude_home": os.path.expanduser(claude_home) if claude_home else None,
         "channel_id": str(entry["channel_id"]),
     }
     if thread_id:
@@ -166,10 +185,11 @@ def prepare_thread_state(registry: dict, project: str, resolved: dict) -> None:
     Path(resolved["bootstrap_file"]).unlink(missing_ok=True)
 
 
-def launch_command(registry_path: str, project: str, thread_id: str | None, resume: str | None = None) -> str:
+def launch_command(registry_path: str, project: str, thread_id: str | None, resume: str | None = None,
+                   overrides: dict | None = None) -> str:
     """Write the launch's proxy MCP config and settings; return its tmux shell command.
     ``resume`` continues that Claude session under the same home and cwd."""
-    resolved = resolve(registry_path, project, thread_id)
+    resolved = resolve(registry_path, project, thread_id, overrides)
     registry = json.loads(Path(registry_path).read_text())
     state_dir = resolved["state_dir"]
     channel_id = resolved["channel_id"]
@@ -292,20 +312,25 @@ def main() -> None:
         command.add_argument("registry")
         command.add_argument("project")
         command.add_argument("--thread-id", type=valid_thread_id)
+        # A Thread Conversation's overrides; the supervisor has validated them.
+        command.add_argument("--account", type=valid_override)
+        command.add_argument("--model", type=valid_override)
+        command.add_argument("--effort", choices=EFFORTS)
         if name == "resolve":
             command.add_argument("--json", action="store_true")
         else:
             command.add_argument("--resume", type=valid_session_id)
     commands.add_parser("listener-pids").add_argument("state_dir")
     args = parser.parse_args()
+    overrides = {field: getattr(args, field, None) for field in ("account", "model", "effort")}
     if args.command == "resolve":
-        resolved = resolve(args.registry, args.project, args.thread_id)
+        resolved = resolve(args.registry, args.project, args.thread_id, overrides)
         if args.json:
             print(json.dumps(resolved, sort_keys=True))
         else:
             print_fields(resolved)
     elif args.command == "launch-command":
-        print(launch_command(args.registry, args.project, args.thread_id, args.resume))
+        print(launch_command(args.registry, args.project, args.thread_id, args.resume, overrides))
     else:
         for pid in listener_pids(args.state_dir):
             print(pid)

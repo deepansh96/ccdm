@@ -658,6 +658,43 @@ function routeDiscordApi(url, init = {}) {
     });
   }
 
+  // Start Thread without Message (type 11 is a public thread) or from a
+  // message, whose thread id is the message id. Like Discord, the Gateway then
+  // sends THREAD_CREATE with the creating bot as the thread owner.
+  const threadCreateMatch = /^\/api\/v10\/channels\/([^/]+)(?:\/messages\/([^/]+))?\/threads$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && threadCreateMatch && method === "POST") {
+    const authorization = headerValue(init.headers, "Authorization");
+    const body = init.body ? JSON.parse(String(init.body)) : {};
+    const [, channelId, messageId = null] = threadCreateMatch;
+    const validDuration = body.auto_archive_duration === undefined ||
+      [60, 1440, 4320, 10080].includes(body.auto_archive_duration);
+    if (typeof body.name !== "string" || !body.name || body.name.length > 100 || !validDuration ||
+        (!messageId && body.type !== undefined && ![10, 11, 12].includes(body.type))) {
+      updateState((state) => {
+        state.fixtures.discord.malformedRequests ||= [];
+        state.fixtures.discord.malformedRequests.push({ method, url: url.href, body });
+      });
+      return response(JSON.stringify({ code: 50035, message: "Invalid Form Body" }), {
+        headers: { "content-type": "application/json" }, status: 400,
+      });
+    }
+    let thread;
+    updateState((state) => {
+      state.fixtures.discord.threadCreates ||= [];
+      const threadId = messageId ?? String(1600000000000000000n + BigInt(state.fixtures.discord.threadCreates.length + 1));
+      thread = { id: threadId, type: messageId ? 11 : (body.type ?? 11), parentId: channelId, parentType: 0,
+        name: body.name, ownerId: authorForToken(authorization), archived: false,
+        autoArchiveDuration: body.auto_archive_duration ?? 4320 };
+      state.fixtures.discord.threadCreates.push({ authorization, body, channelId, messageId, threadId });
+      (state.fixtures.discord.threads ||= {})[threadId] = thread;
+      (state.fixtures.discord.injectedThreads ||= []).push({ delivered: false, newlyCreated: true, ...thread });
+    });
+    return response(JSON.stringify({ id: thread.id, type: thread.type, parent_id: channelId, name: thread.name,
+      owner_id: thread.ownerId, thread_metadata: { archived: false, auto_archive_duration: thread.autoArchiveDuration } }), {
+      headers: { "content-type": "application/json" }, status: 201,
+    });
+  }
+
   // Modify Channel on a thread. Changing auto_archive_duration needs Manage
   // Threads; a bot listed in `manageThreadsDenied` (by authorization) gets 403 50001.
   const threadMatch = /^\/api\/v10\/channels\/([^/]+)$/.exec(url.pathname);

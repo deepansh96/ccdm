@@ -127,6 +127,7 @@ The discord.js shim and REST fake also model Discord threads for the Thread Supe
 
 - `injectDiscordThread` queues a Gateway `threadCreate` carrying a thread channel with `type` (11 public, 12 private), `parentId`, a cached `parent` whose `type` is 0 for a text channel or 15 for a forum, `isThread()`, `archived`, `autoArchiveDuration`, and `ownerId`. A logged-in shim client keeps its process alive until `destroy()`, as discord.js's open Gateway socket does.
 - `PATCH /channels/:id` records each request in the `threadPatches` ledger with its authorization, body, and status. A bot whose authorization is listed in `manageThreadsDenied` lacks Manage Threads and gets 403 with code 50001.
+- `POST /channels/:id/threads` (standalone) and `POST /channels/:id/messages/:id/threads` (the thread id is the message id) record each creation in the `threadCreates` ledger with its authorization, channel, message, body, and thread id, and queue a Gateway `threadCreate` whose owner is the creating bot, as Discord does.
 
 ## Approved Dependency Resolution
 

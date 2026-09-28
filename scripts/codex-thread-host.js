@@ -421,7 +421,7 @@ async function startConversation(conv, opened) {
   // sendTurn marks the turn active before yielding, so later messages queue behind it.
   const first = sendTurn(conv, [{ type: "text", text: firstTurnText(conv, opened.starter, messages) }]);
   await first;
-  await report(conv.threadId, "ready", { trigger_message_id: conv.triggerMessageId });
+  await report(conv.threadId, "ready", conv.trigger);
 }
 
 function failConversation(conv, reason) {
@@ -429,8 +429,7 @@ function failConversation(conv, reason) {
   conv.stopped = true;
   conversations.delete(conv.threadId);
   log(`thread ${conv.threadId} failed: ${reason}`);
-  void report(conv.threadId, "failed", { reason: String(reason).split("\n")[0],
-    trigger_message_id: conv.triggerMessageId });
+  void report(conv.threadId, "failed", { reason: String(reason).split("\n")[0], ...conv.trigger });
 }
 
 function messageEntry(msg) {
@@ -447,7 +446,9 @@ function open(requested) {
   const messages = requested.messages || [];
   const conv = {
     threadId, name: thread.name || threadId, home: thread.home, model: thread.model || null,
-    effort: thread.effort || null, sandbox: thread.sandbox || FULL_ACCESS, triggerMessageId: requested.trigger_message_id,
+    effort: thread.effort || null, sandbox: thread.sandbox || FULL_ACCESS,
+    // The triggering message; a `/thread` first message is in the parent channel.
+    trigger: { trigger_message_id: requested.trigger_message_id, trigger_channel_id: requested.trigger_channel_id || threadId },
     // A stored conversation id resumes that conversation.
     replyToken: randomBytes(16).toString("hex"), runtime: null, codexThreadId: thread.conversation_id || null,
     disabledServers: [],
