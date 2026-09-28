@@ -706,6 +706,20 @@ function routeDiscordApi(url, init = {}) {
       state.fixtures.discord.threadPatches ||= [];
       state.fixtures.discord.threadPatches.push({ authorization, body, status: denied ? 403 : 200,
         threadId: threadMatch[1] });
+      // Archiving a known thread, as Discord does, sends THREAD_UPDATE and
+      // records audit-log action 111 (THREAD_UPDATE) with the bot as actor.
+      const previous = state.fixtures.discord.threads?.[threadMatch[1]];
+      if (!denied && body.archived === true && previous && !previous.archived) {
+        const now = Date.now();
+        const updated = { ...previous, archived: true, archiveTimestamp: new Date(now).toISOString() };
+        state.fixtures.discord.threads[threadMatch[1]] = updated;
+        (state.fixtures.discord.injectedThreads ||= []).push({ ...updated, event: "update", previous, delivered: false });
+        (state.fixtures.discord.auditLogEntries ||= []).unshift({
+          id: String((BigInt(now) - 1420070400000n) << 22n), user_id: authorForToken(authorization),
+          target_id: threadMatch[1], action_type: 111,
+          changes: [{ key: "archived", old_value: false, new_value: true }],
+        });
+      }
     });
     if (denied) {
       return response(JSON.stringify({ code: 50001, message: "Missing Access" }), {

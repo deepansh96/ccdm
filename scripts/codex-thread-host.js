@@ -29,8 +29,9 @@ const FULL_ACCESS = "danger-full-access";
 const FORWARDED_REACTIONS = new Set(["👍", "👎"]);
 // Discord message types a person sends: a default message and a reply.
 const USER_MESSAGE_TYPES = new Set([0, 19]);
-// `/config`, optionally after a mention, belongs to the Thread Supervisor and never reaches a model.
-const CONFIG_COMMAND = /^(?:<@!?[^>\s]+>\s+)?\/config(?:\s|$)/;
+// `/config` and the in-thread management commands, optionally after a mention,
+// belong to the Thread Supervisor and never reach a model.
+const SUPERVISOR_COMMAND = /^(?:<@!?[^>\s]+>\s+)?(?:\/config(?:\s|$)|\/(?:restart|clear|compact|pause|unpause|close)$)/;
 // Thread messages seen before their thread is opened, so one sent just
 // before the handoff still reaches the first turn.
 const RECENT_LIMIT = 200;
@@ -598,7 +599,7 @@ client.once("ready", () => {
 
 client.on("messageCreate", msg => {
   if (!msg.channel?.isThread?.() || msg.author?.bot || !USER_MESSAGE_TYPES.has(msg.type ?? 0)) return;
-  if (!ALLOWED_USER_IDS.has(String(msg.author.id)) || CONFIG_COMMAND.test((msg.content ?? "").trim())) return;
+  if (!ALLOWED_USER_IDS.has(String(msg.author.id)) || SUPERVISOR_COMMAND.test((msg.content ?? "").trim())) return;
   const entry = messageEntry(msg);
   const conv = conversations.get(msg.channelId);
   if (!conv) {

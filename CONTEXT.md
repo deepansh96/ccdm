@@ -29,7 +29,7 @@ An acknowledgment by the CCDM owner in an open **Project Conversation**, includi
 _Avoid_: read receipt, channel view
 
 **Closed Conversation**:
-A **Project Conversation** whose reminders the CCDM owner has ended with `/close`, independently of whether its coding agent is running. A **Thread Conversation** is also closed when the owner or root archives its thread, which also stops its session; any other archive, including Discord's inactivity auto-archive, only stops the session. Only a new normal message from the owner reopens it; bot or guest activity does not.
+A **Project Conversation** whose reminders the CCDM owner has ended with `/close`, independently of whether its coding agent is running. A **Thread Conversation** is also closed when the owner or root archives its thread, or the owner sends `/close` in it, which also stops its session; any other archive, including Discord's inactivity auto-archive, only stops the session. Only a new normal message from the owner reopens it; bot or guest activity does not.
 _Avoid_: stopped session, archived channel
 
 **End-to-End Test Suite**:

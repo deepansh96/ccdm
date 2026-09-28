@@ -2,8 +2,9 @@
 "use strict";
 
 // Applies one Thread Supervisor Discord side effect with the owning project's
-// bot: add or remove a reaction, read a message, post a one-line notice, or
-// create a standalone public thread with the one-week auto-archive.
+// bot: add or remove a reaction, read a message, post a one-line notice,
+// create a standalone public thread with the one-week auto-archive, or archive
+// a thread for `/close`.
 // The bot token is read from the registry here, never passed on the command line.
 const { readFile } = require("node:fs/promises");
 const path = require("node:path");
@@ -59,8 +60,11 @@ async function main() {
       method: "POST", json: { name: request.name, type: PUBLIC_THREAD, auto_archive_duration: AUTO_ARCHIVE_MINUTES },
     });
     result = { id: created.id, owner_id: created.owner_id ?? null };
+  } else if (operation === "archive") {
+    await discord(token, `/channels/${channel}`, { method: "PATCH", json: { archived: true } });
+    result = { archived: true };
   } else {
-    throw new Error("usage: react|unreact|get-message|post|create-thread <request JSON>");
+    throw new Error("usage: react|unreact|get-message|post|create-thread|archive <request JSON>");
   }
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }

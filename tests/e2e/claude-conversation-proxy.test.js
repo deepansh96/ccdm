@@ -252,6 +252,26 @@ test("a Thread Conversation proxy never relays /config, and a hand-over-only boo
   assert.doesNotMatch(proxy.errors, /invalid thread bootstrap/);
 });
 
+test("a Thread Conversation proxy never relays in-thread management commands", async () => {
+  const workspace = createWorkspace();
+  const commands = ["/restart", "/clear", "/compact", "/pause", "/unpause", "/close", "<@app-1> /restart"];
+  const fake = writeFakePlugin(workspace, { notifications: [
+    ...commands.map((content, index) => notification("thread-own", `command-${index}`, content)),
+    notification("thread-own", "owner-1", "/clearly a question, not a command"),
+  ] });
+  const bootstrapFile = path.join(workspace.tmpDir, "thread-own-bootstrap.json");
+  const proxy = startProxy(workspace, fake, { CCDM_CLAUDE_THREAD_ID: "thread-own", CCDM_CLAUDE_BOOTSTRAP_FILE: bootstrapFile });
+  await initialize(proxy);
+  await settle();
+  fs.writeFileSync(`${bootstrapFile}.tmp`, JSON.stringify({ included_message_ids: [] }));
+  fs.renameSync(`${bootstrapFile}.tmp`, bootstrapFile);
+  await proxy.until(output => output.includes("owner-1"), "the ordinary message");
+  await settle();
+  await proxy.stop();
+
+  assert.deepEqual(proxy.notifications().map(item => item.params.meta.message_id), ["owner-1"]);
+});
+
 test("a proxy fails closed with no tools when the plugin lacks the expected Discord tools", async () => {
   const workspace = createWorkspace();
   const fake = writeFakePlugin(workspace, {

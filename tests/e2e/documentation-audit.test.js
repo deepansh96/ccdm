@@ -273,3 +273,15 @@ test("operator documentation and scenario matrix record in-thread /config", () =
     assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-config\\.test\\.js`));
   }
 });
+
+test("operator documentation and scenario matrix record in-thread management commands", () => {
+  const section = operatorReadme.slice(operatorReadme.indexOf("## Thread Supervisor"));
+  for (const phrase of ["/restart  /clear  /compact  /pause  /unpause  /close", "exactly one line",
+    "PATCH archived: true", "close intent", "only the owner's `/close` counts"]) {
+    assert.ok(section.includes(phrase), phrase);
+  }
+  for (const scenario of ["Thread restart and compact isolation", "Thread clear", "Codex thread management commands",
+    "Thread close", "Bot archive without close intent", "Thread management commands never reach a model"]) {
+    assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-management-commands\\.test\\.js`));
+  }
+});

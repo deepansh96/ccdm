@@ -72,6 +72,16 @@ CONFIG_USAGE = "/config [provider=claude|codex] [account=X] [model=Y] [effort=Z]
 # The owner confirms a `/config` provider or account switch by reacting this on its warning.
 CONFIRM_EMOJI = "✅"
 CONFIG_HINT = "/config works inside a thread: send it in the thread whose settings you want to see or change."
+# In-thread management commands, each acting on that thread only, with its one-line acknowledgment.
+# The owner and guests may send them, as in a Codex channel; only the owner's `/close` counts.
+THREAD_COMMANDS = {
+    "/restart": "restarting this thread's session; the conversation resumes.",
+    "/clear": "starting a fresh conversation in this thread.",
+    "/compact": "compacting this thread's conversation.",
+    "/pause": "paused; new messages in this thread wait for /unpause.",
+    "/unpause": "unpaused; waiting messages go through now.",
+    "/close": "closing this thread.",
+}
 # Claude Code's startup screens, read from the tmux pane.
 READY_TEXT = "Listening for channel messages"
 STARTUP_PROMPTS = ("I am using this for local development", "trust the files in this folder", "trust this folder")
@@ -632,11 +642,13 @@ def message(project_root: Path, state_dir: Path, event: dict) -> dict:
         if row and event.get("type", 0) in USER_MESSAGE_TYPES:
             registry = load_registry(project_root)
             project = (registry.get("projects") or {}).get(row["project"])
-            command = isinstance(project, dict) and re.fullmatch(
-                r"/config(?:\s+([\s\S]*))?", command_text(registry, project, event.get("content")))
+            text = command_text(registry, project, event.get("content")) if isinstance(project, dict) else ""
+            command = re.fullmatch(r"/config(?:\s+([\s\S]*))?", text)
+            # In-thread commands never reach the thread's model or its bootstrap.
             if command:
-                # `/config` never reaches the thread's model or its bootstrap.
                 return thread_config(project_root, state_dir, db, row, registry, event, command.group(1) or "")
+            if text in THREAD_COMMANDS:
+                return thread_command(project_root, state_dir, db, row, registry, event, text)
         with BootLock(state_dir):
             row = STORE.thread(db, thread_id)
             if not row:
@@ -677,7 +689,8 @@ def message(project_root: Path, state_dir: Path, event: dict) -> dict:
             if row["state"] != "registered" and not resume:
                 return {"result": "ignored", "reason": f"thread is {row['state']}"}
             write_private(buffered, [held])
-            STORE.update(db, thread_id, state="booting", stop_reason=None, archive_actor=None, **activity)
+            STORE.update(db, thread_id, state="booting", stop_reason=None, archive_actor=None, pending_close=None,
+                         **activity)
             return {"result": "start", "thread_id": thread_id}
     finally:
         db.close()
@@ -788,6 +801,72 @@ def thread_config(project_root: Path, state_dir: Path, db, row, registry: dict, 
                "author": str(event.get("author_name") or author), "content": str(event.get("content") or ""),
                "timestamp": str(event.get("timestamp") or clock_now())}
     return restart_thread(project_root, state_dir, db, row, trigger, **overrides)
+
+
+def thread_command(project_root: Path, state_dir: Path, db, row, registry: dict, event: dict, command: str) -> dict:
+    """An in-thread management command, acting on that thread only, with one
+    acknowledgment line: `/restart` resumes the same conversation, `/clear`
+    starts a fresh one, `/compact`, `/pause`, and `/unpause` go to the Codex
+    thread host or the Claude thread's tmux, and the owner's `/close` closes it."""
+    thread_id = row["thread_id"]
+    project = registry["projects"][row["project"]]
+    author = str(event.get("author_id") or "")
+    owner = str(registry.get("discord_user_id") or "")
+    if not ROUTER.eligible_creator(registry, project, author):
+        return {"result": "ignored", "reason": "ineligible-author"}
+    # As in a channel, only the owner's `/close` counts.
+    if command == "/close" and author != owner:
+        return {"result": "ignored", "reason": "close-owner-only"}
+    if author == owner:
+        STORE.update(db, thread_id, last_owner_activity_at=clock_now())
+
+    def say(line: str):
+        return discord_request(project_root, "post", {"bot_id": project["bot_id"], "channel_id": thread_id,
+                                                      "content": line})
+
+    if command == "/close":
+        return close_thread(project_root, state_dir, db, row, project, event, say)
+    if row["state"] != "live":
+        say(f"{command}: this thread's session is not running.")
+        return {"result": "ignored", "reason": f"thread is {row['state']}"}
+    if command in ("/restart", "/clear"):
+        say(f"{command}: {THREAD_COMMANDS[command]}")
+        trigger = {"id": str(event.get("message_id") or ""), "author_id": author,
+                   "author": str(event.get("author_name") or author), "content": command,
+                   "timestamp": str(event.get("timestamp") or clock_now())}
+        fresh = {"provider_conversation_id": None} if command == "/clear" else {}
+        return restart_thread(project_root, state_dir, db, row, trigger, **fresh)
+    if thread_provider(registry, row) == "codex":
+        answer = host_request(host_runtime_dir(state_dir, row["project"]),
+                              {"op": "command", "thread_id": thread_id, "command": command}, timeout=60)
+        problem = None if answer and answer.get("ok") else ((answer or {}).get("error")
+                                                            or "the Codex thread host did not answer.")
+    else:
+        target = f"={row['runtime_tmux']}"
+        sent = (tmux("send-keys", "-t", target, "-l", command).returncode == 0
+                and tmux("send-keys", "-t", target, "Enter").returncode == 0)
+        problem = None if sent else "the thread's Claude session did not take the command."
+    say(f"{command}: {problem or THREAD_COMMANDS[command]}")
+    return {"result": "failed" if problem else "command-sent", **({"reason": problem} if problem else {})}
+
+
+def close_thread(project_root: Path, state_dir: Path, db, row, project: dict, event: dict, say) -> dict:
+    """The owner's `/close`: record the close intent, archive the thread with the
+    project bot, stop the session, and mark the thread closed. The intent makes
+    the resulting bot archive count as a close."""
+    thread_id = row["thread_id"]
+    STORE.update(db, thread_id, pending_close=json.dumps({"message_id": str(event.get("message_id") or ""),
+                                                          "requested_at": clock_now()}))
+    # Acknowledged first: a post into an archived thread would reopen it.
+    say(f"/close: {THREAD_COMMANDS['/close']}")
+    if not discord_request(project_root, "archive", {"bot_id": project["bot_id"], "channel_id": thread_id}):
+        STORE.update(db, thread_id, pending_close=None)
+        say("/close: Discord did not archive the thread; check the bot's Manage Threads permission.")
+        return {"result": "failed", "reason": "the thread was not archived"}
+    stop_runtime(project_root, state_dir, row)
+    STORE.update(db, thread_id, state="closed", stop_reason=None, turn_running=0, runtime_tmux=None,
+                 runtime_pid=None, runtime_host=None)
+    return {"result": "closed", "thread_id": thread_id}
 
 
 def reaction(project_root: Path, state_dir: Path, event: dict) -> dict:
@@ -933,8 +1012,9 @@ def archive_actor(project_root: Path, registry: dict, event: dict) -> str | None
 
 def archive(project_root: Path, state_dir: Path, event: dict) -> dict:
     """Stop an archived thread's session. An archive by the owner or root
-    closes the conversation; any other actor, or none, is an auto-archive that
-    leaves it open for the owner's next message."""
+    closes the conversation, and so does one by the project bot while the
+    thread holds a `/close` intent; any other actor, or none, is an
+    auto-archive that leaves it open for the owner's next message."""
     thread_id = str(event.get("thread_id") or "")
     db = STORE.connect(state_dir)
     if not db:
@@ -944,17 +1024,21 @@ def archive(project_root: Path, state_dir: Path, event: dict) -> dict:
             return {"result": "ignored", "reason": "unbound-thread"}
         registry = load_registry(project_root)
         actor = archive_actor(project_root, registry, {**event, "thread_id": thread_id})
-        closed = actor is not None and actor in {str(registry.get("discord_user_id") or ""), root_user_id(registry)}
         row = STORE.thread(db, thread_id)
         if not row:
             return {"result": "ignored", "reason": "deleted"}
+        closers = {str(registry.get("discord_user_id") or ""), root_user_id(registry)}
+        if row["pending_close"]:
+            closers.add(ROUTER.bot_user_id(registry, registry["projects"][row["project"]]))
+        closed = actor is not None and actor in closers - {""}
         stop_runtime(project_root, state_dir, row)
         # An auto-archive never reopens a Closed Conversation.
         if closed or row["state"] == "closed":
             fields = {"state": "closed", "stop_reason": None}
         else:
             fields = {"state": "stopped", "stop_reason": "auto-archive"}
-        STORE.update(db, thread_id, **fields, runtime_tmux=None, runtime_pid=None, archive_actor=actor or "unknown")
+        STORE.update(db, thread_id, **fields, runtime_tmux=None, runtime_pid=None, archive_actor=actor or "unknown",
+                     pending_close=None)
         return {"result": fields["state"], "thread_id": thread_id, "archive_actor": actor or "unknown"}
     finally:
         db.close()

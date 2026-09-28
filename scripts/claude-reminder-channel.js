@@ -119,9 +119,9 @@ function isReservedChannelCommand(text) {
   return isCommand(text, /^\/(?:thread|config)(?:\s[\s\S]*)?$/);
 }
 
-// In a thread, the supervisor handles `/config` for that thread.
+// In a thread, the supervisor handles `/config` and the management commands for that thread.
 function isReservedThreadCommand(text) {
-  return isCommand(text, /^\/config(?:\s[\s\S]*)?$/);
+  return isCommand(text, /^(?:\/config(?:\s[\s\S]*)?|\/(?:restart|clear|compact|pause|unpause|close))$/);
 }
 
 function isManagement(text) {
