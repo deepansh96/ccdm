@@ -29,6 +29,8 @@ const FULL_ACCESS = "danger-full-access";
 const FORWARDED_REACTIONS = new Set(["👍", "👎"]);
 // Discord message types a person sends: a default message and a reply.
 const USER_MESSAGE_TYPES = new Set([0, 19]);
+// `/config`, optionally after a mention, belongs to the Thread Supervisor and never reaches a model.
+const CONFIG_COMMAND = /^(?:<@!?[^>\s]+>\s+)?\/config(?:\s|$)/;
 // Thread messages seen before their thread is opened, so one sent just
 // before the handoff still reaches the first turn.
 const RECENT_LIMIT = 200;
@@ -418,6 +420,11 @@ async function startConversation(conv, opened) {
   const messages = [...opened.messages, ...conv.pending];
   conv.pending = [];
   conv.handedOff = true;
+  if (messages.length === 0) {
+    // A `/config` restart with nothing new to say: the conversation waits for the next message.
+    await report(conv.threadId, "ready", conv.trigger);
+    return;
+  }
   // sendTurn marks the turn active before yielding, so later messages queue behind it.
   const first = sendTurn(conv, [{ type: "text", text: firstTurnText(conv, opened.starter, messages) }]);
   await first;
@@ -443,7 +450,9 @@ function open(requested) {
   if (!threadId) return { ok: false, error: "open needs a thread id" };
   if (stopping) return { ok: false, stopping: true, error: "the Codex thread host is stopping" };
   if (conversations.has(threadId)) return { ok: false, error: `thread ${threadId} is already open` };
-  const messages = requested.messages || [];
+  // A held `/config` command only marks the restart; it never reaches the model.
+  const held = requested.messages || [];
+  const messages = held.filter(message => !message.command);
   const conv = {
     threadId, name: thread.name || threadId, home: thread.home, model: thread.model || null,
     effort: thread.effort || null, sandbox: thread.sandbox || FULL_ACCESS,
@@ -454,11 +463,11 @@ function open(requested) {
     disabledServers: [],
     turnActive: false, activeTurnId: null, bootstrapping: false, bootstrapDone: null, deltaBuffer: "",
     mcpReplyCalled: false, terminalError: null, queue: [], paused: false, stopped: false, handedOff: false,
-    pending: [], included: new Set([requested.starter?.id, ...messages.map(message => message.id)].filter(Boolean)),
+    pending: [], included: new Set([requested.starter?.id, ...held.map(message => message.id)].filter(Boolean)),
   };
   conversations.set(threadId, conv);
   // Messages this Gateway delivered before the open, from the trigger on.
-  const since = messages[0]?.timestamp || "";
+  const since = held[0]?.timestamp || "";
   for (const entry of recent.filter(entry => entry.channelId === threadId && entry.timestamp >= since)) {
     if (!conv.included.has(entry.id)) {
       conv.included.add(entry.id);
@@ -589,7 +598,7 @@ client.once("ready", () => {
 
 client.on("messageCreate", msg => {
   if (!msg.channel?.isThread?.() || msg.author?.bot || !USER_MESSAGE_TYPES.has(msg.type ?? 0)) return;
-  if (!ALLOWED_USER_IDS.has(String(msg.author.id))) return;
+  if (!ALLOWED_USER_IDS.has(String(msg.author.id)) || CONFIG_COMMAND.test((msg.content ?? "").trim())) return;
   const entry = messageEntry(msg);
   const conv = conversations.get(msg.channelId);
   if (!conv) {

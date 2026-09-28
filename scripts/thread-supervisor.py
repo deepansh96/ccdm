@@ -68,6 +68,9 @@ REQUESTER_LABELS = {"root": "root", "channel-agent": "the channel agent"}
 REQUEST_SOCKET = "requests.sock"
 NOT_RUNNING = ("the thread supervisor is not running; start it with scripts/install-thread-supervisor.sh "
                "or scripts/thread-supervisor.py run")
+CONFIG_USAGE = "/config [provider=claude|codex] [account=X] [model=Y] [effort=Z]"
+# The owner confirms a `/config` provider or account switch by reacting this on its warning.
+CONFIRM_EMOJI = "✅"
 CONFIG_HINT = "/config works inside a thread: send it in the thread whose settings you want to see or change."
 # Claude Code's startup screens, read from the tmux pane.
 READY_TEXT = "Listening for channel messages"
@@ -334,6 +337,30 @@ class CommandError(ValueError):
     """A `/thread` command the supervisor refuses, with its one-line reason."""
 
 
+def check_overrides(registry: dict, provider: str, overrides: dict, dashed: bool = True) -> None:
+    """Validate a thread's overrides for the provider it will run, the same way
+    for `/thread` (``--flag value``) and `/config` (``name=value``)."""
+    name = lambda field: f"--{field}" if dashed else field
+    shown = lambda field, value: f"--{field} {value}" if dashed else f"{field}={value}"
+    if provider not in PROVIDER_EFFORTS:
+        raise CommandError(f"{name('provider')} must be claude or codex.")
+    account = overrides.get("account")
+    if account is not None:
+        # Only a configured alias selects an account; a Discord message never names a directory (ADR 0003).
+        if "/" in account or account.startswith(("~", ".")):
+            raise CommandError(f"{name('account')} takes an account alias, not a path.")
+        aliases = registry.get("codex_accounts" if provider == "codex" else "claude_accounts")
+        if not isinstance(aliases, dict) or account not in aliases:
+            raise CommandError(f"{shown('account', account)} is not a configured {PROVIDER_LABELS[provider]} account alias.")
+    model = overrides.get("model")
+    if model is not None and not re.fullmatch(r"[A-Za-z0-9._:/\[\]-]+", model):
+        raise CommandError(f"{name('model')} has characters a model name never uses.")
+    effort = overrides.get("effort")
+    if effort is not None and effort not in PROVIDER_EFFORTS[provider]:
+        raise CommandError(f"{name('effort')} for {PROVIDER_LABELS[provider]} must be one of "
+                           f"{', '.join(PROVIDER_EFFORTS[provider])}.")
+
+
 def parse_thread_command(registry: dict, project: dict, arguments: str) -> dict:
     """`<name> [--provider claude|codex] [--account X] [--model Y] [--effort Z] [first message…]`.
     Flags come before the first message; each is validated against the provider
@@ -356,27 +383,19 @@ def parse_thread_command(registry: dict, project: dict, arguments: str) -> dict:
         if not value or value.startswith("--"):
             raise CommandError(f"{flag} needs a value.")
         overrides[flag[2:]] = value
-    project_provider = project.get("type") or "claude"
-    provider = overrides.get("provider", project_provider)
-    if provider not in PROVIDER_EFFORTS:
-        raise CommandError("--provider must be claude or codex.")
-    account = overrides.get("account")
-    if account is not None:
-        # Only a configured alias selects an account; a Discord message never names a directory (ADR 0003).
-        if "/" in account or account.startswith(("~", ".")):
-            raise CommandError("--account takes an account alias, not a path.")
-        aliases = registry.get("codex_accounts" if provider == "codex" else "claude_accounts")
-        if not isinstance(aliases, dict) or account not in aliases:
-            raise CommandError(f"--account {account} is not a configured {PROVIDER_LABELS[provider]} account alias.")
-    model = overrides.get("model")
-    if model is not None and not re.fullmatch(r"[A-Za-z0-9._:/\[\]-]+", model):
-        raise CommandError("--model has characters a model name never uses.")
-    effort = overrides.get("effort")
-    if effort is not None and effort not in PROVIDER_EFFORTS[provider]:
-        raise CommandError(f"--effort for {PROVIDER_LABELS[provider]} must be one of "
-                           f"{', '.join(PROVIDER_EFFORTS[provider])}.")
+    check_overrides(registry, overrides.get("provider", project.get("type") or "claude"), overrides)
     return {"name": name, "first_message": rest.strip() or None,
-            "overrides": {"provider": overrides.get("provider"), "account": account, "model": model, "effort": effort}}
+            "overrides": {field: overrides.get(field) for field in THREAD_FLAGS}}
+
+
+def command_text(registry: dict, project: dict, content: str) -> str:
+    """A message's text without a leading mention of the project bot or root."""
+    text = str(content or "").strip()
+    for app_id in (ROUTER.bot_user_id(registry, project), root_user_id(registry)):
+        for mention in (f"<@{app_id}>", f"<@!{app_id}>"):
+            if app_id and text.startswith(mention):
+                text = text[len(mention):].strip()
+    return text
 
 
 def channel_command(project_root: Path, state_dir: Path, event: dict) -> dict:
@@ -395,11 +414,7 @@ def channel_command(project_root: Path, state_dir: Path, event: dict) -> dict:
     author = str(event.get("author_id") or "")
     if not ROUTER.eligible_creator(registry, project, author):
         return {"result": "ignored", "reason": "ineligible-author"}
-    text = str(event.get("content") or "").strip()
-    for app_id in (ROUTER.bot_user_id(registry, project), root_user_id(registry)):
-        for mention in (f"<@{app_id}>", f"<@!{app_id}>"):
-            if app_id and text.startswith(mention):
-                text = text[len(mention):].strip()
+    text = command_text(registry, project, event.get("content"))
     command = re.fullmatch(r"/(thread|config)(?:\s+([\s\S]*))?", text)
     if not command:
         return {"result": "ignored", "reason": "not-a-command"}
@@ -613,6 +628,15 @@ def message(project_root: Path, state_dir: Path, event: dict) -> dict:
     if not db:
         return {"result": "ignored", "reason": "unbound-thread"}
     try:
+        row = STORE.thread(db, thread_id)
+        if row and event.get("type", 0) in USER_MESSAGE_TYPES:
+            registry = load_registry(project_root)
+            project = (registry.get("projects") or {}).get(row["project"])
+            command = isinstance(project, dict) and re.fullmatch(
+                r"/config(?:\s+([\s\S]*))?", command_text(registry, project, event.get("content")))
+            if command:
+                # `/config` never reaches the thread's model or its bootstrap.
+                return thread_config(project_root, state_dir, db, row, registry, event, command.group(1) or "")
         with BootLock(state_dir):
             row = STORE.thread(db, thread_id)
             if not row:
@@ -655,6 +679,142 @@ def message(project_root: Path, state_dir: Path, event: dict) -> dict:
             write_private(buffered, [held])
             STORE.update(db, thread_id, state="booting", stop_reason=None, archive_actor=None, **activity)
             return {"result": "start", "thread_id": thread_id}
+    finally:
+        db.close()
+
+
+def account_alias(registry: dict, key: str, home: str | None) -> str:
+    """The alias in ``registry[key]`` whose home is ``home``, else `default`."""
+    aliases = registry.get(key) if isinstance(registry.get(key), dict) else {}
+    target = os.path.realpath(os.path.expanduser(home)) if home else None
+    return next((alias for alias, path in aliases.items() if isinstance(path, str) and target
+                 and os.path.realpath(os.path.expanduser(path)) == target), "default")
+
+
+def describe_settings(project_root: Path, registry: dict, row) -> str:
+    """The provider, account, model, and effort a thread runs with, marking inherited values."""
+    provider = thread_provider(registry, row)
+    if provider == "codex":
+        settings = codex_settings(registry, row)
+        values = {"account": account_alias(registry, "codex_accounts", settings["home"]),
+                  "model": settings["model"], "effort": settings["effort"]}
+    else:
+        resolved = LAUNCH.resolve(str(project_root / "registry.json"), row["project"], row["thread_id"],
+                                  claude_overrides(row))
+        values = {"account": account_alias(registry, "claude_accounts", resolved["claude_home"]),
+                  "model": resolved["model"], "effort": resolved["effort"]}
+    values = {"provider": provider, **{field: row[field] or value for field, value in values.items()}}
+    return "/config: " + ", ".join(f"{field} {values[field] or 'default'}{'' if row[field] else ' (inherited)'}"
+                                   for field in THREAD_FLAGS)
+
+
+def parse_config_arguments(arguments: str) -> dict:
+    """`provider=… account=… model=… effort=…`, each at most once."""
+    given: dict = {}
+    for word in arguments.split():
+        field, _, value = word.partition("=")
+        if field not in THREAD_FLAGS:
+            raise CommandError(f"unknown setting {word}; use {CONFIG_USAGE}")
+        if not value:
+            raise CommandError(f"{field}= needs a value.")
+        given[field] = value
+    return given
+
+
+def restart_thread(project_root: Path, state_dir: Path, db, row, trigger: dict, **fields) -> dict:
+    """Stop a live thread's session and start it again with ``fields`` stored:
+    the stored conversation resumes unless ``fields`` clears it. The trigger
+    carries 👀 and, flagged as a command, never reaches the model."""
+    thread_id = row["thread_id"]
+    with BootLock(state_dir):
+        write_private(buffer_path(state_dir, thread_id), [{**trigger, "command": True}])
+        STORE.update(db, thread_id, **fields, state="booting", stop_reason=None, turn_running=0)
+    # The old row names the provider to stop; messages sent meanwhile are held for the new start.
+    stop_runtime(project_root, state_dir, row, keep_held=True)
+    STORE.update(db, thread_id, runtime_tmux=None, runtime_pid=None, runtime_host=None)
+    return {"result": "start", "thread_id": thread_id}
+
+
+def thread_config(project_root: Path, state_dir: Path, db, row, registry: dict, event: dict, arguments: str) -> dict:
+    """The owner's `/config` in a thread: show the settings, store a model or
+    effort change and resume the same conversation, or warn that a provider or
+    account switch starts fresh and wait for the owner's ✅ on the warning."""
+    thread_id = row["thread_id"]
+    project = registry["projects"][row["project"]]
+    author = str(event.get("author_id") or "")
+    if author != str(registry.get("discord_user_id") or ""):
+        return {"result": "ignored", "reason": "config-owner-only"}
+    STORE.update(db, thread_id, last_owner_activity_at=clock_now())
+
+    def say(line: str):
+        return discord_request(project_root, "post", {"bot_id": project["bot_id"], "channel_id": thread_id,
+                                                      "content": line})
+
+    if not arguments.strip():
+        try:
+            say(describe_settings(project_root, registry, row))
+        except (CODEX_HOME.ResolverError, SystemExit) as error:
+            say(f"/config: {error}")
+        return {"result": "config-shown"}
+    current = thread_provider(registry, row)
+    try:
+        given = parse_config_arguments(arguments)
+        provider = given.get("provider", current)
+        switching = provider != current or given.get("account", row["account"]) != row["account"]
+        # Model, effort, and account are provider-specific: a provider switch keeps only what it names.
+        base = {} if provider != current else {field: row[field] for field in THREAD_FLAGS}
+        overrides = {**{field: None for field in THREAD_FLAGS}, **base, **given}
+        check_overrides(registry, provider, overrides, dashed=False)
+    except CommandError as error:
+        say(f"/config: {error}")
+        return {"result": "rejected", "reason": str(error)}
+    if switching:
+        account = f" on account {overrides['account']}" if overrides["account"] else ""
+        posted = say(f"/config: switching this thread to {PROVIDER_LABELS[provider]}{account} starts a fresh "
+                     f"conversation; the owner reacts {CONFIRM_EMOJI} here to confirm.")
+        if not posted:
+            return {"result": "failed", "reason": "the warning was not posted"}
+        STORE.update(db, thread_id, pending_config=json.dumps({"message_id": str(posted["id"]), "overrides": overrides}))
+        discord_request(project_root, "react", {"bot_id": project["bot_id"], "channel_id": thread_id,
+                                                "message_id": str(posted["id"]), "emoji": CONFIRM_EMOJI})
+        return {"result": "config-pending"}
+    changes = ", ".join(f"{field} {value}" for field, value in given.items())
+    if row["state"] != "live":
+        STORE.update(db, thread_id, **overrides)
+        say(f"/config: {changes} saved; the thread uses it from its next start.")
+        return {"result": "config-saved"}
+    say(f"/config: {changes}; resuming this conversation with it.")
+    trigger = {"id": str(event.get("message_id") or ""), "author_id": author,
+               "author": str(event.get("author_name") or author), "content": str(event.get("content") or ""),
+               "timestamp": str(event.get("timestamp") or clock_now())}
+    return restart_thread(project_root, state_dir, db, row, trigger, **overrides)
+
+
+def reaction(project_root: Path, state_dir: Path, event: dict) -> dict:
+    """A ✅ on a thread's pending `/config` warning: only the owner's applies
+    the switch, stopping the session and starting a fresh conversation. The old
+    conversation is left untouched on disk but never resumed."""
+    thread_id = str(event.get("thread_id") or "")
+    db = STORE.connect(state_dir)
+    if not db:
+        return {"result": "ignored", "reason": "unbound-thread"}
+    try:
+        row = STORE.thread(db, thread_id)
+        pending = json.loads(row["pending_config"]) if row and row["pending_config"] else None
+        if (not pending or event.get("emoji") != CONFIRM_EMOJI
+                or str(event.get("message_id") or "") != pending["message_id"]):
+            return {"result": "ignored", "reason": "no-pending-config"}
+        registry = load_registry(project_root)
+        if str(event.get("user_id") or "") != str(registry.get("discord_user_id") or ""):
+            return {"result": "ignored", "reason": "config-owner-only"}
+        fields = {**pending["overrides"], "pending_config": None, "provider_conversation_id": None,
+                  "provider_home": None}
+        if row["state"] != "live":
+            STORE.update(db, thread_id, **fields)
+            return {"result": "config-applied"}
+        trigger = {"id": pending["message_id"], "author_id": str(event["user_id"]), "author": "owner",
+                   "content": "", "timestamp": clock_now()}
+        return restart_thread(project_root, state_dir, db, row, trigger, **fields)
     finally:
         db.close()
 
@@ -719,15 +879,17 @@ def host_request(runtime_dir: Path, request: dict, timeout: float = 10, name: st
         return None
 
 
-def stop_runtime(project_root: Path, state_dir: Path, row) -> None:
+def stop_runtime(project_root: Path, state_dir: Path, row, keep_held: bool = False) -> None:
     """The provider-agnostic stop hook: end a thread's session and remove its
     per-thread runtime files (state dir with launch files, inbox, and
     bootstrap; held boot messages), keeping the row so the thread can resume.
     Provider conversation files are never touched. A Codex thread's
-    conversation is unloaded from its project's thread host."""
+    conversation is unloaded from its project's thread host. A restart
+    (``keep_held``) keeps the messages held for its next start."""
     thread_id = row["thread_id"]
-    with BootLock(state_dir):
-        buffer_path(state_dir, thread_id).unlink(missing_ok=True)
+    if not keep_held:
+        with BootLock(state_dir):
+            buffer_path(state_dir, thread_id).unlink(missing_ok=True)
     try:
         provider = thread_provider(load_registry(project_root), row)
     except (OSError, ValueError):
@@ -816,8 +978,14 @@ def delete(project_root: Path, state_dir: Path, event: dict) -> dict:
 
 
 def bootstrap(row, owner: str, starter: dict | None, held: list[dict]) -> dict:
-    """The thread's first prompt, as one synthetic channel notification."""
+    """The thread's first prompt, as one synthetic channel notification. A
+    restart by `/config` holds only its command, which never reaches the model:
+    with no other message the bootstrap only hands over, and prompts nothing."""
     thread_id = row["thread_id"]
+    included = [message["id"] for message in held]
+    held = [message for message in held if not message.get("command")]
+    if not held:
+        return {"included_message_ids": included}
     lines = [f'You are in the Discord thread "{row["name"]}" (chat_id {thread_id}) under this project\'s channel. '
              "It is its own conversation: reply only in this thread, with chat_id "
              f"{thread_id}. You cannot read or post in the parent channel or in other threads."]
@@ -831,7 +999,7 @@ def bootstrap(row, owner: str, starter: dict | None, held: list[dict]) -> dict:
         "content": "\n".join(lines),
         "meta": {"chat_id": thread_id, "message_id": latest["id"], "user_id": latest["author_id"],
                  "user": latest["author"], "ts": latest["timestamp"]},
-        "included_message_ids": [*([starter["id"]] if starter else []), *(message["id"] for message in held)],
+        "included_message_ids": [*([starter["id"]] if starter else []), *included],
     }
 
 
@@ -1125,7 +1293,7 @@ def run(project_root: Path, state_dir: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("run", "status", "preflight", "disable", "enable", "bind", "message",
-                                            "archive", "delete", "boot", "host-event", "command",
+                                            "archive", "delete", "boot", "host-event", "command", "reaction",
                                             "grant-thread-permissions", "submit"))
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--state-dir", type=Path, default=None)
@@ -1152,11 +1320,11 @@ def main() -> int:
             if not args.payload:
                 raise ValueError("--payload is required")
             result = bind(args.project_root, state_dir, json.loads(args.payload))
-        elif args.command in ("message", "archive", "delete", "host-event", "command"):
+        elif args.command in ("message", "archive", "delete", "host-event", "command", "reaction"):
             if not args.payload:
                 raise ValueError("--payload is required")
             handler = {"message": message, "archive": archive, "delete": delete, "host-event": host_event,
-                       "command": channel_command}[args.command]
+                       "command": channel_command, "reaction": reaction}[args.command]
             result = handler(args.project_root, state_dir, json.loads(args.payload))
         elif args.command == "boot":
             if not args.thread_id:

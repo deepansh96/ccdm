@@ -261,3 +261,15 @@ test("operator documentation and scenario matrix record root and channel-agent t
     assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-create-requests\\.test\\.js`));
   }
 });
+
+test("operator documentation and scenario matrix record in-thread /config", () => {
+  const section = operatorReadme.slice(operatorReadme.indexOf("## Thread Supervisor"));
+  for (const phrase of ["/config [provider=claude|codex] [account=X] [model=Y] [effort=Z]", "(inherited)", "✅",
+    "never resumed again"]) {
+    assert.ok(section.includes(phrase), phrase);
+  }
+  for (const scenario of ["Thread config display", "Thread config model change", "Thread config provider switch",
+    "Thread config validation", "Thread config never reaches a model"]) {
+    assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-config\\.test\\.js`));
+  }
+});

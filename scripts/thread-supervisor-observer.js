@@ -10,7 +10,7 @@ const { readFile } = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const { promisify } = require("node:util");
-const { Client, GatewayIntentBits } = require("discord.js");
+const { Client, GatewayIntentBits, Partials } = require("discord.js");
 
 const exec = promisify(execFile);
 const service = path.join(__dirname, "thread-supervisor.py");
@@ -19,9 +19,13 @@ const projectRoot = argument("--project-root") || path.resolve(__dirname, "..");
 const stateDir = argument("--state-dir") || process.env.CCDM_THREAD_STATE_DIR ||
   path.join(os.homedir(), ".local/state/ccdm/thread-supervisor");
 const AUTO_ARCHIVE_MINUTES = 10080;
+// The reaction that confirms a pending `/config` provider or account switch.
+const CONFIRM_EMOJI = "✅";
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMessageReactions],
+  // A `/config` warning is posted by the project bot, so root never has it cached.
+  partials: [Partials.Message, Partials.Reaction, Partials.User],
 });
 // Events are handled one at a time, in Gateway order.
 let queue = Promise.resolve();
@@ -108,6 +112,17 @@ async function channelCommand(message) {
   if (result.result === "start") startSession(result.thread_id);
 }
 
+// Hands a ✅ to the service, which applies a pending `/config` switch when it
+// is the owner's reaction on that switch's warning.
+async function threadReaction(reaction, user) {
+  const payload = { thread_id: reaction.message.channelId, message_id: reaction.message.id, user_id: user.id,
+    emoji: reaction.emoji.name };
+  const { stdout } = await exec(process.env.CCDM_THREAD_PYTHON || "python3", [service, "reaction",
+    "--project-root", projectRoot, "--state-dir", stateDir, "--payload", JSON.stringify(payload)]);
+  const result = JSON.parse(stdout);
+  if (result.result === "start") startSession(result.thread_id);
+}
+
 // Classifying an archive can wait up to a minute for its audit-log entry, so
 // it runs beside the event queue like a boot.
 function threadArchived(thread) {
@@ -142,6 +157,12 @@ client.on("messageCreate", message => {
   // message that may carry any author.
   if (message.author?.bot && message.type !== 21) return;
   queue = queue.then(() => threadMessage(message)).catch(error => log(`thread ${message.channelId}: ${error.message}`));
+});
+
+client.on("messageReactionAdd", (reaction, user) => {
+  if (user?.bot || reaction.emoji?.name !== CONFIRM_EMOJI) return;
+  queue = queue.then(() => threadReaction(reaction, user))
+    .catch(error => log(`reaction on ${reaction.message?.id}: ${error.message}`));
 });
 
 // Only an archive matters: an unarchive, such as a bot post reopening the

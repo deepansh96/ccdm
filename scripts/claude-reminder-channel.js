@@ -119,6 +119,11 @@ function isReservedChannelCommand(text) {
   return isCommand(text, /^\/(?:thread|config)(?:\s[\s\S]*)?$/);
 }
 
+// In a thread, the supervisor handles `/config` for that thread.
+function isReservedThreadCommand(text) {
+  return isCommand(text, /^\/config(?:\s[\s\S]*)?$/);
+}
+
 function isManagement(text) {
   const trimmed = String(text || "").trim();
   return ["/compact", "/clear", "/pause", "/unpause", "/restart"].includes(trimmed) || [rootAppId].filter(Boolean).some(id =>
@@ -163,7 +168,11 @@ async function deliverBootstrap() {
   try { bootstrap = JSON.parse(raw); } catch { /* Rejected below. */ }
   const meta = bootstrap?.meta;
   const included = bootstrap?.included_message_ids;
-  if (typeof bootstrap?.content === "string" && bootstrap.content && meta?.chat_id === selectedThread &&
+  if (bootstrap && bootstrap.content === undefined && meta === undefined && Array.isArray(included) &&
+      included.every(id => typeof id === "string")) {
+    // A resumed session with nothing new to say, such as after `/config`: hand over and prompt nothing.
+    for (const id of included) bootstrapIncluded.add(id);
+  } else if (typeof bootstrap?.content === "string" && bootstrap.content && meta?.chat_id === selectedThread &&
       typeof meta.message_id === "string" && meta.message_id &&
       (included === undefined || (Array.isArray(included) && included.every(id => typeof id === "string")))) {
     for (const id of [...(included || []), meta.message_id]) bootstrapIncluded.add(id);
@@ -281,7 +290,7 @@ async function handlePluginMessage(line) {
   if (failedClosed) return;
   const meta = message.params?.meta || {};
   if (conversationChat && meta.chat_id !== conversationChat) return;
-  if (selectedProject && !selectedThread && isReservedChannelCommand(message.params?.content)) return;
+  if (selectedProject && (selectedThread ? isReservedThreadCommand : isReservedChannelCommand)(message.params?.content)) return;
   if (!toolsVerified || bootstrapPending) {
     heldNotifications.push(line);
     return;

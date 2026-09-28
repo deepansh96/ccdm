@@ -228,6 +228,30 @@ test("a Thread Conversation proxy delivers its launcher's bootstrap exactly once
   assert.equal(delivered[1].params.content, "sent after the handoff");
 });
 
+test("a Thread Conversation proxy never relays /config, and a hand-over-only bootstrap after a /config restart prompts nothing", async () => {
+  const workspace = createWorkspace();
+  // The /config that restarted the session, a later /config addressed to the
+  // bot, and an owner message sent while the session restarted.
+  const fake = writeFakePlugin(workspace, { notifications: [
+    notification("thread-own", "config-1", "/config model=claude-sonnet-5"),
+    notification("thread-own", "config-2", "<@app-1> /config"),
+    notification("thread-own", "after-restart-1", "carry on"),
+  ] });
+  const bootstrapFile = path.join(workspace.tmpDir, "thread-own-bootstrap.json");
+  const proxy = startProxy(workspace, fake, { CCDM_CLAUDE_THREAD_ID: "thread-own", CCDM_CLAUDE_BOOTSTRAP_FILE: bootstrapFile });
+  await initialize(proxy);
+  await settle();
+  fs.writeFileSync(`${bootstrapFile}.tmp`, JSON.stringify({ included_message_ids: ["config-1"] }));
+  fs.renameSync(`${bootstrapFile}.tmp`, bootstrapFile);
+  await proxy.until(output => output.includes("after-restart-1"), "the message sent during the restart");
+  await settle();
+  await proxy.stop();
+
+  assert.deepEqual(proxy.notifications().map(item => [item.params.meta.message_id, item.params.content]),
+    [["after-restart-1", "carry on"]]);
+  assert.doesNotMatch(proxy.errors, /invalid thread bootstrap/);
+});
+
 test("a proxy fails closed with no tools when the plugin lacks the expected Discord tools", async () => {
   const workspace = createWorkspace();
   const fake = writeFakePlugin(workspace, {
