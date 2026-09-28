@@ -37,6 +37,7 @@ ROUTER = _load("ccdm_thread_router", "thread-supervisor-router.py")
 LAUNCH = _load("ccdm_claude_launch", "claude-launch.py")
 CODEX_HOME = _load("ccdm_codex_home", "resolve-codex-home.py")
 CAPACITY = _load("ccdm_thread_capacity", "thread-supervisor-capacity.py")
+REMINDER_EVENTS = _load("ccdm_conversation_events", "conversation-reminder-events.py")
 # Discord's longest auto-archive duration, in minutes (one week).
 AUTO_ARCHIVE_MINUTES = 10080
 # How long `disable` waits for a running worker to release its lock.
@@ -1215,6 +1216,7 @@ def close_thread(project_root: Path, state_dir: Path, db, row, project: dict, ev
     stop_runtime(project_root, state_dir, row)
     STORE.update(db, thread_id, state="closed", stop_reason=None, turn_running=0, runtime_tmux=None,
                  runtime_pid=None, runtime_host=None)
+    report_conversation(project_root, load_registry(project_root), row["project"], thread_id, "conversation_closed")
     return {"result": "closed", "thread_id": thread_id}
 
 
@@ -1245,6 +1247,36 @@ def reaction(project_root: Path, state_dir: Path, event: dict) -> dict:
         return restart_thread(project_root, state_dir, db, row, trigger, **fields)
     finally:
         db.close()
+
+
+def report_conversation(project_root: Path, registry: dict, project: str, thread_id: str, event_type: str) -> None:
+    """Tell the Conversation Reminder service, through its event outbox, that a
+    Thread Conversation closed or its thread was deleted; nothing is reported
+    where reminders were never set up. A failed hand-off stays in the outbox."""
+    state_dir = REMINDER_EVENTS.default_state_dir()
+    if not state_dir.is_dir():
+        return
+    try:
+        assignment = REMINDER_EVENTS.assignment_for(registry, project)
+    except (KeyError, ValueError):
+        return
+    now = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    event_id = str(uuid.uuid4())
+    event = {"schema_version": 1, "event_id": event_id, "event_type": event_type, "project": project,
+             "channel_id": assignment["channel_id"], "conversation_id": thread_id, "bot_id": assignment["bot_id"],
+             "assignment_generation": assignment["generation"], "provider": "ccdm-root", "event_time": now,
+             "event_order": f"{now}:thread-supervisor:{event_id}", "adapter_instance_id": "thread-supervisor"}
+    outbox = state_dir / "outbox"
+    try:
+        REMINDER_EVENTS.private_directory(outbox)
+        target = outbox / f"{re.sub(r'[^a-zA-Z0-9_-]', '_', event['event_order'])}-{event_id}.json"
+        temporary = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+        with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as spooled:
+            spooled.write(json.dumps(event) + "\n")
+        os.replace(temporary, target)
+        REMINDER_EVENTS.drain_outbox(project_root, state_dir)
+    except (OSError, ValueError, sqlite3.Error) as error:
+        log(f"thread {thread_id}: reporting {event_type} to Conversation Reminders failed: {error}")
 
 
 def discord_request(project_root: Path, operation: str, request: dict):
@@ -1390,6 +1422,9 @@ def archive(project_root: Path, state_dir: Path, event: dict, since: str | None 
             fields = {"state": "stopped", "stop_reason": "auto-archive"}
         STORE.update(db, thread_id, **fields, runtime_tmux=None, runtime_pid=None, archive_actor=actor or "unknown",
                      pending_close=None)
+        if closed and row["state"] != "closed":
+            # An owner or root archive closes only this thread's reminders.
+            report_conversation(project_root, registry, row["project"], thread_id, "conversation_closed")
         return {"result": fields["state"], "thread_id": thread_id, "archive_actor": actor or "unknown"}
     finally:
         db.close()
@@ -1407,6 +1442,8 @@ def delete(project_root: Path, state_dir: Path, event: dict) -> dict:
             return {"result": "ignored", "reason": "unbound-thread"}
         stop_runtime(project_root, state_dir, row)
         STORE.forget(db, thread_id)
+        report_conversation(project_root, load_registry(project_root), row["project"], thread_id,
+                            "conversation_deleted")
         return {"result": "forgotten", "thread_id": thread_id}
     finally:
         db.close()

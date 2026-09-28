@@ -6,7 +6,8 @@ import test from "node:test";
 import { createWorkspace, runNodeEntrypoint, runScript } from "./support/runner.js";
 import { readState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
-import { bridgeChildEnv, createBridgeWorkspace, injectDiscordMessage, injectDiscordReaction, startBridge, startFakeCodexServer, waitForState } from "./support/bridge.js";
+import { bridgeChildEnv, createBridgeWorkspace, injectDiscordMessage, injectDiscordReaction, injectDiscordThread,
+  startBridge, startFakeCodexServer, waitForState } from "./support/bridge.js";
 
 test.afterEach(async () => {
   await cleanup();
@@ -696,4 +697,127 @@ test("a delivered scoped reply stays successful when its reminder receipt cannot
   const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
   assert.equal(JSON.parse(result.stdout).events.some((event) => event.event_type === "turn_completed"), false);
   await bridge.stop();
+});
+
+// Thread Conversations under a Codex project channel. The Thread Supervisor,
+// the reminder service's observer, and the project's Codex thread host each
+// hold their own Gateway connection and receive every thread event.
+const THREAD_A = "1500000000000123456";
+const THREAD_TOKEN = "codex-project-token";
+
+function setupThreadReminders(workspace, { port }) {
+  const projectDir = path.join(workspace.tmpDir, "codex project");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const codexHome = path.join(workspace.homeDir, ".codex-work");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, "config.toml"), "model = \"gpt-6\"\n");
+  fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), JSON.stringify({
+    discord_user_id: "owner", guild_id: "guild",
+    pool: [{ id: "codex-bot", app_id: "codex-app", token: THREAD_TOKEN,
+      state_dir: path.join(workspace.homeDir, "codex-bot"), assigned_to: "codexy" }],
+    projects: { codexy: { type: "codex", path: projectDir, bot_id: "codex-bot", channel_id: "codex-channel",
+      screen_name: "codexy_session", ws_port: 18399, thread_ws_port: port, codex_home: codexHome,
+      codex_sandbox: "workspace-write", assignment_generation: "generation-1", guest_user_ids: ["guest"] } },
+  }, null, 2), { mode: 0o600 });
+  const rootState = path.join(workspace.homeDir, "root-discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.fanOut = true;
+  writeState(seed, workspace.stateDir);
+  const threadClock = path.join(workspace.tmpDir, "thread-clock");
+  fs.writeFileSync(threadClock, `${new Date().toISOString()}\n`);
+  const reminderClock = path.join(workspace.tmpDir, "reminder-clock");
+  fs.writeFileSync(reminderClock, new Date().toISOString());
+  const stateDir = path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders");
+  const env = bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState, CCDM_THREAD_NODE: process.execPath,
+    CCDM_THREAD_CLOCK_FILE: threadClock, CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: reminderClock,
+    CCDM_REMINDER_PROJECT_ROOT: workspace.repoDir });
+  return { env, stateDir, reminderClock };
+}
+
+async function reminderCommand(workspace, context, name) {
+  const result = await runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: [name, "--project-root", workspace.repoDir, "--state-dir", context.stateDir], env: context.env });
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  return JSON.parse(result.stdout);
+}
+
+function startThreadServices(workspace, context) {
+  const reminders = runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["run", "--project-root", workspace.repoDir, "--state-dir", context.stateDir], env: context.env,
+    timeoutMs: 60000 });
+  const supervisor = runScript(workspace, "scripts/thread-supervisor.py", { args: ["run"], env: context.env,
+    timeoutMs: 60000 });
+  return { reminders, supervisor };
+}
+
+async function stopThreadServices(workspace, context, services) {
+  await reminderCommand(workspace, context, "disable");
+  const status = await runScript(workspace, "scripts/thread-supervisor.py", { args: ["status"], env: context.env });
+  process.kill(-JSON.parse(status.stdout).worker_pid, "SIGTERM");
+  for (const running of [services.reminders, services.supervisor]) {
+    const result = await running;
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  }
+}
+
+function codexThreadMessage(workspace, id, content, threadId = THREAD_A, author = { id: "owner", username: "owner" }) {
+  injectDiscordMessage(workspace, { id, channelId: threadId, channelType: 11, parentId: "codex-channel", author, content });
+}
+
+async function threadEvents(workspace, context, predicate) {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", {
+      args: ["codexy", "--json", "--state-dir", context.stateDir], env: context.env });
+    const events = JSON.parse(result.stdout).events;
+    if (predicate(events)) return events;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error("Timed out waiting for thread reminder events");
+}
+
+const later = minutes => new Date(Date.now() + minutes * 60000).toISOString();
+const reminderPosts = (state, channelId) => (state.fixtures.discord.messages ?? [])
+  .filter(message => message.content === "👀" && message.channelId === channelId);
+
+test("an agent reply in a Codex thread arms a 1h reminder that the project bot posts in that thread", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace, { threadIds: ["codex-thread-a"],
+    turnsByThread: { "codex-thread-a": [{ turnId: "answer-turn", status: "completed", waitForRelease: true,
+      mcpReply: true }] } });
+  const context = setupThreadReminders(workspace, { port: codex.port });
+  await reminderCommand(workspace, context, "enable");
+  const services = startThreadServices(workspace, context);
+  await waitForState(workspace, state => (state.fixtures.discord.logins ?? []).length === 2, 10000);
+  injectDiscordThread(workspace, { id: THREAD_A, parentId: "codex-channel", name: "Login bug", ownerId: "owner",
+    autoArchiveDuration: 10080 });
+  codexThreadMessage(workspace, "owner-1", "fix the login redirect");
+
+  // The model answers through the thread's own Discord server while its turn runs.
+  const started = await waitForState(workspace, state => (state.fixtures.codex.threadConfigs ?? []).length === 1, 15000);
+  const serverEnv = started.fixtures.codex.threadConfigs[0].mcpServers[`discord-${THREAD_A}`].env;
+  for (let attempt = 0; attempt < 250 && !fs.existsSync(serverEnv.CCDM_REMINDER_CONTEXT_FILE || ""); attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  const reply = await runNodeEntrypoint(workspace, "scripts/discord-mcp-server.js", {
+    env: bridgeChildEnv(workspace, serverEnv),
+    input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "reply",
+      arguments: { text: "Fixed: the redirect keeps the query string.", scope_token: serverEnv.DISCORD_REPLY_TOKEN } } }) + "\n",
+  });
+  assert.match(JSON.parse(reply.stdout).result.content[0].text, /^sent \(id: /, reply.stderr);
+  codex.releaseTurn("answer-turn");
+  const events = await threadEvents(workspace, context, rows => rows.some(row => row.event_type === "turn_completed"));
+  assert.ok(events.filter(row => row.event_type !== "owner_activity" || row.provider !== "ccdm-root")
+    .every(row => row.conversation_id === THREAD_A), JSON.stringify(events));
+
+  // Nothing before the hour; then one 👀 in the thread, from the project bot.
+  fs.writeFileSync(context.reminderClock, later(59));
+  await new Promise(resolve => setTimeout(resolve, 1500));
+  assert.equal(reminderPosts(readState(workspace.stateDir), THREAD_A).length, 0);
+  fs.writeFileSync(context.reminderClock, later(61));
+  const posted = await waitForState(workspace, state => reminderPosts(state, THREAD_A).length === 1, 15000);
+  assert.equal(reminderPosts(posted, THREAD_A)[0].authorization, `Bot ${THREAD_TOKEN}`);
+  assert.equal(reminderPosts(posted, "codex-channel").length, 0);
+  await stopThreadServices(workspace, context, services);
 });

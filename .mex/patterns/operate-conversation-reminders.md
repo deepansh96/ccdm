@@ -11,7 +11,7 @@ edges:
     condition: when the reminder service's relationship to adapters or sessions is unclear
   - target: context/session-management.md
     condition: when a registration or deregistration also changes reminder assignments
-last_updated: 2026-09-28
+last_updated: 2026-09-29
 ---
 
 # Operate Conversation Reminders
@@ -33,7 +33,9 @@ Read `docs/conversation-reminders.md`. The service runs independently of coding 
 - The conversation store is schema v7, keyed by project and conversation. A v6 store upgrades in place on first open, keeping every Channel Conversation's due time, closure, and streak. Older code refuses a v7 store, so copy the private state directory with the worker stopped before upgrading if a rollback may be needed.
 - Recovery never adopts or deletes a bot `👀` found in history; only a nonce replay or a recorded message ID identifies a reminder.
 - A reaction, including one on a reminder, can pause a conversation indefinitely until the next qualifying agent response; this is expected.
-- A Claude channel is ready only while its adapter launch runs. A plain `scripts/start-session.sh <project>` restart without `CCDM_CLAUDE_REMINDER_ADAPTER=1` leaves it blocked.
+- A Claude channel is ready only while its adapter launch runs. A plain `scripts/start-session.sh <project>` restart without `CCDM_CLAUDE_REMINDER_ADAPTER=1` leaves it blocked. The capability marker is per conversation: `capabilities/<project>/<conversation_id>.json`.
+- Thread Conversations are reminded inside their thread, with thread-local acknowledgment; see "Thread Conversations" in `docs/conversation-reminders.md`. Thread launches get reminder hooks from the service's enabled state, not from `CCDM_CLAUDE_REMINDER_ADAPTER`, so a thread started before `enable` records nothing until its next start.
+- The Thread Supervisor reports thread closes and deletions only when the reminder state directory exists. An owner or root archive or an in-thread `/close` closes only that thread's reminders; an auto-archive keeps them.
 - An adapter launch requires Claude Code 2.x from `2.1.281`, so auto-updates within 2.x keep working. After an update, confirm one adapter launch reaches `ready-observe-only`; if the plugin contract changed, the MCP proxy blocks it.
 - `--dangerously-load-development-channels server:discord` asks for first-use consent in the tmux pane ("I am using this for local development"). Send Enter to confirm; the session sits at the prompt until then. The startup notice "server:discord · no MCP server configured with that name" is stale — the capability marker written after the official plugin handshake is the real proof.
 - Sleep or a clock jump is handled like a restart: channels reconcile before any send, and overdue channels get spaced catch-ups.

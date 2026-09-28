@@ -18,8 +18,7 @@ const selectedProject = process.env.CCDM_CLAUDE_PROJECT || "";
 const selectedChannel = process.env.CCDM_CLAUDE_CHANNEL_ID || "";
 const selectedAppId = process.env.CCDM_CLAUDE_BOT_APP_ID || "";
 const rootAppId = process.env.CCDM_CLAUDE_ROOT_APP_ID || "";
-// A Thread Conversation is pinned to one thread under the project channel;
-// its reminder capability is per conversation and not proven here.
+// A Thread Conversation is pinned to one thread under the project channel.
 const selectedThread = process.env.CCDM_CLAUDE_THREAD_ID || "";
 if (selectedThread && (!selectedProject || !selectedChannel)) {
   process.stderr.write("Claude reminder channel: a thread conversation needs its project channel\n");
@@ -32,8 +31,10 @@ const startTurn = () => selectedThread ? reportTurn(selectedThread, "turn-starte
   : Promise.resolve();
 // Transport scoping is always on; reminder markers, events, and reply metadata
 // run only for a reminder-adapter launch (and for root launches, which predate
-// the split and never set this flag).
-const remindersEnabled = process.env.CCDM_CLAUDE_REMINDER_ADAPTER !== "0" && !selectedThread;
+// the split and never set this flag). A thread launch opts in explicitly while
+// the reminder service is enabled.
+const remindersEnabled = selectedThread ? process.env.CCDM_CLAUDE_REMINDER_ADAPTER === "1"
+  : process.env.CCDM_CLAUDE_REMINDER_ADAPTER !== "0";
 const assignmentFields = remindersEnabled ? [selectedProject, selectedChannel, selectedAppId] : [selectedProject, selectedChannel];
 if (assignmentFields.some(Boolean) && !assignmentFields.every(Boolean)) {
   process.stderr.write("Claude reminder channel: incomplete Claude project assignment\n");
@@ -45,7 +46,13 @@ const interactions = new Map();
 const pendingReplies = new Map();
 let inputNeededMarker = null;
 let supportedServerVersion = null;
-const capabilityPath = remindersEnabled && selectedProject ? path.join(stateDir, "capabilities", `${selectedProject}.json`) : null;
+// One capability marker per Project Conversation.
+const capabilityPath = remindersEnabled && selectedProject
+  ? path.join(stateDir, "capabilities", selectedProject, `${conversationChat}.json`) : null;
+// The assignment of this launch's conversation, or of `chatId` for root.
+const resolveAssignment = (chatId, options = {}) => reminder.resolveAssignmentForChannel(chatId, {
+  registryPath: path.join(projectRoot, "registry.json"), threads: Boolean(selectedThread), ...options,
+});
 
 // The capability marker proves only this live launch. Remove it when this
 // process exits, unless a newer launch has already replaced it.
@@ -181,6 +188,13 @@ async function deliverBootstrap() {
       typeof meta.message_id === "string" && meta.message_id &&
       (included === undefined || (Array.isArray(included) && included.every(id => typeof id === "string")))) {
     for (const id of [...(included || []), meta.message_id]) bootstrapIncluded.add(id);
+    if (remindersEnabled && meta.user_id) {
+      // The bootstrap answers the latest owner message it carries.
+      const assignment = await resolveAssignment(selectedThread, { botAppId: selectedAppId }).catch(() => null);
+      if (assignment?.project === selectedProject && meta.user_id === assignment.owner_id) {
+        interactions.set(meta.message_id, interaction(assignment, meta));
+      }
+    }
     await startTurn();
     process.stdout.write(JSON.stringify({
       jsonrpc: "2.0", method: "notifications/claude/channel", params: { content: bootstrap.content, meta },
@@ -189,6 +203,19 @@ async function deliverBootstrap() {
     process.stderr.write("Claude reminder channel: ignored an invalid thread bootstrap\n");
   }
   await releaseHeldNotifications();
+}
+
+// A reply that answers this owner message can qualify a Conversation Reminder.
+function interaction(assignment, meta) {
+  return {
+    ...assignment,
+    provider: "claude",
+    provider_session_id: launchId,
+    provider_turn_id: meta.message_id,
+    interaction_id: meta.message_id,
+    source_message_id: meta.message_id,
+    initiator_id: meta.user_id,
+  };
 }
 
 async function releaseHeldNotifications() {
@@ -246,9 +273,7 @@ async function handlePluginMessage(line) {
     }
     if (capabilityPath && supportedServerVersion) {
       const markerPath = capabilityPath;
-      const assignment = await reminder.resolveAssignmentForChannel(selectedChannel, {
-        registryPath: path.join(projectRoot, "registry.json"), botAppId: selectedAppId,
-      }).catch(() => null);
+      const assignment = await resolveAssignment(conversationChat, { botAppId: selectedAppId }).catch(() => null);
       if (replyVerified && assignment?.project === selectedProject && assignment.project_type === "claude") {
         const directory = path.dirname(markerPath);
         await fs.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -257,6 +282,7 @@ async function handlePluginMessage(line) {
           schema_version: 1,
           project: selectedProject,
           channel_id: selectedChannel,
+          conversation_id: conversationChat,
           assignment_generation: assignment.assignment_generation,
           plugin_version: "0.0.4",
           server_version: supportedServerVersion,
@@ -303,23 +329,11 @@ async function handlePluginMessage(line) {
   }
   if (bootstrapIncluded.has(meta.message_id)) return;
   if (!isClose(message.params?.content)) {
-    if (remindersEnabled && meta.chat_id && meta.message_id && meta.user_id && (!selectedChannel || meta.chat_id === selectedChannel)) {
-      const assignment = await reminder.resolveAssignmentForChannel(meta.chat_id, {
-        registryPath: path.join(projectRoot, "registry.json"),
-        ...(selectedProject ? { botAppId: selectedAppId } : {}),
-      }).catch(() => null);
+    if (remindersEnabled && meta.chat_id && meta.message_id && meta.user_id && (!conversationChat || meta.chat_id === conversationChat)) {
+      const assignment = await resolveAssignment(meta.chat_id, selectedProject ? { botAppId: selectedAppId } : {})
+        .catch(() => null);
       if (assignment && (!selectedProject || assignment.project === selectedProject) && meta.user_id === assignment.owner_id) {
-        if (selectedProject) {
-          interactions.set(meta.message_id, {
-            ...assignment,
-            provider: "claude",
-            provider_session_id: launchId,
-            provider_turn_id: meta.message_id,
-            interaction_id: meta.message_id,
-            source_message_id: meta.message_id,
-            initiator_id: meta.user_id,
-          });
-        }
+        if (selectedProject) interactions.set(meta.message_id, interaction(assignment, meta));
         await reminder.emitEvent("owner_activity", { ...assignment, provider: selectedProject ? "claude" : "ccdm-root" }, {
           actor_id: meta.user_id,
           source_message_id: meta.message_id,
@@ -348,10 +362,8 @@ async function handlePluginMessage(line) {
   if (!remindersEnabled) return;
   if (!meta.chat_id || !meta.message_id || !meta.user_id) return;
   if (selectedChannel && meta.chat_id !== selectedChannel) return;
-  const assignment = await reminder.resolveAssignmentForChannel(meta.chat_id, {
-    registryPath: path.join(projectRoot, "registry.json"),
-    ...(selectedProject ? { botAppId: selectedAppId } : {}),
-  }).catch(() => null);
+  const assignment = await resolveAssignment(meta.chat_id, selectedProject ? { botAppId: selectedAppId } : {})
+    .catch(() => null);
   if (!assignment || (selectedProject && assignment.project !== selectedProject)) return;
   if (meta.user_id === assignment.owner_id) {
     await reminder.emitEvent("close_requested", { ...assignment, provider: selectedProject ? "claude" : "ccdm-root" }, {
@@ -397,7 +409,7 @@ createInterface({ input: process.stdin }).on("line", line => {
     if (request.method === "tools/call" && request.params?.name === "reply") {
       const supplied = request.params.arguments || {};
       const context = interactions.get(supplied.conversation_interaction_id);
-      if (context && supplied.chat_id === context.channel_id && request.id !== undefined) {
+      if (context && supplied.chat_id === context.conversation_id && request.id !== undefined) {
         pendingReplies.set(request.id, {
           context,
           disposition: supplied.conversation_disposition === "input-needed" ? "input-needed" : "progress",

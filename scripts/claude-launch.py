@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 from uuid import uuid4
@@ -161,6 +162,24 @@ def thread_supervisor_dir() -> str:
                               or "~/.local/state/ccdm/thread-supervisor")
 
 
+def reminder_state_dir() -> Path:
+    return Path(os.environ.get("CCDM_REMINDER_STATE_DIR") or Path.home() / ".local" / "state" / "ccdm" / "conversation-reminders")
+
+
+def reminder_service_enabled() -> bool:
+    """Whether Conversation Reminders are enabled: the service's store is not
+    disabled and its operator ran `enable`."""
+    store = reminder_state_dir() / "conversations.sqlite3"
+    if not store.is_file():
+        return False
+    try:
+        with sqlite3.connect(f"file:{store}?mode=ro", uri=True) as db:
+            settings = dict(db.execute("SELECT key, value FROM settings").fetchall())
+    except sqlite3.Error:
+        return False
+    return settings.get("disabled") == "0" and settings.get("discovery_requested") == "1"
+
+
 def private_json(path: Path, value: dict) -> None:
     with open(path, "w") as f:
         json.dump(value, f, indent=2)
@@ -200,8 +219,12 @@ def launch_command(registry_path: str, project: str, thread_id: str | None, resu
     state_dir = resolved["state_dir"]
     channel_id = resolved["channel_id"]
     claude_home = resolved["claude_home"] or ""
-    # Reminder hooks and markers are for Channel Conversations only.
-    adapter_enabled = os.environ.get("CCDM_CLAUDE_REMINDER_ADAPTER", "0") == "1" and not thread_id
+    # A Channel Conversation opts into reminder hooks and its marker with
+    # CCDM_CLAUDE_REMINDER_ADAPTER=1; a Thread Conversation follows the
+    # reminder service's enabled state, and without the pinned plugin or bot
+    # identities it simply runs without reminders.
+    adapter_enabled = (reminder_service_enabled() if thread_id
+                       else os.environ.get("CCDM_CLAUDE_REMINDER_ADAPTER", "0") == "1")
     version = subprocess.run(["claude", "--version"], capture_output=True, text=True)
     # Claude Code auto-updates, so accept any 2.x release from the first tested one;
     # the MCP proxy still rejects a changed plugin tool contract.
@@ -213,7 +236,10 @@ def launch_command(registry_path: str, project: str, thread_id: str | None, resu
     bots = [bot for bot in registry["pool"] if bot.get("id") == bot_id]
     bot_app_id = str(bots[0].get("app_id") or "") if len(bots) == 1 else ""
     if adapter_enabled and not bot_app_id:
-        sys.exit("Claude reminder adapter requires an unambiguous assigned bot app ID")
+        if thread_id:
+            adapter_enabled = False
+        else:
+            sys.exit("Claude reminder adapter requires an unambiguous assigned bot app ID")
     root_app_id = registry.get("root_bot_app_id") or ""
     root_env = Path(os.environ.get("ROOT_DISCORD_STATE_DIR") or Path.home() / ".claude" / "channels" / "discord") / ".env"
     if root_env.is_file():
@@ -224,10 +250,12 @@ def launch_command(registry_path: str, project: str, thread_id: str | None, resu
                 root_app_id = base64.urlsafe_b64decode(encoded_id + "=" * (-len(encoded_id) % 4)).decode("ascii")
             except (ValueError, UnicodeDecodeError):
                 pass
-    if adapter_enabled and not root_app_id:
-        sys.exit("Claude reminder adapter requires root bot identity")
     selected_home = Path(claude_home) if claude_home else Path.home() / ".claude"
     plugin_cache = selected_home / "plugins" / "cache" / "claude-plugins-official" / "discord"
+    if thread_id and adapter_enabled and (not root_app_id or not (plugin_cache / "0.0.4" / "server.ts").is_file()):
+        adapter_enabled = False
+    if adapter_enabled and not root_app_id:
+        sys.exit("Claude reminder adapter requires root bot identity")
     if adapter_enabled:
         # The reminder capability is pinned to the tested plugin release.
         plugin_dir = plugin_cache / "0.0.4"
@@ -283,7 +311,7 @@ def launch_command(registry_path: str, project: str, thread_id: str | None, resu
         settings["hooks"] = {event: [{"hooks": [{"type": "command", "command": hook}]}]
                              for event in ("Stop", "StopFailure")}
     if adapter_enabled:
-        reminder_dir = Path(os.environ.get("CCDM_REMINDER_STATE_DIR") or Path.home() / ".local" / "state" / "ccdm" / "conversation-reminders")
+        reminder_dir = reminder_state_dir()
         env.update({
             "CCDM_REMINDER_STATE_DIR": str(reminder_dir),
             "CCDM_REMINDER_RECEIPTS_DIR": str(reminder_dir / "claude-receipts"),
@@ -292,8 +320,9 @@ def launch_command(registry_path: str, project: str, thread_id: str | None, resu
         })
         # Hook commands are command hooks: no prompt/agent hook can invoke a model.
         hook = str(SCRIPTS / "claude-reminder-hook.js")
-        settings["hooks"] = {event: [{"hooks": [{"type": "command", "command": f"node '{hook}'"}]}]
-                             for event in ("SessionStart", "Stop", "StopFailure", "SessionEnd")}
+        hooks = settings.setdefault("hooks", {})
+        for event in ("SessionStart", "Stop", "StopFailure", "SessionEnd"):
+            hooks.setdefault(event, []).append({"hooks": [{"type": "command", "command": f"node '{hook}'"}]})
         # The Claude process inherits launch-scoped context, including the same ID
         # as its channel server and its command hooks.
         private_json(Path(state_dir) / "ccdm-conversation-reminder-env.json", env)

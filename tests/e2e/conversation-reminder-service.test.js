@@ -5,7 +5,8 @@ import path from "node:path";
 import test from "node:test";
 
 import { createWorkspace, runScript } from "./support/runner.js";
-import { bridgeChildEnv, injectDiscordMessage, injectDiscordReaction, waitForState } from "./support/bridge.js";
+import { bridgeChildEnv, injectDiscordMessage, injectDiscordReaction, injectDiscordThread, injectDiscordThreadDelete,
+  injectDiscordThreadUpdate, waitForState } from "./support/bridge.js";
 import { readState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -1808,4 +1809,261 @@ print(json.dumps([db.execute('PRAGMA user_version').fetchone()[0],
     assert.deepEqual(JSON.parse(result.stdout),
       { status: "blocked", reason: "conversation store schema is unsupported" }, script);
   }
+});
+
+// Thread Conversations bound by the Thread Supervisor under the project channel.
+const THREAD_A = "1500000000000111111";
+const THREAD_B = "1500000000000222222";
+
+function setupThreads(workspace) {
+  const stateDir = setup(workspace);
+  const registryPath = path.join(workspace.repoDir, "registry.json");
+  const registry = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+  registry.projects.demo.guest_user_ids = ["guest"];
+  fs.writeFileSync(registryPath, JSON.stringify(registry), { mode: 0o600 });
+  const rootState = path.join(workspace.homeDir, "root-discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  fs.writeFileSync(clockFile, "2026-09-24T10:30:00Z");
+  const env = bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
+    CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile });
+  return { stateDir, clockFile, env };
+}
+
+async function bindThread(workspace, threadId) {
+  const result = await runScript(workspace, "scripts/thread-supervisor.py", { args: ["bind", "--project-root",
+    workspace.repoDir, "--payload", JSON.stringify({ thread_id: threadId, type: 11, parent_id: "channel",
+      parent_type: 0, name: `thread ${threadId}`, creator_id: "owner", auto_archive_duration: 10080 })] });
+  assert.equal(JSON.parse(result.stdout).result, "bound", result.stderr || result.stdout);
+}
+
+// An owner question at 09:00 answered at 10:00 in one Thread Conversation.
+async function threadExchange(workspace, stateDir, threadId) {
+  const scoped = { conversation_id: threadId };
+  await event(workspace, stateDir, "owner_activity", `${threadId}-owner`, "2026-09-24T09:00:00Z", {
+    ...scoped, actor_id: "owner", source_message_id: `${threadId}-question`, activity_kind: "message" });
+  await event(workspace, stateDir, "response_delivered", `${threadId}-receipt`, "2026-09-24T10:00:00Z", {
+    ...scoped, provider_session_id: `${threadId}-session`, provider_turn_id: "turn", interaction_id: `${threadId}-question`,
+    message_id: `${threadId}-answer`, disposition: "progress" });
+  await event(workspace, stateDir, "turn_completed", `${threadId}-completion`, "2026-09-24T10:00:00Z", {
+    ...scoped, provider_session_id: `${threadId}-session`, provider_turn_id: "turn", interaction_id: `${threadId}-question`,
+    delivered_message_ids: [`${threadId}-answer`] });
+}
+
+function startWorker(workspace, context, timeoutMs = 30000) {
+  return runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["run", "--project-root", workspace.repoDir, "--state-dir", context.stateDir], env: context.env, timeoutMs });
+}
+
+async function observedEvents(workspace, context, predicate) {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", {
+      args: ["demo", "--json", "--state-dir", context.stateDir], env: context.env });
+    const events = JSON.parse(result.stdout).events;
+    if (predicate(events)) return events;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error("Timed out waiting for observed reminder events");
+}
+
+const posts = (state, channelId) => (state.fixtures.discord.messages ?? [])
+  .filter(message => message.content === "👀" && message.channelId === channelId);
+
+function threadMessage(workspace, threadId, id, author, content = "thanks") {
+  injectDiscordMessage(workspace, { id, channelId: threadId, channelType: 11, parentId: "channel",
+    author: { id: author, username: author }, content });
+}
+
+test("owner activity in one thread acknowledges only that thread, and guest activity acknowledges nothing", async () => {
+  const workspace = createWorkspace();
+  const context = setupThreads(workspace);
+  await reconciledExchange(workspace, context.stateDir);
+  for (const threadId of [THREAD_A, THREAD_B]) {
+    await bindThread(workspace, threadId);
+    await threadExchange(workspace, context.stateDir, threadId);
+  }
+  await command(workspace, context.stateDir, "discover");
+  const running = startWorker(workspace, context);
+  await waitForState(workspace, state => state.fixtures.discord.logins.length === 1);
+  threadMessage(workspace, THREAD_A, "owner-thanks-a", "owner");
+  threadMessage(workspace, THREAD_B, "guest-thanks-b", "guest");
+  injectDiscordMessage(workspace, { channelId: "channel", id: "guest-thanks-channel", author: { id: "guest" },
+    content: "thanks" });
+  await observedEvents(workspace, context, events => events.some(row => row.source_message_id === "owner-thanks-a"));
+  await waitForState(workspace, state => ["guest-thanks-b", "guest-thanks-channel"].every(id =>
+    state.fixtures.discord.deliveredMessages.some(row => row.id === id)));
+
+  // At 11:00 the channel and thread B are reminded, each in its own place;
+  // thread A was acknowledged. Thread sends are spaced by the global gate.
+  fs.writeFileSync(context.clockFile, "2026-09-24T11:00:00Z");
+  await waitForState(workspace, state => posts(state, "channel").length === 1 && posts(state, THREAD_B).length === 1,
+    10000);
+  fs.writeFileSync(context.clockFile, "2026-09-24T11:00:30Z");
+  await new Promise(resolve => setTimeout(resolve, 1500));
+  const state = readState(workspace.stateDir);
+  assert.equal(posts(state, THREAD_A).length, 0);
+  assert.deepEqual([posts(state, "channel").length, posts(state, THREAD_B).length], [1, 1]);
+  assert.equal(posts(state, THREAD_B)[0].authorization, "Bot fixture-token");
+  const observed = await observedEvents(workspace, context, () => true);
+  assert.deepEqual(observed.filter(row => row.event_type === "owner_activity" && row.provider === "ccdm-root")
+    .map(row => [row.source_message_id, row.conversation_id]), [["owner-thanks-a", THREAD_A]]);
+  await command(workspace, context.stateDir, "disable");
+  assert.equal((await running).exitCode, 0);
+});
+
+const THREAD_C = "1500000000000333333";
+// Discord's snowflake epoch; an id's top bits are milliseconds since it.
+const snowflake = iso => String((BigInt(Date.parse(iso)) - 1420070400000n) << 22n);
+
+// The Thread Supervisor runs beside the reminder service; both hold a Gateway
+// connection with root credentials and receive every event.
+function startSupervisor(workspace, context) {
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.fanOut = true;
+  writeState(seed, workspace.stateDir);
+  const threadClock = path.join(workspace.tmpDir, "thread-clock");
+  fs.writeFileSync(threadClock, `${new Date().toISOString()}\n`);
+  context.supervisorEnv = { ...context.env, CCDM_THREAD_NODE: process.execPath, CCDM_THREAD_CLOCK_FILE: threadClock };
+  return runScript(workspace, "scripts/thread-supervisor.py", { args: ["run", "--project-root", workspace.repoDir],
+    env: context.supervisorEnv, timeoutMs: 60000 });
+}
+
+async function supervisorThreads(workspace, context, predicate) {
+  let current;
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const result = await runScript(workspace, "scripts/thread-supervisor.py", {
+      args: ["status", "--project-root", workspace.repoDir], env: context.supervisorEnv });
+    current = JSON.parse(result.stdout);
+    if (predicate(current.projects?.demo?.threads ?? {})) return current;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error(`Timed out waiting for supervisor threads: ${JSON.stringify(current)}`);
+}
+
+async function stopSupervisor(workspace, context, running) {
+  const current = await supervisorThreads(workspace, context, () => true);
+  process.kill(-current.worker_pid, "SIGTERM");
+  const result = await running;
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+}
+
+test("an owner archive or in-thread /close closes only that thread's reminders", async () => {
+  const workspace = createWorkspace();
+  const context = setupThreads(workspace);
+  await reconciledExchange(workspace, context.stateDir);
+  const supervisor = startSupervisor(workspace, context);
+  await waitForState(workspace, state => state.fixtures.discord.logins.length === 1);
+  for (const threadId of [THREAD_A, THREAD_B, THREAD_C]) {
+    injectDiscordThread(workspace, { id: threadId, parentId: "channel", name: `thread ${threadId}`, ownerId: "owner",
+      autoArchiveDuration: 10080 });
+  }
+  await supervisorThreads(workspace, context, threads => [THREAD_A, THREAD_B, THREAD_C].every(id => threads[id]));
+  for (const threadId of [THREAD_A, THREAD_B, THREAD_C]) await threadExchange(workspace, context.stateDir, threadId);
+  await command(workspace, context.stateDir, "discover");
+  const running = startWorker(workspace, context, 60000);
+  await waitForState(workspace, state => state.fixtures.discord.logins.length === 2);
+
+  // The owner closes thread A with /close and archives thread B.
+  threadMessage(workspace, THREAD_A, "owner-close-a", "owner", "/close");
+  const archivedAt = new Date().toISOString();
+  const seeded = readState(workspace.stateDir);
+  seeded.fixtures.discord.auditLogEntries = [{ id: snowflake(archivedAt), user_id: "owner", target_id: THREAD_B,
+    action_type: 111, changes: [{ key: "archived", old_value: false, new_value: true }] }];
+  writeState(seeded, workspace.stateDir);
+  injectDiscordThreadUpdate(workspace, { id: THREAD_B, archived: true, archiveTimestamp: archivedAt });
+  const closed = await observedEvents(workspace, context, events =>
+    events.filter(row => row.event_type === "conversation_closed").length === 2);
+  assert.deepEqual(closed.filter(row => row.event_type === "conversation_closed").map(row => row.conversation_id).sort(),
+    [THREAD_A, THREAD_B]);
+
+  // At 11:00 the channel and thread C are still reminded; A and B never are.
+  fs.writeFileSync(context.clockFile, "2026-09-24T11:00:00Z");
+  await waitForState(workspace, state => posts(state, "channel").length === 1 && posts(state, THREAD_C).length === 1,
+    10000);
+  fs.writeFileSync(context.clockFile, "2026-09-24T11:00:30Z");
+  await new Promise(resolve => setTimeout(resolve, 1500));
+  const state = readState(workspace.stateDir);
+  assert.deepEqual([THREAD_A, THREAD_B, THREAD_C, "channel"].map(id => posts(state, id).length), [0, 0, 1, 1]);
+  // The supervisor, not the reminder observer, acts on an in-thread /close.
+  assert.equal((state.fixtures.discord.reactions ?? []).some(row => row.messageId === "owner-close-a"), false);
+  await command(workspace, context.stateDir, "disable");
+  assert.equal((await running).exitCode, 0);
+  await stopSupervisor(workspace, context, supervisor);
+});
+
+test("deleting a thread drops its reminder state and deletes its outstanding reminder", async () => {
+  const workspace = createWorkspace();
+  const context = setupThreads(workspace);
+  const supervisor = startSupervisor(workspace, context);
+  await waitForState(workspace, state => state.fixtures.discord.logins.length === 1);
+  for (const threadId of [THREAD_A, THREAD_B]) {
+    injectDiscordThread(workspace, { id: threadId, parentId: "channel", name: `thread ${threadId}`, ownerId: "owner",
+      autoArchiveDuration: 10080 });
+  }
+  await supervisorThreads(workspace, context, threads => threads[THREAD_A] && threads[THREAD_B]);
+  for (const threadId of [THREAD_A, THREAD_B]) await threadExchange(workspace, context.stateDir, threadId);
+  await command(workspace, context.stateDir, "discover");
+  const running = startWorker(workspace, context, 60000);
+  await waitForState(workspace, state => state.fixtures.discord.logins.length === 2);
+  fs.writeFileSync(context.clockFile, "2026-09-24T11:00:00Z");
+  await waitForState(workspace, state => posts(state, THREAD_A).length === 1, 10000);
+  fs.writeFileSync(context.clockFile, "2026-09-24T11:00:10Z");
+  await waitForState(workspace, state => posts(state, THREAD_B).length === 1, 10000);
+  const reminder = posts(readState(workspace.stateDir), THREAD_A)[0];
+
+  injectDiscordThreadDelete(workspace, THREAD_A);
+  const deleted = await waitForState(workspace, state => (state.fixtures.discord.deletes ?? [])
+    .some(row => row.messageId === reminder.id), 10000);
+  assert.deepEqual(deleted.fixtures.discord.deletes.map(row => [row.channelId, row.messageId, row.authorization]),
+    [[THREAD_A, reminder.id, "Bot fixture-token"]]);
+  await supervisorThreads(workspace, context, threads => !threads[THREAD_A]);
+
+  // Its next reminder would have been due at 13:00; only thread B's comes.
+  fs.writeFileSync(context.clockFile, "2026-09-24T13:00:20Z");
+  await waitForState(workspace, state => posts(state, THREAD_B).length === 2, 10000);
+  await new Promise(resolve => setTimeout(resolve, 1500));
+  assert.equal(posts(readState(workspace.stateDir), THREAD_A).length, 1);
+  await command(workspace, context.stateDir, "disable");
+  assert.equal((await running).exitCode, 0);
+  await stopSupervisor(workspace, context, supervisor);
+});
+
+test("a reminder into an auto-archived thread is delivered there and starts no session", async () => {
+  const workspace = createWorkspace();
+  const context = setupThreads(workspace);
+  const supervisor = startSupervisor(workspace, context);
+  await waitForState(workspace, state => state.fixtures.discord.logins.length === 1);
+  injectDiscordThread(workspace, { id: THREAD_A, parentId: "channel", name: "Login bug", ownerId: "owner",
+    autoArchiveDuration: 10080 });
+  await supervisorThreads(workspace, context, threads => threads[THREAD_A]);
+  await threadExchange(workspace, context.stateDir, THREAD_A);
+  // Discord's inactivity auto-archive leaves no audit-log entry: after the
+  // supervisor's 60-second wait the thread is only stopped, still reminded.
+  injectDiscordThreadUpdate(workspace, { id: THREAD_A, archived: true, archiveTimestamp: new Date().toISOString() });
+  await waitForState(workspace, state => (state.fixtures.discord.auditLogFetches ?? []).length > 0, 10000);
+  fs.writeFileSync(context.supervisorEnv.CCDM_THREAD_CLOCK_FILE, `${new Date(Date.now() + 61000).toISOString()}\n`);
+  await supervisorThreads(workspace, context, threads => threads[THREAD_A]?.state === "stopped");
+  await command(workspace, context.stateDir, "discover");
+  const running = startWorker(workspace, context, 60000);
+  await waitForState(workspace, state => state.fixtures.discord.logins.length === 2);
+
+  fs.writeFileSync(context.clockFile, "2026-09-24T11:00:00Z");
+  const sent = await waitForState(workspace, state => posts(state, THREAD_A).length === 1, 10000);
+  assert.equal(posts(sent, THREAD_A)[0].authorization, "Bot fixture-token");
+  // The post reopened the thread; the supervisor saw the bot's unarchive and
+  // its message, and started nothing.
+  const reopening = state => [...state.fixtures.discord.injectedThreads.filter(row => row.newlyCreated === false ||
+    row.previous?.archived), ...state.fixtures.discord.injectedMessages];
+  await waitForState(workspace, state => state.fixtures.discord.threads[THREAD_A].archived === false &&
+    reopening(state).length === 3 && reopening(state).every(row => (row.deliveredTo ?? []).length === 2), 10000);
+  await new Promise(resolve => setTimeout(resolve, 1500));
+  const threads = (await supervisorThreads(workspace, context, () => true)).projects.demo.threads;
+  assert.deepEqual([threads[THREAD_A].state, threads[THREAD_A].stop_reason], ["stopped", "auto-archive"]);
+  const state = readState(workspace.stateDir);
+  assert.deepEqual(state.fixtures.tmux.sessions, {});
+  assert.equal(state.fixtures.codex.appServerInvocations.length, 0);
+  await command(workspace, context.stateDir, "disable");
+  assert.equal((await running).exitCode, 0);
+  await stopSupervisor(workspace, context, supervisor);
 });

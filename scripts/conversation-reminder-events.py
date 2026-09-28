@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,10 @@ EVENT_TYPES = {
     "work_resumed",
     "session_terminated",
     "close_requested",
+    # The Thread Supervisor's: a Thread Conversation closed by an owner or root
+    # archive or an in-thread /close, and a deleted thread.
+    "conversation_closed",
+    "conversation_deleted",
 }
 ALLOWED_FIELDS = {
     "schema_version",
@@ -65,6 +70,33 @@ REQUIRED_FIELDS = {
     "event_order",
     "adapter_instance_id",
 }
+
+
+_RESOLVER = None
+
+
+def _resolver():
+    """The shared conversation resolver, loaded on first use."""
+    global _RESOLVER
+    if _RESOLVER is None:
+        spec = importlib.util.spec_from_file_location("ccdm_conversation_resolver",
+                                                      Path(__file__).with_name("resolve-conversation.py"))
+        _RESOLVER = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_RESOLVER)
+    return _RESOLVER
+
+
+def thread_provider(project_name: str, project: dict, thread_id: str) -> str | None:
+    """The provider of ``project_name``'s bound thread ``thread_id``; None when
+    the Thread Supervisor has no such thread for that project."""
+    resolver = _resolver()
+    try:
+        row = resolver.bound_thread(resolver.STORE.default_state_dir(), thread_id)
+    except (OSError, ValueError, sqlite3.Error):
+        return None
+    if row is None or row["project"] != project_name:
+        return None
+    return row["resolved_provider"] or row["provider"] or project.get("type") or "claude"
 
 
 def default_state_dir() -> Path:
@@ -216,6 +248,11 @@ def validate_event(event: object) -> dict:
         raise ValueError("provider lifecycle events require a project adapter")
     if event_type in {"owner_activity", "close_requested"} and normalized["provider"] not in {"codex", "claude", "ccdm-root"}:
         raise ValueError("owner events require a registered CCDM adapter")
+    if event_type in {"conversation_closed", "conversation_deleted"}:
+        if normalized["provider"] != "ccdm-root":
+            raise ValueError(f"{event_type} comes only from the Thread Supervisor")
+        if normalized.get("conversation_id", normalized["channel_id"]) == normalized["channel_id"]:
+            raise ValueError(f"{event_type} requires a Thread Conversation")
     if event_type in {"response_delivered", "input_needed", "turn_completed", "work_resumed"}:
         for field in ("provider_session_id", "provider_turn_id", "message_id", "interaction_id"):
             if field == "message_id" and event_type in {"turn_completed", "work_resumed"}:
@@ -266,9 +303,14 @@ def _assignment_result(registry: dict, event: dict) -> tuple[str | None, str | N
     if assignment["generation"] != event["assignment_generation"]:
         return "stale", "project assignment generation changed"
     # An event from before conversation keys belongs to the Channel Conversation.
-    if event.get("conversation_id", event["channel_id"]) != assignment["channel_id"]:
-        return "stale", "project conversation is not tracked"
-    if event["provider"] in {"codex", "claude"} and (assignment["project"].get("type") or "claude") != event["provider"]:
+    conversation = event.get("conversation_id", event["channel_id"])
+    provider = assignment["project"].get("type") or "claude"
+    if conversation != assignment["channel_id"] and event["event_type"] != "conversation_deleted":
+        # A deleted thread is already gone from the Thread Supervisor's store.
+        provider = thread_provider(event["project"], assignment["project"], conversation)
+        if provider is None:
+            return "stale", "project conversation is not tracked"
+    if event["provider"] in {"codex", "claude"} and provider != event["provider"]:
         return "rejected", "adapter event targets a different project provider"
     if event["event_type"] in {"owner_activity", "close_requested"} and event.get("actor_id") != assignment["owner_id"]:
         return "rejected", "owner event actor does not match the registered owner"
@@ -383,6 +425,7 @@ def _event_summary(row: sqlite3.Row) -> dict:
         "event_time": row["event_time"],
         "event_order": row["event_order"],
         "channel_id": row["channel_id"],
+        "conversation_id": event.get("conversation_id", row["channel_id"]),
         "assignment_generation": row["assignment_generation"],
         "provider": row["provider"],
     }

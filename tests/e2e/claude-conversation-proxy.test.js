@@ -143,7 +143,7 @@ test("a proxy launched without the reminder adapter records no reminder capabili
   await proxy.until(output => output.includes("channel-message-1"), "the channel message");
   await settle();
   const reminderState = path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders");
-  assert.equal(fs.existsSync(path.join(reminderState, "capabilities", "demo.json")), false);
+  assert.equal(fs.existsSync(path.join(reminderState, "capabilities", "demo", "channel-1.json")), false);
   await proxy.stop();
 
   const tools = proxy.response(2).result.tools;

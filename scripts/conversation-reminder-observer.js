@@ -49,19 +49,23 @@ const SUSPENSIONS = {
 };
 let registryFingerprint = null;
 
-async function markHealth(project, state, generation) {
-  if (health[project] === state) return;
-  // Lost access or capability durably stops delivery for that assignment only.
+// Health is kept per conversation: a project's Channel Conversation under the
+// project name, and each Thread Conversation under `<project>/<thread id>`.
+async function markHealth(project, state, generation, threadId = null) {
+  const key = threadId ? `${project}/${threadId}` : project;
+  if (health[key] === state) return;
+  const conversation = threadId ? ["--conversation", threadId] : [];
+  // Lost access or capability durably stops delivery for that conversation only.
   if (generation && SUSPENSIONS[state]) {
     await exec(process.env.CCDM_REMINDER_PYTHON || "python3", [script, "suspend", "--state-dir", stateDir,
-      "--project", project, "--generation", generation, "--reason", SUSPENSIONS[state]]);
-  } else if (generation && state === "ready-observe-only" && SUSPENSIONS[health[project]]) {
+      "--project", project, "--generation", generation, "--reason", SUSPENSIONS[state], ...conversation]);
+  } else if (generation && state === "ready-observe-only" && SUSPENSIONS[health[key]]) {
     // Access or adapter capability returned (for example a Claude session
     // restarted with its adapter); reconcile what was missed before any send.
     await exec(process.env.CCDM_REMINDER_PYTHON || "python3", [script, "resume", "--state-dir", stateDir,
-      "--project", project, "--generation", generation]);
+      "--project", project, "--generation", generation, ...conversation]);
   }
-  health[project] = state;
+  health[key] = state;
   healthWrite = healthWrite.then(async () => {
     await mkdir(stateDir, { recursive: true, mode: 0o700 });
     const temporary = `${healthPath}.${process.pid}.tmp`;
@@ -93,44 +97,48 @@ function closeCommand(content, botAppId, rootAppId) {
   );
 }
 
+// The assignment of the Project Conversation held in `channelId`, a project
+// channel or a bound thread, once its adapter, access, and permissions check out.
 async function assignment(channelId) {
   const found = await reminder.resolveAssignmentForChannel(channelId, {
-    registryPath: path.join(projectRoot, "registry.json"),
+    registryPath: path.join(projectRoot, "registry.json"), threads: true,
   });
   if (!found || !found.owner_id || !found.bot_app_id) return null;
+  const threadId = found.thread_id || null;
   const data = await registry();
   const bot = data.pool?.filter(row => row?.id === found.bot_id);
   if (bot?.length !== 1 || !bot[0].token || bot[0].assigned_to && bot[0].assigned_to !== found.project) {
-    await markHealth(found.project, "blocked-assignment", found.assignment_generation);
+    await markHealth(found.project, "blocked-assignment", found.assignment_generation, threadId);
     return null;
   }
   const readiness = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
     [path.join(__dirname, "conversation-reminder-readiness.py"), found.project, "--json",
-      "--project-root", projectRoot, "--state-dir", stateDir]).then(result => JSON.parse(result.stdout))
+      "--project-root", projectRoot, "--state-dir", stateDir, ...(threadId ? ["--conversation", threadId] : [])])
+    .then(result => JSON.parse(result.stdout))
     // A blocked readiness report exits nonzero but still explains its cause.
     .catch(error => { try { return JSON.parse(error.stdout); } catch { return null; } });
   if (!readiness?.ready) {
     const assignmentProblem = readiness?.assignment_mismatches?.length || readiness?.missing_credentials?.length;
     await markHealth(found.project, assignmentProblem ? "blocked-assignment" : "blocked-adapter-capability",
-      found.assignment_generation);
+      found.assignment_generation, threadId);
     return null;
   }
   const channel = await client.channels.fetch(channelId).catch(() => null);
   if (!channel?.permissionsFor) {
-    await markHealth(found.project, "blocked-observation-access", found.assignment_generation);
+    await markHealth(found.project, "blocked-observation-access", found.assignment_generation, threadId);
     return null;
   }
   // During a Discord outage a guild can be unavailable, with no roles cached;
   // treat that as lost access and retry on the next revalidation.
   if (channel.guild && channel.guild.available === false) {
-    await markHealth(found.project, "blocked-observation-access", found.assignment_generation);
+    await markHealth(found.project, "blocked-observation-access", found.assignment_generation, threadId);
     return null;
   }
   let botMember = found.bot_app_id;
   if (channel.guild?.members?.fetch) {
     botMember = await channel.guild.members.fetch(found.bot_app_id).catch(() => null);
     if (!botMember) {
-      await markHealth(found.project, "blocked-assigned-bot-permissions", found.assignment_generation);
+      await markHealth(found.project, "blocked-assigned-bot-permissions", found.assignment_generation, threadId);
       return null;
     }
   }
@@ -140,18 +148,20 @@ async function assignment(channelId) {
     botPermissions = channel.permissionsFor(botMember);
   } catch {
     // A partially cached guild cannot resolve permissions yet.
-    await markHealth(found.project, "blocked-observation-access", found.assignment_generation);
+    await markHealth(found.project, "blocked-observation-access", found.assignment_generation, threadId);
     return null;
   }
   if (!rootPermissions || !["ViewChannel", "ReadMessageHistory"].every(flag => rootPermissions.has(flag))) {
-    await markHealth(found.project, "blocked-observation-access", found.assignment_generation);
+    await markHealth(found.project, "blocked-observation-access", found.assignment_generation, threadId);
     return null;
   }
-  if (!botPermissions || !["ViewChannel", "ReadMessageHistory", "SendMessages", "AddReactions"].every(flag => botPermissions.has(flag))) {
-    await markHealth(found.project, "blocked-assigned-bot-permissions", found.assignment_generation);
+  // A reminder in a thread needs Send Messages in Threads instead of Send Messages.
+  const send = threadId ? "SendMessagesInThreads" : "SendMessages";
+  if (!botPermissions || !["ViewChannel", "ReadMessageHistory", send, "AddReactions"].every(flag => botPermissions.has(flag))) {
+    await markHealth(found.project, "blocked-assigned-bot-permissions", found.assignment_generation, threadId);
     return null;
   }
-  await markHealth(found.project, "ready-observe-only", found.assignment_generation);
+  await markHealth(found.project, "ready-observe-only", found.assignment_generation, threadId);
   return { ...found, bot_token: bot[0].token };
 }
 
@@ -191,7 +201,7 @@ async function cleanupRetired(project) {
     const credentials = await retiredCredentials(action);
     let reason = credentials.reason;
     if (credentials.token) {
-      const url = `https://discord.com/api/v10/channels/${encodeURIComponent(action.channel_id)}` +
+      const url = `https://discord.com/api/v10/channels/${encodeURIComponent(action.conversation_id || action.channel_id)}` +
         `/messages/${encodeURIComponent(action.message_id)}`;
       for (let attempt = 0; attempt < RETIRED_CLEANUP_ATTEMPTS; attempt++) {
         let response;
@@ -241,13 +251,32 @@ async function cleanupRetired(project) {
   return result;
 }
 
+// The Thread Supervisor's in-thread commands, optionally after a mention.
+const THREAD_COMMAND = /^(?:<@!?[^>\s]+>\s+)?(?:\/config(?:\s[\s\S]*)?|\/(?:restart|clear|compact|pause|unpause))$/;
+
+// The Thread Supervisor binds a new thread as its first messages arrive, so a
+// thread message is resolved again for a few seconds before it is ignored.
+const THREAD_BIND_WAIT_MS = [250, 500, 1000, 2000];
+
+async function threadAssignment(channel) {
+  let found = await assignment(channel?.id);
+  for (const wait of channel?.isThread?.() ? THREAD_BIND_WAIT_MS : []) {
+    if (found || stopping) break;
+    await new Promise(resolve => setTimeout(resolve, wait));
+    found = await assignment(channel.id);
+  }
+  return found;
+}
+
 async function observeMessage(message) {
   if (message.author?.bot) return;
-  const found = await assignment(message.channel?.id);
+  const found = await threadAssignment(message.channel);
   if (!found) return;
   const close = closeCommand(message.content, found.bot_app_id, client.user.id);
   if (message.author.id !== found.owner_id) return;
   const context = { ...found, provider: "ccdm-root" };
+  // In a thread the Thread Supervisor owns /close and reports the closed conversation.
+  if (close && found.thread_id) return;
   if (close) {
     await reminder.emitEvent("close_requested", context, {
       actor_id: message.author.id, source_message_id: message.id, command: "/close",
@@ -257,7 +286,8 @@ async function observeMessage(message) {
   const content = String(message.content || "").trim();
   // Root-management traffic never reopens a conversation, wherever the mention sits.
   const rootMention = [`<@${client.user.id}>`, `<@!${client.user.id}>`].some(value => content.includes(value));
-  const managedCommand = ["/compact", "/clear", "/pause", "/unpause", "/restart"].includes(content);
+  const managedCommand = ["/compact", "/clear", "/pause", "/unpause", "/restart"].includes(content) ||
+    Boolean(found.thread_id && THREAD_COMMAND.test(content));
   if (!content && !message.attachments?.size) return;
   const kind = managedCommand || rootMention ? "management-command"
     : message.attachments?.size ? "attachment" : "message";
@@ -325,7 +355,7 @@ async function recoverIntents(scheduled = false) {
       continue;
     }
     const claimed = Date.parse(intent.claimed_at);
-    const base = `https://discord.com/api/v10/channels/${encodeURIComponent(intent.channel_id)}/messages`;
+    const base = `https://discord.com/api/v10/channels/${encodeURIComponent(intent.conversation_id || intent.channel_id)}/messages`;
     if (await retryClockMs() <= claimed + NONCE_REPLAY_MS) {
       const replay = await sendReminder(base, found.bot_token, intent.nonce);
       if (replay.outcome === "sent") {
@@ -480,7 +510,7 @@ async function sideEffects(recoveryOnly = false) {
             found.assignment_generation !== action.assignment_generation) continue;
         token = found.bot_token;
       }
-      const messageUrl = `https://discord.com/api/v10/channels/${encodeURIComponent(action.channel_id)}` +
+      const messageUrl = `https://discord.com/api/v10/channels/${encodeURIComponent(action.conversation_id || action.channel_id)}` +
         `/messages/${encodeURIComponent(action.message_id)}`;
       const url = action.kind === "ack" ?
         `${messageUrl}/reactions/${encodeURIComponent("✅")}/@me` : messageUrl;
@@ -513,7 +543,7 @@ async function sideEffects(recoveryOnly = false) {
       [script, "claim", "--project-root", projectRoot, "--state-dir", stateDir]);
     const claim = JSON.parse(due.stdout).claim;
     if (!claim) return;
-    const found = await assignment(claim.channel_id);
+    const found = await assignment(claim.conversation_id || claim.channel_id);
     const args = [script, "result", "--project-root", projectRoot, "--state-dir", stateDir,
       "--nonce", claim.nonce];
     if (!found || found.project !== claim.project ||
@@ -525,7 +555,8 @@ async function sideEffects(recoveryOnly = false) {
       [script, "validate", "--project-root", projectRoot, "--state-dir", stateDir,
         "--nonce", claim.nonce]);
     if (!JSON.parse(checked.stdout).valid) return;
-    const url = `https://discord.com/api/v10/channels/${encodeURIComponent(claim.channel_id)}/messages`;
+    // A thread's reminder goes into the thread, even an auto-archived one.
+    const url = `https://discord.com/api/v10/channels/${encodeURIComponent(claim.conversation_id || claim.channel_id)}/messages`;
     let outcome = "uncertain";
     let messageId;
     let sentAt;

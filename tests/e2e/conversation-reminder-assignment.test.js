@@ -414,7 +414,7 @@ test("an ambiguous registry suspends a ready channel and restoring it does not r
   await awaitingExchange(workspace, context.stateDir);
   markReconciled(context.stateDir);
   const running = startWorker(workspace, context);
-  await waitForState(workspace, state => state.fixtures.discord.logins?.length === 1);
+  await waitForStatus(workspace, context.stateDir, current => current.observer_channels.demo === "ready-observe-only");
   const original = readRegistry(workspace);
   const ambiguous = readRegistry(workspace);
   ambiguous.projects.twin = { type: "codex", bot_id: "bot2", channel_id: "channel", assignment_generation: "twin-1" };

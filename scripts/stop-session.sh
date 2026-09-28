@@ -306,14 +306,18 @@ fi
 
 if [[ "$SESSION_TYPE" != "codex" ]]; then
   # The stopped launch no longer proves a filtered Claude transport.
-  python3 - "$PROJECT" <<'PY'
+  python3 - "$PROJECT" "$CHANNEL_ID" <<'PY'
 import os
 import sys
 from pathlib import Path
 
-project = sys.argv[1]
+project, channel = sys.argv[1], sys.argv[2]
 state_dir = Path(os.environ.get("CCDM_REMINDER_STATE_DIR") or Path.home() / ".local" / "state" / "ccdm" / "conversation-reminders")
-if "/" not in project and project not in {"", ".", ".."}:
+safe = lambda name: "/" not in name and name not in {"", ".", ".."}
+if safe(project):
+    # The Channel Conversation's marker, and the one earlier releases kept per project.
+    if safe(channel):
+        (state_dir / "capabilities" / project / f"{channel}.json").unlink(missing_ok=True)
     (state_dir / "capabilities" / f"{project}.json").unlink(missing_ok=True)
 PY
 fi

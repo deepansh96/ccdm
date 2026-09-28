@@ -7,7 +7,7 @@ This service records owner acknowledgment, `/close`, reopening, and qualifying C
 - `registry.json` must have one owner and an unambiguous project channel and assigned bot per project.
 - The root Discord bot token must be in `ROOT_DISCORD_STATE_DIR/.env` as `DISCORD_BOT_TOKEN`; the default root state directory is `~/.claude/channels/discord`.
 - The root bot must be able to view and read project channels. Assigned project bots need view, history, send, and reaction permissions in their own channels. The service checks these permissions and does not change them.
-- Claude projects require the verified launch-scoped reminder adapter to be running; its capability marker proves only that live launch. Codex projects require the current bridge adapter. Unsupported and remote Claude assignments remain excluded.
+- Claude projects require the verified launch-scoped reminder adapter to be running; its capability marker, one per Project Conversation at `capabilities/<project>/<conversation_id>.json` in the state directory, proves only that live launch. Codex projects require the current bridge adapter. Unsupported and remote Claude assignments remain excluded.
 - Python 3 and Node 22 or newer. The supervised worker uses the interpreters the installer resolved, not the login shell's `PATH`.
 - Both provider adapters must be installed: `scripts/codex-bridge.js`, `scripts/discord-mcp-server.js`, `scripts/claude-reminder-channel.js`, `scripts/claude-reminder-hook.js`, and `scripts/conversation-reminder-adapter.js`. If any is missing, no channel receives reminders, including Codex channels. There is no Codex-only override.
 
@@ -60,6 +60,19 @@ Operating the supervised worker:
 - **Assignment retirement:** after any registration or deregistration, run `assignment-changed --project <project>`. See [Assignment changes](#assignment-changes).
 - **History and reaction limits:** discovery and reconciliation cannot see deleted messages or reactions removed while nothing was observing. They cannot tell when an old reaction was added either. See [Time, order, and reaction limits](#time-order-and-reaction-limits).
 - **Indefinite pauses:** any Conversation Reply, including a reaction (even one on a reminder), pauses the conversation until the agent next finishes a turn or asks for input. If no qualifying response follows, the conversation stays paused indefinitely. This is expected. Send a new message to restart the exchange.
+
+## Thread Conversations
+
+Each Thread Conversation is tracked on its own, keyed by project and thread id, and reminded inside its thread.
+
+- **Arming:** a Claude thread's proxy and command hooks, or the project's Codex thread host through the thread's own Discord MCP server, record each confirmed agent reply and completed turn for that thread. A thread launched by the Thread Supervisor gets reminder hooks whenever reminders are enabled (`enable` has run and the service is not disabled); `CCDM_CLAUDE_REMINDER_ADAPTER` applies to Channel Conversations only. A qualifying reply arms the usual 1h → 2h → 4h … 24h backoff.
+- **Delivery:** the worker posts `👀` into the thread with the project's assigned bot, using the same nonce and `enforce_nonce` replay as a channel reminder. Every thread send passes the global 5-second gate that spaces catch-ups, so many waiting threads never burst. There is no digest. The assigned bot needs Send Messages in Threads.
+- **Acknowledgment is thread-local:** the owner's message, attachment, reaction, or thread command in thread A acknowledges only thread A, never a sibling thread or the channel. Guest activity never counts.
+- **Stopped threads keep reminding:** an auto-archived or evicted thread still gets its reminders. Posting into an auto-archived thread reopens it, and the Thread Supervisor ignores that bot unarchive, so no session starts until the owner writes again.
+- **Closing:** an owner or root archive, and an in-thread `/close`, make the Thread Supervisor emit `conversation_closed` through the event outbox. It closes only that thread's reminders; the channel and other threads keep theirs. The reminder observer leaves an in-thread `/close` to the supervisor, so it adds no ✅. A new owner message reopens the thread's conversation.
+- **Deletion:** deleting a thread emits `conversation_deleted`. It drops that thread's state and pending deliveries, then deletes its outstanding reminder as a best effort.
+- **Release:** threads have no history scan yet. A newly seen thread is released for delivery once reminders are enabled, and a thread sent back through restart reconciliation is released at once.
+- **Health:** the observer checks each thread's own assignment, readiness (`conversation-reminder-readiness.py <project> --conversation <thread_id>`), and permissions, and suspends or resumes only that thread. A thread's Claude session need not be running for its reminders.
 
 ## Foreground commands
 

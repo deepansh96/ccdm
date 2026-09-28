@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { createWorkspace, runNodeEntrypoint, runScript } from "./support/runner.js";
-import { bridgeChildEnv, waitForState } from "./support/bridge.js";
+import { bridgeChildEnv, injectDiscordMessage, injectDiscordThread, waitForState } from "./support/bridge.js";
 import { readState, seedRegistry, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 
@@ -608,7 +608,7 @@ test("Claude launcher, filtered channel, command hooks and readiness share one l
   const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
   assert.equal(readiness.exitCode, 0, readiness.stderr);
   assert.deepEqual(JSON.parse(readiness.stdout).events.map(event => event.event_type), ["owner_activity", "response_delivered", "turn_completed"]);
-  const marker = path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders", "capabilities", "demo.json");
+  const marker = path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders", "capabilities", "demo", "channel-1.json");
   assert.deepEqual([JSON.parse(fs.readFileSync(marker, "utf8")).launch_id, JSON.parse(fs.readFileSync(marker, "utf8")).pid],
     [launchEnv.CCDM_CLAUDE_LAUNCH_ID, adapter.pid]);
   await adapter.stop();
@@ -641,7 +641,7 @@ test("a plain Claude restart after an adapter launch never reports a stale ready
   // The adapter dies without cleanup, as with SIGKILL: its marker survives but
   // no longer proves a live launch.
   await adapter.stop("SIGKILL");
-  const marker = path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders", "capabilities", "demo.json");
+  const marker = path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders", "capabilities", "demo", "channel-1.json");
   assert.equal(fs.existsSync(marker), true);
   const dead = await readiness();
   assert.equal(dead.exitCode, 2);
@@ -741,4 +741,191 @@ test("a Claude input-needed receipt replayed after downtime gets one catch-up fr
   await service("disable");
   assert.equal((await running).exitCode, 0);
   await relaunched.stop();
+});
+
+// Thread Conversations under a Claude project channel. The Thread Supervisor
+// and the reminder service's observer each hold a Gateway connection and
+// receive every thread event; the thread's Claude session is driven through
+// the proxy configuration and command hooks its launch generated.
+const THREAD = "1500000000000123456";
+const THREAD_TOKEN = "project-token";
+
+function setupClaudeThreads(workspace) {
+  const botState = path.join(workspace.homeDir, ".claude", "channels", "discord-demo");
+  fs.mkdirSync(botState, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(botState, ".env"), `DISCORD_BOT_TOKEN=${THREAD_TOKEN}\n`, { mode: 0o600 });
+  const claudeHome = path.join(workspace.homeDir, ".claude-work");
+  const plugin = path.join(claudeHome, "plugins", "cache", "claude-plugins-official", "discord", "0.0.4");
+  fs.mkdirSync(plugin, { recursive: true });
+  fs.writeFileSync(path.join(plugin, "server.ts"), "// fixture official plugin\n");
+  const projectDir = path.join(workspace.tmpDir, "demo project");
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), JSON.stringify({
+    discord_user_id: "owner", guild_id: "guild", root_bot_app_id: "root-app",
+    pool: [{ id: "bot", app_id: "app", token: THREAD_TOKEN, state_dir: botState, assigned_to: "demo" }],
+    projects: { demo: { type: "claude", path: projectDir, bot_id: "bot", channel_id: "channel", screen_name: "demo_session",
+      claude_home: claudeHome, assignment_generation: "generation-1", guest_user_ids: ["guest"] } },
+  }, null, 2), { mode: 0o600 });
+  const rootState = path.join(workspace.homeDir, "root-discord");
+  fs.mkdirSync(rootState, { recursive: true });
+  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.fanOut = true;
+  writeState(seed, workspace.stateDir);
+  const threadClock = path.join(workspace.tmpDir, "thread-clock");
+  fs.writeFileSync(threadClock, `${new Date().toISOString()}\n`);
+  const reminderClock = path.join(workspace.tmpDir, "reminder-clock");
+  fs.writeFileSync(reminderClock, new Date().toISOString());
+  const stateDir = path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders");
+  const env = bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState, CCDM_THREAD_NODE: process.execPath,
+    CCDM_THREAD_CLOCK_FILE: threadClock, CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: reminderClock,
+    CCDM_FIXTURE_CLAUDE_VERSION: "2.1.281 (Claude Code)", CCDM_REMINDER_PROJECT_ROOT: workspace.repoDir });
+  return { env, stateDir, reminderClock, threadDir: path.join(botState, "threads", THREAD) };
+}
+
+async function threadReminderCommand(workspace, context, name) {
+  const result = await runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: [name, "--project-root", workspace.repoDir, "--state-dir", context.stateDir], env: context.env });
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  return JSON.parse(result.stdout);
+}
+
+async function waitForSupervisorThread(workspace, context, predicate) {
+  let current;
+  for (let attempt = 0; attempt < 300; attempt++) {
+    const result = await runScript(workspace, "scripts/thread-supervisor.py", { args: ["status"], env: context.env });
+    current = JSON.parse(result.stdout);
+    const thread = current.projects?.demo?.threads?.[THREAD];
+    if (thread && predicate(thread)) return thread;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error(`Timed out waiting for thread ${THREAD}: ${JSON.stringify(current)}`);
+}
+
+// The thread's proxy, run as its generated MCP config tells Claude Code to,
+// with the official plugin replaced by a Local Fake that confirms each reply.
+async function startThreadProxy(workspace, context) {
+  const server = JSON.parse(fs.readFileSync(path.join(context.threadDir, "ccdm-message-export-mcp.json"), "utf8"))
+    .mcpServers.discord;
+  const fake = path.join(workspace.tmpDir, "fake-official-thread-plugin.cjs");
+  fs.writeFileSync(fake, `
+process.stdin.setEncoding("utf8");
+let buffer = "";
+const write = value => process.stdout.write(JSON.stringify(value) + "\\n");
+process.stdin.on("data", chunk => {
+  buffer += chunk;
+  for (let end; (end = buffer.indexOf("\\n")) >= 0;) {
+    const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
+    if (!line) continue;
+    const request = JSON.parse(line);
+    if (request.method === "initialize") write({ jsonrpc: "2.0", id: request.id, result: {
+      protocolVersion: "2025-03-26", capabilities: { experimental: { "claude/channel": {} }, tools: {} },
+      serverInfo: { name: "discord", version: "1.0.0" }, instructions: "Official Discord reply" } });
+    if (request.method === "tools/list") write({ jsonrpc: "2.0", id: request.id, result: { tools:
+      ["reply", "react", "edit_message", "download_attachment", "fetch_messages"].map(name => ({ name, inputSchema: {
+        type: "object", properties: { chat_id: { type: "string" }, text: { type: "string" } }, required: ["chat_id", "text"] } })) } });
+    if (request.method === "tools/call") write({ jsonrpc: "2.0", id: request.id,
+      result: { content: [{ type: "text", text: "sent (id: thread-reply-1)" }] } });
+  }
+});
+`);
+  const child = spawn(process.execPath, server.args, {
+    cwd: workspace.repoDir, stdio: ["pipe", "pipe", "pipe"],
+    env: { ...context.env, ...server.env, CCDM_CLAUDE_PLUGIN_COMMAND: process.execPath,
+      CCDM_CLAUDE_PLUGIN_ARGS: JSON.stringify([fake]) },
+  });
+  const exited = new Promise(resolve => child.once("exit", resolve));
+  registerTeardownCallback(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    await exited;
+  });
+  let output = "";
+  let errors = "";
+  child.stdout.on("data", chunk => { output += chunk; });
+  child.stderr.on("data", chunk => { errors += chunk; });
+  const send = value => child.stdin.write(JSON.stringify({ jsonrpc: "2.0", ...value }) + "\n");
+  const until = async (predicate, label) => {
+    for (let attempt = 0; attempt < 250 && !predicate(); attempt++) await new Promise(r => setTimeout(r, 20));
+    assert.ok(predicate(), `the thread proxy never produced ${label}: ${output}\n${errors}`);
+  };
+  send({ id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {},
+    clientInfo: { name: "claude-code", version: "2.1.281" } } });
+  await until(() => output.includes('"id":1'), "the initialize response");
+  send({ method: "notifications/initialized" });
+  send({ id: 2, method: "tools/list" });
+  await until(() => output.includes("notifications/claude/channel"), "the bootstrap");
+  return { env: server.env, send, until, get output() { return output; } };
+}
+
+// Runs the launch's command hooks for one Claude Code hook event.
+async function runThreadHooks(workspace, context, env, event, fields = {}) {
+  const settings = JSON.parse(fs.readFileSync(env.CCDM_CLAUDE_HOOK_SETTINGS, "utf8"));
+  for (const group of settings.hooks[event] ?? []) {
+    for (const hook of group.hooks) {
+      // Claude Code runs each command hook in a shell with node on PATH.
+      const child = spawn("/bin/sh", ["-c", hook.command], { cwd: workspace.repoDir, stdio: ["pipe", "ignore", "pipe"],
+        env: { ...context.env, ...env, PATH: `${path.dirname(process.execPath)}:${context.env.PATH}` } });
+      let errors = "";
+      child.stderr.on("data", chunk => { errors += chunk; });
+      child.stdin.end(JSON.stringify({ hook_event_name: event, session_id: "thread-session", ...fields }));
+      const exitCode = await new Promise(resolve => child.once("exit", resolve));
+      assert.equal(exitCode, 0, `${hook.command}: ${errors}`);
+    }
+  }
+}
+
+const threadReminders = (state, channelId) => (state.fixtures.discord.messages ?? [])
+  .filter(message => message.content === "👀" && message.channelId === channelId);
+
+test("an agent reply in a Claude thread arms a 1h reminder that the project bot posts in that thread", async () => {
+  const workspace = createWorkspace();
+  const context = setupClaudeThreads(workspace);
+  await threadReminderCommand(workspace, context, "enable");
+  const reminders = runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["run", "--project-root", workspace.repoDir, "--state-dir", context.stateDir], env: context.env,
+    timeoutMs: 60000 });
+  const supervisor = runScript(workspace, "scripts/thread-supervisor.py", { args: ["run"], env: context.env,
+    timeoutMs: 60000 });
+  await waitForState(workspace, state => (state.fixtures.discord.logins ?? []).length === 2, 10000);
+  injectDiscordThread(workspace, { id: THREAD, parentId: "channel", name: "Login bug", ownerId: "owner",
+    autoArchiveDuration: 10080 });
+  injectDiscordMessage(workspace, { id: "owner-1", channelId: THREAD, channelType: 11, parentId: "channel",
+    author: { id: "owner", username: "owner" }, content: "fix the login redirect" });
+  await waitForSupervisorThread(workspace, context, row => row.state === "live");
+
+  // The enabled reminder service gives the thread launch its reminder hooks.
+  const proxy = await startThreadProxy(workspace, context);
+  assert.equal(proxy.env.CCDM_CLAUDE_REMINDER_ADAPTER, "1");
+  await runThreadHooks(workspace, context, proxy.env, "SessionStart");
+  proxy.send({ id: 3, method: "tools/call", params: { name: "reply", arguments: { chat_id: THREAD,
+    text: "Fixed: the redirect keeps the query string.", conversation_interaction_id: "owner-1",
+    conversation_disposition: "progress" } } });
+  await proxy.until(() => proxy.output.includes("thread-reply-1"), "the confirmed reply");
+  // The launch proves its capability in this conversation's own marker.
+  const marker = JSON.parse(fs.readFileSync(path.join(context.stateDir, "capabilities", "demo", `${THREAD}.json`), "utf8"));
+  assert.deepEqual([marker.conversation_id, marker.channel_id], [THREAD, "channel"]);
+  await runThreadHooks(workspace, context, proxy.env, "Stop", { background_tasks: [], session_crons: [] });
+
+  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", {
+    args: ["demo", "--json", "--conversation", THREAD], env: context.env });
+  const events = JSON.parse(readiness.stdout).events;
+  assert.deepEqual(events.filter(row => row.provider === "claude").map(row => [row.event_type, row.conversation_id]),
+    [["response_delivered", THREAD], ["turn_completed", THREAD]]);
+
+  // Nothing before the hour; then one 👀 in the thread, from the project bot.
+  fs.writeFileSync(context.reminderClock, new Date(Date.now() + 59 * 60000).toISOString());
+  await new Promise(resolve => setTimeout(resolve, 1500));
+  assert.equal(threadReminders(readState(workspace.stateDir), THREAD).length, 0);
+  fs.writeFileSync(context.reminderClock, new Date(Date.now() + 61 * 60000).toISOString());
+  const posted = await waitForState(workspace, state => threadReminders(state, THREAD).length === 1, 15000);
+  assert.equal(threadReminders(posted, THREAD)[0].authorization, `Bot ${THREAD_TOKEN}`);
+  assert.equal(threadReminders(posted, "channel").length, 0);
+
+  await threadReminderCommand(workspace, context, "disable");
+  const status = await runScript(workspace, "scripts/thread-supervisor.py", { args: ["status"], env: context.env });
+  process.kill(-JSON.parse(status.stdout).worker_pid, "SIGTERM");
+  for (const running of [reminders, supervisor]) {
+    const result = await running;
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  }
 });

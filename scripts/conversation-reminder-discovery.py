@@ -168,9 +168,15 @@ def next_request(db: sqlite3.Connection, usable: dict, now: datetime) -> dict | 
     if settings.get("disabled") == "1":
         return None
     requested = settings.get("discovery_requested") == "1"
+    # Thread Conversations have no history scan: a thread is released at once,
+    # a new one only after reminders are enabled.
+    startable = ",".join("?" * len(STARTABLE))
+    db.execute(f"""UPDATE conversations SET reconciliation_status='ready'
+        WHERE conversation_id!=channel_id AND reconciliation_status IN ({startable})
+          AND (? OR reconciliation_status!='suspended-incomplete-discovery')""", (*sorted(STARTABLE), requested))
     pass_key = int(now.timestamp()) // PASS_SECONDS
     candidates = []
-    for row in db.execute("SELECT * FROM conversations ORDER BY project").fetchall():
+    for row in db.execute("SELECT * FROM conversations WHERE conversation_id=channel_id ORDER BY project").fetchall():
         assignment = usable.get(row["project"])
         status = row["reconciliation_status"]
         if status not in STARTABLE or assignment is None or (

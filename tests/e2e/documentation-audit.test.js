@@ -112,6 +112,26 @@ test("scenario matrix records the Conversation Reminder store schema v7 migratio
   assert.match(matrix, /\| Conversation reminders \| Store schema v7 migration \| Covered \| `conversation-reminder-migration\.test\.js` seeds a v6 store.*consecutive_reminders.*future version is refused.*conversation_id.*stale.*pre-upgrade event without `conversation_id`/);
 });
 
+test("scenario matrix records Thread Conversation reminders", () => {
+  for (const [scenario, detail] of [
+    ["Thread reply arms an in-thread reminder", /conversation-reminder-codex\.test\.js.*Codex thread host.*conversation-reminder-claude\.test\.js/],
+    ["Per-conversation Claude capability marker", /capabilities\/<project>\/<channel_id>\.json.*not verified/],
+    ["Thread-local acknowledgment", /thread A acknowledges only A.*guest/],
+    ["Thread close events", /`\/close`.*owner archive.*`conversation_closed`/],
+    ["Thread deletion", /`conversation_deleted`.*deletes the thread's outstanding reminder/],
+    ["Reminder into an auto-archived thread", /reopens it.*starts no session/],
+  ]) {
+    const row = matrix.split("\n").find(line => line.startsWith(`| Conversation reminders | ${scenario} | Covered | `));
+    assert.ok(row, scenario);
+    assert.match(row, detail);
+  }
+  const guide = fs.readFileSync("docs/conversation-reminders.md", "utf8");
+  for (const phrase of ["## Thread Conversations", "conversation_closed", "conversation_deleted",
+    "capabilities/<project>/<conversation_id>.json", "--conversation <thread_id>"]) {
+    assert.ok(guide.includes(phrase), phrase);
+  }
+});
+
 test("scenario matrix records the always-on Claude conversation-scoped proxy", () => {
   assert.match(matrix, /\| Claude start \| Always-on conversation-scoped proxy \| Covered \| .*--dangerously-load-development-channels server:discord/);
   assert.match(matrix, /\| Claude start \| Proxy Claude Code version gate \| Covered \| .*2\.1\.281/);

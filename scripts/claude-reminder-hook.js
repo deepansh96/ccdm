@@ -10,6 +10,8 @@ const reminder = require("./conversation-reminder-adapter.js");
 const root = process.env.CCDM_REMINDER_PROJECT_ROOT || path.resolve(__dirname, "..");
 const project = process.env.CCDM_CLAUDE_PROJECT;
 const channel = process.env.CCDM_CLAUDE_CHANNEL_ID;
+// A Thread Conversation's launch reports for its thread.
+const thread = process.env.CCDM_CLAUDE_THREAD_ID || "";
 const appId = process.env.CCDM_CLAUDE_BOT_APP_ID;
 const launchId = process.env.CCDM_CLAUDE_LAUNCH_ID;
 const stateDir = process.env.CCDM_REMINDER_STATE_DIR || path.join(os.homedir(), ".local", "state", "ccdm", "conversation-reminders");
@@ -43,10 +45,11 @@ async function main() {
   if (!project || !channel || !appId || !launchId) return;
   const input = await readInput();
   if (!input.session_id || input.agent_id) return;
-  const assignment = await reminder.resolveAssignmentForChannel(channel, {
-    registryPath: path.join(root, "registry.json"), botAppId: appId,
+  const assignment = await reminder.resolveAssignmentForChannel(thread || channel, {
+    registryPath: path.join(root, "registry.json"), botAppId: appId, threads: Boolean(thread),
   });
-  if (!assignment || assignment.project !== project || assignment.project_type !== "claude") return;
+  if (!assignment || assignment.project !== project || assignment.project_type !== "claude" ||
+      assignment.channel_id !== channel) return;
   const context = { ...assignment, provider: "claude", provider_session_id: launchId };
   if (input.hook_event_name === "SessionStart") {
     await fs.mkdir(path.dirname(bindingPath), { recursive: true, mode: 0o700 });

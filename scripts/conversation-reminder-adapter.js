@@ -29,43 +29,59 @@ function assignmentGeneration(projectName, ownerId, channelId, botId, botAppId, 
   ].join("\0")).digest("hex")}`;
 }
 
+const CONVERSATION_RESOLVER = path.join(__dirname, "resolve-conversation.py");
+
+// The shared conversation resolver maps a channel or bound thread id to its
+// project; null for an unknown or ambiguous id.
+async function resolveConversation(id, projectRoot) {
+  try {
+    const { stdout } = await execFileAsync("python3", [CONVERSATION_RESOLVER, String(id), "--project-root", projectRoot],
+      { encoding: "utf8" });
+    return JSON.parse(stdout);
+  } catch {
+    return null;
+  }
+}
+
+// The assignment of the Project Conversation held in `channelId`: a project
+// channel's Channel Conversation, or, with `threads`, a bound thread's Thread
+// Conversation. `conversation_id` is the thread id for a thread and the
+// channel id otherwise; `channel_id` is always the project channel.
 async function resolveAssignmentForChannel(channelId, options = {}) {
   const registryPath = options.registryPath || path.join(PROJECT_ROOT, "registry.json");
+  const resolved = channelId ? await resolveConversation(channelId, path.dirname(registryPath)) : null;
+  if (!resolved || (resolved.thread_id && !options.threads)) return null;
   const registry = JSON.parse(await fs.readFile(registryPath, "utf8"));
-  const projects = registry.projects && typeof registry.projects === "object" ? registry.projects : {};
-  const matches = [];
-  for (const [projectName, project] of Object.entries(projects)) {
-    if (!project || project.channel_id !== channelId || !project.bot_id) continue;
-    const bots = Array.isArray(registry.pool)
-      ? registry.pool.filter((bot) => bot && bot.id === project.bot_id)
-      : [];
-    if (bots.length !== 1) continue;
-    const bot = bots[0];
-    if (options.botAppId && bot.app_id !== options.botAppId) continue;
-    const ownerId = String(registry.discord_user_id || "");
-    const generation = project.assignment_generation
-      ? String(project.assignment_generation)
-      : assignmentGeneration(
-        projectName,
-        ownerId,
-        String(project.channel_id),
-        String(project.bot_id),
-        String(bot.app_id || ""),
-        String(project.registered_at || ""),
-      );
-    matches.push({
-      project: projectName,
-      project_type: project.type || "claude",
-      owner_id: ownerId,
-      channel_id: String(project.channel_id),
-      bot_id: String(project.bot_id),
-      bot_app_id: String(bot.app_id || ""),
-      assignment_generation: generation,
-    });
-  }
-  if (matches.length !== 1) return null;
-  if (options.requireCodex && matches[0].project_type !== "codex") return null;
-  return matches[0];
+  const project = registry.projects?.[resolved.project];
+  if (!project || !project.bot_id) return null;
+  const bots = Array.isArray(registry.pool) ? registry.pool.filter((bot) => bot && bot.id === project.bot_id) : [];
+  if (bots.length !== 1) return null;
+  const bot = bots[0];
+  if (options.botAppId && bot.app_id !== options.botAppId) return null;
+  const ownerId = String(registry.discord_user_id || "");
+  const generation = project.assignment_generation
+    ? String(project.assignment_generation)
+    : assignmentGeneration(
+      resolved.project,
+      ownerId,
+      String(project.channel_id),
+      String(project.bot_id),
+      String(bot.app_id || ""),
+      String(project.registered_at || ""),
+    );
+  const assignment = {
+    project: resolved.project,
+    project_type: resolved.provider || project.type || "claude",
+    owner_id: ownerId,
+    channel_id: String(project.channel_id),
+    conversation_id: String(resolved.thread_id || project.channel_id),
+    ...(resolved.thread_id ? { thread_id: String(resolved.thread_id) } : {}),
+    bot_id: String(project.bot_id),
+    bot_app_id: String(bot.app_id || ""),
+    assignment_generation: generation,
+  };
+  if (options.requireCodex && assignment.project_type !== "codex") return null;
+  return assignment;
 }
 
 function createEvent(eventType, context, fields = {}) {
@@ -129,14 +145,16 @@ async function emitEvent(eventType, context, fields = {}) {
   return event;
 }
 
-async function writeActiveContext(context) {
-  if (!CONTEXT_FILE) return;
-  await ensurePrivateDirectory(path.dirname(CONTEXT_FILE));
+// A process serving several conversations passes each one's own context file.
+async function writeActiveContext(context, file = CONTEXT_FILE) {
+  if (!file) return;
+  await ensurePrivateDirectory(path.dirname(file));
   const payload = {
     schema_version: 1,
     project: context.project,
     owner_id: context.owner_id,
     channel_id: context.channel_id,
+    conversation_id: context.conversation_id || context.channel_id,
     bot_id: context.bot_id,
     assignment_generation: context.assignment_generation,
     provider: "codex",
@@ -146,17 +164,19 @@ async function writeActiveContext(context) {
     source_message_id: context.source_message_id,
     initiator_id: context.initiator_id,
   };
-  const temporaryPath = `${CONTEXT_FILE}.${process.pid}.tmp`;
+  const temporaryPath = `${file}.${process.pid}.tmp`;
   await fs.writeFile(temporaryPath, `${JSON.stringify(payload)}\n`, { flag: "w", mode: 0o600 });
   await fs.chmod(temporaryPath, 0o600);
-  await fs.rename(temporaryPath, CONTEXT_FILE);
+  await fs.rename(temporaryPath, file);
 }
 
+// The active context of the conversation held in `targetChannelId`.
 async function readActiveContext(targetChannelId) {
   if (!CONTEXT_FILE) return null;
   try {
     const context = JSON.parse(await fs.readFile(CONTEXT_FILE, "utf8"));
-    if (context.schema_version !== 1 || context.provider !== "codex" || context.channel_id !== targetChannelId) return null;
+    if (context.schema_version !== 1 || context.provider !== "codex" ||
+        (context.conversation_id || context.channel_id) !== targetChannelId) return null;
     for (const field of ["project", "owner_id", "channel_id", "bot_id", "assignment_generation", "provider_session_id", "provider_turn_id", "interaction_id"]) {
       if (typeof context[field] !== "string" || !context[field]) return null;
     }
@@ -230,9 +250,9 @@ async function removeTurnReceipts(sessionId, turnId) {
   }
 }
 
-async function clearActiveContext() {
-  if (!CONTEXT_FILE) return;
-  await fs.rm(CONTEXT_FILE, { force: true });
+async function clearActiveContext(file = CONTEXT_FILE) {
+  if (!file) return;
+  await fs.rm(file, { force: true });
 }
 
 async function isRecordedReminderMessage(messageId) {

@@ -17,6 +17,15 @@ const path = require("node:path");
 const WebSocket = require("ws");
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
 
+// Conversation Reminder receipts and events, shared with the conversations'
+// Discord servers; each conversation has its own active reply context file.
+const REMINDER_STATE_DIR = process.env.CCDM_REMINDER_STATE_DIR ||
+  path.join(os.homedir(), ".local", "state", "ccdm", "conversation-reminders");
+process.env.CCDM_REMINDER_PROJECT_ROOT = path.resolve(__dirname, "..");
+process.env.CCDM_REMINDER_STATE_DIR = REMINDER_STATE_DIR;
+process.env.CCDM_REMINDER_RECEIPTS_DIR = path.join(REMINDER_STATE_DIR, "receipts");
+const reminder = require("./conversation-reminder-adapter.js");
+
 const argument = name => process.argv.includes(name) ? process.argv[process.argv.indexOf(name) + 1] : null;
 const PROJECT = argument("--project");
 const ROOT_DIR = path.resolve(__dirname, "..");
@@ -51,6 +60,7 @@ if (!project || !bot?.token) {
   process.exit(2);
 }
 const PROJECT_DIR = project.path.replace(/^~(?=$|\/)/, os.homedir());
+const OWNER_ID = String(registry.discord_user_id || "");
 const ALLOWED_USER_IDS = new Set([registry.discord_user_id, ...(project.guest_user_ids || [])]
   .filter(Boolean).map(String));
 const TEXT_REPLY_FALLBACK = project.text_reply_fallback === true;
@@ -187,6 +197,42 @@ function mcpName(conv) {
   return `discord-${conv.threadId}`;
 }
 
+function reminderContextFile(conv) {
+  return path.join(REMINDER_STATE_DIR, `active-codex-thread-${conv.threadId}.json`);
+}
+
+// A turn answering the owner's message `source` records its replies against
+// that message, so its completion can arm the thread's Conversation Reminder.
+async function beginReminder(conv, source) {
+  conv.reminderContext = null;
+  if (!source || String(source.author_id) !== OWNER_ID || !conv.activeTurnId) return;
+  const assignment = await reminder.resolveAssignmentForChannel(conv.threadId, {
+    threads: true, requireCodex: true, ...(bot.app_id ? { botAppId: bot.app_id } : {}),
+  }).catch(() => null);
+  if (!assignment || assignment.project !== PROJECT) return;
+  conv.reminderContext = { ...assignment, provider: "codex", provider_session_id: conv.codexThreadId,
+    provider_turn_id: conv.activeTurnId, interaction_id: source.id, source_message_id: source.id,
+    initiator_id: String(source.author_id) };
+  await reminder.writeActiveContext(conv.reminderContext, reminderContextFile(conv));
+}
+
+// A completed turn whose confirmed replies answer its owner message arms the reminder.
+async function endReminder(conv, completed) {
+  const context = conv.reminderContext;
+  conv.reminderContext = null;
+  if (!context) return;
+  const receipts = await reminder.receiptsForTurn(context.provider_session_id, context.provider_turn_id);
+  const answered = receipts.filter(receipt => receipt.interaction_id === context.interaction_id);
+  if (completed && answered.length) {
+    await reminder.emitEvent("turn_completed", context, {
+      delivered_message_ids: [...new Set(answered.map(receipt => receipt.message_id))],
+      source_message_id: context.source_message_id,
+    });
+  }
+  await reminder.removeTurnReceipts(context.provider_session_id, context.provider_turn_id);
+  await reminder.clearActiveContext(reminderContextFile(conv));
+}
+
 // Every `discord-*` server of the home other than the conversation's own, sorted.
 async function homeDiscordServers(conv) {
   let cursor;
@@ -210,7 +256,10 @@ function mcpOverride(conv, others) {
     [mcpName(conv)]: {
       command: "node",
       args: [MCP_SERVER_SCRIPT],
-      env: { BOT_TOKEN: bot.token, CHANNEL_ID: conv.threadId, DISCORD_REPLY_TOKEN: conv.replyToken },
+      env: { BOT_TOKEN: bot.token, CHANNEL_ID: conv.threadId, DISCORD_REPLY_TOKEN: conv.replyToken,
+        CCDM_REMINDER_PROJECT_ROOT: process.env.CCDM_REMINDER_PROJECT_ROOT, CCDM_REMINDER_STATE_DIR: REMINDER_STATE_DIR,
+        CCDM_REMINDER_RECEIPTS_DIR: process.env.CCDM_REMINDER_RECEIPTS_DIR,
+        CCDM_REMINDER_CONTEXT_FILE: reminderContextFile(conv) },
       // Without full access, Codex asks before each tool call, and nobody can answer.
       ...(conv.sandbox === FULL_ACCESS ? {} : { default_tools_approval_mode: "approve" }),
     },
@@ -336,6 +385,8 @@ async function onTurnCompleted(conv, turn) {
     return;
   }
   void report(conv.threadId, "turn-ended");
+  await endReminder(conv, !terminalError && turn.status === "completed").catch(error =>
+    log(`thread ${conv.threadId}: recording the reminder completion failed: ${error.message}`));
   if (terminalError) {
     await sendToThread(conv, `**Error:** ${terminalError}`);
   } else if (TEXT_REPLY_FALLBACK && !replied && text && (!turn.status || turn.status === "completed")) {
@@ -344,7 +395,7 @@ async function onTurnCompleted(conv, turn) {
   processQueue(conv);
 }
 
-async function sendTurn(conv, input) {
+async function sendTurn(conv, input, source = null) {
   beginTurn(conv);
   try {
     // A `discord-*` server added to the home since the override was built
@@ -360,6 +411,8 @@ async function sendTurn(conv, input) {
     });
     conv.activeTurnId ||= result?.turn?.id || null;
     void report(conv.threadId, "turn-started");
+    await beginReminder(conv, source).catch(error =>
+      log(`thread ${conv.threadId}: recording the reminder context failed: ${error.message}`));
   } catch (error) {
     log(`thread ${conv.threadId}: turn/start failed: ${error.message}`);
     conv.turnActive = false;
@@ -370,12 +423,14 @@ async function sendTurn(conv, input) {
 
 function processQueue(conv) {
   if (conv.paused || conv.turnActive || conv.stopped || conv.queue.length === 0) return;
-  void sendTurn(conv, conv.queue.shift());
+  const { input, source } = conv.queue.shift();
+  void sendTurn(conv, input, source);
 }
 
-function route(conv, input) {
-  if (conv.paused || conv.turnActive) conv.queue.push(input);
-  else void sendTurn(conv, input);
+// `source` is the thread message the input carries, if any.
+function route(conv, input, source = null) {
+  if (conv.paused || conv.turnActive) conv.queue.push({ input, source });
+  else void sendTurn(conv, input, source);
 }
 
 function splitMessage(text, limit = 2000) {
@@ -427,7 +482,9 @@ async function startConversation(conv, opened) {
     return;
   }
   // sendTurn marks the turn active before yielding, so later messages queue behind it.
-  const first = sendTurn(conv, [{ type: "text", text: firstTurnText(conv, opened.starter, messages) }]);
+  // The first turn answers the latest owner message it carries.
+  const latestOwner = messages.filter(message => String(message.author_id) === OWNER_ID).at(-1) || null;
+  const first = sendTurn(conv, [{ type: "text", text: firstTurnText(conv, opened.starter, messages) }], latestOwner);
   await first;
   await report(conv.threadId, "ready", conv.trigger);
 }
@@ -491,6 +548,8 @@ async function stop(threadId) {
   if (conversations.size === 0) stopping = true;
   if (!conv) return { ok: true, result: "not-open" };
   await unload(conv);
+  conv.reminderContext = null;
+  await reminder.clearActiveContext(reminderContextFile(conv)).catch(() => {});
   return { ok: true, result: "stopped" };
 }
 
@@ -617,7 +676,7 @@ client.on("messageCreate", msg => {
     return;
   }
   log(`thread ${conv.threadId}: ${entry.author}: ${entry.content}`);
-  route(conv, [{ type: "text", text: entry.content }]);
+  route(conv, [{ type: "text", text: entry.content }], entry);
 });
 
 client.on("messageReactionAdd", async (reaction, user) => {

@@ -40,7 +40,14 @@ def adapter_process_live(pid: object) -> bool:
     return "claude-reminder-channel.js" in command
 
 
-def build_readiness(project_name: str, project_root: Path, state_dir: Path) -> dict:
+def capability_path(state_dir: Path, project_name: str, conversation_id: str) -> Path:
+    """A Claude launch's capability marker, one per Project Conversation."""
+    return state_dir / "capabilities" / project_name / f"{conversation_id}.json"
+
+
+def build_readiness(project_name: str, project_root: Path, state_dir: Path, conversation: str | None = None) -> dict:
+    """Readiness of the project's Channel Conversation, or with ``conversation``
+    of that bound Thread Conversation."""
     missing_credentials: list[str] = []
     assignment_mismatches: list[str] = []
     unsupported_capabilities: list[str] = []
@@ -59,11 +66,18 @@ def build_readiness(project_name: str, project_root: Path, state_dir: Path) -> d
     except ValueError:
         assignment = None
         assignment_mismatches.append("project assignment is incomplete or ambiguous")
+    thread_id = conversation if assignment and conversation and conversation != assignment["channel_id"] else None
     if assignment:
         project = assignment["project"]
         provider = project.get("type") or "claude"
+        if thread_id:
+            bound = _EVENTS.thread_provider(project_name, project, thread_id)
+            if bound is None:
+                assignment_mismatches.append("thread is not bound to this project")
+            provider = bound or provider
         assignment_summary = {
             "channel_id": assignment["channel_id"],
+            "conversation_id": thread_id or assignment["channel_id"],
             "bot_id": assignment["bot_id"],
             "generation": assignment["generation"],
         }
@@ -73,9 +87,11 @@ def build_readiness(project_name: str, project_root: Path, state_dir: Path) -> d
             # Local events cannot prove an authenticated adapter on the remote host.
             unsupported_capabilities.append(
                 f"remote {provider.capitalize()} adapter deployment is not verified by local readiness")
-        if provider == "claude":
+        # A Thread Conversation keeps its reminders while its session is stopped:
+        # the Thread Supervisor owns its /close, so no live transport is required.
+        if provider == "claude" and not thread_id:
             try:
-                capability = json.loads((state_dir / "capabilities" / f"{project_name}.json").read_text())
+                capability = json.loads(capability_path(state_dir, project_name, assignment["channel_id"]).read_text())
             except (OSError, json.JSONDecodeError):
                 capability = {}
             verified = (
@@ -153,8 +169,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--state-dir", type=Path, default=_EVENTS.default_state_dir())
     parser.add_argument("--json", action="store_true", help="print machine-readable status")
+    parser.add_argument("--conversation", help="a bound thread id: report that Thread Conversation")
     args = parser.parse_args(argv)
-    readiness = build_readiness(args.project, args.project_root.expanduser().resolve(), args.state_dir.expanduser())
+    readiness = build_readiness(args.project, args.project_root.expanduser().resolve(), args.state_dir.expanduser(),
+                                args.conversation)
     if args.json:
         print(json.dumps(readiness, sort_keys=True))
     else:

@@ -385,6 +385,49 @@ def current_conversation(db: sqlite3.Connection, name: str, assignment: dict) ->
     return current
 
 
+def thread_conversation(db: sqlite3.Connection, name: str, assignment: dict, thread_id: str,
+                        create: bool = True) -> sqlite3.Row | None:
+    """Return a Thread Conversation's row for the current assignment, retiring
+    a row left from another generation first. A new row waits for release like
+    a newly discovered channel."""
+    current = db.execute("SELECT * FROM conversations WHERE project=? AND conversation_id=?",
+                         (name, thread_id)).fetchone()
+    if current is not None and (current["assignment_generation"], current["channel_id"], current["bot_id"],
+                                current["owner_id"]) != (assignment["generation"], assignment["channel_id"],
+                                                         assignment["bot_id"], assignment["owner_id"]):
+        retire_conversation(db, current, "reassigned")
+        current = None
+    if current is None and create:
+        reused = db.execute("SELECT 1 FROM retired_assignments WHERE project=? AND assignment_generation=?",
+                            (name, assignment["generation"])).fetchone()
+        db.execute("""INSERT INTO conversations
+            (project,conversation_id,channel_id,bot_id,assignment_generation,owner_id,state,revision,
+             cleanup_message_ids,reconciliation_status,checkpoint)
+            VALUES (?,?,?,?,?,?,'open-paused',0,'[]',?,0)""",
+            (name, thread_id, assignment["channel_id"], assignment["bot_id"], assignment["generation"],
+             assignment["owner_id"], "blocked-retired-generation" if reused else "suspended-incomplete-discovery"))
+        current = db.execute("SELECT * FROM conversations WHERE project=? AND conversation_id=?",
+                             (name, thread_id)).fetchone()
+    return current
+
+
+def forget_conversation(db: sqlite3.Connection, row: sqlite3.Row) -> None:
+    """Drop a deleted thread's state and pending deliveries; its recorded
+    reminder stays queued for a best-effort delete."""
+    key = (row["project"], row["conversation_id"])
+    if row["reminder_message_id"]:
+        db.execute("""INSERT OR IGNORE INTO pending_actions
+            (action_id,project,conversation_id,assignment_generation,kind,message_id) VALUES (?,?,?,?,?,?)""",
+            ("delete:" + row["reminder_message_id"], *key, row["assignment_generation"], "delete",
+             row["reminder_message_id"]))
+    # A ✅ can no longer be added in a deleted thread.
+    db.execute("UPDATE pending_actions SET completed=2 WHERE project=? AND conversation_id=? AND kind='ack' "
+               "AND completed=0", key)
+    db.execute("DELETE FROM delivery_intents WHERE project=? AND conversation_id=? AND state!='sent'", key)
+    for table in ("owner_sources", "qualifications", "discoveries", "catch_ups", "conversations"):
+        db.execute(f"DELETE FROM {table} WHERE project=? AND conversation_id=?", key)
+
+
 def apply_event(db: sqlite3.Connection, registry: dict, row: sqlite3.Row) -> str:
     return apply_payload(db, registry, EVENTS.validate_event(json.loads(row["payload_json"])), row["commit_order"])
 
@@ -401,7 +444,18 @@ def apply_payload(db: sqlite3.Connection, registry: dict, event: dict, commit_or
     assignment = usable_assignment(registry, event["project"])
     if assignment is None:
         return "stale"
-    current = current_conversation(db, event["project"], assignment)
+    kind = event["event_type"]
+    conversation = event.get("conversation_id", event["channel_id"])
+    if conversation == assignment["channel_id"]:
+        current = current_conversation(db, event["project"], assignment)
+    else:
+        current = thread_conversation(db, event["project"], assignment, conversation,
+                                      create=kind != "conversation_deleted")
+    if kind == "conversation_deleted":
+        if current is not None:
+            forget_conversation(db, current)
+        db.execute("INSERT INTO applied_events VALUES (?)", (event["event_id"],))
+        return "applied"
     if current["reconciliation_status"] in DISCOVERY.ACTIVE or current["reconciliation_status"] == DISCOVERY.RESTART:
         # Left unapplied in the durable event ledger until the history baseline or
         # restart reconciliation commits.
@@ -412,7 +466,6 @@ def apply_payload(db: sqlite3.Connection, registry: dict, event: dict, commit_or
     scoped = "project=? AND conversation_id=? AND assignment_generation=?"
     changes = {"checkpoint": current["checkpoint"] if commit_order is None else commit_order,
                "last_event_order": event["event_order"]}
-    kind = event["event_type"]
     occurred = event["event_time"]
     duplicate_source = False
     if kind == "close_requested" or (kind == "owner_activity" and event["activity_kind"] != "reaction"):
@@ -431,10 +484,13 @@ def apply_payload(db: sqlite3.Connection, registry: dict, event: dict, commit_or
         duplicate_source = any(abs(iso(occurred) - at) <= REACTION_DUPLICATE_WINDOW for at in seen)
         if not duplicate_source:
             db.execute("INSERT OR IGNORE INTO owner_sources VALUES (?,?,?,?,?)", (*key, prefix + occurred, "reaction"))
-    stale_owner_event = (kind in {"close_requested", "owner_activity"} and current["last_ack_at"]
-                         and iso(occurred) < iso(current["last_ack_at"]))
+    stale_owner_event = (kind in {"close_requested", "owner_activity", "conversation_closed"}
+                         and current["last_ack_at"] and iso(occurred) < iso(current["last_ack_at"]))
     if stale_owner_event or duplicate_source:
         pass
+    elif kind == "conversation_closed":
+        # An owner or root archive, or an in-thread /close, closes only this thread.
+        changes.update(state="closed", due_at=None, current_interaction_id=None)
     elif kind == "close_requested":
         changes.update(state="closed", due_at=None, current_interaction_id=None,
                        last_ack_at=occurred, last_ack_message_id=event["source_message_id"])
@@ -1095,15 +1151,18 @@ def pending_actions(state_dir: Path) -> dict:
     if db is None:
         return {"actions": []}
     try:
-        rows = db.execute("""SELECT a.action_id,a.project,a.kind,a.message_id,a.assignment_generation,
-                COALESCE(c.channel_id,r.channel_id) AS channel_id, COALESCE(c.bot_id,r.bot_id) AS bot_id,
-                r.project IS NOT NULL AS retired
+        # A deleted thread's cleanup acts through its project's Channel Conversation assignment.
+        rows = db.execute("""SELECT a.action_id,a.project,a.conversation_id,a.kind,a.message_id,a.assignment_generation,
+                COALESCE(c.channel_id,r.channel_id,p.channel_id) AS channel_id,
+                COALESCE(c.bot_id,r.bot_id,p.bot_id) AS bot_id, r.project IS NOT NULL AS retired
             FROM pending_actions a
             LEFT JOIN conversations c ON c.project=a.project AND c.conversation_id=a.conversation_id
               AND c.assignment_generation=a.assignment_generation
             LEFT JOIN retired_assignments r ON r.project=a.project AND r.conversation_id=a.conversation_id
               AND r.assignment_generation=a.assignment_generation
-            WHERE a.completed=0 AND (c.project IS NOT NULL OR r.project IS NOT NULL)
+            LEFT JOIN conversations p ON p.project=a.project AND p.conversation_id=p.channel_id
+              AND p.assignment_generation=a.assignment_generation
+            WHERE a.completed=0 AND (c.project IS NOT NULL OR r.project IS NOT NULL OR p.project IS NOT NULL)
             ORDER BY a.rowid LIMIT 100""").fetchall()
         return {"actions": [{**dict(row), "retired": bool(row["retired"])} for row in rows]}
     finally:
@@ -1160,8 +1219,14 @@ SUSPENSIONS = {"suspended-assignment", "suspended-adapter-capability", "suspende
                "suspended-delivery-access"}
 
 
-def suspend_assignment(state_dir: Path, project: str, generation: str, reason: str) -> dict:
-    """Durably stop delivery for one assignment after lost access or capability."""
+def conversation_scope(conversation: str | None) -> tuple[str, tuple]:
+    """One Thread Conversation, or by default the project's Channel Conversation."""
+    return ("conversation_id=?", (conversation,)) if conversation else ("conversation_id=channel_id", ())
+
+
+def suspend_assignment(state_dir: Path, project: str, generation: str, reason: str,
+                       conversation: str | None = None) -> dict:
+    """Durably stop delivery for one conversation after lost access or capability."""
     if reason not in SUSPENSIONS:
         raise ValueError("unsupported suspension reason")
     db = connect(state_dir)
@@ -1169,27 +1234,29 @@ def suspend_assignment(state_dir: Path, project: str, generation: str, reason: s
         return {"status": "uninitialized"}
     try:
         db.execute("BEGIN IMMEDIATE")
-        db.execute("""UPDATE conversations SET reconciliation_status=?
-            WHERE project=? AND assignment_generation=?
+        scope, scoped = conversation_scope(conversation)
+        db.execute(f"""UPDATE conversations SET reconciliation_status=?
+            WHERE project=? AND assignment_generation=? AND {scope}
               AND reconciliation_status IN ('ready','suspended-restart-reconciliation','reconciling')""",
-                   (reason, project, generation))
+                   (reason, project, generation, *scoped))
         db.execute("COMMIT")
         return {"status": "suspended"}
     finally:
         db.close()
 
 
-def resume_assignment(state_dir: Path, project: str, generation: str) -> dict:
-    """Return a revalidated assignment to restart reconciliation before any send."""
+def resume_assignment(state_dir: Path, project: str, generation: str, conversation: str | None = None) -> dict:
+    """Return a revalidated conversation to restart reconciliation before any send."""
     db = connect(state_dir)
     if db is None:
         return {"status": "uninitialized"}
     try:
         db.execute("BEGIN IMMEDIATE")
+        scope, scoped = conversation_scope(conversation)
         changed = db.execute(f"""UPDATE conversations SET reconciliation_status='{DISCOVERY.RESTART}'
-            WHERE project=? AND assignment_generation=?
+            WHERE project=? AND assignment_generation=? AND {scope}
               AND reconciliation_status IN ({",".join("?" * len(SUSPENSIONS))})""",
-                             (project, generation, *sorted(SUSPENSIONS))).rowcount
+                             (project, generation, *scoped, *sorted(SUSPENSIONS))).rowcount
         db.execute("COMMIT")
         return {"status": "reconciling" if changed else "unchanged"}
     finally:
@@ -1253,7 +1320,11 @@ def claim_due(project_root: Path, state_dir: Path) -> dict:
                     assignment["channel_id"] != row["channel_id"] or assignment["bot_id"] != row["bot_id"] or
                     not assignment["bot"].get("token")):
                 continue
-            if db.execute("SELECT 1 FROM catch_ups WHERE project=? AND conversation_id=? AND assignment_generation=?", key).fetchone():
+            # Every thread send, like every catch-up, passes one durable global
+            # spacing gate, so many waiting conversations never burst.
+            if row["conversation_id"] != row["channel_id"] or db.execute(
+                    "SELECT 1 FROM catch_ups WHERE project=? AND conversation_id=? AND assignment_generation=?",
+                    key).fetchone():
                 # Initial and catch-up sends share one durable global spacing gate,
                 # so neither a restart nor a second channel can bypass it.
                 gate = db.execute("SELECT value FROM settings WHERE key='catch_up_next_at'").fetchone()
@@ -1267,7 +1338,7 @@ def claim_due(project_root: Path, state_dir: Path) -> dict:
                 VALUES (?,?,?,?,?,'sending',?)""", (nonce, *key, row["revision"], stamp(now)))
             db.execute("COMMIT")
             return {"claim": {"nonce": nonce, "project": row["project"],
-                              "channel_id": row["channel_id"],
+                              "channel_id": row["channel_id"], "conversation_id": row["conversation_id"],
                               "assignment_generation": row["assignment_generation"]}}
         db.execute("COMMIT")
         return {"claim": None}
@@ -1445,6 +1516,7 @@ def main() -> int:
     parser.add_argument("--reason")
     parser.add_argument("--project")
     parser.add_argument("--generation")
+    parser.add_argument("--conversation", help="suspend and resume: a Thread Conversation's thread id")
     parser.add_argument("--payload")
     args = parser.parse_args()
     try:
@@ -1490,11 +1562,11 @@ def main() -> int:
         elif args.command == "suspend":
             if not args.project or not args.generation or not args.reason:
                 raise ValueError("--project, --generation, and --reason are required")
-            result = suspend_assignment(args.state_dir, args.project, args.generation, args.reason)
+            result = suspend_assignment(args.state_dir, args.project, args.generation, args.reason, args.conversation)
         elif args.command == "resume":
             if not args.project or not args.generation:
                 raise ValueError("--project and --generation are required")
-            result = resume_assignment(args.state_dir, args.project, args.generation)
+            result = resume_assignment(args.state_dir, args.project, args.generation, args.conversation)
         elif args.command == "leftover":
             if not args.action_id or not args.reason:
                 raise ValueError("--action-id and --reason are required")
