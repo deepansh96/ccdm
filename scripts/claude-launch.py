@@ -155,6 +155,12 @@ def listener_pids(state_dir: str) -> list[int]:
     return pids
 
 
+def thread_supervisor_dir() -> str:
+    """The Thread Supervisor's state dir, which receives a thread session's turn reports."""
+    return os.path.expanduser(os.environ.get("CCDM_THREAD_STATE_DIR")
+                              or "~/.local/state/ccdm/thread-supervisor")
+
+
 def private_json(path: Path, value: dict) -> None:
     with open(path, "w") as f:
         json.dump(value, f, indent=2)
@@ -266,8 +272,16 @@ def launch_command(registry_path: str, project: str, thread_id: str | None, resu
     if thread_id:
         # The proxy pins the thread and hands over the supervisor's bootstrap.
         env.update({"CCDM_CLAUDE_THREAD_ID": thread_id, "CCDM_CLAUDE_BOOTSTRAP_FILE": resolved["bootstrap_file"],
-                    "DISCORD_STATE_DIR": state_dir, "DISCORD_ACCESS_MODE": "static"})
+                    "DISCORD_STATE_DIR": state_dir, "DISCORD_ACCESS_MODE": "static",
+                    "CCDM_THREAD_STATE_DIR": thread_supervisor_dir()})
     settings: dict = {"enabledPlugins": {"discord@claude-plugins-official": False}}
+    if thread_id:
+        # The thread's turn ends on Claude Code's Stop or StopFailure; its command
+        # hook reports that to the Thread Supervisor, which the proxy told of the start.
+        hook = (f"node '{SCRIPTS / 'claude-thread-turns.js'}' --thread-id '{thread_id}' "
+                f"--state-dir '{thread_supervisor_dir()}'")
+        settings["hooks"] = {event: [{"hooks": [{"type": "command", "command": hook}]}]
+                             for event in ("Stop", "StopFailure")}
     if adapter_enabled:
         reminder_dir = Path(os.environ.get("CCDM_REMINDER_STATE_DIR") or Path.home() / ".local" / "state" / "ccdm" / "conversation-reminders")
         env.update({

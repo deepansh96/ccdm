@@ -11,6 +11,7 @@ const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const reminder = require("./conversation-reminder-adapter.js");
+const { reportTurn } = require("./claude-thread-turns.js");
 
 const projectRoot = process.env.CCDM_REMINDER_PROJECT_ROOT || path.resolve(__dirname, "..");
 const selectedProject = process.env.CCDM_CLAUDE_PROJECT || "";
@@ -25,6 +26,10 @@ if (selectedThread && (!selectedProject || !selectedChannel)) {
   process.exit(2);
 }
 const conversationChat = selectedThread || selectedChannel;
+// Relaying an inbound message to a thread's Claude starts a turn, which the
+// Thread Supervisor must know before the message goes through.
+const startTurn = () => selectedThread ? reportTurn(selectedThread, "turn-started", process.env.CCDM_THREAD_STATE_DIR || undefined)
+  : Promise.resolve();
 // Transport scoping is always on; reminder markers, events, and reply metadata
 // run only for a reminder-adapter launch (and for root launches, which predate
 // the split and never set this flag).
@@ -176,6 +181,7 @@ async function deliverBootstrap() {
       typeof meta.message_id === "string" && meta.message_id &&
       (included === undefined || (Array.isArray(included) && included.every(id => typeof id === "string")))) {
     for (const id of [...(included || []), meta.message_id]) bootstrapIncluded.add(id);
+    await startTurn();
     process.stdout.write(JSON.stringify({
       jsonrpc: "2.0", method: "notifications/claude/channel", params: { content: bootstrap.content, meta },
     }) + "\n");
@@ -333,6 +339,7 @@ async function handlePluginMessage(line) {
         }
       }
     }
+    await startTurn();
     process.stdout.write(`${line}\n`);
     return;
   }

@@ -285,3 +285,18 @@ test("operator documentation and scenario matrix record in-thread management com
     assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-management-commands\\.test\\.js`));
   }
 });
+
+test("operator documentation, example registry, and scenario matrix record thread session caps", () => {
+  const section = operatorReadme.slice(operatorReadme.indexOf("## Thread Supervisor"));
+  for (const phrase of ["`thread_session_caps`", '`{ "claude": 6, "codex": 12 }`', "30 minutes",
+    "`stopped` / `evicted`", "Paused to free a session slot; reply to resume.", "Queued, N sessions busy.",
+    "never evicted", "first-in, first-out", "`Stop` or `StopFailure`", "never a Channel Conversation"]) {
+    assert.ok(section.includes(phrase), phrase);
+  }
+  const example = JSON.parse(fs.readFileSync("registry.example.json", "utf8"));
+  assert.deepEqual(example.thread_session_caps, { claude: 6, codex: 12 });
+  for (const scenario of ["Thread cap eviction", "Evicted thread resume", "Mid-turn session never evicted",
+    "Thread queue FIFO", "Codex cap across hosts"]) {
+    assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-capacity\\.test\\.js`));
+  }
+});

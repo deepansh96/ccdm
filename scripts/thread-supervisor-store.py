@@ -8,13 +8,13 @@ import sqlite3
 import stat
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 THREAD_STATES = ("registered", "booting", "live", "queued", "stopped", "closed")
 STOP_REASONS = ("auto-archive", "evicted", "operator", "crashed", "start-failed", "bot-changed", "guest-changed")
 # One row per bound thread. Override columns are null when the thread inherits
 # the project's setting; resolved columns hold what the running session uses.
 # `archive_actor` is who archived the thread, or 'unknown' when the audit log
-# never named one.
+# never named one. `queue_position` orders the threads waiting for a session slot.
 TABLES = {
     "threads": f"""thread_id TEXT PRIMARY KEY, project TEXT NOT NULL, name TEXT NOT NULL,
         creator_id TEXT NOT NULL, starter_message_id TEXT,
@@ -26,13 +26,16 @@ TABLES = {
         turn_running INTEGER NOT NULL DEFAULT 0,
         runtime_tmux TEXT, runtime_pid INTEGER, runtime_host TEXT, runtime_home TEXT,
         created_at TEXT NOT NULL, last_owner_activity_at TEXT, last_turn_end_at TEXT,
-        pending_config TEXT, pending_close TEXT, archive_actor TEXT""",
+        pending_config TEXT, pending_close TEXT, archive_actor TEXT, queue_position INTEGER""",
     "creation_requests": """request_id TEXT PRIMARY KEY, project TEXT NOT NULL, name TEXT NOT NULL,
         provider TEXT, account TEXT, model TEXT, effort TEXT, first_message TEXT,
         requester_id TEXT NOT NULL,
         requester_kind TEXT NOT NULL CHECK(requester_kind IN ('owner','guest','root','channel-agent')),
         status TEXT NOT NULL, thread_id TEXT, created_at TEXT NOT NULL""",
 }
+# The thread columns each schema version added, and the statement that adds them.
+MIGRATIONS = {2: ("archive_actor", "ALTER TABLE threads ADD COLUMN archive_actor TEXT"),
+              3: ("queue_position", "ALTER TABLE threads ADD COLUMN queue_position INTEGER")}
 COLUMNS = {
     "threads": {"thread_id", "project", "name", "creator_id", "starter_message_id",
                 "provider", "account", "model", "effort",
@@ -40,7 +43,7 @@ COLUMNS = {
                 "provider_conversation_id", "provider_home", "state", "stop_reason", "turn_running",
                 "runtime_tmux", "runtime_pid", "runtime_host", "runtime_home",
                 "created_at", "last_owner_activity_at", "last_turn_end_at", "pending_config", "pending_close",
-                "archive_actor"},
+                "archive_actor", "queue_position"},
     "creation_requests": {"request_id", "project", "name", "provider", "account", "model", "effort",
                           "first_message", "requester_id", "requester_kind", "status", "thread_id", "created_at"},
 }
@@ -64,11 +67,12 @@ def store_path(state_dir: Path) -> Path:
 
 def verify(db: sqlite3.Connection, migratable: bool = False) -> None:
     """Refuse a store whose version or exact column sets are not this schema
-    (or, when ``migratable``, schema v1, which `connect` migrates)."""
+    (or, when ``migratable``, an earlier schema, which `connect` migrates)."""
     version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version != SCHEMA_VERSION and not (migratable and version == 1):
+    if version != SCHEMA_VERSION and not (migratable and version in range(1, SCHEMA_VERSION)):
         raise ValueError("thread store schema is unsupported")
-    expected = COLUMNS if version == SCHEMA_VERSION else {**COLUMNS, "threads": COLUMNS["threads"] - {"archive_actor"}}
+    later = {column for added, (column, _) in MIGRATIONS.items() if added > version}
+    expected = {**COLUMNS, "threads": COLUMNS["threads"] - later}
     tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if any(table not in tables or {row[1] for row in db.execute(f"PRAGMA table_info({table})")} != columns
            for table, columns in expected.items()):
@@ -83,7 +87,7 @@ def check_private(path: Path) -> None:
 
 
 def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
-    """Open the store, creating it only when ``create`` is set; a schema v1 store gains `archive_actor`."""
+    """Open the store, creating it only when ``create`` is set; an earlier schema gains its later columns."""
     path = store_path(state_dir)
     existed = path.exists()
     if not existed and not create:
@@ -102,13 +106,15 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
         db.execute("PRAGMA synchronous=FULL")
         db.execute("PRAGMA secure_delete=ON")
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, SCHEMA_VERSION) or (version == 0 and existed):
+        if version not in range(SCHEMA_VERSION + 1) or (version == 0 and existed):
             raise ValueError("thread store schema is unsupported")
-        if version == 1:
+        if 0 < version < SCHEMA_VERSION:
             db.execute("BEGIN IMMEDIATE")
-            if db.execute("PRAGMA user_version").fetchone()[0] == 1:
-                db.execute("ALTER TABLE threads ADD COLUMN archive_actor TEXT")
-                db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            # Re-read the version under the write lock: a concurrent open may have migrated it.
+            current = db.execute("PRAGMA user_version").fetchone()[0]
+            for added in range(current + 1, SCHEMA_VERSION + 1):
+                db.execute(MIGRATIONS[added][1])
+            db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             db.execute("COMMIT")
         if version == 0:
             # Re-read the version under the write lock: a concurrent open may have created it.
@@ -240,3 +246,27 @@ def forget(db: sqlite3.Connection, thread_id: str) -> None:
     except sqlite3.Error:
         db.execute("ROLLBACK")
         raise
+
+
+def enqueue(db: sqlite3.Connection, thread_id: str, **fields) -> None:
+    """Mark a thread queued, with ``fields``, behind every thread already waiting;
+    a thread already waiting keeps its place."""
+    unknown = set(fields) - COLUMNS["threads"]
+    if unknown:
+        raise ValueError(f"unknown thread columns: {sorted(unknown)}")
+    assignments = "".join(f", {name}=?" for name in fields)
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        db.execute(f"""UPDATE threads SET state='queued'{assignments}, queue_position=CASE WHEN state='queued'
+            THEN queue_position ELSE (SELECT COALESCE(MAX(queue_position), 0) + 1 FROM threads
+            WHERE state='queued') END WHERE thread_id=?""",
+                   (*fields.values(), thread_id))
+        db.execute("COMMIT")
+    except sqlite3.Error:
+        db.execute("ROLLBACK")
+        raise
+
+
+def queued(db: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Threads waiting for a session slot, first queued first."""
+    return db.execute("SELECT * FROM threads WHERE state='queued' ORDER BY queue_position").fetchall()

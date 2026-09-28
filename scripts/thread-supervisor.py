@@ -36,6 +36,7 @@ STORE = _load("ccdm_thread_store", "thread-supervisor-store.py")
 ROUTER = _load("ccdm_thread_router", "thread-supervisor-router.py")
 LAUNCH = _load("ccdm_claude_launch", "claude-launch.py")
 CODEX_HOME = _load("ccdm_codex_home", "resolve-codex-home.py")
+CAPACITY = _load("ccdm_thread_capacity", "thread-supervisor-capacity.py")
 # Discord's longest auto-archive duration, in minutes (one week).
 AUTO_ARCHIVE_MINUTES = 10080
 # How long `disable` waits for a running worker to release its lock.
@@ -82,6 +83,11 @@ THREAD_COMMANDS = {
     "/unpause": "unpaused; waiting messages go through now.",
     "/close": "closing this thread.",
 }
+# The notices a thread gets when the live-session cap pauses it or makes it wait.
+PAUSED_NOTICE = "Paused to free a session slot; reply to resume."
+QUEUED_NOTICE = "Queued, {busy} sessions busy."
+# How often, in real seconds, the worker starts queued threads whose slot has freed.
+QUEUE_INTERVAL_SECONDS = 0.5
 # Claude Code's startup screens, read from the tmux pane.
 READY_TEXT = "Listening for channel messages"
 STARTUP_PROMPTS = ("I am using this for local development", "trust the files in this folder", "trust this folder")
@@ -281,6 +287,8 @@ def status(state_dir: Path, project_root: Path | None = None) -> dict:
                         entry[field] = row[field]
                 if row["archive_actor"] == "unknown":
                     entry["archive"] = "archive-actor-unknown"
+                if row["turn_running"]:
+                    entry["turn_running"] = True
                 buffered = buffer_path(state_dir, row["thread_id"])
                 if row["state"] == "booting" and buffered.exists():
                     entry["buffered_messages"] = len(json.loads(buffered.read_text(encoding="utf-8")))
@@ -496,10 +504,10 @@ def create_thread(project_root: Path, state_dir: Path, registry: dict, project_n
                 return done
             write_private(buffer_path(state_dir, thread_id), [held])
             activity = {"last_owner_activity_at": clock_now()} if kind == "owner" else {}
-            STORE.update(db, thread_id, state="booting", **activity)
+            decision = admit(db, registry, row, **activity)
+        return {**done, "result": settle_admission(project_root, state_dir, registry, row, decision)["result"]}
     finally:
         db.close()
-    return {**done, "result": "start"}
 
 
 def local_request(project_root: Path, state_dir: Path, request: dict) -> dict:
@@ -672,7 +680,7 @@ def message(project_root: Path, state_dir: Path, event: dict) -> dict:
                     "timestamp": str(event.get("timestamp") or clock_now())}
             buffered = buffer_path(state_dir, thread_id)
             activity = {"last_owner_activity_at": clock_now()} if author == owner else {}
-            if row["state"] == "booting":
+            if row["state"] in ("booting", "queued"):
                 if not buffered.exists():
                     # Handed off: the session's own Gateway delivers it live.
                     return {"result": "live"}
@@ -689,11 +697,78 @@ def message(project_root: Path, state_dir: Path, event: dict) -> dict:
             if row["state"] != "registered" and not resume:
                 return {"result": "ignored", "reason": f"thread is {row['state']}"}
             write_private(buffered, [held])
-            STORE.update(db, thread_id, state="booting", stop_reason=None, archive_actor=None, pending_close=None,
-                         **activity)
-            return {"result": "start", "thread_id": thread_id}
+            decision = admit(db, registry, row, stop_reason=None, archive_actor=None, pending_close=None, **activity)
+        return settle_admission(project_root, state_dir, registry, row, decision)
     finally:
         db.close()
+
+
+def admit(db, registry: dict, row, **fields) -> dict:
+    """Under the BootLock, with its trigger held: claim a session slot for
+    ``row`` under its provider's cap, storing ``fields`` with the outcome. At
+    the cap, the live idle session with the oldest activity is marked
+    `stopped/evicted` to make room; with none idle, the thread is queued."""
+    provider = thread_provider(registry, row)
+    decision = CAPACITY.admit(STORE.threads(db), lambda other: thread_provider(registry, other), provider,
+                              CAPACITY.caps(registry)[provider], clock_now(), row["thread_id"])
+    if decision["result"] == "queue":
+        STORE.enqueue(db, row["thread_id"], **fields)
+        return decision
+    if decision["result"] == "evict":
+        STORE.update(db, decision["victim"]["thread_id"], state="stopped", stop_reason="evicted", turn_running=0,
+                     runtime_tmux=None, runtime_pid=None, runtime_host=None)
+    STORE.update(db, row["thread_id"], **fields, state="booting", queue_position=None)
+    return decision
+
+
+def settle_admission(project_root: Path, state_dir: Path, registry: dict, row, decision: dict) -> dict:
+    """After ``admit``, outside the BootLock: stop an evicted session and post
+    its pause notice, or post the queue notice in the waiting thread."""
+    def post(thread, content: str) -> None:
+        bot_id = ((registry.get("projects") or {}).get(thread["project"]) or {}).get("bot_id")
+        if bot_id:
+            discord_request(project_root, "post", {"bot_id": bot_id, "channel_id": thread["thread_id"],
+                                                   "content": content})
+
+    if decision["result"] == "queue":
+        post(row, QUEUED_NOTICE.format(busy=decision["busy"]))
+        return {"result": "queued", "thread_id": row["thread_id"]}
+    if decision["result"] == "evict":
+        victim = decision["victim"]
+        stop_runtime(project_root, state_dir, victim)
+        post(victim, PAUSED_NOTICE)
+    return {"result": "start", "thread_id": row["thread_id"]}
+
+
+def start_queued(project_root: Path, state_dir: Path) -> list[str]:
+    """Start queued threads, oldest first per provider, while their provider
+    has a free slot or an idle session to evict: after a stop, close, or
+    delete, or once a live session goes idle while others wait."""
+    db = STORE.connect(state_dir)
+    if not db:
+        return []
+    started = []
+    try:
+        if not STORE.queued(db):
+            return []
+        registry = load_registry(project_root)
+        blocked = set()
+        with BootLock(state_dir):
+            for row in STORE.queued(db):
+                provider = thread_provider(registry, row)
+                if provider in blocked:
+                    continue
+                decision = admit(db, registry, row)
+                if decision["result"] == "queue":
+                    blocked.add(provider)
+                else:
+                    started.append((row, decision))
+        for row, decision in started:
+            settle_admission(project_root, state_dir, registry, row, decision)
+            start_boot(project_root, state_dir, row["thread_id"])
+    finally:
+        db.close()
+    return [row["thread_id"] for row, _ in started]
 
 
 def account_alias(registry: dict, key: str, home: str | None) -> str:
@@ -1289,7 +1364,9 @@ def boot(project_root: Path, state_dir: Path, thread_id: str) -> dict:
     launched = subprocess.run([str(Path(__file__).with_name("start-thread-session.sh")), row["project"], thread_id,
                                *([resume] if resume else []),
                                *(argument for field, value in overrides.items() for argument in (f"--{field}", value))],
-                              capture_output=True, text=True, timeout=120)
+                              capture_output=True, text=True, timeout=120,
+                              # The session reports its turns to this supervisor's state dir.
+                              env={**os.environ, "CCDM_THREAD_STATE_DIR": str(state_dir)})
     if launched.returncode != 0:
         detail = (launched.stderr.strip() or launched.stdout.strip() or "the Claude thread launcher failed")
         return fail(detail.splitlines()[-1])
@@ -1354,12 +1431,19 @@ def run(project_root: Path, state_dir: Path) -> dict:
             [os.environ.get("CCDM_THREAD_NODE", "node"), str(Path(__file__).with_name("thread-supervisor-observer.js")),
              "--project-root", str(project_root), "--state-dir", str(state_dir)],
             env={**os.environ, "CCDM_THREAD_STATE_DIR": str(state_dir)})
+        next_queue_check = 0.0
         try:
             while not stopping.wait(0.2) and not disabled_marker(state_dir).exists():
                 # A group-wide SIGTERM reaches the observer too; let this
                 # process's handler run before treating the exit as a failure.
                 if observer.poll() is not None and not stopping.wait(0.5):
                     return {"status": "blocked", "reason": "the thread observer stopped"}
+                if time.monotonic() >= next_queue_check:
+                    next_queue_check = time.monotonic() + QUEUE_INTERVAL_SECONDS
+                    try:
+                        start_queued(project_root, state_dir)
+                    except (OSError, ValueError, KeyError, sqlite3.Error, subprocess.SubprocessError) as error:
+                        log(f"starting queued threads failed: {error}")
         finally:
             server.shutdown()
             server.server_close()

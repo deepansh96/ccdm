@@ -9,6 +9,10 @@
   "claude_accounts": {
     "example-claude": "~/.claude-example"
   },
+  "thread_session_caps": {
+    "claude": 6,
+    "codex": 12
+  },
   "project_bot_role_id": null,
   "category_ids": [],
   "pool": [],

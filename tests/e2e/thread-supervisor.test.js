@@ -238,7 +238,7 @@ test("preflight validates the owner, root credentials, and store without side ef
   assert.equal(fs.statSync(stateDir).mode & 0o777, 0o755);
 });
 
-test("a schema v1 thread store passes preflight and gains the archive actor column, keeping its rows", async () => {
+test("a schema v1 thread store passes preflight and gains the archive actor and queue position columns, keeping its rows", async () => {
   const workspace = createWorkspace();
   const rootState = setup(workspace);
   const env = supervisorEnv(workspace, rootState);
@@ -274,7 +274,8 @@ PRAGMA user_version=1;
   assert.deepEqual(current.projects.demo.threads["thread-1"], { name: "Old", creator_id: "owner", state: "stopped",
     stop_reason: "auto-archive", provider_conversation_id: "session-1" });
   const version = spawnSync("python3", ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); " +
-    "print(db.execute('PRAGMA user_version').fetchone()[0], 'archive_actor' in " +
-    "[row[1] for row in db.execute('PRAGMA table_info(threads)')])", store], { encoding: "utf8" });
-  assert.equal(version.stdout.trim(), "2 True", version.stderr);
+    "columns = [row[1] for row in db.execute('PRAGMA table_info(threads)')]; " +
+    "print(db.execute('PRAGMA user_version').fetchone()[0], 'archive_actor' in columns, 'queue_position' in columns)",
+  store], { encoding: "utf8" });
+  assert.equal(version.stdout.trim(), "3 True True", version.stderr);
 });
