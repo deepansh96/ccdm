@@ -182,6 +182,10 @@ This audit maps the PRD workflow bullets from issue #4 to automated scenarios or
 | Setup | Named account registry template | Covered | The real fresh `setup.sh` surface emits empty `codex_accounts` and null `default_codex_account` fields without the legacy `codex_home` key. |
 | Setup | Generic registry example | Covered | `registry.example.json` parses as JSON and uses generic placeholder aliases and Codex Home paths. |
 | Documentation | Named account operator documentation | Covered | README documents alias/home terminology, both-scope precedence, validation failures, login preparation, persistence, migration, restart, and rollback. |
+| Router | Owner message routed to one session; guest forwarded; bot, webhook, and stranger messages dropped | Covered | `tests/e2e/router.test.js` drives `scripts/router.js serve` through the discord.js shim and a scripted `scripts/router/client.js` session. |
+| Router | Offline 💤 without replay, pool channels ignored, management commands and owner reactions as events | Covered | Asserts only fake-recorded reactions and socket events. |
+| Router | `reply` under the Project Identity, sanitized usernames, and `scope_violation` logging | Covered | Webhook execute with `wait=true`; `demo-claude · 42%`, `demo-claude`, and the `discord-root-agent` sanitized literal. |
+| Router | `ensure-webhook` idempotency and `router status` | Covered | One webhook create, `webhook_id` in the registry, no webhook token in the Test Workspace, status output, or logs; status exits non-zero when the Router is down. |
 
 - DeepSeek Exa opt-in: hosted MCP configuration survives scoped Discord cleanup; default homes omit Exa and rotation rejects setup-only options.
 

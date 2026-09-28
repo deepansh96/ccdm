@@ -1,0 +1,91 @@
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import { createRequire } from "node:module";
+import path from "node:path";
+
+import { bridgeChildEnv, collectProcess, createBridgeWorkspace } from "./bridge.js";
+import { runNodeEntrypoint } from "./runner.js";
+import { seedRegistry } from "./state.js";
+import { registerTeardownCallback } from "./teardown.js";
+
+export const OWNER_ID = "owner-id";
+export const ROOT_TOKEN = "root-bot-token";
+
+// A router-transport Claude project, a router-transport Codex project, and a
+// pool project whose bot still serves its own channel.
+export function routerRegistry(overrides = {}) {
+  return {
+    discord_user_id: OWNER_ID,
+    guild_id: "guild-id",
+    pool: [{ id: "bot2", token: "pool-bot-token", app_id: "pool-app-id" }],
+    projects: {
+      demo: { channel_id: "demo-channel", type: "claude", transport: "router", guest_user_ids: ["guest-id"] },
+      beta: { channel_id: "beta-channel", type: "codex", transport: "router" },
+      legacy: { channel_id: "legacy-channel", type: "claude", bot_id: "bot2" },
+      ...overrides,
+    },
+  };
+}
+
+// The Router's private state lives inside the Test Workspace; a short path
+// keeps the socket under the platform's Unix-socket length limit.
+export function createRouterWorkspace(registry = routerRegistry()) {
+  const workspace = createBridgeWorkspace();
+  const routerStateDir = path.join(workspace.tmpRoot, "router");
+  const rootStateDir = path.join(workspace.homeDir, ".claude/channels/discord");
+  fs.mkdirSync(rootStateDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(rootStateDir, ".env"), `DISCORD_BOT_TOKEN=${ROOT_TOKEN}\n`, { mode: 0o600 });
+  seedRegistry(workspace, registry);
+  return Object.freeze({ ...workspace, routerStateDir, socketPath: path.join(routerStateDir, "router.sock") });
+}
+
+export function routerEnv(workspace, extraEnv = {}) {
+  return bridgeChildEnv(workspace, { CCDM_ROUTER_STATE_DIR: workspace.routerStateDir, ...extraEnv });
+}
+
+// A launcher writes the per-project key before starting a session.
+export function writeProjectKey(workspace, project, key) {
+  const keysDir = path.join(workspace.routerStateDir, "keys");
+  fs.mkdirSync(keysDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(keysDir, `${project}.key`), `${key}\n`, { mode: 0o600 });
+}
+
+export function runRouterCli(workspace, args, options = {}) {
+  return runNodeEntrypoint(workspace, "scripts/router.js", { args, env: routerEnv(workspace), ...options });
+}
+
+export async function startRouter(workspace) {
+  const env = routerEnv(workspace);
+  const command = [process.execPath, path.join(workspace.repoDir, "scripts/router.js"), "serve"];
+  const child = spawn(command[0], command.slice(1), {
+    cwd: workspace.repoDir,
+    detached: true,
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const running = collectProcess(child, { command, cwd: workspace.repoDir, detached: true, env }, workspace);
+  registerTeardownCallback(() => running.stop());
+  await running.waitForOutput(/router ready/);
+  return running;
+}
+
+// A scripted session: the shared client library, loaded from the Test Workspace.
+export async function connectSession(workspace, project, key) {
+  const { RouterClient } = createRequire(import.meta.url)(path.join(workspace.repoDir, "scripts/router/client.js"));
+  const client = new RouterClient({ socketPath: workspace.socketPath, project, key, role: "project" });
+  const events = [];
+  client.on("event", (event) => events.push(event));
+  const scope = await client.connect();
+  registerTeardownCallback(() => client.close());
+  return { client, events, scope };
+}
+
+export async function waitFor(predicate, describe, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = predicate();
+    if (value) return value;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for ${describe()}`);
+}

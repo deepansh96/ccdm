@@ -39,7 +39,7 @@ export function createBridgeWorkspace(options = {}) {
   return workspace;
 }
 
-function collectProcess(child, metadata, workspace) {
+export function collectProcess(child, metadata, workspace) {
   let stdout = "";
   let stderr = "";
   child.stdout.setEncoding("utf8");
@@ -400,6 +400,9 @@ export function injectDiscordMessage(workspace, message = {}) {
     delivered: false,
     id: message.id ?? `message-${Date.now()}`,
     attachments: message.attachments ?? [],
+    ...(message.webhookId ? { webhookId: message.webhookId } : {}),
+    ...(message.createdTimestamp ? { createdTimestamp: message.createdTimestamp } : {}),
+    ...(message.replyTo ? { replyTo: message.replyTo } : {}),
   });
   writeState(state, workspace.stateDir);
 }

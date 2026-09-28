@@ -85,9 +85,13 @@ function fixtureMessage(client, raw) {
       username: raw.author?.username ?? "Allowed User",
     },
     channel: { id: raw.channelId },
+    channelId: raw.channelId,
     client,
     content: raw.content ?? "",
+    createdTimestamp: raw.createdTimestamp ?? Date.now(),
     id: raw.id,
+    reference: raw.replyTo ? { channelId: raw.channelId, messageId: raw.replyTo } : null,
+    webhookId: raw.webhookId ?? null,
     reactions: {
       cache: new Map([
         [

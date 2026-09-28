@@ -232,6 +232,79 @@ function routeChannelHistory(url, method, init) {
   return json(page);
 }
 
+// Discord refuses webhook names and username overrides that contain these
+// words or run past 80 characters.
+function webhookNameProblem(name) {
+  if (typeof name !== "string" || name.length === 0) return "Must be between 1 and 80 in length.";
+  if ([...name].length > 80) return "Must be between 1 and 80 in length.";
+  if (/discord|clyde/i.test(name)) return `Username cannot contain "${/clyde/i.test(name) ? "clyde" : "discord"}"`;
+  return null;
+}
+
+// Channel webhooks: create and list with the bot token, execute with the
+// webhook's own token. Executed messages are stored with their webhook_id.
+function routeWebhooks(url, method, init) {
+  if (url.hostname !== "discord.com") return null;
+  const json = (body, status = 200) => response(JSON.stringify(body), {
+    headers: { "content-type": "application/json" }, status,
+  });
+  const channelMatch = /^\/api\/v10\/channels\/([^/]+)\/webhooks$/.exec(url.pathname);
+  if (channelMatch && method === "GET") {
+    const webhooks = (readState().fixtures?.discord?.webhooks ?? []).filter(webhook => webhook.channel_id === channelMatch[1]);
+    return json(webhooks);
+  }
+  if (channelMatch && method === "POST") {
+    const parsedBody = init.body ? JSON.parse(String(init.body)) : {};
+    const problem = webhookNameProblem(parsedBody.name);
+    if (problem) return json({ code: 50035, message: "Invalid Form Body", errors: { name: problem } }, 400);
+    let created;
+    updateState((state) => {
+      state.fixtures.discord.webhooks ||= [];
+      state.fixtures.discord.webhookCreates ||= [];
+      const number = state.fixtures.discord.webhooks.length + 1;
+      created = { id: `fake-webhook-${number}`, token: `fake-webhook-token-${number}`, type: 1,
+        channel_id: channelMatch[1], name: parsedBody.name };
+      state.fixtures.discord.webhooks.push(created);
+      state.fixtures.discord.webhookCreates.push({ authorization: headerValue(init.headers, "Authorization"),
+        channelId: channelMatch[1], name: parsedBody.name });
+    });
+    return json(created);
+  }
+  const executeMatch = /^\/api\/v10\/webhooks\/([^/]+)\/([^/]+)$/.exec(url.pathname);
+  if (executeMatch && method === "POST") {
+    const parsedBody = init.body ? JSON.parse(String(init.body)) : {};
+    const webhook = (readState().fixtures?.discord?.webhooks ?? []).find(entry => entry.id === executeMatch[1]);
+    if (!webhook || webhook.token !== executeMatch[2]) return json({ code: 10015, message: "Unknown Webhook" }, 404);
+    const problem = parsedBody.username === undefined ? null : webhookNameProblem(parsedBody.username);
+    const empty = !parsedBody.content ? "Cannot send an empty message" : null;
+    if (problem || empty) {
+      updateState((state) => {
+        state.fixtures.discord.webhookRejections ||= [];
+        state.fixtures.discord.webhookRejections.push({ webhookId: webhook.id, username: parsedBody.username,
+          reason: problem || empty });
+      });
+      return json({ code: 50035, message: "Invalid Form Body", errors: { username: problem, content: empty } }, 400);
+    }
+    let created;
+    updateState((state) => {
+      state.fixtures.discord.messages ||= [];
+      created = {
+        avatarUrl: parsedBody.avatar_url,
+        channelId: webhook.channel_id,
+        content: parsedBody.content,
+        id: `fake-message-${state.fixtures.discord.messages.length + 1}`,
+        username: parsedBody.username ?? webhook.name,
+        webhookId: webhook.id,
+      };
+      state.fixtures.discord.messages.push(created);
+    });
+    if (url.searchParams.get("wait") !== "true") return response("", { status: 204 });
+    return json({ id: created.id, channel_id: created.channelId, content: created.content, webhook_id: webhook.id,
+      author: { id: webhook.id, username: created.username, bot: true } });
+  }
+  return null;
+}
+
 function routeDiscordApi(url, init = {}) {
   const method = (init.method || "GET").toUpperCase();
   if (url.hostname === "discord.com") {
@@ -400,6 +473,9 @@ function routeDiscordApi(url, init = {}) {
       headers: { "content-type": "application/json" },
     });
   }
+
+  const webhookRoute = routeWebhooks(url, method, init);
+  if (webhookRoute) return webhookRoute;
 
   const historyRoute = routeChannelHistory(url, method, init);
   if (historyRoute) return historyRoute;
@@ -718,10 +794,31 @@ function hostFromNetArgs(args) {
   return { host: "localhost", port: "" };
 }
 
+// Unix-socket path of a net.connect call, or null for TCP.
+function unixPathFromNetArgs(args) {
+  const first = args[0];
+  if (typeof first === "string" && !/^\d+$/.test(first)) return first;
+  if (typeof first === "object" && first !== null && typeof first.path === "string") return first.path;
+  return null;
+}
+
+// Local sockets such as the Router's are allowed only inside the Test Workspace.
+function isWorkspaceSocket(socketPath) {
+  if (!socketPath || !stateDir) return false;
+  const workspaceRoot = path.dirname(path.resolve(stateDir));
+  return path.resolve(socketPath).startsWith(`${workspaceRoot}${path.sep}`);
+}
+
 function installNetGuard() {
   const originalConnect = net.connect.bind(net);
   const originalCreateConnection = net.createConnection.bind(net);
   function guardedConnect(...args) {
+    const socketPath = unixPathFromNetArgs(args);
+    if (socketPath !== null) {
+      if (isWorkspaceSocket(socketPath)) return originalConnect(...args);
+      recordBlocked("net", `unix:${socketPath}`);
+      throw new Error(`Blocked unexpected net egress: unix:${socketPath}`);
+    }
     const { host, port } = hostFromNetArgs(args);
     const allowedPort = String(process.env.WS_PORT || "");
     const isLocal = ["127.0.0.1", "localhost", "::1", ""].includes(String(host));
@@ -734,6 +831,8 @@ function installNetGuard() {
   }
   net.connect = guardedConnect;
   net.createConnection = function guardedCreateConnection(...args) {
+    const socketPath = unixPathFromNetArgs(args);
+    if (socketPath !== null && isWorkspaceSocket(socketPath)) return originalCreateConnection(...args);
     const { host, port } = hostFromNetArgs(args);
     const allowedPort = String(process.env.WS_PORT || "");
     const isLocal = ["127.0.0.1", "localhost", "::1", ""].includes(String(host));
