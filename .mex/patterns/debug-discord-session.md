@@ -10,7 +10,7 @@ edges:
     condition: when permissions, scope tokens, or routing may be wrong
   - target: context/session-management.md
     condition: when process or tmux state may be wrong
-last_updated: 2026-09-22
+last_updated: 2026-09-28
 ---
 
 # Debug A Discord Session
@@ -35,6 +35,7 @@ last_updated: 2026-09-22
 - Root mentions and project messages intentionally follow different routing paths.
 - Claude commands are tmux relay; Codex commands are handled in the bridge.
 - `stream disconnected before completion: response.failed event received` is a terminal upstream Responses event after Codex has exhausted its internal retries, not a Discord disconnect. The bridge retries it once only when no agent work has started, which avoids repeating possible side effects.
+- A Claude session whose pane stops repainting and ignores Esc, Ctrl+C, SIGINT, and a resize is stuck at the OS level, not busy. Check for a hung credential read with `pgrep -lf "security find-generic-password"`, which looks for `Claude Code-credentials` (projects without `claude_home`) or `Claude Code-credentials-<first 8 hex of sha256(home dir)>`. A locked login keychain (typical after the Mac sleeps) blocks that read, and the CLI cannot repaint or answer queued Discord messages until the keychain is unlocked on the machine (log in, or `security unlock-keychain`). Confirm the hang and try unlocking before restarting: a restart keeps committed work but loses uncommitted work and the session's live context.
 
 ## Verify
 - [ ] One user message produces at most one response from the assigned bot.
