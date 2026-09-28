@@ -184,3 +184,18 @@ test("operator documentation and scenario matrix record Claude Thread Conversati
   assert.match(matrix, /\| Fixture contracts \| Claude startup screens \| Covered \| .*claudeBootScreens/);
   assert.match(fs.readFileSync(".mex/context/session-management.md", "utf8"), /start-thread-session\.sh/);
 });
+
+test("operator documentation, glossary, and scenario matrix record the Thread Conversation lifecycle", () => {
+  const section = operatorReadme.slice(operatorReadme.indexOf("## Thread Supervisor"));
+  for (const phrase of ["action 111", "archive-actor-unknown", "60 seconds", "claude --resume <session id>",
+    "View Audit Log"]) {
+    assert.ok(section.includes(phrase), phrase);
+  }
+  for (const scenario of ["Thread archive by owner or root", "Thread auto-archive", "Audit log unavailable",
+    "Thread deletion", "Thread resume"]) {
+    assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-lifecycle\\.test\\.js`));
+  }
+  assert.match(matrix, /\| Thread Supervisor \| Thread store schema v2 \| Covered \| .*thread-supervisor\.test\.js/);
+  assert.match(matrix, /\| Fixture contracts \| Thread lifecycle events \| Covered \| .*auditLogEntries/);
+  assert.match(fs.readFileSync("CONTEXT.md", "utf8"), /closed when the owner or root archives its thread/);
+});

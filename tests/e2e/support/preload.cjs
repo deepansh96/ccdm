@@ -257,6 +257,31 @@ function routeDiscordApi(url, init = {}) {
     });
   }
 
+  // Get Guild Audit Log from seeded `auditLogEntries` (newest first, as
+  // Discord returns them), filtered by `action_type`. `auditLogForbidden`
+  // answers 403 50013, as for a bot without View Audit Log.
+  const auditLogMatch = /^\/api\/v10\/guilds\/([^/]+)\/audit-logs$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && auditLogMatch && method === "GET") {
+    const discord = readState().fixtures?.discord ?? {};
+    const actionType = url.searchParams.get("action_type");
+    updateState((nextState) => {
+      nextState.fixtures.discord.auditLogFetches ||= [];
+      nextState.fixtures.discord.auditLogFetches.push({ authorization: headerValue(init.headers, "Authorization"),
+        guildId: auditLogMatch[1], actionType, limit: url.searchParams.get("limit") });
+    });
+    if (discord.auditLogForbidden) {
+      return response(JSON.stringify({ code: 50013, message: "Missing Permissions" }), {
+        headers: { "content-type": "application/json" }, status: 403,
+      });
+    }
+    const entries = (discord.auditLogEntries ?? [])
+      .filter(entry => actionType === null || String(entry.action_type) === actionType);
+    return response(JSON.stringify({ audit_log_entries: entries, users: [], threads: [], integrations: [],
+      webhooks: [], application_commands: [], auto_moderation_rules: [], guild_scheduled_events: [] }), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
   if (url.hostname === "discord.com" && guildRolesMatch && method === "GET") {
     const state = readState();
     return response(JSON.stringify(state.fixtures?.discord?.roles ?? []), {
@@ -479,6 +504,20 @@ function routeDiscordApi(url, init = {}) {
         } : {}),
       };
       state.fixtures.discord.messages.push(created);
+      // A post into an archived thread reopens it. Discord then sends
+      // THREAD_UPDATE (archived: false), THREAD_CREATE again, and the post.
+      const thread = state.fixtures.discord.threads?.[createMessageMatch[1]];
+      if (thread?.archived) {
+        const reopened = { ...thread, archived: false };
+        state.fixtures.discord.threads[thread.id] = reopened;
+        state.fixtures.discord.injectedThreads ||= [];
+        state.fixtures.discord.injectedThreads.push({ ...reopened, event: "update", previous: thread, delivered: false },
+          { ...reopened, newlyCreated: false, delivered: false });
+        state.fixtures.discord.injectedMessages ||= [];
+        state.fixtures.discord.injectedMessages.push({ id: created.id, channelId: thread.id, channelType: thread.type,
+          parentId: thread.parentId, content: created.content, attachments: [], delivered: false,
+          author: { bot: true, id: authorForToken(created.authorization), username: "Project Bot" } });
+      }
       if (parsedBody.content === "👀" && state.fixtures.discord.crashAfterReminderAccept) {
         crashAfterAccept = true;
         state.fixtures.discord.crashAfterReminderAccept = false;

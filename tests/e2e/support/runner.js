@@ -502,7 +502,10 @@ function runTmux() {
     const launch = parseTmuxLaunch(shellCommand);
     const readyFile = tmuxState.startupMode ? "" : launch.env.CODEX_STARTUP_READY_FILE;
     const pid = spawnPlaceholder(readyFile);
-    const sessionId = \`fixture-session-\${pid}\`;
+    // Like Claude Code, a resumed launch continues the named session.
+    const resumeIndex = launch.claudeArgs?.indexOf("--resume") ?? -1;
+    const sessionId = resumeIndex >= 0 ? launch.claudeArgs[resumeIndex + 1].replace(/^'(.*)'$/, "$1")
+      : \`fixture-session-\${pid}\`;
     const processCommand =
       launch.kind === "codex-bridge"
         ? \`node scripts/codex-bridge.js CHANNEL_ID='\${launch.env.CHANNEL_ID}' BOT_APP_ID='\${launch.env.BOT_APP_ID}' WS_PORT='\${launch.env.WS_PORT}'\`

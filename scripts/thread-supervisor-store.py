@@ -8,11 +8,13 @@ import sqlite3
 import stat
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 THREAD_STATES = ("registered", "booting", "live", "queued", "stopped", "closed")
 STOP_REASONS = ("auto-archive", "evicted", "operator", "crashed", "start-failed", "bot-changed", "guest-changed")
 # One row per bound thread. Override columns are null when the thread inherits
 # the project's setting; resolved columns hold what the running session uses.
+# `archive_actor` is who archived the thread, or 'unknown' when the audit log
+# never named one.
 TABLES = {
     "threads": f"""thread_id TEXT PRIMARY KEY, project TEXT NOT NULL, name TEXT NOT NULL,
         creator_id TEXT NOT NULL, starter_message_id TEXT,
@@ -24,7 +26,7 @@ TABLES = {
         turn_running INTEGER NOT NULL DEFAULT 0,
         runtime_tmux TEXT, runtime_pid INTEGER, runtime_host TEXT, runtime_home TEXT,
         created_at TEXT NOT NULL, last_owner_activity_at TEXT, last_turn_end_at TEXT,
-        pending_config TEXT, pending_close TEXT""",
+        pending_config TEXT, pending_close TEXT, archive_actor TEXT""",
     "creation_requests": """request_id TEXT PRIMARY KEY, project TEXT NOT NULL, name TEXT NOT NULL,
         provider TEXT, account TEXT, model TEXT, effort TEXT, first_message TEXT,
         requester_id TEXT NOT NULL,
@@ -37,7 +39,8 @@ COLUMNS = {
                 "resolved_provider", "resolved_account", "resolved_model", "resolved_effort",
                 "provider_conversation_id", "provider_home", "state", "stop_reason", "turn_running",
                 "runtime_tmux", "runtime_pid", "runtime_host", "runtime_home",
-                "created_at", "last_owner_activity_at", "last_turn_end_at", "pending_config", "pending_close"},
+                "created_at", "last_owner_activity_at", "last_turn_end_at", "pending_config", "pending_close",
+                "archive_actor"},
     "creation_requests": {"request_id", "project", "name", "provider", "account", "model", "effort",
                           "first_message", "requester_id", "requester_kind", "status", "thread_id", "created_at"},
 }
@@ -59,13 +62,16 @@ def store_path(state_dir: Path) -> Path:
     return state_dir / "threads.sqlite3"
 
 
-def verify(db: sqlite3.Connection) -> None:
-    """Refuse a store whose version or exact column sets are not this schema."""
-    if db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+def verify(db: sqlite3.Connection, migratable: bool = False) -> None:
+    """Refuse a store whose version or exact column sets are not this schema
+    (or, when ``migratable``, schema v1, which `connect` migrates)."""
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    if version != SCHEMA_VERSION and not (migratable and version == 1):
         raise ValueError("thread store schema is unsupported")
+    expected = COLUMNS if version == SCHEMA_VERSION else {**COLUMNS, "threads": COLUMNS["threads"] - {"archive_actor"}}
     tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if any(table not in tables or {row[1] for row in db.execute(f"PRAGMA table_info({table})")} != columns
-           for table, columns in COLUMNS.items()):
+           for table, columns in expected.items()):
         raise ValueError("thread store schema is unsupported")
     if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
         raise ValueError("thread store is corrupt")
@@ -77,7 +83,7 @@ def check_private(path: Path) -> None:
 
 
 def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
-    """Open the store, creating or migrating it only when ``create`` is set."""
+    """Open the store, creating it only when ``create`` is set; a schema v1 store gains `archive_actor`."""
     path = store_path(state_dir)
     existed = path.exists()
     if not existed and not create:
@@ -96,8 +102,14 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
         db.execute("PRAGMA synchronous=FULL")
         db.execute("PRAGMA secure_delete=ON")
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, SCHEMA_VERSION) or (version == 0 and existed):
+        if version not in (0, 1, SCHEMA_VERSION) or (version == 0 and existed):
             raise ValueError("thread store schema is unsupported")
+        if version == 1:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("PRAGMA user_version").fetchone()[0] == 1:
+                db.execute("ALTER TABLE threads ADD COLUMN archive_actor TEXT")
+                db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            db.execute("COMMIT")
         if version == 0:
             # Re-read the version under the write lock: a concurrent open may have created it.
             db.execute("BEGIN IMMEDIATE")
@@ -121,7 +133,7 @@ def inspect(state_dir: Path) -> str:
         return "absent"
     check_private(path)
     with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
-        verify(db)
+        verify(db, migratable=True)
     return "ok"
 
 
@@ -159,6 +171,17 @@ def update(db: sqlite3.Connection, thread_id: str, **fields) -> None:
     db.execute("BEGIN IMMEDIATE")
     try:
         db.execute(f"UPDATE threads SET {assignments} WHERE thread_id=?", (*fields.values(), thread_id))
+        db.execute("COMMIT")
+    except sqlite3.Error:
+        db.execute("ROLLBACK")
+        raise
+
+
+def forget(db: sqlite3.Connection, thread_id: str) -> None:
+    """Remove a deleted thread's row."""
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        db.execute("DELETE FROM threads WHERE thread_id=?", (thread_id,))
         db.execute("COMMIT")
     except sqlite3.Error:
         db.execute("ROLLBACK")

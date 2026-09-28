@@ -421,17 +421,33 @@ export function injectDiscordMessage(workspace, message = {}) {
 // Queues a Gateway THREAD_CREATE. Public threads are type 11 and private
 // threads type 12; `parentType` 15 is a forum channel.
 export function injectDiscordThread(workspace, thread = {}) {
-  updateFixtureState(workspace, state => (state.fixtures.discord.injectedThreads ||= []).push({
-    archived: false,
-    autoArchiveDuration: 1440,
-    delivered: false,
-    name: "thread",
-    newlyCreated: true,
-    ownerId: "owner",
-    parentType: 0,
-    type: 11,
-    ...thread,
-  }));
+  updateFixtureState(workspace, state => {
+    const created = { archived: false, autoArchiveDuration: 1440, name: "thread", ownerId: "owner", parentType: 0,
+      type: 11, ...thread };
+    // The REST fake keeps the thread so a post into it can unarchive it.
+    (state.fixtures.discord.threads ||= {})[created.id] = created;
+    (state.fixtures.discord.injectedThreads ||= []).push({ delivered: false, newlyCreated: true, ...created });
+  });
+}
+
+// Queues a Gateway THREAD_UPDATE for a thread injected earlier, such as
+// `{ archived: true, archiveTimestamp }`; the shim emits the old and new thread.
+export function injectDiscordThreadUpdate(workspace, thread) {
+  updateFixtureState(workspace, state => {
+    const previous = state.fixtures.discord.threads[thread.id];
+    const updated = { ...previous, ...thread };
+    state.fixtures.discord.threads[thread.id] = updated;
+    state.fixtures.discord.injectedThreads.push({ ...updated, event: "update", previous, delivered: false });
+  });
+}
+
+// Queues a Gateway THREAD_DELETE for a thread injected earlier.
+export function injectDiscordThreadDelete(workspace, threadId) {
+  updateFixtureState(workspace, state => {
+    const deleted = state.fixtures.discord.threads[threadId];
+    delete state.fixtures.discord.threads[threadId];
+    state.fixtures.discord.injectedThreads.push({ ...deleted, event: "delete", delivered: false });
+  });
 }
 
 export function injectDiscordReaction(workspace, reaction = {}) {

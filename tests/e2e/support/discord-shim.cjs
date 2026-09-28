@@ -173,6 +173,7 @@ function fixtureReaction(client, raw) {
 function fixtureThread(raw) {
   return {
     archived: raw.archived ?? false,
+    archiveTimestamp: raw.archiveTimestamp ? Date.parse(raw.archiveTimestamp) : null,
     autoArchiveDuration: raw.autoArchiveDuration ?? 1440,
     id: raw.id,
     name: raw.name ?? `thread-${raw.id}`,
@@ -253,7 +254,7 @@ class Client extends EventEmitter {
         if (thread) {
           thread.delivered = true;
           state.fixtures.discord.deliveredThreads ||= [];
-          state.fixtures.discord.deliveredThreads.push({ id: thread.id });
+          state.fixtures.discord.deliveredThreads.push({ id: thread.id, event: thread.event ?? "create" });
           deliveredThread = { ...thread };
           return;
         }
@@ -281,7 +282,11 @@ class Client extends EventEmitter {
         state.fixtures.discord.deliveredReactions.push({ id: nextReaction.id });
         deliveredReaction = { ...nextReaction };
       });
-      if (deliveredThread) {
+      if (deliveredThread?.event === "update") {
+        this.emit("threadUpdate", fixtureThread(deliveredThread.previous), fixtureThread(deliveredThread));
+      } else if (deliveredThread?.event === "delete") {
+        this.emit("threadDelete", fixtureThread(deliveredThread));
+      } else if (deliveredThread) {
         this.emit("threadCreate", fixtureThread(deliveredThread), deliveredThread.newlyCreated ?? true);
       } else if (delivered) {
         this.emit("messageCreate", fixtureMessage(this, delivered));

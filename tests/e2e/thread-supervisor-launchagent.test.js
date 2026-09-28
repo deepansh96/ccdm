@@ -37,7 +37,9 @@ function setup(workspace) {
 }
 
 const plistPath = workspace => path.join(workspace.homeDir, "Library", "LaunchAgents", `${LABEL}.plist`);
-const install = (workspace, context, extra = {}) => runScript(workspace, INSTALLER, { env: context.env, ...extra });
+// The installer's preflight probes the audit log, so it runs against the REST fake.
+const install = (workspace, context, extra = {}) =>
+  runScript(workspace, INSTALLER, { env: bridgeChildEnv(workspace, context.env), ...extra });
 
 async function supervisor(workspace, context, name, expected = 0) {
   const result = await runScript(workspace, "scripts/thread-supervisor.py", {

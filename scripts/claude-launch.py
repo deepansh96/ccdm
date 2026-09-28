@@ -31,6 +31,12 @@ def valid_thread_id(value: str) -> str:
     return value
 
 
+def valid_session_id(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9-]+", value or ""):
+        raise argparse.ArgumentTypeError("a Claude session id has only letters, digits, and hyphens")
+    return value
+
+
 def resolve(registry_path: str, project: str, thread_id: str | None = None) -> dict:
     registry = json.load(open(registry_path))
     entry = registry["projects"][project]
@@ -160,8 +166,9 @@ def prepare_thread_state(registry: dict, project: str, resolved: dict) -> None:
     Path(resolved["bootstrap_file"]).unlink(missing_ok=True)
 
 
-def launch_command(registry_path: str, project: str, thread_id: str | None) -> str:
-    """Write the launch's proxy MCP config and settings; return its tmux shell command."""
+def launch_command(registry_path: str, project: str, thread_id: str | None, resume: str | None = None) -> str:
+    """Write the launch's proxy MCP config and settings; return its tmux shell command.
+    ``resume`` continues that Claude session under the same home and cwd."""
     resolved = resolve(registry_path, project, thread_id)
     registry = json.loads(Path(registry_path).read_text())
     state_dir = resolved["state_dir"]
@@ -272,6 +279,8 @@ def launch_command(registry_path: str, project: str, thread_id: str | None) -> s
         flags += f" --model '{resolved['model']}'"
     if resolved["effort"]:
         flags += f" --effort '{resolved['effort']}'"
+    if resume:
+        flags += f" --resume '{resume}'"
     return f"cd '{resolved['path']}' && {launch_env} claude {flags}"
 
 
@@ -285,6 +294,8 @@ def main() -> None:
         command.add_argument("--thread-id", type=valid_thread_id)
         if name == "resolve":
             command.add_argument("--json", action="store_true")
+        else:
+            command.add_argument("--resume", type=valid_session_id)
     commands.add_parser("listener-pids").add_argument("state_dir")
     args = parser.parse_args()
     if args.command == "resolve":
@@ -294,7 +305,7 @@ def main() -> None:
         else:
             print_fields(resolved)
     elif args.command == "launch-command":
-        print(launch_command(args.registry, args.project, args.thread_id))
+        print(launch_command(args.registry, args.project, args.thread_id, args.resume))
     else:
         for pid in listener_pids(args.state_dir):
             print(pid)

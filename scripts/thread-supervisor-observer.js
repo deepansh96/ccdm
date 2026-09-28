@@ -89,6 +89,22 @@ async function threadMessage(message) {
   if (JSON.parse(stdout).result === "start") startSession(message.channelId);
 }
 
+// Classifying an archive can wait up to a minute for its audit-log entry, so
+// it runs beside the event queue like a boot.
+function threadArchived(thread) {
+  const payload = { thread_id: thread.id,
+    archived_at: thread.archiveTimestamp ? new Date(thread.archiveTimestamp).toISOString() : null };
+  const child = spawn(process.env.CCDM_THREAD_PYTHON || "python3", [service, "archive", "--payload",
+    JSON.stringify(payload), "--project-root", projectRoot, "--state-dir", stateDir],
+  { stdio: ["ignore", "ignore", "inherit"] });
+  child.on("error", error => log(`thread ${thread.id}: archive handling failed: ${error.message}`));
+}
+
+async function threadDeleted(thread) {
+  await exec(process.env.CCDM_THREAD_PYTHON || "python3", [service, "delete", "--project-root", projectRoot,
+    "--state-dir", stateDir, "--payload", JSON.stringify({ thread_id: thread.id })]);
+}
+
 // A session boot can take up to the boot timeout, so it runs beside the event
 // queue; messages that arrive meanwhile are held for its bootstrap.
 function startSession(threadId) {
@@ -103,6 +119,17 @@ client.on("messageCreate", message => {
   // message that may carry any author.
   if (message.author?.bot && message.type !== 21) return;
   queue = queue.then(() => threadMessage(message)).catch(error => log(`thread ${message.channelId}: ${error.message}`));
+});
+
+// Only an archive matters: an unarchive, such as a bot post reopening the
+// thread, never resumes a session; the owner's next message does.
+client.on("threadUpdate", (previous, thread) => {
+  if (!thread.archived || previous?.archived === true) return;
+  queue = queue.then(() => threadArchived(thread)).catch(error => log(`thread ${thread.id}: ${error.message}`));
+});
+
+client.on("threadDelete", thread => {
+  queue = queue.then(() => threadDeleted(thread)).catch(error => log(`thread ${thread.id}: ${error.message}`));
 });
 
 client.on("threadCreate", thread => {

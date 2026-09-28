@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from datetime import datetime, timezone
 import fcntl
 import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import sqlite3
 import stat
@@ -37,6 +39,10 @@ DISABLE_TIMEOUT_SECONDS = 30
 # supervisor clock, fails once and waits for the next owner message.
 BOOT_TIMEOUT_SECONDS = 120
 BOOTING_EMOJI = "👀"
+# How long, on the supervisor clock, an archive waits for its audit-log actor
+# before it is treated as an auto-archive, and the real-time retry interval.
+ARCHIVE_ACTOR_TIMEOUT_SECONDS = 60
+ARCHIVE_ACTOR_RETRY_SECONDS = 0.5
 # Discord message types a person sends: a default message and a reply.
 USER_MESSAGE_TYPES = {0, 19}
 # A thread's starter reference, carrying the parent-channel message it began from.
@@ -76,6 +82,37 @@ def root_credentials_present() -> bool:
     return bool(token) and not any(character.isspace() for character in token)
 
 
+def root_user_id(registry: dict) -> str:
+    """The root bot's user id, decoded from its token's first segment when possible."""
+    directory = Path(os.environ.get("ROOT_DISCORD_STATE_DIR") or Path.home() / ".claude" / "channels" / "discord")
+    try:
+        lines = (directory / ".env").read_text(encoding="utf-8").splitlines()
+        token = next(line[len("DISCORD_BOT_TOKEN="):].strip().strip("'\"") for line in lines
+                     if line.startswith("DISCORD_BOT_TOKEN="))
+        encoded = token.split(".")[0]
+        decoded = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("ascii")
+        if decoded.isdigit():
+            return decoded
+    except (OSError, StopIteration, ValueError, UnicodeDecodeError):
+        pass
+    return str(registry.get("root_bot_app_id") or "")
+
+
+def audit_log(project_root: Path, mode: str, request: dict) -> dict | None:
+    """One root-credential audit-log read; None when it fails for any reason but a 403."""
+    try:
+        completed = subprocess.run(
+            [os.environ.get("CCDM_THREAD_NODE", "node"), str(Path(__file__).with_name("thread-supervisor-audit.js")),
+             mode, json.dumps(request)], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        log(f"audit-log {mode} failed: {error}")
+        return None
+    if completed.returncode != 0:
+        log(completed.stderr.strip() or f"audit-log {mode} failed")
+        return None
+    return json.loads(completed.stdout)
+
+
 def configuration_blockers(project_root: Path) -> list[str]:
     blockers = []
     try:
@@ -107,7 +144,19 @@ def preflight(project_root: Path, state_dir: Path) -> dict:
     except (OSError, ValueError, sqlite3.Error) as error:
         store = "unusable"
         blockers.append(f"the thread store cannot be used: {error}")
-    return {"status": "blocked" if blockers else "ok", "blockers": blockers, "store": store,
+    # Archives are classified by their audit-log actor, which needs View Audit Log.
+    audit = "unverified"
+    try:
+        guild_id = str(load_registry(project_root).get("guild_id") or "")
+    except (OSError, ValueError, json.JSONDecodeError):
+        guild_id = ""
+    if guild_id and root_credentials_present():
+        checked = audit_log(project_root, "check", {"guild_id": guild_id})
+        audit = checked["result"] if checked else "unverified"
+    if audit == "forbidden":
+        blockers.append("the root bot lacks View Audit Log in the guild, so thread archives cannot be told apart "
+                        "from auto-archives; grant View Audit Log to the root bot's role")
+    return {"status": "blocked" if blockers else "ok", "blockers": blockers, "store": store, "audit_log": audit,
             "disabled": disabled_marker(state_dir).exists(), "state_dir": str(state_dir)}
 
 
@@ -195,6 +244,8 @@ def status(state_dir: Path, project_root: Path | None = None) -> dict:
                 for field in ("stop_reason", "provider_conversation_id", "runtime_tmux"):
                     if row[field] is not None:
                         entry[field] = row[field]
+                if row["archive_actor"] == "unknown":
+                    entry["archive"] = "archive-actor-unknown"
                 buffered = buffer_path(state_dir, row["thread_id"])
                 if row["state"] == "booting" and buffered.exists():
                     entry["buffered_messages"] = len(json.loads(buffered.read_text(encoding="utf-8")))
@@ -331,13 +382,13 @@ def message(project_root: Path, state_dir: Path, event: dict) -> dict:
                 if activity:
                     STORE.update(db, thread_id, **activity)
                 return {"result": "buffered"}
-            # A failed start is never retried automatically: only the next
-            # owner message retries it.
-            retry = row["state"] == "stopped" and row["stop_reason"] == "start-failed" and author == owner
-            if row["state"] != "registered" and not retry:
+            # Only an owner message resumes a stopped or closed thread, and a
+            # failed start is never retried automatically.
+            resume = row["state"] in ("stopped", "closed") and author == owner
+            if row["state"] != "registered" and not resume:
                 return {"result": "ignored", "reason": f"thread is {row['state']}"}
             write_private(buffered, [held])
-            STORE.update(db, thread_id, state="booting", stop_reason=None, **activity)
+            STORE.update(db, thread_id, state="booting", stop_reason=None, archive_actor=None, **activity)
             return {"result": "start", "thread_id": thread_id}
     finally:
         db.close()
@@ -376,6 +427,95 @@ def claude_session(resolved: dict) -> tuple[int | None, str | None]:
             return pid, session.get("sessionId") or session.get("session_id") or session.get("id")
         time.sleep(0.25)
     return None, None
+
+
+def stop_runtime(project_root: Path, state_dir: Path, row) -> None:
+    """The provider-agnostic stop hook: end a thread's session and remove its
+    per-thread runtime files (state dir with launch files, inbox, and
+    bootstrap; held boot messages), keeping the row so the thread can resume.
+    Provider conversation files are never touched. Only Claude threads run a
+    session so far."""
+    thread_id = row["thread_id"]
+    with BootLock(state_dir):
+        buffer_path(state_dir, thread_id).unlink(missing_ok=True)
+    try:
+        resolved = LAUNCH.resolve(str(project_root / "registry.json"), row["project"], thread_id)
+    except (OSError, ValueError, KeyError, StopIteration, SystemExit):
+        resolved = None
+    session = row["runtime_tmux"] or (resolved and resolved["session_name"])
+    if session:
+        tmux("kill-session", "-t", f"={session}")
+    if resolved:
+        for pid in LAUNCH.listener_pids(resolved["state_dir"]):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        shutil.rmtree(resolved["state_dir"], ignore_errors=True)
+
+
+def archive_actor(project_root: Path, registry: dict, event: dict) -> str | None:
+    """Who archived the thread, from audit-log action 111; None when root may
+    not read the audit log or no entry appears within the retry window."""
+    started = clock_now()
+    request = {"guild_id": str(registry.get("guild_id") or ""), "thread_id": str(event["thread_id"]),
+               "archived_at": event.get("archived_at")}
+    while True:
+        found = audit_log(project_root, "actor", request)
+        if found and found["result"] == "found":
+            return found["user_id"]
+        if found and found["result"] == "forbidden":
+            log(f"thread {event['thread_id']}: the root bot cannot read the audit log; treating it as auto-archived")
+            return None
+        if elapsed_seconds(started) >= ARCHIVE_ACTOR_TIMEOUT_SECONDS:
+            return None
+        time.sleep(ARCHIVE_ACTOR_RETRY_SECONDS)
+
+
+def archive(project_root: Path, state_dir: Path, event: dict) -> dict:
+    """Stop an archived thread's session. An archive by the owner or root
+    closes the conversation; any other actor, or none, is an auto-archive that
+    leaves it open for the owner's next message."""
+    thread_id = str(event.get("thread_id") or "")
+    db = STORE.connect(state_dir)
+    if not db:
+        return {"result": "ignored", "reason": "unbound-thread"}
+    try:
+        if not STORE.thread(db, thread_id):
+            return {"result": "ignored", "reason": "unbound-thread"}
+        registry = load_registry(project_root)
+        actor = archive_actor(project_root, registry, {**event, "thread_id": thread_id})
+        closed = actor is not None and actor in {str(registry.get("discord_user_id") or ""), root_user_id(registry)}
+        row = STORE.thread(db, thread_id)
+        if not row:
+            return {"result": "ignored", "reason": "deleted"}
+        stop_runtime(project_root, state_dir, row)
+        # An auto-archive never reopens a Closed Conversation.
+        if closed or row["state"] == "closed":
+            fields = {"state": "closed", "stop_reason": None}
+        else:
+            fields = {"state": "stopped", "stop_reason": "auto-archive"}
+        STORE.update(db, thread_id, **fields, runtime_tmux=None, runtime_pid=None, archive_actor=actor or "unknown")
+        return {"result": fields["state"], "thread_id": thread_id, "archive_actor": actor or "unknown"}
+    finally:
+        db.close()
+
+
+def delete(project_root: Path, state_dir: Path, event: dict) -> dict:
+    """Forget a deleted thread: stop its session and drop its row and runtime files."""
+    thread_id = str(event.get("thread_id") or "")
+    db = STORE.connect(state_dir)
+    if not db:
+        return {"result": "ignored", "reason": "unbound-thread"}
+    try:
+        row = STORE.thread(db, thread_id)
+        if not row:
+            return {"result": "ignored", "reason": "unbound-thread"}
+        stop_runtime(project_root, state_dir, row)
+        STORE.forget(db, thread_id)
+        return {"result": "forgotten", "thread_id": thread_id}
+    finally:
+        db.close()
 
 
 def bootstrap(row, owner: str, starter: dict | None, held: list[dict]) -> dict:
@@ -417,12 +557,7 @@ def boot(project_root: Path, state_dir: Path, thread_id: str) -> dict:
         with BootLock(state_dir):
             buffer_path(state_dir, thread_id).unlink(missing_ok=True)
             STORE.update(db, thread_id, state="stopped", stop_reason="start-failed", runtime_tmux=None, runtime_pid=None)
-        tmux("kill-session", "-t", f"={resolved['session_name']}")
-        for pid in LAUNCH.listener_pids(resolved["state_dir"]):
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pass
+        stop_runtime(project_root, state_dir, STORE.thread(db, thread_id))
         log(f"thread {thread_id} failed to start: {reason}")
         discord_request(project_root, "post", {"bot_id": bot_id, "channel_id": thread_id,
                                                "content": f"Thread session failed to start: {reason}"})
@@ -430,8 +565,12 @@ def boot(project_root: Path, state_dir: Path, thread_id: str) -> dict:
         db.close()
         return {"status": "failed", "reason": reason}
 
-    launched = subprocess.run([str(Path(__file__).with_name("start-thread-session.sh")), row["project"], thread_id],
-                              capture_output=True, text=True, timeout=120)
+    # A thread with a stored conversation resumes it under the same Claude
+    # home and cwd; an account change starts fresh.
+    home = str(resolved["claude_home"] or Path.home() / ".claude")
+    resume = row["provider_conversation_id"] if row["provider_home"] == home else None
+    launched = subprocess.run([str(Path(__file__).with_name("start-thread-session.sh")), row["project"], thread_id,
+                               *([resume] if resume else [])], capture_output=True, text=True, timeout=120)
     if launched.returncode != 0:
         detail = (launched.stderr.strip() or launched.stdout.strip() or "the Claude thread launcher failed")
         return fail(detail.splitlines()[-1])
@@ -452,7 +591,7 @@ def boot(project_root: Path, state_dir: Path, thread_id: str) -> dict:
 
     pid, session_id = claude_session(resolved)
     starter = None
-    if row["starter_message_id"]:
+    if row["starter_message_id"] and not resume:
         starter = discord_request(project_root, "get-message", {
             "bot_id": bot_id, "channel_id": resolved["channel_id"], "message_id": row["starter_message_id"]})
     with BootLock(state_dir):
@@ -463,7 +602,7 @@ def boot(project_root: Path, state_dir: Path, thread_id: str) -> dict:
         STORE.update(db, thread_id, state="live", stop_reason=None, resolved_provider="claude",
                      resolved_account=resolved["claude_home"], resolved_model=resolved["model"],
                      resolved_effort=resolved["effort"], provider_conversation_id=session_id,
-                     provider_home=str(resolved["claude_home"] or Path.home() / ".claude"),
+                     provider_home=home,
                      runtime_tmux=session, runtime_pid=pid)
     discord_request(project_root, "unreact", reaction)
     db.close()
@@ -515,7 +654,7 @@ def run(project_root: Path, state_dir: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("run", "status", "preflight", "disable", "enable", "bind", "message",
-                                            "boot", "grant-thread-permissions"))
+                                            "archive", "delete", "boot", "grant-thread-permissions"))
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--state-dir", type=Path, default=None)
     parser.add_argument("--payload", help="internal: the observer's thread event as JSON")
@@ -540,10 +679,11 @@ def main() -> int:
             if not args.payload:
                 raise ValueError("--payload is required")
             result = bind(args.project_root, state_dir, json.loads(args.payload))
-        elif args.command == "message":
+        elif args.command in ("message", "archive", "delete"):
             if not args.payload:
                 raise ValueError("--payload is required")
-            result = message(args.project_root, state_dir, json.loads(args.payload))
+            handler = {"message": message, "archive": archive, "delete": delete}[args.command]
+            result = handler(args.project_root, state_dir, json.loads(args.payload))
         elif args.command == "boot":
             if not args.thread_id:
                 raise ValueError("--thread-id is required")

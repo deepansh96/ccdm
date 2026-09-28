@@ -237,3 +237,44 @@ test("preflight validates the owner, root credentials, and store without side ef
   assert.ok(exposed.some(blocker => /state directory is not private/.test(blocker)), exposed.join("\n"));
   assert.equal(fs.statSync(stateDir).mode & 0o777, 0o755);
 });
+
+test("a schema v1 thread store passes preflight and gains the archive actor column, keeping its rows", async () => {
+  const workspace = createWorkspace();
+  const rootState = setup(workspace);
+  const env = supervisorEnv(workspace, rootState);
+  const stateDir = defaultStateDir(workspace);
+  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const store = path.join(stateDir, "threads.sqlite3");
+  // The schema v1 thread store, as the first Thread Supervisor release created it.
+  const seeded = spawnSync("python3", ["-c", `
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.executescript("""
+CREATE TABLE threads (thread_id TEXT PRIMARY KEY, project TEXT NOT NULL, name TEXT NOT NULL,
+  creator_id TEXT NOT NULL, starter_message_id TEXT, provider TEXT, account TEXT, model TEXT, effort TEXT,
+  resolved_provider TEXT, resolved_account TEXT, resolved_model TEXT, resolved_effort TEXT,
+  provider_conversation_id TEXT, provider_home TEXT, state TEXT NOT NULL, stop_reason TEXT,
+  turn_running INTEGER NOT NULL DEFAULT 0, runtime_tmux TEXT, runtime_pid INTEGER, runtime_host TEXT,
+  runtime_home TEXT, created_at TEXT NOT NULL, last_owner_activity_at TEXT, last_turn_end_at TEXT,
+  pending_config TEXT, pending_close TEXT);
+CREATE TABLE creation_requests (request_id TEXT PRIMARY KEY, project TEXT NOT NULL, name TEXT NOT NULL,
+  provider TEXT, account TEXT, model TEXT, effort TEXT, first_message TEXT, requester_id TEXT NOT NULL,
+  requester_kind TEXT NOT NULL, status TEXT NOT NULL, thread_id TEXT, created_at TEXT NOT NULL);
+INSERT INTO threads (thread_id, project, name, creator_id, state, stop_reason, provider_conversation_id, created_at)
+  VALUES ('thread-1', 'demo', 'Old', 'owner', 'stopped', 'auto-archive', 'session-1', '2026-09-27T10:00:00Z');
+PRAGMA user_version=1;
+""")`, store], { encoding: "utf8" });
+  assert.equal(seeded.status, 0, seeded.stderr);
+  fs.chmodSync(store, 0o600);
+
+  const checked = await supervisor(workspace, "preflight", env);
+  assert.equal(checked.exitCode, 0, checked.stdout);
+  assert.equal(JSON.parse(checked.stdout).store, "ok");
+  const current = await status(workspace, env);
+  assert.deepEqual(current.projects.demo.threads["thread-1"], { name: "Old", creator_id: "owner", state: "stopped",
+    stop_reason: "auto-archive", provider_conversation_id: "session-1" });
+  const version = spawnSync("python3", ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); " +
+    "print(db.execute('PRAGMA user_version').fetchone()[0], 'archive_actor' in " +
+    "[row[1] for row in db.execute('PRAGMA table_info(threads)')])", store], { encoding: "utf8" });
+  assert.equal(version.stdout.trim(), "2 True", version.stderr);
+});

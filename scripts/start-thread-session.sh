@@ -1,9 +1,11 @@
 #!/bin/zsh
-# Usage: ./scripts/start-thread-session.sh <project_name> <thread_id>
+# Usage: ./scripts/start-thread-session.sh <project_name> <thread_id> [resume_session_id]
 # Starts a Claude Thread Conversation pinned to one Discord thread under the
 # project's channel, in tmux session <screen_name>-t-<last 6 digits of the
 # thread id>. The Thread Supervisor runs this and then drives startup and the
-# bootstrap handoff. It never touches the project's Channel Conversation.
+# bootstrap handoff. With a session id it resumes that Claude conversation
+# (`claude --resume`) under the same Claude home and cwd. It never touches the
+# project's Channel Conversation.
 
 set -euo pipefail
 
@@ -13,9 +15,10 @@ REGISTRY="$ROOT_DIR/registry.json"
 
 PROJECT="${1:-}"
 THREAD_ID="${2:-}"
+RESUME_ID="${3:-}"
 
 if [[ -z "$PROJECT" || -z "$THREAD_ID" ]]; then
-  echo "Usage: $0 <project_name> <thread_id>"
+  echo "Usage: $0 <project_name> <thread_id> [resume_session_id]"
   exit 1
 fi
 
@@ -39,6 +42,8 @@ fi
 # The helper prepares the private thread state dir (symlinked .env, parent-only
 # access.json), writes this thread's own proxy MCP config and settings, and
 # maps model, effort, and account exactly as for the Channel Conversation.
-LAUNCH_COMMAND="$(python3 "$SCRIPT_DIR/claude-launch.py" launch-command "$REGISTRY" "$PROJECT" --thread-id "$THREAD_ID")" || exit $?
+RESUME_ARGS=()
+[[ -n "$RESUME_ID" ]] && RESUME_ARGS=(--resume "$RESUME_ID")
+LAUNCH_COMMAND="$(python3 "$SCRIPT_DIR/claude-launch.py" launch-command "$REGISTRY" "$PROJECT" --thread-id "$THREAD_ID" "${RESUME_ARGS[@]}")" || exit $?
 tmux new-session -d -s "$SESSION_NAME" -- zsh -ic "$LAUNCH_COMMAND"
 echo "Started Claude thread session in tmux session '$SESSION_NAME'"
