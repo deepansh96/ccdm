@@ -133,3 +133,21 @@ test("operator documentation and scenario matrix record the Thread Supervisor", 
   }
   assert.match(fs.readFileSync(".mex/context/architecture.md", "utf8"), /\*\*Thread Supervisor\*\*/);
 });
+
+test("operator documentation and scenario matrix record the Thread Supervisor LaunchAgent", () => {
+  const section = operatorReadme.slice(operatorReadme.indexOf("## Thread Supervisor"));
+  for (const phrase of ["scripts/install-thread-supervisor.sh", "docs/thread-supervisor.md",
+    "scripts/thread-supervisor.py disable", "scripts/thread-supervisor.py enable"]) {
+    assert.ok(section.includes(phrase), phrase);
+  }
+  const guide = fs.readFileSync("docs/thread-supervisor.md", "utf8");
+  for (const phrase of ["## Install", "## Restart", "## Foreground debug mode", "scripts/install-thread-supervisor.sh",
+    "com.discord.thread-supervisor", "scripts/thread-supervisor.py disable", "scripts/thread-supervisor.py enable",
+    "scripts/thread-supervisor.py run", "KeepAlive", "CCDM_THREAD_NODE", "service.log"]) {
+    assert.ok(guide.includes(phrase), phrase);
+  }
+  for (const scenario of ["Supervised LaunchAgent installation", "Disable, enable, and restart",
+    "Foreground run against the supervised lock"]) {
+    assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-supervisor-launchagent\\.test\\.js`));
+  }
+});

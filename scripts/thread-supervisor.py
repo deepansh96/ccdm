@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 
 
 def _load(name: str, filename: str):
@@ -29,6 +30,8 @@ STORE = _load("ccdm_thread_store", "thread-supervisor-store.py")
 ROUTER = _load("ccdm_thread_router", "thread-supervisor-router.py")
 # Discord's longest auto-archive duration, in minutes (one week).
 AUTO_ARCHIVE_MINUTES = 10080
+# How long `disable` waits for a running worker to release its lock.
+DISABLE_TIMEOUT_SECONDS = 30
 
 
 def clock_now() -> str:
@@ -74,6 +77,10 @@ def configuration_blockers(project_root: Path) -> list[str]:
     return blockers
 
 
+def disabled_marker(state_dir: Path) -> Path:
+    return state_dir / "disabled"
+
+
 def preflight(project_root: Path, state_dir: Path) -> dict:
     """Read-only checks: it creates, migrates, and re-permissions nothing."""
     blockers = configuration_blockers(project_root)
@@ -85,7 +92,7 @@ def preflight(project_root: Path, state_dir: Path) -> dict:
         store = "unusable"
         blockers.append(f"the thread store cannot be used: {error}")
     return {"status": "blocked" if blockers else "ok", "blockers": blockers, "store": store,
-            "state_dir": str(state_dir)}
+            "disabled": disabled_marker(state_dir).exists(), "state_dir": str(state_dir)}
 
 
 def worker(state_dir: Path) -> dict:
@@ -112,7 +119,29 @@ def status(state_dir: Path) -> dict:
                 projects.setdefault(row["project"], {"threads": {}})["threads"][row["thread_id"]] = {
                     "name": row["name"], "creator_id": row["creator_id"], "state": row["state"]}
         db.close()
-    return {"status": "ok", **worker(state_dir), "state_dir": str(state_dir), "projects": projects}
+    return {"status": "ok", **worker(state_dir), "disabled": disabled_marker(state_dir).exists(),
+            "state_dir": str(state_dir), "projects": projects}
+
+
+def disable(state_dir: Path) -> dict:
+    """Stop the worker and keep it stopped: a disabled `run` exits successfully at launch,
+    so a LaunchAgent that relaunches only on unsuccessful exits stays down."""
+    STORE.private_directory(state_dir)
+    marker = disabled_marker(state_dir)
+    os.close(os.open(marker, os.O_WRONLY | os.O_CREAT, 0o600))
+    os.chmod(marker, 0o600)
+    deadline = time.monotonic() + DISABLE_TIMEOUT_SECONDS
+    while worker(state_dir)["running"]:
+        if time.monotonic() > deadline:
+            return {"status": "blocked", "reason": "the thread supervisor worker did not stop", **worker(state_dir)}
+        time.sleep(0.1)
+    return status(state_dir)
+
+
+def enable(project_root: Path, state_dir: Path) -> dict:
+    """Clear the disabled marker and validate; the operator then starts `run` or reruns the installer."""
+    disabled_marker(state_dir).unlink(missing_ok=True)
+    return preflight(project_root, state_dir)
 
 
 def bind(project_root: Path, state_dir: Path, event: dict) -> dict:
@@ -135,6 +164,8 @@ def run(project_root: Path, state_dir: Path) -> dict:
     blockers = configuration_blockers(project_root)
     if blockers:
         return {"status": "blocked", "blockers": blockers}
+    if disabled_marker(state_dir).exists():
+        return {"status": "disabled", "disabled": True}
     STORE.private_directory(state_dir)
     lock_path = state_dir / "worker.lock"
     with lock_path.open("a+") as lock:
@@ -155,7 +186,7 @@ def run(project_root: Path, state_dir: Path) -> dict:
              "--project-root", str(project_root), "--state-dir", str(state_dir)],
             env={**os.environ, "CCDM_THREAD_STATE_DIR": str(state_dir)})
         try:
-            while not stopping.wait(0.2):
+            while not stopping.wait(0.2) and not disabled_marker(state_dir).exists():
                 # A group-wide SIGTERM reaches the observer too; let this
                 # process's handler run before treating the exit as a failure.
                 if observer.poll() is not None and not stopping.wait(0.5):
@@ -173,7 +204,7 @@ def run(project_root: Path, state_dir: Path) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("run", "status", "preflight", "bind"))
+    parser.add_argument("command", choices=("run", "status", "preflight", "disable", "enable", "bind"))
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--state-dir", type=Path, default=None)
     parser.add_argument("--payload", help="internal: the observer's thread event as JSON")
@@ -184,6 +215,10 @@ def main() -> int:
             result = status(state_dir)
         elif args.command == "preflight":
             result = preflight(args.project_root, state_dir)
+        elif args.command == "disable":
+            result = disable(state_dir)
+        elif args.command == "enable":
+            result = enable(args.project_root, state_dir)
         elif args.command == "bind":
             if not args.payload:
                 raise ValueError("--payload is required")

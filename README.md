@@ -595,6 +595,8 @@ scripts/thread-supervisor.py status      # bound threads per project, with name,
 
 `run` logs in with the root bot credentials from `ROOT_DISCORD_STATE_DIR/.env` (default `~/.claude/channels/discord/.env`). Only one worker runs at a time: a second `run` exits nonzero while the lock is held. The supervisor is independent of the Conversation Reminder service; neither needs the other running. State lives in `~/.local/state/ccdm/thread-supervisor/` (override with `CCDM_THREAD_STATE_DIR`): the directory is `0700` and the SQLite thread store and lock are `0600`. `preflight` creates nothing and names every blocker it finds.
 
+On macOS, `scripts/install-thread-supervisor.sh` installs the same worker as the `com.discord.thread-supervisor` LaunchAgent. It runs `preflight` first and keeps credentials out of the plist. To restart the supervisor, run `scripts/thread-supervisor.py disable`, then `scripts/thread-supervisor.py enable`, then the installer. `disable` stops the worker and keeps launchd from relaunching it. For foreground debugging, `disable` and `enable`, then use `run`. See the [Thread Supervisor guide](docs/thread-supervisor.md) for install, restart, and foreground debug mode.
+
 ## Scheduled Usage Stats Poster
 
 A separate, opt-in macOS LaunchAgent can post usage stats to Discord on a schedule. It is not installed by `setup.sh` and it is not the old tmux-based `usage-report-loop.sh` flow.
