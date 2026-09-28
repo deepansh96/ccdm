@@ -23,6 +23,7 @@ last_updated: 2026-09-28
 5. After writing or changing the project entry, run `scripts/conversation-reminder-service.py assignment-changed --project <project>` so Conversation Reminders get a fresh assignment generation.
 6. Start through the matching lifecycle script and report bot/channel/type without exposing credentials.
 7. On deregistration, stop fully first, remove permissions/access entries and guest role, reset the bot name, release the pool entry, remove the project, then run the same `assignment-changed` command to retire its reminder state.
+8. Beside every `assignment-changed`, run `scripts/thread-supervisor.py project-changed --project <project>`. After deregistration it stops and closes all of the project's threads. After a bot reassignment it restarts the project's live threads on the new bot with resume (`bot-changed`), rebuilding each Claude thread's state dir under the new bot's `state_dir` and replacing a Codex project's thread host. Stopped threads stay stopped.
 
 ## Gotchas
 - One bot cannot serve two projects.
@@ -36,6 +37,7 @@ last_updated: 2026-09-28
 ## Verify
 - [ ] Bot sees only its assigned channel.
 - [ ] Registry, Discord overrides, and access files agree.
+- [ ] After `project-changed`, `scripts/threads.sh list <project>` shows no thread still running on the old bot, or (after deregistration) every thread is `closed` in `scripts/thread-supervisor.py status`.
 - [ ] Start/stop E2E coverage still passes.
 
 ## Update Scaffold

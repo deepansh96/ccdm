@@ -216,6 +216,20 @@ async function tryDeleteMemberRole(registry, userId, roleId, token) {
   });
 }
 
+// Restart the project's live thread sessions with resume, so each regenerates
+// its access for the current guests. A failure leaves the access change in place.
+function restartThreads(projectName) {
+  try {
+    execFileSync(process.env.CCDM_THREAD_PYTHON || "python3",
+      [path.join(__dirname, "thread-supervisor.py"), "project-changed", "--project", projectName,
+        "--project-root", ROOT_DIR],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] });
+  } catch (error) {
+    process.exitCode = 1;
+    console.error(`Error: restarting ${projectName}'s thread sessions failed: ${error.stdout?.trim() || error.message}`);
+  }
+}
+
 function persistGuestAccess(registry, project, roleId, userIds) {
   project.guest_role_id = roleId;
   project.guest_user_ids = unique(userIds);
@@ -237,6 +251,7 @@ async function grant(registry, target, userId, options = {}) {
   const result = await prepareGuestAccess(registry, target, userId, options);
   persistGuestAccess(registry, result.project, result.roleId, result.guestUserIds);
   console.log(`Granted ${userId} guest access to ${result.projectName}.`);
+  restartThreads(result.projectName);
   return result;
 }
 
@@ -291,6 +306,7 @@ async function invite(registry, target, userId) {
   persistGuestAccess(registry, result.project, result.roleId, result.guestUserIds);
   console.log(`Granted ${userId} guest access to ${result.projectName}.`);
   console.log(`Invite: ${inviteResult.url}`);
+  restartThreads(result.projectName);
 }
 
 async function deleteInvite(token, code) {
@@ -314,6 +330,7 @@ async function revoke(registry, target, userId) {
   saveRegistry(registry);
   updateAccessJson(registry, project);
   console.log(`Revoked ${userId} guest access from ${projectName}.`);
+  restartThreads(projectName);
 }
 
 async function sync(registry, target) {

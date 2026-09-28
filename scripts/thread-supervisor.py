@@ -71,6 +71,11 @@ REQUEST_SOCKET = "requests.sock"
 OPERATOR_OPS = ("stop", "restart", "close")
 OPERATOR_NOTICES = {"stop": "Stopped by root; the owner's next message resumes this thread.",
                     "restart": "Restarting this thread's session for root; the conversation resumes."}
+# The line a live thread gets when a registry change restarts its session.
+PROJECT_CHANGE_NOTICES = {
+    "bot-changed": "Restarting this thread's session on the project's new bot; the conversation resumes.",
+    "guest-changed": "Restarting this thread's session because guest access changed; the conversation resumes.",
+}
 # A Discord thread link, optionally to one message in the thread.
 THREAD_LINK = re.compile(r"https://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/channels/[^/\s]+/(\d+)(?:/\d+)?/?")
 NOT_RUNNING = ("the thread supervisor is not running; start it with scripts/install-thread-supervisor.sh "
@@ -711,6 +716,101 @@ def stop_threads(project_root: Path, state_dir: Path, project_name: str) -> dict
     if project.get("screen_name"):
         tmux("kill-session", "-t", f"={project['screen_name']}-threads")
     return {"status": "ok", "project": project_name, "stopped": stopped}
+
+
+def retire_state_dir(registry: dict, row) -> None:
+    """End the listeners of a Claude thread's state dir under the bot its last
+    session started with, and remove that dir, once the project no longer uses that bot."""
+    bot = next((entry for entry in registry.get("pool") or [] if isinstance(entry, dict)
+                and entry.get("id") == row["runtime_bot"] and entry.get("state_dir")), None)
+    if not bot:
+        return
+    thread_dir = os.path.join(os.path.expanduser(bot["state_dir"]), "threads", row["thread_id"])
+    for pid in LAUNCH.listener_pids(thread_dir):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    shutil.rmtree(thread_dir, ignore_errors=True)
+
+
+def project_changed(project_root: Path, state_dir: Path, project_name: str) -> dict:
+    """The registration hook, run after the registry changes a project. A
+    deregistered project's threads all stop and close. Otherwise each live
+    thread restarts and resumes its conversation, `bot-changed` onto the
+    project's new bot or `guest-changed` for its current guests; stopped
+    threads stay stopped."""
+    registry = load_registry(project_root)
+    projects = registry.get("projects") if isinstance(registry.get("projects"), dict) else {}
+    project = projects.get(project_name)
+    db = STORE.connect(state_dir)
+    try:
+        rows = [row for row in (STORE.threads(db) if db else []) if row["project"] == project_name]
+        if not isinstance(project, dict):
+            return deregistered(state_dir, registry, db, project_name, rows)
+        return restart_changed(project_root, state_dir, registry, db, project_name, project, rows)
+    finally:
+        if db:
+            db.close()
+
+
+def deregistered(state_dir: Path, registry: dict, db, project_name: str, rows: list) -> dict:
+    """Stop every session of a project gone from the registry and close its threads."""
+    closed, hosts = [], set()
+    for row in rows:
+        if row["state"] == "closed":
+            continue
+        with BootLock(state_dir):
+            STORE.update(db, row["thread_id"], state="closed", stop_reason=None, turn_running=0, queue_position=None,
+                         runtime_tmux=None, runtime_pid=None, runtime_host=None)
+            buffer_path(state_dir, row["thread_id"]).unlink(missing_ok=True)
+        closed.append(row["thread_id"])
+        if row["state"] in ("booting", "live"):
+            if (row["resolved_provider"] or row["provider"]) == "codex":
+                host_request(host_runtime_dir(state_dir, project_name), {"op": "stop", "thread_id": row["thread_id"]})
+                if row["runtime_tmux"]:
+                    hosts.add(row["runtime_tmux"])
+            elif row["runtime_tmux"]:
+                tmux("kill-session", "-t", f"={row['runtime_tmux']}")
+        retire_state_dir(registry, row)
+    for session in hosts:
+        tmux("kill-session", "-t", f"={session}")
+    return {"status": "ok", "project": project_name, "result": "deregistered", "closed": sorted(closed)}
+
+
+def restart_changed(project_root: Path, state_dir: Path, registry: dict, db, project_name: str, project: dict,
+                    rows: list) -> dict:
+    """Stop every live thread of the project, then start each again, resuming
+    its conversation. A Codex project's thread host is replaced, so the new
+    one logs in with the current bot and reads the current guests."""
+    live = [row for row in rows if row["state"] == "live"]
+    reasons = {}
+    for row in live:
+        reason = "bot-changed" if row["runtime_bot"] and row["runtime_bot"] != project["bot_id"] else "guest-changed"
+        reasons[row["thread_id"]] = reason
+        with BootLock(state_dir):
+            STORE.update(db, row["thread_id"], state="stopped", stop_reason=reason, turn_running=0,
+                         runtime_tmux=None, runtime_pid=None, runtime_host=None)
+        stop_runtime(project_root, state_dir, row)
+        if reason == "bot-changed":
+            retire_state_dir(registry, row)
+    if any(thread_provider(registry, row) == "codex" for row in live) and project.get("screen_name"):
+        tmux("kill-session", "-t", f"={project['screen_name']}-threads")
+    for row in live:
+        thread_id = row["thread_id"]
+        posted = discord_request(project_root, "post", {"bot_id": project["bot_id"], "channel_id": thread_id,
+                                                        "content": PROJECT_CHANGE_NOTICES[reasons[thread_id]]})
+        # The notice carries 👀; as a command it never reaches the model.
+        trigger = {"id": str((posted or {}).get("id") or ""), "author_id": root_user_id(registry) or "root",
+                   "author": "root", "content": "/restart", "timestamp": clock_now(), "command": True}
+        with BootLock(state_dir):
+            write_private(buffer_path(state_dir, thread_id), [trigger])
+            decision = admit(db, registry, STORE.thread(db, thread_id), stop_reason=None, archive_actor=None,
+                             pending_close=None)
+        if settle_admission(project_root, state_dir, registry, row, decision)["result"] == "start":
+            start_boot(project_root, state_dir, thread_id)
+    return {"status": "ok", "project": project_name, "result": "restarted",
+            "restarted": [{"thread_id": row["thread_id"], "reason": reasons[row["thread_id"]]} for row in live]}
 
 
 def start_boot(project_root: Path, state_dir: Path, thread_id: str) -> None:
@@ -1447,7 +1547,7 @@ def codex_boot(project_root: Path, state_dir: Path, db, row, registry: dict, rea
                 STORE.update(db, thread_id, resolved_provider="codex", resolved_account=settings["home"],
                              resolved_model=settings["model"], resolved_effort=settings["effort"],
                              runtime_tmux=session, runtime_host=str(runtime_dir / "control.sock"),
-                             runtime_home=settings["home"])
+                             runtime_home=settings["home"], runtime_bot=project["bot_id"])
         # A host exiting after its last thread stopped refuses new threads; start another.
         if not (opened and opened.get("stopping")) or elapsed_seconds(started) >= BOOT_TIMEOUT_SECONDS:
             break
@@ -1573,7 +1673,7 @@ def boot(project_root: Path, state_dir: Path, thread_id: str) -> dict:
                      resolved_account=resolved["claude_home"], resolved_model=resolved["model"],
                      resolved_effort=resolved["effort"], provider_conversation_id=session_id,
                      provider_home=home,
-                     runtime_tmux=session, runtime_pid=pid)
+                     runtime_tmux=session, runtime_pid=pid, runtime_bot=bot_id)
     discord_request(project_root, "unreact", reaction)
     db.close()
     return {"status": "live", "thread_id": thread_id, "session_id": session_id}
@@ -1636,7 +1736,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("run", "status", "preflight", "disable", "enable", "bind", "message",
                                             "archive", "delete", "boot", "host-event", "command", "reaction",
-                                            "grant-thread-permissions", "submit", "list", "stop-threads"))
+                                            "grant-thread-permissions", "submit", "list", "stop-threads",
+                                            "project-changed"))
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--state-dir", type=Path, default=None)
     parser.add_argument("--payload", help="internal: the observer's or Codex thread host's thread event, or a "
@@ -1644,12 +1745,12 @@ def main() -> int:
     parser.add_argument("--thread-id", help="internal: the thread `boot` starts")
     target = parser.add_mutually_exclusive_group()
     target.add_argument("--project", help="grant-thread-permissions: only this registered project; "
-                                          "list and stop-threads: the project")
+                                          "list, stop-threads, and project-changed: the project")
     target.add_argument("--all", action="store_true", help="grant-thread-permissions: every registered project")
     args = parser.parse_args()
     if args.command == "grant-thread-permissions" and not (args.project or args.all):
         parser.error("grant-thread-permissions needs --project <project> or --all")
-    if args.command in ("list", "stop-threads") and not args.project:
+    if args.command in ("list", "stop-threads", "project-changed") and not args.project:
         parser.error(f"{args.command} needs --project <project>")
     state_dir = args.state_dir or STORE.default_state_dir()
     try:
@@ -1681,6 +1782,8 @@ def main() -> int:
             result = list_threads(args.project_root, state_dir, args.project)
         elif args.command == "stop-threads":
             result = stop_threads(args.project_root, state_dir, args.project)
+        elif args.command == "project-changed":
+            result = project_changed(args.project_root, state_dir, args.project)
         elif args.command == "submit":
             if not args.payload:
                 raise ValueError("--payload is required")

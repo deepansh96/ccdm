@@ -8,13 +8,14 @@ import sqlite3
 import stat
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 THREAD_STATES = ("registered", "booting", "live", "queued", "stopped", "closed")
 STOP_REASONS = ("auto-archive", "evicted", "operator", "crashed", "start-failed", "bot-changed", "guest-changed")
 # One row per bound thread. Override columns are null when the thread inherits
 # the project's setting; resolved columns hold what the running session uses.
 # `archive_actor` is who archived the thread, or 'unknown' when the audit log
 # never named one. `queue_position` orders the threads waiting for a session slot.
+# `runtime_bot` is the pool bot the thread's last session started under.
 TABLES = {
     "threads": f"""thread_id TEXT PRIMARY KEY, project TEXT NOT NULL, name TEXT NOT NULL,
         creator_id TEXT NOT NULL, starter_message_id TEXT,
@@ -26,7 +27,7 @@ TABLES = {
         turn_running INTEGER NOT NULL DEFAULT 0,
         runtime_tmux TEXT, runtime_pid INTEGER, runtime_host TEXT, runtime_home TEXT,
         created_at TEXT NOT NULL, last_owner_activity_at TEXT, last_turn_end_at TEXT,
-        pending_config TEXT, pending_close TEXT, archive_actor TEXT, queue_position INTEGER""",
+        pending_config TEXT, pending_close TEXT, archive_actor TEXT, queue_position INTEGER, runtime_bot TEXT""",
     "creation_requests": """request_id TEXT PRIMARY KEY, project TEXT NOT NULL, name TEXT NOT NULL,
         provider TEXT, account TEXT, model TEXT, effort TEXT, first_message TEXT,
         requester_id TEXT NOT NULL,
@@ -35,7 +36,8 @@ TABLES = {
 }
 # The thread columns each schema version added, and the statement that adds them.
 MIGRATIONS = {2: ("archive_actor", "ALTER TABLE threads ADD COLUMN archive_actor TEXT"),
-              3: ("queue_position", "ALTER TABLE threads ADD COLUMN queue_position INTEGER")}
+              3: ("queue_position", "ALTER TABLE threads ADD COLUMN queue_position INTEGER"),
+              4: ("runtime_bot", "ALTER TABLE threads ADD COLUMN runtime_bot TEXT")}
 COLUMNS = {
     "threads": {"thread_id", "project", "name", "creator_id", "starter_message_id",
                 "provider", "account", "model", "effort",
@@ -43,7 +45,7 @@ COLUMNS = {
                 "provider_conversation_id", "provider_home", "state", "stop_reason", "turn_running",
                 "runtime_tmux", "runtime_pid", "runtime_host", "runtime_home",
                 "created_at", "last_owner_activity_at", "last_turn_end_at", "pending_config", "pending_close",
-                "archive_actor", "queue_position"},
+                "archive_actor", "queue_position", "runtime_bot"},
     "creation_requests": {"request_id", "project", "name", "provider", "account", "model", "effort",
                           "first_message", "requester_id", "requester_kind", "status", "thread_id", "created_at"},
 }

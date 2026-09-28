@@ -339,3 +339,21 @@ test("operator documentation, root instructions, patterns, and scenario matrix r
     assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-operations\\.test\\.js`));
   }
 });
+
+test("operator documentation, root instructions, patterns, and scenario matrix record the project-changed hook", () => {
+  const section = operatorReadme.slice(operatorReadme.indexOf("## Thread Supervisor"));
+  for (const phrase of ["scripts/thread-supervisor.py project-changed --project <project>", "`bot-changed`",
+    "`guest-changed`", "Stopped, queued, and closed threads stay as they are."]) {
+    assert.ok(section.includes(phrase), phrase);
+  }
+  const rootInstructions = fs.readFileSync("CLAUDE.md.example", "utf8");
+  const deregistration = rootInstructions.slice(rootInstructions.indexOf("#### 6. Deregister a project"),
+    rootInstructions.indexOf("#### 7. Pool status"));
+  assert.ok(deregistration.includes("scripts/thread-supervisor.py project-changed --project <project>"));
+  assert.match(deregistration, /bot is reassigned/);
+  assert.match(fs.readFileSync(".mex/patterns/register-project.md", "utf8"), /project-changed --project <project>/);
+  assert.match(fs.readFileSync(".mex/patterns/manage-guest-access.md", "utf8"), /project-changed --project <project>/);
+  for (const scenario of ["Thread deregistration", "Thread bot reassignment", "Thread guest change"]) {
+    assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-project-changes\\.test\\.js`));
+  }
+});

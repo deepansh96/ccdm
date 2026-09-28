@@ -275,7 +275,8 @@ PRAGMA user_version=1;
     stop_reason: "auto-archive", provider_conversation_id: "session-1" });
   const version = spawnSync("python3", ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); " +
     "columns = [row[1] for row in db.execute('PRAGMA table_info(threads)')]; " +
-    "print(db.execute('PRAGMA user_version').fetchone()[0], 'archive_actor' in columns, 'queue_position' in columns)",
+    "print(db.execute('PRAGMA user_version').fetchone()[0], 'archive_actor' in columns, 'queue_position' in columns, " +
+    "'runtime_bot' in columns)",
   store], { encoding: "utf8" });
-  assert.equal(version.stdout.trim(), "3 True True", version.stderr);
+  assert.equal(version.stdout.trim(), "4 True True True", version.stderr);
 });

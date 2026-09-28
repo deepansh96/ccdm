@@ -192,7 +192,10 @@ This assigns an available bot from the pool to a new project and scopes it to a 
 7. Set the bot's `assigned_to` to `null` in the pool (returns it to the pool).
 8. Clear `session_id` and `pid` (set to `null`).
 9. Remove the project entry from `registry.json`.
-10. Confirm the bot has been returned to the pool. The Discord channel still exists (not deleted).
+10. Run `scripts/thread-supervisor.py project-changed --project <project>`. With the project gone from the registry, it stops every thread session and marks every thread of the project `closed`.
+11. Confirm the bot has been returned to the pool. The Discord channel still exists (not deleted).
+
+When a project's bot is reassigned (its `bot_id` changes in `registry.json`), run the same `scripts/thread-supervisor.py project-changed --project <project>` afterwards. It restarts the project's live threads on the new bot, resuming each conversation (`bot-changed`); stopped and closed threads stay as they are.
 
 #### 7. Pool status (`pool`, `pool status`)
 
@@ -524,7 +527,7 @@ When the user sends a voice message (`.ogg` audio attachment), transcribe it usi
 
 - **#root channels** (one per category): Messages go to the root bot WITHOUT @mention. These are configured in the root bot's `access.json` with `requireMention: false`.
 - **Project channels**: Messages go to the assigned project bot WITHOUT @mention. The root bot can only be reached in project channels via @mention (`requireMention: true` in root bot's `access.json`).
-- **Project threads**: A thread under a project channel is that project's Thread Conversation. When a request comes from or names a thread id, resolve it before acting: `scripts/resolve-conversation.py <channel_or_thread_id>` prints `{project, thread_id, provider, bot, channel_id}` (`thread_id` is null for the project channel itself) or exits nonzero with the reason. Act on the resolved project; never treat a thread id as a separate project. `scripts/send-claude-command.sh --channel`, `scripts/guest-access.js`, and `scripts/export-discord-range.js` accept a thread id directly: the relay reaches that thread's own session, guest access changes the parent project, and exports use the parent project bot. Root replies in a thread of an allowed project channel under that channel's access rules.
+- **Project threads**: A thread under a project channel is that project's Thread Conversation. When a request comes from or names a thread id, resolve it before acting: `scripts/resolve-conversation.py <channel_or_thread_id>` prints `{project, thread_id, provider, bot, channel_id}` (`thread_id` is null for the project channel itself) or exits nonzero with the reason. Act on the resolved project; never treat a thread id as a separate project. `scripts/send-claude-command.sh --channel`, `scripts/guest-access.js`, and `scripts/export-discord-range.js` accept a thread id directly: the relay reaches that thread's own session, guest access changes the parent project (a grant or revoke runs `project-changed`, which restarts the project's live threads with resume so their access is current), and exports use the parent project bot. Root replies in a thread of an allowed project channel under that channel's access rules.
 - **Project bot isolation**: Each project bot has the "project-bot" role (which denies VIEW_CHANNEL on all categories) plus a member-level override that allows it on its one assigned channel. It cannot see any other channel.
 - **New categories**: When a new category is added to the server, apply the "project-bot" role deny on it:
   ```sh
