@@ -123,6 +123,11 @@ The same tmux/process contract covers the Codex startup surface:
 - The fixture records only the bridge command construction. App-server spawning and WebSocket protocol behavior belong to later Codex bridge scenarios.
 - The `npm` fixture fails closed and records invocations so startup scenarios can prove Test Workspaces do not run package installation or contact npm.
 
+The discord.js shim and REST fake also model Discord threads for the Thread Supervisor:
+
+- `injectDiscordThread` queues a Gateway `threadCreate` carrying a thread channel with `type` (11 public, 12 private), `parentId`, a cached `parent` whose `type` is 0 for a text channel or 15 for a forum, `isThread()`, `archived`, `autoArchiveDuration`, and `ownerId`. A logged-in shim client keeps its process alive until `destroy()`, as discord.js's open Gateway socket does.
+- `PATCH /channels/:id` records each request in the `threadPatches` ledger with its authorization, body, and status. A bot whose authorization is listed in `manageThreadsDenied` lacks Manage Threads and gets 403 with code 50001.
+
 ## Approved Dependency Resolution
 
 Dependencies are installed only in the source checkout before the suite runs. Test Workspaces do not run `npm ci`, do not contact the npm registry, and do not use the developer's original `PATH`.

@@ -406,6 +406,25 @@ export function injectDiscordMessage(workspace, message = {}) {
   writeState(state, workspace.stateDir);
 }
 
+// Queues a Gateway THREAD_CREATE. Public threads are type 11 and private
+// threads type 12; `parentType` 15 is a forum channel.
+export function injectDiscordThread(workspace, thread = {}) {
+  const state = readState(workspace.stateDir);
+  state.fixtures.discord.injectedThreads ||= [];
+  state.fixtures.discord.injectedThreads.push({
+    archived: false,
+    autoArchiveDuration: 1440,
+    delivered: false,
+    name: "thread",
+    newlyCreated: true,
+    ownerId: "owner",
+    parentType: 0,
+    type: 11,
+    ...thread,
+  });
+  writeState(state, workspace.stateDir);
+}
+
 export function injectDiscordReaction(workspace, reaction = {}) {
   const state = readState(workspace.stateDir);
   state.fixtures.discord.injectedReactions.push({

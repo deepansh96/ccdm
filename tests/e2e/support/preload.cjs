@@ -598,6 +598,28 @@ function routeDiscordApi(url, init = {}) {
     });
   }
 
+  // Modify Channel on a thread. Changing auto_archive_duration needs Manage
+  // Threads; a bot listed in `manageThreadsDenied` (by authorization) gets 403 50001.
+  const threadMatch = /^\/api\/v10\/channels\/([^/]+)$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && threadMatch && method === "PATCH") {
+    const authorization = headerValue(init.headers, "Authorization");
+    const body = init.body ? JSON.parse(String(init.body)) : {};
+    const denied = (readState().fixtures?.discord?.manageThreadsDenied ?? []).includes(authorization);
+    updateState((state) => {
+      state.fixtures.discord.threadPatches ||= [];
+      state.fixtures.discord.threadPatches.push({ authorization, body, status: denied ? 403 : 200,
+        threadId: threadMatch[1] });
+    });
+    if (denied) {
+      return response(JSON.stringify({ code: 50001, message: "Missing Access" }), {
+        headers: { "content-type": "application/json" }, status: 403,
+      });
+    }
+    return response(JSON.stringify({ id: threadMatch[1], type: 11, ...body }), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
   if (url.hostname === "discord.com") {
     updateState((state) => {
       state.fixtures.discord.malformedRequests ||= [];

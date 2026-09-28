@@ -583,6 +583,18 @@ Ask the root agent for a usage report by messaging `usage`, `limits`, or `how mu
 
 The opt-in foreground [Project Conversation state service](docs/conversation-reminders.md) records owner replies, `/close`, reopening, and due times for registered Claude and Codex channels. It sends a `👀` from each channel's assigned bot one hour after a conversation starts awaiting the owner; while reminders are ignored, the gap grows to 2, 4, 6 … hours and settles at one a day. Run `scripts/conversation-reminder-service.py enable` to check prerequisites and opt in, then `run` to start the worker. On macOS, `scripts/install-conversation-reminder-service.sh` can supervise the same worker as an opt-in LaunchAgent. It validates configuration first and keeps credentials out of the plist. It never changes the Usage Stats Poster. After a restart, reconnect, or re-enable, the service reconciles missed activity before sending. Each overdue channel then gets at most one catch-up, spaced at least five seconds apart.
 
+## Thread Supervisor
+
+The Thread Supervisor is a separate root-level service that watches Discord threads in registered project channels. It binds a thread to its project when the thread is public (type 11), its parent is a registered local project channel (not a `remote:` project, forum, or media channel), and the CCDM owner or one of the project's guests created it. Private threads, threads under unregistered or root channels, and threads created by anyone else are ignored. A re-sent thread event never binds a thread twice. When a thread binds, the supervisor sets its auto-archive to one week (10080 minutes) with the project's bot. If that bot lacks Manage Threads, the thread stays bound and the failure is logged. This first version only records threads; it does not yet start coding sessions for them.
+
+```bash
+scripts/thread-supervisor.py preflight   # read-only: owner, root credentials, store
+scripts/thread-supervisor.py run         # foreground worker; Ctrl-C stops it
+scripts/thread-supervisor.py status      # bound threads per project, with name, creator, and state
+```
+
+`run` logs in with the root bot credentials from `ROOT_DISCORD_STATE_DIR/.env` (default `~/.claude/channels/discord/.env`). Only one worker runs at a time: a second `run` exits nonzero while the lock is held. The supervisor is independent of the Conversation Reminder service; neither needs the other running. State lives in `~/.local/state/ccdm/thread-supervisor/` (override with `CCDM_THREAD_STATE_DIR`): the directory is `0700` and the SQLite thread store and lock are `0600`. `preflight` creates nothing and names every blocker it finds.
+
 ## Scheduled Usage Stats Poster
 
 A separate, opt-in macOS LaunchAgent can post usage stats to Discord on a schedule. It is not installed by `setup.sh` and it is not the old tmux-based `usage-report-loop.sh` flow.

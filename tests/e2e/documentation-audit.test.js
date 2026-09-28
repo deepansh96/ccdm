@@ -119,3 +119,17 @@ test("scenario matrix records the always-on Claude conversation-scoped proxy", (
   assert.match(matrix, /\| Claude proxy \| Thread Conversation scoping and bootstrap \| Covered \| .*exactly once/);
   assert.match(matrix, /\| Claude proxy \| Fail closed on plugin tool contract \| Covered \|/);
 });
+
+test("operator documentation and scenario matrix record the Thread Supervisor", () => {
+  const section = operatorReadme.slice(operatorReadme.indexOf("## Thread Supervisor"));
+  assert.ok(operatorReadme.includes("## Thread Supervisor"));
+  for (const phrase of ["scripts/thread-supervisor.py preflight", "scripts/thread-supervisor.py run",
+    "scripts/thread-supervisor.py status", "CCDM_THREAD_STATE_DIR", "10080", "Manage Threads"]) {
+    assert.ok(section.includes(phrase), phrase);
+  }
+  for (const scenario of ["Owner thread binding and one-week auto-archive", "Binding eligibility",
+    "Thread event dedupe", "Missing Manage Threads", "Worker lock, private state, and preflight"]) {
+    assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| `));
+  }
+  assert.match(fs.readFileSync(".mex/context/architecture.md", "utf8"), /\*\*Thread Supervisor\*\*/);
+});
