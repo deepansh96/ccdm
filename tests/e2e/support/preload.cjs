@@ -310,6 +310,14 @@ function routeDiscordApi(url, init = {}) {
         overwriteId: channelPermissionMatch[2],
         type: parsedBody.type,
       });
+      // A seeded channel keeps the overwrite, as Discord's channel list would show it.
+      const channel = (state.fixtures.discord.channels ?? []).find(entry => entry.id === channelPermissionMatch[1]);
+      if (channel) {
+        channel.permission_overwrites = [
+          ...(channel.permission_overwrites ?? []).filter(entry => entry.id !== channelPermissionMatch[2]),
+          { id: channelPermissionMatch[2], type: parsedBody.type, allow: parsedBody.allow, deny: parsedBody.deny },
+        ];
+      }
     });
     return response("", { status: 204 });
   }

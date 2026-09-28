@@ -10,7 +10,7 @@ edges:
     condition: for registry and lifecycle invariants
   - target: context/discord-security.md
     condition: for permissions, roles, tokens, and allowlists
-last_updated: 2026-09-25
+last_updated: 2026-09-28
 ---
 
 # Register Or Deregister A Project
@@ -19,7 +19,7 @@ last_updated: 2026-09-25
 1. Resolve the channel, absolute project path, session type, and project name.
 2. When the user requested a new channel or category lookup, use the documented root-management workflow and the root bot's stored credentials through Discord REST. The scoped Discord MCP remains the reply/message surface; its lack of channel-administration tools is not a blocker and is not a reason to request the bot token from the user.
 3. On registration, claim one unassigned pool bot and allocate an unused Codex WebSocket port when needed.
-4. Apply the `project-bot` role, the assigned-channel member override, bot state `.env`, project access file, and root-bot mentioned access.
+4. Apply the `project-bot` role, the assigned-channel member override (`{"allow":"326417615936","deny":"0","type":1}`: the messaging bits plus Manage Threads, bit 34, and Create Public Threads, bit 35), bot state `.env`, project access file, and root-bot mentioned access.
 5. After writing or changing the project entry, run `scripts/conversation-reminder-service.py assignment-changed --project <project>` so Conversation Reminders get a fresh assignment generation.
 6. Start through the matching lifecycle script and report bot/channel/type without exposing credentials.
 7. On deregistration, stop fully first, remove permissions/access entries and guest role, reset the bot name, release the pool entry, remove the project, then run the same `assignment-changed` command to retire its reminder state.
@@ -30,6 +30,7 @@ last_updated: 2026-09-25
 - Never substitute a different Discord MCP for an authorized administration workflow; keep REST mutations limited to the exact guild, category, channel, bot, and permissions the user requested.
 - Update JSON structurally and preserve optional account/model fields.
 - Never assign a bot to Plan A general unless explicitly requested.
+- Projects registered before threads lack the two thread bits; `scripts/thread-supervisor.py grant-thread-permissions --all` adds them idempotently, and `scripts/thread-supervisor.py status` lists any project still missing them.
 - Never copy an old `assignment_generation` into a re-registration; polling cannot detect an identical delete/re-add, so the generation contract must run.
 
 ## Verify

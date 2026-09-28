@@ -110,7 +110,66 @@ def worker(state_dir: Path) -> dict:
     return {"running": False}
 
 
-def status(state_dir: Path) -> dict:
+def permission_targets(registry: dict, project: str | None) -> tuple[list[dict], dict]:
+    """Each named project's channel and assigned bot user; projects that cannot be targeted, with why."""
+    projects = registry.get("projects") if isinstance(registry.get("projects"), dict) else {}
+    if project is not None and project not in projects:
+        raise ValueError(f"no registered project named {project}")
+    bots = {str(bot.get("id")): bot for bot in registry.get("pool") or [] if isinstance(bot, dict)}
+    targets, skipped = [], {}
+    for name, entry in projects.items():
+        if project is not None and name != project:
+            continue
+        bot = bots.get(str((entry or {}).get("bot_id") or ""))
+        if not (entry or {}).get("channel_id") or not bot or not bot.get("app_id"):
+            skipped[name] = "the project has no channel or no assigned pool bot with an app_id"
+            continue
+        targets.append({"project": name, "channel_id": str(entry["channel_id"]), "bot_user_id": str(bot["app_id"])})
+    return targets, skipped
+
+
+def thread_permissions(project_root: Path, mode: str, project: str | None = None) -> tuple[dict, dict]:
+    """Run the root-credential REST helper; return its per-project results and the untargetable projects."""
+    registry = load_registry(project_root)
+    targets, skipped = permission_targets(registry, project)
+    if not targets:
+        return {}, skipped
+    request = json.dumps({"guild_id": str(registry.get("guild_id") or ""), "targets": targets})
+    completed = subprocess.run(
+        [os.environ.get("CCDM_THREAD_NODE", "node"), str(Path(__file__).with_name("thread-supervisor-permissions.js")),
+         mode, request], capture_output=True, text=True, timeout=120)
+    if completed.returncode != 0:
+        raise ValueError(completed.stderr.strip() or "the thread permission helper failed")
+    return json.loads(completed.stdout), skipped
+
+
+def grant_thread_permissions(project_root: Path, project: str | None) -> dict:
+    results, skipped = thread_permissions(project_root, "grant", project)
+    grouped: dict = {"granted": [], "unchanged": [], "failed": {name: reason for name, reason in skipped.items()}}
+    for name, outcome in results.items():
+        if outcome["result"] == "failed":
+            grouped["failed"][name] = outcome["reason"]
+        else:
+            grouped[outcome["result"]].append(name)
+    return {"status": "blocked" if grouped["failed"] else "ok", **grouped}
+
+
+def thread_permission_report(project_root: Path) -> dict:
+    """Projects whose bot lacks Create Public Threads or Manage Threads on its own channel."""
+    try:
+        results, _ = thread_permissions(project_root, "check")
+    except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as error:
+        return {"status": "unverified", "reason": str(error)}
+    report: dict = {"status": "ok", "missing": sorted(name for name, outcome in results.items()
+                                                      if outcome["result"] == "missing")}
+    unverified = {name: outcome["reason"] for name, outcome in results.items() if outcome["result"] == "failed"}
+    if unverified:
+        report["unverified"] = unverified
+    return report
+
+
+def status(state_dir: Path, project_root: Path | None = None) -> dict:
+    """Bound threads per project; with a project root, also the thread permission report."""
     projects: dict = {}
     db = STORE.connect(state_dir)
     if db:
@@ -119,8 +178,11 @@ def status(state_dir: Path) -> dict:
                 projects.setdefault(row["project"], {"threads": {}})["threads"][row["thread_id"]] = {
                     "name": row["name"], "creator_id": row["creator_id"], "state": row["state"]}
         db.close()
-    return {"status": "ok", **worker(state_dir), "disabled": disabled_marker(state_dir).exists(),
-            "state_dir": str(state_dir), "projects": projects}
+    result = {"status": "ok", **worker(state_dir), "disabled": disabled_marker(state_dir).exists(),
+              "state_dir": str(state_dir), "projects": projects}
+    if project_root is not None:
+        result["thread_permissions"] = thread_permission_report(project_root)
+    return result
 
 
 def disable(state_dir: Path) -> dict:
@@ -204,15 +266,21 @@ def run(project_root: Path, state_dir: Path) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("run", "status", "preflight", "disable", "enable", "bind"))
+    parser.add_argument("command", choices=("run", "status", "preflight", "disable", "enable", "bind",
+                                            "grant-thread-permissions"))
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--state-dir", type=Path, default=None)
     parser.add_argument("--payload", help="internal: the observer's thread event as JSON")
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("--project", help="grant-thread-permissions: only this registered project")
+    target.add_argument("--all", action="store_true", help="grant-thread-permissions: every registered project")
     args = parser.parse_args()
+    if args.command == "grant-thread-permissions" and not (args.project or args.all):
+        parser.error("grant-thread-permissions needs --project <project> or --all")
     state_dir = args.state_dir or STORE.default_state_dir()
     try:
         if args.command == "status":
-            result = status(state_dir)
+            result = status(state_dir, args.project_root)
         elif args.command == "preflight":
             result = preflight(args.project_root, state_dir)
         elif args.command == "disable":
@@ -223,9 +291,11 @@ def main() -> int:
             if not args.payload:
                 raise ValueError("--payload is required")
             result = bind(args.project_root, state_dir, json.loads(args.payload))
+        elif args.command == "grant-thread-permissions":
+            result = grant_thread_permissions(args.project_root, args.project)
         else:
             result = run(args.project_root, state_dir)
-    except (OSError, ValueError, KeyError, sqlite3.Error, json.JSONDecodeError) as error:
+    except (OSError, ValueError, KeyError, sqlite3.Error, json.JSONDecodeError, subprocess.SubprocessError) as error:
         result = {"status": "blocked", "reason": str(error)}
     print(json.dumps(result, sort_keys=True))
     sys.stdout.flush()

@@ -23,7 +23,7 @@ last_updated: 2026-09-28
 
 ## Bot Isolation
 
-The intended setup gives each project bot the zero-permission `project-bot` role with `VIEW_CHANNEL` denied on managed categories, then a member-level allow override only on its assigned channel. The root bot can see managed channels but requires mention outside its root channel. Local `access.json` allowlists are required in addition to Discord permissions.
+The intended setup gives each project bot the zero-permission `project-bot` role with `VIEW_CHANNEL` denied on managed categories, then a member-level allow override (`326417615936`, including Create Public Threads and Manage Threads) only on its assigned channel. The root bot can see managed channels but requires mention outside its root channel. Local `access.json` allowlists are required in addition to Discord permissions.
 
 Project bots must not have Administrator on any assigned role: it bypasses even member-level channel denies. Before removing it, back up role and channel permissions, confirm the granting role is exclusive to the bot, and verify that its assigned channel already grants the required messaging permissions. Confirm allowed and denied channel access after the change. Record machine-specific audit outcomes and credential issues only in ignored local notes.
 

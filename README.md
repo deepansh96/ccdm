@@ -593,6 +593,15 @@ scripts/thread-supervisor.py run         # foreground worker; Ctrl-C stops it
 scripts/thread-supervisor.py status      # bound threads per project, with name, creator, and state
 ```
 
+Project bots need Create Public Threads (bit 35) and Manage Threads (bit 34) on their own channel. New registrations grant them through the member overwrite `326417615936`. For projects registered earlier, run the idempotent grant with root credentials:
+
+```bash
+scripts/thread-supervisor.py grant-thread-permissions --all              # every registered project
+scripts/thread-supervisor.py grant-thread-permissions --project <project> # one project
+```
+
+It PUTs `{"allow":"326417615936","deny":"0","type":1}` for each project's assigned bot on that project's channel and changes nothing else. A project whose overwrite already matches gets no request, and an unknown project fails before any Discord call. `status` reports `thread_permissions.missing`: the projects whose bot still lacks either bit. Guest role permissions are unchanged.
+
 `run` logs in with the root bot credentials from `ROOT_DISCORD_STATE_DIR/.env` (default `~/.claude/channels/discord/.env`). Only one worker runs at a time: a second `run` exits nonzero while the lock is held. The supervisor is independent of the Conversation Reminder service; neither needs the other running. State lives in `~/.local/state/ccdm/thread-supervisor/` (override with `CCDM_THREAD_STATE_DIR`): the directory is `0700` and the SQLite thread store and lock are `0600`. `preflight` creates nothing and names every blocker it finds.
 
 On macOS, `scripts/install-thread-supervisor.sh` installs the same worker as the `com.discord.thread-supervisor` LaunchAgent. It runs `preflight` first and keeps credentials out of the plist. To restart the supervisor, run `scripts/thread-supervisor.py disable`, then `scripts/thread-supervisor.py enable`, then the installer. `disable` stops the worker and keeps launchd from relaunching it. For foreground debugging, `disable` and `enable`, then use `run`. See the [Thread Supervisor guide](docs/thread-supervisor.md) for install, restart, and foreground debug mode.

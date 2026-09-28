@@ -151,3 +151,21 @@ test("operator documentation and scenario matrix record the Thread Supervisor La
     assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-supervisor-launchagent\\.test\\.js`));
   }
 });
+
+test("registration documentation grants project bots the thread permissions", () => {
+  // 274878008384 plus Manage Threads (bit 34) and Create Public Threads (bit 35).
+  const threadAllow = "326417615936";
+  for (const file of ["CLAUDE.md.example", "skills/create-discord-pool-bot/SKILL.md", ".mex/patterns/register-project.md"]) {
+    const text = fs.readFileSync(file, "utf8");
+    assert.ok(text.includes(threadAllow), `${file} uses ${threadAllow}`);
+    assert.ok(!text.includes("274878008384"), `${file} drops the pre-thread integer`);
+    for (const phrase of ["Create Public Threads", "Manage Threads"]) assert.ok(text.includes(phrase), `${file}: ${phrase}`);
+  }
+  const section = operatorReadme.slice(operatorReadme.indexOf("## Thread Supervisor"));
+  for (const phrase of ["scripts/thread-supervisor.py grant-thread-permissions --all", "--project", threadAllow]) {
+    assert.ok(section.includes(phrase), phrase);
+  }
+  for (const scenario of ["Grant thread permissions", "Scoped thread permission grant", "Missing thread permissions in status"]) {
+    assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-supervisor-permissions\\.test\\.js`));
+  }
+});

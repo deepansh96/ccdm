@@ -37,7 +37,7 @@ Complete this phase only when the token is visible once, Message Content Intent 
 Open this URL in a new tab, substituting the application ID:
 
 ```text
-https://discord.com/oauth2/authorize?client_id=<app_id>&permissions=274878008384&integration_type=0&scope=bot
+https://discord.com/oauth2/authorize?client_id=<app_id>&permissions=326417615936&integration_type=0&scope=bot
 ```
 
 Select the server whose ID matches `registry.json.guild_id`, continue, verify these permissions, then authorize:
@@ -48,6 +48,8 @@ Select the server whose ID matches `registry.json.guild_id`, continue, verify th
 - Read Message History
 - Attach Files
 - Add Reactions
+- Create Public Threads (bit 35)
+- Manage Threads (bit 34)
 
 Complete this phase only when Discord reports that the bot was added to the intended server.
 

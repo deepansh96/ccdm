@@ -135,9 +135,9 @@ This assigns an available bot from the pool to a new project and scopes it to a 
    curl -s -X PUT "https://discord.com/api/v10/channels/<channel_id>/permissions/<bot_app_id>" \
      -H "Authorization: Bot <root_bot_token>" \
      -H "Content-Type: application/json" \
-     -d '{"allow": "274878008384", "deny": "0", "type": 1}'
+     -d '{"allow": "326417615936", "deny": "0", "type": 1}'
    ```
-   Permission bits: VIEW_CHANNEL + SEND_MESSAGES + READ_MESSAGE_HISTORY + ATTACH_FILES + ADD_REACTIONS + SEND_MESSAGES_IN_THREADS = `274878008384`. `type: 1` = member override.
+   Permission bits: VIEW_CHANNEL + SEND_MESSAGES + READ_MESSAGE_HISTORY + ATTACH_FILES + ADD_REACTIONS + SEND_MESSAGES_IN_THREADS + MANAGE_THREADS (Manage Threads, bit 34) + CREATE_PUBLIC_THREADS (Create Public Threads, bit 35) = `326417615936`. `type: 1` = member override. Projects registered before threads can be brought up to date with `scripts/thread-supervisor.py grant-thread-permissions --all`.
 7. Write the `.env` file in the bot's state directory:
    ```
    DISCORD_BOT_TOKEN=<token>
@@ -339,10 +339,10 @@ import time
    curl -s -X POST "https://discord.com/api/v10/oauth2/authorize?client_id=<app_id>&scope=bot" \
      -H "Authorization: <user_token>" \
      -H "Content-Type: application/json" \
-     -d '{"guild_id": "<guild_id>", "permissions": "274878008384", "authorize": true}'
+     -d '{"guild_id": "<guild_id>", "permissions": "326417615936", "authorize": true}'
    ```
    - `guild_id`: read from `registry.json`.
-   - Permissions `274878008384` = View Channels + Send Messages + Send in Threads + Read History + Attach Files + Add Reactions.
+   - Permissions `326417615936` = View Channels + Send Messages + Send in Threads + Read History + Attach Files + Add Reactions + Manage Threads (bit 34) + Create Public Threads (bit 35).
 
 8. **Message Content Intent** — the bot gets `GATEWAY_MESSAGE_CONTENT_LIMITED` (flag 524288) by default, which works for bots in < 100 servers. No manual toggle needed for personal use.
 
