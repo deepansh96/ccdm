@@ -61,7 +61,7 @@ For an explicit history-preserving restart, use `scripts/start-codex-session.sh 
 
 ## Stop Invariant
 
-`scripts/stop-session.sh <project>` is the common teardown path: kill the recorded process tree, kill the exact tmux session, sweep listener processes by assignment identity, then clear `pid` and `session_id`. Do not replace this with only `tmux kill-session`; orphan listeners have caused duplicate processing.
+`scripts/stop-session.sh <project>` is the common teardown path: kill the recorded process tree, kill the exact tmux session, sweep listener processes by assignment identity, then clear `pid` and `session_id`. Do not replace this with only `tmux kill-session`; orphan listeners have caused duplicate processing. Without a flag it never touches Thread Conversations; `--threads` runs `thread-supervisor.py stop-threads --project <project>` (every booting, live, or queued thread becomes `stopped/operator`, each thread's runtime is swept, and tmux `<screen_name>-threads` is stopped) and leaves the channel session, and `--all` does both. Root operates single threads with `scripts/threads.sh list|stop|restart|close` (see `patterns/manage-threads.md`).
 
 ## Registration
 

@@ -10,7 +10,7 @@ You are a coordinator bot. Users message you on Discord to start, stop, and mana
 
 - `registry.json` — contains the bot pool and project assignments
 - `scripts/start-session.sh <project>` — generic script to start any registered project's Discord session
-- `scripts/stop-session.sh <project>` — generic script to stop any registered project's Discord session
+- `scripts/stop-session.sh <project> [--threads|--all]` — generic script to stop any registered project's Discord session (the Channel Conversation only; `--threads` stops only its thread sessions, `--all` both)
 
 ## How to respond
 
@@ -467,6 +467,20 @@ scripts/threads.sh create <project> <name> [--provider claude|codex] [--account 
 - It acts through the running Thread Supervisor. If the supervisor is not running, it exits nonzero with the reason and creates nothing; an invalid option exits nonzero with the same one-line error `/thread` would post.
 - On success it prints JSON with the `thread_id`; link it as `https://discord.com/channels/<guild_id>/<thread_id>`.
 - A project's Channel Conversation agent can open threads in its own channel with its `create_thread` tool; send the user there instead of doing it from root when they ask the project agent.
+
+#### 14. Operate threads (`list threads in <project>`, `stop/restart/close <thread>`)
+
+```sh
+scripts/threads.sh list <project>
+scripts/threads.sh stop|restart|close [<project>] <thread>
+scripts/stop-session.sh <project> --threads   # or --all to include the Channel Conversation
+```
+
+- `list` shows each thread's name, id, provider/model, state (with stop reason), and idle time.
+- `<thread>` is the thread's exact name, its link `https://discord.com/channels/<guild_id>/<thread_id>`, or its id. An ambiguous name fails with every match listed; add the project to narrow it, or use the link.
+- `stop` marks the thread `stopped/operator`; the owner's next message in it resumes it. `restart` resumes a live or stopped thread's conversation. `close` archives and closes the thread, including a stopped one.
+- `stop`, `restart`, and `close` need the running Thread Supervisor; otherwise they exit nonzero with the reason.
+- "Restart <project>" still means the Channel Conversation: use `scripts/stop-session.sh <project>` without a flag, which never touches threads.
 
 ### Discord Polls
 

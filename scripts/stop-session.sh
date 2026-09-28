@@ -1,6 +1,8 @@
 #!/bin/zsh
-# Usage: ./scripts/stop-session.sh <project_name>
-# Reads registry.json to get the tmux session name and stops it.
+# Usage: ./scripts/stop-session.sh <project_name> [--threads|--all]
+# Reads registry.json to get the tmux session name and stops the project's
+# Channel Conversation. `--threads` instead stops only its Thread Conversation
+# sessions and Codex thread host; `--all` stops both.
 
 set -euo pipefail
 
@@ -8,11 +10,36 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 REGISTRY="$ROOT_DIR/registry.json"
 
-PROJECT="${1:-}"
+PROJECT=""
+SCOPE="channel"
+for arg in "$@"; do
+  case "$arg" in
+    --threads) SCOPE="threads" ;;
+    --all) SCOPE="all" ;;
+    -*) PROJECT="" && break ;;
+    *) [[ -z "$PROJECT" ]] && PROJECT="$arg" || { PROJECT="" && break; } ;;
+  esac
+done
 
 if [[ -z "$PROJECT" ]]; then
-  echo "Usage: $0 <project_name>"
+  echo "Usage: $0 <project_name> [--threads|--all]"
   exit 1
+fi
+
+stop_threads() {
+  local reply
+  if ! reply="$(python3 "$SCRIPT_DIR/thread-supervisor.py" stop-threads --project "$PROJECT")"; then
+    echo "Could not stop the threads of '$PROJECT': $reply" >&2
+    exit 1
+  fi
+  printf '%s' "$reply" | python3 -c 'import json, sys
+reply = json.load(sys.stdin)
+print("Stopped %d thread session(s) and the thread host for %r" % (len(reply["stopped"]), reply["project"]))'
+}
+
+if [[ "$SCOPE" == "threads" ]]; then
+  stop_threads
+  exit 0
 fi
 
 collect_tree() {
@@ -305,3 +332,7 @@ with open(path, 'w') as f:
 "
 
 echo "Stopped Discord session '$PROJECT'"
+
+if [[ "$SCOPE" == "all" ]]; then
+  stop_threads
+fi

@@ -8,6 +8,8 @@ triggers:
 edges:
   - target: context/session-management.md
     condition: always before changing session state
+  - target: patterns/manage-threads.md
+    condition: when the request names a thread or asks to stop a project's threads
 last_updated: 2026-09-28
 ---
 
@@ -16,7 +18,7 @@ last_updated: 2026-09-28
 ## Steps
 1. Read the project and assigned bot from `registry.json`; treat a missing `type` as `claude`.
 2. For start, run `scripts/start-session.sh <project>` or `scripts/start-codex-session.sh <project>` based on type.
-3. For stop, run `scripts/stop-session.sh <project>`. For restart, stop fully before starting.
+3. For stop, run `scripts/stop-session.sh <project>`. For restart, stop fully before starting. This stops only the Channel Conversation; add `--threads` to stop only the project's thread sessions and Codex thread host, or `--all` for both. For one thread, follow `patterns/manage-threads.md`.
 4. Capture the exact tmux pane and confirm the expected listener banner.
 5. Confirm `registry.json` contains the current PID/session state without displaying secrets.
 

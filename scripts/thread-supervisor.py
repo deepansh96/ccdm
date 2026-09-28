@@ -67,6 +67,12 @@ REQUESTER_LABELS = {"root": "root", "channel-agent": "the channel agent"}
 # The private local socket, in the state dir, through which root and channel
 # agents submit creation requests to the running supervisor.
 REQUEST_SOCKET = "requests.sock"
+# Root's operations on one existing thread, and the line each posts in it.
+OPERATOR_OPS = ("stop", "restart", "close")
+OPERATOR_NOTICES = {"stop": "Stopped by root; the owner's next message resumes this thread.",
+                    "restart": "Restarting this thread's session for root; the conversation resumes."}
+# A Discord thread link, optionally to one message in the thread.
+THREAD_LINK = re.compile(r"https://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/channels/[^/\s]+/(\d+)(?:/\d+)?/?")
 NOT_RUNNING = ("the thread supervisor is not running; start it with scripts/install-thread-supervisor.sh "
                "or scripts/thread-supervisor.py run")
 CONFIG_USAGE = "/config [provider=claude|codex] [account=X] [model=Y] [effort=Z]"
@@ -513,10 +519,15 @@ def create_thread(project_root: Path, state_dir: Path, registry: dict, project_n
 def local_request(project_root: Path, state_dir: Path, request: dict) -> dict:
     """One creation request from root, for a named project, or from a Channel
     Conversation's agent, for its own channel's project only. It takes the
-    `/thread` arguments and the same validation and creation path."""
+    `/thread` arguments and the same validation and creation path. Root's
+    stop, restart, or close of one thread (``op``) goes to `operate`."""
     registry = load_registry(project_root)
     projects = registry.get("projects") if isinstance(registry.get("projects"), dict) else {}
     kind = request.get("requester")
+    if "op" in request:
+        if kind != "root" or request["op"] not in OPERATOR_OPS:
+            raise CommandError("root alone stops, restarts, or closes a thread")
+        return operate(project_root, state_dir, registry, request)
     if kind == "root":
         project_name = str(request.get("project") or "")
         if not isinstance(projects.get(project_name), dict):
@@ -542,6 +553,164 @@ def local_request(project_root: Path, state_dir: Path, request: dict) -> dict:
     if result["result"] == "start":
         start_boot(project_root, state_dir, result["thread_id"])
     return {"status": "ok", "project": project_name, "name": parsed["name"], **result}
+
+
+def find_thread(db, projects: dict, target: str, project: str | None = None):
+    """The bound thread a Discord thread link or id names, or the one thread
+    named exactly ``target``, within ``project`` when given."""
+    if project is not None and not isinstance(projects.get(project), dict):
+        raise CommandError(f"no registered project named {project}")
+    within = f" in {project}" if project else ""
+    link = THREAD_LINK.fullmatch(target)
+    thread_id = link.group(1) if link else target
+    row = STORE.thread(db, thread_id) if db else None
+    if row and project in (None, row["project"]):
+        return row
+    matches = [] if link or not db else [other for other in STORE.threads(db)
+                                         if other["name"] == target and project in (None, other["project"])]
+    if len(matches) > 1:
+        raise CommandError(f"thread name {target} is ambiguous: " + ", ".join(
+            f"{other['name']} in {other['project']} ({other['thread_id']})" for other in matches))
+    if not matches:
+        raise CommandError(f"no bound thread {thread_id}{within}" if link or target.isdigit()
+                           else f"no thread named {target}{within}")
+    return matches[0]
+
+
+def operate(project_root: Path, state_dir: Path, registry: dict, request: dict) -> dict:
+    """Root's `stop`, `restart`, or `close` of one thread, named by link, id,
+    or exact name. `stop` records `stopped/operator`; `restart` resumes a live
+    or stopped thread's conversation; `close` archives and closes a thread in
+    any state but closed, as the owner's `/close` does."""
+    projects = registry.get("projects") if isinstance(registry.get("projects"), dict) else {}
+    op = request["op"]
+    db = STORE.connect(state_dir)
+    try:
+        row = find_thread(db, projects, str(request.get("thread") or ""), request.get("project") or None)
+        project = projects.get(row["project"])
+        if not isinstance(project, dict):
+            raise CommandError(f"{row['project']} is no longer registered")
+        thread_id, label = row["thread_id"], f"thread {row['name']} ({row['thread_id']})"
+        if row["state"] in ("booting", "closed"):
+            raise CommandError(f"{label} is {row['state']}")
+
+        def say(line: str):
+            return discord_request(project_root, "post", {"bot_id": project["bot_id"], "channel_id": thread_id,
+                                                          "content": line})
+
+        if op == "close":
+            closed = close_thread(project_root, state_dir, db, row, project, {"message_id": ""}, lambda line: None)
+            if closed["result"] == "failed":
+                raise CommandError("Discord did not archive the thread; check the bot's Manage Threads permission.")
+            result = "closed"
+        elif op == "stop":
+            if row["state"] == "stopped":
+                raise CommandError(f"{label} is already stopped")
+            with BootLock(state_dir):
+                STORE.update(db, thread_id, state="stopped", stop_reason="operator", turn_running=0,
+                             queue_position=None, runtime_tmux=None, runtime_pid=None, runtime_host=None)
+            stop_runtime(project_root, state_dir, row)
+            say(OPERATOR_NOTICES["stop"])
+            result = "stopped"
+        else:
+            if row["state"] not in ("live", "stopped"):
+                raise CommandError(f"{label} is {row['state']}; only a live or stopped thread restarts")
+            posted = say(OPERATOR_NOTICES["restart"])
+            # The notice carries 👀; as a command it never reaches the model.
+            trigger = {"id": str((posted or {}).get("id") or ""), "author_id": root_user_id(registry) or "root",
+                       "author": "root", "content": "/restart", "timestamp": clock_now()}
+            if row["state"] == "live":
+                started = restart_thread(project_root, state_dir, db, row, trigger)
+            else:
+                with BootLock(state_dir):
+                    write_private(buffer_path(state_dir, thread_id), [{**trigger, "command": True}])
+                    decision = admit(db, registry, row, stop_reason=None, archive_actor=None, pending_close=None)
+                started = settle_admission(project_root, state_dir, registry, row, decision)
+            if started["result"] == "start":
+                start_boot(project_root, state_dir, thread_id)
+            result = "restarting" if started["result"] == "start" else started["result"]
+    finally:
+        if db:
+            db.close()
+    return {"status": "ok", "project": row["project"], "name": row["name"], "thread_id": thread_id, "result": result}
+
+
+def list_threads(project_root: Path, state_dir: Path, project_name: str) -> dict:
+    """Each of a project's threads with its provider and model, state (with
+    stop reason), and seconds since its last owner message, turn end, or creation."""
+    registry = load_registry(project_root)
+    projects = registry.get("projects") if isinstance(registry.get("projects"), dict) else {}
+    if not isinstance(projects.get(project_name), dict):
+        raise CommandError(f"no registered project named {project_name}")
+    db = STORE.connect(state_dir)
+    entries = []
+    try:
+        for row in (STORE.threads(db) if db else []):
+            if row["project"] != project_name:
+                continue
+            try:
+                settings = thread_settings(project_root, registry, row)
+            except (CODEX_HOME.ResolverError, SystemExit, OSError, ValueError, KeyError):
+                settings = {"provider": thread_provider(registry, row), "model": row["model"]}
+            active = max(value for value in (row["last_owner_activity_at"] or row["created_at"], row["last_turn_end_at"])
+                         if value)
+            entries.append({"name": row["name"], "thread_id": row["thread_id"], "provider": settings["provider"],
+                            "model": settings["model"] or "default",
+                            "state": row["state"] + (f"/{row['stop_reason']}" if row["stop_reason"] else ""),
+                            "idle_seconds": max(0, int(elapsed_seconds(active)))})
+    finally:
+        if db:
+            db.close()
+    return {"status": "ok", "project": project_name, "threads": entries}
+
+
+def idle_text(seconds: int) -> str:
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    if minutes < 24 * 60:
+        return f"{minutes // 60}h{minutes % 60:02d}m"
+    return f"{minutes // (24 * 60)}d{minutes // 60 % 24:02d}h"
+
+
+def thread_table(listed: dict) -> str:
+    """`threads.sh list` output: one aligned row per thread, columns two spaces apart."""
+    rows = [("NAME", "THREAD", "PROVIDER/MODEL", "STATE", "IDLE")]
+    rows += [(entry["name"], entry["thread_id"], f"{entry['provider']}/{entry['model']}", entry["state"],
+              idle_text(entry["idle_seconds"])) for entry in listed["threads"]]
+    if len(rows) == 1:
+        return f"No threads in {listed['project']}."
+    widths = [max(len(row[column]) for row in rows) for column in range(len(rows[0]))]
+    return "\n".join("  ".join(value.ljust(width) for value, width in zip(row, widths)).rstrip() for row in rows)
+
+
+def stop_threads(project_root: Path, state_dir: Path, project_name: str) -> dict:
+    """`stop-session.sh --threads`: stop every running session of a project's
+    threads as `stopped/operator`, sweep each thread's runtime, and stop the
+    project's Codex thread host. The Channel Conversation is never touched."""
+    registry = load_registry(project_root)
+    projects = registry.get("projects") if isinstance(registry.get("projects"), dict) else {}
+    project = projects.get(project_name)
+    if not isinstance(project, dict):
+        raise CommandError(f"no registered project named {project_name}")
+    stopped = []
+    db = STORE.connect(state_dir)
+    try:
+        for row in (STORE.threads(db) if db else []):
+            if row["project"] != project_name:
+                continue
+            if row["state"] in ("booting", "live", "queued"):
+                with BootLock(state_dir):
+                    STORE.update(db, row["thread_id"], state="stopped", stop_reason="operator", turn_running=0,
+                                 queue_position=None, runtime_tmux=None, runtime_pid=None, runtime_host=None)
+                stopped.append(row["thread_id"])
+            stop_runtime(project_root, state_dir, row)
+    finally:
+        if db:
+            db.close()
+    if project.get("screen_name"):
+        tmux("kill-session", "-t", f"={project['screen_name']}-threads")
+    return {"status": "ok", "project": project_name, "stopped": stopped}
 
 
 def start_boot(project_root: Path, state_dir: Path, thread_id: str) -> None:
@@ -779,8 +948,8 @@ def account_alias(registry: dict, key: str, home: str | None) -> str:
                  and os.path.realpath(os.path.expanduser(path)) == target), "default")
 
 
-def describe_settings(project_root: Path, registry: dict, row) -> str:
-    """The provider, account, model, and effort a thread runs with, marking inherited values."""
+def thread_settings(project_root: Path, registry: dict, row) -> dict:
+    """The provider, account, model, and effort a thread runs with: each override, else the inherited value."""
     provider = thread_provider(registry, row)
     if provider == "codex":
         settings = codex_settings(registry, row)
@@ -791,7 +960,12 @@ def describe_settings(project_root: Path, registry: dict, row) -> str:
                                   claude_overrides(row))
         values = {"account": account_alias(registry, "claude_accounts", resolved["claude_home"]),
                   "model": resolved["model"], "effort": resolved["effort"]}
-    values = {"provider": provider, **{field: row[field] or value for field, value in values.items()}}
+    return {"provider": provider, **{field: row[field] or value for field, value in values.items()}}
+
+
+def describe_settings(project_root: Path, registry: dict, row) -> str:
+    """The provider, account, model, and effort a thread runs with, marking inherited values."""
+    values = thread_settings(project_root, registry, row)
     return "/config: " + ", ".join(f"{field} {values[field] or 'default'}{'' if row[field] else ' (inherited)'}"
                                    for field in THREAD_FLAGS)
 
@@ -1462,18 +1636,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("run", "status", "preflight", "disable", "enable", "bind", "message",
                                             "archive", "delete", "boot", "host-event", "command", "reaction",
-                                            "grant-thread-permissions", "submit"))
+                                            "grant-thread-permissions", "submit", "list", "stop-threads"))
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--state-dir", type=Path, default=None)
     parser.add_argument("--payload", help="internal: the observer's or Codex thread host's thread event, or a "
                                           "`submit` creation request, as JSON")
     parser.add_argument("--thread-id", help="internal: the thread `boot` starts")
     target = parser.add_mutually_exclusive_group()
-    target.add_argument("--project", help="grant-thread-permissions: only this registered project")
+    target.add_argument("--project", help="grant-thread-permissions: only this registered project; "
+                                          "list and stop-threads: the project")
     target.add_argument("--all", action="store_true", help="grant-thread-permissions: every registered project")
     args = parser.parse_args()
     if args.command == "grant-thread-permissions" and not (args.project or args.all):
         parser.error("grant-thread-permissions needs --project <project> or --all")
+    if args.command in ("list", "stop-threads") and not args.project:
+        parser.error(f"{args.command} needs --project <project>")
     state_dir = args.state_dir or STORE.default_state_dir()
     try:
         if args.command == "status":
@@ -1500,6 +1677,10 @@ def main() -> int:
             result = boot(args.project_root, state_dir, args.thread_id)
         elif args.command == "grant-thread-permissions":
             result = grant_thread_permissions(args.project_root, args.project)
+        elif args.command == "list":
+            result = list_threads(args.project_root, state_dir, args.project)
+        elif args.command == "stop-threads":
+            result = stop_threads(args.project_root, state_dir, args.project)
         elif args.command == "submit":
             if not args.payload:
                 raise ValueError("--payload is required")
@@ -1508,7 +1689,8 @@ def main() -> int:
             result = run(args.project_root, state_dir)
     except (OSError, ValueError, KeyError, sqlite3.Error, json.JSONDecodeError, subprocess.SubprocessError) as error:
         result = {"status": "blocked", "reason": str(error)}
-    print(json.dumps(result, sort_keys=True))
+    print(thread_table(result) if args.command == "list" and result.get("status") == "ok"
+          else json.dumps(result, sort_keys=True))
     sys.stdout.flush()
     if args.command == "submit":
         return 0 if result.get("status") == "ok" else 2

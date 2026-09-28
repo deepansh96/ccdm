@@ -317,3 +317,25 @@ test("operator documentation, root instructions, and scenario matrix record the 
   assert.match(matrix, /\| Discord MCP \| Root thread access \| Covered \| .*discord-mcp\.test\.js/);
   assert.match(matrix, /\| Codex bridge \| Root thread access \| Covered \| .*bridge-basic-turn\.test\.js/);
 });
+
+test("operator documentation, root instructions, patterns, and scenario matrix record root thread operations", () => {
+  const section = operatorReadme.slice(operatorReadme.indexOf("## Thread Supervisor"));
+  for (const phrase of ["scripts/threads.sh list <project>", "scripts/threads.sh stop|restart|close [<project>] <thread>",
+    "scripts/stop-session.sh <project> --threads", "scripts/stop-session.sh <project> --all", "`stopped` / `operator`",
+    "https://discord.com/channels/<guild>/<thread>"]) {
+    assert.ok(section.includes(phrase), phrase);
+  }
+  const rootInstructions = fs.readFileSync("CLAUDE.md.example", "utf8");
+  for (const phrase of ["scripts/threads.sh list <project>", "scripts/threads.sh stop|restart|close [<project>] <thread>",
+    "scripts/stop-session.sh <project> --threads"]) {
+    assert.ok(rootInstructions.includes(phrase), phrase);
+  }
+  const pattern = fs.readFileSync(".mex/patterns/manage-threads.md", "utf8");
+  for (const phrase of ["scripts/threads.sh list <project>", "--threads", "--all"]) assert.ok(pattern.includes(phrase), phrase);
+  assert.match(fs.readFileSync(".mex/patterns/INDEX.md", "utf8"), /\[manage-threads\.md\]\(manage-threads\.md\)/);
+  assert.match(fs.readFileSync(".mex/patterns/manage-session.md", "utf8"), /--threads/);
+  for (const scenario of ["Thread list", "Thread operations by name", "Thread operations by link",
+    "Ambiguous or unknown thread", "Channel-only and thread-only stop", "Codex thread host stop"]) {
+    assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-operations\\.test\\.js`));
+  }
+});
