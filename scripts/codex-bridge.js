@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const { spawn } = require("child_process");
 const { createHmac, randomBytes } = require("crypto");
 const { writeFile, mkdir, mkdtemp, readFile, rm, rename } = require("fs/promises");
@@ -20,6 +19,7 @@ process.env.CCDM_REMINDER_STATE_DIR = REMINDER_STATE_DIR;
 process.env.CCDM_REMINDER_CONTEXT_FILE = REMINDER_CONTEXT_FILE;
 process.env.CCDM_REMINDER_RECEIPTS_DIR = REMINDER_RECEIPTS_DIR;
 const reminderAdapter = require("./conversation-reminder-adapter.js");
+const { createPoolTransport } = require("./codex-bridge-transport.js");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
@@ -91,12 +91,15 @@ let pendingBootstrapInstructionReason = null;
 let pendingCompactionChannelId = null;
 let messageQueue = [];
 let bridgePaused = false;
-let discordClient = null;
-let discordChannel = null;
+const discordTransport = createPoolTransport({
+  token: BOT_TOKEN,
+  primaryChannelId: CHANNEL_ID,
+  guildId: GUILD_ID,
+});
 let codexProcess = null;
 let typingInterval = null;
 let activeOutputChannelId = null;
-let activeTypingChannel = null;
+let activeTypingChannelId = null;
 let threadResetting = false;
 let lastNicknameUpdate = 0;
 let fallbackLoggedCompletedItemTypes = new Set();
@@ -303,7 +306,7 @@ function escapeRegExp(value) {
 
 function mentionsApp(msg, appId) {
   if (!appId) return false;
-  if (msg.mentions?.users?.has?.(appId)) return true;
+  if (msg.mentionedUserIds?.includes(appId)) return true;
   const mentionPattern = new RegExp(`<@!?${escapeRegExp(appId)}>`);
   return mentionPattern.test(msg.content || "");
 }
@@ -386,9 +389,8 @@ async function shouldHandleDiscordMessage(msg) {
   return true;
 }
 
-async function shouldHandleDiscordReaction(reaction, user) {
+async function shouldHandleDiscordReaction(channelId, user) {
   if (user.bot) return false;
-  const channelId = reaction.message.channelId || reaction.message.channel?.id;
   if (!channelId) return false;
   if (!ROOT_MULTI_CHANNEL) {
     return channelId === CHANNEL_ID &&
@@ -476,7 +478,7 @@ function captureTextReplyFallback(item) {
 }
 
 async function updateNickname(totalTokens, contextWindow) {
-  if (!GUILD_ID || !BOT_TOKEN || !contextWindow) return;
+  if (!discordTransport.supportsNickname || !contextWindow) return;
   const now = Date.now();
   if (now - lastNicknameUpdate < NICKNAME_INTERVAL) return;
   lastNicknameUpdate = now;
@@ -487,45 +489,16 @@ async function updateNickname(totalTokens, contextWindow) {
   const suffix = ` · ${pct}%`;
   const base = BOT_DISPLAY_NAME.slice(0, Math.max(0, 32 - suffix.length)).replace(/[\s·_-]+$/, "");
   const nick = `${base}${suffix}`;
-  try {
-    const res = await fetch(
-      `https://discord.com/api/v10/guilds/${GUILD_ID}/members/@me`,
-      {
-        method: "PATCH",
-        headers: {
-          Authorization: `Bot ${BOT_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ nick }),
-      }
-    );
-    if (res.ok) {
-      console.log(`Nickname updated: ${nick}`);
-    } else {
-      const body = await res.text().catch(() => "");
-      console.error(
-        `Nickname update failed: Discord API ${res.status}${res.statusText ? ` ${res.statusText}` : ""}${body ? `: ${body}` : ""}`
-      );
-    }
-  } catch (err) {
-    console.error(`Nickname update failed: ${err.message || err}`);
-  }
-}
-
-async function channelById(channelId) {
-  if (!channelId || !discordClient) return discordChannel;
-  if (discordChannel?.id === channelId) return discordChannel;
-  const cached = discordClient.channels.cache.get(channelId);
-  if (cached) return cached;
-  return await discordClient.channels.fetch(channelId);
+  await discordTransport.setNickname(nick);
 }
 
 async function startTyping(channelId = CHANNEL_ID) {
-  activeTypingChannel = await channelById(channelId);
-  if (!activeTypingChannel) return;
-  activeTypingChannel.sendTyping().catch(() => {});
+  const channel = await discordTransport.fetchChannel(channelId);
+  activeTypingChannelId = channel?.id ?? null;
+  if (!channel) return;
+  discordTransport.sendTyping(channel.id).catch(() => {});
   typingInterval = setInterval(() => {
-    if (activeTypingChannel) activeTypingChannel.sendTyping().catch(() => {});
+    if (activeTypingChannelId) discordTransport.sendTyping(activeTypingChannelId).catch(() => {});
   }, 8000);
 }
 
@@ -534,18 +507,12 @@ function stopTyping() {
     clearInterval(typingInterval);
     typingInterval = null;
   }
-  activeTypingChannel = null;
+  activeTypingChannelId = null;
 }
 
 async function sendToDiscord(text, channelId = activeOutputChannelId || CHANNEL_ID) {
-  const channel = await channelById(channelId);
-  if (!channel || !text.trim()) return;
-  const chunks = splitMessage(text);
-  const sent = [];
-  for (const chunk of chunks) {
-    sent.push(await channel.send(chunk));
-  }
-  return sent;
+  if (!text.trim()) return;
+  return await discordTransport.send(channelId, splitMessage(text));
 }
 
 function recordSessionTermination() {
@@ -931,7 +898,7 @@ async function processQueue() {
   if (bridgePaused || threadResetting || turnActive || !threadId || messageQueue.length === 0) return;
   const { input, msg: queuedMsg, channelId, channelScopeToken } = messageQueue.shift();
   if (queuedMsg && !queuedMsg.synthetic) {
-    queuedMsg.reactions.cache.get("⏳")?.users.remove(queuedMsg.client.user.id).catch(() => {});
+    discordTransport.removeOwnReaction(queuedMsg, "⏳").catch(() => {});
   }
   await sendTurn(input, channelId, channelScopeToken, 0, queuedMsg);
 }
@@ -951,7 +918,7 @@ function canSteerRootScope(channelId, token) {
 async function routeInput(input, msg, channelId, channelScopeToken) {
   const queueInput = async () => {
     messageQueue.push({ input, msg, channelId, channelScopeToken });
-    if (msg && !msg.synthetic) await msg.react("⏳");
+    if (msg && !msg.synthetic) await discordTransport.react(msg, "⏳");
   };
 
   const rootScopeMatches = ROOT_MULTI_CHANNEL && canSteerRootScope(channelId, channelScopeToken);
@@ -1310,7 +1277,7 @@ async function buildInput(msg, textOverride = null) {
   } else if (text) {
     input.push({ type: "text", text });
   }
-  for (const att of msg.attachments.values()) {
+  for (const att of msg.attachments) {
     if (att.contentType && att.contentType.startsWith("image/")) {
       const dataUrl = await fetchAttachmentDataUrl(att.url, att.contentType);
       if (dataUrl) input.push({ type: "image", url: dataUrl });
@@ -1356,14 +1323,14 @@ async function buildInput(msg, textOverride = null) {
 }
 
 function buildReactionInput(reaction, user) {
-  const channelId = reaction.message.channelId || reaction.message.channel.id;
+  const channelId = reaction.message.channel.id;
   const source = reaction.message.content.trim().replace(/\s+/g, " ");
   const excerpt = source.length > 80 ? `${source.slice(0, 77)}...` : source;
   const text = `User ${user.globalName || user.username || user.id} reacted ${reaction.emoji.name} to your message${excerpt ? `: "${excerpt}"` : ""} (message ID: ${reaction.message.id}).`;
   const msg = {
     id: reaction.message.id,
     author: user,
-    channel: { id: channelId, name: reaction.message.channel?.name },
+    channel: { id: channelId, name: reaction.message.channel.name },
   };
   const channelScopeToken = ROOT_MULTI_CHANNEL
     ? createDiscordChannelScopeToken(msg)
@@ -1488,49 +1455,18 @@ async function initializeCodex() {
 }
 
 function startDiscordBot() {
-  const client = new Client({
-    intents: [
-      GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.GuildMessageReactions,
-      GatewayIntentBits.MessageContent,
-    ],
-    partials: [Partials.Message, Partials.Reaction, Partials.User],
-  });
-  discordClient = client;
-
-  client.once("ready", async () => {
+  discordTransport.onReaction(async (event) => {
+    if (!(await shouldHandleDiscordReaction(event.channelId, event.user))) return;
+    let reaction;
     try {
-      console.log(`Discord bot logged in as ${client.user.tag}`);
-      discordChannel = client.channels.cache.get(CHANNEL_ID) || await client.channels.fetch(CHANNEL_ID);
-      if (!discordChannel) throw new Error("Discord channel unavailable");
-      console.log(`Listening in #${discordChannel.name}`);
-      if (process.env.CODEX_STARTUP_READY_FILE) {
-        const readyFile = process.env.CODEX_STARTUP_READY_FILE;
-        await writeFile(`${readyFile}.tmp`, "ready\n", { mode: 0o600 });
-        await rename(`${readyFile}.tmp`, readyFile);
-      }
-      if (ROOT_MULTI_CHANNEL) {
-        console.log(`Root routing active for ${rootChannelAccess.size} configured channel(s)`);
-      }
-    } catch (err) {
-      console.error("Discord startup failed:", err);
-      process.exit(1);
-    }
-  });
-
-  client.on("messageReactionAdd", async (reaction, user) => {
-    if (!(await shouldHandleDiscordReaction(reaction, user))) return;
-    try {
-      if (user.partial) await user.fetch();
-      if (reaction.partial) await reaction.fetch();
-      if (reaction.message.partial) await reaction.message.fetch();
+      reaction = await event.load();
     } catch (err) {
       console.log(`[discord] Failed to fetch reaction context: ${err.message || err}`);
       return;
     }
+    const { user } = reaction;
     if (user.bot) return;
-    const reactionChannelId = reaction.message.channelId || reaction.message.channel?.id;
+    const reactionChannelId = reaction.message.channel.id;
     const assignment = await reminderAdapter.resolveAssignmentForChannel(reactionChannelId, {
       requireCodex: true,
       ...(!ROOT_MULTI_CHANNEL && BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
@@ -1548,7 +1484,7 @@ function startDiscordBot() {
       });
     }
     if (recordedReminder) return;
-    if (!FORWARDED_REACTIONS.has(reaction.emoji.name) || reaction.message.author?.id !== client.user.id) return;
+    if (!FORWARDED_REACTIONS.has(reaction.emoji.name) || reaction.message.author?.id !== discordTransport.botUserId()) return;
 
     const { input, channelId, channelScopeToken } = buildReactionInput(reaction, user);
     console.log(`[discord] ${user.username}: ${reaction.emoji.name} on ${reaction.message.id}`);
@@ -1562,7 +1498,7 @@ function startDiscordBot() {
     await routeInput(input, reactionSource, channelId, channelScopeToken);
   });
 
-  client.on("messageCreate", async (msg) => {
+  discordTransport.onMessage(async (msg) => {
     if (!msg.author.bot && isCloseCommand(msg.content)) {
       // Root management routing reserves /close in every registered project
       // channel, whichever provider serves it; a project bridge only its own.
@@ -1603,7 +1539,7 @@ function startDiscordBot() {
     if (bridgeSlashCommand && text === "/pause") {
       console.log("[discord] /pause requested");
       bridgePaused = true;
-      await msg.react("⏸️");
+      await discordTransport.react(msg, "⏸️");
       await sendToDiscord("Bridge paused. New messages will be queued.", channelId);
       return;
     }
@@ -1612,14 +1548,14 @@ function startDiscordBot() {
       console.log("[discord] /unpause requested");
       bridgePaused = false;
       processQueue();
-      await msg.react("▶️");
+      await discordTransport.react(msg, "▶️");
       await sendToDiscord("Bridge unpaused.", channelId);
       return;
     }
 
     if (bridgeSlashCommand && text === "/compact") {
       console.log("[discord] /compact requested");
-      await msg.react("🔄");
+      await discordTransport.react(msg, "🔄");
       if (turnActive) {
         pendingCompactionChannelId = channelId;
         await sendToDiscord("Compaction queued.", channelId);
@@ -1631,7 +1567,7 @@ function startDiscordBot() {
 
     if (bridgeSlashCommand && text === "/clear") {
       console.log("[discord] /clear requested");
-      await msg.react("🔄");
+      await discordTransport.react(msg, "🔄");
       threadResetting = true;
       activeOutputChannelId = channelId;
       const previousThreadId = threadId;
@@ -1687,7 +1623,7 @@ function startDiscordBot() {
 
     if (bridgeSlashCommand && text === "/restart") {
       console.log("[discord] /restart requested");
-      await msg.react("🔄");
+      await discordTransport.react(msg, "🔄");
       try {
         if (ROOT_MULTI_CHANNEL) {
           const logPath = scheduleRootRestart();
@@ -1726,7 +1662,7 @@ function startDiscordBot() {
           `<@${ROOT_BOT_APP_ID}>`, `<@!${ROOT_BOT_APP_ID}>`,
         ].some(mention => ROOT_BOT_APP_ID && msg.content.includes(mention))
           ? "management-command"
-          : msg.attachments.size > 0 && !text ? "attachment" : "message",
+          : msg.attachments.length > 0 && !text ? "attachment" : "message",
       });
     }
 
@@ -1735,7 +1671,26 @@ function startDiscordBot() {
     await routeInput(input, msg, channelId, channelScopeToken);
   });
 
-  client.login(BOT_TOKEN);
+  void (async () => {
+    try {
+      const { userTag } = await discordTransport.connect();
+      console.log(`Discord bot logged in as ${userTag}`);
+      const channel = await discordTransport.fetchChannel(CHANNEL_ID);
+      if (!channel) throw new Error("Discord channel unavailable");
+      console.log(`Listening in #${channel.name}`);
+      if (process.env.CODEX_STARTUP_READY_FILE) {
+        const readyFile = process.env.CODEX_STARTUP_READY_FILE;
+        await writeFile(`${readyFile}.tmp`, "ready\n", { mode: 0o600 });
+        await rename(`${readyFile}.tmp`, readyFile);
+      }
+      if (ROOT_MULTI_CHANNEL) {
+        console.log(`Root routing active for ${rootChannelAccess.size} configured channel(s)`);
+      }
+    } catch (err) {
+      console.error("Discord startup failed:", err);
+      process.exit(1);
+    }
+  })();
 
   let stopping = false;
   async function cleanup() {
@@ -1745,7 +1700,7 @@ function startDiscordBot() {
     console.log("Shutting down...");
     await recordSessionTermination();
     await reminderAdapter.clearActiveContext().catch(() => {});
-    client.destroy();
+    discordTransport.destroy();
     if (ws) ws.close();
     if (codexProcess) codexProcess.kill();
     if (discordChannelScopeDir) {
