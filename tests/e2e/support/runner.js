@@ -507,10 +507,13 @@ function runTmux() {
       launch.kind === "codex-bridge"
         ? \`node scripts/codex-bridge.js CHANNEL_ID='\${launch.env.CHANNEL_ID}' BOT_APP_ID='\${launch.env.BOT_APP_ID}' WS_PORT='\${launch.env.WS_PORT}'\`
         : \`claude \${launch.claudeArgs.join(" ")} DISCORD_STATE_DIR='\${launch.env.DISCORD_STATE_DIR}'\${launch.env.CLAUDE_CONFIG_DIR ? \` CLAUDE_CONFIG_DIR='\${launch.env.CLAUDE_CONFIG_DIR}'\` : ""}\`;
+    // Claude Code's startup screens, such as the development-channel consent
+    // and workspace-trust prompts; each Enter sent to the pane advances one.
+    const bootScreens = launch.kind === "claude-listener" ? tmuxState.claudeBootScreens || [] : [];
     const paneOutput =
       launch.kind === "codex-bridge"
         ? "Codex-Discord bridge running\\nListening in #channel-id\\n"
-        : "Listening for channel messages\\n";
+        : bootScreens[0] ?? "Listening for channel messages\\n";
 
     updateState((state) => {
       if (state.fixtures.tmux.sessions[name]) {
@@ -526,6 +529,7 @@ function runTmux() {
         env: launch.env,
         bridgeCommand: launch.bridgeCommand,
         paneOutput,
+        ...(bootScreens.length > 1 ? { pendingScreens: bootScreens.slice(1) } : {}),
         pid,
         killAttempts: priorKillAttempts,
         shellCommand,
@@ -618,6 +622,9 @@ function runTmux() {
     updateState((state) => {
       const session = state.fixtures.tmux.sessions[name] || { name };
       session.sendKeys = [...(session.sendKeys || []), args.slice(targetIndex + 2)];
+      if (args.slice(targetIndex + 2).includes("Enter") && session.pendingScreens?.length) {
+        session.paneOutput = session.pendingScreens.shift();
+      }
       state.fixtures.tmux.sessions[name] = session;
       return state;
     });

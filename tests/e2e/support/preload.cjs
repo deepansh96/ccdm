@@ -589,6 +589,19 @@ function routeDiscordApi(url, init = {}) {
     return response("", { status: 204 });
   }
 
+  if (url.hostname === "discord.com" && reactionMatch && method === "DELETE") {
+    updateState((state) => {
+      state.fixtures.discord.reactionDeletes ||= [];
+      state.fixtures.discord.reactionDeletes.push({
+        authorization: headerValue(init.headers, "Authorization"),
+        channelId: reactionMatch[1],
+        emoji: reactionMatch[3],
+        messageId: reactionMatch[2],
+      });
+    });
+    return response("", { status: 204 });
+  }
+
   const nicknameMatch = /^\/api\/v10\/guilds\/([^/]+)\/members\/([^/]+)$/.exec(url.pathname);
   if (url.hostname === "discord.com" && nicknameMatch && method === "PATCH") {
     const parsedBody = init.body ? JSON.parse(String(init.body)) : {};

@@ -144,3 +144,22 @@ def bind(db: sqlite3.Connection, thread_id: str, project: str, name: str, creato
 
 def threads(db: sqlite3.Connection) -> list[sqlite3.Row]:
     return db.execute("SELECT * FROM threads ORDER BY project, created_at, thread_id").fetchall()
+
+
+def thread(db: sqlite3.Connection, thread_id: str) -> sqlite3.Row | None:
+    return db.execute("SELECT * FROM threads WHERE thread_id=?", (thread_id,)).fetchone()
+
+
+def update(db: sqlite3.Connection, thread_id: str, **fields) -> None:
+    """Set the named columns on one thread row."""
+    unknown = set(fields) - COLUMNS["threads"]
+    if unknown or not fields:
+        raise ValueError(f"unknown thread columns: {sorted(unknown)}")
+    assignments = ", ".join(f"{name}=?" for name in fields)
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        db.execute(f"UPDATE threads SET {assignments} WHERE thread_id=?", (*fields.values(), thread_id))
+        db.execute("COMMIT")
+    except sqlite3.Error:
+        db.execute("ROLLBACK")
+        raise

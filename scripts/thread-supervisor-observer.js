@@ -3,8 +3,9 @@
 
 // The Thread Supervisor's Gateway client. It logs in as root, hands each
 // thread event to the Python service, and applies Discord side effects with
-// the owning project's bot. It never dispatches coding input.
-const { execFile } = require("node:child_process");
+// the owning project's bot. It never dispatches coding input: a thread session
+// reads its messages through its own Gateway connection and bootstrap.
+const { execFile, spawn } = require("node:child_process");
 const { readFile } = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
@@ -73,6 +74,36 @@ async function threadCreated(thread) {
   const result = JSON.parse(stdout);
   if (result.result === "bound" && result.set_auto_archive) await setAutoArchive(thread.id, result.bot_id);
 }
+
+// Hands one thread message to the service, which records a starter reference,
+// holds it for a booting session's bootstrap, or asks for a session start.
+async function threadMessage(message) {
+  const payload = {
+    thread_id: message.channelId, message_id: message.id, type: message.type ?? 0,
+    author_id: message.author?.id ?? null, author_name: message.author?.username ?? null,
+    content: message.content ?? "", reference_message_id: message.reference?.messageId ?? null,
+    timestamp: new Date(message.createdTimestamp ?? Date.now()).toISOString(),
+  };
+  const { stdout } = await exec(process.env.CCDM_THREAD_PYTHON || "python3", [service, "message",
+    "--project-root", projectRoot, "--state-dir", stateDir, "--payload", JSON.stringify(payload)]);
+  if (JSON.parse(stdout).result === "start") startSession(message.channelId);
+}
+
+// A session boot can take up to the boot timeout, so it runs beside the event
+// queue; messages that arrive meanwhile are held for its bootstrap.
+function startSession(threadId) {
+  const child = spawn(process.env.CCDM_THREAD_PYTHON || "python3", [service, "boot", "--thread-id", threadId,
+    "--project-root", projectRoot, "--state-dir", stateDir], { stdio: ["ignore", "ignore", "inherit"] });
+  child.on("error", error => log(`thread ${threadId}: session start failed: ${error.message}`));
+}
+
+client.on("messageCreate", message => {
+  if (!message.channel?.isThread?.()) return;
+  // A bot's own posts never drive a thread; a starter reference is a system
+  // message that may carry any author.
+  if (message.author?.bot && message.type !== 21) return;
+  queue = queue.then(() => threadMessage(message)).catch(error => log(`thread ${message.channelId}: ${error.message}`));
+});
 
 client.on("threadCreate", thread => {
   queue = queue.then(() => threadCreated(thread)).catch(error => log(`thread ${thread.id}: ${error.message}`));

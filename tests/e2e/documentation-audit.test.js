@@ -169,3 +169,18 @@ test("registration documentation grants project bots the thread permissions", ()
     assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-supervisor-permissions\\.test\\.js`));
   }
 });
+
+test("operator documentation and scenario matrix record Claude Thread Conversation sessions", () => {
+  const section = operatorReadme.slice(operatorReadme.indexOf("## Thread Supervisor"));
+  for (const phrase of ["scripts/start-thread-session.sh", "<screen_name>-t-", "DISCORD_ACCESS_MODE=static",
+    "120 seconds", "stop-session.sh <project>"]) {
+    assert.ok(section.includes(phrase), phrase);
+  }
+  for (const scenario of ["Claude thread session start", "Claude thread boot handoff", "Claude thread starter message",
+    "Claude thread boot timeout", "Thread session eligibility"]) {
+    assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-claude-session\\.test\\.js`));
+  }
+  assert.match(matrix, /\| Claude start \| Shared launch mapping \| Covered \| .*claude-launch\.py/);
+  assert.match(matrix, /\| Fixture contracts \| Claude startup screens \| Covered \| .*claudeBootScreens/);
+  assert.match(fs.readFileSync(".mex/context/session-management.md", "utf8"), /start-thread-session\.sh/);
+});

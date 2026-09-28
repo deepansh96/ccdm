@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { WebSocketServer } from "ws";
 
@@ -7,7 +8,18 @@ import { createWorkspace } from "./runner.js";
 import { readState, recordCommandInvocation, writeState } from "./state.js";
 import { registerTeardownCallback } from "./teardown.js";
 
+const { withStateLock } = createRequire(import.meta.url)("./state-lock.cjs");
 const overlayRoots = new WeakMap();
+
+// Read-modify-write of fixture state under the lock the Discord shim's poller
+// holds, so an injection never overwrites a concurrent delivery.
+export function updateFixtureState(workspace, updater) {
+  return withStateLock(workspace.stateDir, () => {
+    const state = readState(workspace.stateDir);
+    updater(state);
+    return writeState(state, workspace.stateDir);
+  });
+}
 
 function writeOverlay(workspace) {
   const overlayRoot = path.join(workspace.tmpRoot, "overlays", "node_modules");
@@ -392,26 +404,24 @@ export function startBridge(workspace, options = {}) {
 }
 
 export function injectDiscordMessage(workspace, message = {}) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.injectedMessages.push({
+  updateFixtureState(workspace, state => state.fixtures.discord.injectedMessages.push({
     author: { bot: false, id: "allowed-user-id", username: "Allowed User", ...(message.author ?? {}) },
     channelId: message.channelId ?? "channel-id",
     ...(message.channelType !== undefined ? { channelType: message.channelType } : {}),
     ...(message.parentId !== undefined ? { parentId: message.parentId } : {}),
     content: message.content ?? "hello",
+    ...(message.type !== undefined ? { type: message.type } : {}),
+    ...(message.reference !== undefined ? { reference: message.reference } : {}),
     delivered: false,
     id: message.id ?? `message-${Date.now()}`,
     attachments: message.attachments ?? [],
-  });
-  writeState(state, workspace.stateDir);
+  }));
 }
 
 // Queues a Gateway THREAD_CREATE. Public threads are type 11 and private
 // threads type 12; `parentType` 15 is a forum channel.
 export function injectDiscordThread(workspace, thread = {}) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.injectedThreads ||= [];
-  state.fixtures.discord.injectedThreads.push({
+  updateFixtureState(workspace, state => (state.fixtures.discord.injectedThreads ||= []).push({
     archived: false,
     autoArchiveDuration: 1440,
     delivered: false,
@@ -421,8 +431,7 @@ export function injectDiscordThread(workspace, thread = {}) {
     parentType: 0,
     type: 11,
     ...thread,
-  });
-  writeState(state, workspace.stateDir);
+  }));
 }
 
 export function injectDiscordReaction(workspace, reaction = {}) {

@@ -64,6 +64,7 @@ function initialState() {
         messages: [],
         nicknamePatches: [],
         ready: [],
+        reactionDeletes: [],
         reactions: [],
         restFailureUses: [],
         restFailures: [],

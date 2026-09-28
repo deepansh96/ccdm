@@ -95,7 +95,12 @@ function fixtureMessage(client, raw) {
     channelId: raw.channelId,
     client,
     content: raw.content ?? "",
+    createdTimestamp: raw.createdTimestamp ?? Date.parse("2026-09-28T10:00:00.000Z"),
     id: raw.id,
+    // Discord message types: 0 is a normal message, 18 the thread-created
+    // notice in the parent channel, and 21 a thread's starter reference.
+    type: raw.type ?? 0,
+    reference: raw.reference ?? null,
     reactions: {
       cache: new Map([
         [
