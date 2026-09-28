@@ -157,6 +157,10 @@ export async function startFakeCodexServer(workspace, options = {}) {
   const interruptedTurnIds = new Set();
   const pendingTurnReleases = new Map();
   const clientMessages = [];
+  // The home's configured servers, changeable mid-test, and the Codex
+  // conversations archived on the Codex side.
+  let homeMcpServers = options.homeMcpServers;
+  const archivedThreadIds = new Set(options.archivedThreadIds ?? []);
   markCodexServer(workspace, port, { ready: true, ...(options.fixture ?? {}) });
 
   // Each thread/start and thread/resume, with its per-conversation MCP override.
@@ -202,10 +206,10 @@ export async function startFakeCodexServer(workspace, options = {}) {
             reply({ data: [{ name: "unrelated", tools: {} }], nextCursor: "discord-page" });
             break;
           }
-          if (options.homeMcpServers) {
+          if (homeMcpServers) {
             // The Codex Home's own configured servers, such as another
             // project's `discord-*` entry.
-            reply({ data: options.homeMcpServers.map(name => ({ name, tools: { reply: { name: "reply" } } })) });
+            reply({ data: homeMcpServers.map(name => ({ name, tools: { reply: { name: "reply" } } })) });
             break;
           }
           reply({
@@ -245,6 +249,8 @@ export async function startFakeCodexServer(workspace, options = {}) {
           recordThreadConfig(message);
           if (options.resumeError) {
             replyError({ code: -32000, message: options.resumeError });
+          } else if (archivedThreadIds.has(message.params?.threadId)) {
+            replyError({ code: -32600, message: `session ${message.params.threadId} is archived` });
           } else {
             reply({ thread: { id: message.params.threadId } });
           }
@@ -376,7 +382,12 @@ export async function startFakeCodexServer(workspace, options = {}) {
           }
           break;
         case "thread/archive":
+          archivedThreadIds.add(message.params?.threadId);
           reply({});
+          break;
+        case "thread/unarchive":
+          archivedThreadIds.delete(message.params?.threadId);
+          reply({ thread: { id: message.params?.threadId } });
           break;
         default:
           reply({});
@@ -399,6 +410,15 @@ export async function startFakeCodexServer(workspace, options = {}) {
       const release = pendingTurnReleases.get(turnId);
       if (!release) throw new Error(`No pending fake turn release for ${turnId}`);
       release();
+    },
+    // Changes the home's configured MCP servers, as another bridge writing
+    // config.toml would.
+    setHomeMcpServers(names) {
+      homeMcpServers = names;
+    },
+    // Archives a conversation on the Codex side, as `/clear` in a channel does.
+    archiveThread(threadId) {
+      archivedThreadIds.add(threadId);
     },
     async close() {
       await new Promise((resolve) => server.close(resolve));

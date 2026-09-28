@@ -605,22 +605,27 @@ def quoted(value) -> str:
 
 def ensure_host(project_root: Path, state_dir: Path, project: str, session: str, started: str) -> str | None:
     """Start the project's Codex thread host in tmux unless it runs; None once
-    its control socket answers, otherwise why it did not."""
+    its control socket answers, otherwise why it did not. A host that is
+    exiting because its last thread stopped is waited out and started again."""
     runtime_dir = host_runtime_dir(state_dir, project)
-    if tmux("has-session", "-t", f"={session}").returncode != 0:
-        command = (f"cd {quoted(project_root)} && node scripts/codex-thread-host.js --project {quoted(project)} "
-                   f"--state-dir {quoted(state_dir)}")
-        launched = tmux("new-session", "-d", "-s", session, "--", "zsh", "-ic", command)
-        if launched.returncode != 0:
-            log(launched.stderr.strip() or f"tmux new-session {session} failed")
-            return "the Codex thread host could not be launched."
-    while host_request(runtime_dir, {"op": "ping"}) is None:
+    launched_here = False
+    while True:
         if tmux("has-session", "-t", f"={session}").returncode != 0:
-            return "the Codex thread host exited during startup."
+            if launched_here:
+                return "the Codex thread host exited during startup."
+            command = (f"cd {quoted(project_root)} && node scripts/codex-thread-host.js --project {quoted(project)} "
+                       f"--state-dir {quoted(state_dir)}")
+            launched = tmux("new-session", "-d", "-s", session, "--", "zsh", "-ic", command)
+            if launched.returncode != 0:
+                log(launched.stderr.strip() or f"tmux new-session {session} failed")
+                return "the Codex thread host could not be launched."
+            launched_here = True
+        answer = host_request(runtime_dir, {"op": "ping"})
+        if answer and answer.get("ok"):
+            return None
         if elapsed_seconds(started) >= BOOT_TIMEOUT_SECONDS:
             return f"the Codex thread host was not ready within {BOOT_TIMEOUT_SECONDS} seconds."
         time.sleep(0.2)
-    return None
 
 
 def codex_boot(project_root: Path, state_dir: Path, db, row, registry: dict, reaction: dict, started: str) -> dict:
@@ -639,28 +644,37 @@ def codex_boot(project_root: Path, state_dir: Path, db, row, registry: dict, rea
         return fail(str(error))
     project = registry["projects"][row["project"]]
     session = f"{project['screen_name']}-threads"
-    problem = ensure_host(project_root, state_dir, row["project"], session, started)
-    if problem:
-        return fail(problem)
+    # A thread with a stored conversation resumes it on the same Codex Home;
+    # an account change starts fresh.
+    resume = row["provider_conversation_id"] if row["provider_home"] == settings["home"] else None
     starter = None
-    if row["starter_message_id"]:
+    if row["starter_message_id"] and not resume:
         starter = discord_request(project_root, "get-message", {
             "bot_id": reaction["bot_id"], "channel_id": str(project["channel_id"]),
             "message_id": row["starter_message_id"]})
     runtime_dir = host_runtime_dir(state_dir, row["project"])
-    with BootLock(state_dir):
-        buffered = buffer_path(state_dir, thread_id)
-        held = json.loads(buffered.read_text(encoding="utf-8"))
-        opened = host_request(runtime_dir, {"op": "open", "thread": {
-            "thread_id": thread_id, "name": row["name"], **settings}, "starter": starter, "messages": held,
-            "trigger_message_id": reaction["message_id"]})
-        if opened and opened.get("ok"):
-            # Handed off: the host's own Gateway delivers later messages.
-            buffered.unlink()
-            STORE.update(db, thread_id, resolved_provider="codex", resolved_account=settings["home"],
-                         resolved_model=settings["model"], resolved_effort=settings["effort"],
-                         runtime_tmux=session, runtime_host=str(runtime_dir / "control.sock"),
-                         runtime_home=settings["home"])
+    while True:
+        problem = ensure_host(project_root, state_dir, row["project"], session, started)
+        if problem:
+            return fail(problem)
+        with BootLock(state_dir):
+            buffered = buffer_path(state_dir, thread_id)
+            held = json.loads(buffered.read_text(encoding="utf-8"))
+            opened = host_request(runtime_dir, {"op": "open", "thread": {
+                "thread_id": thread_id, "name": row["name"], **settings,
+                **({"conversation_id": resume} if resume else {})}, "starter": starter, "messages": held,
+                "trigger_message_id": reaction["message_id"]})
+            if opened and opened.get("ok"):
+                # Handed off: the host's own Gateway delivers later messages.
+                buffered.unlink()
+                STORE.update(db, thread_id, resolved_provider="codex", resolved_account=settings["home"],
+                             resolved_model=settings["model"], resolved_effort=settings["effort"],
+                             runtime_tmux=session, runtime_host=str(runtime_dir / "control.sock"),
+                             runtime_home=settings["home"])
+        # A host exiting after its last thread stopped refuses new threads; start another.
+        if not (opened and opened.get("stopping")) or elapsed_seconds(started) >= BOOT_TIMEOUT_SECONDS:
+            break
+        time.sleep(0.2)
     if not (opened and opened.get("ok")):
         return fail((opened or {}).get("error") or "the Codex thread host did not accept the thread.")
     while True:

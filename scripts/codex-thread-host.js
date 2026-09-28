@@ -33,6 +33,8 @@ const USER_MESSAGE_TYPES = new Set([0, 19]);
 // before the handoff still reaches the first turn.
 const RECENT_LIMIT = 200;
 const BOOTSTRAP_TIMEOUT_MS = Number(process.env.CODEX_BOOTSTRAP_TIMEOUT_MS || 60000);
+// How long an unload waits for the app-server before the host moves on.
+const UNLOAD_TIMEOUT_MS = 5000;
 
 if (!PROJECT) {
   console.error("usage: codex-thread-host.js --project <project> [--state-dir <dir>]");
@@ -182,10 +184,8 @@ function mcpName(conv) {
   return `discord-${conv.threadId}`;
 }
 
-// The conversation's own Discord server, scoped to its thread, with every
-// other `discord-*` server of the home disabled. It travels with the request
-// and is never written into the home's config.toml.
-async function mcpOverride(conv) {
+// Every `discord-*` server of the home other than the conversation's own, sorted.
+async function homeDiscordServers(conv) {
   let cursor;
   const others = [];
   do {
@@ -196,6 +196,13 @@ async function mcpOverride(conv) {
     }
     cursor = page?.nextCursor;
   } while (cursor);
+  return others.sort();
+}
+
+// The conversation's own Discord server, scoped to its thread, with every
+// other `discord-*` server of the home disabled. It travels with each
+// thread/start and thread/resume and is never written into the home's config.toml.
+function mcpOverride(conv, others) {
   return {
     [mcpName(conv)]: {
       command: "node",
@@ -212,13 +219,16 @@ function turnSettings(conv) {
   return { ...(conv.model ? { model: conv.model } : {}), ...(conv.effort ? { effort: conv.effort } : {}) };
 }
 
-async function startCodexThread(conv) {
-  const result = await request(conv.runtime, "thread/start", {
+// The settings thread/start and thread/resume share, recording which home
+// servers the override disables.
+function conversationParams(conv, others) {
+  conv.disabledServers = others;
+  return {
     cwd: PROJECT_DIR,
     sandbox: conv.sandbox,
     approvalPolicy: "never",
     ...(conv.model ? { model: conv.model } : {}),
-    config: { mcp_servers: await mcpOverride(conv),
+    config: { mcp_servers: mcpOverride(conv, others),
       ...(conv.effort ? { model_reasoning_effort: conv.effort } : {}) },
     developerInstructions: `This conversation is the Discord thread "${conv.name}", connected through the ` +
       `${mcpName(conv)} MCP server. Do not call Discord MCP tools unless the current task includes an explicit ` +
@@ -226,10 +236,42 @@ async function startCodexThread(conv) {
       "Discord. Use the exposed Discord MCP tools directly. If a tool is deferred, discover it through tool search " +
       "first. Never reconstruct the Discord transport through shell commands, read its credentials, or launch a " +
       "replacement MCP server to send a reply.",
-  });
+  };
+}
+
+async function startCodexThread(conv) {
+  const result = await request(conv.runtime, "thread/start", conversationParams(conv, await homeDiscordServers(conv)));
   if (!result?.thread?.id) throw new Error("Codex did not return a conversation id");
   conv.codexThreadId = result.thread.id;
   await report(conv.threadId, "conversation-id", { conversation_id: conv.codexThreadId, home: conv.home });
+}
+
+// Loads the stored conversation again, with a fresh override; a conversation
+// archived on the Codex side is unarchived first.
+async function resumeCodexThread(conv, others) {
+  const params = { threadId: conv.codexThreadId, ...conversationParams(conv, others || await homeDiscordServers(conv)) };
+  try {
+    await request(conv.runtime, "thread/resume", params);
+  } catch (error) {
+    if (!/archived/i.test(error.message)) throw error;
+    await request(conv.runtime, "thread/unarchive", { threadId: conv.codexThreadId });
+    await request(conv.runtime, "thread/resume", params);
+  }
+}
+
+// Unloads the conversation from its app-server; it never archives it.
+async function unload(conv) {
+  if (!conv.runtime || !conv.codexThreadId) return;
+  const unloading = (async () => {
+    if (conv.turnActive) {
+      await request(conv.runtime, "turn/interrupt", { threadId: conv.codexThreadId,
+        ...(conv.activeTurnId ? { turnId: conv.activeTurnId } : {}) }).catch(() => {});
+    }
+    await request(conv.runtime, "thread/unsubscribe", { threadId: conv.codexThreadId });
+  })().catch(error => log(`thread ${conv.threadId}: unloading failed: ${error.message}`));
+  let timer;
+  await Promise.race([unloading, new Promise(resolve => { timer = setTimeout(resolve, UNLOAD_TIMEOUT_MS); })]);
+  clearTimeout(timer);
 }
 
 // The existing no-action bootstrap, adapted to a thread: it configures the
@@ -302,6 +344,14 @@ async function onTurnCompleted(conv, turn) {
 async function sendTurn(conv, input) {
   beginTurn(conv);
   try {
+    // A `discord-*` server added to the home since the override was built
+    // would reach this conversation: reload it with a refreshed override first.
+    const others = await homeDiscordServers(conv);
+    if (others.join("\n") !== conv.disabledServers.join("\n")) {
+      log(`thread ${conv.threadId}: the home's Discord servers changed; reloading the conversation`);
+      await request(conv.runtime, "thread/unsubscribe", { threadId: conv.codexThreadId });
+      await resumeCodexThread(conv, others);
+    }
     const result = await request(conv.runtime, "turn/start", {
       threadId: conv.codexThreadId, input, approvalPolicy: "never", ...turnSettings(conv),
     });
@@ -356,8 +406,13 @@ function firstTurnText(conv, starter, messages) {
 
 async function startConversation(conv, opened) {
   conv.runtime = await runtimeFor(conv.home);
-  await startCodexThread(conv);
-  if (conv.stopped) return;
+  if (conv.codexThreadId) {
+    await resumeCodexThread(conv);
+    await report(conv.threadId, "conversation-id", { conversation_id: conv.codexThreadId, home: conv.home });
+  } else {
+    await startCodexThread(conv);
+  }
+  if (conv.stopped) return unload(conv);
   await sendBootstrap(conv);
   if (conv.stopped) return;
   const messages = [...opened.messages, ...conv.pending];
@@ -387,12 +442,15 @@ function open(requested) {
   const thread = requested.thread || {};
   const threadId = String(thread.thread_id || "");
   if (!threadId) return { ok: false, error: "open needs a thread id" };
+  if (stopping) return { ok: false, stopping: true, error: "the Codex thread host is stopping" };
   if (conversations.has(threadId)) return { ok: false, error: `thread ${threadId} is already open` };
   const messages = requested.messages || [];
   const conv = {
     threadId, name: thread.name || threadId, home: thread.home, model: thread.model || null,
     effort: thread.effort || null, sandbox: thread.sandbox || FULL_ACCESS, triggerMessageId: requested.trigger_message_id,
-    replyToken: randomBytes(16).toString("hex"), runtime: null, codexThreadId: null,
+    // A stored conversation id resumes that conversation.
+    replyToken: randomBytes(16).toString("hex"), runtime: null, codexThreadId: thread.conversation_id || null,
+    disabledServers: [],
     turnActive: false, activeTurnId: null, bootstrapping: false, bootstrapDone: null, deltaBuffer: "",
     mcpReplyCalled: false, terminalError: null, queue: [], paused: false, stopped: false, handedOff: false,
     pending: [], included: new Set([requested.starter?.id, ...messages.map(message => message.id)].filter(Boolean)),
@@ -411,16 +469,17 @@ function open(requested) {
   return { ok: true };
 }
 
-function stop(threadId) {
+// Stopping unloads the conversation. Once no conversation is left, the host
+// refuses new ones and exits after replying.
+async function stop(threadId) {
   const conv = conversations.get(threadId);
-  if (!conv) return { ok: true, result: "not-open" };
-  conv.stopped = true;
-  conversations.delete(threadId);
-  // Stopping unloads the conversation; it never archives it.
-  if (conv.turnActive && conv.codexThreadId && conv.runtime) {
-    request(conv.runtime, "turn/interrupt", { threadId: conv.codexThreadId,
-      ...(conv.activeTurnId ? { turnId: conv.activeTurnId } : {}) }).catch(() => {});
+  if (conv) {
+    conv.stopped = true;
+    conversations.delete(threadId);
   }
+  if (conversations.size === 0) stopping = true;
+  if (!conv) return { ok: true, result: "not-open" };
+  await unload(conv);
   return { ok: true, result: "stopped" };
 }
 
@@ -460,11 +519,12 @@ async function handleControl(line) {
   try {
     switch (requested.op) {
       case "ping":
+        if (stopping) return { ok: false, stopping: true, error: "the Codex thread host is stopping" };
         return { ok: true, threads: [...conversations.keys()] };
       case "open":
         return open(requested);
       case "stop":
-        return stop(threadId);
+        return await stop(threadId);
       case "config": {
         const conv = conversations.get(threadId);
         if (!conv) return { ok: false, error: `thread ${threadId} is not open` };
@@ -496,7 +556,9 @@ function startControlServer() {
       for (let end; (end = buffer.indexOf("\n")) >= 0;) {
         const line = buffer.slice(0, end);
         buffer = buffer.slice(end + 1);
-        void handleControl(line).then(reply => socket.write(`${JSON.stringify(reply)}\n`));
+        void handleControl(line).then(reply => socket.write(`${JSON.stringify(reply)}\n`, () => {
+          if (stopping) void shutdown();
+        }));
       }
     });
   });
@@ -515,6 +577,7 @@ const client = new Client({
   partials: [Partials.Message, Partials.Reaction, Partials.User],
 });
 let controlServer = null;
+let stopping = false;
 let shuttingDown = false;
 
 client.once("ready", () => {

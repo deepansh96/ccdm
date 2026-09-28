@@ -215,3 +215,17 @@ test("operator documentation and scenario matrix record Codex Thread Conversatio
   // The project-mode Codex scope token lives as long as its process, not one turn.
   assert.match(fs.readFileSync(".mex/context/decisions.md", "utf8"), /reply scope token is per process/);
 });
+
+test("operator documentation and scenario matrix record the Codex Thread Conversation lifecycle", () => {
+  const section = operatorReadme.slice(operatorReadme.indexOf("## Thread Supervisor"));
+  for (const phrase of ["thread/unsubscribe", "thread/resume", "thread/unarchive", "never calls `thread/archive`",
+    "stops its app-servers and exits", "refreshed override"]) {
+    assert.ok(section.includes(phrase), phrase);
+  }
+  for (const scenario of ["Codex thread stop and host exit", "Codex thread resume", "Codex thread close and delete",
+    "Codex thread tool-scope drift"]) {
+    assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-codex-lifecycle\\.test\\.js`));
+  }
+  assert.match(matrix, /\| Fixture contracts \| Codex thread host fakes \| Covered \| .*setHomeMcpServers/);
+  assert.match(fs.readFileSync(".mex/context/session-management.md", "utf8"), /thread\/unsubscribe/);
+});

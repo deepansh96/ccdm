@@ -114,7 +114,7 @@ last_updated: 2026-09-28
 **Decision:** Codex sends user-visible messages only through dynamically registered Discord MCP tools protected by a scope token. In project mode the reply scope token is per process: the channel bridge mints one at startup (a Codex thread host, one per conversation), and it lasts until that process exits. Only root mode adds a per-turn signed channel scope token.
 **Reasoning:** Automatic text streaming could leak intermediate output and let delegated agents post outside parent control.
 **Alternatives considered:** Stream all assistant deltas or accept plain-text fallback by default; rejected for privacy and routing correctness.
-**Consequences:** The top-level agent must call `reply`, `edit_message`, or `react`; subagents return results only to their parent. Codex Thread Conversations get their Discord server from a per-conversation `thread/start` `config.mcp_servers` override scoped to the thread, never from `config.toml`.
+**Consequences:** The top-level agent must call `reply`, `edit_message`, or `react`; subagents return results only to their parent. Codex Thread Conversations get their Discord server from a per-conversation `config.mcp_servers` override scoped to the thread, sent on every `thread/start` and `thread/resume`, never from `config.toml`.
 
 ### Default E2E tests to local fakes
 **Date:** 2026-05-28

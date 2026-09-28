@@ -494,7 +494,9 @@ function runTmux() {
     const targetIndex = args.indexOf("-t");
     const name = normalizeSessionTarget(args[targetIndex + 1]);
     const session = readState().fixtures.tmux.sessions[name];
-    if (session?.startupMode === "exit") {
+    // Like tmux, a session ends when a thread host it runs exits.
+    const hostExited = session?.command?.[2]?.includes(" node scripts/codex-thread-host.js ") && !isAlive(session.pid);
+    if (session?.startupMode === "exit" || hostExited) {
       updateState((state) => { delete state.fixtures.tmux.sessions[name]; return state; });
       process.exit(1);
     }
