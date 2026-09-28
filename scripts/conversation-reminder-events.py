@@ -111,6 +111,8 @@ def assignment_for(registry: dict, project_name: str) -> dict:
         "owner_id": str(owner_id),
         "channel_id": str(channel_id),
         "bot_id": str(bot_id),
+        # The identity that speaks for the project; the Conversation store keys on it.
+        "identity": f"pool:{bot_id}",
         "bot": bot,
         "generation": generation,
     }

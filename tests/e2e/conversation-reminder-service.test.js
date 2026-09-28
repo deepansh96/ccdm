@@ -1743,8 +1743,10 @@ test("a canceled send and a late send after reassignment never grow the streak",
     ["generation-2", 0, null]);
 });
 
-test("a v5 store upgrades to v6, keeping a recorded reminder's pending due time", async () => {
-  const downgrade = `ALTER TABLE conversations DROP COLUMN consecutive_reminders; PRAGMA user_version=5;`;
+test("a v5 store upgrades to v7, keeping a recorded reminder's pending due time", async () => {
+  const downgrade = `ALTER TABLE conversations DROP COLUMN consecutive_reminders;
+    ALTER TABLE conversations RENAME COLUMN identity TO bot_id; UPDATE conversations SET bot_id='bot';
+    ALTER TABLE retired_assignments RENAME COLUMN identity TO bot_id; PRAGMA user_version=5;`;
   const withReminder = createWorkspace();
   const stateDir = setup(withReminder);
   await reconciledExchange(withReminder, stateDir);
@@ -1756,7 +1758,8 @@ test("a v5 store upgrades to v6, keeping a recorded reminder's pending due time"
   assert.deepEqual([...streak(upgraded), upgraded.reminder_message_id],
     ["awaiting-owner", "2026-09-24T13:00:00Z", 1, "r-1"]);
   const version = spawnSync("python3", ["-c", "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('PRAGMA user_version').fetchone()[0])", database], { encoding: "utf8" });
-  assert.equal(version.stdout.trim(), "6");
+  assert.equal(version.stdout.trim(), "7");
+  assert.equal(upgraded.identity, "pool:bot");
   assert.deepEqual(streak(await sendAt(withReminder, stateDir, clockFile, "2026-09-24T13:00:00Z", "r-2")),
     ["awaiting-owner", "2026-09-24T17:00:00Z", 2]);
 
@@ -1768,7 +1771,7 @@ test("a v5 store upgrades to v6, keeping a recorded reminder's pending due time"
     ["awaiting-owner", "2026-09-24T11:00:00Z", 0]);
 });
 
-test("a fresh store is created at v6, and a v6 store without the streak or a future version fails closed", async () => {
+test("a fresh store is created at v7, and a v7 store without the streak or a future version fails closed", async () => {
   const workspace = createWorkspace();
   const stateDir = setup(workspace);
   await cli(workspace, stateDir, "sync");
@@ -1778,9 +1781,9 @@ db=sqlite3.connect(sys.argv[1])
 print(json.dumps([db.execute('PRAGMA user_version').fetchone()[0],
   'consecutive_reminders' in [row[1] for row in db.execute('PRAGMA table_info(conversations)')]]))`, database],
   { encoding: "utf8" });
-  assert.deepEqual(JSON.parse(shape.stdout), [6, true]);
-  for (const script of ["PRAGMA user_version=7;",
-    "PRAGMA user_version=6; ALTER TABLE conversations DROP COLUMN consecutive_reminders;"]) {
+  assert.deepEqual(JSON.parse(shape.stdout), [7, true]);
+  for (const script of ["PRAGMA user_version=8;",
+    "PRAGMA user_version=7; ALTER TABLE conversations DROP COLUMN consecutive_reminders;"]) {
     const copy = createWorkspace();
     const copyDir = setup(copy);
     await cli(copy, copyDir, "sync");
@@ -1792,4 +1795,148 @@ print(json.dumps([db.execute('PRAGMA user_version').fetchone()[0],
     assert.deepEqual(JSON.parse(result.stdout),
       { status: "blocked", reason: "conversation store schema is unsupported" }, script);
   }
+});
+
+// A v6 store as the v6 service wrote it, seeded by hand: one awaiting
+// conversation mid-streak and one retired assignment with pending cleanup.
+const V6_STORE = `
+CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT INTO settings VALUES ('disabled','0');
+CREATE TABLE conversations (
+  project TEXT PRIMARY KEY, channel_id TEXT NOT NULL, bot_id TEXT NOT NULL,
+  assignment_generation TEXT NOT NULL, owner_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('closed','open-paused','awaiting-owner')),
+  revision INTEGER NOT NULL, last_ack_at TEXT, last_ack_message_id TEXT,
+  current_interaction_id TEXT, response_message_id TEXT, response_at TEXT,
+  due_at TEXT, reminder_message_id TEXT, cleanup_message_ids TEXT NOT NULL,
+  last_event_order TEXT, reconciliation_status TEXT NOT NULL,
+  checkpoint INTEGER NOT NULL DEFAULT 0,
+  consecutive_reminders INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE applied_events (event_id TEXT PRIMARY KEY);
+CREATE TABLE owner_sources (project TEXT NOT NULL, assignment_generation TEXT NOT NULL,
+  source_message_id TEXT NOT NULL, kind TEXT NOT NULL, PRIMARY KEY(project,assignment_generation,source_message_id));
+CREATE TABLE qualifications (project TEXT NOT NULL, assignment_generation TEXT NOT NULL,
+  provider_session_id TEXT NOT NULL, provider_turn_id TEXT NOT NULL, kind TEXT NOT NULL,
+  response_message_id TEXT NOT NULL, PRIMARY KEY(project,assignment_generation,provider_session_id,
+  provider_turn_id,kind,response_message_id));
+CREATE TABLE pending_actions (action_id TEXT PRIMARY KEY, project TEXT NOT NULL, kind TEXT NOT NULL,
+  message_id TEXT NOT NULL, assignment_generation TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE delivery_intents (nonce TEXT PRIMARY KEY, project TEXT NOT NULL, assignment_generation TEXT NOT NULL,
+  revision INTEGER NOT NULL, state TEXT NOT NULL, message_id TEXT, claimed_at TEXT NOT NULL, retry_at TEXT);
+CREATE UNIQUE INDEX active_delivery_intent ON delivery_intents(project,assignment_generation)
+  WHERE state IN ('sending','uncertain');
+CREATE TABLE retired_assignments (project TEXT NOT NULL, assignment_generation TEXT NOT NULL,
+  channel_id TEXT NOT NULL, bot_id TEXT NOT NULL, reason TEXT NOT NULL, retired_at TEXT NOT NULL,
+  PRIMARY KEY(project,assignment_generation));
+CREATE TABLE retired_leftovers (action_id TEXT PRIMARY KEY, project TEXT NOT NULL,
+  assignment_generation TEXT NOT NULL, message_id TEXT NOT NULL, reason TEXT NOT NULL);
+CREATE TABLE discoveries (
+  project TEXT NOT NULL, assignment_generation TEXT NOT NULL, phase TEXT NOT NULL,
+  started_revision INTEGER NOT NULL, watermark_id TEXT, before_id TEXT, after_id TEXT,
+  summary_json TEXT NOT NULL, pages_total INTEGER NOT NULL DEFAULT 0,
+  reactions_total INTEGER NOT NULL DEFAULT 0, passes INTEGER NOT NULL DEFAULT 0,
+  pass_key INTEGER, pass_pages INTEGER NOT NULL DEFAULT 0,
+  pass_reactions INTEGER NOT NULL DEFAULT 0, last_seq INTEGER NOT NULL DEFAULT 0,
+  pending_request TEXT, retry_at TEXT, reason TEXT, basis TEXT,
+  PRIMARY KEY(project,assignment_generation));
+CREATE TABLE catch_ups (project TEXT NOT NULL, assignment_generation TEXT NOT NULL, marked_at TEXT NOT NULL,
+  PRIMARY KEY(project,assignment_generation));
+INSERT INTO conversations VALUES ('demo','channel','bot','generation-1','owner','awaiting-owner',7,
+  '2026-09-24T09:00:00Z','ack-1','question-1','answer-1','2026-09-24T10:00:00Z','2026-09-24T17:00:00Z',
+  'r-2','[]','2026-09-24T13:00:00Z:r-2','ready',3,2);
+INSERT INTO retired_assignments VALUES ('demo','generation-0','old-channel','old-bot','reassigned',
+  '2026-09-23T08:00:00Z');
+INSERT INTO pending_actions VALUES ('delete:r-old','demo','delete','r-old','generation-0',0);
+PRAGMA user_version=6;
+`;
+
+function seedV6(workspace) {
+  const stateDir = setup(workspace);
+  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const database = path.join(stateDir, "conversations.sqlite3");
+  sql(database, V6_STORE);
+  fs.chmodSync(database, 0o600);
+  return { stateDir, database };
+}
+
+function storeRows(database) {
+  const result = spawnSync("python3", ["-c", `import json,sqlite3,sys
+db=sqlite3.connect(sys.argv[1]); db.row_factory=sqlite3.Row
+print(json.dumps({"version": db.execute('PRAGMA user_version').fetchone()[0],
+  "conversations": [dict(r) for r in db.execute('SELECT * FROM conversations ORDER BY project')],
+  "retired_assignments": [dict(r) for r in db.execute('SELECT * FROM retired_assignments')]}))`, database],
+  { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  return JSON.parse(result.stdout);
+}
+
+const V7_CONVERSATION = {
+  project: "demo", channel_id: "channel", identity: "pool:bot", assignment_generation: "generation-1",
+  owner_id: "owner", state: "awaiting-owner", revision: 7, last_ack_at: "2026-09-24T09:00:00Z",
+  last_ack_message_id: "ack-1", current_interaction_id: "question-1", response_message_id: "answer-1",
+  response_at: "2026-09-24T10:00:00Z", due_at: "2026-09-24T17:00:00Z", reminder_message_id: "r-2",
+  cleanup_message_ids: "[]", last_event_order: "2026-09-24T13:00:00Z:r-2", reconciliation_status: "ready",
+  checkpoint: 3, consecutive_reminders: 2,
+};
+const V7_RETIRED = {
+  project: "demo", assignment_generation: "generation-0", channel_id: "old-channel", identity: "pool:old-bot",
+  reason: "reassigned", retired_at: "2026-09-23T08:00:00Z",
+};
+
+function backups(stateDir) {
+  return fs.readdirSync(stateDir).filter(name => name.includes("backup"));
+}
+
+test("a v6 store migrates to v7, keying conversations and retired assignments by pool identity", async () => {
+  const workspace = createWorkspace();
+  const { stateDir, database } = seedV6(workspace);
+  const status = await cli(workspace, stateDir, "status");
+  assert.equal(status.conversations.demo.identity, "pool:bot");
+  assert.equal(status.conversations.demo.consecutive_reminders, 2);
+  assert.equal(status.retired_assignments[0].identity, "pool:old-bot");
+  assert.deepEqual(storeRows(database),
+    { version: 7, conversations: [V7_CONVERSATION], retired_assignments: [V7_RETIRED] });
+
+  // The pre-migration store is kept privately beside the migrated one.
+  assert.deepEqual(backups(stateDir), ["conversations.v6.backup.sqlite3"]);
+  const backup = path.join(stateDir, "conversations.v6.backup.sqlite3");
+  assert.equal(fs.statSync(backup).mode & 0o777, 0o600);
+  const original = storeRows(backup);
+  assert.equal(original.version, 6);
+  assert.deepEqual(original.conversations[0].bot_id, "bot");
+  assert.deepEqual(original.retired_assignments[0].bot_id, "old-bot");
+
+  // Pool cleanup for the retired assignment still names its own bot.
+  const actions = await cli(workspace, stateDir, "actions");
+  assert.deepEqual(actions.actions.map(a => [a.message_id, a.channel_id, a.bot_id, a.retired]),
+    [["r-old", "old-channel", "old-bot", true]]);
+
+  // Re-running on the v7 store changes nothing and takes no second backup.
+  await cli(workspace, stateDir, "status");
+  assert.deepEqual(storeRows(database),
+    { version: 7, conversations: [V7_CONVERSATION], retired_assignments: [V7_RETIRED] });
+  assert.deepEqual(backups(stateDir), ["conversations.v6.backup.sqlite3"]);
+});
+
+test("a failed v7 migration leaves the v6 store usable", async () => {
+  const workspace = createWorkspace();
+  const { stateDir, database } = seedV6(workspace);
+  // An injected failure aborts the identity rewrite partway through.
+  sql(database, `CREATE TRIGGER fail_migration BEFORE UPDATE ON retired_assignments
+    BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;`);
+  const failed = await runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["status", "--project-root", workspace.repoDir, "--state-dir", stateDir],
+  });
+  assert.notEqual(failed.exitCode, 0);
+  const untouched = storeRows(database);
+  assert.equal(untouched.version, 6);
+  assert.equal(untouched.conversations[0].bot_id, "bot");
+  assert.equal(untouched.retired_assignments[0].bot_id, "old-bot");
+  assert.deepEqual(backups(stateDir), ["conversations.v6.backup.sqlite3"]);
+
+  sql(database, "DROP TRIGGER fail_migration;");
+  await cli(workspace, stateDir, "status");
+  assert.deepEqual(storeRows(database),
+    { version: 7, conversations: [V7_CONVERSATION], retired_assignments: [V7_RETIRED] });
 });

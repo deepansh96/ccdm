@@ -130,8 +130,8 @@ test("idle reassignment retires the old generation and removes its reminder with
   await waitForState(workspace, state => state.fixtures.discord.deletes?.length === 1);
   const retired = await waitForStatus(workspace, context.stateDir, current =>
     current.retired_assignments?.[0]?.cleanup.completed.includes("fake-message-1"));
-  assert.deepEqual(retired.retired_assignments.map(row => [row.project, row.assignment_generation, row.bot_id]),
-    [["demo", "generation-1", "bot"]]);
+  assert.deepEqual(retired.retired_assignments.map(row => [row.project, row.assignment_generation, row.identity]),
+    [["demo", "generation-1", "pool:bot"]]);
   const current = retired.conversations.demo;
   assert.equal(current.assignment_generation, "generation-2");
   assert.equal(current.state, "open-paused");
