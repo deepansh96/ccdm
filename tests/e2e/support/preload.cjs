@@ -772,10 +772,17 @@ function requestTarget(args) {
   };
 }
 
+// The bridge's WS_PORT, or a port the harness registered as a fake Codex
+// app-server, such as one a Codex thread host picks per Codex Home.
+function isFakeCodexPort(port) {
+  return Boolean(port) && (port === String(process.env.WS_PORT || "") ||
+    readState().fixtures?.codex?.servers?.[port]?.ready === true);
+}
+
 function isAllowedWebSocketUpgrade(target) {
   const upgrade = target.headers.Upgrade ?? target.headers.upgrade;
   const local = ["127.0.0.1", "localhost", "::1", ""].includes(String(target.host));
-  return local && target.port === String(process.env.WS_PORT || "") && String(upgrade).toLowerCase() === "websocket";
+  return local && isFakeCodexPort(target.port) && String(upgrade).toLowerCase() === "websocket";
 }
 
 function blockRequest(kind, original) {
@@ -805,9 +812,8 @@ function installNetGuard() {
   const originalCreateConnection = net.createConnection.bind(net);
   function guardedConnect(...args) {
     const { host, port } = hostFromNetArgs(args);
-    const allowedPort = String(process.env.WS_PORT || "");
     const isLocal = ["127.0.0.1", "localhost", "::1", ""].includes(String(host));
-    if (allowedPort && isLocal && port === allowedPort) {
+    if (isLocal && isFakeCodexPort(port)) {
       return originalConnect(...args);
     }
     const target = `${host}:${port}`;
@@ -817,9 +823,8 @@ function installNetGuard() {
   net.connect = guardedConnect;
   net.createConnection = function guardedCreateConnection(...args) {
     const { host, port } = hostFromNetArgs(args);
-    const allowedPort = String(process.env.WS_PORT || "");
     const isLocal = ["127.0.0.1", "localhost", "::1", ""].includes(String(host));
-    if (allowedPort && isLocal && port === allowedPort) {
+    if (isLocal && isFakeCodexPort(port)) {
       return originalCreateConnection(...args);
     }
     return guardedConnect(...args);

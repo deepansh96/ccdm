@@ -11,8 +11,10 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
+import socket
 import sqlite3
 import stat
 import subprocess
@@ -31,6 +33,7 @@ def _load(name: str, filename: str):
 STORE = _load("ccdm_thread_store", "thread-supervisor-store.py")
 ROUTER = _load("ccdm_thread_router", "thread-supervisor-router.py")
 LAUNCH = _load("ccdm_claude_launch", "claude-launch.py")
+CODEX_HOME = _load("ccdm_codex_home", "resolve-codex-home.py")
 # Discord's longest auto-archive duration, in minutes (one week).
 AUTO_ARCHIVE_MINUTES = 10080
 # How long `disable` waits for a running worker to release its lock.
@@ -339,7 +342,7 @@ def message(project_root: Path, state_dir: Path, event: dict) -> dict:
     """Route one message in a thread: record a starter reference, trigger a
     session start, or hold the message for a booting thread's bootstrap.
 
-    This path is provider-agnostic; only Claude threads start for now."""
+    This path is provider-agnostic."""
     thread_id = str(event.get("thread_id") or "")
     db = STORE.connect(state_dir)
     if not db:
@@ -363,9 +366,6 @@ def message(project_root: Path, state_dir: Path, event: dict) -> dict:
             owner = str(registry.get("discord_user_id") or "")
             if not author or not ROUTER.eligible_creator(registry, project, author):
                 return {"result": "ignored", "reason": "ineligible-author"}
-            if thread_provider(registry, row) != "claude":
-                # Codex threads wait for the Codex thread host.
-                return {"result": "ignored", "reason": "provider-not-supported"}
             held = {"id": str(event.get("message_id") or ""), "author_id": author,
                     "author": str(event.get("author_name") or author), "content": str(event.get("content") or ""),
                     "timestamp": str(event.get("timestamp") or clock_now())}
@@ -429,15 +429,47 @@ def claude_session(resolved: dict) -> tuple[int | None, str | None]:
     return None, None
 
 
+def host_runtime_dir(state_dir: Path, project: str) -> Path:
+    """The private runtime dir of a project's Codex thread host, holding its control socket."""
+    return state_dir / "hosts" / re.sub(r"[^A-Za-z0-9._-]", "_", project)
+
+
+def host_request(runtime_dir: Path, request: dict, timeout: float = 10) -> dict | None:
+    """One request on a Codex thread host's control socket; None when the host is unreachable.
+    The socket is addressed relative to its directory: an absolute path can exceed the Unix socket limit."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(timeout)
+            previous = os.getcwd()
+            os.chdir(runtime_dir)
+            try:
+                client.connect("control.sock")
+            finally:
+                os.chdir(previous)
+            client.sendall(json.dumps(request).encode("utf-8") + b"\n")
+            with client.makefile("rb") as replies:
+                line = replies.readline()
+        return json.loads(line) if line else None
+    except (OSError, ValueError):
+        return None
+
+
 def stop_runtime(project_root: Path, state_dir: Path, row) -> None:
     """The provider-agnostic stop hook: end a thread's session and remove its
     per-thread runtime files (state dir with launch files, inbox, and
     bootstrap; held boot messages), keeping the row so the thread can resume.
-    Provider conversation files are never touched. Only Claude threads run a
-    session so far."""
+    Provider conversation files are never touched. A Codex thread's
+    conversation is unloaded from its project's thread host."""
     thread_id = row["thread_id"]
     with BootLock(state_dir):
         buffer_path(state_dir, thread_id).unlink(missing_ok=True)
+    try:
+        provider = thread_provider(load_registry(project_root), row)
+    except (OSError, ValueError):
+        provider = None
+    if provider == "codex":
+        host_request(host_runtime_dir(state_dir, row["project"]), {"op": "stop", "thread_id": thread_id})
+        return
     try:
         resolved = LAUNCH.resolve(str(project_root / "registry.json"), row["project"], thread_id)
     except (OSError, ValueError, KeyError, StopIteration, SystemExit):
@@ -538,8 +570,149 @@ def bootstrap(row, owner: str, starter: dict | None, held: list[dict]) -> dict:
     }
 
 
+def boot_failed(project_root: Path, state_dir: Path, db, thread_id: str, reaction: dict, reason: str) -> dict:
+    """A thread start failed: stop it as start-failed, post one line, and remove 👀.
+    Only the next owner message retries."""
+    with BootLock(state_dir):
+        buffer_path(state_dir, thread_id).unlink(missing_ok=True)
+        STORE.update(db, thread_id, state="stopped", stop_reason="start-failed", runtime_tmux=None, runtime_pid=None,
+                     runtime_host=None)
+    stop_runtime(project_root, state_dir, STORE.thread(db, thread_id))
+    log(f"thread {thread_id} failed to start: {reason}")
+    discord_request(project_root, "post", {"bot_id": reaction["bot_id"], "channel_id": thread_id,
+                                           "content": f"Thread session failed to start: {reason}"})
+    discord_request(project_root, "unreact", reaction)
+    return {"status": "failed", "reason": reason}
+
+
+def codex_settings(registry: dict, row) -> dict:
+    """The Codex Home, model, effort, and sandbox a Codex thread runs with:
+    each thread override, else the project's value."""
+    project = registry["projects"][row["project"]]
+    if row["account"]:
+        home = CODEX_HOME.resolve_account_home(CODEX_HOME.codex_accounts(registry), row["account"],
+                                               f"thread {row['thread_id']} account")
+    else:
+        home = CODEX_HOME.resolve_codex_home(registry, row["project"])
+    return {"home": home, "model": row["model"] or project.get("codex_model") or project.get("model"),
+            "effort": row["effort"] or project.get("codex_reasoning_effort") or project.get("model_reasoning_effort"),
+            "sandbox": project.get("codex_sandbox") or "danger-full-access"}
+
+
+def quoted(value) -> str:
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
+def ensure_host(project_root: Path, state_dir: Path, project: str, session: str, started: str) -> str | None:
+    """Start the project's Codex thread host in tmux unless it runs; None once
+    its control socket answers, otherwise why it did not."""
+    runtime_dir = host_runtime_dir(state_dir, project)
+    if tmux("has-session", "-t", f"={session}").returncode != 0:
+        command = (f"cd {quoted(project_root)} && node scripts/codex-thread-host.js --project {quoted(project)} "
+                   f"--state-dir {quoted(state_dir)}")
+        launched = tmux("new-session", "-d", "-s", session, "--", "zsh", "-ic", command)
+        if launched.returncode != 0:
+            log(launched.stderr.strip() or f"tmux new-session {session} failed")
+            return "the Codex thread host could not be launched."
+    while host_request(runtime_dir, {"op": "ping"}) is None:
+        if tmux("has-session", "-t", f"={session}").returncode != 0:
+            return "the Codex thread host exited during startup."
+        if elapsed_seconds(started) >= BOOT_TIMEOUT_SECONDS:
+            return f"the Codex thread host was not ready within {BOOT_TIMEOUT_SECONDS} seconds."
+        time.sleep(0.2)
+    return None
+
+
+def codex_boot(project_root: Path, state_dir: Path, db, row, registry: dict, reaction: dict, started: str) -> dict:
+    """Open a Codex thread conversation on the project's thread host, which
+    reports it ready or failed through `host-event`."""
+    thread_id = row["thread_id"]
+
+    def fail(reason: str) -> dict:
+        result = boot_failed(project_root, state_dir, db, thread_id, reaction, reason)
+        db.close()
+        return result
+
+    try:
+        settings = codex_settings(registry, row)
+    except CODEX_HOME.ResolverError as error:
+        return fail(str(error))
+    project = registry["projects"][row["project"]]
+    session = f"{project['screen_name']}-threads"
+    problem = ensure_host(project_root, state_dir, row["project"], session, started)
+    if problem:
+        return fail(problem)
+    starter = None
+    if row["starter_message_id"]:
+        starter = discord_request(project_root, "get-message", {
+            "bot_id": reaction["bot_id"], "channel_id": str(project["channel_id"]),
+            "message_id": row["starter_message_id"]})
+    runtime_dir = host_runtime_dir(state_dir, row["project"])
+    with BootLock(state_dir):
+        buffered = buffer_path(state_dir, thread_id)
+        held = json.loads(buffered.read_text(encoding="utf-8"))
+        opened = host_request(runtime_dir, {"op": "open", "thread": {
+            "thread_id": thread_id, "name": row["name"], **settings}, "starter": starter, "messages": held,
+            "trigger_message_id": reaction["message_id"]})
+        if opened and opened.get("ok"):
+            # Handed off: the host's own Gateway delivers later messages.
+            buffered.unlink()
+            STORE.update(db, thread_id, resolved_provider="codex", resolved_account=settings["home"],
+                         resolved_model=settings["model"], resolved_effort=settings["effort"],
+                         runtime_tmux=session, runtime_host=str(runtime_dir / "control.sock"),
+                         runtime_home=settings["home"])
+    if not (opened and opened.get("ok")):
+        return fail((opened or {}).get("error") or "the Codex thread host did not accept the thread.")
+    while True:
+        current = STORE.thread(db, thread_id)
+        if not current or current["state"] != "booting":
+            db.close()
+            return {"status": current["state"] if current else "forgotten", "thread_id": thread_id}
+        if elapsed_seconds(started) >= BOOT_TIMEOUT_SECONDS:
+            return fail(f"Codex was not ready within {BOOT_TIMEOUT_SECONDS} seconds.")
+        time.sleep(0.2)
+
+
+def host_event(project_root: Path, state_dir: Path, event: dict) -> dict:
+    """Record one event the Codex thread host reports about a thread it hosts."""
+    thread_id = str(event.get("thread_id") or "")
+    kind = event.get("event")
+    db = STORE.connect(state_dir)
+    if not db:
+        return {"result": "ignored", "reason": "unbound-thread"}
+    try:
+        row = STORE.thread(db, thread_id)
+        if not row:
+            return {"result": "ignored", "reason": "unbound-thread"}
+        if kind == "conversation-id":
+            STORE.update(db, thread_id, provider_conversation_id=str(event["conversation_id"]),
+                         provider_home=str(event["home"]))
+        elif kind == "turn-started":
+            STORE.update(db, thread_id, turn_running=1)
+        elif kind == "turn-ended":
+            STORE.update(db, thread_id, turn_running=0, last_turn_end_at=clock_now())
+        elif kind in ("ready", "failed"):
+            if row["state"] != "booting":
+                return {"result": "ignored", "reason": f"thread is {row['state']}"}
+            reaction = {"bot_id": load_registry(project_root)["projects"][row["project"]]["bot_id"],
+                        "channel_id": thread_id, "message_id": str(event.get("trigger_message_id") or ""),
+                        "emoji": BOOTING_EMOJI}
+            if kind == "failed":
+                return boot_failed(project_root, state_dir, db, thread_id, reaction,
+                                   str(event.get("reason") or "the Codex conversation failed to start."))
+            with BootLock(state_dir):
+                STORE.update(db, thread_id, state="live", stop_reason=None)
+            discord_request(project_root, "unreact", reaction)
+        else:
+            raise ValueError(f"unknown host event: {kind}")
+        return {"result": "recorded", "event": kind}
+    finally:
+        db.close()
+
+
 def boot(project_root: Path, state_dir: Path, thread_id: str) -> dict:
-    """Launch a Claude thread session, accept its startup prompts, and hand over the bootstrap."""
+    """Start a thread's session: a Claude thread session, launched and handed its
+    bootstrap here, or a Codex conversation on the project's thread host."""
     started = clock_now()
     db = STORE.connect(state_dir)
     row = STORE.thread(db, thread_id) if db else None
@@ -551,19 +724,14 @@ def boot(project_root: Path, state_dir: Path, thread_id: str) -> dict:
         trigger = json.loads(buffer_path(state_dir, thread_id).read_text(encoding="utf-8"))[0]["id"]
     reaction = {"bot_id": bot_id, "channel_id": thread_id, "message_id": trigger, "emoji": BOOTING_EMOJI}
     discord_request(project_root, "react", reaction)
+    if thread_provider(registry, row) == "codex":
+        return codex_boot(project_root, state_dir, db, row, registry, reaction, started)
     resolved = LAUNCH.resolve(str(project_root / "registry.json"), row["project"], thread_id)
 
     def fail(reason: str) -> dict:
-        with BootLock(state_dir):
-            buffer_path(state_dir, thread_id).unlink(missing_ok=True)
-            STORE.update(db, thread_id, state="stopped", stop_reason="start-failed", runtime_tmux=None, runtime_pid=None)
-        stop_runtime(project_root, state_dir, STORE.thread(db, thread_id))
-        log(f"thread {thread_id} failed to start: {reason}")
-        discord_request(project_root, "post", {"bot_id": bot_id, "channel_id": thread_id,
-                                               "content": f"Thread session failed to start: {reason}"})
-        discord_request(project_root, "unreact", reaction)
+        result = boot_failed(project_root, state_dir, db, thread_id, reaction, reason)
         db.close()
-        return {"status": "failed", "reason": reason}
+        return result
 
     # A thread with a stored conversation resumes it under the same Claude
     # home and cwd; an account change starts fresh.
@@ -654,10 +822,11 @@ def run(project_root: Path, state_dir: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("run", "status", "preflight", "disable", "enable", "bind", "message",
-                                            "archive", "delete", "boot", "grant-thread-permissions"))
+                                            "archive", "delete", "boot", "host-event",
+                                            "grant-thread-permissions"))
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--state-dir", type=Path, default=None)
-    parser.add_argument("--payload", help="internal: the observer's thread event as JSON")
+    parser.add_argument("--payload", help="internal: the observer's or Codex thread host's thread event as JSON")
     parser.add_argument("--thread-id", help="internal: the thread `boot` starts")
     target = parser.add_mutually_exclusive_group()
     target.add_argument("--project", help="grant-thread-permissions: only this registered project")
@@ -679,10 +848,10 @@ def main() -> int:
             if not args.payload:
                 raise ValueError("--payload is required")
             result = bind(args.project_root, state_dir, json.loads(args.payload))
-        elif args.command in ("message", "archive", "delete"):
+        elif args.command in ("message", "archive", "delete", "host-event"):
             if not args.payload:
                 raise ValueError("--payload is required")
-            handler = {"message": message, "archive": archive, "delete": delete}[args.command]
+            handler = {"message": message, "archive": archive, "delete": delete, "host-event": host_event}[args.command]
             result = handler(args.project_root, state_dir, json.loads(args.payload))
         elif args.command == "boot":
             if not args.thread_id:

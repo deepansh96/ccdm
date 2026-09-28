@@ -221,6 +221,11 @@ class Client extends EventEmitter {
     updateState((state) => {
       state.fixtures.discord.logins ||= [];
       state.fixtures.discord.logins.push({ token });
+      // With `fanOut`, like Discord, each logged-in client receives every
+      // event injected after its login; otherwise one client claims each.
+      this._clientKey = `${process.pid}:${state.fixtures.discord.logins.length}`;
+      this._firstEvents = Object.fromEntries(["injectedThreads", "injectedMessages", "injectedReactions",
+        "injectedGatewayEvents"].map(list => [list, (state.fixtures.discord[list] ?? []).length]));
     });
     const failure = readState().fixtures?.discord?.failures?.login;
     if (failure) return Promise.reject(new Error(failure));
@@ -250,7 +255,16 @@ class Client extends EventEmitter {
       let deliveredGateway = null;
       let deliveredThread = null;
       updateState((state) => {
-        const thread = (state.fixtures?.discord?.injectedThreads ?? []).find((entry) => !entry.delivered);
+        const fanOut = state.fixtures?.discord?.fanOut === true;
+        const claim = (list) => {
+          const entries = state.fixtures?.discord?.[list] ?? [];
+          if (!fanOut) return entries.find((entry) => !entry.delivered);
+          const entry = entries.slice(this._firstEvents?.[list] ?? 0)
+            .find((candidate) => !(candidate.deliveredTo ?? []).includes(this._clientKey));
+          if (entry) (entry.deliveredTo ||= []).push(this._clientKey);
+          return entry;
+        };
+        const thread = claim("injectedThreads");
         if (thread) {
           thread.delivered = true;
           state.fixtures.discord.deliveredThreads ||= [];
@@ -258,8 +272,7 @@ class Client extends EventEmitter {
           deliveredThread = { ...thread };
           return;
         }
-        const messages = state.fixtures?.discord?.injectedMessages ?? [];
-        const next = messages.find((message) => !message.delivered);
+        const next = claim("injectedMessages");
         if (next) {
           next.delivered = true;
           state.fixtures.discord.deliveredMessages ||= [];
@@ -267,11 +280,10 @@ class Client extends EventEmitter {
           delivered = { ...next };
           return;
         }
-        const reactions = state.fixtures?.discord?.injectedReactions ?? [];
-        const nextReaction = reactions.find((reaction) => !reaction.delivered);
+        const nextReaction = claim("injectedReactions");
         if (!nextReaction) {
           // Scripted Gateway lifecycle events, such as a disconnect and a new session.
-          const gateway = (state.fixtures?.discord?.injectedGatewayEvents ?? []).find((event) => !event.delivered);
+          const gateway = claim("injectedGatewayEvents");
           if (!gateway) return false;
           gateway.delivered = true;
           deliveredGateway = gateway.event;

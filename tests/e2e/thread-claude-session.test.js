@@ -323,25 +323,20 @@ test("a boot that never becomes ready fails once after 120 seconds and waits for
   await stopRun(workspace, context.env, running);
 });
 
-test("a stranger's message and a thread in a Codex project start nothing", async () => {
+test("a stranger's message in a bound Claude thread starts nothing", async () => {
   const workspace = createWorkspace();
   const context = setup(workspace);
   const running = startRun(workspace, context.env);
   await waitForState(workspace, state => state.fixtures.discord.ready.length === 1);
-  const codexThread = "1500000000000222222";
   const laterThread = "1500000000000333333";
   injectDiscordThread(workspace, { id: THREAD, parentId: "channel", ownerId: "owner" });
-  injectDiscordThread(workspace, { id: codexThread, parentId: "codex-channel", ownerId: "owner" });
   injectDiscordThread(workspace, { id: laterThread, parentId: "channel", ownerId: "owner" });
   ownerMessage(workspace, "stranger-1", "let me in", THREAD, { id: "stranger", username: "stranger" });
-  injectDiscordMessage(workspace, { id: "codex-1", channelId: codexThread, channelType: 11, parentId: "codex-channel",
-    author: { id: "owner", username: "owner" }, content: "codex please" });
   ownerMessage(workspace, "owner-1", "this one starts", laterThread);
   await waitForThread(workspace, context.env, laterThread, row => row.state === "live", "live");
 
   const current = await status(workspace, context.env);
   assert.equal(current.projects.demo.threads[THREAD].state, "registered");
-  assert.equal(current.projects.codexy.threads[codexThread].state, "registered");
   const state = readState(workspace.stateDir);
   assert.deepEqual(Object.keys(state.fixtures.tmux.sessions), ["demo_session-t-333333"]);
   assert.deepEqual(decoded(state.fixtures.discord.reactions).map(row => row.messageId), ["owner-1"]);

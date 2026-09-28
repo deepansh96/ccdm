@@ -225,6 +225,7 @@ function normalizeState(value) {
         routes: value?.fixtures?.curl?.routes || [],
       },
       codex: {
+        ...(value?.fixtures?.codex || {}),
         appServerInvocations: value?.fixtures?.codex?.appServerInvocations || [],
         bridgeInvocations: value?.fixtures?.codex?.bridgeInvocations || [],
         protocolEvents: value?.fixtures?.codex?.protocolEvents || [],
@@ -411,7 +412,34 @@ function parseCodexBridgeLaunch(shellCommand) {
   };
 }
 
+// The Codex thread host is real CCDM code, so the fixture runs it (with the
+// discord.js shim and the fake app-server inherited through this environment)
+// instead of a placeholder.
+function parseCodexThreadHostLaunch(shellCommand) {
+  const match = /^cd '([^']*)' && node (scripts\\/codex-thread-host\\.js)((?: (?:'[^']*'|[^\\s']+))*)$/.exec(shellCommand);
+  if (!match) {
+    throw new Error("unsupported tmux launch command: " + shellCommand);
+  }
+  const hostArgs = [...match[3].matchAll(/'([^']*)'|([^\\s']+)/g)].map((token) => token[1] ?? token[2]);
+  return { cwd: match[1], env: {}, script: path.join(match[1], match[2]), hostArgs };
+}
+
+function spawnCodexThreadHost(launch, name) {
+  const log = fs.openSync(path.join(stateDir, "thread-host-" + name + ".log"), "a");
+  const child = spawn(process.execPath, [launch.script, ...launch.hostArgs], {
+    cwd: launch.cwd,
+    detached: true,
+    env: process.env,
+    stdio: ["ignore", log, log],
+  });
+  child.unref();
+  return child.pid;
+}
+
 function parseTmuxLaunch(shellCommand) {
+  if (/ node scripts\\/codex-thread-host\\.js /.test(shellCommand)) {
+    return { kind: "codex-thread-host", ...parseCodexThreadHostLaunch(shellCommand) };
+  }
   if (shellCommand.endsWith(" node scripts/codex-bridge.js")) {
     return { kind: "codex-bridge", ...parseCodexBridgeLaunch(shellCommand) };
   }
@@ -501,20 +529,24 @@ function runTmux() {
       tmuxState.lastKilledSessions?.[name]?.killAttempts ?? preexistingSession?.killAttempts ?? 0;
     const launch = parseTmuxLaunch(shellCommand);
     const readyFile = tmuxState.startupMode ? "" : launch.env.CODEX_STARTUP_READY_FILE;
-    const pid = spawnPlaceholder(readyFile);
+    const pid = launch.kind === "codex-thread-host" ? spawnCodexThreadHost(launch, name) : spawnPlaceholder(readyFile);
     // Like Claude Code, a resumed launch continues the named session.
     const resumeIndex = launch.claudeArgs?.indexOf("--resume") ?? -1;
     const sessionId = resumeIndex >= 0 ? launch.claudeArgs[resumeIndex + 1].replace(/^'(.*)'$/, "$1")
       : \`fixture-session-\${pid}\`;
     const processCommand =
-      launch.kind === "codex-bridge"
+      launch.kind === "codex-thread-host"
+        ? "node scripts/codex-thread-host.js " + launch.hostArgs.join(" ")
+        : launch.kind === "codex-bridge"
         ? \`node scripts/codex-bridge.js CHANNEL_ID='\${launch.env.CHANNEL_ID}' BOT_APP_ID='\${launch.env.BOT_APP_ID}' WS_PORT='\${launch.env.WS_PORT}'\`
         : \`claude \${launch.claudeArgs.join(" ")} DISCORD_STATE_DIR='\${launch.env.DISCORD_STATE_DIR}'\${launch.env.CLAUDE_CONFIG_DIR ? \` CLAUDE_CONFIG_DIR='\${launch.env.CLAUDE_CONFIG_DIR}'\` : ""}\`;
     // Claude Code's startup screens, such as the development-channel consent
     // and workspace-trust prompts; each Enter sent to the pane advances one.
     const bootScreens = launch.kind === "claude-listener" ? tmuxState.claudeBootScreens || [] : [];
     const paneOutput =
-      launch.kind === "codex-bridge"
+      launch.kind === "codex-thread-host"
+        ? ""
+        : launch.kind === "codex-bridge"
         ? "Codex-Discord bridge running\\nListening in #channel-id\\n"
         : bootScreens[0] ?? "Listening for channel messages\\n";
 
@@ -548,7 +580,12 @@ function runTmux() {
       });
       return state;
     });
-    if (launch.kind === "codex-bridge") {
+    if (launch.kind === "codex-thread-host") {
+      updateState((state) => {
+        (state.fixtures.codex.threadHostInvocations ||= []).push({ args: launch.hostArgs, cwd: launch.cwd, pid, session: name });
+        return state;
+      });
+    } else if (launch.kind === "codex-bridge") {
       recordCodexBridgeInvocation({
         command: launch.bridgeCommand,
         cwd: launch.cwd,
@@ -582,6 +619,9 @@ function runTmux() {
       if (nextSession.killFailuresRemaining > 0) {
         nextSession.killFailuresRemaining -= 1;
       } else {
+        if (nextSession.command?.[2]?.includes(" node scripts/codex-thread-host.js ")) {
+          try { process.kill(-nextSession.pid, "SIGTERM"); } catch { /* already gone */ }
+        }
         nextState.fixtures.tmux.lastKilledSessions = {
           ...(nextState.fixtures.tmux.lastKilledSessions || {}),
           [name]: { killAttempts: nextSession.killAttempts },

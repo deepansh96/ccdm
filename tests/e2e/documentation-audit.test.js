@@ -199,3 +199,19 @@ test("operator documentation, glossary, and scenario matrix record the Thread Co
   assert.match(matrix, /\| Fixture contracts \| Thread lifecycle events \| Covered \| .*auditLogEntries/);
   assert.match(fs.readFileSync("CONTEXT.md", "utf8"), /closed when the owner or root archives its thread/);
 });
+
+test("operator documentation and scenario matrix record Codex Thread Conversations", () => {
+  const section = operatorReadme.slice(operatorReadme.indexOf("## Thread Supervisor"));
+  for (const phrase of ["scripts/codex-thread-host.js", "<screen_name>-threads", "thread_ws_port", "codex_sandbox",
+    "config.mcp_servers", "default_tools_approval_mode", "enabled: false", "control.sock", "host-event"]) {
+    assert.ok(section.includes(phrase), phrase);
+  }
+  for (const scenario of ["Codex thread session start", "Codex thread tool scope", "Codex thread settings",
+    "Two Codex threads", "Codex thread boot handoff", "Codex thread host eligibility"]) {
+    assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-codex-session\\.test\\.js`));
+  }
+  assert.match(matrix, /\| Fixture contracts \| Codex thread host fakes \| Covered \| .*forbidDiscordConfigWrites/);
+  assert.match(fs.readFileSync(".mex/context/session-management.md", "utf8"), /codex-thread-host\.js/);
+  // The project-mode Codex scope token lives as long as its process, not one turn.
+  assert.match(fs.readFileSync(".mex/context/decisions.md", "utf8"), /reply scope token is per process/);
+});

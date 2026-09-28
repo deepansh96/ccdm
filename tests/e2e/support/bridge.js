@@ -127,18 +127,18 @@ export function runPreloadProbe(workspace, code, extraEnv = {}) {
 }
 
 function recordCodexEvent(workspace, event) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.codex.protocolEvents.push({ at: new Date().toISOString(), ...event });
-  writeState(state, workspace.stateDir);
+  updateFixtureState(workspace, state => {
+    state.fixtures.codex.protocolEvents.push({ at: new Date().toISOString(), ...event });
+  });
 }
 
 function markCodexServer(workspace, port, values) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.codex.servers[String(port)] = {
-    ...(state.fixtures.codex.servers[String(port)] ?? {}),
-    ...values,
-  };
-  writeState(state, workspace.stateDir);
+  updateFixtureState(workspace, state => {
+    state.fixtures.codex.servers[String(port)] = {
+      ...(state.fixtures.codex.servers[String(port)] ?? {}),
+      ...values,
+    };
+  });
 }
 
 export async function startFakeCodexServer(workspace, options = {}) {
@@ -146,6 +146,9 @@ export async function startFakeCodexServer(workspace, options = {}) {
   await new Promise((resolve) => server.once("listening", resolve));
   const port = server.address().port;
   const turnPlans = [...(options.turns ?? [])];
+  // Per-Codex-thread turn queues; a thread without one uses `turns`.
+  const threadTurnPlans = Object.fromEntries(Object.entries(options.turnsByThread ?? {})
+    .map(([threadId, plans]) => [threadId, [...plans]]));
   const steerPlans = [...(options.steer ?? [])];
   let serverRequestId = 10000;
   let threadStartCount = 0;
@@ -155,6 +158,12 @@ export async function startFakeCodexServer(workspace, options = {}) {
   const pendingTurnReleases = new Map();
   const clientMessages = [];
   markCodexServer(workspace, port, { ready: true, ...(options.fixture ?? {}) });
+
+  // Each thread/start and thread/resume, with its per-conversation MCP override.
+  const recordThreadConfig = (message) => updateFixtureState(workspace, state => {
+    (state.fixtures.codex.threadConfigs ||= []).push({ method: message.method,
+      mcpServers: message.params?.config?.mcp_servers ?? null, params: message.params });
+  });
 
   server.on("connection", (socket) => {
     recordCodexEvent(workspace, { event: "connection", port });
@@ -193,6 +202,12 @@ export async function startFakeCodexServer(workspace, options = {}) {
             reply({ data: [{ name: "unrelated", tools: {} }], nextCursor: "discord-page" });
             break;
           }
+          if (options.homeMcpServers) {
+            // The Codex Home's own configured servers, such as another
+            // project's `discord-*` entry.
+            reply({ data: options.homeMcpServers.map(name => ({ name, tools: { reply: { name: "reply" } } })) });
+            break;
+          }
           reply({
             data: [
               ...(options.staleMcpName ? [{ name: options.staleMcpName, status: "running" }] : []),
@@ -208,6 +223,14 @@ export async function startFakeCodexServer(workspace, options = {}) {
           reply({});
           break;
         case "config/value/write":
+          if (options.forbidDiscordConfigWrites && String(message.params?.keyPath ?? "").startsWith("mcp_servers.discord-")) {
+            // A thread host must never persist a Discord server into the home.
+            updateFixtureState(workspace, state => {
+              (state.fixtures.codex.violations ||= []).push({ method: message.method, keyPath: message.params.keyPath });
+            });
+            replyError({ code: -32000, message: "thread hosts must not write mcp_servers.discord-*" });
+            break;
+          }
           if (message.params?.keyPath?.startsWith("mcp_servers.")) registeredMcpName = message.params.keyPath.slice("mcp_servers.".length);
           if (options.failMcpRegistration) {
             replyError({ code: -32000, message: options.failMcpRegistration });
@@ -219,6 +242,7 @@ export async function startFakeCodexServer(workspace, options = {}) {
           reply({});
           break;
         case "thread/resume":
+          recordThreadConfig(message);
           if (options.resumeError) {
             replyError({ code: -32000, message: options.resumeError });
           } else {
@@ -226,6 +250,7 @@ export async function startFakeCodexServer(workspace, options = {}) {
           }
           break;
         case "thread/start":
+          recordThreadConfig(message);
           threadStartCount += 1;
           {
             const configuredThreadIds = options.threadIds ?? (options.threadId ? [options.threadId] : null);
@@ -244,7 +269,10 @@ export async function startFakeCodexServer(workspace, options = {}) {
             replyError({ code: -32000, message: options.bootstrapError });
             break;
           }
-          const plan = isSystem ? (options.bootstrapPlan ?? { delta: "", complete: true }) : (turnPlans.shift() ?? { delta: "Codex response", complete: true });
+          const threadPlans = threadTurnPlans[message.params?.threadId];
+          const bootstrapPlan = options.bootstrapPlans?.[message.params?.threadId] ?? options.bootstrapPlan;
+          const plan = isSystem ? (bootstrapPlan ?? { delta: "", complete: true })
+            : ((threadPlans?.length ? threadPlans.shift() : turnPlans.shift()) ?? { delta: "Codex response", complete: true });
           const turnId = plan.turnId ?? `turn-${Date.now()}`;
           const notificationTurnId = plan.notificationTurnId ?? turnId;
           const turnThreadId = message.params?.threadId;
@@ -357,6 +385,9 @@ export async function startFakeCodexServer(workspace, options = {}) {
   });
 
   registerTeardownCallback(async () => {
+    // A client the harness does not stop itself, such as a thread host
+    // launched through tmux, must not hold the close open.
+    for (const client of server.clients) client.terminate();
     await new Promise((resolve) => server.close(resolve));
   });
 

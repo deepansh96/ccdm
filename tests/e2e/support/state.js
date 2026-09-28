@@ -141,6 +141,7 @@ function normalizeState(value) {
         routes: value?.fixtures?.curl?.routes ?? [],
       },
       codex: {
+        ...(value?.fixtures?.codex ?? {}),
         appServerInvocations: value?.fixtures?.codex?.appServerInvocations ?? [],
         bridgeInvocations: value?.fixtures?.codex?.bridgeInvocations ?? [],
         protocolEvents: value?.fixtures?.codex?.protocolEvents ?? [],

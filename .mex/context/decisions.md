@@ -16,7 +16,7 @@ edges:
     condition: when changing lifecycle or process ownership
   - target: context/discord-security.md
     condition: when changing channel isolation or reply authority
-last_updated: 2026-09-27
+last_updated: 2026-09-28
 ---
 
 # Decisions
@@ -111,10 +111,10 @@ last_updated: 2026-09-27
 ### Give Codex explicit scoped Discord write tools
 **Date:** 2026-05-22
 **Status:** Active
-**Decision:** Codex sends user-visible messages only through dynamically registered Discord MCP tools protected by a per-turn scope token.
+**Decision:** Codex sends user-visible messages only through dynamically registered Discord MCP tools protected by a scope token. In project mode the reply scope token is per process: the channel bridge mints one at startup (a Codex thread host, one per conversation), and it lasts until that process exits. Only root mode adds a per-turn signed channel scope token.
 **Reasoning:** Automatic text streaming could leak intermediate output and let delegated agents post outside parent control.
 **Alternatives considered:** Stream all assistant deltas or accept plain-text fallback by default; rejected for privacy and routing correctness.
-**Consequences:** The top-level agent must call `reply`, `edit_message`, or `react`; subagents return results only to their parent.
+**Consequences:** The top-level agent must call `reply`, `edit_message`, or `react`; subagents return results only to their parent. Codex Thread Conversations get their Discord server from a per-conversation `thread/start` `config.mcp_servers` override scoped to the thread, never from `config.toml`.
 
 ### Default E2E tests to local fakes
 **Date:** 2026-05-28
