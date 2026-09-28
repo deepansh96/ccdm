@@ -282,6 +282,36 @@ function routeDiscordApi(url, init = {}) {
     });
   }
 
+  // List Active Guild Threads and List Public Archived Threads, from the
+  // fake's `threads`. Archived threads come newest archive first, paged by an
+  // ISO `before` archive timestamp as Discord pages them.
+  const activeThreadsMatch = /^\/api\/v10\/guilds\/([^/]+)\/threads\/active$/.exec(url.pathname);
+  const archivedThreadsMatch = /^\/api\/v10\/channels\/([^/]+)\/threads\/archived\/public$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && (activeThreadsMatch || archivedThreadsMatch) && method === "GET") {
+    const threads = Object.values(readState().fixtures?.discord?.threads ?? {});
+    const limit = Number(url.searchParams.get("limit") || "50");
+    const before = url.searchParams.get("before");
+    updateState((nextState) => {
+      nextState.fixtures.discord.threadListFetches ||= [];
+      nextState.fixtures.discord.threadListFetches.push({ authorization: headerValue(init.headers, "Authorization"),
+        route: activeThreadsMatch ? "active" : "archived-public",
+        ...(activeThreadsMatch ? { guildId: activeThreadsMatch[1] } : { channelId: archivedThreadsMatch[1], limit }),
+        ...(before ? { before } : {}) });
+    });
+    // Like Discord, only a forum (15) or media (16) channel's threads carry `applied_tags`.
+    const channel = thread => ({ id: thread.id, type: thread.type, parent_id: thread.parentId, name: thread.name,
+      owner_id: thread.ownerId, ...([15, 16].includes(thread.parentType) ? { applied_tags: [] } : {}),
+      thread_metadata: { archived: Boolean(thread.archived),
+        auto_archive_duration: thread.autoArchiveDuration,
+        archive_timestamp: thread.archiveTimestamp ?? "2026-09-01T00:00:00.000000+00:00" } });
+    const json = body => response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
+    if (activeThreadsMatch) return json({ threads: threads.filter(thread => !thread.archived).map(channel), members: [] });
+    const archived = threads.filter(thread => thread.archived && thread.type === 11 &&
+      thread.parentId === archivedThreadsMatch[1] && (!before || Date.parse(thread.archiveTimestamp) < Date.parse(before)))
+      .sort((a, b) => Date.parse(b.archiveTimestamp) - Date.parse(a.archiveTimestamp));
+    return json({ threads: archived.slice(0, limit).map(channel), members: [], has_more: archived.length > limit });
+  }
+
   if (url.hostname === "discord.com" && guildRolesMatch && method === "GET") {
     const state = readState();
     return response(JSON.stringify(state.fixtures?.discord?.roles ?? []), {

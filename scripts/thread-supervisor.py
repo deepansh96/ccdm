@@ -1341,10 +1341,11 @@ def stop_runtime(project_root: Path, state_dir: Path, row, keep_held: bool = Fal
         shutil.rmtree(resolved["state_dir"], ignore_errors=True)
 
 
-def archive_actor(project_root: Path, registry: dict, event: dict) -> str | None:
+def archive_actor(project_root: Path, registry: dict, event: dict, since: str | None = None) -> str | None:
     """Who archived the thread, from audit-log action 111; None when root may
-    not read the audit log or no entry appears within the retry window."""
-    started = clock_now()
+    not read the audit log or no entry appears within the retry window, which
+    starts at ``since`` (by default, now)."""
+    started = since or clock_now()
     request = {"guild_id": str(registry.get("guild_id") or ""), "thread_id": str(event["thread_id"]),
                "archived_at": event.get("archived_at")}
     while True:
@@ -1359,11 +1360,12 @@ def archive_actor(project_root: Path, registry: dict, event: dict) -> str | None
         time.sleep(ARCHIVE_ACTOR_RETRY_SECONDS)
 
 
-def archive(project_root: Path, state_dir: Path, event: dict) -> dict:
+def archive(project_root: Path, state_dir: Path, event: dict, since: str | None = None) -> dict:
     """Stop an archived thread's session. An archive by the owner or root
     closes the conversation, and so does one by the project bot while the
     thread holds a `/close` intent; any other actor, or none, is an
-    auto-archive that leaves it open for the owner's next message."""
+    auto-archive that leaves it open for the owner's next message. A missed
+    archive waits for its actor only from ``since``, when it happened."""
     thread_id = str(event.get("thread_id") or "")
     db = STORE.connect(state_dir)
     if not db:
@@ -1372,7 +1374,7 @@ def archive(project_root: Path, state_dir: Path, event: dict) -> dict:
         if not STORE.thread(db, thread_id):
             return {"result": "ignored", "reason": "unbound-thread"}
         registry = load_registry(project_root)
-        actor = archive_actor(project_root, registry, {**event, "thread_id": thread_id})
+        actor = archive_actor(project_root, registry, {**event, "thread_id": thread_id}, since)
         row = STORE.thread(db, thread_id)
         if not row:
             return {"result": "ignored", "reason": "deleted"}
@@ -1408,6 +1410,147 @@ def delete(project_root: Path, state_dir: Path, event: dict) -> dict:
         return {"result": "forgotten", "thread_id": thread_id}
     finally:
         db.close()
+
+
+def reconcile_request(mode: str, request: dict):
+    """One read (or auto-archive update) for reconciliation; None when it fails."""
+    completed = subprocess.run(
+        [os.environ.get("CCDM_THREAD_NODE", "node"), str(Path(__file__).with_name("thread-supervisor-reconcile.js")),
+         mode, json.dumps(request)], capture_output=True, text=True, timeout=300)
+    if completed.returncode == 0 and completed.stderr:
+        sys.stderr.write(completed.stderr)
+    if completed.returncode != 0:
+        log(completed.stderr.strip() or f"reconciliation {mode} failed")
+        return None
+    return json.loads(completed.stdout)
+
+
+def process_alive(pid: int | None) -> bool:
+    try:
+        os.kill(pid, 0)
+    except (OSError, TypeError):
+        return False
+    return True
+
+
+def booting_elsewhere(thread_id: str) -> bool:
+    """Whether a `boot` process for this thread is still starting its session."""
+    try:
+        listed = subprocess.run(["ps", "axww", "-o", "command="], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return any("thread-supervisor.py boot" in line and f"--thread-id {thread_id}" in line
+               for line in listed.splitlines())
+
+
+def session_alive(registry: dict, state_dir: Path, row) -> bool:
+    """Whether a `live` or `booting` thread's session still runs: its tmux
+    session and Claude process, or its conversation on the project's Codex
+    thread host. A booting thread whose `boot` process is running counts."""
+    if row["state"] == "booting" and booting_elsewhere(row["thread_id"]):
+        return True
+    if thread_provider(registry, row) == "codex":
+        answer = host_request(host_runtime_dir(state_dir, row["project"]), {"op": "ping"})
+        return bool(answer and answer.get("ok") and row["thread_id"] in answer.get("threads", []))
+    return (bool(row["runtime_tmux"]) and tmux("has-session", "-t", f"={row['runtime_tmux']}").returncode == 0
+            and (row["runtime_pid"] is None or process_alive(row["runtime_pid"])))
+
+
+def unanswered(registry: dict, project: dict, history: list[dict]) -> list[dict]:
+    """The owner and guest messages after the thread's last agent reply, oldest
+    first, when the newest of them is the owner's; commands never count."""
+    agent, owner = ROUTER.bot_user_id(registry, project), str(registry.get("discord_user_id") or "")
+    held = []
+    for entry in history:  # newest first
+        if entry["author_id"] == agent:
+            break
+        author = str(entry["author_id"] or "")
+        text = command_text(registry, project, entry["content"])
+        if (entry["type"] in USER_MESSAGE_TYPES and ROUTER.eligible_creator(registry, project, author)
+                and not re.fullmatch(r"/config(?:\s[\s\S]*)?", text) and text not in THREAD_COMMANDS):
+            held.insert(0, {"id": str(entry["id"]), "author_id": author, "author": entry["author_name"] or author,
+                            "content": entry["content"], "timestamp": entry["timestamp"] or clock_now()})
+    return held if any(entry["author_id"] == owner for entry in held) else []
+
+
+# Stopped threads that reconciliation never restarts: a crash or failed start
+# retries only on the next owner message, and root's stop holds until one.
+NO_AUTOMATIC_START = ("crashed", "start-failed", "operator")
+
+
+def reconcile(project_root: Path, state_dir: Path) -> dict:
+    """Catch up on thread events missed while the supervisor was down or its
+    Gateway was disconnected: bind unknown active threads, classify archives
+    the store has not seen, mark dead sessions `stopped/crashed`, and start
+    threads whose newest owner message is newer than the agent's last reply."""
+    registry = load_registry(project_root)
+    projects = {name: project for name, project in (registry.get("projects") or {}).items()
+                if isinstance(project, dict) and project.get("channel_id")
+                and not str(project.get("path") or "").startswith("remote:")}
+    result = {"status": "ok", "bound": [], "archived": {}, "crashed": [], "started": []}
+    db = STORE.connect(state_dir, create=True)
+    try:
+        rows = {row["thread_id"]: row for row in STORE.threads(db) if row["project"] in projects}
+        # A known thread may have been archived unseen, unless it is already closed or classified.
+        channels = [{"channel_id": str(project["channel_id"]),
+                     "thread_ids": [thread_id for thread_id, row in rows.items() if row["project"] == name
+                                    and row["state"] != "closed" and row["archive_actor"] is None]}
+                    for name, project in projects.items()]
+        listed = reconcile_request("threads", {"guild_id": str(registry.get("guild_id") or ""), "channels": channels})
+        if listed is None:
+            return {"status": "blocked", "reason": "the thread lists could not be read with root credentials"}
+        threads = listed["threads"]
+        for thread in threads:
+            if thread["thread_id"] in rows or thread["archived"]:
+                continue
+            bound = bind(project_root, state_dir, thread)
+            if bound["result"] == "bound":
+                result["bound"].append(thread["thread_id"])
+                if bound["set_auto_archive"]:
+                    reconcile_request("auto-archive", {"project_root": str(project_root), "bot_id": bound["bot_id"],
+                                                       "thread_id": thread["thread_id"]})
+        for thread in threads:
+            row = rows.get(thread["thread_id"])
+            if thread["archived"] and row and row["state"] != "closed" and row["archive_actor"] is None:
+                classified = archive(project_root, state_dir, thread, since=thread["archived_at"])
+                result["archived"][thread["thread_id"]] = classified["result"]
+        for row in STORE.threads(db):
+            if row["project"] in projects and row["state"] in ("live", "booting") and \
+                    not session_alive(registry, state_dir, row):
+                stop_runtime(project_root, state_dir, row)
+                STORE.update(db, row["thread_id"], state="stopped", stop_reason="crashed", turn_running=0,
+                             runtime_tmux=None, runtime_pid=None, runtime_host=None)
+                result["crashed"].append(row["thread_id"])
+        for thread in threads:
+            row = STORE.thread(db, thread["thread_id"])
+            if thread["archived"] or not row or row["state"] not in ("registered", "stopped", "closed") \
+                    or row["stop_reason"] in NO_AUTOMATIC_START:
+                continue
+            history = reconcile_request("history", {"thread_id": row["thread_id"]})
+            if history is None:
+                continue
+            project = projects[row["project"]]
+            starter = next((entry["reference_message_id"] for entry in history["messages"]
+                            if entry["type"] == THREAD_STARTER_MESSAGE and entry["reference_message_id"]), None)
+            if starter and not row["starter_message_id"]:
+                STORE.update(db, row["thread_id"], starter_message_id=str(starter))
+            held = unanswered(registry, project, history["messages"])
+            if not held:
+                continue
+            with BootLock(state_dir):
+                current = STORE.thread(db, row["thread_id"])
+                # A live event may have started it meanwhile.
+                if not current or current["state"] != row["state"]:
+                    continue
+                write_private(buffer_path(state_dir, row["thread_id"]), held)
+                decision = admit(db, registry, current, stop_reason=None, archive_actor=None, pending_close=None,
+                                 last_owner_activity_at=clock_now())
+            if settle_admission(project_root, state_dir, registry, current, decision)["result"] == "start":
+                start_boot(project_root, state_dir, row["thread_id"])
+            result["started"].append(row["thread_id"])
+    finally:
+        db.close()
+    return result
 
 
 def bootstrap(row, owner: str, starter: dict | None, held: list[dict]) -> dict:
@@ -1737,7 +1880,7 @@ def main() -> int:
     parser.add_argument("command", choices=("run", "status", "preflight", "disable", "enable", "bind", "message",
                                             "archive", "delete", "boot", "host-event", "command", "reaction",
                                             "grant-thread-permissions", "submit", "list", "stop-threads",
-                                            "project-changed"))
+                                            "project-changed", "reconcile"))
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--state-dir", type=Path, default=None)
     parser.add_argument("--payload", help="internal: the observer's or Codex thread host's thread event, or a "
@@ -1784,6 +1927,8 @@ def main() -> int:
             result = stop_threads(args.project_root, state_dir, args.project)
         elif args.command == "project-changed":
             result = project_changed(args.project_root, state_dir, args.project)
+        elif args.command == "reconcile":
+            result = reconcile(args.project_root, state_dir)
         elif args.command == "submit":
             if not args.payload:
                 raise ValueError("--payload is required")

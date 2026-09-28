@@ -357,3 +357,20 @@ test("operator documentation, root instructions, patterns, and scenario matrix r
     assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-project-changes\\.test\\.js`));
   }
 });
+
+test("operator documentation, guide, and scenario matrix record Thread Supervisor reconciliation", () => {
+  const section = operatorReadme.slice(operatorReadme.indexOf("## Thread Supervisor"));
+  for (const phrase of ["scripts/thread-supervisor.py reconcile", "`stopped` / `crashed`", "Gateway reconnect",
+    "newest owner message"]) {
+    assert.ok(section.includes(phrase), phrase);
+  }
+  const guide = fs.readFileSync("docs/thread-supervisor.md", "utf8");
+  for (const phrase of ["## Reconciliation", "scripts/thread-supervisor.py reconcile", "`stopped` / `crashed`"]) {
+    assert.ok(guide.includes(phrase), phrase);
+  }
+  for (const scenario of ["Missed thread creation", "Missed owner message", "Missed archive", "Crashed thread session",
+    "Gateway reconnect reconciliation"]) {
+    assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-reconcile\\.test\\.js`));
+  }
+  assert.match(matrix, /\| Fixture contracts \| Thread lists \| Covered \| .*threadListFetches/);
+});

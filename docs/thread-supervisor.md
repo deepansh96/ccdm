@@ -41,6 +41,16 @@ scripts/install-thread-supervisor.sh
 
 To remove the LaunchAgent, run `disable`, then `launchctl unload ~/Library/LaunchAgents/com.discord.thread-supervisor.plist` and delete that file. Keep the state directory.
 
+## Reconciliation
+
+The supervisor catches up on thread events it missed while it was stopped or disconnected. The observer queues a reconciliation pass when it logs in, when the Gateway resumes, and when a new Gateway session starts, so the pass runs in order with live events. To run one by hand:
+
+```sh
+scripts/thread-supervisor.py reconcile
+```
+
+A pass binds unknown active threads, classifies unseen archives by audit-log actor, marks dead `live` or `booting` sessions `stopped` / `crashed`, and starts threads whose newest owner message is newer than the agent's last reply. Crashed, failed, and root-stopped threads wait for the owner's next message.
+
 ## Foreground debug mode
 
 ```sh

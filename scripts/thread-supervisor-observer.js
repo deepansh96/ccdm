@@ -180,6 +180,28 @@ client.on("threadCreate", thread => {
   queue = queue.then(() => threadCreated(thread)).catch(error => log(`thread ${thread.id}: ${error.message}`));
 });
 
+// Thread events missed while the supervisor was down or the Gateway was
+// disconnected are caught up in order with live ones: on login, on a resumed
+// session, and on any later new session.
+function reconcile(reason) {
+  queue = queue.then(async () => {
+    const { stdout, stderr } = await exec(process.env.CCDM_THREAD_PYTHON || "python3", [service, "reconcile",
+      "--project-root", projectRoot, "--state-dir", stateDir], { maxBuffer: 16 * 1024 * 1024 });
+    process.stderr.write(stderr);
+    const result = JSON.parse(stdout);
+    if (result.status !== "ok") log(`reconciliation after ${reason} did not finish: ${result.reason}`);
+  }).catch(error => log(`reconciliation after ${reason} failed: ${error.message}`));
+}
+
+let readyOnce = false;
+client.on("ready", () => {
+  readyOnce = true;
+  reconcile("login");
+});
+client.on("shardResume", () => reconcile("a Gateway resume"));
+// The first shardReady precedes "ready"; any later one is a new Gateway session.
+client.on("shardReady", () => { if (readyOnce) reconcile("a new Gateway session"); });
+
 for (const signal of ["SIGTERM", "SIGINT"]) {
   process.on(signal, () => {
     queue.finally(() => {
