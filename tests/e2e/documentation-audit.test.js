@@ -108,6 +108,10 @@ test("scenario matrix records the channel bridge's thread-message filtering", ()
   assert.match(matrix, /\| Codex bridge \| Thread message filtering \| Covered \| .*type 11.*parentId/);
 });
 
+test("scenario matrix records the Conversation Reminder store schema v7 migration", () => {
+  assert.match(matrix, /\| Conversation reminders \| Store schema v7 migration \| Covered \| `conversation-reminder-migration\.test\.js` seeds a v6 store.*consecutive_reminders.*future version is refused.*conversation_id.*stale.*pre-upgrade event without `conversation_id`/);
+});
+
 test("scenario matrix records the always-on Claude conversation-scoped proxy", () => {
   assert.match(matrix, /\| Claude start \| Always-on conversation-scoped proxy \| Covered \| .*--dangerously-load-development-channels server:discord/);
   assert.match(matrix, /\| Claude start \| Proxy Claude Code version gate \| Covered \| .*2\.1\.281/);

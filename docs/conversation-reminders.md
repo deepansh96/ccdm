@@ -99,6 +99,8 @@ After that window a replay could post a duplicate, and Discord does not return a
 
 State is stored privately under `~/.local/state/ccdm/conversation-reminders/` by default. `CCDM_REMINDER_STATE_DIR` selects another private state directory. The conversation store is separate from the adapter event receiver and Usage Stats storage. Keep both the event and conversation databases across restarts; an unsupported or corrupt store blocks operation rather than being replaced. Do not delete them to clear a closed conversation; send a new normal owner message to reopen it.
 
+The conversation store uses schema v7, which keys each conversation by its project and conversation id. A Channel Conversation's id is its channel id. Opening a v6 store upgrades it in place: every existing row becomes its project's Channel Conversation and keeps its due time, closure, `consecutive_reminders` streak, pending cleanup, and retired assignments, so `status` shows the same channels as before. Adapter events buffered before the upgrade carry no conversation id and apply to the Channel Conversation. An event for another conversation, or from a retired assignment generation, is rejected as stale. Opening a v7 store again changes nothing, and a store from a newer version is refused. Older code refuses a v7 store: to roll back, first copy the private state directory while the worker is stopped, and restore that copy with the older code.
+
 For a reconciled channel, the assigned bot sends exactly `👀` with mentions disabled one hour after a qualifying response. While the owner ignores it, each replacement waits longer: after `k` consecutive reminders the next is due `min(2k, 24)` hours later.
 
 | Reminders already sent | Gap to the next reminder |

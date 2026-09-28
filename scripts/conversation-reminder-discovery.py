@@ -36,6 +36,7 @@ APPROXIMATION = "historical-owner-then-bot-approximation"
 LIMITATION = ("Historical messages carry no turn-completion metadata; the owner-then-assigned-bot "
               "ordering approximates a completed answer and is used only for discovery.")
 
+# The table as store v4 created it; store v7 adds conversation_id to its key.
 SCHEMA = """
     CREATE TABLE discoveries (
         project TEXT NOT NULL, assignment_generation TEXT NOT NULL, phase TEXT NOT NULL,
@@ -48,7 +49,7 @@ SCHEMA = """
         PRIMARY KEY(project,assignment_generation)
     );
 """
-COLUMNS = {"project", "assignment_generation", "phase", "started_revision", "watermark_id", "before_id",
+COLUMNS = {"project", "conversation_id", "assignment_generation", "phase", "started_revision", "watermark_id", "before_id",
            "after_id", "summary_json", "pages_total", "reactions_total", "passes", "pass_key",
            "pass_pages", "pass_reactions", "last_seq", "pending_request", "retry_at", "reason", "basis"}
 
@@ -176,8 +177,8 @@ def next_request(db: sqlite3.Connection, usable: dict, now: datetime) -> dict | 
                 assignment["generation"], assignment["channel_id"], assignment["bot_id"]) != (
                 row["assignment_generation"], row["channel_id"], row["bot_id"]):
             continue
-        found = db.execute("SELECT * FROM discoveries WHERE project=? AND assignment_generation=?",
-                           (row["project"], row["assignment_generation"])).fetchone()
+        found = db.execute("SELECT * FROM discoveries WHERE project=? AND conversation_id=? AND assignment_generation=?",
+                           (row["project"], row["conversation_id"], row["assignment_generation"])).fetchone()
         # A channel released before a restart rescans from its persisted acknowledgment.
         fresh_restart = status == RESTART or (found is None and status == "reconciling")
         if fresh_restart:
@@ -200,16 +201,17 @@ def next_request(db: sqlite3.Connection, usable: dict, now: datetime) -> dict | 
         return None
     _, _, project, row, found, fresh_restart = min(candidates, key=lambda item: item[:3])
     generation = row["assignment_generation"]
+    key = (project, row["conversation_id"], generation)
     if found is None:
         mode = "restart" if fresh_restart else "initial"
-        db.execute("DELETE FROM discoveries WHERE project=? AND assignment_generation=?", (project, generation))
-        db.execute("""INSERT INTO discoveries (project,assignment_generation,phase,started_revision,summary_json)
-            VALUES (?,?,'backward',?,?)""", (project, generation, row["revision"],
-                                             json.dumps(_initial_summary(mode, row["last_ack_at"] if fresh_restart else None))))
-        db.execute("UPDATE conversations SET reconciliation_status=? WHERE project=?",
-                   ("reconciling" if fresh_restart else "discovering", project))
-        found = db.execute("SELECT * FROM discoveries WHERE project=? AND assignment_generation=?",
-                           (project, generation)).fetchone()
+        db.execute("DELETE FROM discoveries WHERE project=? AND conversation_id=? AND assignment_generation=?", key)
+        db.execute("""INSERT INTO discoveries
+            (project,conversation_id,assignment_generation,phase,started_revision,summary_json)
+            VALUES (?,?,?,'backward',?,?)""", (*key, row["revision"],
+                                               json.dumps(_initial_summary(mode, row["last_ack_at"] if fresh_restart else None))))
+        db.execute("UPDATE conversations SET reconciliation_status=? WHERE project=? AND conversation_id=?",
+                   ("reconciling" if fresh_restart else "discovering", *key[:2]))
+        found = db.execute("SELECT * FROM discoveries WHERE project=? AND conversation_id=? AND assignment_generation=?", key).fetchone()
     seq = db.execute("SELECT COALESCE(MAX(last_seq),0)+1 FROM discoveries").fetchone()[0]
     request = {"request_id": f"{seq}", "project": project, "assignment_generation": generation,
                "channel_id": row["channel_id"], "limit": PAGE_LIMIT}
@@ -225,8 +227,8 @@ def next_request(db: sqlite3.Connection, usable: dict, now: datetime) -> dict | 
     reactions = (found["pass_reactions"] if same_pass else 0) + (request["kind"] == "reactions")
     # Budgets count attempts, so a crash between request and result still spends them.
     db.execute("""UPDATE discoveries SET pending_request=?, last_seq=?, pass_key=?, passes=passes+?,
-            pass_pages=?, pass_reactions=? WHERE project=? AND assignment_generation=?""",
-        (json.dumps(request), seq, pass_key, 0 if same_pass else 1, pages, reactions, project, generation))
+            pass_pages=?, pass_reactions=? WHERE project=? AND conversation_id=? AND assignment_generation=?""",
+        (json.dumps(request), seq, pass_key, 0 if same_pass else 1, pages, reactions, *key))
     return request
 
 
@@ -256,26 +258,27 @@ def record_result(db: sqlite3.Connection, payload: dict, now: datetime, recorded
     if request["request_id"] != payload.get("request_id"):
         return "ignored"
     project, generation = found["project"], found["assignment_generation"]
-    row = db.execute("SELECT * FROM conversations WHERE project=?", (project,)).fetchone()
-    key = (project, generation)
+    row = db.execute("SELECT * FROM conversations WHERE project=? AND conversation_id=?",
+                     (project, found["conversation_id"])).fetchone()
+    key = (project, found["conversation_id"], generation)
     if row is None or row["assignment_generation"] != generation or row["reconciliation_status"] not in ACTIVE:
-        db.execute("DELETE FROM discoveries WHERE project=? AND assignment_generation=?", key)
+        db.execute("DELETE FROM discoveries WHERE project=? AND conversation_id=? AND assignment_generation=?", key)
         return "ignored"
-    db.execute("UPDATE discoveries SET pending_request=NULL WHERE project=? AND assignment_generation=?", key)
+    db.execute("UPDATE discoveries SET pending_request=NULL WHERE project=? AND conversation_id=? AND assignment_generation=?", key)
     status = payload.get("status")
     reactions = request["kind"] == "reactions"
     if status == 429:
         retry = payload.get("retry_after")
         delay = float(retry) if isinstance(retry, (int, float)) and retry >= 0 else TRANSIENT_RETRY_SECONDS
-        db.execute("UPDATE discoveries SET retry_at=?, reason=? WHERE project=? AND assignment_generation=?",
+        db.execute("UPDATE discoveries SET retry_at=?, reason=? WHERE project=? AND conversation_id=? AND assignment_generation=?",
                    (_stamp(now + timedelta(seconds=max(1.0, delay))), "rate-limited; waiting for Discord", *key))
         return "backoff"
     if status in (401, 403) or (status == 404 and not reactions):
-        db.execute("UPDATE discoveries SET retry_at=?, reason=? WHERE project=? AND assignment_generation=?",
+        db.execute("UPDATE discoveries SET retry_at=?, reason=? WHERE project=? AND conversation_id=? AND assignment_generation=?",
                    (_stamp(now + timedelta(seconds=DENIED_RETRY_SECONDS)),
                     payload.get("reason") or "history access denied or unavailable", *key))
-        db.execute("UPDATE conversations SET reconciliation_status='suspended-discovery-history' WHERE project=?",
-                   (project,))
+        db.execute("UPDATE conversations SET reconciliation_status='suspended-discovery-history' WHERE project=? AND conversation_id=?",
+                   key[:2])
         return "suspended"
     summary = {**_initial_summary(), **json.loads(found["summary_json"])}
     messages = None if reactions else _valid_messages(payload, recorded_reminders)
@@ -283,13 +286,13 @@ def record_result(db: sqlite3.Connection, payload: dict, now: datetime, recorded
     malformed = (not reactions and messages is None) or (
         reactions and status == 200 and (not isinstance(users, list) or not all(isinstance(u, str) for u in users)))
     if (status != 200 and not (reactions and status == 404)) or malformed:
-        db.execute("UPDATE discoveries SET retry_at=?, reason=? WHERE project=? AND assignment_generation=?",
+        db.execute("UPDATE discoveries SET retry_at=?, reason=? WHERE project=? AND conversation_id=? AND assignment_generation=?",
                    (_stamp(now + timedelta(seconds=TRANSIENT_RETRY_SECONDS)),
                     "history temporarily unavailable; resuming from checkpoint", *key))
         return "backoff"
     restart = summary.get("mode") == "restart"
-    db.execute("UPDATE conversations SET reconciliation_status=? WHERE project=?",
-               ("reconciling" if restart else "discovering", project))
+    db.execute("UPDATE conversations SET reconciliation_status=? WHERE project=? AND conversation_id=?",
+               ("reconciling" if restart else "discovering", *key[:2]))
     changes: dict = {"retry_at": None, "reason": None}
     messages = messages or []
     phase = found["phase"]
@@ -348,9 +351,9 @@ def record_result(db: sqlite3.Connection, payload: dict, now: datetime, recorded
     if phase == "reactions" and not summary["queue"]:
         if row["revision"] != found["started_revision"]:
             # Something changed the conversation outside the buffer; rescan.
-            db.execute("DELETE FROM discoveries WHERE project=? AND assignment_generation=?", key)
-            db.execute("UPDATE conversations SET reconciliation_status=? WHERE project=?",
-                       (RESTART if restart else "suspended-incomplete-discovery", project))
+            db.execute("DELETE FROM discoveries WHERE project=? AND conversation_id=? AND assignment_generation=?", key)
+            db.execute("UPDATE conversations SET reconciliation_status=? WHERE project=? AND conversation_id=?",
+                       (RESTART if restart else "suspended-incomplete-discovery", *key[:2]))
             return "restarted"
         if restart:
             # The service merges this summary onto the persisted state, then releases the channel.
@@ -360,7 +363,7 @@ def record_result(db: sqlite3.Connection, payload: dict, now: datetime, recorded
                             bool(summary["normal"] and summary["normal"]["id"] in adapter_interactions))
             changes.update(phase="complete", basis=basis)
     columns = ",".join(f"{name}=?" for name in changes)
-    db.execute(f"UPDATE discoveries SET {columns} WHERE project=? AND assignment_generation=?",
+    db.execute(f"UPDATE discoveries SET {columns} WHERE project=? AND conversation_id=? AND assignment_generation=?",
                (*changes.values(), *key))
     if changes["phase"] != "complete":
         return "progress"
@@ -391,26 +394,28 @@ def _commit(db: sqlite3.Connection, row: sqlite3.Row, summary: dict, active_turn
             changes.update(response_message_id=anchor["id"], response_at=anchor["at"],
                            due_at=_stamp(_iso(anchor["at"]) + timedelta(hours=1)))
         columns = ",".join(f"{name}=?" for name in changes)
-        db.execute(f"UPDATE conversations SET {columns}, revision=revision+1 WHERE project=?",
-                   (*changes.values(), row["project"]))
+        db.execute(f"UPDATE conversations SET {columns}, revision=revision+1 WHERE project=? AND conversation_id=?",
+                   (*changes.values(), row["project"], row["conversation_id"]))
     for source in summary["owner_ids"]:
-        db.execute("INSERT OR IGNORE INTO owner_sources VALUES (?,?,?,?)",
-                   (row["project"], row["assignment_generation"], source, "history"))
-    mark_reactions_seen(db, row["project"], row["assignment_generation"], summary["reacted"])
-    db.execute("UPDATE conversations SET reconciliation_status='ready' WHERE project=?", (row["project"],))
+        db.execute("INSERT OR IGNORE INTO owner_sources VALUES (?,?,?,?,?)",
+                   (row["project"], row["conversation_id"], row["assignment_generation"], source, "history"))
+    mark_reactions_seen(db, row["project"], row["conversation_id"], row["assignment_generation"], summary["reacted"])
+    db.execute("UPDATE conversations SET reconciliation_status='ready' WHERE project=? AND conversation_id=?",
+               (row["project"], row["conversation_id"]))
     return basis
 
 
-def mark_reactions_seen(db: sqlite3.Connection, project: str, generation: str, reacted: list[dict]) -> None:
+def mark_reactions_seen(db: sqlite3.Connection, project: str, conversation: str, generation: str,
+                        reacted: list[dict]) -> None:
     """Remember owner reactions already accounted for, so a later restart does not re-pause on them."""
     for item in reacted:
-        db.execute("INSERT OR IGNORE INTO owner_sources VALUES (?,?,?,?)",
-                   (project, generation, "reaction:" + item["id"], "history-reaction"))
+        db.execute("INSERT OR IGNORE INTO owner_sources VALUES (?,?,?,?,?)",
+                   (project, conversation, generation, "reaction:" + item["id"], "history-reaction"))
 
 
-def status_for(db: sqlite3.Connection, project: str, generation: str) -> dict | None:
-    found = db.execute("SELECT * FROM discoveries WHERE project=? AND assignment_generation=?",
-                       (project, generation)).fetchone()
+def status_for(db: sqlite3.Connection, project: str, conversation: str, generation: str) -> dict | None:
+    found = db.execute("SELECT * FROM discoveries WHERE project=? AND conversation_id=? AND assignment_generation=?",
+                       (project, conversation, generation)).fetchone()
     if found is None:
         return None
     return {"phase": found["phase"], "basis": found["basis"],

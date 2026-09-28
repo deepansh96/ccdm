@@ -11,7 +11,7 @@ edges:
     condition: when the reminder service's relationship to adapters or sessions is unclear
   - target: context/session-management.md
     condition: when a registration or deregistration also changes reminder assignments
-last_updated: 2026-09-25
+last_updated: 2026-09-28
 ---
 
 # Operate Conversation Reminders
@@ -30,6 +30,7 @@ Read `docs/conversation-reminders.md`. The service runs independently of coding 
 
 ## Gotchas
 - Never edit or delete the private databases to clear state; a new owner message reopens a closed conversation.
+- The conversation store is schema v7, keyed by project and conversation. A v6 store upgrades in place on first open, keeping every Channel Conversation's due time, closure, and streak. Older code refuses a v7 store, so copy the private state directory with the worker stopped before upgrading if a rollback may be needed.
 - Recovery never adopts or deletes a bot `👀` found in history; only a nonce replay or a recorded message ID identifies a reminder.
 - A reaction, including one on a reminder, can pause a conversation indefinitely until the next qualifying agent response; this is expected.
 - A Claude channel is ready only while its adapter launch runs. A plain `scripts/start-session.sh <project>` restart without `CCDM_CLAUDE_REMINDER_ADAPTER=1` leaves it blocked.

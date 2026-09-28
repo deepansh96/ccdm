@@ -1743,32 +1743,47 @@ test("a canceled send and a late send after reassignment never grow the streak",
     ["generation-2", 0, null]);
 });
 
-test("a v5 store upgrades to v6, keeping a recorded reminder's pending due time", async () => {
-  const downgrade = `ALTER TABLE conversations DROP COLUMN consecutive_reminders; PRAGMA user_version=5;`;
+// Rewrite a current store as v5 wrote it: without conversation keys or the streak.
+function downgradeToV5(database) {
+  const result = spawnSync("python3", ["-c", `import sqlite3,sys
+db=sqlite3.connect(sys.argv[1])
+for table in ("conversations","owner_sources","qualifications","pending_actions","delivery_intents",
+              "retired_assignments","retired_leftovers","discoveries","catch_ups"):
+    columns=[row[1] for row in db.execute(f"PRAGMA table_info({table})")
+             if row[1] not in ("conversation_id","consecutive_reminders")]
+    db.execute(f"CREATE TABLE {table}_v5 AS SELECT {','.join(columns)} FROM {table}")
+    db.execute(f"DROP TABLE {table}")
+    db.execute(f"ALTER TABLE {table}_v5 RENAME TO {table}")
+db.execute("CREATE UNIQUE INDEX active_delivery_intent ON delivery_intents(project,assignment_generation) WHERE state IN ('sending','uncertain')")
+db.execute("PRAGMA user_version=5"); db.commit(); db.close()`, database], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+}
+
+test("a v5 store upgrades through v6, keeping a recorded reminder's pending due time", async () => {
   const withReminder = createWorkspace();
   const stateDir = setup(withReminder);
   await reconciledExchange(withReminder, stateDir);
   const clockFile = path.join(withReminder.tmpDir, "reminder-clock");
   await sendAt(withReminder, stateDir, clockFile, "2026-09-24T11:00:00Z", "r-1");
   const database = path.join(stateDir, "conversations.sqlite3");
-  sql(database, downgrade);
+  downgradeToV5(database);
   const upgraded = (await cli(withReminder, stateDir, "status")).conversations.demo;
   assert.deepEqual([...streak(upgraded), upgraded.reminder_message_id],
     ["awaiting-owner", "2026-09-24T13:00:00Z", 1, "r-1"]);
   const version = spawnSync("python3", ["-c", "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('PRAGMA user_version').fetchone()[0])", database], { encoding: "utf8" });
-  assert.equal(version.stdout.trim(), "6");
+  assert.equal(version.stdout.trim(), "7");
   assert.deepEqual(streak(await sendAt(withReminder, stateDir, clockFile, "2026-09-24T13:00:00Z", "r-2")),
     ["awaiting-owner", "2026-09-24T17:00:00Z", 2]);
 
   const withoutReminder = createWorkspace();
   const otherDir = setup(withoutReminder);
   await reconciledExchange(withoutReminder, otherDir);
-  sql(path.join(otherDir, "conversations.sqlite3"), downgrade);
+  downgradeToV5(path.join(otherDir, "conversations.sqlite3"));
   assert.deepEqual(streak((await cli(withoutReminder, otherDir, "status")).conversations.demo),
     ["awaiting-owner", "2026-09-24T11:00:00Z", 0]);
 });
 
-test("a fresh store is created at v6, and a v6 store without the streak or a future version fails closed", async () => {
+test("a fresh store is created at v7, and a v7 store without the streak or a future version fails closed", async () => {
   const workspace = createWorkspace();
   const stateDir = setup(workspace);
   await cli(workspace, stateDir, "sync");
@@ -1776,11 +1791,12 @@ test("a fresh store is created at v6, and a v6 store without the streak or a fut
   const shape = spawnSync("python3", ["-c", `import json,sqlite3,sys
 db=sqlite3.connect(sys.argv[1])
 print(json.dumps([db.execute('PRAGMA user_version').fetchone()[0],
-  'consecutive_reminders' in [row[1] for row in db.execute('PRAGMA table_info(conversations)')]]))`, database],
+  'consecutive_reminders' in [row[1] for row in db.execute('PRAGMA table_info(conversations)')],
+  'conversation_id' in [row[1] for row in db.execute('PRAGMA table_info(conversations)')]]))`, database],
   { encoding: "utf8" });
-  assert.deepEqual(JSON.parse(shape.stdout), [6, true]);
-  for (const script of ["PRAGMA user_version=7;",
-    "PRAGMA user_version=6; ALTER TABLE conversations DROP COLUMN consecutive_reminders;"]) {
+  assert.deepEqual(JSON.parse(shape.stdout), [7, true, true]);
+  for (const script of ["PRAGMA user_version=8;",
+    "PRAGMA user_version=7; ALTER TABLE conversations DROP COLUMN consecutive_reminders;"]) {
     const copy = createWorkspace();
     const copyDir = setup(copy);
     await cli(copy, copyDir, "sync");

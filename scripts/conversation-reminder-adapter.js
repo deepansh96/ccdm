@@ -77,6 +77,8 @@ function createEvent(eventType, context, fields = {}) {
     event_type: eventType,
     project: context.project,
     channel_id: context.channel_id,
+    // A Channel Conversation is identified by its channel.
+    conversation_id: context.conversation_id || context.channel_id,
     bot_id: context.bot_id,
     assignment_generation: context.assignment_generation,
     provider: context.provider || "codex",

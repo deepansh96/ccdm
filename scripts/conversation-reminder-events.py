@@ -31,6 +31,7 @@ ALLOWED_FIELDS = {
     "event_type",
     "project",
     "channel_id",
+    "conversation_id",
     "bot_id",
     "assignment_generation",
     "provider",
@@ -198,6 +199,8 @@ def validate_event(event: object) -> dict:
     for field in ("event_id", "project", "channel_id", "bot_id", "assignment_generation", "provider", "adapter_instance_id"):
         if not isinstance(event.get(field), str) or not event[field].strip():
             raise ValueError(f"{field} must be a non-empty string")
+    if "conversation_id" in event and (not isinstance(event["conversation_id"], str) or not event["conversation_id"].strip()):
+        raise ValueError("conversation_id must be a non-empty string")
     try:
         parsed_time = datetime.fromisoformat(str(event["event_time"]).replace("Z", "+00:00"))
     except ValueError as error:
@@ -262,6 +265,9 @@ def _assignment_result(registry: dict, event: dict) -> tuple[str | None, str | N
         return "stale", "project channel or bot assignment changed"
     if assignment["generation"] != event["assignment_generation"]:
         return "stale", "project assignment generation changed"
+    # An event from before conversation keys belongs to the Channel Conversation.
+    if event.get("conversation_id", event["channel_id"]) != assignment["channel_id"]:
+        return "stale", "project conversation is not tracked"
     if event["provider"] in {"codex", "claude"} and (assignment["project"].get("type") or "claude") != event["provider"]:
         return "rejected", "adapter event targets a different project provider"
     if event["event_type"] in {"owner_activity", "close_requested"} and event.get("actor_id") != assignment["owner_id"]:
