@@ -21,7 +21,7 @@ The installer validates everything before it touches launchd. It checks for `pyt
 
 On success it renders `~/Library/LaunchAgents/com.discord.thread-supervisor.plist` from `scripts/com.discord.thread-supervisor.plist.in` and loads it. The plist holds only absolute paths: the Python interpreter, the supervisor script, the repository, the state directory, Node (`CCDM_THREAD_NODE`), and the root state directory. It holds no tokens, registry values, or channel IDs; the worker reads credentials from their existing private files. `RunAtLoad` starts the worker at login. `KeepAlive` relaunches it only after an unsuccessful exit, with a 30-second throttle, so a crash or a lost lock race is retried and a `disable` stays stopped. The worker's umask is `077`.
 
-State lives in `~/.local/state/ccdm/thread-supervisor/`, or `CCDM_THREAD_STATE_DIR` when it is set at install time. The directory is `0700`. The thread store, worker lock, `disabled` marker, and the `service.log` and `service.err` logs are `0600`.
+State lives in `~/.local/state/ccdm/thread-supervisor/`, or `CCDM_THREAD_STATE_DIR` when it is set at install time. The directory is `0700`. The thread store, worker lock, `disabled` marker, and the `service.log` and `service.err` logs are `0600`. The running worker also listens on `requests.sock` (`0600`), the private request socket through which `scripts/threads.sh create` and the channel agents' `create_thread` tool submit creation requests; it removes the socket when it stops.
 
 Running the installer again renders the same plist and reloads it. If launchd rejects a replacement, the installer restores the previous plist and reloads the previous service.
 

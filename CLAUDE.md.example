@@ -454,6 +454,20 @@ You can restart yourself by running the restart script in the background with `n
    ```
 3. The script kills your current process, waits 2 seconds, and starts a fresh instance in the `root_agent` tmux session.
 
+#### 13. Open a thread (`open a thread in <project>`, `start a thread`)
+
+Open a Thread Conversation in a project's channel with its own session:
+
+```sh
+scripts/threads.sh create <project> <name> [--provider claude|codex] [--account X] [--model Y] [--effort Z] [first message…]
+```
+
+- `<name>` is one word (use hyphens). The options and their validation are the same as the in-channel `/thread` command; each falls back to the project's setting.
+- With a first message the thread's session starts at once; without one it waits for the owner's first message in the thread.
+- It acts through the running Thread Supervisor. If the supervisor is not running, it exits nonzero with the reason and creates nothing; an invalid option exits nonzero with the same one-line error `/thread` would post.
+- On success it prints JSON with the `thread_id`; link it as `https://discord.com/channels/<guild_id>/<thread_id>`.
+- A project's Channel Conversation agent can open threads in its own channel with its `create_thread` tool; send the user there instead of doing it from root when they ask the project agent.
+
 ### Discord Polls
 
 Create native Discord polls using the API directly:

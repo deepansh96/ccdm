@@ -244,3 +244,20 @@ test("operator documentation and scenario matrix record the /thread command and 
   assert.match(matrix, /\| Codex bridge \| Reserved thread commands \| Covered \| .*\/thread.*\/config/);
   assert.match(matrix, /\| Fixture contracts \| Thread creation routes \| Covered \| .*threadCreates/);
 });
+
+test("operator documentation and scenario matrix record root and channel-agent thread creation", () => {
+  const section = operatorReadme.slice(operatorReadme.indexOf("## Thread Supervisor"));
+  for (const phrase of ["scripts/threads.sh create <project> <name>", "create_thread", "requests.sock", "channel-agent",
+    "From root: …"]) {
+    assert.ok(section.includes(phrase), phrase);
+  }
+  const rootInstructions = fs.readFileSync("CLAUDE.md.example", "utf8");
+  for (const phrase of ["scripts/threads.sh create <project> <name>", "create_thread"]) {
+    assert.ok(rootInstructions.includes(phrase), phrase);
+  }
+  assert.match(fs.readFileSync("docs/thread-supervisor.md", "utf8"), /requests\.sock/);
+  for (const scenario of ["Root thread creation", "Thread creation without a supervisor", "Root thread creation validation",
+    "Channel agent create_thread tool", "Thread sessions lack create_thread"]) {
+    assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-create-requests\\.test\\.js`));
+  }
+});

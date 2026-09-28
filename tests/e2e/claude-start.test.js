@@ -171,6 +171,7 @@ test("start-session starts a Claude project through tmux and records PID/session
       CHANNEL_ID: "channel-1",
       DISCORD_STATE_DIR: stateDir,
       DISCORD_MCP_EXPORT_ONLY: "1",
+      CCDM_CREATE_THREAD: "1",
     },
   });
   assert.equal(fs.statSync(mcpConfigPath).mode & 0o777, 0o600);

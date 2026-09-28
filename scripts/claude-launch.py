@@ -243,10 +243,16 @@ def launch_command(registry_path: str, project: str, thread_id: str | None, resu
     config_path = Path(state_dir) / "ccdm-message-export-mcp.json"
     settings_file = str(Path(state_dir) / ("ccdm-conversation-reminder-hooks.json" if adapter_enabled
                                            else "ccdm-claude-channel-settings.json"))
+    exporter_env = {"CHANNEL_ID": thread_id or channel_id, "DISCORD_STATE_DIR": state_dir, "DISCORD_MCP_EXPORT_ONLY": "1"}
+    if not thread_id:
+        # A Channel Conversation also opens Thread Conversations in its own channel.
+        exporter_env["CCDM_CREATE_THREAD"] = "1"
+        if os.environ.get("CCDM_THREAD_STATE_DIR"):
+            exporter_env["CCDM_THREAD_STATE_DIR"] = os.environ["CCDM_THREAD_STATE_DIR"]
     config = {"mcpServers": {"discord-message-export": {
         "command": "node", "args": [str(SCRIPTS / "discord-mcp-server.js")],
         # A thread's read-only exporter is scoped to the thread itself.
-        "env": {"CHANNEL_ID": thread_id or channel_id, "DISCORD_STATE_DIR": state_dir, "DISCORD_MCP_EXPORT_ONLY": "1"},
+        "env": exporter_env,
     }}}
     env = {
         "CCDM_REMINDER_PROJECT_ROOT": str(ROOT_DIR),

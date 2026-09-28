@@ -12,6 +12,7 @@ const reminderAdapter = require("./conversation-reminder-adapter.js");
 
 const execFileAsync = promisify(execFile);
 const EXPORT_SCRIPT = path.resolve(__dirname, "export-discord-range.js");
+const THREAD_SUPERVISOR = path.resolve(__dirname, "thread-supervisor.py");
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const DISCORD_REPLY_TOKEN = process.env.DISCORD_REPLY_TOKEN;
@@ -21,6 +22,11 @@ const READ_ONLY = ["1", "true", "yes", "on"].includes(
   (process.env.DISCORD_MCP_EXPORT_ONLY || "").toLowerCase()
 );
 const READ_ONLY_TOOLS = new Set(["read_last_x_messages_in_channel", "export_message_range"]);
+// A Channel Conversation's server also opens Thread Conversations under its
+// own channel; root and thread sessions never get this tool.
+const CREATE_THREAD = ["1", "true", "yes", "on"].includes(
+  (process.env.CCDM_CREATE_THREAD || "").toLowerCase()
+);
 const DISCORD_CHANNEL_OVERRIDE = ["1", "true", "yes", "on"].includes(
   (process.env.DISCORD_CHANNEL_OVERRIDE || "").toLowerCase()
 );
@@ -400,11 +406,64 @@ const ALL_TOOLS = [
     },
   },
 ];
-const TOOLS = READ_ONLY
-  ? ALL_TOOLS.filter((tool) => READ_ONLY_TOOLS.has(tool.name))
-  : ALL_TOOLS;
+const CREATE_THREAD_TOOL = {
+  name: "create_thread",
+  description:
+    "Open a new Discord thread under this project's channel, with its own agent session. Overrides are optional and default to the project's settings. With a first message the session starts at once; otherwise it waits for the owner's first message in the thread.",
+  inputSchema: {
+    type: "object",
+    properties: withScopeToken({
+      name: { type: "string", description: "Thread name: one word, up to 100 characters (use hyphens, not spaces)." },
+      provider: { type: "string", enum: ["claude", "codex"], description: "Agent provider for the thread." },
+      account: { type: "string", description: "A configured Claude or Codex account alias." },
+      model: { type: "string", description: "Model for the thread's session." },
+      effort: { type: "string", description: "Reasoning effort for the thread's session." },
+      message: { type: "string", description: "First message; starts the thread's session with it." },
+    }),
+    required: requiredWithScope(["name"]),
+  },
+};
+const TOOLS = [
+  ...(READ_ONLY ? ALL_TOOLS.filter((tool) => READ_ONLY_TOOLS.has(tool.name)) : ALL_TOOLS),
+  ...(CREATE_THREAD ? [CREATE_THREAD_TOOL] : []),
+];
+
+// A creation request for this server's own channel, in `/thread` argument form,
+// submitted to the running Thread Supervisor.
+async function createThread(args) {
+  const words = [args.name, ...["provider", "account", "model", "effort"]
+    .filter((flag) => args[flag] !== undefined)
+    .flatMap((flag) => [`--${flag}`, args[flag]])];
+  if (words.some((word) => typeof word !== "string" || !word || /\s/.test(word))) {
+    throw new Error("name, provider, account, model, and effort must each be one word");
+  }
+  const request = {
+    requester: "channel-agent",
+    channel_id: CHANNEL_ID,
+    arguments: [...words, ...(args.message ? [String(args.message)] : [])].join(" "),
+  };
+  let stdout;
+  try {
+    ({ stdout } = await execFileAsync(process.env.CCDM_THREAD_PYTHON || "python3",
+      [THREAD_SUPERVISOR, "submit", "--payload", JSON.stringify(request)], { env: process.env }));
+  } catch (error) {
+    let reason;
+    try {
+      reason = JSON.parse(error.stdout).reason;
+    } catch {
+      reason = (error.stderr || error.message).trim();
+    }
+    throw new Error(reason);
+  }
+  const reply = JSON.parse(stdout);
+  return `created thread "${reply.name}" (id: ${reply.thread_id})${reply.result === "start" ? "; its session is starting" : ""}`;
+}
 
 async function handleToolCall(name, args) {
+  if (name === "create_thread" && CREATE_THREAD) {
+    requireScopeToken(args.scope_token);
+    return createThread(args);
+  }
   if (READ_ONLY && !READ_ONLY_TOOLS.has(name)) {
     throw new Error(`Tool unavailable in read-only mode: ${name}`);
   }

@@ -15,6 +15,7 @@ import re
 import shutil
 import signal
 import socket
+import socketserver
 import sqlite3
 import stat
 import subprocess
@@ -60,6 +61,13 @@ PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex"}
 # `--effort` values and Codex's `model_reasoning_effort` values.
 PROVIDER_EFFORTS = {"claude": LAUNCH.EFFORTS,
                     "codex": ("none", "minimal", "low", "medium", "high", "xhigh")}
+# Who a creation request names as its author when it has no Discord message.
+REQUESTER_LABELS = {"root": "root", "channel-agent": "the channel agent"}
+# The private local socket, in the state dir, through which root and channel
+# agents submit creation requests to the running supervisor.
+REQUEST_SOCKET = "requests.sock"
+NOT_RUNNING = ("the thread supervisor is not running; start it with scripts/install-thread-supervisor.sh "
+               "or scripts/thread-supervisor.py run")
 CONFIG_HINT = "/config works inside a thread: send it in the thread whose settings you want to see or change."
 # Claude Code's startup screens, read from the tmux pane.
 READY_TEXT = "Listening for channel messages"
@@ -395,10 +403,9 @@ def channel_command(project_root: Path, state_dir: Path, event: dict) -> dict:
     command = re.fullmatch(r"/(thread|config)(?:\s+([\s\S]*))?", text)
     if not command:
         return {"result": "ignored", "reason": "not-a-command"}
-    bot_id = project["bot_id"]
 
     def say(line: str) -> None:
-        discord_request(project_root, "post", {"bot_id": bot_id, "channel_id": channel_id, "content": line})
+        discord_request(project_root, "post", {"bot_id": project["bot_id"], "channel_id": channel_id, "content": line})
 
     if command.group(1) == "config":
         say(CONFIG_HINT)
@@ -408,17 +415,33 @@ def channel_command(project_root: Path, state_dir: Path, event: dict) -> dict:
     except CommandError as error:
         say(f"/thread: {error}")
         return {"result": "rejected", "reason": str(error)}
-    request_id = str(uuid.uuid4())
     kind = "owner" if author == str(registry.get("discord_user_id") or "") else "guest"
+    held = {"id": str(event.get("message_id") or ""), "channel_id": channel_id, "author_id": author,
+            "author": str(event.get("author_name") or author), "content": parsed["first_message"],
+            "timestamp": str(event.get("timestamp") or clock_now())}
+    result = create_thread(project_root, state_dir, registry, project_name, parsed, author, kind, held)
+    if result["result"] == "failed":
+        say("/thread: Discord did not create the thread; check the bot's Create Public Threads permission.")
+    return result
+
+
+def create_thread(project_root: Path, state_dir: Path, registry: dict, project_name: str, parsed: dict,
+                  requester_id: str, kind: str, held: dict | None) -> dict:
+    """The one creation path for `/thread`, root, and the channel agent: record
+    a creation request, create the thread with the project bot, and bind it by
+    fulfilling the request. With a first message, the held trigger ``held`` (or,
+    when None, that message posted in the new thread) starts the session."""
+    project = registry["projects"][project_name]
+    bot_id, channel_id = project["bot_id"], str(project["channel_id"])
+    request_id = str(uuid.uuid4())
     db = STORE.connect(state_dir, create=True)
     try:
         STORE.create_request(db, request_id, project_name, parsed["name"], parsed["overrides"],
-                             parsed["first_message"], author, kind, clock_now())
+                             parsed["first_message"], requester_id, kind, clock_now())
         created = discord_request(project_root, "create-thread", {"bot_id": bot_id, "channel_id": channel_id,
                                                                   "name": parsed["name"]})
         if not created:
             STORE.update_request(db, request_id, status="failed")
-            say("/thread: Discord did not create the thread; check the bot's Create Public Threads permission.")
             return {"result": "failed", "request_id": request_id}
         thread_id = str(created["id"])
         STORE.update_request(db, request_id, thread_id=thread_id)
@@ -428,24 +451,116 @@ def channel_command(project_root: Path, state_dir: Path, event: dict) -> dict:
                                            "parent_type": 0, "name": parsed["name"],
                                            "creator_id": str(created.get("owner_id") or ROUTER.bot_user_id(registry, project)),
                                            "auto_archive_duration": AUTO_ARCHIVE_MINUTES})
+    done = {"result": "created", "thread_id": thread_id, "request_id": request_id, "bind": bound["result"]}
     if not parsed["first_message"]:
         # The thread waits for the first owner or guest message in it.
-        return {"result": "created", "thread_id": thread_id, "bind": bound["result"]}
-    held = {"id": str(event.get("message_id") or ""), "channel_id": channel_id, "author_id": author,
-            "author": str(event.get("author_name") or author), "content": parsed["first_message"],
-            "timestamp": str(event.get("timestamp") or clock_now())}
+        return done
+    if held is None:
+        # A local request has no Discord message: show its first message in
+        # the thread, where 👀 then marks the boot.
+        author = REQUESTER_LABELS[kind]
+        posted = discord_request(project_root, "post", {"bot_id": bot_id, "channel_id": thread_id,
+                                                        "content": f"From {author}: {parsed['first_message']}"})
+        held = {"id": str((posted or {}).get("id") or ""), "channel_id": thread_id, "author_id": requester_id,
+                "author": author, "content": parsed["first_message"], "timestamp": clock_now()}
     db = STORE.connect(state_dir)
     try:
         with BootLock(state_dir):
             row = STORE.thread(db, thread_id)
             if not row or row["state"] != "registered":
-                return {"result": "created", "thread_id": thread_id, "bind": bound["result"]}
+                return done
             write_private(buffer_path(state_dir, thread_id), [held])
             activity = {"last_owner_activity_at": clock_now()} if kind == "owner" else {}
             STORE.update(db, thread_id, state="booting", **activity)
     finally:
         db.close()
-    return {"result": "start", "thread_id": thread_id}
+    return {**done, "result": "start"}
+
+
+def local_request(project_root: Path, state_dir: Path, request: dict) -> dict:
+    """One creation request from root, for a named project, or from a Channel
+    Conversation's agent, for its own channel's project only. It takes the
+    `/thread` arguments and the same validation and creation path."""
+    registry = load_registry(project_root)
+    projects = registry.get("projects") if isinstance(registry.get("projects"), dict) else {}
+    kind = request.get("requester")
+    if kind == "root":
+        project_name = str(request.get("project") or "")
+        if not isinstance(projects.get(project_name), dict):
+            raise CommandError(f"no registered project named {project_name}")
+        project = projects[project_name]
+        requester_id = root_user_id(registry) or "root"
+    elif kind == "channel-agent":
+        found = ROUTER.project_for_channel(registry, str(request.get("channel_id") or ""))
+        if not found:
+            raise CommandError("the calling channel is not a registered project channel")
+        project_name, project = found
+        requester_id = ROUTER.bot_user_id(registry, project) or str(project.get("bot_id") or "")
+    else:
+        raise CommandError("a creation request needs requester root or channel-agent")
+    if str(project.get("path") or "").startswith("remote:"):
+        raise CommandError(f"{project_name} is a remote project, which has no Thread Conversations")
+    if not project.get("channel_id") or not project.get("bot_id"):
+        raise CommandError(f"{project_name} has no channel or assigned bot")
+    parsed = parse_thread_command(registry, project, str(request.get("arguments") or ""))
+    result = create_thread(project_root, state_dir, registry, project_name, parsed, requester_id, kind, None)
+    if result["result"] == "failed":
+        raise CommandError("Discord did not create the thread; check the bot's Create Public Threads permission.")
+    if result["result"] == "start":
+        start_boot(project_root, state_dir, result["thread_id"])
+    return {"status": "ok", "project": project_name, "name": parsed["name"], **result}
+
+
+def start_boot(project_root: Path, state_dir: Path, thread_id: str) -> None:
+    """Start a thread's session beside the caller, as the observer does."""
+    child = subprocess.Popen([os.environ.get("CCDM_THREAD_PYTHON") or sys.executable, str(Path(__file__).resolve()), "boot",
+                              "--thread-id", thread_id, "--project-root", str(project_root),
+                              "--state-dir", str(state_dir)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    threading.Thread(target=child.wait, daemon=True).start()
+
+
+class RequestHandler(socketserver.StreamRequestHandler):
+    """One JSON request line in, one JSON reply line out."""
+
+    def handle(self):
+        try:
+            reply = local_request(self.server.project_root, self.server.state_dir, json.loads(self.rfile.readline()))
+        except CommandError as error:
+            reply = {"status": "rejected", "reason": str(error)}
+        except (OSError, ValueError, KeyError, sqlite3.Error, subprocess.SubprocessError) as error:
+            reply = {"status": "failed", "reason": str(error)}
+        self.wfile.write(json.dumps(reply, sort_keys=True).encode("utf-8") + b"\n")
+
+
+def request_server(project_root: Path, state_dir: Path) -> socketserver.ThreadingUnixStreamServer:
+    """Listen on the private request socket, bound relative to the state dir
+    (an absolute path can exceed the Unix socket limit). Only the worker that
+    holds the lock calls this, so a leftover socket is stale."""
+    previous = os.getcwd()
+    os.chdir(state_dir)
+    try:
+        Path(REQUEST_SOCKET).unlink(missing_ok=True)
+        server = socketserver.ThreadingUnixStreamServer(REQUEST_SOCKET, RequestHandler)
+        os.chmod(REQUEST_SOCKET, 0o600)
+    finally:
+        os.chdir(previous)
+    server.daemon_threads = True
+    server.project_root, server.state_dir = project_root, state_dir
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True).start()
+    return server
+
+
+def submit(state_dir: Path, request: dict) -> dict:
+    """Send one creation request to the running supervisor and return its reply."""
+    if not worker(state_dir)["running"] or not (state_dir / REQUEST_SOCKET).exists():
+        return {"status": "blocked", "reason": NOT_RUNNING}
+    # Creation makes up to three Discord calls of at most 60 seconds each.
+    reply = host_request(state_dir, request, timeout=200, name=REQUEST_SOCKET)
+    if reply is None:
+        return {"status": "blocked", "reason": NOT_RUNNING if not worker(state_dir)["running"]
+                else "the thread supervisor did not answer the creation request"}
+    return reply
 
 
 def boot_dir(state_dir: Path) -> Path:
@@ -584,8 +699,8 @@ def host_runtime_dir(state_dir: Path, project: str) -> Path:
     return state_dir / "hosts" / re.sub(r"[^A-Za-z0-9._-]", "_", project)
 
 
-def host_request(runtime_dir: Path, request: dict, timeout: float = 10) -> dict | None:
-    """One request on a Codex thread host's control socket; None when the host is unreachable.
+def host_request(runtime_dir: Path, request: dict, timeout: float = 10, name: str = "control.sock") -> dict | None:
+    """One request on a local control socket, by default a Codex thread host's; None when it is unreachable.
     The socket is addressed relative to its directory: an absolute path can exceed the Unix socket limit."""
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
@@ -593,7 +708,7 @@ def host_request(runtime_dir: Path, request: dict, timeout: float = 10) -> dict 
             previous = os.getcwd()
             os.chdir(runtime_dir)
             try:
-                client.connect("control.sock")
+                client.connect(name)
             finally:
                 os.chdir(previous)
             client.sendall(json.dumps(request).encode("utf-8") + b"\n")
@@ -979,6 +1094,7 @@ def run(project_root: Path, state_dir: Path) -> dict:
         lock.write(str(os.getpid()))
         lock.flush()
         STORE.connect(state_dir, create=True).close()
+        server = request_server(project_root, state_dir)
         stopping = threading.Event()
         signal.signal(signal.SIGTERM, lambda *_: stopping.set())
         signal.signal(signal.SIGINT, lambda *_: stopping.set())
@@ -993,6 +1109,9 @@ def run(project_root: Path, state_dir: Path) -> dict:
                 if observer.poll() is not None and not stopping.wait(0.5):
                     return {"status": "blocked", "reason": "the thread observer stopped"}
         finally:
+            server.shutdown()
+            server.server_close()
+            (state_dir / REQUEST_SOCKET).unlink(missing_ok=True)
             observer.terminate()
             try:
                 observer.wait(timeout=15)
@@ -1007,10 +1126,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("run", "status", "preflight", "disable", "enable", "bind", "message",
                                             "archive", "delete", "boot", "host-event", "command",
-                                            "grant-thread-permissions"))
+                                            "grant-thread-permissions", "submit"))
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--state-dir", type=Path, default=None)
-    parser.add_argument("--payload", help="internal: the observer's or Codex thread host's thread event as JSON")
+    parser.add_argument("--payload", help="internal: the observer's or Codex thread host's thread event, or a "
+                                          "`submit` creation request, as JSON")
     parser.add_argument("--thread-id", help="internal: the thread `boot` starts")
     target = parser.add_mutually_exclusive_group()
     target.add_argument("--project", help="grant-thread-permissions: only this registered project")
@@ -1044,12 +1164,18 @@ def main() -> int:
             result = boot(args.project_root, state_dir, args.thread_id)
         elif args.command == "grant-thread-permissions":
             result = grant_thread_permissions(args.project_root, args.project)
+        elif args.command == "submit":
+            if not args.payload:
+                raise ValueError("--payload is required")
+            result = submit(state_dir, json.loads(args.payload))
         else:
             result = run(args.project_root, state_dir)
     except (OSError, ValueError, KeyError, sqlite3.Error, json.JSONDecodeError, subprocess.SubprocessError) as error:
         result = {"status": "blocked", "reason": str(error)}
     print(json.dumps(result, sort_keys=True))
     sys.stdout.flush()
+    if args.command == "submit":
+        return 0 if result.get("status") == "ok" else 2
     return 2 if result.get("status") == "blocked" else 0
 
 
