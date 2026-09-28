@@ -296,7 +296,7 @@ test("operator documentation, example registry, and scenario matrix record threa
   const example = JSON.parse(fs.readFileSync("registry.example.json", "utf8"));
   assert.deepEqual(example.thread_session_caps, { claude: 6, codex: 12 });
   for (const scenario of ["Thread cap eviction", "Evicted thread resume", "Mid-turn session never evicted",
-    "Thread queue FIFO", "Codex cap across hosts"]) {
+    "Codex mid-turn never evicted", "Thread queue FIFO", "Codex cap across hosts"]) {
     assert.match(matrix, new RegExp(`\\| Thread Supervisor \\| ${scenario} \\| Covered \\| .*thread-capacity\\.test\\.js`));
   }
 });

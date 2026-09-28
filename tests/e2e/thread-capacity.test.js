@@ -337,3 +337,27 @@ test("the Codex cap counts conversations across project hosts, never a running C
   assert.ok(sessions.alpha_session, "the Channel Conversation keeps running");
   await stopRun(workspace, context.env, running);
 });
+
+test("a Codex conversation mid-turn is never evicted: the new thread queues until the host reports turn-ended", async () => {
+  const workspace = createWorkspace();
+  // alpha's first real turn runs until the test releases it.
+  const fake = await startFakeCodexServer(workspace, { turns: [{ turnId: "held-turn", waitForRelease: true, delta: "done" }] });
+  const context = setupCodex(workspace, fake);
+  const running = startRun(workspace, context.env);
+  await waitForState(workspace, state => state.fixtures.discord.ready.length === 1);
+  openThread(workspace, FIRST, "owner-1", "Login bug", "alpha-channel");
+  await waitForThread(workspace, context.env, FIRST, row => row?.turn_running === true, "mid-turn", 20000, "alpha");
+
+  context.at("2026-09-28T10:31:00Z");
+  openThread(workspace, SECOND, "owner-2", "Billing", "beta-channel");
+  await waitForThread(workspace, context.env, SECOND, row => row?.state === "queued", "queued", 15000, "beta");
+  assert.deepEqual(posts(workspace, SECOND), [["Bot beta-token", "Queued, 1 sessions busy."]]);
+  await new Promise(resolve => setTimeout(resolve, 1500));
+  assert.equal((await status(workspace, context.env)).projects.alpha.threads[FIRST].state, "live");
+
+  fake.releaseTurn("held-turn");
+  await waitForThread(workspace, context.env, SECOND, row => row?.state === "live", "started", 20000, "beta");
+  const alpha = (await status(workspace, context.env)).projects.alpha.threads[FIRST];
+  assert.deepEqual([alpha.state, alpha.stop_reason], ["stopped", "evicted"]);
+  await stopRun(workspace, context.env, running);
+});
