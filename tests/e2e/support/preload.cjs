@@ -321,7 +321,8 @@ function routeWebhooks(url, method, init) {
     updateState((state) => {
       state.fixtures.discord.webhooks ||= [];
       state.fixtures.discord.webhookCreates ||= [];
-      const number = state.fixtures.discord.webhooks.length + 1;
+      // Numbered by creation, so a recreated webhook never reuses a deleted id.
+      const number = state.fixtures.discord.webhookCreates.length + 1;
       created = { id: `fake-webhook-${number}`, token: `fake-webhook-token-${number}`, type: 1,
         channel_id: channelMatch[1], name: parsedBody.name };
       state.fixtures.discord.webhooks.push(created);
@@ -329,6 +330,22 @@ function routeWebhooks(url, method, init) {
         channelId: channelMatch[1], name: parsedBody.name });
     });
     return json(created);
+  }
+  // One webhook by id with the bot token: GET returns it with its token (the
+  // bot's application created it); DELETE removes it.
+  const webhookMatch = /^\/api\/v10\/webhooks\/([^/]+)$/.exec(url.pathname);
+  if (webhookMatch && (method === "GET" || method === "DELETE")) {
+    if (!headerValue(init.headers, "Authorization")) return json({ code: 0, message: "401: Unauthorized" }, 401);
+    const webhook = (readState().fixtures?.discord?.webhooks ?? []).find(entry => entry.id === webhookMatch[1]);
+    if (!webhook) return json({ code: 10015, message: "Unknown Webhook" }, 404);
+    if (method === "GET") return json(webhook);
+    updateState((state) => {
+      state.fixtures.discord.webhooks = state.fixtures.discord.webhooks.filter(entry => entry.id !== webhook.id);
+      state.fixtures.discord.webhookDeletes ||= [];
+      state.fixtures.discord.webhookDeletes.push({ authorization: headerValue(init.headers, "Authorization"),
+        webhookId: webhook.id });
+    });
+    return response("", { status: 204 });
   }
   // Webhook message edit: only messages this webhook sent. Discord does not
   // let an edit change the username.

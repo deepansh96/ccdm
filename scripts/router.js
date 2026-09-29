@@ -8,6 +8,7 @@
 //   scripts/router.js status                  report Router health (non-zero if unreachable)
 //   scripts/router.js preflight               read-only supervision readiness as JSON (non-zero on blockers)
 //   scripts/router.js ensure-webhook <project>  find or create the project's webhook
+//   scripts/router.js delete-webhook <project>  delete the project's webhook and its token
 //   scripts/router.js migrate-root-config     copy root channels and users from root access.json
 const path = require("node:path");
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
@@ -19,9 +20,10 @@ const { classifyMessage, classifyReaction } = require("./router/inbound.js");
 const { preflight } = require("./router/preflight.js");
 const { registryPath, rootStateDir, rootToken, socketPath, stateDir } = require("./router/paths.js");
 const { DEFAULT_RELOAD_DEBOUNCE_MS, loadRoutingTable, watchRegistry } = require("./router/registry.js");
+const { assignmentChanged } = require("./router/reminders.js");
 const { migrateRootConfig } = require("./router/root-config.js");
 const { createRouterServer } = require("./router/server.js");
-const { ensureWebhook } = require("./router/webhooks.js");
+const { deleteWebhook, ensureWebhook } = require("./router/webhooks.js");
 
 const OFFLINE_EMOJI = "💤";
 
@@ -43,7 +45,13 @@ async function serve() {
   const bot = { id: null };
   const server = createRouterServer({
     stateDir: stateDir(), socketPath: socketPath(), getTable: () => table, gateway, registry,
-    context: { stateDir: stateDir(), token, attachments, bot }, log,
+    context: {
+      stateDir: stateDir(), registryFile: registryPath(), token, attachments, bot, log,
+      // A failed reminder update is logged; the reply it heals still goes out.
+      assignmentChanged: project => assignmentChanged(project, { registryFile: registryPath() })
+        .then(() => log(`assignment_changed project=${project}`), error => log(`assignment_changed_failed ${error.message}`)),
+    },
+    log,
   });
   await server.listen();
   const registryWatcher = watchRegistry(registryPath(), {
@@ -148,6 +156,13 @@ async function ensureWebhookCommand(project) {
   console.log(`${result.created ? "created" : "reused"} webhook ${result.name} id=${result.webhook_id}`);
 }
 
+async function deleteWebhookCommand(project) {
+  if (!project) throw new Error("usage: router.js delete-webhook <project>");
+  const result = await deleteWebhook({ project, registryFile: registryPath(), stateDir: stateDir(), token: await rootToken() });
+  if (result.deleted.length === 0) return console.log(`no webhook ${result.name} to delete`);
+  console.log(`deleted webhook ${result.name} id=${result.deleted.join(",")}`);
+}
+
 async function migrateRootConfigCommand() {
   const moved = await migrateRootConfig({ accessFile: path.join(rootStateDir(), "access.json"), registryFile: registryPath() });
   const fields = Object.entries(moved);
@@ -158,11 +173,12 @@ async function migrateRootConfigCommand() {
 const [command = "serve", ...args] = process.argv.slice(2);
 const commands = {
   serve, status, preflight: preflightCommand,
-  "ensure-webhook": () => ensureWebhookCommand(args[0]), "migrate-root-config": migrateRootConfigCommand,
+  "ensure-webhook": () => ensureWebhookCommand(args[0]), "delete-webhook": () => deleteWebhookCommand(args[0]),
+  "migrate-root-config": migrateRootConfigCommand,
 };
 
 if (!Object.hasOwn(commands, command)) {
-  console.error(`unknown command: ${command}\nusage: router.js serve | status | preflight | ensure-webhook <project> | migrate-root-config`);
+  console.error(`unknown command: ${command}\nusage: router.js serve | status | preflight | ensure-webhook <project> | delete-webhook <project> | migrate-root-config`);
   process.exit(2);
 }
 commands[command]().catch(error => {

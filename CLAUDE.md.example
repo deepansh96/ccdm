@@ -113,7 +113,18 @@ This assigns an available bot from the pool to a new project and scopes it to a 
 2. Ask: "What is the project directory path?" (user provides absolute path)
 3. Derive `project_name` from the channel name (or let user specify). Derive `screen_name`: lowercase, underscores.
 
-**Registration steps:**
+**Router projects:** when registering a project onto the Router (`transport: "router"`), skip the pool steps below. There is no bot to assign, rename, give a role, or write access files for:
+1. Create the channel (or resolve the one the user named) with the root bot's REST credentials.
+2. Add the project to `registry.json` with `path`, `screen_name`, `channel_id`, `type`, and `transport: "router"` (no `bot_id`).
+3. Create its Project Identity webhook:
+   ```sh
+   scripts/router.js ensure-webhook <project_name>
+   ```
+   This finds or creates `ccdm-<project_name>` in the channel, records `webhook_id` in the registry, and keeps the webhook token only in private Router state. Never copy the token anywhere.
+4. Run `scripts/conversation-reminder-service.py assignment-changed --project <project_name>`.
+5. Start the session through its launcher and tell the user which channel it serves.
+
+**Registration steps (pool projects):**
 1. Check the pool for an unassigned bot (`assigned_to` is `null`). If none available, tell the user: "No bots available in the pool. Add one with `pool add` or remove a project to free one up."
 2. Claim the first available bot: set its `assigned_to` to `<project_name>`.
 3. Add the project to `registry.json` with `bot_id`, `path`, `screen_name`, and `channel_id`.
@@ -169,6 +180,17 @@ This assigns an available bot from the pool to a new project and scopes it to a 
 
 #### 6. Deregister a project (`deregister`, `remove`, `unregister`)
 
+**Router projects** (`transport: "router"`): there is no bot to rename or return to the pool.
+1. Stop the session fully.
+2. Delete its Project Identity webhook, which also removes the private token and clears `webhook_id`:
+   ```sh
+   scripts/router.js delete-webhook <project_name>
+   ```
+   Running it again is a no-op.
+3. Remove the project entry from `registry.json`, then run `scripts/conversation-reminder-service.py assignment-changed --project <project_name>`.
+4. Confirm the removal. The Discord channel still exists (not deleted).
+
+**Pool projects:**
 1. Stop the session if running (`tmux kill-session -t <screen_name>`).
 2. Find the project's assigned bot in the pool via `bot_id`. Get `token` and `app_id` from the pool entry, and `channel_id` from the project entry.
 3. Rename the bot back to its base name (e.g., `bot2`):

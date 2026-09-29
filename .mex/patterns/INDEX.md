@@ -1,7 +1,7 @@
 ---
 name: pattern-index
 description: Task routing index for CCDM patterns.
-last_updated: 2026-09-25
+last_updated: 2026-09-29
 ---
 
 # Pattern Index
@@ -17,7 +17,7 @@ Lookup table for all pattern files in this directory. Check here before starting
 | [manage-claude-home-login.md](manage-claude-home-login.md) | Checking, restoring, or remotely completing a Claude home login |
 | [manage-guest-access.md](manage-guest-access.md) | Granting, syncing, listing, or revoking one project's guest access |
 | [manage-session.md](manage-session.md) | Starting, stopping, or restarting a registered project session |
-| [register-project.md](register-project.md) | Assigning a pool bot to a project or releasing it |
+| [register-project.md](register-project.md) | Registering or deregistering a Router project (webhook admin commands) or a pool project |
 | [publish-public-repo.md](publish-public-repo.md) | Auditing changes for private data before an authorized public commit and push |
 | [setup-chatgpt-codex-account.md](setup-chatgpt-codex-account.md) | Adding or authenticating another ChatGPT subscription Codex Account Alias |
 | [setup-mimo-codex.md](setup-mimo-codex.md) | Preparing or rotating an isolated MiMo home for Codex sessions |

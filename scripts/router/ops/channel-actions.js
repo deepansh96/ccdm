@@ -5,7 +5,7 @@
 // reactions, and typing.
 const { MESSAGE_LIMIT } = require("../chunks.js");
 const { discordRequest } = require("../discord-rest.js");
-const { readWebhookSecret } = require("../webhooks.js");
+const { projectWebhookSecret } = require("../webhooks.js");
 const { OpError, ScopeViolation } = require("./errors.js");
 const { scopedMessage } = require("./targets.js");
 
@@ -70,7 +70,9 @@ async function editMessage(ctx, args) {
   }
   if (ctx.session.role === "root") return editBotMessage(ctx, args, arrival);
   const { route } = ctx.session;
-  const secret = await readWebhookSecret(ctx.stateDir, route.project);
+  const secret = await projectWebhookSecret({
+    project: route.project, registryFile: ctx.registryFile, stateDir: ctx.stateDir, token: ctx.token,
+  });
   if (!secret) throw new OpError("webhook_missing", `no webhook for ${route.project}; run ensure-webhook`);
   const message = await scopedMessage(ctx, args.message_id);
   if (message.webhook_id !== secret.webhook_id) {

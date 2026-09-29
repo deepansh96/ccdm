@@ -1,6 +1,6 @@
 ---
 name: register-project
-description: Assign or release a bot while preserving channel isolation and registry consistency.
+description: Register or deregister a Router or pool project while preserving channel isolation and registry consistency.
 triggers:
   - "register project"
   - "deregister project"
@@ -10,12 +10,22 @@ edges:
     condition: for registry and lifecycle invariants
   - target: context/discord-security.md
     condition: for permissions, roles, tokens, and allowlists
-last_updated: 2026-09-25
+last_updated: 2026-09-29
 ---
 
 # Register Or Deregister A Project
 
-## Steps
+## Router Projects
+For a project on the Router (`transport: "router"`) there is no bot to claim, rename, role, or give access files:
+1. Create or resolve the channel with root's REST credentials, as in step 2 below.
+2. Write the entry with `path`, `screen_name`, `channel_id`, `type`, and `transport: "router"`, with no `bot_id`.
+3. Run `scripts/router.js ensure-webhook <project>`. It finds or creates `ccdm-<project>`, records `webhook_id` in the registry, and keeps the token only in private Router state.
+4. Run `scripts/conversation-reminder-service.py assignment-changed --project <project>`, then start through the matching launcher.
+5. On deregistration, stop fully, run `scripts/router.js delete-webhook <project>` (deletes the webhook and its token and clears `webhook_id`; a rerun is a no-op), remove the entry, then run `assignment-changed`.
+
+The Router heals a webhook deleted in Discord by recreating it once, updating `webhook_id`, and running `assignment-changed` itself. A second deletion in a row fails replies with `webhook_deleted` until `ensure-webhook` runs. A lost token with a known `webhook_id` is refetched through the bot.
+
+## Pool Project Steps
 1. Resolve the channel, absolute project path, session type, and project name.
 2. When the user requested a new channel or category lookup, use the documented root-management workflow and the root bot's stored credentials through Discord REST. The scoped Discord MCP remains the reply/message surface; its lack of channel-administration tools is not a blocker and is not a reason to request the bot token from the user.
 3. On registration, claim one unassigned pool bot and allocate an unused Codex WebSocket port when needed.
