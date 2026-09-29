@@ -512,6 +512,10 @@ No need to provide a token — bots are managed in the pool. If the pool is empt
 
 `scripts/migrate-to-router.sh <project>` moves one pool project to the Router. It checks that the Router is healthy, the project is registered with a pool bot, and root has its channel permissions; then it stops the session, runs `ensure-webhook`, sets `transport: "router"`, runs the reminder `assignment-changed`, starts the session through its launcher, and verifies that `router status` shows it connected in its channel and that `scripts/router.js probe <project>` posts a short connection notice under the project's `webhook_id`. Each step prints `<step>: ok` or `<step>: failed — <reason>`. A preflight failure changes nothing; any later failure rolls the project back to its pool bot and exits non-zero naming the failed step. `scripts/migrate-to-router.sh --rollback <project>` returns a migrated project to its pool bot (stop, remove `transport`, `assignment-changed`, pool start). The script runs `node` unless `CCDM_ROUTER_NODE` names another binary.
 
+### Retiring the Bot Pool
+
+Once every project has `transport: "router"`, `scripts/retire-pool.sh` retires the pool. By default it is a dry run that prints each action `--apply` would take and changes nothing; it refuses (exit non-zero, naming the projects) while any project is still on the pool. `scripts/retire-pool.sh --apply` then, with the root token, removes every pool bot's guild membership (assigned or not), moves each bot's state directory into the private backup `~/.local/state/ccdm/pool-retirement/state/<bot>` (0700; `CCDM_POOL_BACKUP_DIR` selects another backup directory), deletes the `project-bot` role, writes a 0600 copy of the registry to `registry.json` in the backup, and strips `pool`, `max_pool_size`, `project_bot_role_id`, and each project's `bot_id`, `bot_display_name`, and `transport`. Bot applications are kept. A rerun after retirement does nothing.
+
 ### Channel Isolation
 
 Each project bot is locked to a single Discord channel using:

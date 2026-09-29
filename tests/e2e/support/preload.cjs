@@ -802,6 +802,43 @@ function routeDiscordApi(url, init = {}) {
     return response("", { status: 204 });
   }
 
+  // Pool retirement: kicking a member, deleting a role, and (never expected)
+  // deleting an application are recorded for tests to assert on.
+  const guildMemberMatch = /^\/api\/v10\/guilds\/([^/]+)\/members\/([^/]+)$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && guildMemberMatch && method === "DELETE") {
+    updateState((state) => {
+      state.fixtures.discord.memberRemovals ||= [];
+      state.fixtures.discord.memberRemovals.push({
+        authorization: headerValue(init.headers, "Authorization"),
+        guildId: guildMemberMatch[1],
+        userId: guildMemberMatch[2],
+      });
+    });
+    return response("", { status: 204 });
+  }
+
+  const guildRoleMatch = /^\/api\/v10\/guilds\/([^/]+)\/roles\/([^/]+)$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && guildRoleMatch && method === "DELETE") {
+    updateState((state) => {
+      state.fixtures.discord.roleDeletes ||= [];
+      state.fixtures.discord.roleDeletes.push({
+        authorization: headerValue(init.headers, "Authorization"),
+        guildId: guildRoleMatch[1],
+        roleId: guildRoleMatch[2],
+      });
+    });
+    return response("", { status: 204 });
+  }
+
+  const applicationMatch = /^\/api\/v10\/applications\/([^/]+)$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && applicationMatch && method === "DELETE") {
+    updateState((state) => {
+      state.fixtures.discord.applicationDeletes ||= [];
+      state.fixtures.discord.applicationDeletes.push({ applicationId: applicationMatch[1] });
+    });
+    return response("", { status: 204 });
+  }
+
   const nicknameMatch = /^\/api\/v10\/guilds\/([^/]+)\/members\/([^/]+)$/.exec(url.pathname);
   if (url.hostname === "discord.com" && nicknameMatch && method === "PATCH") {
     const parsedBody = init.body ? JSON.parse(String(init.body)) : {};
