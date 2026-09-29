@@ -7,6 +7,7 @@ const { watch } = require("node:fs");
 const { chmod, mkdir, readFile, unlink } = require("node:fs/promises");
 const net = require("node:net");
 const path = require("node:path");
+const { ScopeViolation } = require("./ops/errors.js");
 const { OPERATIONS } = require("./ops/index.js");
 
 const PROTOCOL_VERSION = 1;
@@ -111,16 +112,20 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, context, 
     if (!operation) return fail("unknown_op", `unknown op: ${frame.op}`);
     if (!operation.roles.includes(connection.role)) return fail("forbidden", `${frame.op} is not allowed for ${connection.role}`);
     const args = frame.args && typeof frame.args === "object" ? frame.args : {};
-    if (operation.scoped && String(args.channel_id) !== connection.route.channel_id) {
-      log(`scope_violation project=${connection.route.project} op=${frame.op} target=${args.channel_id}`);
-      violations.push({ project: connection.route.project, op: frame.op, target: String(args.channel_id), at: new Date().toISOString() });
+    const violation = (target, message) => {
+      log(`scope_violation project=${connection.route.project} op=${frame.op} target=${target}`);
+      violations.push({ project: connection.route.project, op: frame.op, target: String(target), at: new Date().toISOString() });
       if (violations.length > RECENT_VIOLATIONS) violations.shift();
-      return fail("scope_violation", "channel_id is outside this session's scope");
+      fail("scope_violation", message);
+    };
+    if (operation.scoped && String(args.channel_id) !== connection.route.channel_id) {
+      return violation(args.channel_id, "channel_id is outside this session's scope");
     }
     try {
       const result = await operation.run({ ...context, session: connection, sessions: listSessions, violations: () => [...violations], table: getTable(), gateway }, args);
       respond({ ok: true, result });
     } catch (error) {
+      if (error instanceof ScopeViolation) return violation(error.target, error.message);
       if (error.code && !error.status) return fail(error.code, error.message);
       log(`op_failed project=${connection.route?.project ?? "-"} op=${frame.op} error=${error.message}`);
       fail("discord_error", error.message);

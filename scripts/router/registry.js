@@ -24,7 +24,12 @@ function buildRoutingTable(registry) {
     channels.set(route.channel_id, route);
     projects.set(name, route);
   }
-  return { ownerId: registry.discord_user_id ? String(registry.discord_user_id) : null, channels, projects };
+  return {
+    ownerId: registry.discord_user_id ? String(registry.discord_user_id) : null,
+    guildId: registry.guild_id ? String(registry.guild_id) : null,
+    channels,
+    projects,
+  };
 }
 
 async function loadRoutingTable(file) {

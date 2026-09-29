@@ -8,4 +8,12 @@ class OpError extends Error {
   }
 }
 
-module.exports = { OpError };
+// A target outside the session's scope; the server logs and records `target`.
+class ScopeViolation extends OpError {
+  constructor(target, message) {
+    super("scope_violation", message);
+    this.target = String(target);
+  }
+}
+
+module.exports = { OpError, ScopeViolation };

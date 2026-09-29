@@ -70,6 +70,16 @@ export async function startRouter(workspace) {
   return running;
 }
 
+// Each project gets its webhook and key, then the Router starts.
+export async function routerWithWebhooks(workspace, projects) {
+  for (const project of projects) {
+    const result = await runRouterCli(workspace, ["ensure-webhook", project]);
+    if (result.exitCode !== 0) throw new Error(`ensure-webhook ${project} failed: ${result.stderr || result.stdout}`);
+    writeProjectKey(workspace, project, `${project}-key`);
+  }
+  return startRouter(workspace);
+}
+
 // A scripted session: the shared client library, loaded from the Test Workspace.
 // `env` stands in for the session process environment (reconnect backoff bounds).
 export async function connectSession(workspace, project, key, { env = {} } = {}) {

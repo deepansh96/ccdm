@@ -232,6 +232,23 @@ function routeChannelHistory(url, method, init) {
   return json(page);
 }
 
+// A message the fake created or injected, shaped as Discord's GET returns it.
+function channelMessage(state, messageId) {
+  const discord = state.fixtures?.discord ?? {};
+  const sent = (discord.messages ?? []).find(message => message.id === messageId && !message.deleted);
+  if (sent) {
+    return { id: sent.id, channel_id: sent.channelId, content: sent.content,
+      ...(sent.webhookId ? { webhook_id: sent.webhookId } : {}),
+      author: sent.webhookId ? { id: sent.webhookId, username: sent.username, bot: true }
+        : { id: authorForToken(sent.authorization), bot: true } };
+  }
+  const injected = (discord.injectedMessages ?? []).find(message => message.id === messageId);
+  if (!injected) return null;
+  return { id: injected.id, channel_id: injected.channelId, content: injected.content,
+    ...(injected.webhookId ? { webhook_id: injected.webhookId } : {}),
+    author: { id: injected.author.id, username: injected.author.username, bot: Boolean(injected.author.bot) } };
+}
+
 // Discord refuses webhook names and username overrides that contain these
 // words or run past 80 characters.
 function webhookNameProblem(name) {
@@ -270,13 +287,40 @@ function routeWebhooks(url, method, init) {
     });
     return json(created);
   }
+  // Webhook message edit: only messages this webhook sent. Discord does not
+  // let an edit change the username.
+  const webhookEditMatch = /^\/api\/v10\/webhooks\/([^/]+)\/([^/]+)\/messages\/([^/]+)$/.exec(url.pathname);
+  if (webhookEditMatch && method === "PATCH") {
+    const parsedBody = init.body ? JSON.parse(String(init.body)) : {};
+    const [, webhookId, webhookToken, messageId] = webhookEditMatch;
+    const webhook = (readState().fixtures?.discord?.webhooks ?? []).find(entry => entry.id === webhookId);
+    if (!webhook || webhook.token !== webhookToken) return json({ code: 10015, message: "Unknown Webhook" }, 404);
+    let edited = null;
+    updateState((state) => {
+      const message = (state.fixtures.discord.messages ?? []).find(entry =>
+        entry.id === messageId && entry.webhookId === webhookId && !entry.deleted);
+      if (!message) return;
+      message.content = parsedBody.content ?? message.content;
+      state.fixtures.discord.webhookEdits ||= [];
+      state.fixtures.discord.webhookEdits.push({ webhookId, messageId, content: parsedBody.content });
+      edited = message;
+    });
+    if (!edited) return json({ code: 10008, message: "Unknown Message" }, 404);
+    return json({ id: edited.id, channel_id: edited.channelId, content: edited.content, webhook_id: webhookId,
+      author: { id: webhookId, username: edited.username, bot: true } });
+  }
   const executeMatch = /^\/api\/v10\/webhooks\/([^/]+)\/([^/]+)$/.exec(url.pathname);
   if (executeMatch && method === "POST") {
-    const parsedBody = init.body ? JSON.parse(String(init.body)) : {};
+    // Multipart executes carry the JSON body as payload_json beside files[n].
+    const form = formBodyFields(init.body);
+    const parsedBody = form ? JSON.parse(form.payload_json ?? "{}") : init.body ? JSON.parse(String(init.body)) : {};
+    const uploads = form ? Object.keys(form).filter(key => /^files\[\d+\]$/.test(key))
+      .map(key => ({ name: form[key].name, size: form[key].size })) : [];
     const webhook = (readState().fixtures?.discord?.webhooks ?? []).find(entry => entry.id === executeMatch[1]);
     if (!webhook || webhook.token !== executeMatch[2]) return json({ code: 10015, message: "Unknown Webhook" }, 404);
     const problem = parsedBody.username === undefined ? null : webhookNameProblem(parsedBody.username);
-    const empty = !parsedBody.content ? "Cannot send an empty message" : null;
+    const empty = !parsedBody.content && uploads.length === 0 ? "Cannot send an empty message"
+      : [...(parsedBody.content ?? "")].length > 2000 ? "Must be 2000 or fewer in length." : null;
     if (problem || empty) {
       updateState((state) => {
         state.fixtures.discord.webhookRejections ||= [];
@@ -295,6 +339,7 @@ function routeWebhooks(url, method, init) {
         id: `fake-message-${state.fixtures.discord.messages.length + 1}`,
         username: parsedBody.username ?? webhook.name,
         webhookId: webhook.id,
+        ...(uploads.length ? { uploads } : {}),
       };
       state.fixtures.discord.messages.push(created);
     });
@@ -606,6 +651,14 @@ function routeDiscordApi(url, init = {}) {
   }
   if (url.hostname === "discord.com" && getMessageMatch && method === "GET") {
     const state = readState();
+    // Messages the fake knows the channel of: sent through it or injected.
+    const known = channelMessage(state, getMessageMatch[2]);
+    if (known) {
+      return response(JSON.stringify(known.channel_id === getMessageMatch[1] ? known : { code: 10008, message: "Unknown Message" }), {
+        headers: { "content-type": "application/json" },
+        status: known.channel_id === getMessageMatch[1] ? 200 : 404,
+      });
+    }
     const message = (state.fixtures?.discord?.restMessages ?? []).find((entry) => entry.id === getMessageMatch[2]);
     updateState((nextState) => {
       nextState.fixtures.discord.messageFetches ||= [];
@@ -653,6 +706,27 @@ function routeDiscordApi(url, init = {}) {
         emoji: reactionMatch[3],
         messageId: reactionMatch[2],
       });
+    });
+    return response("", { status: 204 });
+  }
+  if (url.hostname === "discord.com" && reactionMatch && method === "DELETE") {
+    updateState((state) => {
+      state.fixtures.discord.reactionDeletes ||= [];
+      state.fixtures.discord.reactionDeletes.push({
+        authorization: headerValue(init.headers, "Authorization"),
+        channelId: reactionMatch[1],
+        emoji: reactionMatch[3],
+        messageId: reactionMatch[2],
+      });
+    });
+    return response("", { status: 204 });
+  }
+
+  const typingMatch = /^\/api\/v10\/channels\/([^/]+)\/typing$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && typingMatch && method === "POST") {
+    updateState((state) => {
+      state.fixtures.discord.typing ||= [];
+      state.fixtures.discord.typing.push({ authorization: headerValue(init.headers, "Authorization"), channelId: typingMatch[1] });
     });
     return response("", { status: 204 });
   }

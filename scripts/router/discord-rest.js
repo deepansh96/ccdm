@@ -12,13 +12,16 @@ class DiscordError extends Error {
   }
 }
 
+// A FormData `body` is sent as multipart (fetch sets its boundary); anything else as JSON.
 async function discordRequest(method, route, { token, body, query } = {}) {
   const url = new URL(`${API}${route}`);
   for (const [key, value] of Object.entries(query || {})) url.searchParams.set(key, String(value));
   const headers = {};
   if (token) headers.Authorization = `Bot ${token}`;
-  if (body !== undefined) headers["Content-Type"] = "application/json";
-  const res = await fetch(url.href, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  const multipart = body instanceof FormData;
+  if (body !== undefined && !multipart) headers["Content-Type"] = "application/json";
+  const payload = body === undefined || multipart ? body : JSON.stringify(body);
+  const res = await fetch(url.href, { method, headers, body: payload });
   const text = res.status === 204 ? "" : await res.text();
   let parsed = null;
   try {

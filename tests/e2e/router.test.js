@@ -11,6 +11,7 @@ import {
   connectSession,
   createRouterWorkspace,
   routerRegistry,
+  routerWithWebhooks,
   runRouterCli,
   startRouter,
   waitFor,
@@ -108,14 +109,6 @@ test("ensure-webhook creates the project webhook once, reuses it, and keeps its 
   }
 });
 
-async function routerWithWebhooks(workspace, projects) {
-  for (const project of projects) {
-    const result = await runRouterCli(workspace, ["ensure-webhook", project]);
-    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-    writeProjectKey(workspace, project, `${project}-key`);
-  }
-  return startRouter(workspace);
-}
 
 test("a session's reply posts through its project webhook under its Project Identity", async () => {
   const workspace = createRouterWorkspace();
@@ -130,7 +123,10 @@ test("a session's reply posts through its project webhook under its Project Iden
     { id: "fake-message-1", channelId: "demo-channel", content: "done", username: "demo-claude · 42%", webhookId: "fake-webhook-1" },
     { id: "fake-message-2", channelId: "demo-channel", content: "still done", username: "demo-claude", webhookId: "fake-webhook-1" },
   ]);
-  assert.deepEqual([withPct, withoutPct], [{ message_id: "fake-message-1" }, { message_id: "fake-message-2" }]);
+  assert.deepEqual([withPct, withoutPct], [
+    { message_id: "fake-message-1", message_ids: ["fake-message-1"] },
+    { message_id: "fake-message-2", message_ids: ["fake-message-2"] },
+  ]);
 });
 
 test("project names Discord would refuse get a sanitized username that keeps the context suffix", async () => {
