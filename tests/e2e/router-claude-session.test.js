@@ -181,3 +181,71 @@ test("after stop-session the Router treats the channel as offline and the next o
   const registry = JSON.parse(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"));
   assert.equal(registry.projects.demo.pid, null);
 });
+
+// Claude runs the statusline command with its own environment, which for a
+// router launch carries the launch key path. An inherited DISCORD_STATE_DIR
+// must not turn the run into a nickname PATCH.
+function runStatusline(workspace, script, pct) {
+  const stateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, ".env"), "DISCORD_BOT_TOKEN=root-bot-token\n");
+  return runScript(workspace, script, {
+    env: {
+      CCDM_ROUTER_KEY_FILE: path.join(workspace.routerStateDir, "keys", "demo.key"),
+      DISCORD_STATE_DIR: stateDir,
+      CONTEXT_DISCORD_INTERVAL: "0",
+    },
+    input: `${JSON.stringify({ context_window: { used_percentage: pct } })}\n`,
+  });
+}
+
+async function ownerMessageReply(workspace, id, count) {
+  injectDiscordMessage(workspace, {
+    id, channelId: "demo-channel", content: "status?", author: { id: OWNER_ID, username: "Owner" },
+  });
+  const done = await waitForState(workspace, (next) => next.fixtures.discord.messages.length >= count
+    && (next.fixtures.claude.toolResults?.length ?? 0) >= count);
+  return done.fixtures.discord.messages[count - 1].username;
+}
+
+test("the statusline's context percentage rides on the next reply's Project Identity without a nickname PATCH", async () => {
+  const workspace = claudeRouterWorkspace();
+  await routerWithWebhooks(workspace, ["demo"]);
+  const state = readState(workspace.stateDir);
+  state.fixtures.claude.replyText = "working";
+  writeState(state, workspace.stateDir);
+  const started = await startSession(workspace);
+  assert.equal(started.exitCode, 0, started.stderr || started.stdout);
+
+  const first = await runStatusline(workspace, "scripts/cc-statusline-wrapper.sh", 42);
+  assert.equal(first.exitCode, 0, first.stderr || first.stdout);
+  assert.match(first.stdout, /ccstatusline fixture output/);
+  assert.equal(await ownerMessageReply(workspace, "owner-message-1", 1), "demo-claude · 42%");
+
+  const second = await runStatusline(workspace, "scripts/cc-statusline-wrapper.sh", 57);
+  assert.equal(second.exitCode, 0, second.stderr || second.stdout);
+  assert.equal(await ownerMessageReply(workspace, "owner-message-2", 2), "demo-claude · 57%");
+
+  const context = path.join(workspace.routerStateDir, "launches", "demo", "context.json");
+  assert.equal(fs.statSync(context).mode & 0o777, 0o600);
+
+  const nicknames = await runStatusline(workspace, "scripts/cc-discord-nicknames.sh", 61);
+  assert.equal(nicknames.exitCode, 0, nicknames.stderr || nicknames.stdout);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const after = readState(workspace.stateDir);
+  assert.deepEqual(after.fixtures.discord.nicknamePatches, []);
+  assert.deepEqual(after.fixtures.curl.requests, []);
+});
+
+test("an unreadable context file drops the percentage rather than posting a wrong one", async () => {
+  const workspace = claudeRouterWorkspace();
+  await routerWithWebhooks(workspace, ["demo"]);
+  const state = readState(workspace.stateDir);
+  state.fixtures.claude.replyText = "working";
+  writeState(state, workspace.stateDir);
+  const started = await startSession(workspace);
+  assert.equal(started.exitCode, 0, started.stderr || started.stdout);
+  fs.writeFileSync(path.join(workspace.routerStateDir, "launches", "demo", "context.json"), "{not json", { mode: 0o600 });
+
+  assert.equal(await ownerMessageReply(workspace, "owner-message-1", 1), "demo-claude");
+});

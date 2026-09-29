@@ -12,7 +12,12 @@
 //   CCDM_ROUTER_STATE_DIR     the Router state directory (its socket lives there)
 //   CCDM_CLAUDE_PROJECT       the project this session serves
 //   CCDM_CHANNEL_READY_FILE   where the Router hello outcome is written for the launcher
+//
+// The statusline wrapper writes the latest context percentage to
+// `<state>/launches/<project>/context.json`; reply and edit_message send it as
+// `context_pct`, or omit it when the file is missing or unreadable.
 const { readFileSync, renameSync, writeFileSync } = require("node:fs");
+const path = require("node:path");
 const { createInterface } = require("node:readline");
 const { RouterClient } = require("./router/client.js");
 
@@ -27,6 +32,16 @@ const INSTRUCTIONS = [
   "fetch_messages pulls recent channel history. This session can read and act only in its own project channel.",
 ].join("\n");
 
+function contextPct() {
+  const file = path.join(process.env.CCDM_ROUTER_STATE_DIR || "", "launches", process.env.CCDM_CLAUDE_PROJECT || "", "context.json");
+  try {
+    const pct = JSON.parse(readFileSync(file, "utf8")).context_pct;
+    return Number.isFinite(pct) ? pct : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // Each tool forwards to one Router operation; `args` maps tool input to op args.
 const TOOLS = {
   reply: {
@@ -38,7 +53,7 @@ const TOOLS = {
     },
     required: ["chat_id", "text"],
     op: "reply",
-    args: ({ chat_id, text, reply_to, files }) => ({ channel_id: chat_id, text, reply_to, files }),
+    args: ({ chat_id, text, reply_to, files }) => ({ channel_id: chat_id, text, reply_to, files, context_pct: contextPct() }),
     format: result => result.message_ids.length > 1
       ? `sent ${result.message_ids.length} parts (ids: ${result.message_ids.join(", ")})`
       : `sent (id: ${result.message_id})`,
@@ -56,7 +71,7 @@ const TOOLS = {
     properties: { chat_id: { type: "string" }, message_id: { type: "string" }, text: { type: "string" } },
     required: ["chat_id", "message_id", "text"],
     op: "edit_message",
-    args: ({ chat_id, message_id, text }) => ({ channel_id: chat_id, message_id, text }),
+    args: ({ chat_id, message_id, text }) => ({ channel_id: chat_id, message_id, text, context_pct: contextPct() }),
     format: () => "edited",
   },
   fetch_messages: {

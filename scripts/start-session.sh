@@ -310,6 +310,8 @@ for directory in (Path(router_state), keys_dir, launch.parent, launch):
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(directory, 0o700)
 (launch / "ready.json").unlink(missing_ok=True)
+# A previous launch's context percentage would be wrong for this one.
+(launch / "context.json").unlink(missing_ok=True)
 
 def write_private(path: Path, text: str) -> None:
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")

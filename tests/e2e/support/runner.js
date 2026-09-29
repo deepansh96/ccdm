@@ -43,6 +43,7 @@ const HOST_WRAPPERS = new Map([
   ["head", "/usr/bin/head"],
   ["ls", "/bin/ls"],
   ["mkdir", "/bin/mkdir"],
+  ["mv", "/bin/mv"],
   ["python3", null],
   ["sed", null],
   ["tr", "/usr/bin/tr"],

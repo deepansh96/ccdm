@@ -730,6 +730,8 @@ Use the wrapper if you also use Claude Code in the terminal and want the status 
 
 Both env vars are optional. The scripts also require `DISCORD_STATE_DIR` to be set, which happens automatically when Claude Code starts with the Discord plugin.
 
+For `transport: "router"` projects the scripts make no nickname PATCH: they write the percentage to a private file in the project's Router launch directory, and each reply posts as `<project>-claude · N%`.
+
 ## Preventing Sleep
 
 CCDM needs your machine to stay awake — if it sleeps, all tmux sessions (and their Discord bots) go offline.
