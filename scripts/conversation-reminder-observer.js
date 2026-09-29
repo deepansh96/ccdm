@@ -239,8 +239,12 @@ function connectRouter() {
 }
 
 // Retired cleanup may use only the bot that served the retired assignment, and
-// only while that bot is not authorized for a different channel.
+// only while that bot is not authorized for a different channel. Root sent a
+// retired router assignment's reminders, so root removes them.
 async function retiredCredentials(action) {
+  if (String(action.identity || "").startsWith("router:")) {
+    return rootToken().then(token => ({ token }), () => ({ reason: "root Discord credentials are unavailable" }));
+  }
   const data = await registry();
   const bots = Array.isArray(data.pool) ? data.pool.filter(row => row?.id === action.bot_id) : [];
   if (bots.length !== 1 || !bots[0].token) return { reason: "retired bot credentials are no longer available" };

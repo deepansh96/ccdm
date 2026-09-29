@@ -329,9 +329,27 @@ def retire_conversation(db: sqlite3.Connection, row: sqlite3.Row, reason: str) -
     db.execute("DELETE FROM conversations WHERE project=?", (project,))
 
 
+def transport_switched(row: sqlite3.Row, assignment: dict) -> bool:
+    """Whether only the project's transport changed: pool bot to Router webhook, or back."""
+    return (row["channel_id"], row["owner_id"]) == (assignment["channel_id"], assignment["owner_id"]) and \
+        row["identity"].split(":", 1)[0] != assignment["identity"].split(":", 1)[0]
+
+
+# The open conversation a transport switch carries into its new generation.
+CARRIED_COLUMNS = ("state", "current_interaction_id", "last_ack_at", "last_ack_message_id", "response_message_id",
+                   "response_at", "due_at", "consecutive_reminders", "reconciliation_status", "checkpoint",
+                   "last_event_order")
+
+
 def current_conversation(db: sqlite3.Connection, name: str, assignment: dict) -> sqlite3.Row:
     """Return the row for the current assignment, retiring any other generation first."""
     current = db.execute("SELECT * FROM conversations WHERE project=?", (name,)).fetchone()
+    if (current is not None and current["assignment_generation"] == assignment["generation"]
+            and transport_switched(current, assignment)):
+        # A transport switch waits for assignment-changed, which carries the open
+        # conversation into a new generation. Nothing is sent meanwhile: a claim
+        # needs the row's identity to match the registry.
+        return current
     if current is not None and (current["assignment_generation"], current["channel_id"], current["identity"],
                                 current["owner_id"]) != (assignment["generation"], assignment["channel_id"],
                                                          assignment["identity"], assignment["owner_id"]):
@@ -557,6 +575,12 @@ def assignment_changed(project_root: Path, state_dir: Path, name: str) -> dict:
                 renewed = None
             if renewed:
                 current_conversation(db, name, renewed)
+                if row is not None and transport_switched(row, renewed):
+                    # Open conversations survive the switch; only the retired
+                    # identity's reminders are cleaned up.
+                    db.execute(f"""UPDATE conversations SET {",".join(f"{c}=?" for c in CARRIED_COLUMNS)},
+                        revision=? WHERE project=?""",
+                               (*(row[c] for c in CARRIED_COLUMNS), row["revision"] + 1, name))
         db.execute("COMMIT")
         return {"status": "changed", "project": name, "retired_generations": retired,
                 "assignment_generation": generation}
@@ -627,6 +651,46 @@ def root_credentials_present() -> bool:
     return bool(token) and not any(character.isspace() for character in token)
 
 
+ROOT_PERMISSION_NAMES = {"SendMessages": "Send Messages", "ReadMessageHistory": "Read Message History",
+                         "AddReactions": "Add Reactions", "ManageMessages": "Manage Messages"}
+
+
+def router_prerequisites(projects: object) -> dict:
+    """Per router project, what root and the Router still need before delivery, each with its fix."""
+    names = sorted(name for name, project in (projects.items() if isinstance(projects, dict) else [])
+                   if isinstance(project, dict) and project.get("transport") == "router")
+    if not names:
+        return {}
+    try:
+        completed = subprocess.run([os.environ.get("CCDM_REMINDER_NODE", "node"),
+                                    str(Path(__file__).with_name("router.js")), "status", "--json"],
+                                   capture_output=True, text=True, timeout=15)
+        router = json.loads(completed.stdout) if completed.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        router = None
+    reported = {row.get("project"): row for row in (router or {}).get("projects") or [] if isinstance(row, dict)}
+    result = {}
+    for name in names:
+        blockers = []
+        row = reported.get(name)
+        if router is None:
+            blockers.append("the Router is not reachable; start the Router "
+                            "(scripts/install-router-service.sh, or scripts/router.js serve)")
+        if not projects[name].get("webhook_id") or (row is not None and not row.get("webhook")):
+            blockers.append(f"the project's webhook is missing; run scripts/router.js ensure-webhook {name}")
+        if router is not None and row is not None:
+            missing = row.get("missing_permissions")
+            if missing is None:
+                blockers.append("the Router is not connected to Discord yet; retry once "
+                                "scripts/router.js status shows the gateway ready")
+            for flag in missing or []:
+                label = ROOT_PERMISSION_NAMES.get(flag, flag)
+                blockers.append(f"root lacks {label} in the project channel; grant root permission {label} in "
+                                f"{projects[name].get('channel_id')}")
+        result[name] = {"ready": not blockers, "blockers": blockers}
+    return result
+
+
 def enablement_checks(project_root: Path, state_dir: Path, prepare: bool = True) -> dict:
     """Foreground opt-in checks. Discord permissions are verified per channel by the worker.
 
@@ -670,6 +734,11 @@ def preflight(project_root: Path, state_dir: Path) -> dict:
     """Read-only supervisor checks: configuration, adapters, credentials, and an intact store."""
     checks = enablement_checks(project_root, state_dir, prepare=False)
     blockers = list(checks["blockers"])
+    try:
+        routed = router_prerequisites(EVENTS.load_registry(project_root).get("projects"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        routed = {}
+    blockers += [f"{name}: {blocker}" for name, row in routed.items() for blocker in row["blockers"]]
     current = None
     if not blockers:
         try:
@@ -690,6 +759,7 @@ def readiness_report(project_root: Path, state_dir: Path, db: sqlite3.Connection
     except (OSError, ValueError, json.JSONDecodeError):
         projects = None
     report = {}
+    routed = router_prerequisites(projects)
     for name in sorted(projects if isinstance(projects, dict) else {}):
         adapter = READINESS.build_readiness(name, project_root, state_dir)
         conversation = conversations.get(name)
@@ -723,6 +793,11 @@ def readiness_report(project_root: Path, state_dir: Path, db: sqlite3.Connection
             blockers.append("history: " + history + (f" ({reason})" if reason else ""))
         if uncertain:
             blockers.append("uncertain delivery: run recover")
+        speaker = (adapter["assignment"] or {}).get("bot_id")
+        if conversation and speaker and conversation["identity"] != (
+                speaker if speaker.startswith("router:") else f"pool:{speaker}"):
+            blockers.append("assignment: the project's transport changed; run assignment-changed --project " + name)
+        blockers += [f"router: {blocker}" for blocker in routed.get(name, {}).get("blockers", [])]
         report[name] = {
             "provider": adapter["provider"], "adapter": adapter["status"], "observation": observation,
             "history": history, "assignment": adapter["assignment_mismatches"] or "ok",
@@ -730,6 +805,7 @@ def readiness_report(project_root: Path, state_dir: Path, db: sqlite3.Connection
             "pending_cleanup": conversation["cleanup_message_ids"] if conversation else [],
             "catch_up_queued": bool(conversation and conversation["catch_up_queued"]),
             "delivery_ready": not blockers, "blockers": blockers,
+            **({"router": routed[name]} if name in routed else {}),
         }
     return {"provider_prerequisites": prerequisites, "projects": report}
 

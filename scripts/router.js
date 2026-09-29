@@ -5,7 +5,7 @@
 // channel to its one session, and acts in Discord on the session's behalf.
 //
 //   scripts/router.js serve                   run the Router daemon
-//   scripts/router.js status                  report Router health (non-zero if unreachable)
+//   scripts/router.js status [--json]         report Router health (non-zero if unreachable)
 //   scripts/router.js preflight               read-only supervision readiness as JSON (non-zero on blockers)
 //   scripts/router.js ensure-webhook <project>  find or create the project's webhook
 //   scripts/router.js delete-webhook <project>  delete the project's webhook and its token
@@ -43,10 +43,12 @@ async function serve() {
   const attachments = createAttachmentCache();
   // The root bot's own user, known once the gateway is ready.
   const bot = { id: null };
+  // The gateway client, for `status` to check root's channel permissions.
+  const discord = { client: null };
   const server = createRouterServer({
     stateDir: stateDir(), socketPath: socketPath(), getTable: () => table, gateway, registry,
     context: {
-      stateDir: stateDir(), registryFile: registryPath(), token, attachments, bot, log,
+      stateDir: stateDir(), registryFile: registryPath(), token, attachments, bot, discord, log,
       // A failed reminder update is logged; the reply it heals still goes out.
       assignmentChanged: project => assignmentChanged(project, { registryFile: registryPath() })
         .then(() => log(`assignment_changed project=${project}`), error => log(`assignment_changed_failed ${error.message}`)),
@@ -74,6 +76,7 @@ async function serve() {
     partials: [Partials.Message, Partials.Reaction, Partials.User],
   });
   const ready = new Promise(resolve => client.once("ready", resolve));
+  discord.client = client;
 
   client.on("messageCreate", async message => {
     try {
@@ -118,7 +121,7 @@ async function serve() {
   log(`router ready: ${table.projects.size} router project(s), socket ${socketPath()}`);
 }
 
-async function status() {
+async function status(json = false) {
   const client = new RouterClient({ role: "status", timeoutMs: 5000 });
   let result;
   try {
@@ -131,6 +134,7 @@ async function status() {
   } finally {
     client.close();
   }
+  if (json) return console.log(JSON.stringify(result));
   console.log(`gateway: ${result.gateway}`);
   console.log(`registry loaded: ${result.registry_loaded_at}`);
   if (result.registry_error) console.log(`registry error: ${result.registry_error.at} ${result.registry_error.message}`);
@@ -140,7 +144,9 @@ async function status() {
   }
   console.log("webhooks:");
   for (const project of result.projects) {
-    console.log(`  ${project.project} channel=${project.channel_id} webhook=${project.webhook ? "present" : "missing"}`);
+    const missing = project.missing_permissions;
+    const access = missing === null ? "unknown" : missing.length ? `missing ${missing.join(",")}` : "ok";
+    console.log(`  ${project.project} channel=${project.channel_id} webhook=${project.webhook ? "present" : "missing"} root_permissions=${access}`);
   }
   console.log(`scope violations: ${result.scope_violations.length}`);
   for (const violation of result.scope_violations) {
@@ -176,13 +182,13 @@ async function migrateRootConfigCommand() {
 
 const [command = "serve", ...args] = process.argv.slice(2);
 const commands = {
-  serve, status, preflight: preflightCommand,
+  serve, status: () => status(args.includes("--json")), preflight: preflightCommand,
   "ensure-webhook": () => ensureWebhookCommand(args[0]), "delete-webhook": () => deleteWebhookCommand(args[0]),
   "migrate-root-config": migrateRootConfigCommand,
 };
 
 if (!Object.hasOwn(commands, command)) {
-  console.error(`unknown command: ${command}\nusage: router.js serve | status | preflight | ensure-webhook <project> | delete-webhook <project> | migrate-root-config`);
+  console.error(`unknown command: ${command}\nusage: router.js serve | status [--json] | preflight | ensure-webhook <project> | delete-webhook <project> | migrate-root-config`);
   process.exit(2);
 }
 commands[command]().catch(error => {

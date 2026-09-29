@@ -3,6 +3,23 @@
 // status: Router health for `router status`. Never includes webhook tokens.
 const { readWebhookSecret } = require("../webhooks.js");
 
+// What root needs in a project channel to send, read, react, and clean up.
+const ROOT_PERMISSIONS = ["SendMessages", "ReadMessageHistory", "AddReactions", "ManageMessages"];
+
+// Root's missing permissions in a channel, or null before the gateway is ready.
+async function missingPermissions(ctx, channelId) {
+  const client = ctx.discord?.client;
+  if (!client?.user) return null;
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  let permissions = null;
+  try {
+    permissions = channel?.permissionsFor?.(client.user) ?? null;
+  } catch {
+    // A partially cached guild cannot resolve permissions: report them all missing.
+  }
+  return ROOT_PERMISSIONS.filter(flag => !permissions?.has(flag));
+}
+
 async function status(ctx) {
   const projects = [];
   for (const route of ctx.table.projects.values()) {
@@ -11,6 +28,7 @@ async function status(ctx) {
       project: route.project,
       channel_id: route.channel_id,
       webhook: Boolean(route.webhook_id && secret?.webhook_id === route.webhook_id),
+      missing_permissions: await missingPermissions(ctx, route.channel_id),
     });
   }
   return {
