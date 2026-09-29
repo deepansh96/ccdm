@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { startFakeCodexServer } from "./support/bridge.js";
 import { createRouterWorkspace, routerEnv, startRouter } from "./support/router.js";
 import { createWorkspace, runScript } from "./support/runner.js";
 import { readState, seedFixtureProcess, seedRegistry, seedTmuxSession, writeState } from "./support/state.js";
@@ -126,13 +127,20 @@ function codexAppServerCommand() {
   return "codex app-server --listen ws://127.0.0.1:18342";
 }
 
-function seedRootCodexFiles(workspace) {
-  const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
-  fs.mkdirSync(rootStateDir, { recursive: true });
-  fs.writeFileSync(path.join(rootStateDir, ".env"), "DISCORD_BOT_TOKEN=cm9vdC1hcHA.fixture.token\n");
-  fs.writeFileSync(path.join(rootStateDir, "access.json"), `${JSON.stringify({
-    groups: { "root-channel-id": { requireMention: false } },
-  })}\n`);
+// Root Codex reads its root channels from the registry.
+function seedRootCodexFiles(workspace, rootChannels = ["root-channel-id"]) {
+  const registryFile = path.join(workspace.repoDir, "registry.json");
+  const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+  registry.root_channels = rootChannels;
+  fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
+}
+
+// Root Codex is a Router client: a Router, and the fake app-server its bridge
+// bootstraps against.
+async function rootCodexRouterEnv(workspace, extraEnv = {}) {
+  const codex = await startFakeCodexServer(workspace);
+  await startRouter(workspace);
+  return routerEnv(workspace, { ROOT_CODEX_WS_PORT: String(codex.port), ...extraEnv });
 }
 
 async function stopProject(workspace) {
@@ -389,29 +397,28 @@ test("root Claude reminder launch rejects an unproven version before teardown", 
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent.paneOutput, "existing root\n");
 });
 
-test("restart-root-codex-agent starts the root bot through the Codex bridge", async () => {
-  const workspace = createWorkspace();
+test("restart-root-codex-agent starts the root bot through the Codex bridge in Router root mode", async () => {
+  const workspace = createRouterWorkspace();
   const codexHome = path.join(workspace.homeDir, ".codex-ccdm");
   fs.mkdirSync(codexHome, { recursive: true });
-  seedRegistry(workspace, buildRegistry(workspace, { codexHome }));
+  seedRegistry(workspace, {
+    ...buildRegistry(workspace, { codexHome }),
+    root_bot_app_id: "root-app",
+    root_allowed_user_ids: ["global-user-id"],
+  });
+  seedRootCodexFiles(workspace);
   const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
-  fs.mkdirSync(rootStateDir, { recursive: true });
-  fs.writeFileSync(path.join(rootStateDir, ".env"), "DISCORD_BOT_TOKEN=cm9vdC1hcHA.fixture.token\n");
-  fs.writeFileSync(path.join(rootStateDir, "access.json"), `${JSON.stringify({
-    allowFrom: ["global-user-id"],
-    groups: {
-      "root-channel-id": { requireMention: false, allowFrom: ["channel-only-user-id"] },
-    },
-  })}\n`);
+  const env = await rootCodexRouterEnv(workspace, { CODEX_HOME: path.join(workspace.homeDir, ".codex-legacy") });
+  const port = env.ROOT_CODEX_WS_PORT;
   const panePid = spawnOwnedProcess(workspace, "zsh root pane");
   const childPid = spawnOwnedProcess(workspace, "claude root child", { ppid: panePid });
   const orphanBridgePid = spawnOwnedProcess(
     workspace,
-    "node scripts/codex-bridge.js BOT_APP_ID='root-app' WS_PORT='18399'",
+    `node scripts/codex-bridge.js BOT_APP_ID='root-app' WS_PORT='${port}'`,
   );
   const orphanAppServerPid = spawnOwnedProcess(
     workspace,
-    "codex app-server --listen ws://127.0.0.1:18399",
+    `codex app-server --listen ws://127.0.0.1:${port}`,
   );
   const orphanClaudePid = spawnOwnedProcess(
     workspace,
@@ -423,10 +430,7 @@ test("restart-root-codex-agent starts the root bot through the Codex bridge", as
     { stateDir: workspace.stateDir },
   );
 
-  const result = await runScript(workspace, "restart-root-codex-agent.sh", {
-    args: ["root-channel-id"],
-    env: { CODEX_HOME: path.join(workspace.homeDir, ".codex-legacy") },
-  });
+  const result = await runScript(workspace, "restart-root-codex-agent.sh", { args: ["root-channel-id"], env, timeoutMs: 30000 });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.match(result.stdout, /Restarted root Codex agent in tmux session 'root_agent'/);
@@ -441,22 +445,24 @@ test("restart-root-codex-agent starts the root bot through the Codex bridge", as
     ALLOWED_USER_IDS: "allowed-user-id,global-user-id",
     BOT_APP_ID: "root-app",
     BOT_DISPLAY_NAME: "root-codex",
-    BOT_TOKEN: "cm9vdC1hcHA.fixture.token",
+    CCDM_CHANNEL_READY_FILE: path.join(workspace.routerStateDir, "launches", ".root", "ready.json"),
+    CCDM_ROUTER_KEY_FILE: path.join(workspace.routerStateDir, "keys", ".root.key"),
+    CCDM_ROUTER_ROLE: "root",
+    CCDM_ROUTER_STATE_DIR: workspace.routerStateDir,
     CHANNEL_ID: "root-channel-id",
     CODEX_HOME: codexHome,
     GUILD_ID: "guild-id",
     PROJECT_DIR: workspace.repoDir,
-    ROOT_ACCESS_FILE: path.join(rootStateDir, "access.json"),
     ROOT_BOT_APP_ID: "root-app",
     ROOT_MULTI_CHANNEL: "1",
-    WS_PORT: "18399",
+    WS_PORT: port,
   });
   assert.equal(session.bridgeCommand, "node scripts/codex-bridge.js");
   assert.equal(session.killAttempts, 2);
 });
 
 test("restart-root-codex-agent uses the Default Codex Account when no emergency override is set", async () => {
-  const workspace = createWorkspace();
+  const workspace = createRouterWorkspace();
   const defaultAccountHome = path.join(workspace.homeDir, ".codex-default-account");
   fs.mkdirSync(defaultAccountHome, { recursive: true });
   const registry = buildRegistry(workspace, { sessionType: "codex" });
@@ -467,6 +473,7 @@ test("restart-root-codex-agent uses the Default Codex Account when no emergency 
 
   const result = await runScript(workspace, "restart-root-codex-agent.sh", {
     args: ["root-channel-id"],
+    env: await rootCodexRouterEnv(workspace),
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
@@ -562,7 +569,7 @@ test("restart-root-codex-agent rejects a Default Codex Account and Legacy Codex 
 });
 
 test("restart-root-codex-agent keeps ROOT_CODEX_HOME above the shared home", async () => {
-  const workspace = createWorkspace();
+  const workspace = createRouterWorkspace();
   const rootHome = path.join(workspace.homeDir, ".codex-root");
   const defaultAccountHome = path.join(workspace.homeDir, ".codex-default-account");
   fs.mkdirSync(rootHome, { recursive: true });
@@ -571,17 +578,11 @@ test("restart-root-codex-agent keeps ROOT_CODEX_HOME above the shared home", asy
   registry.codex_accounts = { "codex-default": defaultAccountHome };
   registry.default_codex_account = "codex-default";
   seedRegistry(workspace, registry);
-  const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
-  fs.mkdirSync(rootStateDir, { recursive: true });
-  fs.writeFileSync(path.join(rootStateDir, ".env"), "DISCORD_BOT_TOKEN=cm9vdC1hcHA.fixture.token\n");
-  fs.writeFileSync(path.join(rootStateDir, "access.json"), `${JSON.stringify({
-    allowFrom: [],
-    groups: { "root-channel-id": { requireMention: false } },
-  })}\n`);
+  seedRootCodexFiles(workspace);
 
   const result = await runScript(workspace, "restart-root-codex-agent.sh", {
     args: ["root-channel-id"],
-    env: { ROOT_CODEX_HOME: rootHome },
+    env: await rootCodexRouterEnv(workspace, { ROOT_CODEX_HOME: rootHome }),
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
@@ -592,12 +593,7 @@ test("restart-root-codex-agent validates the selected home before tearing down r
   const workspace = createWorkspace();
   const missingHome = path.join(workspace.homeDir, ".missing-root-codex");
   seedRegistry(workspace, buildRegistry(workspace, { codexHome: missingHome }));
-  const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
-  fs.mkdirSync(rootStateDir, { recursive: true });
-  fs.writeFileSync(path.join(rootStateDir, ".env"), "DISCORD_BOT_TOKEN=cm9vdC1hcHA.fixture.token\n");
-  fs.writeFileSync(path.join(rootStateDir, "access.json"), `${JSON.stringify({
-    groups: { "root-channel-id": { requireMention: false } },
-  })}\n`);
+  seedRootCodexFiles(workspace);
   const panePid = spawnOwnedProcess(workspace, "zsh root pane");
   const childPid = spawnOwnedProcess(workspace, "node scripts/codex-bridge.js", { ppid: panePid });
   seedTmuxSession("root_agent", { panePid, paneOutput: "old root\n" }, { stateDir: workspace.stateDir });
@@ -700,7 +696,7 @@ test("restart-root-codex-agent rejects every invalid selected home before root t
 });
 
 test("restart-root-codex-agent uses ambient CODEX_HOME when the registry has no home", async () => {
-  const workspace = createWorkspace();
+  const workspace = createRouterWorkspace();
   const ambientHome = path.join(workspace.homeDir, ".codex-ambient");
   fs.mkdirSync(ambientHome, { recursive: true });
   seedRegistry(workspace, buildRegistry(workspace));
@@ -708,7 +704,7 @@ test("restart-root-codex-agent uses ambient CODEX_HOME when the registry has no 
 
   const result = await runScript(workspace, "restart-root-codex-agent.sh", {
     args: ["root-channel-id"],
-    env: { CODEX_HOME: ambientHome },
+    env: await rootCodexRouterEnv(workspace, { CODEX_HOME: ambientHome }),
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
@@ -716,7 +712,7 @@ test("restart-root-codex-agent uses ambient CODEX_HOME when the registry has no 
 });
 
 test("restart-root-codex-agent lets ROOT_CODEX_HOME recover from a broken registry home", async () => {
-  const workspace = createWorkspace();
+  const workspace = createRouterWorkspace();
   const rootHome = path.join(workspace.homeDir, ".codex-emergency");
   fs.mkdirSync(rootHome, { recursive: true });
   const registry = buildRegistry(workspace);
@@ -726,7 +722,7 @@ test("restart-root-codex-agent lets ROOT_CODEX_HOME recover from a broken regist
 
   const result = await runScript(workspace, "restart-root-codex-agent.sh", {
     args: ["root-channel-id"],
-    env: { ROOT_CODEX_HOME: rootHome },
+    env: await rootCodexRouterEnv(workspace, { ROOT_CODEX_HOME: rootHome }),
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
@@ -734,7 +730,7 @@ test("restart-root-codex-agent lets ROOT_CODEX_HOME recover from a broken regist
 });
 
 test("restart-root-codex-agent re-reads the registry home on every restart", async () => {
-  const workspace = createWorkspace();
+  const workspace = createRouterWorkspace();
   const firstHome = path.join(workspace.homeDir, ".codex-first");
   const secondHome = path.join(workspace.homeDir, ".codex-second");
   fs.mkdirSync(firstHome, { recursive: true });
@@ -744,37 +740,36 @@ test("restart-root-codex-agent re-reads the registry home on every restart", asy
   registry.default_codex_account = "first";
   seedRegistry(workspace, registry);
   seedRootCodexFiles(workspace);
+  const env = await rootCodexRouterEnv(workspace);
 
   const firstResult = await runScript(workspace, "restart-root-codex-agent.sh", {
     args: ["root-channel-id"],
+    env,
   });
   assert.equal(firstResult.exitCode, 0, firstResult.stderr || firstResult.stdout);
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent.env.CODEX_HOME, firstHome);
 
   registry.default_codex_account = "second";
+  registry.root_channels = ["root-channel-id"];
   fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), `${JSON.stringify(registry, null, 2)}\n`);
 
   const secondResult = await runScript(workspace, "restart-root-codex-agent.sh", {
     args: ["root-channel-id"],
+    env,
   });
   assert.equal(secondResult.exitCode, 0, secondResult.stderr || secondResult.stdout);
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent.env.CODEX_HOME, secondHome);
 });
 
 test("restart-root-codex-agent keeps the legacy default without home overrides", async () => {
-  const workspace = createWorkspace();
+  const workspace = createRouterWorkspace();
   fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
   seedRegistry(workspace, buildRegistry(workspace));
-  const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
-  fs.mkdirSync(rootStateDir, { recursive: true });
-  fs.writeFileSync(path.join(rootStateDir, ".env"), "DISCORD_BOT_TOKEN=cm9vdC1hcHA.fixture.token\n");
-  fs.writeFileSync(path.join(rootStateDir, "access.json"), `${JSON.stringify({
-    allowFrom: [],
-    groups: { "root-channel-id": { requireMention: false } },
-  })}\n`);
+  seedRootCodexFiles(workspace);
 
   const result = await runScript(workspace, "restart-root-codex-agent.sh", {
     args: ["root-channel-id"],
+    env: await rootCodexRouterEnv(workspace),
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
@@ -784,35 +779,21 @@ test("restart-root-codex-agent keeps the legacy default without home overrides",
   );
 });
 
-test("restart-root-codex-agent rejects an unconfigured channel before stopping the current root", async () => {
+test("restart-root-codex-agent rejects a channel missing from the registry's root channels before stopping the current root", async () => {
   const workspace = createWorkspace();
   seedRegistry(workspace, buildRegistry(workspace));
-  const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
-  fs.mkdirSync(rootStateDir, { recursive: true });
-  fs.writeFileSync(path.join(rootStateDir, "access.json"), `${JSON.stringify({
-    groups: { "configured-channel": { requireMention: false } },
-  })}\n`);
   const panePid = spawnOwnedProcess(workspace, "zsh root pane");
   const childPid = spawnOwnedProcess(workspace, "claude root child", { ppid: panePid });
   seedTmuxSession("root_agent", { panePid, paneOutput: "old root\n" }, { stateDir: workspace.stateDir });
 
-  const result = await runScript(workspace, "restart-root-codex-agent.sh", {
-    args: ["missing-channel"],
-  });
+  const unmigrated = await runScript(workspace, "restart-root-codex-agent.sh", { args: ["missing-channel"] });
+  assert.notEqual(unmigrated.exitCode, 0);
+  assert.match(unmigrated.stderr, /No root_channels in .*registry\.json\. Run `node scripts\/router\.js migrate-root-config`/);
 
+  seedRootCodexFiles(workspace, ["configured-channel"]);
+  const result = await runScript(workspace, "restart-root-codex-agent.sh", { args: ["missing-channel"] });
   assert.notEqual(result.exitCode, 0);
-  assert.match(result.stderr, /Root channel missing-channel is not configured as a no-mention channel/);
-  assert.ok(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent);
-  assert.equal(isAlive(childPid), true);
-
-  fs.writeFileSync(path.join(rootStateDir, "access.json"), `${JSON.stringify({
-    groups: { "missing-channel": { requireMention: true } },
-  })}\n`);
-  const mentionedResult = await runScript(workspace, "restart-root-codex-agent.sh", {
-    args: ["missing-channel"],
-  });
-  assert.notEqual(mentionedResult.exitCode, 0);
-  assert.match(mentionedResult.stderr, /requireMention set to false/);
+  assert.match(result.stderr, /Root channel missing-channel is not in root_channels/);
   assert.ok(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent);
   assert.equal(isAlive(childPid), true);
 });

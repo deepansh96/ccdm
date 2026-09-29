@@ -1270,55 +1270,6 @@ test("bridge restarts its own Codex session from slash command", async () => {
   assert.equal(state.fixtures.tmux.sessions.alpha.env.CHANNEL_ID, "channel-id");
 });
 
-test("root bridge restarts through the root Codex restart script", async () => {
-  const workspace = createBridgeWorkspace();
-  fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
-  const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
-  fs.mkdirSync(rootStateDir, { recursive: true });
-  fs.writeFileSync(path.join(rootStateDir, ".env"), "DISCORD_BOT_TOKEN=cm9vdC1hcHA.fixture.token\n");
-  fs.writeFileSync(path.join(rootStateDir, "access.json"), `${JSON.stringify({
-    allowFrom: ["allowed-user-id"],
-    groups: { "root-channel": { requireMention: false, allowFrom: ["allowed-user-id"] } },
-  })}\n`);
-  fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), `${JSON.stringify({
-    discord_user_id: "allowed-user-id",
-    guild_id: "guild-id",
-    pool: [
-      { id: "bot1", app_id: "root-app", token: "root-token", state_dir: rootStateDir, assigned_to: null },
-    ],
-    projects: {},
-  })}\n`);
-  const codex = await startFakeCodexServer(workspace, { channelId: "root-channel" });
-  const bridge = startBridge(workspace, {
-    botAppId: "root-app",
-    botToken: "cm9vdC1hcHA.fixture.token",
-    channelId: "root-channel",
-    port: codex.port,
-    rootBotAppId: "root-app",
-    env: {
-      ROOT_ACCESS_FILE: path.join(rootStateDir, "access.json"),
-      ROOT_MULTI_CHANNEL: "1",
-    },
-  });
-
-  await bridge.waitForOutput(/Listening in #channel-root-channel/, 7000);
-  await injectMessageUntil(
-    workspace,
-    { channelId: "root-channel", content: "/restart", id: "root-restart-message" },
-    (state) => state.fixtures.discord.sends.some((send) => send.content.startsWith("Restarting root session")),
-    5000,
-  );
-  const result = await bridge.closed;
-  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  const state = await waitForState(
-    workspace,
-    (nextState) => Boolean(nextState.fixtures.tmux.sessions.root_agent),
-    5000,
-  );
-  assert.equal(state.fixtures.tmux.sessions.root_agent.env.CHANNEL_ID, "root-channel");
-  assert.equal(state.fixtures.tmux.sessions.root_agent.bridgeCommand, "node scripts/codex-bridge.js");
-});
-
 test("bridge stops typing after a non-retryable Codex error", async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, {

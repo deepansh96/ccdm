@@ -36,11 +36,14 @@ const DISCORD_GLOBAL_USER_IDS = new Set(
 );
 // Router backend (a router-transport Codex project): the tools are Router
 // operations in this project's channel, reached with the launch key file.
-// No Discord token is configured.
+// No Discord token is configured. For root Codex (`CCDM_ROUTER_ROLE=root`)
+// they act as root in the channel each call names; the Router enforces root's
+// channel scope, and the turn's channel grant still applies.
 const ROUTER_KEY_FILE = process.env.CCDM_ROUTER_KEY_FILE;
+const ROUTER_ROOT = Boolean(ROUTER_KEY_FILE) && process.env.CCDM_ROUTER_ROLE === "root";
 const ROUTER_PROJECT = process.env.CCDM_CODEX_PROJECT;
 
-if (ROUTER_KEY_FILE ? !ROUTER_PROJECT || !CHANNEL_ID : (!BOT_TOKEN && !READ_ONLY) || !CHANNEL_ID) {
+if (ROUTER_KEY_FILE ? (!ROUTER_ROOT && !ROUTER_PROJECT) || !CHANNEL_ID : (!BOT_TOKEN && !READ_ONLY) || !CHANNEL_ID) {
   process.stderr.write(`Missing ${ROUTER_KEY_FILE ? "CCDM_CODEX_PROJECT or CHANNEL_ID" : READ_ONLY ? "CHANNEL_ID" : "BOT_TOKEN or CHANNEL_ID"}\n`);
   process.exit(1);
 }
@@ -234,7 +237,7 @@ async function targetChannelId(args) {
   if (!args.channel_id) {
     throw new Error("channel_id is required in root multi-channel mode");
   }
-  if (!DISCORD_ACCESS_FILE) {
+  if (!DISCORD_ACCESS_FILE && !ROUTER_ROOT) {
     throw new Error("Discord access file is required in root multi-channel mode");
   }
   if (!DISCORD_CHANNEL_SCOPE_FILE || !DISCORD_CHANNEL_SCOPE_SECRET) {
@@ -260,6 +263,12 @@ async function targetChannelId(args) {
     scope = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
   } catch {
     throw new Error("Discord channel scope is missing, expired, or invalid");
+  }
+  if (ROUTER_ROOT) {
+    if (!DISCORD_GLOBAL_USER_IDS.has(String(scope.author_id)) && args.channel_id !== scope.channel_id) {
+      throw new Error(`Discord channel ${args.channel_id} is not allowed for this message`);
+    }
+    return args.channel_id;
   }
   const access = JSON.parse(await readFile(DISCORD_ACCESS_FILE, "utf8"));
   if (!Object.hasOwn(access.groups || {}, args.channel_id)) {
@@ -419,7 +428,9 @@ function routerClient() {
   if (!routerConnection) {
     routerConnection = (async () => {
       const key = (await readFile(ROUTER_KEY_FILE, "utf8")).trim();
-      const client = new RouterClient({ project: ROUTER_PROJECT, key, role: "project", listener: false });
+      const client = ROUTER_ROOT
+        ? new RouterClient({ key, role: "root", listener: false })
+        : new RouterClient({ project: ROUTER_PROJECT, key, role: "project", listener: false });
       client.on("end", () => {
         routerConnection = null;
       });
@@ -433,17 +444,19 @@ function routerClient() {
   return routerConnection;
 }
 
-async function routerRequest(op, args) {
+async function routerRequest(op, channelId, args) {
   const client = await routerClient();
   try {
-    return await client.request(op, { channel_id: CHANNEL_ID, ...args });
+    return await client.request(op, { channel_id: channelId, ...args });
   } catch (error) {
     throw new Error(`Router ${op} failed: ${error.code || error.message}`);
   }
 }
 
 // The bridge records its latest context percentage in the launch directory.
+// Root posts as the bot, which carries none.
 async function routerContextPct() {
+  if (ROUTER_ROOT) return undefined;
   const file = path.join(process.env.CCDM_ROUTER_STATE_DIR || "", "launches", ROUTER_PROJECT, "context.json");
   try {
     const pct = JSON.parse(await readFile(file, "utf8")).context_pct;
@@ -454,6 +467,7 @@ async function routerContextPct() {
 }
 
 async function handleRouterToolCall(name, args) {
+  const channelId = await targetChannelId(args);
   switch (name) {
     case "reply": {
       const { text, files, reply_to, scope_token, conversation_disposition } = args;
@@ -461,8 +475,8 @@ async function handleRouterToolCall(name, args) {
       if (conversation_disposition && !["progress", "input-needed"].includes(conversation_disposition)) {
         throw new Error("Unsupported conversation disposition");
       }
-      const reminderContext = await reminderAdapter.readActiveContext(CHANNEL_ID);
-      const result = await routerRequest("reply", {
+      const reminderContext = await reminderAdapter.readActiveContext(channelId);
+      const result = await routerRequest("reply", channelId, {
         text: text || "", files, reply_to, context_pct: await routerContextPct(),
       });
       if (reminderContext) {
@@ -481,29 +495,29 @@ async function handleRouterToolCall(name, args) {
     case "edit_message": {
       const { message_id, text, scope_token } = args;
       requireScopeToken(scope_token);
-      await routerRequest("edit_message", { message_id, text, context_pct: await routerContextPct() });
+      await routerRequest("edit_message", channelId, { message_id, text, context_pct: await routerContextPct() });
       return `edited (id: ${message_id})`;
     }
 
     case "react": {
       const { message_id, emoji, scope_token } = args;
       requireScopeToken(scope_token);
-      await routerRequest("react", { message_id, emoji });
+      await routerRequest("react", channelId, { message_id, emoji });
       return `reacted with ${emoji}`;
     }
 
     case "fetch_messages": {
-      const result = await routerRequest("fetch_messages", { limit: Math.min(args.limit || 20, 100) });
+      const result = await routerRequest("fetch_messages", channelId, { limit: Math.min(args.limit || 20, 100) });
       return result.text;
     }
 
     case "read_last_x_messages_in_channel": {
-      const result = await routerRequest("read_last_x_messages_in_channel", { count: args.count });
+      const result = await routerRequest("read_last_x_messages_in_channel", channelId, { count: args.count });
       return result.path ? `saved ${result.count} messages to ${result.path}` : result.text;
     }
 
     case "export_message_range": {
-      const result = await routerRequest("export_message_range", {
+      const result = await routerRequest("export_message_range", channelId, {
         start_message_id: args.start_message_id,
         ...(args.end_message_id ? { end_message_id: args.end_message_id } : {}),
       });
@@ -512,7 +526,7 @@ async function handleRouterToolCall(name, args) {
 
     case "download_attachment": {
       const { message_id, attachment_index = 0, save_dir } = args;
-      const att = await routerRequest("download_attachment", { message_id, attachment_index });
+      const att = await routerRequest("download_attachment", channelId, { message_id, attachment_index });
       const dir = save_dir || process.cwd();
       await mkdir(dir, { recursive: true });
       const filePath = path.join(dir, path.basename(att.name || att.id));

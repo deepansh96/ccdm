@@ -217,14 +217,18 @@ function createPoolTransport({ token, primaryChannelId, guildId }) {
 
 // Router events carry plain fields; the bridge sees them in its message and
 // reaction shapes. A management command arrives as its plain `/command` text.
-function createRouterTransport({ project, keyFile, launchDir, registryPath }) {
+// In the root role the transport is the Router's root client: it receives
+// root-channel messages and the owner's project-channel mentions, and may act
+// in any root or registered channel.
+function createRouterTransport({ project, role = "project", keyFile, launchDir, registryPath }) {
   let router = null;
   let scope = null;
   let messageHandler = null;
   let reactionHandler = null;
   let contextPct;
 
-  const channel = (channelId) => ({ id: channelId, name: project });
+  const root = role === "root";
+  const channel = (channelId) => ({ id: channelId, name: root ? channelId : project });
 
   function toMessage(event, content = event.content) {
     return {
@@ -274,7 +278,7 @@ function createRouterTransport({ project, keyFile, launchDir, registryPath }) {
 
     async connect() {
       const key = (await readFile(keyFile, "utf8")).trim();
-      router = new RouterClient({ project, key, role: "project" });
+      router = root ? new RouterClient({ key, role: "root" }) : new RouterClient({ project, key, role: "project" });
       router.on("message", (event) => messageHandler?.(toMessage(event)));
       router.on("command", (event) => messageHandler?.(toMessage(event, `/${event.command}`)));
       router.on("reaction", (event) => reactionHandler?.(toReaction(event)));
@@ -282,7 +286,7 @@ function createRouterTransport({ project, keyFile, launchDir, registryPath }) {
       router.on("reconnect", () => console.log("Router connection restored"));
       router.on("end", (error) => console.error(`Router session ended${error ? `: ${error.code || error.message}` : ""}`));
       scope = await router.connect();
-      return { userTag: `${project} via the CCDM Router`, scope };
+      return { userTag: `${root ? "root" : project} via the CCDM Router`, scope };
     },
 
     // Project replies post through the project's webhook, not as a bot user,
@@ -299,7 +303,8 @@ function createRouterTransport({ project, keyFile, launchDir, registryPath }) {
     },
 
     async fetchChannel(channelId) {
-      return scope && channelId === scope.channel_id ? channel(channelId) : null;
+      const inScope = root ? scope?.root_channels?.includes(channelId) : channelId === scope?.channel_id;
+      return inScope ? channel(channelId) : null;
     },
 
     async send(channelId, chunks) {

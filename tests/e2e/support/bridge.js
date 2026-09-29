@@ -339,8 +339,10 @@ export async function startFakeCodexServer(workspace, options = {}) {
             pendingTurnReleases.delete(turnId);
           };
           // `mcpReplyText`: the agent replies through the registered Discord
-          // MCP server's reply tool before the turn completes. `mcpEditText`
-          // then edits that reply with its edit_message tool.
+          // MCP server's reply tool before the turn completes, adding the
+          // arguments `mcpReplyArgs(input)` derives from the turn input (a root
+          // turn's channel grant). `mcpEditText` then edits that reply with its
+          // edit_message tool.
           const callTool = (tool, args) => {
             notify("item/started", {
               threadId: turnThreadId,
@@ -360,7 +362,7 @@ export async function startFakeCodexServer(workspace, options = {}) {
           };
           const finishTurn = plan.mcpReplyText
             ? () => {
-              callTool("reply", { text: plan.mcpReplyText }).then((result) => {
+              callTool("reply", { text: plan.mcpReplyText, ...plan.mcpReplyArgs?.(message.params.input) }).then((result) => {
                 const messageId = /\(id: ([^)]+)\)/.exec(result?.content?.[0]?.text ?? "")?.[1];
                 if (plan.mcpEditText && messageId) return callTool("edit_message", { message_id: messageId, text: plan.mcpEditText });
               }).then(completeTurn);

@@ -72,12 +72,18 @@ const FORWARDED_REACTIONS = new Set(["👍", "👎"]);
 // file path, never a Discord token, and the Router serves Discord.
 const ROUTER_KEY_FILE = process.env.CCDM_ROUTER_KEY_FILE || "";
 const ROUTER_MODE = Boolean(ROUTER_KEY_FILE);
-const ROUTER_PROJECT = process.env.CCDM_CODEX_PROJECT || "";
-const ROUTER_LAUNCH_DIR = ROUTER_MODE ? path.join(routerPaths.stateDir(), "launches", ROUTER_PROJECT) : null;
+// Root mode over the Router (restart-root-codex-agent.sh): the bridge is the
+// Router's root client, and root channels and allowed users come from the
+// registry.
+const ROUTER_ROOT = ROUTER_MODE && process.env.CCDM_ROUTER_ROLE === "root";
+const ROUTER_PROJECT = ROUTER_ROOT ? "" : process.env.CCDM_CODEX_PROJECT || "";
+const ROUTER_LAUNCH_DIR = ROUTER_MODE
+  ? path.join(routerPaths.stateDir(), "launches", ROUTER_ROOT ? ".root" : ROUTER_PROJECT)
+  : null;
 // The launcher waits on this file for the bridge's startup outcome.
 const LAUNCH_READY_FILE = process.env.CCDM_CHANNEL_READY_FILE || "";
 
-if (ROUTER_MODE ? !ROUTER_PROJECT || !CHANNEL_ID || !PROJECT_DIR : !BOT_TOKEN || !CHANNEL_ID || !PROJECT_DIR) {
+if (ROUTER_MODE ? (!ROUTER_ROOT && !ROUTER_PROJECT) || !CHANNEL_ID || !PROJECT_DIR : !BOT_TOKEN || !CHANNEL_ID || !PROJECT_DIR) {
   console.error(
     ROUTER_MODE
       ? "Missing required env vars: CCDM_CODEX_PROJECT, CHANNEL_ID, PROJECT_DIR"
@@ -104,7 +110,8 @@ let messageQueue = [];
 let bridgePaused = false;
 const discordTransport = ROUTER_MODE
   ? createRouterTransport({
-    project: ROUTER_PROJECT, keyFile: ROUTER_KEY_FILE, launchDir: ROUTER_LAUNCH_DIR, registryPath: REGISTRY_PATH,
+    project: ROUTER_PROJECT, role: ROUTER_ROOT ? "root" : "project", keyFile: ROUTER_KEY_FILE,
+    launchDir: ROUTER_LAUNCH_DIR, registryPath: REGISTRY_PATH,
   })
   : createPoolTransport({
     token: BOT_TOKEN,
@@ -359,6 +366,16 @@ function stripThisBotMention(text) {
 
 async function loadRootAccess(log = true) {
   if (!ROOT_MULTI_CHANNEL) return;
+  if (ROUTER_ROOT) {
+    const registry = JSON.parse(await readFile(REGISTRY_PATH, "utf8"));
+    const rootChannels = (registry.root_channels || []).map(String);
+    if (!rootChannels.includes(CHANNEL_ID)) {
+      throw new Error(`Primary root channel ${CHANNEL_ID} is not in root_channels in ${REGISTRY_PATH}`);
+    }
+    rootChannelAccess = new Map(rootChannels.map((channelId) => [channelId, { requireMention: false }]));
+    if (log) console.log(`Root multi-channel routing enabled for ${rootChannelAccess.size} channel(s)`);
+    return;
+  }
   const access = JSON.parse(await readFile(ROOT_ACCESS_FILE, "utf8"));
   const channelAccess = new Map(Object.entries(access.groups || {}));
   if (channelAccess.get(CHANNEL_ID)?.requireMention !== false) {
@@ -388,6 +405,9 @@ async function shouldHandleDiscordMessage(msg) {
     if (mentionsRootBot(msg)) return false;
     return true;
   }
+  // The Router delivers root only what addresses it: root-channel messages
+  // from allowed users and the owner's mentions in project channels.
+  if (ROUTER_ROOT) return true;
 
   try {
     await loadRootAccess(false);
@@ -1407,7 +1427,7 @@ async function registerDiscordMcp() {
         ...(ROUTER_MODE ? {
           CCDM_ROUTER_KEY_FILE: ROUTER_KEY_FILE,
           CCDM_ROUTER_STATE_DIR: routerPaths.stateDir(),
-          CCDM_CODEX_PROJECT: ROUTER_PROJECT,
+          ...(ROUTER_ROOT ? { CCDM_ROUTER_ROLE: "root" } : { CCDM_CODEX_PROJECT: ROUTER_PROJECT }),
         } : { BOT_TOKEN }),
         CHANNEL_ID,
         DISCORD_REPLY_TOKEN,
@@ -1417,7 +1437,8 @@ async function registerDiscordMcp() {
         CCDM_REMINDER_RECEIPTS_DIR: REMINDER_RECEIPTS_DIR,
         ...(ROOT_MULTI_CHANNEL ? {
           DISCORD_CHANNEL_OVERRIDE: "1",
-          DISCORD_ACCESS_FILE: ROOT_ACCESS_FILE,
+          // Over the Router, the Router enforces root's channel scope.
+          ...(ROUTER_ROOT ? {} : { DISCORD_ACCESS_FILE: ROOT_ACCESS_FILE }),
           DISCORD_CHANNEL_SCOPE_FILE: discordChannelScopeFile,
           DISCORD_CHANNEL_SCOPE_SECRET,
           DISCORD_GLOBAL_USER_IDS: [...ALLOWED_USER_IDS].join(","),

@@ -430,7 +430,7 @@ If you prefer to set things up by hand:
    ```bash
    ./restart-root-codex-agent.sh [channel_id]
    ```
-   The selected channel must already be in the root `access.json` `groups` map. The script checks this before stopping the current root agent. It keeps `restart-root-agent.sh` as the Claude rollback path.
+   Root Codex runs `scripts/codex-bridge.js` in root mode as a Router client, so the Router must be running. The selected channel must be in the registry's `root_channels` (omit it when there is only one); allowed users are the owner and `root_allowed_user_ids`. Run `node scripts/router.js migrate-root-config` once to move both from the root `access.json`. The script checks this before stopping the current root agent. It keeps `restart-root-agent.sh` as the Claude rollback path.
 
 ## Commands
 

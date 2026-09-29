@@ -1,13 +1,18 @@
 #!/bin/zsh
-# Restart the root Discord bot as a Codex bridge for one channel.
+# Restart the root agent as a Codex bridge in root mode, a Router client.
+# The bridge holds root's Router key and no Discord token; root channels and
+# allowed users come from the registry. Root admin scripts keep reading the
+# root token from root's Discord state directory.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REGISTRY="$SCRIPT_DIR/registry.json"
 ROOT_STATE_DIR="${ROOT_DISCORD_STATE_DIR:-$HOME/.claude/channels/discord}"
-ENV_FILE="$ROOT_STATE_DIR/.env"
-ACCESS_FILE="$ROOT_STATE_DIR/access.json"
+ROUTER_STATE_DIR="${CCDM_ROUTER_STATE_DIR:-$HOME/.local/state/ccdm/router}"
+ROOT_KEY_FILE="$ROUTER_STATE_DIR/keys/.root.key"
+ROOT_LAUNCH_DIR="$ROUTER_STATE_DIR/launches/.root"
+ROOT_READY_FILE="$ROOT_LAUNCH_DIR/ready.json"
 
 CHANNEL_ID="${1:-${ROOT_CODEX_CHANNEL_ID:-}}"
 WS_PORT="${ROOT_CODEX_WS_PORT:-18399}"
@@ -44,14 +49,14 @@ terminate_pids() {
 }
 
 find_root_listener_pids() {
-  python3 - "$ROOT_STATE_DIR" "$WS_PORT" "$BOT_APP_ID" <<'PY'
+  python3 - "$ROOT_STATE_DIR" "$WS_PORT" "$BOT_APP_ID" "$ROOT_KEY_FILE" <<'PY'
 import os
 import re
 import shlex
 import subprocess
 import sys
 
-state_dir, ws_port, bot_app_id = sys.argv[1:4]
+state_dir, ws_port, bot_app_id, root_key_file = sys.argv[1:5]
 target_state_dir = os.path.normpath(os.path.expanduser(state_dir))
 try:
     ps = subprocess.check_output(
@@ -123,7 +128,11 @@ def is_root_bridge(command: str) -> bool:
         len(argv) >= 2
         and os.path.basename(argv[0]) == "node"
         and os.path.normpath(argv[1]).endswith("scripts/codex-bridge.js")
-        and (has_env(command, "BOT_APP_ID", bot_app_id) or has_env(command, "WS_PORT", ws_port))
+        and (
+            (bot_app_id and has_env(command, "BOT_APP_ID", bot_app_id))
+            or has_env(command, "WS_PORT", ws_port)
+            or has_env(command, "CCDM_ROUTER_KEY_FILE", root_key_file)
+        )
     )
 
 def is_app_server(command: str) -> bool:
@@ -147,85 +156,46 @@ for line in ps.splitlines():
 PY
 }
 
-if [[ -z "$CHANNEL_ID" && -f "$ACCESS_FILE" ]]; then
-  CHANNEL_ID="$(python3 - "$ACCESS_FILE" <<'PY'
+# Unit-separated, so an empty field (no root_bot_app_id) keeps its place.
+IFS=$'\x1f' read -r CHANNEL_ID REGISTRY_USER_ID GUILD_ID REGISTRY_ROOT_APP_ID REGISTRY_ALLOWED_USER_IDS <<< "$(python3 - "$REGISTRY" "$CHANNEL_ID" <<'PY'
 import json
 import sys
 
-groups = json.load(open(sys.argv[1])).get("groups", {})
-root_channels = [
-    channel_id
-    for channel_id, config in groups.items()
-    if config.get("requireMention") is False
-]
-if len(root_channels) == 1:
-    print(root_channels[0])
-PY
-)"
-fi
-
-if [[ -z "$CHANNEL_ID" ]]; then
-  echo "Usage: $0 <channel_id> (or set ROOT_CODEX_CHANNEL_ID)" >&2
-  echo "Refusing to guess because this root bot can be allowed in multiple channels." >&2
-  exit 1
-fi
-
-if [[ ! -f "$ACCESS_FILE" ]]; then
-  echo "Missing root access file: $ACCESS_FILE" >&2
-  exit 1
-fi
-
-if ! python3 - "$ACCESS_FILE" "$CHANNEL_ID" <<'PY'
-import json
-import sys
-
-access_file, channel_id = sys.argv[1:3]
-groups = json.load(open(access_file)).get("groups", {})
-channel = groups.get(channel_id)
-if not isinstance(channel, dict) or channel.get("requireMention") is not False:
-    print(
-        f"Root channel {channel_id} is not configured as a no-mention channel in {access_file}. "
-        "Add it to groups with requireMention set to false before restarting.",
-        file=sys.stderr,
+registry_path, channel_id = sys.argv[1:3]
+registry = json.load(open(registry_path))
+root_channels = [str(channel) for channel in registry.get("root_channels") or []]
+if not root_channels:
+    sys.exit(
+        f"No root_channels in {registry_path}. "
+        "Run `node scripts/router.js migrate-root-config` to move them from root's access.json."
     )
-    sys.exit(1)
-PY
-then
-  exit 1
-fi
-
-if [[ ! -f "$ENV_FILE" ]]; then
-  echo "Missing root bot env file: $ENV_FILE" >&2
-  exit 1
-fi
-
-BOT_TOKEN="$(python3 - "$ENV_FILE" <<'PY'
-import sys
-
-for line in open(sys.argv[1]):
-    if line.startswith("DISCORD_BOT_TOKEN="):
-        print(line.split("=", 1)[1].strip())
-        break
-PY
-)"
-
-if [[ -z "$BOT_TOKEN" ]]; then
-  echo "DISCORD_BOT_TOKEN is missing from $ENV_FILE" >&2
-  exit 1
-fi
-
-IFS=$'\t' read -r REGISTRY_USER_ID GUILD_ID REGISTRY_ROOT_APP_ID <<< "$(python3 - "$REGISTRY" <<'PY'
-import json
-import sys
-
-registry = json.load(open(sys.argv[1]))
-print("\t".join([
-    str(registry.get("discord_user_id") or ""),
+if not channel_id:
+    if len(root_channels) != 1:
+        sys.exit(
+            f"Usage: restart-root-codex-agent.sh <channel_id> (or set ROOT_CODEX_CHANNEL_ID)\n"
+            "Refusing to guess because the registry lists several root channels."
+        )
+    channel_id = root_channels[0]
+if channel_id not in root_channels:
+    sys.exit(f"Root channel {channel_id} is not in root_channels in {registry_path}.")
+owner = str(registry.get("discord_user_id") or "")
+seen = set()
+allowed = []
+for user_id in [owner, *(registry.get("root_allowed_user_ids") or [])]:
+    user_id = str(user_id).strip()
+    if user_id and user_id not in seen:
+        seen.add(user_id)
+        allowed.append(user_id)
+print("\x1f".join([
+    channel_id,
+    owner,
     str(registry.get("guild_id") or ""),
     str(registry.get("root_bot_app_id") or ""),
+    ",".join(allowed),
 ]))
 PY
 )"
+[[ -n "$CHANNEL_ID" ]] || exit 1
 
 if CODEX_HOME_DIR="$(python3 "$SCRIPT_DIR/scripts/resolve-codex-home.py" "$REGISTRY" --root)"; then
   :
@@ -234,49 +204,15 @@ else
   exit "$resolver_status"
 fi
 
-ALLOWED_USER_IDS="${ROOT_CODEX_ALLOWED_USER_IDS:-$(python3 - "$REGISTRY_USER_ID" "$ACCESS_FILE" <<'PY'
-import json
-import sys
-
-ids = [sys.argv[1]]
-access_path = sys.argv[2]
-access = json.load(open(access_path))
-ids.extend(access.get("allowFrom") or [])
-seen = set()
-deduped = []
-for user_id in ids:
-    user_id = str(user_id).strip()
-    if user_id and user_id not in seen:
-        seen.add(user_id)
-        deduped.append(user_id)
-print(",".join(deduped))
-PY
-)}"
-
+ALLOWED_USER_IDS="${ROOT_CODEX_ALLOWED_USER_IDS:-$REGISTRY_ALLOWED_USER_IDS}"
 if [[ -z "$ALLOWED_USER_IDS" ]]; then
   echo "No allowed Discord user IDs found. Set ROOT_CODEX_ALLOWED_USER_IDS." >&2
   exit 1
 fi
 
-BOT_APP_ID="${ROOT_CODEX_BOT_APP_ID:-$(python3 - "$BOT_TOKEN" "$REGISTRY_ROOT_APP_ID" <<'PY'
-import base64
-import sys
-
-token = sys.argv[1]
-fallback = sys.argv[2]
-try:
-    token_id = token.split(".", 1)[0]
-    token_id += "=" * ((4 - len(token_id) % 4) % 4)
-    print(base64.urlsafe_b64decode(token_id).decode())
-except Exception:
-    print(fallback)
-PY
-)}"
-
-if [[ -z "$BOT_APP_ID" ]]; then
-  echo "Could not determine root bot app ID. Set ROOT_CODEX_BOT_APP_ID." >&2
-  exit 1
-fi
+# Only used to strip root's own mention from message text; the Router decides
+# which messages address root.
+BOT_APP_ID="${ROOT_CODEX_BOT_APP_ID:-$REGISTRY_ROOT_APP_ID}"
 
 # Kill the current root_agent tmux session, whether it is Claude or Codex.
 if tmux has-session -t root_agent 2>/dev/null; then
@@ -299,9 +235,67 @@ if [[ -n "$ORPHAN_PIDS" ]]; then
   echo "$ORPHAN_PIDS" | sed 's/^/  /'
   terminate_pids "${(@f)ORPHAN_PIDS}"
 fi
+# Replacing root's key revokes the root session still holding the old one.
+python3 - "$ROUTER_STATE_DIR" "$ROOT_LAUNCH_DIR" <<'PY'
+import os
+import secrets
+import sys
+from pathlib import Path
 
-if ! tmux new-session -d -s root_agent -- zsh -ic "cd '$SCRIPT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' BOT_TOKEN='$BOT_TOKEN' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$SCRIPT_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$ALLOWED_USER_IDS' GUILD_ID='$GUILD_ID' ROOT_BOT_APP_ID='$BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' BOT_DISPLAY_NAME='$BOT_DISPLAY_NAME' ROOT_MULTI_CHANNEL='1' ROOT_ACCESS_FILE='$ACCESS_FILE' node scripts/codex-bridge.js"; then
+router_state, launch_dir = map(Path, sys.argv[1:3])
+keys_dir = router_state / "keys"
+for directory in (router_state, keys_dir, launch_dir.parent, launch_dir):
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+# A previous launch's outcome is wrong for this one.
+(launch_dir / "ready.json").unlink(missing_ok=True)
+key_file = keys_dir / ".root.key"
+tmp = key_file.with_name(f".{key_file.name}.{os.getpid()}.tmp")
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write(secrets.token_urlsafe(32) + "\n")
+os.replace(tmp, key_file)
+PY
+
+if ! tmux new-session -d -s root_agent -- zsh -ic "cd '$SCRIPT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' CCDM_ROUTER_ROLE='root' CCDM_ROUTER_STATE_DIR='$ROUTER_STATE_DIR' CCDM_ROUTER_KEY_FILE='$ROOT_KEY_FILE' CCDM_CHANNEL_READY_FILE='$ROOT_READY_FILE' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$SCRIPT_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$ALLOWED_USER_IDS' GUILD_ID='$GUILD_ID' ROOT_BOT_APP_ID='$BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' BOT_DISPLAY_NAME='$BOT_DISPLAY_NAME' ROOT_MULTI_CHANNEL='1' node scripts/codex-bridge.js"; then
   echo "Failed to create tmux session 'root_agent'" >&2
+  python3 -c 'import sys; from pathlib import Path; Path(sys.argv[1]).unlink(missing_ok=True)' "$ROOT_KEY_FILE"
+  exit 1
+fi
+
+# The bridge reports its Router hello outcome once Codex is up and bootstrapped.
+if ! python3 - "$ROOT_READY_FILE" <<'PY'
+import json
+import os
+import subprocess
+import sys
+import time
+
+ready_file = sys.argv[1]
+deadline = time.monotonic() + float(os.environ.get("CCDM_CODEX_LAUNCH_TIMEOUT_S") or 120)
+while time.monotonic() < deadline:
+    try:
+        with open(ready_file) as f:
+            outcome = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        if subprocess.run(["tmux", "has-session", "-t", "=root_agent"],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+            sys.exit("Root Codex launch failed: bridge exited before saying hello")
+        time.sleep(0.2)
+        continue
+    if outcome.get("ok"):
+        print("Root bridge connected to the Router")
+        sys.exit(0)
+    sys.exit(f"Root Codex launch failed: {outcome.get('error')}")
+sys.exit("Root Codex launch failed: the bridge never said hello to the Router")
+PY
+then
+  echo "Root launch failed; cleaning up" >&2
+  tmux kill-session -t "=root_agent" 2>/dev/null || true
+  LEFTOVER_PIDS="$(find_root_listener_pids)"
+  [[ -z "$LEFTOVER_PIDS" ]] || terminate_pids "${(@f)LEFTOVER_PIDS}"
+  python3 -c 'import sys; from pathlib import Path; [Path(p).unlink(missing_ok=True) for p in sys.argv[1:]]' \
+    "$ROOT_KEY_FILE" "$ROOT_READY_FILE"
   exit 1
 fi
 

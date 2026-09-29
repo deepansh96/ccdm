@@ -89,12 +89,12 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     : connection.role === "observer" ? readKey(OBSERVER_KEY_FILE) : projectKey(connection.route.project);
 
   function forget(connection) {
-    if (connection.role === "root") {
+    if (connection.listener === false) {
+      opConnections.delete(connection);
+    } else if (connection.role === "root") {
       if (rootSession === connection) rootSession = null;
     } else if (connection.role === "observer") {
       if (observerSession === connection) observerSession = null;
-    } else if (connection.listener === false) {
-      opConnections.delete(connection);
     } else if (connection.route && sessions.get(connection.route.project) === connection) {
       sessions.delete(connection.route.project);
     }
@@ -128,11 +128,18 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     }
     if (frame.role === "root") {
       if (!keysMatch(await readKey(ROOT_KEY_FILE), frame.key)) return reject("unauthorized", "unknown root key");
-      if (rootSession) revoke(rootSession, "replaced");
       Object.assign(connection, {
         role: "root", route: { project: "root", channel_id: null }, key: frame.key, connectedAt: new Date().toISOString(),
       });
-      rootSession = connection;
+      // Root's op-only connection (root Codex's scoped MCP server) acts as
+      // root but receives no events and never replaces root's listener.
+      if (frame.listener === false) {
+        connection.listener = false;
+        opConnections.add(connection);
+      } else {
+        if (rootSession) revoke(rootSession, "replaced");
+        rootSession = connection;
+      }
       return send(connection.socket, {
         type: "hello_ok", v: PROTOCOL_VERSION, scope: { project: "root", root_channels: [...getTable().rootChannels] },
       });

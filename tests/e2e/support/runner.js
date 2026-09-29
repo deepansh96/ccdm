@@ -388,9 +388,10 @@ function parseCodexBridgeLaunch(shellCommand) {
   for (const envMatch of envText.matchAll(envRe)) {
     env[envMatch[1]] = envMatch[2] ?? envMatch[3];
   }
-  // A router launch carries the launch key file path instead of any bot identity.
+  // A router launch carries the launch key file path instead of any bot
+  // identity; root's names no project.
   const required = env.CCDM_ROUTER_KEY_FILE
-    ? ["CCDM_CODEX_PROJECT", "CCDM_ROUTER_STATE_DIR", "CHANNEL_ID", "PROJECT_DIR", "WS_PORT", "ALLOWED_USER_IDS", "GUILD_ID", "CODEX_HOME"]
+    ? [env.CCDM_ROUTER_ROLE === "root" ? "CCDM_ROUTER_ROLE" : "CCDM_CODEX_PROJECT", "CCDM_ROUTER_STATE_DIR", "CHANNEL_ID", "PROJECT_DIR", "WS_PORT", "ALLOWED_USER_IDS", "GUILD_ID", "CODEX_HOME"]
     : [
       "BOT_TOKEN",
       "CHANNEL_ID",
