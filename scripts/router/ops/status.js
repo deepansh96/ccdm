@@ -20,7 +20,13 @@ async function missingPermissions(ctx, channelId) {
   return ROOT_PERMISSIONS.filter(flag => !permissions?.has(flag));
 }
 
-async function status(ctx) {
+// Root's standing in one registered channel, router or pool, for `args.project`.
+async function target(ctx, project) {
+  const channelId = [...ctx.table.registered].find(([, name]) => name === project)?.[0];
+  return channelId ? { project, channel_id: channelId, missing_permissions: await missingPermissions(ctx, channelId) } : null;
+}
+
+async function status(ctx, args = {}) {
   const projects = [];
   for (const route of ctx.table.projects.values()) {
     const secret = await readWebhookSecret(ctx.stateDir, route.project);
@@ -43,6 +49,7 @@ async function status(ctx) {
     })),
     projects,
     scope_violations: ctx.violations(),
+    ...(args.project === undefined ? {} : { target: await target(ctx, String(args.project)) }),
   };
 }
 

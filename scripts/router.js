@@ -9,6 +9,7 @@
 //   scripts/router.js preflight               read-only supervision readiness as JSON (non-zero on blockers)
 //   scripts/router.js ensure-webhook <project>  find or create the project's webhook
 //   scripts/router.js delete-webhook <project>  delete the project's webhook and its token
+//   scripts/router.js probe <project>         post a connection notice through the project's webhook
 //   scripts/router.js migrate-root-config     copy root channels and users from root access.json
 const path = require("node:path");
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
@@ -18,6 +19,7 @@ const { discordRequest } = require("./router/discord-rest.js");
 const { acquireRouterLock } = require("./router/lock.js");
 const { classifyMessage, classifyReaction, observedMessage } = require("./router/inbound.js");
 const { preflight } = require("./router/preflight.js");
+const { probe } = require("./router/probe.js");
 const { registryPath, rootStateDir, rootToken, socketPath, stateDir } = require("./router/paths.js");
 const { DEFAULT_RELOAD_DEBOUNCE_MS, loadRoutingTable, watchRegistry } = require("./router/registry.js");
 const { assignmentChanged } = require("./router/reminders.js");
@@ -173,6 +175,12 @@ async function deleteWebhookCommand(project) {
   console.log(`deleted webhook ${result.name} id=${result.deleted.join(",")}`);
 }
 
+async function probeCommand(project) {
+  if (!project) throw new Error("usage: router.js probe <project>");
+  const result = await probe({ project, registryFile: registryPath(), stateDir: stateDir(), token: await rootToken() });
+  console.log(`probe message ${result.message_id} webhook_id=${result.webhook_id}`);
+}
+
 async function migrateRootConfigCommand() {
   const moved = await migrateRootConfig({ accessFile: path.join(rootStateDir(), "access.json"), registryFile: registryPath() });
   const fields = Object.entries(moved);
@@ -184,11 +192,12 @@ const [command = "serve", ...args] = process.argv.slice(2);
 const commands = {
   serve, status: () => status(args.includes("--json")), preflight: preflightCommand,
   "ensure-webhook": () => ensureWebhookCommand(args[0]), "delete-webhook": () => deleteWebhookCommand(args[0]),
+  probe: () => probeCommand(args[0]),
   "migrate-root-config": migrateRootConfigCommand,
 };
 
 if (!Object.hasOwn(commands, command)) {
-  console.error(`unknown command: ${command}\nusage: router.js serve | status [--json] | preflight | ensure-webhook <project> | delete-webhook <project> | migrate-root-config`);
+  console.error(`unknown command: ${command}\nusage: router.js serve | status [--json] | preflight | ensure-webhook <project> | delete-webhook <project> | probe <project> | migrate-root-config`);
   process.exit(2);
 }
 commands[command]().catch(error => {

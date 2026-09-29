@@ -404,8 +404,10 @@ function routeWebhooks(url, method, init) {
       state.fixtures.discord.messages.push(created);
     });
     if (url.searchParams.get("wait") !== "true") return response("", { status: 204 });
-    return json({ id: created.id, channel_id: created.channelId, content: created.content, webhook_id: webhook.id,
-      author: { id: webhook.id, username: created.username, bot: true } });
+    // A test can make Discord attribute the returned message to another webhook.
+    const returnedWebhookId = readState().fixtures?.discord?.webhookExecuteReturnsWebhookId ?? webhook.id;
+    return json({ id: created.id, channel_id: created.channelId, content: created.content, webhook_id: returnedWebhookId,
+      author: { id: returnedWebhookId, username: created.username, bot: true } });
   }
   return null;
 }
