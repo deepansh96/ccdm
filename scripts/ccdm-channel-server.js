@@ -101,12 +101,12 @@ async function hasCommandHooks() {
   } catch { return false; }
 }
 
-// This project's router Claude assignment, or null when the registry no
+// This project's Claude assignment, or null when the registry no
 // longer assigns the channel to it.
 async function reminderAssignment(channelId) {
   const assignment = await reminder.resolveAssignmentForChannel(channelId, { registryPath: REGISTRY_PATH }).catch(() => null);
-  return assignment?.project === process.env.CCDM_CLAUDE_PROJECT && assignment.project_type === "claude" &&
-    assignment.transport === "router" ? assignment : null;
+  return assignment?.project === process.env.CCDM_CLAUDE_PROJECT && assignment.project_type === "claude"
+    ? assignment : null;
 }
 
 async function writeCapabilityMarker(granted) {

@@ -21,13 +21,9 @@ function mentions(content, id) {
   return Boolean(id) && [`<@${id}>`, `<@!${id}>`].some(value => content.includes(value));
 }
 
-// A router project's agent speaks only through its own webhook; a pool
-// project's through its assigned bot.
+// A project's agent speaks only through its own Router webhook.
 function agentReply(message, found) {
-  if (found.transport === "router") {
-    return Boolean(found.webhook_id) && String(message.webhook_id ?? "") === String(found.webhook_id);
-  }
-  return String(message.author?.id || "") === String(found.bot_app_id);
+  return Boolean(found.webhook_id) && String(message.webhook_id ?? "") === String(found.webhook_id);
 }
 
 function classify(message, found, rootUserId, isClose) {

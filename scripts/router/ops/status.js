@@ -20,7 +20,7 @@ async function missingPermissions(ctx, channelId) {
   return ROOT_PERMISSIONS.filter(flag => !permissions?.has(flag));
 }
 
-// Root's standing in one registered channel, router or pool, for `args.project`.
+// Root's standing in one registered channel, for `args.project`.
 async function target(ctx, project) {
   const channelId = [...ctx.table.registered].find(([, name]) => name === project)?.[0];
   return channelId ? { project, channel_id: channelId, missing_permissions: await missingPermissions(ctx, channelId) } : null;

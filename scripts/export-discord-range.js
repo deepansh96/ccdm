@@ -2,7 +2,7 @@
 
 const { createWriteStream } = require("node:fs");
 const { mkdir, mkdtemp, readFile, writeFile } = require("node:fs/promises");
-const { tmpdir } = require("node:os");
+const { homedir, tmpdir } = require("node:os");
 const path = require("node:path");
 const { Readable } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
@@ -22,24 +22,20 @@ function validateIds(channelId, startId, endId) {
   }
 }
 
-async function botToken(channelId) {
-  if (process.env.DISCORD_BOT_TOKEN || process.env.BOT_TOKEN) {
-    return process.env.DISCORD_BOT_TOKEN || process.env.BOT_TOKEN;
+// Operator-run exports read only the root token from root's Discord state
+// directory; there are no per-project bot tokens.
+async function rootToken() {
+  const stateDir = (process.env.ROOT_DISCORD_STATE_DIR || "~/.claude/channels/discord").replace(/^~(?=$|\/)/, homedir());
+  let contents;
+  try {
+    contents = await readFile(path.join(stateDir, ".env"), "utf8");
+  } catch {
+    throw new Error("Cannot read root Discord credentials; check ROOT_DISCORD_STATE_DIR");
   }
-  if (process.env.DISCORD_STATE_DIR) {
-    try {
-      const env = await readFile(path.join(process.env.DISCORD_STATE_DIR, ".env"), "utf8");
-      const match = env.match(/^DISCORD_BOT_TOKEN=(.+)$/m);
-      if (match) return match[1].trim();
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-    }
-  }
-  const registry = JSON.parse(await readFile(path.join(__dirname, "..", "registry.json"), "utf8"));
-  const project = Object.values(registry.projects || {}).find((entry) => String(entry.channel_id) === channelId);
-  const bot = (registry.pool || []).find((entry) => entry.id === project?.bot_id);
-  if (!bot?.token) throw new Error("No bot token found; set DISCORD_BOT_TOKEN");
-  return bot.token;
+  const line = contents.split(/\r?\n/).find((entry) => entry.startsWith("DISCORD_BOT_TOKEN="));
+  const token = line?.slice("DISCORD_BOT_TOKEN=".length).trim().replace(/^(["'])(.*)\1$/, "$2");
+  if (!token || /\s/.test(token)) throw new Error("Root Discord state has no valid DISCORD_BOT_TOKEN");
+  return token;
 }
 
 async function discordGet(token, endpoint) {
@@ -143,7 +139,7 @@ async function exportRange({ token, channelId, startId, endId }) {
 async function main() {
   const [channelId, startId, endId] = process.argv.slice(2);
   validateIds(channelId, startId, endId);
-  const output = await exportRange({ token: await botToken(channelId), channelId, startId, endId });
+  const output = await exportRange({ token: await rootToken(), channelId, startId, endId });
   process.stdout.write(`${output}\n`);
 }
 

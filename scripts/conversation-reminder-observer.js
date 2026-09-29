@@ -1,16 +1,15 @@
 #!/usr/bin/env node
 "use strict";
 
-// This is a management-only observer. It never dispatches coding input. Pool
-// project channels are observed through its own Gateway login; router project
-// channels through the Router, as its read-only `observer` client.
+// This is a management-only observer. It never dispatches coding input. Every
+// project channel is observed through the Router, as its read-only `observer`
+// client, and root sends every reminder over Discord's REST API.
 const { execFile } = require("node:child_process");
 const crypto = require("node:crypto");
 const { mkdir, readFile, rename, writeFile } = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const { promisify } = require("node:util");
-const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const reminder = require("./conversation-reminder-adapter.js");
 const discovery = require("./conversation-reminder-discovery.js");
 const { RouterClient } = require("./router/client.js");
@@ -21,18 +20,12 @@ const script = path.join(__dirname, "conversation-reminder-service.py");
 const projectRoot = process.argv[process.argv.indexOf("--project-root") + 1] || path.resolve(__dirname, "..");
 const stateDir = process.argv[process.argv.indexOf("--state-dir") + 1] || path.join(os.homedir(), ".local/state/ccdm/conversation-reminders");
 const recoverOnce = process.argv.includes("--recover-once");
-// REST-only retired cleanup for assignment-changed; it never logs in to the Gateway.
+// REST-only retired cleanup for assignment-changed; it never connects to the Router.
 const cleanupRetiredOnce = process.argv.includes("--cleanup-retired-once");
 const cleanupProject = cleanupRetiredOnce ? process.argv[process.argv.indexOf("--project") + 1] : null;
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildMessageReactions, GatewayIntentBits.MessageContent],
-  partials: [Partials.Message, Partials.Reaction, Partials.User],
-});
 let busy = false;
 let stopping = false;
 let connected = false;
-let readyOnce = false;
 const nextActionAttempt = new Map();
 const healthPath = path.join(stateDir, "observer-health.json");
 const health = {};
@@ -53,9 +46,9 @@ const SUSPENSIONS = {
   "blocked-assigned-bot-permissions": "suspended-delivery-access",
 };
 let registryFingerprint = null;
-// Root's own user, from the Gateway when logged in, else from Discord's REST API.
+// Root's own user, from Discord's REST API.
 const rootUser = { id: null };
-const rootUserId = () => client.user?.id ?? rootUser.id;
+const rootUserId = () => rootUser.id;
 
 async function markHealth(project, state, generation) {
   if (health[project] === state) return;
@@ -106,53 +99,7 @@ async function assignment(channelId) {
     registryPath: path.join(projectRoot, "registry.json"),
   });
   if (!found || !found.owner_id) return null;
-  if (found.transport === "router") return routerAssignment(found);
-  if (!found.bot_app_id) return null;
-  const data = await registry();
-  const bot = data.pool?.filter(row => row?.id === found.bot_id);
-  if (bot?.length !== 1 || !bot[0].token || bot[0].assigned_to && bot[0].assigned_to !== found.project) {
-    await markHealth(found.project, "blocked-assignment", found.assignment_generation);
-    return null;
-  }
-  if (!(await adapterReady(found))) return null;
-  const channel = await client.channels.fetch(channelId).catch(() => null);
-  if (!channel?.permissionsFor) {
-    await markHealth(found.project, "blocked-observation-access", found.assignment_generation);
-    return null;
-  }
-  // During a Discord outage a guild can be unavailable, with no roles cached;
-  // treat that as lost access and retry on the next revalidation.
-  if (channel.guild && channel.guild.available === false) {
-    await markHealth(found.project, "blocked-observation-access", found.assignment_generation);
-    return null;
-  }
-  let botMember = found.bot_app_id;
-  if (channel.guild?.members?.fetch) {
-    botMember = await channel.guild.members.fetch(found.bot_app_id).catch(() => null);
-    if (!botMember) {
-      await markHealth(found.project, "blocked-assigned-bot-permissions", found.assignment_generation);
-      return null;
-    }
-  }
-  let rootPermissions, botPermissions;
-  try {
-    rootPermissions = channel.permissionsFor(client.user);
-    botPermissions = channel.permissionsFor(botMember);
-  } catch {
-    // A partially cached guild cannot resolve permissions yet.
-    await markHealth(found.project, "blocked-observation-access", found.assignment_generation);
-    return null;
-  }
-  if (!rootPermissions || !["ViewChannel", "ReadMessageHistory"].every(flag => rootPermissions.has(flag))) {
-    await markHealth(found.project, "blocked-observation-access", found.assignment_generation);
-    return null;
-  }
-  if (!botPermissions || !["ViewChannel", "ReadMessageHistory", "SendMessages", "AddReactions"].every(flag => botPermissions.has(flag))) {
-    await markHealth(found.project, "blocked-assigned-bot-permissions", found.assignment_generation);
-    return null;
-  }
-  await markHealth(found.project, "ready-observe-only", found.assignment_generation);
-  return { ...found, bot_token: bot[0].token, sender_id: found.bot_app_id };
+  return routerAssignment(found);
 }
 
 async function adapterReady(found) {
@@ -168,8 +115,8 @@ async function adapterReady(found) {
   return false;
 }
 
-// A router project is observed only while the Router connection is up, and
-// root sends its reminders.
+// A project is observed only while the Router connection is up, and root sends
+// its reminders.
 async function routerAssignment(found) {
   if (!routerObserver?.ready) {
     await markHealth(found.project, "blocked-observation-access", found.assignment_generation);
@@ -180,7 +127,7 @@ async function routerAssignment(found) {
   return { ...found, bot_token: await rootToken(), sender_id: rootUserId() };
 }
 
-// The Router connection for router project channels. Each worker start writes
+// The Router connection for project channels. Each worker start writes
 // a fresh observer key, so an older observer's connection is revoked.
 const ROUTER_RETRY_MS = 2000;
 let routerObserver = null;
@@ -197,11 +144,11 @@ async function writeObserverKey() {
   return key;
 }
 
-// Any Router outage may have dropped events: suspend every router project at
-// once, so it reconciles before any further send once the Router is back.
+// Any Router outage may have dropped events: suspend every project at once,
+// so it reconciles before any further send once the Router is back.
 async function suspendRouterProjects() {
   for (const project of Object.values((await registry()).projects || {})) {
-    if (project?.transport === "router" && project.channel_id) await assignment(String(project.channel_id));
+    if (project?.channel_id) await assignment(String(project.channel_id));
   }
 }
 
@@ -214,11 +161,11 @@ function connectRouter() {
       channelId: event.channel_id, messageId: event.message_id, authorId: event.author?.id,
       bot: Boolean(event.author?.bot || event.webhook_id), content: event.content,
       attachmentCount: event.attachment_count,
-    }, "router").catch(report("message")));
+    }).catch(report("message")));
     observer.on("reaction", event => observeOwnerReaction({
       channelId: event.channel_id, messageId: event.message_id, userId: event.user?.id, bot: false,
       emoji: event.emoji,
-    }, "router").catch(report("reaction")));
+    }).catch(report("reaction")));
     observer.on("disconnect", () => suspendRouterProjects().catch(report("suspension")));
     try {
       await observer.connect();
@@ -238,25 +185,10 @@ function connectRouter() {
   return routerStarting;
 }
 
-// Retired cleanup may use only the bot that served the retired assignment, and
-// only while that bot is not authorized for a different channel. Root sent a
-// retired router assignment's reminders, so root removes them.
-async function retiredCredentials(action) {
-  if (String(action.identity || "").startsWith("router:")) {
-    return rootToken().then(token => ({ token }), () => ({ reason: "root Discord credentials are unavailable" }));
-  }
-  const data = await registry();
-  const bots = Array.isArray(data.pool) ? data.pool.filter(row => row?.id === action.bot_id) : [];
-  if (bots.length !== 1 || !bots[0].token) return { reason: "retired bot credentials are no longer available" };
-  const projects = data.projects && typeof data.projects === "object" ? data.projects : {};
-  const assignedTo = bots[0].assigned_to;
-  const channels = Object.values(projects).filter(project => project?.bot_id === action.bot_id)
-    .map(project => String(project.channel_id));
-  if (assignedTo) channels.push(String(projects[assignedTo]?.channel_id));
-  if (channels.some(channel => channel !== action.channel_id)) {
-    return { reason: "retired bot is now authorized for another assignment" };
-  }
-  return { token: bots[0].token };
+// Root removes every retired reminder: its own, and a v7 `pool:` row's, whose
+// pool bot no longer exists (root's Manage Messages covers another author's).
+async function retiredCredentials() {
+  return rootToken().then(token => ({ token }), () => ({ reason: "root Discord credentials are unavailable" }));
 }
 
 async function reportLeftover(action, reason) {
@@ -275,7 +207,7 @@ async function cleanupRetired(project) {
   const result = { completed: [], inaccessible: [] };
   for (const action of JSON.parse(pending.stdout).actions) {
     if (!action.retired || action.kind !== "delete" || action.project !== project) continue;
-    const credentials = await retiredCredentials(action);
+    const credentials = await retiredCredentials();
     let reason = credentials.reason;
     if (credentials.token) {
       const url = `https://discord.com/api/v10/channels/${encodeURIComponent(action.channel_id)}` +
@@ -296,7 +228,7 @@ async function cleanupRetired(project) {
         }
         if (response.status === 401 || response.status === 403) {
           reason = response.status === 401
-            ? "retired bot credentials were rejected" : "retired bot no longer has access to the channel";
+            ? "root Discord credentials were rejected" : "root no longer has access to the channel";
           break;
         }
         reason = `Discord did not delete the retired reminder (HTTP ${response.status}); delete the message in Discord`;
@@ -328,12 +260,11 @@ async function cleanupRetired(project) {
   return result;
 }
 
-// One message in a project channel, from the Gateway (pool channels) or the
-// Router (router channels); each channel is observed through one of them only.
-async function observeOwnerMessage({ channelId, messageId, authorId, bot, content, attachmentCount }, via) {
+// One message in a project channel, from the Router.
+async function observeOwnerMessage({ channelId, messageId, authorId, bot, content, attachmentCount }) {
   if (bot) return;
   const found = await assignment(channelId);
-  if (!found || (found.transport === "router") !== (via === "router")) return;
+  if (!found) return;
   const close = closeCommand(content, found.bot_app_id, rootUserId());
   if (authorId !== found.owner_id) return;
   const context = { ...found, provider: "ccdm-root" };
@@ -355,21 +286,10 @@ async function observeOwnerMessage({ channelId, messageId, authorId, bot, conten
   });
 }
 
-function observeMessage(message) {
-  return observeOwnerMessage({
-    channelId: message.channel?.id, messageId: message.id, authorId: message.author?.id,
-    bot: Boolean(message.author?.bot), content: message.content, attachmentCount: message.attachments?.size ?? 0,
-  }, "gateway");
-}
-
-function reactionEmoji(reaction) {
-  return String(reaction.emoji?.id || reaction.emoji?.name || "") || undefined;
-}
-
-async function observeOwnerReaction({ channelId, messageId, userId, bot, emoji }, via) {
+async function observeOwnerReaction({ channelId, messageId, userId, bot, emoji }) {
   if (bot) return;
   const found = await assignment(channelId);
-  if (!found || (found.transport === "router") !== (via === "router") || userId !== found.owner_id) return;
+  if (!found || userId !== found.owner_id) return;
   // Any owner reaction acknowledges, including one on a recorded reminder.
   // The stable reaction identity lets the service merge this copy with the
   // Codex bridge's copy of the same Discord reaction.
@@ -377,13 +297,6 @@ async function observeOwnerReaction({ channelId, messageId, userId, bot, emoji }
     actor_id: userId, source_message_id: messageId, activity_kind: "reaction",
     reaction_emoji: emoji,
   });
-}
-
-function observeReaction(reaction, user) {
-  return observeOwnerReaction({
-    channelId: reaction.message?.channel?.id || reaction.message?.channelId, messageId: reaction.message?.id,
-    userId: user?.id, bot: Boolean(user?.bot), emoji: reactionEmoji(reaction),
-  }, "gateway");
 }
 
 // A lost reminder is identified only by evidence bound to its durable intent.
@@ -437,7 +350,7 @@ async function recoverIntents(scheduled = false) {
         continue;
       }
       unresolved.push({ project: intent.project, nonce: intent.nonce, reason: replay.outcome === "access"
-        ? "Discord refused the nonce replay; restore assigned bot access, then retry recover"
+        ? "Discord refused the nonce replay; restore root's channel access, then retry recover"
         : "the nonce replay got no usable answer; retrying while Discord's duplicate check still applies" });
       continue;
     }
@@ -460,7 +373,7 @@ async function recoverIntents(scheduled = false) {
       }
       if (!response.ok) {
         reason = response.status === 401 || response.status === 403
-          ? "Discord identity lookup denied; restore assigned bot access before retrying"
+          ? "Discord identity lookup denied; restore root's channel access before retrying"
           : "Discord identity lookup failed; retry recovery without resending";
         break;
       }
@@ -482,7 +395,7 @@ async function recoverIntents(scheduled = false) {
     }
     if (complete && candidates.length) {
       unresolved.push({ project: intent.project, nonce: intent.nonce, candidates,
-        reason: `${candidates.length} unrecorded 👀 message(s) from the assigned bot fall in the claim window, ` +
+        reason: `${candidates.length} unrecorded 👀 message(s) from root fall in the claim window, ` +
           "but no evidence binds them to this intent, so none was adopted. If a listed message is a stray " +
           "reminder, delete it in Discord and run recover; if it is an ordinary bot message, run " +
           `assignment-changed --project ${intent.project} to retire the unresolved intent` });
@@ -544,8 +457,8 @@ async function sendReminder(url, token, nonce) {
 }
 
 async function sideEffects(recoveryOnly = false) {
-  // While the Gateway is down no owner activity can be observed, so neither
-  // reconciliation nor delivery may run until the reconnect gap is recorded.
+  // While observation is suspended no owner activity can be observed, so neither
+  // reconciliation nor delivery may run until the gap is recorded.
   if (busy || stopping || (!recoveryOnly && !connected)) return;
   busy = true;
   try {
@@ -571,7 +484,7 @@ async function sideEffects(recoveryOnly = false) {
       let token;
       if (action.retired) {
         if (action.kind !== "delete") continue;
-        const credentials = await retiredCredentials(action);
+        const credentials = await retiredCredentials();
         if (!credentials.token) {
           await reportLeftover(action, credentials.reason);
           continue;
@@ -593,7 +506,7 @@ async function sideEffects(recoveryOnly = false) {
       });
       if (action.retired && (response.status === 401 || response.status === 403)) {
         await reportLeftover(action, response.status === 401
-          ? "retired bot credentials were rejected" : "retired bot no longer has access to the channel");
+          ? "root Discord credentials were rejected" : "root no longer has access to the channel");
         continue;
       }
       if (!response.ok && !(action.kind === "delete" && response.status === 404)) {
@@ -664,10 +577,6 @@ async function sideEffects(recoveryOnly = false) {
   }
 }
 
-client.on("messageCreate", message => observeMessage(message).catch(error =>
-  process.stderr.write(`Conversation observer message failed: ${error.message}\n`)));
-client.on("messageReactionAdd", (reaction, user) => observeReaction(reaction, user).catch(error =>
-  process.stderr.write(`Conversation observer reaction failed: ${error.message}\n`)));
 // Revalidate owner, uniqueness, access, and capability for every registered
 // project whenever the registry changes, and periodically so a stopped or
 // restarted Claude adapter is noticed without other channel traffic.
@@ -677,7 +586,7 @@ async function revalidate() {
   const source = await readFile(path.join(projectRoot, "registry.json"), "utf8");
   if (source === registryFingerprint && performance.now() - lastRevalidation < REVALIDATE_MS) return;
   lastRevalidation = performance.now();
-  await observeTransports(JSON.parse(source));
+  await connectRouter();
   for (const [name, project] of Object.entries(JSON.parse(source).projects || {})) {
     if (!project?.channel_id || !(await assignment(project.channel_id))) {
       if (!health[name]) await markHealth(name, "blocked-assignment");
@@ -686,8 +595,8 @@ async function revalidate() {
   registryFingerprint = source;
 }
 
-// Any disconnect, resume, or new session may have dropped events. Durably send
-// every ready channel back through restart reconciliation before further sends.
+// A sleep or clock jump may have dropped events. Durably send every ready
+// channel back through restart reconciliation before further sends.
 let gapChain = Promise.resolve();
 let gapSequence = 0;
 function observationGap(connectedNow) {
@@ -703,20 +612,14 @@ function observationGap(connectedNow) {
   });
   return gapChain;
 }
-for (const name of ["shardDisconnect", "shardReconnecting", "invalidated"]) {
-  client.on(name, () => observationGap(false));
-}
-client.on("shardResume", () => observationGap(true));
-// The first shardReady precedes "ready"; any later one is a new Gateway session.
-client.on("shardReady", () => { if (readyOnce) observationGap(true); });
 
 // Timers stop while the machine sleeps but the wall clock keeps going, and the
-// Gateway socket can look connected until a missed heartbeat is noticed. A tick
+// Router socket can look connected until the Router notices it is gone. A tick
 // whose wall-clock gap disagrees with its monotonic gap, or that arrives far too
 // late, is treated like a restart: nothing sends before restart reconciliation,
 // and overdue channels get spaced catch-ups.
 const WAKE_GAP_MS = 30000;
-// Long enough for discord.js to notice a dead socket (about one heartbeat).
+// Long enough for a dead connection to be noticed and replaced.
 const WAKE_SETTLE_MS = Number(process.env.CCDM_REMINDER_WAKE_SETTLE_MS) || 45000;
 let lastTick = null;
 function wakeDetected() {
@@ -743,18 +646,6 @@ function tick() {
   sideEffects(false);
 }
 
-// Router projects are observed through the Router, pool projects through the
-// Gateway; the Gateway login is skipped while every project is a router one.
-let gatewayStarted = false;
-async function observeTransports(data) {
-  const projects = Object.values(data.projects || {}).filter(Boolean);
-  if (projects.some(project => project.transport === "router")) await connectRouter();
-  if (!gatewayStarted && (projects.length === 0 || projects.some(project => project.transport !== "router"))) {
-    gatewayStarted = true;
-    await client.login(await rootToken());
-  }
-}
-
 let begun = false;
 async function begin() {
   if (begun) return;
@@ -764,22 +655,14 @@ async function begin() {
     try {
       const result = await sideEffects(true);
       process.stdout.write(`${JSON.stringify(result)}\n`);
-      client.destroy();
       process.exit(0);
     } catch (error) {
       process.stderr.write(`Conversation recovery unavailable: ${error.message}\n`);
-      client.destroy();
       process.exit(2);
     }
   }
   setInterval(tick, 250);
 }
-
-client.on("ready", async () => {
-  connected = true;
-  readyOnce = true;
-  await begin();
-});
 
 async function fetchRootUserId(token) {
   const response = await fetch("https://discord.com/api/v10/users/@me", {
@@ -792,9 +675,7 @@ async function fetchRootUserId(token) {
 
 async function start() {
   const token = await rootToken();
-  await observeTransports(await registry());
-  if (gatewayStarted) return;
-  // Router projects only: nothing observes through the Gateway.
+  await connectRouter();
   rootUser.id = await fetchRootUserId(token);
   connected = true;
   await begin();
@@ -805,7 +686,6 @@ function shutdown() {
   stopping = true;
   if (busy) return;
   routerObserver?.close();
-  client.destroy();
   process.exit(0);
 }
 process.on("SIGTERM", shutdown);

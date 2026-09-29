@@ -88,21 +88,12 @@ def assignment_for(registry: dict, project_name: str) -> dict:
         raise KeyError("project is not registered")
     owner_id = registry.get("discord_user_id")
     channel_id = project.get("channel_id")
-    if project.get("transport") == "router":
-        # A router project speaks through its webhook, and root delivers its
-        # reminders; the webhook identity stands where a pool bot's ID would.
-        webhook_id = project.get("webhook_id")
-        if not owner_id or not channel_id or not webhook_id:
-            raise ValueError("project assignment is incomplete or ambiguous")
-        speaker, app_id, bot = f"router:{webhook_id}", "", {}
-    else:
-        bot_id = project.get("bot_id")
-        pool = registry.get("pool")
-        matching_bots = [bot for bot in pool if isinstance(bot, dict) and bot.get("id") == bot_id] if isinstance(pool, list) else []
-        if not owner_id or not channel_id or not bot_id or len(matching_bots) != 1:
-            raise ValueError("project assignment is incomplete or ambiguous")
-        bot = matching_bots[0]
-        speaker, app_id = str(bot_id), str(bot.get("app_id") or "")
+    # Every project speaks through its Router webhook, whatever its
+    # `transport`, and root delivers its reminders.
+    webhook_id = project.get("webhook_id")
+    if not owner_id or not channel_id or not webhook_id:
+        raise ValueError("project assignment is incomplete or ambiguous")
+    speaker, app_id = f"router:{webhook_id}", ""
     identity = "\0".join((
         project_name,
         str(owner_id),
@@ -119,18 +110,12 @@ def assignment_for(registry: dict, project_name: str) -> dict:
         "project": project,
         "owner_id": str(owner_id),
         "channel_id": str(channel_id),
-        # Events name the speaker in `bot_id`: a pool bot, or `router:<webhook_id>`.
+        # Events name the speaker in `bot_id`: `router:<webhook_id>`.
         "bot_id": speaker,
         # The identity that speaks for the project; the Conversation store keys on it.
-        "identity": speaker if speaker.startswith("router:") else f"pool:{speaker}",
-        "bot": bot,
+        "identity": speaker,
         "generation": generation,
     }
-
-
-def can_deliver(assignment: dict) -> bool:
-    """Whether reminders have a sender: root for a router project, else the pool bot's token."""
-    return assignment["identity"].startswith("router:") or bool(assignment["bot"].get("token"))
 
 
 def private_directory(path: Path) -> None:

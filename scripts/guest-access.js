@@ -70,12 +70,6 @@ function rootToken() {
   return token;
 }
 
-function projectBot(registry, project) {
-  const bot = (registry.pool || []).find((entry) => entry.id === project.bot_id);
-  if (!bot) throw new Error(`registry.json is missing bot ${project.bot_id}`);
-  return bot;
-}
-
 function resolveProjects(registry, target) {
   const projects = Object.entries(registry.projects || {});
   if (!target) return projects;
@@ -92,36 +86,6 @@ function safeName(value) {
 
 function roleName(projectName, project) {
   return `ccdm-guest-${safeName(projectName)}-${safeName(project.channel_id)}`.slice(0, 100);
-}
-
-function effectiveUsers(registry, project) {
-  return unique([registry.discord_user_id, ...(project.guest_user_ids || [])]);
-}
-
-// Router projects have no bot of their own: the Router reads guests straight
-// from the registry, so only pool bots keep a per-bot access.json.
-function updateAccessJson(registry, project) {
-  if (project.transport === "router") return;
-  const bot = projectBot(registry, project);
-  const stateDir = expandHome(bot.state_dir);
-  const file = path.join(stateDir, "access.json");
-  const access = readJson(file, {
-    dmPolicy: "allowlist",
-    allowFrom: [],
-    groups: {},
-    pending: {},
-  });
-  const users = effectiveUsers(registry, project);
-  access.dmPolicy = access.dmPolicy || "allowlist";
-  access.allowFrom = unique([registry.discord_user_id]);
-  access.groups = access.groups || {};
-  access.groups[project.channel_id] = {
-    ...(access.groups[project.channel_id] || {}),
-    requireMention: false,
-    allowFrom: users,
-  };
-  access.pending = access.pending || {};
-  writeJson(file, access);
 }
 
 async function discordApi(token, route, options = {}) {
@@ -215,7 +179,6 @@ function persistGuestAccess(registry, project, roleId, userIds) {
   project.guest_role_id = roleId;
   project.guest_user_ids = unique(userIds);
   saveRegistry(registry);
-  updateAccessJson(registry, project);
 }
 
 async function prepareGuestAccess(registry, target, userId, options = {}) {
@@ -307,7 +270,6 @@ async function revoke(registry, target, userId) {
     if (Object.keys(project.guest_invites).length === 0) delete project.guest_invites;
   }
   saveRegistry(registry);
-  updateAccessJson(registry, project);
   console.log(`Revoked ${userId} guest access from ${projectName}.`);
 }
 
@@ -319,7 +281,6 @@ async function sync(registry, target) {
       project.guest_role_id = await ensureGuestRole(registry, projectName, project, token);
       saveRegistry(registry);
     }
-    updateAccessJson(registry, project);
     if (project.guest_role_id) {
       await syncDiscordPermissions(registry, project, project.guest_role_id, token);
       for (const userId of project.guest_user_ids || []) {

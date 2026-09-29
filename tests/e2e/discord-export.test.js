@@ -10,6 +10,13 @@ import { cleanup } from "./support/teardown.js";
 
 test.afterEach(cleanup);
 
+// The export tool reads only the root token from root's Discord state directory.
+function seedRootState(workspace, dir = path.join(workspace.homeDir, ".claude", "channels", "discord"), token = "root-token") {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, ".env"), `DISCORD_BOT_TOKEN=${token}\n`, { mode: 0o600 });
+  return dir;
+}
+
 test("exports an inclusive Discord message range and downloads attachments", async () => {
   const workspace = createWorkspace();
   const state = readState(workspace.stateDir);
@@ -20,10 +27,11 @@ test("exports an inclusive Discord message range and downloads attachments", asy
   ];
   state.fixtures.discord.attachments["https://cdn.discordapp.com/a1"] = { body: "attachment body" };
   writeState(state, workspace.stateDir);
+  seedRootState(workspace);
 
   const result = await runNodeEntrypoint(workspace, "scripts/export-discord-range.js", {
     args: ["100", "101", "103"],
-    env: bridgeChildEnv(workspace, { DISCORD_BOT_TOKEN: "bot-token" }),
+    env: bridgeChildEnv(workspace),
   });
 
   assert.equal(result.exitCode, 0, result.stderr);
@@ -36,9 +44,13 @@ test("exports an inclusive Discord message range and downloads attachments", asy
   const attachment = text.match(/^Saved: (.+)$/m)?.[1];
   assert.equal(fs.readFileSync(attachment, "utf8"), "attachment body");
   assert.equal(path.dirname(path.dirname(attachment)), path.dirname(output));
+  assert.deepEqual(
+    [...new Set(readState(workspace.stateDir).fixtures.discord.messageFetches.map(({ authorization }) => authorization))],
+    ["Bot root-token"],
+  );
 });
 
-test("exports from a start message through the latest message using the bot state token", async () => {
+test("exports from a start message through the latest message using an explicitly selected root state directory", async () => {
   const workspace = createWorkspace();
   const state = readState(workspace.stateDir);
   state.fixtures.discord.restMessages = [
@@ -47,17 +59,11 @@ test("exports from a start message through the latest message using the bot stat
     { id: "101", timestamp: "2026-07-13T10:00:00.000Z", content: "older", author: { id: "1", username: "Alice" }, attachments: [] },
   ];
   writeState(state, workspace.stateDir);
-  const discordStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord2");
-  fs.mkdirSync(discordStateDir, { recursive: true });
-  fs.writeFileSync(path.join(discordStateDir, ".env"), "DISCORD_BOT_TOKEN=bot-token\n", { mode: 0o600 });
+  const rootStateDir = seedRootState(workspace, path.join(workspace.homeDir, "custom root"), "custom-root-token");
 
   const result = await runNodeEntrypoint(workspace, "scripts/export-discord-range.js", {
     args: ["100", "102"],
-    env: bridgeChildEnv(workspace, {
-      BOT_TOKEN: "",
-      DISCORD_BOT_TOKEN: "",
-      DISCORD_STATE_DIR: discordStateDir,
-    }),
+    env: bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootStateDir }),
   });
 
   assert.equal(result.exitCode, 0, result.stderr);
@@ -65,6 +71,7 @@ test("exports from a start message through the latest message using the bot stat
   assert.match(text, /Message ID: 102/);
   assert.match(text, /Message ID: 103/);
   assert.doesNotMatch(text, /Message ID: 101/);
+  assert.equal(readState(workspace.stateDir).fixtures.discord.messageFetches[0].authorization, "Bot custom-root-token");
 });
 
 test("paginates ranges larger than Discord's 100-message page limit", async () => {
@@ -81,10 +88,11 @@ test("paginates ranges larger than Discord's 100-message page limit", async () =
     };
   });
   writeState(state, workspace.stateDir);
+  seedRootState(workspace);
 
   const result = await runNodeEntrypoint(workspace, "scripts/export-discord-range.js", {
     args: ["100", "1000", "1204"],
-    env: bridgeChildEnv(workspace, { DISCORD_BOT_TOKEN: "bot-token" }),
+    env: bridgeChildEnv(workspace),
   });
 
   assert.equal(result.exitCode, 0, result.stderr);
@@ -97,16 +105,19 @@ test("paginates ranges larger than Discord's 100-message page limit", async () =
   );
 });
 
-test("exports refuse an unregistered channel instead of borrowing bot1 credentials", async () => {
+test("exports never fall back to a pool bot token when root credentials are missing", async () => {
   const workspace = createWorkspace();
+  const poolStateDir = seedRootState(workspace, path.join(workspace.homeDir, ".claude", "channels", "discord2"), "pool-state-token");
   fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), JSON.stringify({
-    pool: [{ id: "bot1", token: "project-only-token" }], projects: {},
+    pool: [{ id: "bot2", token: "pool-registry-token", state_dir: poolStateDir }],
+    projects: { alpha: { channel_id: "100", bot_id: "bot2" } },
   }));
   const result = await runNodeEntrypoint(workspace, "scripts/export-discord-range.js", {
     args: ["100", "101"],
-    env: bridgeChildEnv(workspace, { BOT_TOKEN: "", DISCORD_BOT_TOKEN: "", DISCORD_STATE_DIR: "" }),
+    env: bridgeChildEnv(workspace, { BOT_TOKEN: "", DISCORD_BOT_TOKEN: "", DISCORD_STATE_DIR: poolStateDir }),
   });
   assert.notEqual(result.exitCode, 0);
-  assert.match(result.stderr, /No bot token found/);
+  assert.match(result.stderr, /Cannot read root Discord credentials/);
+  assert.doesNotMatch(result.stderr, /pool-/);
   assert.deepEqual(readState(workspace.stateDir).fixtures.discord.messageFetches, []);
 });

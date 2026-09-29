@@ -11,15 +11,16 @@ import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => cleanup());
 
-// Switching a project between the Bot Pool and the Router: the real reminder
-// service CLI, the real Router, and the fake Discord. `ensure-webhook` gives
-// demo `fake-webhook-1`; root's Gateway user is `fixture-bot-user-id`.
+// A project that was served by a Bot Pool bot is now served through the
+// Router: the real reminder service CLI, the real Router, and the fake
+// Discord. `ensure-webhook` gives demo `fake-webhook-1`; root's Gateway user is
+// `fixture-bot-user-id`. There is no pool, so the pool bot's history exists
+// only as the v7 store rows it left behind, which the tests seed directly.
 function switchWorkspace(demo = {}) {
   const workspace = createRouterWorkspace({
     discord_user_id: OWNER_ID,
     guild_id: "guild-id",
-    pool: [{ id: "bot", app_id: "app", token: "pool-bot-token", assigned_to: "demo" }],
-    projects: { demo: { type: "codex", bot_id: "bot", channel_id: "demo-channel", assignment_generation: "gen-1",
+    projects: { demo: { type: "codex", channel_id: "demo-channel", assignment_generation: "gen-1",
       screen_name: "demo_codex", ...demo } },
   });
   fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
@@ -35,7 +36,6 @@ function switchWorkspace(demo = {}) {
 
 const registryFile = (context) => path.join(context.workspace.repoDir, "registry.json");
 const readRegistry = (context) => JSON.parse(fs.readFileSync(registryFile(context), "utf8"));
-const writeRegistry = (context, registry) => fs.writeFileSync(registryFile(context), JSON.stringify(registry, null, 2));
 
 async function service(context, name, args = []) {
   const result = await runScript(context.workspace, "scripts/conversation-reminder-service.py", {
@@ -48,7 +48,7 @@ async function service(context, name, args = []) {
 
 async function event(context, type, id, time, fields) {
   const value = { schema_version: 1, event_id: id, event_type: type, project: "demo", channel_id: "demo-channel",
-    bot_id: "bot", assignment_generation: "gen-1", provider: "codex", event_time: time,
+    bot_id: "router:fake-webhook-1", assignment_generation: "gen-1", provider: "codex", event_time: time,
     event_order: `${time}:${id}`, adapter_instance_id: "test-adapter", ...fields };
   const result = await runScript(context.workspace, "scripts/conversation-reminder-events.py", {
     args: ["ingest", "--project-root", context.workspace.repoDir, "--state-dir", context.stateDir],
@@ -58,8 +58,20 @@ async function event(context, type, id, time, fields) {
   assert.equal(JSON.parse(result.stdout).status, "committed");
 }
 
-// The pool bot answered the owner's question at 10:00; the owner has not replied.
-async function awaitingOwner(context) {
+function sql(context, script) {
+  const result = spawnSync("python3", ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.commit()",
+    path.join(context.stateDir, "conversations.sqlite3"), script], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+}
+
+// The pool bot answered the owner's question at 10:00 and reminded at 11:00;
+// the owner has not replied. The exchange is ingested under the project's
+// webhook, then its row is rewritten to what the pool worker left in the v7
+// store: the `pool:bot` identity, one reminder sent, the next due at 13:00.
+// The pool reminder is still in the channel.
+async function pooledHistory(context) {
+  const ensured = await runRouterCli(context.workspace, ["ensure-webhook", "demo"]);
+  assert.equal(ensured.exitCode, 0, ensured.stderr || ensured.stdout);
   await event(context, "owner_activity", "owner-1", "2026-09-24T09:00:00Z",
     { actor_id: OWNER_ID, source_message_id: "question", activity_kind: "message" });
   const turn = { provider_session_id: "session", provider_turn_id: "turn", interaction_id: "question" };
@@ -69,9 +81,13 @@ async function awaitingOwner(context) {
     { ...turn, delivered_message_ids: ["answer"] });
   await service(context, "sync");
   // Discovery belongs to its own suite; seed only its outcome.
-  const seeded = spawnSync("python3", ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute(\"UPDATE conversations SET reconciliation_status='ready'\"); db.commit()",
-    path.join(context.stateDir, "conversations.sqlite3")], { encoding: "utf8" });
-  assert.equal(seeded.status, 0, seeded.stderr);
+  sql(context, `UPDATE conversations SET reconciliation_status='ready', identity='pool:bot',
+    reminder_message_id='pool-reminder', due_at='2026-09-24T13:00:00Z', consecutive_reminders=1,
+    revision=revision+1`);
+  const state = readState(context.workspace.stateDir);
+  state.fixtures.discord.messages = [...(state.fixtures.discord.messages ?? []), { id: "pool-reminder",
+    channelId: "demo-channel", authorization: "Bot pool-bot-token", content: "👀" }];
+  writeState(state, context.workspace.stateDir);
 }
 
 async function waitForStatus(context, predicate) {
@@ -106,91 +122,62 @@ async function nextReminder(context, previous) {
 
 const deletes = (context) => (readState(context.workspace.stateDir).fixtures.discord.deletes ?? [])
   .map((row) => [row.messageId, row.authorization]);
+const reminders = (context) => readState(context.workspace.stateDir).fixtures.discord.messages
+  .filter((row) => row.content === "👀").map((row) => [row.id, row.authorization, Boolean(row.deleted)]);
 
-test("switching to the Router retires the pool reminder with the pool bot, and root reminds under the webhook identity", async () => {
+test("switching a pool conversation to the Router carries it to the webhook identity, root deletes the pool reminder, and root reminds", async () => {
   const context = switchWorkspace();
-  await awaitingOwner(context);
+  await pooledHistory(context);
+  const registry = readRegistry(context);
+  assert.equal(registry.pool, undefined);
+  assert.deepEqual([registry.projects.demo.webhook_id, registry.projects.demo.bot_id, registry.projects.demo.transport],
+    ["fake-webhook-1", undefined, undefined]);
   await startRouter(context.workspace);
   const running = startWorker(context);
-  const pooled = await nextReminder(context, null);
-  assert.deepEqual([pooled.sent.channelId, pooled.sent.authorization, pooled.sent.content],
-    ["demo-channel", "Bot pool-bot-token", "👀"]);
 
-  const ensured = await runRouterCli(context.workspace, ["ensure-webhook", "demo"]);
-  assert.equal(ensured.exitCode, 0, ensured.stderr || ensured.stdout);
-  const registry = readRegistry(context);
-  registry.projects.demo.transport = "router";
-  writeRegistry(context, registry);
   // Until the generation changes, nothing is sent and status names the fix.
-  const pending = await service(context, "status");
-  assert.equal(pending.conversations.demo.identity, "pool:bot");
+  const pending = await waitForStatus(context, (current) => current.worker_running);
+  assert.deepEqual([pending.conversations.demo.identity, pending.conversations.demo.reminder_message_id],
+    ["pool:bot", "pool-reminder"]);
   assert.ok(pending.readiness.projects.demo.blockers.includes(
     "assignment: the project's transport changed; run assignment-changed --project demo"));
+  assert.deepEqual(reminders(context), [["pool-reminder", "Bot pool-bot-token", false]]);
 
   const changed = await service(context, "assignment-changed", ["--project", "demo"]);
   assert.deepEqual(changed.retired_generations, ["gen-1"]);
   assert.notEqual(changed.assignment_generation, "gen-1");
   assert.equal(readRegistry(context).projects.demo.assignment_generation, changed.assignment_generation);
-  // Either the change workflow or the running worker deletes it, always as the pool bot.
-  assert.deepEqual([...changed.retired_cleanup.completed, ...changed.retired_cleanup.inaccessible], [pooled.id]);
+  // Either the change workflow or the running worker deletes it, always as root.
+  assert.deepEqual([...changed.retired_cleanup.completed, ...changed.retired_cleanup.inaccessible], ["pool-reminder"]);
   await waitForStatus(context, (current) => current.retired_assignments?.find((row) =>
-    row.assignment_generation === "gen-1")?.cleanup.completed.includes(pooled.id));
-  assert.deepEqual([...new Set(deletes(context).map(String))], [[pooled.id, "Bot pool-bot-token"]].map(String));
+    row.assignment_generation === "gen-1")?.cleanup.completed.includes("pool-reminder"));
+  assert.deepEqual([...new Set(deletes(context).map(String))], [["pool-reminder", `Bot ${ROOT_TOKEN}`]].map(String));
+  assert.deepEqual(reminders(context), [["pool-reminder", "Bot pool-bot-token", true]]);
+  // The retired pool generation stays readable as history.
+  const history = (await service(context, "status")).retired_assignments.find((row) => row.assignment_generation === "gen-1");
+  assert.equal(history.identity, "pool:bot");
   // The open conversation keeps its state under the new identity.
   const switched = (await service(context, "status")).conversations.demo;
   assert.deepEqual([switched.identity, switched.assignment_generation, switched.state, switched.response_message_id,
-    switched.reminder_message_id],
-  ["router:fake-webhook-1", changed.assignment_generation, "awaiting-owner", "answer", null]);
+    switched.reminder_message_id, switched.consecutive_reminders],
+  ["router:fake-webhook-1", changed.assignment_generation, "awaiting-owner", "answer", null, 1]);
 
-  // Two hours after the first reminder, root sends the next one.
+  // Two hours after the pool reminder, root sends the next one.
   context.setClock("2026-09-24T13:01:00Z");
-  const routed = await nextReminder(context, pooled.id);
+  const routed = await nextReminder(context, "pool-reminder");
   assert.deepEqual([routed.sent.channelId, routed.sent.authorization, routed.sent.content],
     ["demo-channel", `Bot ${ROOT_TOKEN}`, "👀"]);
   assert.equal(routed.status.conversations.demo.identity, "router:fake-webhook-1");
-  await stopWorker(context, running);
-});
-
-test("rolling back to the pool issues another generation, retires root's reminder, and the pool bot reminds again", async () => {
-  const context = switchWorkspace();
-  await awaitingOwner(context);
-  await startRouter(context.workspace);
-  const ensured = await runRouterCli(context.workspace, ["ensure-webhook", "demo"]);
-  assert.equal(ensured.exitCode, 0, ensured.stderr || ensured.stdout);
-  const registry = readRegistry(context);
-  registry.projects.demo.transport = "router";
-  writeRegistry(context, registry);
-  const forward = await service(context, "assignment-changed", ["--project", "demo"]);
-  const running = startWorker(context);
-  const routed = await nextReminder(context, null);
-  assert.deepEqual([routed.sent.authorization, routed.status.conversations.demo.identity],
-    [`Bot ${ROOT_TOKEN}`, "router:fake-webhook-1"]);
-
-  const rollback = readRegistry(context);
-  delete rollback.projects.demo.transport;
-  writeRegistry(context, rollback);
-  const back = await service(context, "assignment-changed", ["--project", "demo"]);
-  assert.deepEqual(back.retired_generations, [forward.assignment_generation]);
-  assert.ok(![forward.assignment_generation, "gen-1"].includes(back.assignment_generation));
-  await waitForStatus(context, (current) => current.retired_assignments?.find((row) =>
-    row.assignment_generation === forward.assignment_generation)?.cleanup.completed.includes(routed.id));
-  assert.deepEqual([...new Set(deletes(context).map(String))], [[routed.id, `Bot ${ROOT_TOKEN}`]].map(String));
-  const restored = (await service(context, "status")).conversations.demo;
-  assert.deepEqual([restored.identity, restored.assignment_generation, restored.state, restored.reminder_message_id],
-    ["pool:bot", back.assignment_generation, "awaiting-owner", null]);
-
-  context.setClock("2026-09-24T13:01:00Z");
-  const pooled = await nextReminder(context, routed.id);
-  assert.deepEqual([pooled.sent.channelId, pooled.sent.authorization, pooled.sent.content],
-    ["demo-channel", "Bot pool-bot-token", "👀"]);
-  assert.equal(pooled.status.conversations.demo.identity, "pool:bot");
+  // Only the seeded pool reminder ever carried the pool bot's token.
+  assert.deepEqual(reminders(context),
+    [["pool-reminder", "Bot pool-bot-token", true], [routed.id, `Bot ${ROOT_TOKEN}`, false]]);
   await stopWorker(context, running);
 });
 
 const routerBlockers = (report) => report.readiness.projects.demo.router;
 
 test("status and preflight name each missing router prerequisite with its fix, and show ready once all are present", async () => {
-  const context = switchWorkspace({ transport: "router" });
+  const context = switchWorkspace();
   const preflight = async () => {
     const result = await runScript(context.workspace, "scripts/conversation-reminder-service.py", {
       args: ["preflight", "--project-root", context.workspace.repoDir, "--state-dir", context.stateDir],

@@ -60,6 +60,35 @@ test("an owner message in a router project channel reaches only that project's s
   assert.deepEqual(beta.events, []);
 });
 
+test("a registry with no transport fields and no pool routes every project through the Router", async () => {
+  const workspace = createRouterWorkspace({
+    discord_user_id: OWNER_ID,
+    guild_id: "guild-id",
+    projects: {
+      demo: { channel_id: "demo-channel", type: "claude" },
+      beta: { channel_id: "beta-channel", type: "codex" },
+    },
+  });
+  writeProjectKey(workspace, "demo", "demo-key");
+  writeProjectKey(workspace, "beta", "beta-key");
+  const router = await startRouter(workspace);
+  const demo = await connectSession(workspace, "demo", "demo-key");
+  const beta = await connectSession(workspace, "beta", "beta-key");
+
+  for (const [id, channelId] of [["demo-message", "demo-channel"], ["beta-message", "beta-channel"]]) {
+    injectDiscordMessage(workspace, {
+      id, channelId, content: `hello ${channelId}`, author: { id: OWNER_ID, username: "Owner" },
+    });
+  }
+
+  await waitFor(() => demo.events.length > 0 && beta.events.length > 0,
+    () => `both project events; router:\n${router.stdout}\n${router.stderr}`);
+  assert.deepEqual(demo.events.map(({ message_id, channel_id }) => ({ message_id, channel_id })),
+    [{ message_id: "demo-message", channel_id: "demo-channel" }]);
+  assert.deepEqual(beta.events.map(({ message_id, channel_id }) => ({ message_id, channel_id })),
+    [{ message_id: "beta-message", channel_id: "beta-channel" }]);
+});
+
 test("the network guard permits Unix sockets inside the Test Workspace and blocks other egress", async () => {
   const workspace = createRouterWorkspace();
   const inside = path.join(workspace.tmpRoot, "probe.sock");

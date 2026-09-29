@@ -46,8 +46,6 @@ async function main() {
     registryPath: path.join(root, "registry.json"),
   });
   if (!assignment || assignment.project !== project || assignment.project_type !== "claude") return;
-  // Every Claude launch is a Router launch; a pool assignment has no Claude session.
-  if (assignment.transport !== "router") return;
   const context = { ...assignment, provider: "claude", provider_session_id: launchId };
   if (input.hook_event_name === "SessionStart") {
     await fs.mkdir(path.dirname(bindingPath), { recursive: true, mode: 0o700 });

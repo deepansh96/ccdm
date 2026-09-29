@@ -3,44 +3,60 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { createWorkspace, runScript } from "./support/runner.js";
-import { bridgeChildEnv, waitForState } from "./support/bridge.js";
+import { runScript } from "./support/runner.js";
+import { injectDiscordMessage, waitForState } from "./support/bridge.js";
+import { ROOT_TOKEN, createRouterWorkspace, routerEnv, runRouterCli, startRouter } from "./support/router.js";
 import { readState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => cleanup());
 
 // Restart, reconnect, and re-enable scenarios drive the real foreground service
-// against the stateful Discord history fake with a controllable clock. Expected
-// times come from literal timelines, never from the service's own calculation.
+// and the real Router against the stateful Discord history fake with a
+// controllable clock. Expected times come from literal timelines, never from
+// the service's own calculation. Every project is a Router project that speaks
+// through the webhook ensure-webhook gives it, so its identity is
+// `router:<webhook_id>`, and root sends, acknowledges, and deletes with its token.
 
-function setup(workspace, projects = { demo: "channel" }) {
+// Each project's webhook id, from the current test's registry.
+const webhooks = {};
+const hook = name => webhooks[name];
+
+async function setup(projects = { demo: "channel" }) {
   const names = Object.keys(projects);
-  fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), JSON.stringify({
+  const workspace = createRouterWorkspace({
     discord_user_id: "owner", guild_id: "guild",
-    pool: names.map(name => ({ id: `bot-${name}`, app_id: `app-${name}`, token: `token-${name}` })),
     projects: Object.fromEntries(names.map(name => [name, {
-      type: "codex", bot_id: `bot-${name}`, channel_id: projects[name], assignment_generation: `gen-${name}`,
+      type: "codex", channel_id: projects[name], assignment_generation: `gen-${name}`,
     }])),
-  }), { mode: 0o600 });
-  const rootState = path.join(workspace.homeDir, "root-discord");
-  fs.mkdirSync(rootState, { recursive: true });
-  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  });
+  for (const name of Object.keys(webhooks)) delete webhooks[name];
+  for (const name of names) {
+    const result = await runRouterCli(workspace, ["ensure-webhook", name]);
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  }
+  const registry = JSON.parse(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"));
+  for (const name of names) webhooks[name] = registry.projects[name].webhook_id;
   const clockFile = path.join(workspace.tmpDir, "reminder-clock");
-  const env = bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
-    CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile });
-  return { stateDir: path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders"),
-    clockFile, env, setClock: value => fs.writeFileSync(clockFile, value) };
+  const context = { stateDir: path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders"),
+    clockFile, env: routerEnv(workspace, { CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile,
+      CCDM_ROUTER_RECONNECT_MIN_MS: "100", CCDM_ROUTER_RECONNECT_MAX_MS: "200" }),
+    setClock: value => fs.writeFileSync(clockFile, value), router: null };
+  return { workspace, context };
 }
 
+const rootEnvFile = workspace => path.join(workspace.homeDir, ".claude", "channels", "discord", ".env");
+
+// A message authored by a project's webhook is that project's agent reply.
 function message(id, timestamp, author, content = "text", extra = {}) {
+  const webhook = Object.values(webhooks).includes(author);
   return { id, timestamp, content, type: 0, attachments: [],
-    author: { id: author, bot: author.startsWith("app-") }, ...extra };
+    author: { id: author, bot: webhook }, ...(webhook ? { webhook_id: author } : {}), ...extra };
 }
 
-// An owner question at 08:00 answered by the assigned bot at 08:05.
+// An owner question at 08:00 answered by the project's webhook at 08:05.
 function answered(name, prefix = name) {
-  return [message(`${prefix}-2`, "2026-09-20T08:05:00Z", `app-${name}`, "Done"),
+  return [message(`${prefix}-2`, "2026-09-20T08:05:00Z", hook(name), "Done"),
     message(`${prefix}-1`, "2026-09-20T08:00:00Z", "owner", "Please do it")];
 }
 
@@ -51,7 +67,7 @@ function seedHistory(workspace, history, extra = {}) {
   writeState(state, workspace.stateDir);
 }
 
-// A message sent while nothing observed the Gateway exists only in history.
+// A message sent while nothing observed the Router exists only in history.
 function missed(workspace, channelId, raw) {
   const state = readState(workspace.stateDir);
   state.fixtures.discord.history[channelId].unshift(raw);
@@ -66,10 +82,12 @@ async function command(workspace, context, name, extra = []) {
   return JSON.parse(result.stdout);
 }
 
-function startWorker(workspace, context) {
+// The worker observes through the Router, so one runs before the first worker starts.
+async function startWorker(workspace, context) {
+  context.router ??= await startRouter(workspace);
   return runScript(workspace, "scripts/conversation-reminder-service.py", {
     args: ["run", "--project-root", workspace.repoDir, "--state-dir", context.stateDir],
-    env: context.env, timeoutMs: 30000,
+    env: context.env, timeoutMs: 120000,
   });
 }
 
@@ -103,8 +121,7 @@ async function discoveredThenStopped(workspace, context, names) {
 }
 
 test("downtime catch-up sends one reminder per overdue channel, spaced globally, anchored to its send", async () => {
-  const workspace = createWorkspace();
-  const context = setup(workspace, { alpha: "alpha-channel", beta: "beta-channel", gamma: "gamma-channel" });
+  const { workspace, context } = await setup({ alpha: "alpha-channel", beta: "beta-channel", gamma: "gamma-channel" });
   seedHistory(workspace, {
     "alpha-channel": answered("alpha"),
     "beta-channel": answered("beta"),
@@ -117,7 +134,7 @@ test("downtime catch-up sends one reminder per overdue channel, spaced globally,
   // Gamma's owner replies while the service is down; the bot's later answer has
   // no live completion, so history alone never re-arms it.
   missed(workspace, "gamma-channel", message("gamma-3", "2026-09-20T10:00:00Z", "owner", "Next step"));
-  missed(workspace, "gamma-channel", message("gamma-4", "2026-09-20T10:05:00Z", "app-gamma", "Next step done"));
+  missed(workspace, "gamma-channel", message("gamma-4", "2026-09-20T10:05:00Z", hook("gamma"), "Next step done"));
 
   await command(workspace, context, "enable");
   context.setClock("2026-09-20T15:20:00Z");
@@ -152,8 +169,7 @@ test("downtime catch-up sends one reminder per overdue channel, spaced globally,
 });
 
 test("waking from sleep reconciles missed replies before any send and spaces overdue catch-ups", async () => {
-  const workspace = createWorkspace();
-  const context = setup(workspace, { alpha: "alpha-channel", beta: "beta-channel", gamma: "gamma-channel" });
+  const { workspace, context } = await setup({ alpha: "alpha-channel", beta: "beta-channel", gamma: "gamma-channel" });
   const wallOffset = path.join(workspace.tmpDir, "wall-offset");
   context.env = { ...context.env, CCDM_TEST_WALL_OFFSET_FILE: wallOffset, CCDM_REMINDER_WAKE_SETTLE_MS: "4000" };
   seedHistory(workspace, {
@@ -171,7 +187,7 @@ test("waking from sleep reconciles missed replies before any send and spaces ove
   assert.equal(reminders(readState(workspace.stateDir)).length, 0);
 
   // The Mac sleeps for seven hours. Gamma's owner replies from a phone; the
-  // Gateway never delivers it and the socket still looks connected on wake.
+  // Router never delivers it and the socket still looks connected on wake.
   missed(workspace, "gamma-channel", message("gamma-3", "2026-09-20T10:00:00Z", "owner", "Next step"));
   fs.writeFileSync(wallOffset, String(7 * 3600000));
   await waitForStatus(workspace, context, current => names.every(name =>
@@ -201,7 +217,7 @@ test("waking from sleep reconciles missed replies before any send and spaces ove
 async function adapterEvent(workspace, context, project, type, id, time, fields = {}) {
   const value = {
     schema_version: 1, event_id: id, event_type: type, project, channel_id: `${project}-channel`,
-    bot_id: `bot-${project}`, assignment_generation: `gen-${project}`, provider: "codex",
+    bot_id: `router:${hook(project)}`, assignment_generation: `gen-${project}`, provider: "codex",
     event_time: time, event_order: `${time}:${id}`, adapter_instance_id: "test-adapter", ...fields,
   };
   const result = await runScript(workspace, "scripts/conversation-reminder-events.py", {
@@ -212,17 +228,16 @@ async function adapterEvent(workspace, context, project, type, id, time, fields 
 }
 
 test("missed owner activity and provider replay are applied before any catch-up is sent", async () => {
-  const workspace = createWorkspace();
   const names = ["closed", "reacted", "ambiguous", "replayed", "denied", "untouched"];
-  const context = setup(workspace, Object.fromEntries(names.map(name => [name, `${name}-channel`])));
+  const { workspace, context } = await setup(Object.fromEntries(names.map(name => [name, `${name}-channel`])));
   seedHistory(workspace, Object.fromEntries(names.map(name => [`${name}-channel`, [
-    message(`${name}-2`, "2026-09-20T08:05:00Z", `app-${name}`, "Done"),
-    message(`${name}-p`, "2026-09-20T08:02:00Z", `app-${name}`, "Working"),
+    message(`${name}-2`, "2026-09-20T08:05:00Z", hook(name), "Done"),
+    message(`${name}-p`, "2026-09-20T08:02:00Z", hook(name), "Working"),
     message(`${name}-1`, "2026-09-20T08:00:00Z", "owner", "Please do it"),
   ]])));
   await discoveredThenStopped(workspace, context, names);
 
-  // Downtime, 10:00-15:20. Nothing observes the Gateway.
+  // Downtime, 10:00-15:20. Nothing observes the Router.
   missed(workspace, "closed-channel", message("closed-3", "2026-09-20T10:00:00Z", "owner", "/close"));
   const state = readState(workspace.stateDir);
   state.fixtures.discord.history["reacted-channel"][0].reactions = [{ emoji: { name: "party", id: "77" }, count: 1 }];
@@ -233,7 +248,7 @@ test("missed owner activity and provider replay are applied before any catch-up 
   writeState(state, workspace.stateDir);
   // A still-running Codex bridge answered a new owner message and durably recorded it.
   missed(workspace, "replayed-channel", message("replayed-3", "2026-09-20T12:00:00Z", "owner", "One more"));
-  missed(workspace, "replayed-channel", message("replayed-4", "2026-09-20T12:05:00Z", "app-replayed", "Answered"));
+  missed(workspace, "replayed-channel", message("replayed-4", "2026-09-20T12:05:00Z", hook("replayed"), "Answered"));
   await adapterEvent(workspace, context, "replayed", "owner_activity", "replayed-owner", "2026-09-20T12:00:01Z", {
     actor_id: "owner", source_message_id: "replayed-3", activity_kind: "message" });
   await adapterEvent(workspace, context, "replayed", "response_delivered", "replayed-receipt", "2026-09-20T12:05:00Z", {
@@ -267,7 +282,7 @@ test("missed owner activity and provider replay are applied before any catch-up 
   const acknowledged = await waitForState(workspace, current => current.fixtures.discord.reactions?.some(row =>
     row.messageId === "closed-3" && decodeURIComponent(row.emoji) === "✅"), 20000);
   assert.equal(acknowledged.fixtures.discord.reactions.find(row => row.messageId === "closed-3").authorization,
-    "Bot token-closed");
+    `Bot ${ROOT_TOKEN}`);
   const first = await waitForState(workspace, current => reminders(current).length === 1, 20000);
   context.setClock("2026-09-20T15:20:05Z");
   const second = await waitForState(workspace, current => reminders(current).length === 2, 20000);
@@ -281,9 +296,8 @@ test("missed owner activity and provider replay are applied before any catch-up 
 });
 
 test("a rate limit outranks catch-up spacing, and a restart during catch-up cannot bypass it", async () => {
-  const workspace = createWorkspace();
   const names = ["alpha", "beta", "gamma"];
-  const context = setup(workspace, Object.fromEntries(names.map(name => [name, `${name}-channel`])));
+  const { workspace, context } = await setup(Object.fromEntries(names.map(name => [name, `${name}-channel`])));
   seedHistory(workspace, Object.fromEntries(names.map(name => [`${name}-channel`, answered(name)])));
   await discoveredThenStopped(workspace, context, names);
   const seed = readState(workspace.stateDir);
@@ -335,16 +349,8 @@ test("a rate limit outranks catch-up spacing, and a restart during catch-up cann
   await stopWorker(workspace, context, worker);
 });
 
-function gatewayEvent(workspace, event) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.injectedGatewayEvents ||= [];
-  state.fixtures.discord.injectedGatewayEvents.push({ event, delivered: false });
-  writeState(state, workspace.stateDir);
-}
-
-test("a Gateway reconnect gap is reconciled from history before the next reminder is due", async () => {
-  const workspace = createWorkspace();
-  const context = setup(workspace, { alpha: "alpha-channel", beta: "beta-channel" });
+test("a Router reconnect gap is reconciled from history before the next reminder is due", async () => {
+  const { workspace, context } = await setup({ alpha: "alpha-channel", beta: "beta-channel" });
   seedHistory(workspace, { "alpha-channel": answered("alpha"), "beta-channel": answered("beta") });
   await command(workspace, context, "enable");
   context.setClock("2026-09-20T08:30:00Z");
@@ -352,19 +358,21 @@ test("a Gateway reconnect gap is reconciled from history before the next reminde
   await waitForStatus(workspace, context, current => ["alpha", "beta"].every(name =>
     current.conversations[name]?.reconciliation_status === "ready"));
 
-  gatewayEvent(workspace, "shardDisconnect");
+  await context.router.stop();
   const gap = await waitForStatus(workspace, context, current => ["alpha", "beta"].every(name =>
-    current.conversations[name].reconciliation_status === "suspended-restart-reconciliation"));
-  assert.match(gap.readiness.projects.alpha.blockers.join("\n"), /history: suspended-restart-reconciliation/);
-  // While disconnected, the owner answers alpha; the observer never sees it.
+    current.conversations[name].reconciliation_status === "suspended-observation-access"));
+  assert.match(gap.readiness.projects.alpha.blockers.join("\n"), /history: suspended-observation-access/);
+  // While the Router is down, the owner answers alpha; the observer never sees it.
   missed(workspace, "alpha-channel", message("alpha-3", "2026-09-20T08:40:00Z", "owner", "Thanks, looks good"));
   context.setClock("2026-09-20T09:05:00Z");
   await settle();
-  assert.equal(reminders(readState(workspace.stateDir)).length, 0, "nothing is sent while the Gateway is down");
+  assert.equal(reminders(readState(workspace.stateDir)).length, 0, "nothing is sent while the Router is down");
 
-  gatewayEvent(workspace, "shardReady");
+  // The observer's client reconnects on its own; its next revalidation (at most
+  // thirty seconds later) resumes the projects through restart reconciliation.
+  context.router = await startRouter(workspace);
   const reconciled = await waitForStatus(workspace, context, current => ["alpha", "beta"].every(name =>
-    current.conversations[name].reconciliation_status === "ready"));
+    current.conversations[name].reconciliation_status === "ready"), 600);
   assert.deepEqual([reconciled.conversations.alpha.state, reconciled.conversations.alpha.last_ack_message_id],
     ["open-paused", "alpha-3"]);
   const sent = await waitForState(workspace, state => reminders(state).length === 1, 20000);
@@ -375,9 +383,8 @@ test("a Gateway reconnect gap is reconciled from history before the next reminde
 });
 
 test("a queued catch-up honors an owner reply and a deregistration before its turn", async () => {
-  const workspace = createWorkspace();
   const names = ["alpha", "beta", "gamma"];
-  const context = setup(workspace, Object.fromEntries(names.map(name => [name, `${name}-channel`])));
+  const { workspace, context } = await setup(Object.fromEntries(names.map(name => [name, `${name}-channel`])));
   seedHistory(workspace, Object.fromEntries(names.map(name => [`${name}-channel`, answered(name)])));
   await discoveredThenStopped(workspace, context, names);
   await command(workspace, context, "enable");
@@ -391,9 +398,9 @@ test("a queued catch-up honors an owner reply and a deregistration before its tu
   const state = readState(workspace.stateDir);
   state.fixtures.discord.history["beta-channel"].unshift(
     message("beta-3", "2026-09-20T15:20:02Z", "owner", "Seen it, thanks"));
-  state.fixtures.discord.injectedMessages.push({ id: "beta-3", channelId: "beta-channel", content: "Seen it, thanks",
-    author: { id: "owner", bot: false }, attachments: [], delivered: false });
   writeState(state, workspace.stateDir);
+  injectDiscordMessage(workspace, { id: "beta-3", channelId: "beta-channel", content: "Seen it, thanks",
+    author: { id: "owner" } });
   const registryPath = path.join(workspace.repoDir, "registry.json");
   const registry = JSON.parse(fs.readFileSync(registryPath, "utf8"));
   delete registry.projects.gamma;
@@ -409,9 +416,8 @@ test("a queued catch-up honors an owner reply and a deregistration before its tu
 });
 
 test("disable lets an in-flight send finish, keeps closures, and re-enable reconciles before sending", async () => {
-  const workspace = createWorkspace();
   const names = ["alpha", "beta", "shut"];
-  const context = setup(workspace, Object.fromEntries(names.map(name => [name, `${name}-channel`])));
+  const { workspace, context } = await setup(Object.fromEntries(names.map(name => [name, `${name}-channel`])));
   seedHistory(workspace, {
     "alpha-channel": answered("alpha"), "beta-channel": answered("beta"),
     "shut-channel": [message("shut-3", "2026-09-20T08:10:00Z", "owner", "/close"), ...answered("shut")],
@@ -456,8 +462,7 @@ test("disable lets an in-flight send finish, keeps closures, and re-enable recon
 });
 
 test("a catch-up waits for the cleanup backlog left before downtime", async () => {
-  const workspace = createWorkspace();
-  const context = setup(workspace, { alpha: "alpha-channel" });
+  const { workspace, context } = await setup({ alpha: "alpha-channel" });
   seedHistory(workspace, { "alpha-channel": answered("alpha") });
   await command(workspace, context, "enable");
   context.setClock("2026-09-20T08:30:00Z");
@@ -495,10 +500,9 @@ test("a catch-up waits for the cleanup backlog left before downtime", async () =
 });
 
 test("an uncertain delivery stays gated through restart until its nonce replay resolves its identity", async () => {
-  const workspace = createWorkspace();
-  const context = setup(workspace, { alpha: "alpha-channel", beta: "beta-channel" });
+  const { workspace, context } = await setup({ alpha: "alpha-channel", beta: "beta-channel" });
   seedHistory(workspace, { "alpha-channel": answered("alpha"),
-    "beta-channel": [message("beta-3", "2026-09-20T09:30:00Z", "app-beta", "Done"), ...answered("beta").slice(1)] });
+    "beta-channel": [message("beta-3", "2026-09-20T09:30:00Z", hook("beta"), "Done"), ...answered("beta").slice(1)] });
   await command(workspace, context, "enable");
   context.setClock("2026-09-20T08:30:00Z");
   const first = startWorker(workspace, context);
@@ -550,13 +554,12 @@ test("an uncertain delivery stays gated through restart until its nonce replay r
 });
 
 test("an interrupted restart scan resumes from its checkpoint before releasing the channel", async () => {
-  const workspace = createWorkspace();
-  const context = setup(workspace, { alpha: "alpha-channel" });
+  const { workspace, context } = await setup({ alpha: "alpha-channel" });
   const start = Date.parse("2026-09-20T08:00:00Z");
   seedHistory(workspace, { "alpha-channel": Array.from({ length: 150 }, (_, index) => {
     const at = new Date(start + index * 1000).toISOString().replace(".000Z", "Z");
     return index === 0 ? message("300000", at, "owner", "Run it")
-      : message(String(300000 + index), at, "app-alpha", `progress ${index}`);
+      : message(String(300000 + index), at, hook("alpha"), `progress ${index}`);
   }).reverse() });
   await discoveredThenStopped(workspace, context, ["alpha"]);
   const before = readState(workspace.stateDir).fixtures.discord.historyFetches.length;
@@ -583,8 +586,7 @@ test("an interrupted restart scan resumes from its checkpoint before releasing t
 });
 
 test("unmet Claude prerequisites block enablement and cannot be bypassed into Codex-only delivery", async () => {
-  const workspace = createWorkspace();
-  const context = setup(workspace, { alpha: "alpha-channel" });
+  const { workspace, context } = await setup({ alpha: "alpha-channel" });
   seedHistory(workspace, { "alpha-channel": answered("alpha") });
   const adapter = path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js");
   const saved = fs.readFileSync(adapter);
@@ -599,7 +601,7 @@ test("unmet Claude prerequisites block enablement and cannot be bypassed into Co
   assert.match(blocked.reason, /provider prerequisites are unmet: claude missing scripts\/ccdm-channel-server\.js/);
   assert.deepEqual(blocked.preflight.provider_prerequisites.providers.codex, { met: true, missing: [] });
   assert.equal(blocked.preflight.root_credentials, "present");
-  assert.doesNotMatch(refused.stdout, /fixture-root-token|token-alpha/);
+  assert.doesNotMatch(refused.stdout, new RegExp(ROOT_TOKEN));
 
   // Even a directly requested scan of a ready Codex channel cannot send.
   await command(workspace, context, "discover");
@@ -622,7 +624,7 @@ test("unmet Claude prerequisites block enablement and cannot be bypassed into Co
   assert.equal(fs.statSync(context.stateDir).mode & 0o777, 0o700);
   const again = startWorker(workspace, context);
   const sent = await waitForState(workspace, state => reminders(state).length === 1, 20000);
-  assert.equal(reminders(sent)[0].authorization, "Bot token-alpha");
+  assert.equal(reminders(sent)[0].authorization, `Bot ${ROOT_TOKEN}`);
   const released = await waitForStatus(workspace, context, current =>
     current.conversations.alpha.due_at === "2026-09-20T17:20:00Z");
   assert.deepEqual([released.readiness.projects.alpha.delivery_ready, released.readiness.projects.alpha.blockers],
@@ -631,9 +633,8 @@ test("unmet Claude prerequisites block enablement and cannot be bypassed into Co
 });
 
 test("enable refuses without root observation credentials or an owner, and never exposes secrets", async () => {
-  const workspace = createWorkspace();
-  const context = setup(workspace, { alpha: "alpha-channel" });
-  fs.rmSync(path.join(workspace.homeDir, "root-discord", ".env"));
+  const { workspace, context } = await setup({ alpha: "alpha-channel" });
+  fs.rmSync(rootEnvFile(workspace));
   const registryPath = path.join(workspace.repoDir, "registry.json");
   const registry = JSON.parse(fs.readFileSync(registryPath, "utf8"));
   delete registry.discord_user_id;
@@ -645,7 +646,6 @@ test("enable refuses without root observation credentials or an owner, and never
   const blocked = JSON.parse(refused.stdout);
   assert.match(blocked.reason, /no CCDM owner/);
   assert.match(blocked.reason, /root Discord credentials are unavailable: set DISCORD_BOT_TOKEN in ROOT_DISCORD_STATE_DIR\/\.env/);
-  assert.doesNotMatch(refused.stdout, /token-alpha/);
   // A refused enable validates without side effects: no state directory exists.
   assert.equal(fs.existsSync(context.stateDir), false);
   const current = await command(workspace, context, "status");
@@ -655,11 +655,10 @@ test("enable refuses without root observation credentials or an owner, and never
 });
 
 test("a refused enable leaves an existing state directory's permissions unchanged", async () => {
-  const workspace = createWorkspace();
-  const context = setup(workspace, { alpha: "alpha-channel" });
+  const { workspace, context } = await setup({ alpha: "alpha-channel" });
   fs.mkdirSync(context.stateDir, { recursive: true, mode: 0o755 });
   fs.chmodSync(context.stateDir, 0o755);
-  fs.rmSync(path.join(workspace.homeDir, "root-discord", ".env"));
+  fs.rmSync(rootEnvFile(workspace));
   const refused = await runScript(workspace, "scripts/conversation-reminder-service.py", {
     args: ["enable", "--project-root", workspace.repoDir, "--state-dir", context.stateDir], env: context.env,
   });
@@ -669,16 +668,14 @@ test("a refused enable leaves an existing state directory's permissions unchange
   assert.deepEqual(fs.readdirSync(context.stateDir), []);
 
   // Once every blocker clears, enable prepares the private directory itself.
-  fs.writeFileSync(path.join(workspace.homeDir, "root-discord", ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n",
-    { mode: 0o600 });
+  fs.writeFileSync(rootEnvFile(workspace), `DISCORD_BOT_TOKEN=${ROOT_TOKEN}\n`, { mode: 0o600 });
   const enabled = await command(workspace, context, "enable");
   assert.deepEqual(enabled.preflight.blockers, []);
   assert.equal(fs.statSync(context.stateDir).mode & 0o777, 0o700);
 });
 
 test("a generation change during downtime rediscovers the new assignment and shares the catch-up spacing", async () => {
-  const workspace = createWorkspace();
-  const context = setup(workspace, { alpha: "alpha-channel", beta: "beta-channel" });
+  const { workspace, context } = await setup({ alpha: "alpha-channel", beta: "beta-channel" });
   seedHistory(workspace, { "alpha-channel": answered("alpha"), "beta-channel": answered("beta") });
   await discoveredThenStopped(workspace, context, ["alpha", "beta"]);
   const changed = await command(workspace, context, "assignment-changed", ["--project", "beta"]);
@@ -687,7 +684,7 @@ test("a generation change during downtime rediscovers the new assignment and sha
   const late = await runScript(workspace, "scripts/conversation-reminder-events.py", {
     args: ["ingest", "--project-root", workspace.repoDir, "--state-dir", context.stateDir],
     input: JSON.stringify({ schema_version: 1, event_id: "late-owner", event_type: "owner_activity", project: "beta",
-      channel_id: "beta-channel", bot_id: "bot-beta", assignment_generation: "gen-beta", provider: "codex",
+      channel_id: "beta-channel", bot_id: `router:${hook("beta")}`, assignment_generation: "gen-beta", provider: "codex",
       event_time: "2026-09-20T12:00:00Z", event_order: "late", adapter_instance_id: "test-adapter",
       actor_id: "owner", source_message_id: "beta-late", activity_kind: "message" }),
   });

@@ -5,8 +5,8 @@ import test from "node:test";
 
 import { spawn, spawnSync } from "node:child_process";
 
-import { createWorkspace, runScript } from "./support/runner.js";
-import { routerEnv, runRouterCli, startBridge, waitFor, writeProjectKey } from "./support/router.js";
+import { runScript } from "./support/runner.js";
+import { routerEnv, runRouterCli, startBridge, startRouter, waitFor, writeProjectKey } from "./support/router.js";
 import {
   bridgeChildEnv, createBridgeWorkspace, injectDiscordMessage, startFakeCodexServer, waitForState,
 } from "./support/bridge.js";
@@ -23,21 +23,40 @@ test.afterEach(async () => cleanup());
 const LABEL = "com.discord.conversation-reminders";
 const INSTALLER = "scripts/install-conversation-reminder-service.sh";
 
-function setup(workspace) {
+// Every project is served through the Router, so the installer's preflight
+// needs it up and the project's webhook made: `ensure-webhook` gives demo
+// `fake-webhook-1`. The Router logs in as root from root's default Discord
+// state; the worker reads root's token from ROOT_DISCORD_STATE_DIR.
+async function setup(workspace) {
   fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), JSON.stringify({
     discord_user_id: "owner", guild_id: "guild",
-    pool: [{ id: "bot", app_id: "app", token: "fixture-project-token" }],
-    projects: { demo: { type: "codex", bot_id: "bot", channel_id: "channel", assignment_generation: "gen-demo" } },
+    projects: { demo: { type: "codex", channel_id: "channel", assignment_generation: "gen-demo" } },
   }), { mode: 0o600 });
   const rootState = path.join(workspace.homeDir, "root-discord");
   fs.mkdirSync(rootState, { recursive: true });
   fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const routerRootState = path.join(workspace.homeDir, ".claude", "channels", "discord");
+  fs.mkdirSync(routerRootState, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(routerRootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  const ensured = await runRouterCli(workspace, ["ensure-webhook", "demo"]);
+  assert.equal(ensured.exitCode, 0, ensured.stderr || ensured.stdout);
+  await startRouter(workspace);
   return {
     rootState,
     stateDir: path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders"),
-    env: { ROOT_DISCORD_STATE_DIR: rootState, CCDM_REMINDER_NODE: process.execPath },
+    env: { ROOT_DISCORD_STATE_DIR: rootState, CCDM_REMINDER_NODE: process.execPath,
+      CCDM_ROUTER_STATE_DIR: workspace.routerStateDir },
+    // The rendered LaunchAgent environment names no Router state directory.
+    extraEnv: { CCDM_ROUTER_STATE_DIR: workspace.routerStateDir },
   };
 }
+
+// Each worker start writes a fresh observer key before connecting to the
+// Router, so a changed key marks one more observer start.
+const observerKey = workspace => {
+  const file = path.join(workspace.routerStateDir, "keys", ".observer.key");
+  return fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null;
+};
 
 const plistPath = workspace => path.join(workspace.homeDir, "Library", "LaunchAgents", `${LABEL}.plist`);
 const install = (workspace, context, extra = {}) => runScript(workspace, INSTALLER, { env: context.env, ...extra });
@@ -78,8 +97,8 @@ const operations = workspace =>
   readState(workspace.stateDir).fixtures.launchctl.invocations.map(({ operation }) => operation);
 
 test("installer renders a secret-free LaunchAgent that supervises the foreground worker", async () => {
-  const workspace = createWorkspace();
-  const context = setup(workspace);
+  const workspace = createBridgeWorkspace();
+  const context = await setup(workspace);
 
   const result = await install(workspace, context);
 
@@ -149,8 +168,8 @@ test("installer renders a secret-free LaunchAgent that supervises the foreground
 });
 
 test("reinstalling the same LaunchAgent is idempotent", async () => {
-  const workspace = createWorkspace();
-  const context = setup(workspace);
+  const workspace = createBridgeWorkspace();
+  const context = await setup(workspace);
   const first = await install(workspace, context);
   assert.equal(first.exitCode, 0, first.stderr || first.stdout);
   const firstPlist = fs.readFileSync(plistPath(workspace), "utf8");
@@ -165,8 +184,8 @@ test("reinstalling the same LaunchAgent is idempotent", async () => {
 });
 
 test("a failed replacement load restores the previous plist and loaded service", async () => {
-  const workspace = createWorkspace();
-  const context = setup(workspace);
+  const workspace = createBridgeWorkspace();
+  const context = await setup(workspace);
   const first = await install(workspace, context);
   assert.equal(first.exitCode, 0, first.stderr || first.stdout);
   const prior = fs.readFileSync(plistPath(workspace), "utf8");
@@ -203,8 +222,8 @@ test("missing prerequisites or provider capabilities refuse installation before 
       fs.rmSync(path.join(context.rootState, ".env")) },
   ];
   for (const scenario of cases) {
-    const workspace = createWorkspace();
-    const context = setup(workspace);
+    const workspace = createBridgeWorkspace();
+    const context = await setup(workspace);
     scenario.prepare(workspace, context);
 
     const result = await install(workspace, context);
@@ -219,8 +238,8 @@ test("missing prerequisites or provider capabilities refuse installation before 
 });
 
 test("invalid configuration or an unusable store leaves the working installation and permissions intact", async () => {
-  const workspace = createWorkspace();
-  const context = setup(workspace);
+  const workspace = createBridgeWorkspace();
+  const context = await setup(workspace);
   const first = await install(workspace, context);
   assert.equal(first.exitCode, 0, first.stderr || first.stdout);
   const registryPath = path.join(workspace.repoDir, "registry.json");
@@ -253,14 +272,17 @@ test("invalid configuration or an unusable store leaves the working installation
 });
 
 test("supervised and foreground launches share one worker, and disable keeps relaunches from sending", async () => {
-  const workspace = createWorkspace();
-  const context = setup(workspace);
+  const workspace = createBridgeWorkspace();
+  const context = await setup(workspace);
   const installed = await install(workspace, context);
   assert.equal(installed.exitCode, 0, installed.stderr || installed.stdout);
   await service(workspace, context, "enable");
+  // Only the Router logs in to the Gateway; the worker observes through it.
+  const routerLogins = readState(workspace.stateDir).fixtures.discord.logins.length;
 
   const supervised = launchAsSupervisor(workspace, context);
-  await waitForState(workspace, state => state.fixtures.discord.logins.length === 1, 10000);
+  await waitFor(() => observerKey(workspace) !== null, () => "the supervised worker's observer start", 10000);
+  const supervisedKey = observerKey(workspace);
   assert.equal((await service(workspace, context, "status")).worker_running, true);
   const foreground = await runScript(workspace, "scripts/conversation-reminder-service.py", {
     args: ["run", "--project-root", workspace.repoDir, "--state-dir", context.stateDir],
@@ -278,7 +300,8 @@ test("supervised and foreground launches share one worker, and disable keeps rel
   assert.equal(relaunched.exitCode, 0, relaunched.stderr || relaunched.stdout);
   assert.equal(JSON.parse(relaunched.stdout).disabled, true);
   const state = readState(workspace.stateDir);
-  assert.equal(state.fixtures.discord.logins.length, 1);
+  assert.equal(observerKey(workspace), supervisedKey);
+  assert.equal(state.fixtures.discord.logins.length, routerLogins);
   assert.deepEqual((state.fixtures.discord.messages ?? []).filter(row => row.content === "👀"), []);
 
   // Re-enabling names both ways to start the stopped worker.
@@ -291,12 +314,13 @@ test("supervised and foreground launches share one worker, and disable keeps rel
     args: ["run", "--project-root", workspace.repoDir, "--state-dir", context.stateDir],
     env: bridgeChildEnv(workspace, context.env), timeoutMs: 30000,
   });
-  await waitForState(workspace, current => current.fixtures.discord.logins.length === 2, 10000);
+  await waitFor(() => observerKey(workspace) !== supervisedKey, () => "the foreground worker's observer start", 10000);
   const refused = await launchAsSupervisor(workspace, context);
   assert.equal(refused.exitCode, 2, "a nonzero exit lets launchd retry after ThrottleInterval");
   assert.match(JSON.parse(refused.stdout).reason, /already running/);
   await service(workspace, context, "disable");
   assert.equal((await manual).exitCode, 0);
+  assert.equal(readState(workspace.stateDir).fixtures.discord.logins.length, routerLogins);
 
   assert.equal(fs.statSync(context.stateDir).mode & 0o777, 0o700);
   for (const name of ["conversations.sqlite3", "worker.lock", "service.log", "service.err"]) {
@@ -305,8 +329,8 @@ test("supervised and foreground launches share one worker, and disable keeps rel
 });
 
 test("the reminder supervisor leaves the Usage Stats Poster service, storage, and output unchanged", async () => {
-  const workspace = createWorkspace();
-  const context = setup(workspace);
+  const workspace = createBridgeWorkspace();
+  const context = await setup(workspace);
   const usage = await runScript(workspace, "scripts/install-usage-stats-poster.sh");
   assert.equal(usage.exitCode, 0, usage.stderr || usage.stdout);
   const usagePlist = path.join(path.dirname(plistPath(workspace)), "com.discord.usage-stats-poster.plist");

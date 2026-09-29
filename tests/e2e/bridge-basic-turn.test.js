@@ -471,6 +471,9 @@ test("bridge covers filtering, fallback splitting, MCP reply suppression, and th
     (nextState) => nextState.fixtures.discord.messages.length === 2,
     5000,
   );
+  // The fake records the reply before the Router acknowledges it to the
+  // bridge, which ends the turn only then; let it settle before the next turn.
+  await new Promise((resolve) => setTimeout(resolve, 150));
   await injectMessageUntil(
     workspace,
     { content: "mcp will reply", id: "mcp-message" },

@@ -27,7 +27,7 @@ The intended setup gives each project bot the zero-permission `project-bot` role
 
 Project bots must not have Administrator on any assigned role: it bypasses even member-level channel denies. Before removing it, back up role and channel permissions, confirm the granting role is exclusive to the bot, and verify that its assigned channel already grants the required messaging permissions. Confirm allowed and denied channel access after the change. Record machine-specific audit outcomes and credential issues only in ignored local notes.
 
-Guest management and usage reporting read `DISCORD_BOT_TOKEN` from `ROOT_DISCORD_STATE_DIR/.env`, defaulting to `~/.claude/channels/discord/.env`. Missing or invalid root credentials fail before Discord requests, with no pool fallback. The old poster `root_bot_id` selector is no longer used. Project launchers derive the root identity from root state or an explicit `root_bot_app_id`, never a pool position, and no longer pass the unused management token to project bridges. Exports require explicit credentials or the bot assigned to their channel.
+Guest management and usage reporting read `DISCORD_BOT_TOKEN` from `ROOT_DISCORD_STATE_DIR/.env`, defaulting to `~/.claude/channels/discord/.env`. Missing or invalid root credentials fail before Discord requests, with no pool fallback. The old poster `root_bot_id` selector is no longer used. Project launchers derive the root identity from root state or an explicit `root_bot_app_id`, never a pool position, and no longer pass the unused management token to project bridges. Operator exports (`export-discord-range.js`) read only the same root token, and no script reads a pool bot token.
 
 ## Credentials
 
@@ -41,7 +41,7 @@ The bridge dynamically registers one Discord MCP server for its channel. User-vi
 
 ## Guests
 
-Use `scripts/guest-access.js`; do not create generic server invites. `invite` or `grant` creates/synchronizes the project role, denies other managed locations, allows the target channel, and updates both registry and bot allowlists. Restart a pool project session after access changes. Router projects have no per-bot `access.json`: the Router reloads guests from the registry, so a grant or revoke applies to the next message without a restart. `revoke` removes the role and all allowlist entries.
+Use `scripts/guest-access.js`; do not create generic server invites. `invite` or `grant` creates/synchronizes the project role, denies other managed locations, allows the target channel, and updates the registry. No per-bot `access.json` is written and no `project-bot` role or override is touched: the Router reloads guests from the registry, so a grant or revoke applies to the next message without a restart. `revoke` removes the role, the registry entry, and outstanding invites.
 
 Project-specific user and channel access exceptions live in ignored `CLAUDE.local.md`. Apply those rules without copying local IDs into tracked files.
 

@@ -309,7 +309,7 @@ def usable_assignment(registry: dict, name: str) -> dict | None:
     assignment = EVENTS.assignment_for(registry, name)
     same_channel = [item for item in registry["projects"].values() if isinstance(item, dict)
                     and str(item.get("channel_id")) == assignment["channel_id"]]
-    return assignment if len(same_channel) == 1 and EVENTS.can_deliver(assignment) else None
+    return assignment if len(same_channel) == 1 else None
 
 
 def retire_conversation(db: sqlite3.Connection, row: sqlite3.Row, reason: str) -> None:
@@ -658,7 +658,7 @@ ROOT_PERMISSION_NAMES = {"SendMessages": "Send Messages", "ReadMessageHistory": 
 def router_prerequisites(projects: object) -> dict:
     """Per router project, what root and the Router still need before delivery, each with its fix."""
     names = sorted(name for name, project in (projects.items() if isinstance(projects, dict) else [])
-                   if isinstance(project, dict) and project.get("transport") == "router")
+                   if isinstance(project, dict))
     if not names:
         return {}
     try:
@@ -794,8 +794,7 @@ def readiness_report(project_root: Path, state_dir: Path, db: sqlite3.Connection
         if uncertain:
             blockers.append("uncertain delivery: run recover")
         speaker = (adapter["assignment"] or {}).get("bot_id")
-        if conversation and speaker and conversation["identity"] != (
-                speaker if speaker.startswith("router:") else f"pool:{speaker}"):
+        if conversation and speaker and conversation["identity"] != speaker:
             blockers.append("assignment: the project's transport changed; run assignment-changed --project " + name)
         blockers += [f"router: {blocker}" for blocker in routed.get(name, {}).get("blockers", [])]
         report[name] = {
@@ -914,7 +913,7 @@ def status(state_dir: Path, project_root: Path | None = None) -> dict:
                                         "the registration, run scripts/conversation-reminder-service.py "
                                         "assignment-changed --project " + ", ".join(sorted(blocked)) + "."
                                         if blocked else None),
-                "recovery_guidance": ("Run recover after restoring assigned bot access. Recovery identifies a lost "
+                "recovery_guidance": ("Run recover after restoring root's channel access. Recovery identifies a lost "
                                       "reminder only by replaying its nonce inside Discord's duplicate-check window; "
                                       "it never adopts or deletes a bot emoji found in history. If recover lists "
                                       "unbound candidates, delete a stray reminder in Discord and run recover again, "
@@ -1289,8 +1288,7 @@ def claim_due(project_root: Path, state_dir: Path) -> dict:
             except (KeyError, ValueError):
                 continue
             if (assignment["generation"] != row["assignment_generation"] or
-                    assignment["channel_id"] != row["channel_id"] or assignment["identity"] != row["identity"] or
-                    not EVENTS.can_deliver(assignment)):
+                    assignment["channel_id"] != row["channel_id"] or assignment["identity"] != row["identity"]):
                 continue
             if db.execute("SELECT 1 FROM catch_ups WHERE project=? AND assignment_generation=?",
                           (row["project"], row["assignment_generation"])).fetchone():
@@ -1335,7 +1333,7 @@ def validate_claim(project_root: Path, state_dir: Path, nonce: str) -> dict:
                 assignment = EVENTS.assignment_for(registry, intent["project"])
                 valid = (assignment["generation"] == intent["assignment_generation"] and
                          assignment["channel_id"] == row["channel_id"] and
-                         assignment["identity"] == row["identity"] and EVENTS.can_deliver(assignment))
+                         assignment["identity"] == row["identity"])
             except (KeyError, ValueError):
                 valid = False
         if not valid and intent and intent["state"] == "sending":
@@ -1362,7 +1360,7 @@ def record_result(project_root: Path, state_dir: Path, nonce: str, outcome: str,
         row = db.execute("SELECT * FROM conversations WHERE project=?", (intent["project"],)).fetchone()
         if outcome == "absent":
             # History covering the whole claim window shows no reminder from the
-            # assigned bot: nothing was created, so reconcile and allow a new send.
+            # root: nothing was created, so reconcile and allow a new send.
             db.execute("UPDATE delivery_intents SET state='failed', retry_at=NULL WHERE nonce=?", (nonce,))
             if (row and row["assignment_generation"] == intent["assignment_generation"] and
                     row["reconciliation_status"] == "suspended-uncertain-send"):

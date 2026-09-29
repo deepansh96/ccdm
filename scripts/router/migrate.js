@@ -1,7 +1,7 @@
 "use strict";
 
 // Cuts one project over from its pool bot to the Router, verified and
-// reversible; `--rollback` returns it to its pool bot. Each step prints
+// reversible; `--rollback` refuses, since no pool bot remains. Each step prints
 // `<step>: ok` or `<step>: failed — <reason>`.
 //
 //   scripts/migrate-to-router.sh <project>

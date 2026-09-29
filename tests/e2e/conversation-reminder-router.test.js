@@ -31,9 +31,9 @@ function reminderRouterWorkspace() {
     discord_user_id: OWNER_ID,
     guild_id: "guild-id",
     projects: {
-      demo: { channel_id: "demo-channel", type: "codex", transport: "router", screen_name: "demo_codex",
+      demo: { channel_id: "demo-channel", type: "codex", screen_name: "demo_codex",
         assignment_generation: "gen-demo", session_id: null, pid: null },
-      beta: { channel_id: "beta-channel", type: "codex", transport: "router", screen_name: "beta_codex",
+      beta: { channel_id: "beta-channel", type: "codex", screen_name: "beta_codex",
         assignment_generation: "gen-beta" },
     },
   });

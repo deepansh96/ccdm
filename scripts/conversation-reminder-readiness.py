@@ -96,11 +96,6 @@ def build_readiness(project_name: str, project_root: Path, state_dir: Path) -> d
                 # An exited channel server no longer records owner activity or replies.
                 unsupported_capabilities.append(
                     "Claude launch-scoped transport is not running for this assignment" + relaunch)
-        # Root delivers a router project's reminders; a pool project needs its bot.
-        if not _EVENTS.can_deliver(assignment):
-            missing_credentials.append("assigned_project_bot_token")
-        if not assignment["identity"].startswith("router:") and not assignment["bot"].get("app_id"):
-            assignment_mismatches.append("assigned project bot app ID is missing")
         channel_matches = [
             name for name, candidate in (registry.get("projects") or {}).items()
             if isinstance(candidate, dict) and candidate.get("channel_id") == assignment["channel_id"]
