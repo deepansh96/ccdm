@@ -16,6 +16,7 @@ async function status(ctx) {
   return {
     gateway: ctx.gateway.state,
     registry_loaded_at: ctx.table.loadedAt,
+    registry_error: ctx.registry?.error ?? null,
     sessions: ctx.sessions().map(session => ({
       role: session.role,
       project: session.route.project,

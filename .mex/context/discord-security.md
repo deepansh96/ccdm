@@ -16,7 +16,7 @@ edges:
     condition: when granting, syncing, listing, or revoking guest access
   - target: patterns/debug-discord-session.md
     condition: when a bot cannot read or reply in its assigned channel
-last_updated: 2026-09-27
+last_updated: 2026-09-29
 ---
 
 # Discord Security
@@ -41,7 +41,7 @@ The bridge dynamically registers one Discord MCP server for its channel. User-vi
 
 ## Guests
 
-Use `scripts/guest-access.js`; do not create generic server invites. `invite` or `grant` creates/synchronizes the project role, denies other managed locations, allows the target channel, and updates both registry and bot allowlists. Restart the project session after access changes. `revoke` removes the role and all allowlist entries.
+Use `scripts/guest-access.js`; do not create generic server invites. `invite` or `grant` creates/synchronizes the project role, denies other managed locations, allows the target channel, and updates both registry and bot allowlists. Restart a pool project session after access changes. Router projects have no per-bot `access.json`: the Router reloads guests from the registry, so a grant or revoke applies to the next message without a restart. `revoke` removes the role and all allowlist entries.
 
 Project-specific user and channel access exceptions live in ignored `CLAUDE.local.md`. Apply those rules without copying local IDs into tracked files.
 

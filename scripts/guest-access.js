@@ -98,7 +98,10 @@ function effectiveUsers(registry, project) {
   return unique([registry.discord_user_id, ...(project.guest_user_ids || [])]);
 }
 
+// Router projects have no bot of their own: the Router reads guests straight
+// from the registry, so only pool bots keep a per-bot access.json.
 function updateAccessJson(registry, project) {
+  if (project.transport === "router") return;
   const bot = projectBot(registry, project);
   const stateDir = expandHome(bot.state_dir);
   const file = path.join(stateDir, "access.json");

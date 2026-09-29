@@ -345,3 +345,74 @@ test("guest access reads an explicitly selected root state directory", async () 
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(readState(workspace.stateDir).fixtures.discord.roleCreates[0].authorization, "Bot custom-root-token");
 });
+
+function routerProjectRegistry(workspace) {
+  const registry = buildRegistry(workspace);
+  delete registry.projects.beta;
+  registry.projects.gamma = {
+    path: path.join(workspace.tmpDir, "gamma"),
+    channel_id: "channel-gamma",
+    type: "claude",
+    transport: "router",
+  };
+  return registry;
+}
+
+function perBotAccessFiles(workspace) {
+  return ["discord", "discord2"]
+    .map((dir) => path.join(workspace.homeDir, ".claude", "channels", dir, "access.json"))
+    .filter((file) => fs.existsSync(file));
+}
+
+test("guest grant for a router project sets the human guest's role and overrides without per-bot state", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, routerProjectRegistry(workspace));
+
+  const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
+    args: ["grant", "gamma", GUEST_ID],
+    env: preloadEnv(workspace),
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /Granted 222222222222222222 guest access to gamma/);
+  assert.deepEqual(readRegistry(workspace).projects.gamma.guest_user_ids, [GUEST_ID]);
+  assert.deepEqual(perBotAccessFiles(workspace), []);
+  const discord = readState(workspace.stateDir).fixtures.discord;
+  assert.deepEqual(
+    discord.permissionOverwrites.map(({ channelId, overwriteId, type, allow, deny }) => ({ channelId, overwriteId, type, allow, deny })),
+    [
+      { channelId: "category-a", overwriteId: "fake-role-1", type: 0, allow: "0", deny: VIEW_CHANNEL },
+      { channelId: "category-a", overwriteId: GUEST_ID, type: 1, allow: "0", deny: VIEW_CHANNEL },
+      { channelId: "channel-alpha", overwriteId: "fake-role-1", type: 0, allow: "0", deny: VIEW_CHANNEL },
+      { channelId: "channel-alpha", overwriteId: GUEST_ID, type: 1, allow: "0", deny: VIEW_CHANNEL },
+      { channelId: "channel-gamma", overwriteId: "fake-role-1", type: 0, allow: GUEST_ALLOW, deny: "0" },
+      { channelId: "channel-gamma", overwriteId: GUEST_ID, type: 1, allow: GUEST_ALLOW, deny: "0" },
+    ],
+  );
+  assert.deepEqual(discord.memberRolePuts.map(({ userId, roleId }) => ({ userId, roleId })), [
+    { userId: GUEST_ID, roleId: "fake-role-1" },
+  ]);
+  assert.equal(JSON.stringify(discord).includes("project-bot-role-id"), false);
+});
+
+test("guest revoke for a router project removes the guest without per-bot state", async () => {
+  const workspace = createWorkspace();
+  const registry = routerProjectRegistry(workspace);
+  registry.projects.gamma.guest_role_id = "existing-role";
+  registry.projects.gamma.guest_user_ids = [GUEST_ID];
+  seedRegistry(workspace, registry);
+
+  const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
+    args: ["revoke", "gamma", GUEST_ID],
+    env: preloadEnv(workspace),
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.deepEqual(readRegistry(workspace).projects.gamma.guest_user_ids, []);
+  assert.deepEqual(perBotAccessFiles(workspace), []);
+  const discord = readState(workspace.stateDir).fixtures.discord;
+  assert.deepEqual(discord.memberRoleDeletes.map(({ userId, roleId }) => ({ userId, roleId })), [
+    { userId: GUEST_ID, roleId: "existing-role" },
+  ]);
+  assert.equal(JSON.stringify(discord).includes("project-bot-role-id"), false);
+});

@@ -48,7 +48,7 @@ async function claimSocketPath(socketPath) {
   await unlink(socketPath).catch(error => { if (error.code !== "ENOENT") throw error; });
 }
 
-function createRouterServer({ stateDir, socketPath, getTable, gateway, context, log }) {
+function createRouterServer({ stateDir, socketPath, getTable, gateway, registry, context, log }) {
   // project name -> the one session connected for it.
   const sessions = new Map();
   const violations = [];
@@ -122,7 +122,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, context, 
       return violation(args.channel_id, "channel_id is outside this session's scope");
     }
     try {
-      const result = await operation.run({ ...context, session: connection, sessions: listSessions, violations: () => [...violations], table: getTable(), gateway }, args);
+      const result = await operation.run({ ...context, session: connection, sessions: listSessions, violations: () => [...violations], table: getTable(), gateway, registry }, args);
       respond({ ok: true, result });
     } catch (error) {
       if (error instanceof ScopeViolation) return violation(error.target, error.message);
@@ -195,6 +195,14 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, context, 
       if (!connection) return false;
       send(connection.socket, { type: "event", ...event });
       return true;
+    },
+    // A reloaded registry can move a connected project's channel or webhook.
+    refreshRoutes() {
+      const { projects } = getTable();
+      for (const connection of sessions.values()) {
+        const route = projects.get(connection.route.project);
+        if (route) connection.route = route;
+      }
     },
     close() {
       keysWatcher?.close();

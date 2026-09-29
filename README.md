@@ -527,7 +527,7 @@ To invite someone into one project channel only, run:
 scripts/guest-access.js invite <project-or-channel-id> <discord-user-id>
 ```
 
-This creates a one-use invite and a per-project `ccdm-guest-<project>` role. The role is denied on CCDM-managed categories and other project channels, then allowed on the target channel with text, message history, attachments, reactions, and thread replies. The guest user ID is also added to the project bot allowlist so Claude/Codex can read their messages.
+This creates a one-use invite and a per-project `ccdm-guest-<project>` role. The role is denied on CCDM-managed categories and other project channels, then allowed on the target channel with text, message history, attachments, reactions, and thread replies. The guest user ID is also added to the project bot allowlist so Claude/Codex can read their messages. For `transport: "router"` projects there is no bot allowlist: the Router reloads guests from `registry.json`, so the change applies to the next message without a restart.
 
 For users already in the server, use `grant` instead of `invite`. Use `revoke` to remove their project guest role and bot access.
 

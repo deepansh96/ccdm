@@ -13,7 +13,7 @@ const { RouterClient } = require("./router/client.js");
 const { discordRequest } = require("./router/discord-rest.js");
 const { classifyMessage, classifyReaction } = require("./router/inbound.js");
 const { registryPath, rootToken, socketPath, stateDir } = require("./router/paths.js");
-const { loadRoutingTable } = require("./router/registry.js");
+const { DEFAULT_RELOAD_DEBOUNCE_MS, loadRoutingTable, watchRegistry } = require("./router/registry.js");
 const { createRouterServer } = require("./router/server.js");
 const { ensureWebhook } = require("./router/webhooks.js");
 
@@ -25,14 +25,29 @@ function log(line) {
 
 async function serve() {
   const token = await rootToken();
-  const table = await loadRoutingTable(registryPath());
+  let table = await loadRoutingTable(registryPath());
   const gateway = { state: "connecting" };
+  // The last failed reload, shown by `router status` until a good one lands.
+  const registry = { error: null };
   const attachments = createAttachmentCache();
   const server = createRouterServer({
-    stateDir: stateDir(), socketPath: socketPath(), getTable: () => table, gateway,
+    stateDir: stateDir(), socketPath: socketPath(), getTable: () => table, gateway, registry,
     context: { stateDir: stateDir(), token, attachments }, log,
   });
   await server.listen();
+  const registryWatcher = watchRegistry(registryPath(), {
+    debounceMs: Number(process.env.CCDM_ROUTER_REGISTRY_DEBOUNCE_MS) || DEFAULT_RELOAD_DEBOUNCE_MS,
+    onLoad(next) {
+      table = next;
+      registry.error = null;
+      server.refreshRoutes();
+      log(`registry reloaded: ${table.projects.size} router project(s)`);
+    },
+    onError(error) {
+      registry.error = { message: error.message, at: new Date().toISOString() };
+      log(`registry_reload_failed error=${error.message}`);
+    },
+  });
 
   const client = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
@@ -65,6 +80,7 @@ async function serve() {
   });
 
   const stop = () => {
+    registryWatcher.close();
     server.close();
     client.destroy();
     process.exit(0);
@@ -93,6 +109,7 @@ async function status() {
   }
   console.log(`gateway: ${result.gateway}`);
   console.log(`registry loaded: ${result.registry_loaded_at}`);
+  if (result.registry_error) console.log(`registry error: ${result.registry_error.at} ${result.registry_error.message}`);
   console.log(`sessions: ${result.sessions.length}`);
   for (const session of result.sessions) {
     console.log(`  ${session.role} ${session.project} scope=${session.scope.channel_id} connected=${session.connected_at}`);
