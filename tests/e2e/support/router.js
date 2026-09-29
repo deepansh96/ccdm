@@ -141,3 +141,21 @@ export function fetchThroughFakeCdn(workspace, url) {
   const output = execFileSync(process.execPath, ["-e", script], { cwd: workspace.repoDir, env: routerEnv(workspace), encoding: "utf8" });
   return JSON.parse(output);
 }
+
+// Root's key lives beside the project keys under a name no project can take.
+export function writeRootKey(workspace, key) {
+  const keysDir = path.join(workspace.routerStateDir, "keys");
+  fs.mkdirSync(keysDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(keysDir, ".root.key"), `${key}\n`, { mode: 0o600 });
+}
+
+// A scripted root session: the shared client library in `role: "root"`.
+export async function connectRoot(workspace, key) {
+  const { RouterClient } = createRequire(import.meta.url)(path.join(workspace.repoDir, "scripts/router/client.js"));
+  const client = new RouterClient({ socketPath: workspace.socketPath, key, role: "root" });
+  const events = [];
+  client.on("event", (event) => events.push(event));
+  const scope = await client.connect();
+  registerTeardownCallback(() => client.close());
+  return { client, events, scope };
+}

@@ -1,7 +1,8 @@
 "use strict";
 
 // Routing table derived from registry.json. Only router-transport projects
-// are routed; pool projects keep being served by their own bots.
+// are routed; pool projects keep being served by their own bots. Root's
+// channels and allowed users come from the registry too.
 const { watch } = require("node:fs");
 const { readFile, rename, writeFile, stat } = require("node:fs/promises");
 const path = require("node:path");
@@ -16,7 +17,10 @@ async function readRegistry(file) {
 function buildRoutingTable(registry) {
   const channels = new Map();
   const projects = new Map();
+  // Every registered project channel, router or pool: root may act in any.
+  const registered = new Map();
   for (const [name, project] of Object.entries(registry.projects || {})) {
+    if (project?.channel_id) registered.set(String(project.channel_id), name);
     if (project?.transport !== "router" || !project.channel_id) continue;
     const route = {
       project: name,
@@ -34,6 +38,9 @@ function buildRoutingTable(registry) {
     guildId: registry.guild_id ? String(registry.guild_id) : null,
     channels,
     projects,
+    registered,
+    rootChannels: new Set((registry.root_channels || []).map(String)),
+    rootAllowedUserIds: new Set((registry.root_allowed_user_ids || []).map(String)),
   };
 }
 

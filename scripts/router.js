@@ -7,13 +7,16 @@
 //   scripts/router.js serve                   run the Router daemon
 //   scripts/router.js status                  report Router health (non-zero if unreachable)
 //   scripts/router.js ensure-webhook <project>  find or create the project's webhook
+//   scripts/router.js migrate-root-config     copy root channels and users from root access.json
+const path = require("node:path");
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const { createAttachmentCache } = require("./router/attachments.js");
 const { RouterClient } = require("./router/client.js");
 const { discordRequest } = require("./router/discord-rest.js");
 const { classifyMessage, classifyReaction } = require("./router/inbound.js");
-const { registryPath, rootToken, socketPath, stateDir } = require("./router/paths.js");
+const { registryPath, rootStateDir, rootToken, socketPath, stateDir } = require("./router/paths.js");
 const { DEFAULT_RELOAD_DEBOUNCE_MS, loadRoutingTable, watchRegistry } = require("./router/registry.js");
+const { migrateRootConfig } = require("./router/root-config.js");
 const { createRouterServer } = require("./router/server.js");
 const { ensureWebhook } = require("./router/webhooks.js");
 
@@ -30,9 +33,11 @@ async function serve() {
   // The last failed reload, shown by `router status` until a good one lands.
   const registry = { error: null };
   const attachments = createAttachmentCache();
+  // The root bot's own user, known once the gateway is ready.
+  const bot = { id: null };
   const server = createRouterServer({
     stateDir: stateDir(), socketPath: socketPath(), getTable: () => table, gateway, registry,
-    context: { stateDir: stateDir(), token, attachments }, log,
+    context: { stateDir: stateDir(), token, attachments, bot }, log,
   });
   await server.listen();
   const registryWatcher = watchRegistry(registryPath(), {
@@ -61,7 +66,7 @@ async function serve() {
       const routed = classifyMessage(table, message);
       if (!routed) return;
       attachments.remember(routed.event);
-      if (server.deliver(routed.route.project, routed.event)) return;
+      if (routed.root ? server.deliverRoot(routed.event) : server.deliver(routed.route.project, routed.event)) return;
       // No live session: mark the message and drop it. Nothing is replayed later.
       await discordRequest("PUT",
         `/channels/${routed.route.channel_id}/messages/${message.id}/reactions/${encodeURIComponent(OFFLINE_EMOJI)}/@me`,
@@ -90,6 +95,7 @@ async function serve() {
 
   await client.login(token);
   await ready;
+  bot.id = client.user.id;
   gateway.state = "ready";
   log(`router ready: ${table.projects.size} router project(s), socket ${socketPath()}`);
 }
@@ -130,11 +136,20 @@ async function ensureWebhookCommand(project) {
   console.log(`${result.created ? "created" : "reused"} webhook ${result.name} id=${result.webhook_id}`);
 }
 
+async function migrateRootConfigCommand() {
+  const moved = await migrateRootConfig({ accessFile: path.join(rootStateDir(), "access.json"), registryFile: registryPath() });
+  const fields = Object.entries(moved);
+  if (fields.length === 0) return console.log("root config already in the registry: nothing to migrate");
+  for (const [field, values] of fields) console.log(`migrated ${field}: ${values.join(", ") || "(none)"}`);
+}
+
 const [command = "serve", ...args] = process.argv.slice(2);
-const commands = { serve, status, "ensure-webhook": () => ensureWebhookCommand(args[0]) };
+const commands = {
+  serve, status, "ensure-webhook": () => ensureWebhookCommand(args[0]), "migrate-root-config": migrateRootConfigCommand,
+};
 
 if (!Object.hasOwn(commands, command)) {
-  console.error(`unknown command: ${command}\nusage: router.js serve | status | ensure-webhook <project>`);
+  console.error(`unknown command: ${command}\nusage: router.js serve | status | ensure-webhook <project> | migrate-root-config`);
   process.exit(2);
 }
 commands[command]().catch(error => {

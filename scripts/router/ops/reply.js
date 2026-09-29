@@ -1,6 +1,7 @@
 "use strict";
 
-// reply: post text and files in the session's channel under its Project Identity.
+// reply: post text and files in the session's channel under its Project
+// Identity. Root posts as the bot itself, with native replies.
 const { readFile } = require("node:fs/promises");
 const path = require("node:path");
 const { splitMessage } = require("../chunks.js");
@@ -49,11 +50,33 @@ function jumpLine(ctx, messageId) {
   return `↪ [jump](https://discord.com/channels/${ctx.table.guildId}/${ctx.session.route.channel_id}/${messageId})`;
 }
 
-async function reply(ctx, args) {
+function validReply(args) {
   const files = validFiles(args.files);
   if (typeof args.text !== "string" || (args.text.length === 0 && files.length === 0)) {
     throw new OpError("invalid_args", "text is required");
   }
+  return files;
+}
+
+async function botReply(ctx, args, files) {
+  const target = args.reply_to === undefined ? null : await scopedMessage(ctx, args.reply_to);
+  const ids = [];
+  for (const [index, chunk] of splitMessage(args.text).entries()) {
+    const payload = {
+      content: chunk, allowed_mentions: { parse: [] },
+      ...(index === 0 && target ? { message_reference: { message_id: target.id } } : {}),
+    };
+    const message = await discordRequest("POST", `/channels/${ctx.session.route.channel_id}/messages`, {
+      token: ctx.token, body: await executeBody(payload, index === 0 ? files : []),
+    });
+    ids.push(message.id);
+  }
+  return { message_id: ids[0], message_ids: ids };
+}
+
+async function reply(ctx, args) {
+  const files = validReply(args);
+  if (ctx.session.role === "root") return botReply(ctx, args, files);
   const { route } = ctx.session;
   const secret = await projectWebhook(ctx);
   const target = args.reply_to === undefined ? null : await scopedMessage(ctx, args.reply_to);
@@ -74,6 +97,6 @@ async function reply(ctx, args) {
 
 module.exports = {
   ops: {
-    reply: { roles: ["project"], scoped: true, run: reply },
+    reply: { roles: ["project", "root"], scoped: true, run: reply },
   },
 };

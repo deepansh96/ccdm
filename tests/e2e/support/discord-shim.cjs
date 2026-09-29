@@ -76,6 +76,23 @@ function attachmentMap(entries = []) {
   return map;
 }
 
+// Like Discord's `referenced_message.author`: who wrote the message a native
+// reply points at. A webhook message's author is the webhook; a message the
+// fake created without one was sent by this gateway's bot.
+function repliedUser(client, raw) {
+  if (!raw.replyTo) return null;
+  const discord = readState().fixtures?.discord ?? {};
+  const injected = (discord.injectedMessages ?? []).find(message => message.id === raw.replyTo);
+  if (injected) return { id: injected.webhookId ?? injected.author?.id, bot: Boolean(injected.webhookId || injected.author?.bot) };
+  const sent = (discord.messages ?? []).find(message => message.id === raw.replyTo);
+  if (sent) return { id: sent.webhookId ?? client.user.id, bot: true };
+  for (const history of Object.values(discord.history ?? {})) {
+    const seeded = Array.isArray(history) && history.find(message => message.id === raw.replyTo);
+    if (seeded) return { id: seeded.webhook_id ?? seeded.author?.id, bot: Boolean(seeded.author?.bot) };
+  }
+  return null;
+}
+
 function fixtureMessage(client, raw) {
   return {
     attachments: attachmentMap(raw.attachments),
@@ -91,6 +108,7 @@ function fixtureMessage(client, raw) {
     createdTimestamp: raw.createdTimestamp ?? Date.now(),
     id: raw.id,
     reference: raw.replyTo ? { channelId: raw.channelId, messageId: raw.replyTo } : null,
+    mentions: { repliedUser: repliedUser(client, raw) },
     webhookId: raw.webhookId ?? null,
     reactions: {
       cache: new Map([

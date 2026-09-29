@@ -17,15 +17,19 @@ function registryPath() {
   return process.env.CCDM_REGISTRY_PATH || path.resolve(__dirname, "../..", "registry.json");
 }
 
+// Root's Discord state directory: its token and legacy access.json.
+function rootStateDir() {
+  return process.env.ROOT_DISCORD_STATE_DIR || path.join(os.homedir(), ".claude/channels/discord");
+}
+
 // The root bot token, read from root's Discord state directory as the other
 // root admin tools do. It is never copied anywhere else.
 async function rootToken() {
-  const directory = process.env.ROOT_DISCORD_STATE_DIR || path.join(os.homedir(), ".claude/channels/discord");
-  const source = await readFile(path.join(directory, ".env"), "utf8");
+  const source = await readFile(path.join(rootStateDir(), ".env"), "utf8");
   const line = source.split(/\r?\n/).find(value => value.startsWith("DISCORD_BOT_TOKEN="));
   const token = line?.slice("DISCORD_BOT_TOKEN=".length).trim().replace(/^(["'])(.*)\1$/, "$2");
   if (!token || /\s/.test(token)) throw new Error("root Discord credentials are unavailable");
   return token;
 }
 
-module.exports = { registryPath, rootToken, socketPath, stateDir };
+module.exports = { registryPath, rootStateDir, rootToken, socketPath, stateDir };

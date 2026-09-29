@@ -187,6 +187,8 @@ function authorForToken(authorization) {
     const bot = (registry.pool ?? []).find(entry => `Bot ${entry.token}` === authorization);
     if (bot?.app_id) return String(bot.app_id);
   } catch { /* Fall back to the single-bot fixture identity. */ }
+  // The Router's token is the fake gateway's bot user.
+  if (process.env.CCDM_ROUTER_STATE_DIR) return "fixture-bot-user-id";
   return "app";
 }
 

@@ -1,7 +1,8 @@
 "use strict";
 
 // Write actions in the session's channel beyond replies: edits of the
-// project's own webhook messages, the bot's reactions, and typing.
+// project's own webhook messages (root: the bot's own messages), the bot's
+// reactions, and typing.
 const { MESSAGE_LIMIT } = require("../chunks.js");
 const { discordRequest } = require("../discord-rest.js");
 const { readWebhookSecret } = require("../webhooks.js");
@@ -67,6 +68,7 @@ async function editMessage(ctx, args) {
   if (typeof args.text !== "string" || args.text.length === 0 || args.text.length > MESSAGE_LIMIT) {
     throw new OpError("invalid_args", `text must be 1-${MESSAGE_LIMIT} characters`);
   }
+  if (ctx.session.role === "root") return editBotMessage(ctx, args, arrival);
   const { route } = ctx.session;
   const secret = await readWebhookSecret(ctx.stateDir, route.project);
   if (!secret) throw new OpError("webhook_missing", `no webhook for ${route.project}; run ensure-webhook`);
@@ -77,6 +79,20 @@ async function editMessage(ctx, args) {
   return coalescedEdit(`${secret.webhook_id}/${message.id}`, arrival, args.text, async text => {
     const edited = await discordRequest("PATCH", `/webhooks/${secret.webhook_id}/${secret.token}/messages/${message.id}`, {
       body: { content: text, allowed_mentions: { parse: [] } },
+    });
+    return { message_id: edited.id };
+  });
+}
+
+async function editBotMessage(ctx, args, arrival) {
+  const message = await scopedMessage(ctx, args.message_id);
+  if (message.webhook_id || !ctx.bot.id || message.author?.id !== ctx.bot.id) {
+    throw new ScopeViolation(args.message_id, "only the bot's own messages can be edited");
+  }
+  const { channel_id: channelId } = ctx.session.route;
+  return coalescedEdit(`bot/${message.id}`, arrival, args.text, async text => {
+    const edited = await discordRequest("PATCH", `/channels/${channelId}/messages/${message.id}`, {
+      token: ctx.token, body: { content: text, allowed_mentions: { parse: [] } },
     });
     return { message_id: edited.id };
   });
@@ -99,8 +115,8 @@ async function typing(ctx) {
 
 module.exports = {
   ops: {
-    edit_message: { roles: ["project"], scoped: true, run: editMessage },
-    react: { roles: ["project"], scoped: true, run: react },
-    typing: { roles: ["project"], scoped: true, run: typing },
+    edit_message: { roles: ["project", "root"], scoped: true, run: editMessage },
+    react: { roles: ["project", "root"], scoped: true, run: react },
+    typing: { roles: ["project", "root"], scoped: true, run: typing },
   },
 };

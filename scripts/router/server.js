@@ -13,6 +13,9 @@ const { OPERATIONS } = require("./ops/index.js");
 const PROTOCOL_VERSION = 1;
 // How many recent scope violations `router status` keeps.
 const RECENT_VIOLATIONS = 20;
+// Root's key file, beside the project keys; a leading dot keeps it apart
+// from any project's `<project>.key`.
+const ROOT_KEY_FILE = ".root.key";
 
 function send(socket, frame) {
   if (!socket.destroyed) socket.write(`${JSON.stringify(frame)}\n`);
@@ -37,6 +40,13 @@ function parseFrame(line) {
   return frame;
 }
 
+// Root's route for one target channel, or null outside root's scope.
+function rootTarget(table, channelId) {
+  if (table.rootChannels.has(channelId)) return { project: "root", channel_id: channelId };
+  const project = table.registered.get(channelId);
+  return project ? { project, channel_id: channelId } : null;
+}
+
 // A live socket already owns the path: refuse rather than steal it.
 async function claimSocketPath(socketPath) {
   const live = await new Promise(resolve => {
@@ -51,21 +61,34 @@ async function claimSocketPath(socketPath) {
 function createRouterServer({ stateDir, socketPath, getTable, gateway, registry, context, log }) {
   // project name -> the one session connected for it.
   const sessions = new Map();
+  // Root's one session, apart from the projects so no project name can take it.
+  let rootSession = null;
   const violations = [];
   const keysDir = path.join(stateDir, "keys");
   let keysWatcher = null;
 
-  async function projectKey(project) {
+  async function readKey(file) {
     try {
-      return (await readFile(path.join(keysDir, `${path.basename(project)}.key`), "utf8")).trim();
+      return (await readFile(path.join(keysDir, file), "utf8")).trim();
     } catch {
       return null;
     }
   }
 
+  const projectKey = project => readKey(`${path.basename(project)}.key`);
+  const connectionKey = connection => connection.role === "root" ? readKey(ROOT_KEY_FILE) : projectKey(connection.route.project);
+
+  function forget(connection) {
+    if (connection.role === "root") {
+      if (rootSession === connection) rootSession = null;
+    } else if (connection.route && sessions.get(connection.route.project) === connection) {
+      sessions.delete(connection.route.project);
+    }
+  }
+
   // The session loses its place: it is told why, then disconnected.
   function revoke(connection, reason) {
-    if (sessions.get(connection.route.project) === connection) sessions.delete(connection.route.project);
+    forget(connection);
     log(`revoked project=${connection.route.project} reason=${reason}`);
     send(connection.socket, { type: "event", event: "revoked", reason });
     connection.socket.end();
@@ -73,8 +96,8 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
 
   // A launch wrote a new key: any session still holding the old one goes.
   async function revokeStaleKeys() {
-    for (const connection of [...sessions.values()]) {
-      if (!keysMatch(await projectKey(connection.route.project), connection.key)) revoke(connection, "key_rotated");
+    for (const connection of [...sessions.values(), ...(rootSession ? [rootSession] : [])]) {
+      if (!keysMatch(await connectionKey(connection), connection.key)) revoke(connection, "key_rotated");
     }
   }
 
@@ -87,6 +110,17 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     if (frame.role === "status") {
       connection.role = "status";
       return send(connection.socket, { type: "hello_ok", v: PROTOCOL_VERSION, scope: null });
+    }
+    if (frame.role === "root") {
+      if (!keysMatch(await readKey(ROOT_KEY_FILE), frame.key)) return reject("unauthorized", "unknown root key");
+      if (rootSession) revoke(rootSession, "replaced");
+      Object.assign(connection, {
+        role: "root", route: { project: "root", channel_id: null }, key: frame.key, connectedAt: new Date().toISOString(),
+      });
+      rootSession = connection;
+      return send(connection.socket, {
+        type: "hello_ok", v: PROTOCOL_VERSION, scope: { project: "root", root_channels: [...getTable().rootChannels] },
+      });
     }
     if (frame.role !== "project") return reject("unsupported_role", `unsupported role: ${frame.role}`);
     const route = getTable().projects.get(String(frame.project));
@@ -118,11 +152,17 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       if (violations.length > RECENT_VIOLATIONS) violations.shift();
       fail("scope_violation", message);
     };
-    if (operation.scoped && String(args.channel_id) !== connection.route.channel_id) {
+    // Root acts in its own channels and any registered channel, one target per request.
+    let session = connection;
+    if (operation.scoped && connection.role === "root") {
+      const route = rootTarget(getTable(), String(args.channel_id));
+      if (!route) return violation(args.channel_id, "channel_id is neither a root channel nor a registered channel");
+      session = { ...connection, route };
+    } else if (operation.scoped && String(args.channel_id) !== connection.route.channel_id) {
       return violation(args.channel_id, "channel_id is outside this session's scope");
     }
     try {
-      const result = await operation.run({ ...context, session: connection, sessions: listSessions, violations: () => [...violations], table: getTable(), gateway, registry }, args);
+      const result = await operation.run({ ...context, session, sessions: listSessions, violations: () => [...violations], table: getTable(), gateway, registry }, args);
       respond({ ok: true, result });
     } catch (error) {
       if (error instanceof ScopeViolation) return violation(error.target, error.message);
@@ -133,7 +173,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
   }
 
   function listSessions() {
-    return [...sessions.values()].map(connection => ({
+    return [...(rootSession ? [rootSession] : []), ...sessions.values()].map(connection => ({
       role: connection.role, route: connection.route, connectedAt: connection.connectedAt,
     }));
   }
@@ -167,9 +207,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       }
     });
     socket.on("error", () => {});
-    socket.on("close", () => {
-      if (connection.route && sessions.get(connection.route.project) === connection) sessions.delete(connection.route.project);
-    });
+    socket.on("close", () => forget(connection));
   }
 
   const server = net.createServer(onConnection);
@@ -196,6 +234,12 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       send(connection.socket, { type: "event", ...event });
       return true;
     },
+    // Delivers to root's live session; false when root is not connected.
+    deliverRoot(event) {
+      if (!rootSession) return false;
+      send(rootSession.socket, { type: "event", ...event });
+      return true;
+    },
     // A reloaded registry can move a connected project's channel or webhook.
     refreshRoutes() {
       const { projects } = getTable();
@@ -207,6 +251,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     close() {
       keysWatcher?.close();
       for (const connection of sessions.values()) connection.socket.destroy();
+      rootSession?.socket.destroy();
       server.close();
     },
   };
