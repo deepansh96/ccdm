@@ -12,6 +12,12 @@
 //   CCDM_ROUTER_STATE_DIR     the Router state directory (its socket lives there)
 //   CCDM_CLAUDE_PROJECT       the project this session serves
 //   CCDM_CHANNEL_READY_FILE   where the Router hello outcome is written for the launcher
+//   CCDM_ROUTER_ROLE          `root` for root Claude (restart-root-agent.sh); otherwise a project
+//
+// In the root role the server speaks for root: it receives root-channel
+// messages and the owner's bot mentions in project channels, may act in any
+// registered channel, posts as the bot, and records no Conversation Reminder
+// events or management commands.
 //
 // The statusline wrapper writes the latest context percentage to
 // `<state>/launches/<project>/context.json`; reply and edit_message send it as
@@ -51,6 +57,13 @@ const INSTRUCTIONS = [
   "",
   "For every reply, pass conversation_interaction_id copied from the owner message_id being answered. Set conversation_disposition to input-needed only when the delivered reply explicitly asks the owner for input; otherwise use progress. A reply without a valid interaction ID is delivered normally but does not count as a confirmed Conversation Reminder response.",
 ].join("\n");
+const ROOT_INSTRUCTIONS = [
+  ...INSTRUCTIONS.split("\n").slice(0, 5),
+  "",
+  "You are the CCDM root agent. Messages arrive from root channels and from bot mentions in registered project channels. fetch_messages, read_last_x_messages_in_channel, and export_message_range read any root or registered project channel; reply, react, and edit_message act there as the root bot.",
+].join("\n");
+
+const ROOT = process.env.CCDM_ROUTER_ROLE === "root";
 
 const REMINDER_PROJECT_ROOT = process.env.CCDM_REMINDER_PROJECT_ROOT || path.dirname(__dirname);
 const REMINDER_STATE_DIR = process.env.CCDM_REMINDER_STATE_DIR || path.join(os.homedir(), ".local", "state", "ccdm", "conversation-reminders");
@@ -304,6 +317,19 @@ const TOOLS = {
   },
 };
 
+// Root reads any of its channels, so its read tools take the channel; reply
+// correlation is a project Conversation Reminder concern.
+if (ROOT) {
+  for (const name of ["read_last_x_messages_in_channel", "export_message_range"]) {
+    const tool = TOOLS[name];
+    const args = tool.args;
+    tool.properties = { chat_id: { type: "string", description: "Channel to read." }, ...tool.properties };
+    tool.required = ["chat_id", ...tool.required];
+    tool.args = input => ({ ...args(input), channel_id: input.chat_id });
+  }
+  TOOLS.reply.required = ["chat_id", "text"];
+}
+
 function send(frame) {
   process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...frame })}\n`);
 }
@@ -370,8 +396,8 @@ function scheduleRestart(project) {
 }
 
 // Reminder events are recorded in arrival order, after any stranded outbox.
-let reminderEvents = reminder.drainOutbox();
-process.on("exit", removeCapabilityMarker);
+let reminderEvents = ROOT ? Promise.resolve() : reminder.drainOutbox();
+if (!ROOT) process.on("exit", removeCapabilityMarker);
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(signal, () => process.exit(0));
 
 function main() {
@@ -384,7 +410,7 @@ function main() {
     process.stderr.write(`ccdm channel: launch key unavailable\n`);
     process.exit(1);
   }
-  const router = new RouterClient({ project, key, role: "project" });
+  const router = new RouterClient({ project, key, role: ROOT ? "root" : "project" });
 
   // Channel notifications wait until Claude has finished initializing.
   let initialized = false;
@@ -404,6 +430,7 @@ function main() {
     else notify(kind, event);
   };
   router.on("message", event => {
+    if (ROOT) return deliver("message")(event);
     reminderEvents = reminderEvents.then(() => recordOwnerMessage(event)).catch(error => {
       process.stderr.write(`ccdm channel: reminder activity recording failed: ${error.message}\n`);
     });
@@ -447,6 +474,7 @@ function main() {
   }
   let commands = Promise.resolve();
   router.on("command", event => {
+    if (ROOT) return;
     const run = Object.hasOwn(COMMANDS, event.command) ? COMMANDS[event.command] : null;
     if (!run) return;
     commands = commands.then(() => run(event)).catch(error => {
@@ -456,14 +484,14 @@ function main() {
   router.on("disconnect", () => process.stderr.write("ccdm channel: Router connection lost; reconnecting\n"));
   router.on("reconnect", () => process.stderr.write("ccdm channel: Router connection restored\n"));
   router.on("end", error => {
-    removeCapabilityMarker();
+    if (!ROOT) removeCapabilityMarker();
     process.stderr.write(`ccdm channel: Router session ended${error ? `: ${error.code || error.message}` : ""}\n`);
   });
 
   router.connect().then(
     async granted => {
       scope = granted;
-      await writeCapabilityMarker(granted).catch(error => {
+      if (!ROOT) await writeCapabilityMarker(granted).catch(error => {
         process.stderr.write(`ccdm channel: capability marker failed: ${error.message}\n`);
       });
       reportReady({ ok: true, scope: granted });
@@ -512,7 +540,7 @@ function main() {
         protocolVersion: PROTOCOL_VERSION,
         capabilities: { tools: {}, experimental: { "claude/channel": {} } },
         serverInfo: { name: "ccdm", version: "1.0.0" },
-        instructions: INSTRUCTIONS,
+        instructions: ROOT ? ROOT_INSTRUCTIONS : INSTRUCTIONS,
       } });
     }
     if (method === "notifications/initialized") {

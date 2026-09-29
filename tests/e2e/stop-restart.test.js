@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { createRouterWorkspace, routerEnv, startRouter } from "./support/router.js";
 import { createWorkspace, runScript } from "./support/runner.js";
 import { readState, seedFixtureProcess, seedRegistry, seedTmuxSession, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
@@ -290,8 +291,9 @@ test("stop-session skips Codex listener sweep when required registry fields are 
   assert.equal(isAlive(orphanPid), true);
 });
 
-test("restart-root-agent simulates root_agent cleanup, retry, fresh launch, and trust-dialog send-key", async () => {
-  const workspace = createWorkspace();
+test("restart-root-agent simulates root_agent cleanup, retry, fresh launch, and development-channel send-key", async () => {
+  const workspace = createRouterWorkspace();
+  await startRouter(workspace);
   const panePid = spawnOwnedProcess(workspace, "zsh root pane");
   const childPid = spawnOwnedProcess(workspace, "claude root child", { ppid: panePid });
   seedTmuxSession(
@@ -300,14 +302,14 @@ test("restart-root-agent simulates root_agent cleanup, retry, fresh launch, and 
     { stateDir: workspace.stateDir },
   );
 
-  const result = await runScript(workspace, "restart-root-agent.sh");
+  const result = await runScript(workspace, "restart-root-agent.sh", { env: routerEnv(workspace) });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.match(result.stdout, /Restarted root agent in tmux session 'root_agent'/);
   assert.equal(isAlive(childPid), false);
   const session = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
   assert.equal(session.cwd, workspace.repoDir);
-  assert.equal(session.env.DISCORD_STATE_DIR, "~/.claude/channels/discord");
+  assert.equal(session.env.CCDM_ROUTER_KEY_FILE, path.join(workspace.routerStateDir, "keys", ".root.key"));
   assert.deepEqual(session.sendKeys, [["Enter"]]);
   assert.equal(session.killAttempts, 2);
 });
@@ -830,12 +832,13 @@ test("restart-root-agent launch failures include command diagnostics", async () 
 });
 
 test("restart-root-agent teardown failures are recorded as diagnostics", async () => {
-  const workspace = createWorkspace();
+  const workspace = createRouterWorkspace();
+  await startRouter(workspace);
   registerTeardownCallback(() => {
     throw new Error("restart cleanup failure");
   });
 
-  const result = await runScript(workspace, "restart-root-agent.sh");
+  const result = await runScript(workspace, "restart-root-agent.sh", { env: routerEnv(workspace) });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   await cleanup({ stateDir: workspace.stateDir });

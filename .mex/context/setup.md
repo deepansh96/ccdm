@@ -32,7 +32,7 @@ last_updated: 2026-09-22
 2. Run `./setup.sh` and provide the Discord user, guild, root channel, and bot token values it requests.
 3. Verify the generated local `registry.json` and `~/.claude/channels/discord/access.json`.
 4. Run `npm test`.
-5. Start the root agent with `./restart-root-agent.sh` or `./restart-root-codex-agent.sh <channel_id>`.
+5. Start the root agent with `./restart-root-agent.sh` or `./restart-root-codex-agent.sh <channel_id>`. Root Claude is a Router client, so the Router must be running with `root_channels` in the registry before `restart-root-agent.sh`.
 
 ## Environment Variables
 - `DISCORD_BOT_TOKEN` (required per bot) - stored in each local Discord state directory, never in tracked files.

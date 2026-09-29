@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { createWorkspace, runScript } from "./support/runner.js";
 import { bridgeChildEnv, waitForState } from "./support/bridge.js";
+import { routerEnv, startRouter } from "./support/router.js";
 import { readState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -505,7 +506,11 @@ test("project stop and root restart keep the independent service and closed stat
 
   const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"] });
   assert.equal(stopped.exitCode, 0, stopped.stderr || stopped.stdout);
-  const restarted = await runScript(workspace, "restart-root-agent.sh");
+  // Root Claude launches as a Router client; a short state path keeps the socket valid.
+  const routerStateDir = path.join(workspace.tmpRoot, "router");
+  const routerWorkspace = { ...workspace, routerStateDir, socketPath: path.join(routerStateDir, "router.sock") };
+  await startRouter(routerWorkspace, { env: { ROOT_DISCORD_STATE_DIR: path.join(workspace.homeDir, "root-discord") } });
+  const restarted = await runScript(workspace, "restart-root-agent.sh", { env: routerEnv(routerWorkspace) });
   assert.equal(restarted.exitCode, 0, restarted.stderr || restarted.stdout);
 
   const current = await command(workspace, context.stateDir, "status");
