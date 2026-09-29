@@ -13,7 +13,7 @@ import {
   routerWithWebhooks,
   runRouterCli,
 } from "./support/router.js";
-import { readState, writeState } from "./support/state.js";
+import { readState, seedTmuxSession, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => {
@@ -482,4 +482,120 @@ test("tool calls aimed at another channel surface scope_violation to Claude and 
   }
   const { messages, reactions, webhookEdits, attachmentFetches } = readState(workspace.stateDir).fixtures.discord;
   assert.deepEqual([messages, reactions, webhookEdits ?? [], attachmentFetches], [[], [], [], []]);
+});
+
+function command(workspace, id, content, author = { id: OWNER_ID, username: "Owner" }) {
+  injectDiscordMessage(workspace, { id, channelId: "demo-channel", content, author });
+}
+
+function acknowledgments(state) {
+  const { reactions, messages } = state.fixtures.discord;
+  return {
+    reactions: reactions.map(({ messageId, emoji }) => [messageId, decodeURIComponent(emoji)]),
+    messages: messages.map(({ channelId, content, username }) => [channelId, content, username]),
+  };
+}
+
+test("/compact and /clear are typed into demo's own tmux pane with an acknowledgment and no Claude turn", async () => {
+  const workspace = claudeRouterWorkspace();
+  await routerWithWebhooks(workspace, ["demo"]);
+  const started = await startSession(workspace);
+  assert.equal(started.exitCode, 0, started.stderr || started.stdout);
+  seedTmuxSession("other_claude", { paneOutput: "Listening\n" }, { stateDir: workspace.stateDir });
+
+  command(workspace, "cmd-compact", "/compact");
+  await waitForState(workspace, (next) => next.fixtures.tmux.sessions.demo_claude.sendKeys.length >= 3);
+  command(workspace, "cmd-clear", "/clear");
+  const done = await waitForState(workspace, (next) => next.fixtures.tmux.sessions.demo_claude.sendKeys.length >= 5
+    && next.fixtures.discord.messages.length >= 2);
+
+  assert.deepEqual(done.fixtures.tmux.sessions.demo_claude.sendKeys, [
+    ["Enter"], ["-l", "/compact"], ["Enter"], ["-l", "/clear"], ["Enter"],
+  ]);
+  assert.equal(done.fixtures.tmux.sessions.other_claude.sendKeys, undefined);
+  assert.deepEqual(acknowledgments(done), {
+    reactions: [["cmd-compact", "🔄"], ["cmd-clear", "🔄"]],
+    messages: [
+      ["demo-channel", "Sent /compact to Claude.", "demo-claude"],
+      ["demo-channel", "Sent /clear to Claude.", "demo-claude"],
+    ],
+  });
+  assert.deepEqual(done.fixtures.claude.channelNotifications ?? [], []);
+});
+
+test("/pause queues owner messages and /unpause delivers them to Claude in order", async () => {
+  const workspace = claudeRouterWorkspace();
+  await routerWithWebhooks(workspace, ["demo"]);
+  const started = await startSession(workspace);
+  assert.equal(started.exitCode, 0, started.stderr || started.stdout);
+
+  command(workspace, "cmd-pause", "/pause");
+  await waitForState(workspace, (next) => next.fixtures.discord.messages.length >= 1);
+  command(workspace, "queued-1", "first while paused");
+  command(workspace, "queued-2", "second while paused");
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.deepEqual(readState(workspace.stateDir).fixtures.claude.channelNotifications ?? [], []);
+
+  command(workspace, "cmd-unpause", "/unpause");
+  const done = await waitForState(workspace, (next) => (next.fixtures.claude.channelNotifications?.length ?? 0) >= 2
+    && next.fixtures.discord.messages.length >= 2);
+
+  assert.deepEqual(done.fixtures.claude.channelNotifications.map(({ content, meta }) => [content, meta.message_id]), [
+    ["first while paused", "queued-1"],
+    ["second while paused", "queued-2"],
+  ]);
+  assert.deepEqual(acknowledgments(done), {
+    reactions: [["cmd-pause", "⏸️"], ["cmd-unpause", "▶️"]],
+    messages: [
+      ["demo-channel", "Session paused. New messages will be queued.", "demo-claude"],
+      ["demo-channel", "Session unpaused.", "demo-claude"],
+    ],
+  });
+});
+
+function demoRuntime(workspace) {
+  const registry = JSON.parse(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"));
+  const keyFile = path.join(workspace.routerStateDir, "keys", "demo.key");
+  return { pid: registry.projects.demo.pid, key: fs.existsSync(keyFile) ? fs.readFileSync(keyFile, "utf8") : null };
+}
+
+// Restarts demo with `author`'s /restart and waits for the relaunched session
+// to hold a new PID record and a new key, with root's pane untouched.
+async function assertRestartsOnlyDemo(workspace, author) {
+  await routerWithWebhooks(workspace, ["demo"]);
+  const started = await startSession(workspace);
+  assert.equal(started.exitCode, 0, started.stderr || started.stdout);
+  seedTmuxSession("root_agent", { paneOutput: "root listening\n" }, { stateDir: workspace.stateDir });
+  const before = demoRuntime(workspace);
+
+  command(workspace, "cmd-restart", "/restart", author);
+
+  const deadline = Date.now() + 20000;
+  for (;;) {
+    const after = demoRuntime(workspace);
+    if (typeof after.pid === "number" && after.pid !== before.pid && after.key && after.key !== before.key) {
+      const status = await runRouterCli(workspace, ["status"]);
+      if (/sessions: 1\n  project demo scope=demo-channel connected=/.test(status.stdout)) break;
+    }
+    assert.ok(Date.now() < deadline, `demo never relaunched: ${JSON.stringify({ before, after })}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const state = readState(workspace.stateDir);
+  assert.equal(state.fixtures.tmux.lastKilledSessions.demo_claude.killAttempts, 1);
+  assert.equal(state.fixtures.tmux.sessions.demo_claude.devChannelPrompt, "accepted");
+  assert.deepEqual(state.fixtures.tmux.sessions.root_agent, { name: "root_agent", paneOutput: "root listening\n" });
+  assert.equal(state.fixtures.tmux.lastKilledSessions.root_agent, undefined);
+  assert.deepEqual(acknowledgments(state), {
+    reactions: [["cmd-restart", "🔄"]],
+    messages: [["demo-channel", "Restarting session — fresh session coming up.", "demo-claude"]],
+  });
+  assert.deepEqual(state.fixtures.claude.channelNotifications ?? [], []);
+}
+
+test("/restart in demo's channel relaunches only demo, which reconnects with a new key", async () => {
+  await assertRestartsOnlyDemo(claudeRouterWorkspace(), { id: OWNER_ID, username: "Owner" });
+});
+
+test("a guest's /restart follows the Codex bridge's allowed-user policy: demo restarts and root never does", async () => {
+  await assertRestartsOnlyDemo(claudeRouterWorkspace(), { id: "guest-id", username: "Guest" });
 });

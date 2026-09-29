@@ -16,12 +16,21 @@
 // The statusline wrapper writes the latest context percentage to
 // `<state>/launches/<project>/context.json`; reply and edit_message send it as
 // `context_pct`, or omit it when the file is missing or unreadable.
+//
+// Router `command` events run here, never as a Claude turn: /compact and
+// /clear are typed into this session's own tmux pane through
+// send-claude-command.sh, /pause queues inbound events until /unpause, and
+// /restart relaunches this project (never root) through stop-session.sh and
+// start-session.sh.
+const { execFile, spawn } = require("node:child_process");
 const { readFileSync, renameSync, writeFileSync } = require("node:fs");
 const { chmod, mkdir, writeFile } = require("node:fs/promises");
+const os = require("node:os");
 const path = require("node:path");
 const { createInterface } = require("node:readline");
 const { RouterClient } = require("./router/client.js");
 
+const ROOT_DIR = path.dirname(__dirname);
 const PROTOCOL_VERSION = "2025-03-26";
 const INSTRUCTIONS = [
   "The sender reads Discord, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.",
@@ -203,6 +212,33 @@ function notification(kind, event) {
   };
 }
 
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function relayClaudeCommand(project, command) {
+  return new Promise((resolve, reject) => {
+    execFile(path.join(ROOT_DIR, "scripts", "send-claude-command.sh"), ["--project", project, command], (error, stdout, stderr) => {
+      if (error) reject(new Error(stderr.trim() || error.message));
+      else resolve(stdout);
+    });
+  });
+}
+
+// Stopping the session kills this process tree, so the restart runs in a
+// backgrounded subshell that the launching shell leaves behind.
+function scheduleRestart(project) {
+  const logPath = path.join(os.tmpdir(), `ccdm-restart-${project.replace(/[^a-zA-Z0-9._-]/g, "_")}.log`);
+  const steps = [
+    `cd ${shellQuote(ROOT_DIR)}`,
+    `./scripts/stop-session.sh ${shellQuote(project)}`,
+    `./scripts/start-session.sh ${shellQuote(project)}`,
+  ].join(" && ");
+  const child = spawn("/bin/sh", ["-c", `(${steps}) >> ${shellQuote(logPath)} 2>&1 &`], { detached: true, env: process.env, stdio: "ignore" });
+  child.unref();
+  return logPath;
+}
+
 function main() {
   const project = process.env.CCDM_CLAUDE_PROJECT;
   let key;
@@ -218,15 +254,65 @@ function main() {
   // Channel notifications wait until Claude has finished initializing.
   let initialized = false;
   const queued = [];
-  const notify = kind => event => {
+  const notify = (kind, event) => {
+    // Like the plugin, show the bot typing while Claude takes the message in.
+    if (kind === "message") router.request("typing", { channel_id: event.channel_id }).catch(() => {});
     const params = notification(kind, event);
     if (initialized) send({ method: "notifications/claude/channel", params });
     else queued.push(params);
   };
-  // Like the plugin, show the bot typing while Claude takes the message in.
-  router.on("message", event => router.request("typing", { channel_id: event.channel_id }).catch(() => {}));
-  router.on("message", notify("message"));
-  router.on("reaction", notify("reaction"));
+  // While paused, inbound events wait here and are delivered in order on /unpause.
+  let paused = false;
+  const pausedEvents = [];
+  const deliver = kind => event => {
+    if (paused) pausedEvents.push([kind, event]);
+    else notify(kind, event);
+  };
+  router.on("message", deliver("message"));
+  router.on("reaction", deliver("reaction"));
+
+  // Commands run one at a time, in arrival order, and acknowledge like the
+  // Codex bridge: a reaction on the command, then a short reply.
+  const react = (event, emoji) => router.request("react", { channel_id: event.channel_id, message_id: event.message_id, emoji });
+  const say = (event, text) => router.request("reply", { channel_id: event.channel_id, text, context_pct: contextPct() });
+  const COMMANDS = {
+    pause: async event => {
+      paused = true;
+      await react(event, "⏸️");
+      await say(event, "Session paused. New messages will be queued.");
+    },
+    unpause: async event => {
+      paused = false;
+      for (const [kind, queuedEvent] of pausedEvents.splice(0)) notify(kind, queuedEvent);
+      await react(event, "▶️");
+      await say(event, "Session unpaused.");
+    },
+    compact: event => relayAcknowledged(event, "compact"),
+    clear: event => relayAcknowledged(event, "clear"),
+    restart: async event => {
+      await react(event, "🔄");
+      await say(event, "Restarting session — fresh session coming up.");
+      const logPath = scheduleRestart(project);
+      process.stderr.write(`ccdm channel: restart scheduled for '${project}'; log: ${logPath}\n`);
+    },
+  };
+  async function relayAcknowledged(event, name) {
+    await react(event, "🔄");
+    try {
+      await relayClaudeCommand(project, name);
+    } catch (error) {
+      return say(event, `**Error:** Failed to ${name} — ${error.message}`);
+    }
+    await say(event, `Sent /${name} to Claude.`);
+  }
+  let commands = Promise.resolve();
+  router.on("command", event => {
+    const run = Object.hasOwn(COMMANDS, event.command) ? COMMANDS[event.command] : null;
+    if (!run) return;
+    commands = commands.then(() => run(event)).catch(error => {
+      process.stderr.write(`ccdm channel: /${event.command} failed: ${error.code || error.message}\n`);
+    });
+  });
   router.on("disconnect", () => process.stderr.write("ccdm channel: Router connection lost; reconnecting\n"));
   router.on("reconnect", () => process.stderr.write("ccdm channel: Router connection restored\n"));
   router.on("end", error => process.stderr.write(`ccdm channel: Router session ended${error ? `: ${error.code || error.message}` : ""}\n`));
