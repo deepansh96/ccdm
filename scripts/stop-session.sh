@@ -147,6 +147,46 @@ for line in ps.splitlines():
 PY
 }
 
+# Router-transport Claude listeners carry their launch key file path (never
+# the key) in their environment: the claude process and its channel server.
+find_router_claude_pids() {
+  local key_file="$1"
+  python3 - "$key_file" <<'PY'
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+target = os.path.normpath(sys.argv[1])
+try:
+    ps = subprocess.check_output(["ps", "axeww", "-o", "pid=,command="], text=True, stderr=subprocess.DEVNULL)
+except Exception:
+    sys.exit(0)
+env_re = re.compile(r"""CCDM_ROUTER_KEY_FILE=(?:"([^"]+)"|'([^']+)'|([^\s]+))""")
+
+def is_listener(command: str) -> bool:
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    if not argv:
+        return False
+    exe = os.path.basename(argv[0])
+    if exe == "claude":
+        return "--dangerously-load-development-channels" in argv and "server:ccdm" in argv
+    return exe == "node" and any(os.path.basename(arg) == "ccdm-channel-server.js" for arg in argv[1:])
+
+for line in ps.splitlines():
+    pid_text, _, command = line.strip().partition(" ")
+    if not pid_text.isdigit() or "ps axeww" in command or "python3 -" in command:
+        continue
+    keys = [next(g for g in m.groups() if g is not None) for m in env_re.finditer(command)]
+    if any(os.path.normpath(key) == target for key in keys) and is_listener(command):
+        print(pid_text)
+PY
+}
+
 find_codex_listener_pids() {
   local channel_id="$1"
   local ws_port="$2"
@@ -220,11 +260,13 @@ for line in ps.splitlines():
 PY
 }
 
-IFS=$'\t' read -r SCREEN_NAME SESSION_TYPE STATE_DIR REGISTRY_PID CHANNEL_ID WS_PORT BOT_APP_ID <<< "$(python3 -c "
+IFS=$'\t' read -r SCREEN_NAME SESSION_TYPE STATE_DIR REGISTRY_PID CHANNEL_ID WS_PORT BOT_APP_ID TRANSPORT <<< "$(python3 -c "
 import json, os
 r = json.load(open('$REGISTRY'))
 p = r['projects']['$PROJECT']
-bot = next(b for b in r['pool'] if b['id'] == p['bot_id'])
+transport = 'router' if p.get('transport') == 'router' else 'pool'
+# Router projects have no pool bot.
+bot = {} if transport == 'router' else next(b for b in r['pool'] if b['id'] == p['bot_id'])
 def field(value):
     return '__NONE__' if value in (None, '') else str(value)
 session_type = p.get('type', 'claude')
@@ -232,11 +274,12 @@ ws_port = p.get('ws_port', 18300) if session_type == 'codex' else p.get('ws_port
 print('\t'.join([
     field(p['screen_name']),
     field(session_type),
-    field(os.path.expanduser(bot['state_dir'])),
+    field(os.path.expanduser(bot['state_dir']) if bot else None),
     field(p.get('pid')),
     field(p.get('channel_id')),
     field(ws_port),
     field(bot.get('app_id')),
+    transport,
 ]))
 ")"
 
@@ -245,8 +288,13 @@ print('\t'.join([
 [[ "$WS_PORT" == "__NONE__" ]] && WS_PORT=""
 [[ "$BOT_APP_ID" == "__NONE__" ]] && BOT_APP_ID=""
 
+ROUTER_STATE_DIR="${CCDM_ROUTER_STATE_DIR:-$HOME/.local/state/ccdm/router}"
+ROUTER_KEY_FILE="$ROUTER_STATE_DIR/keys/$PROJECT.key"
+
 find_owned_listener_pids() {
-  if [[ "$SESSION_TYPE" == "codex" ]]; then
+  if [[ "$SESSION_TYPE" != "codex" && "$TRANSPORT" == "router" ]]; then
+    find_router_claude_pids "$ROUTER_KEY_FILE"
+  elif [[ "$SESSION_TYPE" == "codex" ]]; then
     if [[ -z "$CHANNEL_ID" || -z "$WS_PORT" || -z "$BOT_APP_ID" ]]; then
       echo "Skipping Codex listener sweep for '$PROJECT': missing channel_id, ws_port, or bot_app_id" >&2
       return 0
@@ -275,6 +323,20 @@ if [[ -n "$ORPHAN_PIDS" ]]; then
   echo "Cleaning remaining listener process(es):"
   echo "$ORPHAN_PIDS" | sed 's/^/  /'
   terminate_pids "${(@f)ORPHAN_PIDS}"
+fi
+
+if [[ "$SESSION_TYPE" != "codex" && "$TRANSPORT" == "router" ]]; then
+  # The stopped launch's key and launch files go with it; the next launch writes fresh ones.
+  python3 - "$ROUTER_KEY_FILE" "$ROUTER_STATE_DIR/launches/$PROJECT" <<'PY'
+import shutil
+import sys
+from pathlib import Path
+
+key_file, launch_dir = sys.argv[1:3]
+if "/" not in Path(key_file).name:
+    Path(key_file).unlink(missing_ok=True)
+shutil.rmtree(launch_dir, ignore_errors=True)
+PY
 fi
 
 if [[ "$SESSION_TYPE" != "codex" ]]; then

@@ -131,6 +131,7 @@ function normalizeState(value) {
       ...initialState().fixtures,
       ...(value?.fixtures ?? {}),
       claude: {
+        ...(value?.fixtures?.claude ?? {}),
         invocations: value?.fixtures?.claude?.invocations ?? [],
       },
       curl: {
