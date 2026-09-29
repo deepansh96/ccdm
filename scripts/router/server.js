@@ -16,6 +16,8 @@ const RECENT_VIOLATIONS = 20;
 // Root's key file, beside the project keys; a leading dot keeps it apart
 // from any project's `<project>.key`.
 const ROOT_KEY_FILE = ".root.key";
+// The Conversation Reminder observer's key, named apart the same way.
+const OBSERVER_KEY_FILE = ".observer.key";
 
 function send(socket, frame) {
   if (!socket.destroyed) socket.write(`${JSON.stringify(frame)}\n`);
@@ -63,6 +65,9 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
   const sessions = new Map();
   // Root's one session, apart from the projects so no project name can take it.
   let rootSession = null;
+  // The read-only reminder observer: it receives every project-channel event
+  // and may perform no operation.
+  let observerSession = null;
   // Op-only project connections (`listener: false`, such as a Codex bridge's
   // scoped MCP server): they act in the project's scope but receive no events
   // and never replace the project's listener.
@@ -80,11 +85,14 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
   }
 
   const projectKey = project => readKey(`${path.basename(project)}.key`);
-  const connectionKey = connection => connection.role === "root" ? readKey(ROOT_KEY_FILE) : projectKey(connection.route.project);
+  const connectionKey = connection => connection.role === "root" ? readKey(ROOT_KEY_FILE)
+    : connection.role === "observer" ? readKey(OBSERVER_KEY_FILE) : projectKey(connection.route.project);
 
   function forget(connection) {
     if (connection.role === "root") {
       if (rootSession === connection) rootSession = null;
+    } else if (connection.role === "observer") {
+      if (observerSession === connection) observerSession = null;
     } else if (connection.listener === false) {
       opConnections.delete(connection);
     } else if (connection.route && sessions.get(connection.route.project) === connection) {
@@ -102,7 +110,8 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
 
   // A launch wrote a new key: any session still holding the old one goes.
   async function revokeStaleKeys() {
-    for (const connection of [...sessions.values(), ...opConnections, ...(rootSession ? [rootSession] : [])]) {
+    for (const connection of [...sessions.values(), ...opConnections, ...(rootSession ? [rootSession] : []),
+      ...(observerSession ? [observerSession] : [])]) {
       if (!keysMatch(await connectionKey(connection), connection.key)) revoke(connection, "key_rotated");
     }
   }
@@ -127,6 +136,16 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       return send(connection.socket, {
         type: "hello_ok", v: PROTOCOL_VERSION, scope: { project: "root", root_channels: [...getTable().rootChannels] },
       });
+    }
+    if (frame.role === "observer") {
+      if (!keysMatch(await readKey(OBSERVER_KEY_FILE), frame.key)) return reject("unauthorized", "unknown observer key");
+      if (observerSession) revoke(observerSession, "replaced");
+      Object.assign(connection, {
+        role: "observer", route: { project: "observer", channel_id: null }, key: frame.key,
+        connectedAt: new Date().toISOString(),
+      });
+      observerSession = connection;
+      return send(connection.socket, { type: "hello_ok", v: PROTOCOL_VERSION, scope: { project: "observer" } });
     }
     if (frame.role !== "project") return reject("unsupported_role", `unsupported role: ${frame.role}`);
     const route = getTable().projects.get(String(frame.project));
@@ -187,7 +206,8 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
   }
 
   function listSessions() {
-    return [...(rootSession ? [rootSession] : []), ...sessions.values()].map(connection => ({
+    return [...(rootSession ? [rootSession] : []), ...(observerSession ? [observerSession] : []),
+      ...sessions.values()].map(connection => ({
       role: connection.role, route: connection.route, connectedAt: connection.connectedAt,
     }));
   }
@@ -254,6 +274,12 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       send(rootSession.socket, { type: "event", ...event });
       return true;
     },
+    // Delivers to the reminder observer; false when it is not connected.
+    deliverObserver(event) {
+      if (!observerSession) return false;
+      send(observerSession.socket, { type: "event", ...event });
+      return true;
+    },
     // A reloaded registry can move a connected project's channel or webhook.
     refreshRoutes() {
       const { projects } = getTable();
@@ -266,6 +292,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       keysWatcher?.close();
       for (const connection of [...sessions.values(), ...opConnections]) connection.socket.destroy();
       rootSession?.socket.destroy();
+      observerSession?.socket.destroy();
       server.close();
     },
   };

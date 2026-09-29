@@ -4,6 +4,7 @@
 // root, and as what. Returns null for anything the Router ignores. A result
 // with `root: true` is for root's session, never the project's.
 const COMMANDS = new Set(["/pause", "/unpause", "/compact", "/clear", "/restart"]);
+const CLOSE_COMMAND = "/close";
 
 function allowedAuthor(allowed, table, user) {
   const id = String(user.id);
@@ -67,12 +68,33 @@ function classifyMessage(table, message) {
     ts: new Date(message.createdTimestamp).toISOString(),
   };
   const content = String(message.content || "");
-  // 5. Plain management commands pass through to the session adapter.
+  // 5. `/close` is for the reminder service alone, which sees it through the observer.
+  if (content.trim() === CLOSE_COMMAND) return null;
+  // 6. Plain management commands pass through to the session adapter.
   if (COMMANDS.has(content.trim())) {
     return { route, event: { event: "command", command: content.trim().slice(1), ...base } };
   }
-  // 6. Everything else is a message.
+  // 7. Everything else is a message.
   return { route, event: messageEvent(route, author, message) };
+}
+
+// The reminder observer's copy of every message in a router project channel,
+// bots and webhooks included: it tells owner activity and closure from agent
+// replies itself, by author and `webhook_id`.
+function observedMessage(table, message) {
+  const route = table.channels.get(String(message.channelId ?? message.channel?.id));
+  if (!route) return null;
+  return {
+    event: "message",
+    project: route.project,
+    message_id: message.id,
+    channel_id: route.channel_id,
+    author: { id: String(message.author?.id ?? ""), bot: Boolean(message.author?.bot) },
+    webhook_id: message.webhookId ? String(message.webhookId) : null,
+    content: String(message.content || ""),
+    attachment_count: message.attachments?.size ?? 0,
+    ts: new Date(message.createdTimestamp).toISOString(),
+  };
 }
 
 async function classifyReaction(table, reaction, user) {
@@ -101,4 +123,4 @@ async function classifyReaction(table, reaction, user) {
   };
 }
 
-module.exports = { classifyMessage, classifyReaction };
+module.exports = { classifyMessage, classifyReaction, observedMessage };

@@ -16,7 +16,7 @@ const { createAttachmentCache } = require("./router/attachments.js");
 const { RouterClient } = require("./router/client.js");
 const { discordRequest } = require("./router/discord-rest.js");
 const { acquireRouterLock } = require("./router/lock.js");
-const { classifyMessage, classifyReaction } = require("./router/inbound.js");
+const { classifyMessage, classifyReaction, observedMessage } = require("./router/inbound.js");
 const { preflight } = require("./router/preflight.js");
 const { registryPath, rootStateDir, rootToken, socketPath, stateDir } = require("./router/paths.js");
 const { DEFAULT_RELOAD_DEBOUNCE_MS, loadRoutingTable, watchRegistry } = require("./router/registry.js");
@@ -77,6 +77,8 @@ async function serve() {
 
   client.on("messageCreate", async message => {
     try {
+      const observed = observedMessage(table, message);
+      if (observed) server.deliverObserver(observed);
       const routed = classifyMessage(table, message);
       if (!routed) return;
       attachments.remember(routed.event);
@@ -92,7 +94,9 @@ async function serve() {
   client.on("messageReactionAdd", async (reaction, user) => {
     try {
       const routed = await classifyReaction(table, reaction, user);
-      if (routed) server.deliver(routed.route.project, routed.event);
+      if (!routed) return;
+      server.deliver(routed.route.project, routed.event);
+      server.deliverObserver({ ...routed.event, project: routed.route.project });
     } catch (error) {
       log(`reaction_failed error=${error.message}`);
     }

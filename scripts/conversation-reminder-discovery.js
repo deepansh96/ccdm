@@ -21,6 +21,15 @@ function mentions(content, id) {
   return Boolean(id) && [`<@${id}>`, `<@!${id}>`].some(value => content.includes(value));
 }
 
+// A router project's agent speaks only through its own webhook; a pool
+// project's through its assigned bot.
+function agentReply(message, found) {
+  if (found.transport === "router") {
+    return Boolean(found.webhook_id) && String(message.webhook_id ?? "") === String(found.webhook_id);
+  }
+  return String(message.author?.id || "") === String(found.bot_app_id);
+}
+
 function classify(message, found, rootUserId, isClose) {
   const author = String(message.author?.id || "");
   const content = String(message.content || "").trim();
@@ -31,7 +40,7 @@ function classify(message, found, rootUserId, isClose) {
     if (isClose(content, found.bot_app_id, rootUserId)) kind = "owner-close";
     else if (MANAGEMENT_COMMANDS.has(content) || mentions(content, rootUserId)) kind = "owner-command";
     else if (content || message.attachments?.length) kind = "owner-message";
-  } else if (author === String(found.bot_app_id)) {
+  } else if (agentReply(message, found)) {
     kind = COMMAND_OUTPUTS.has(content) ||
       /^\*\*Error:\*\* Failed to (clear|restart|compact|send message to Codex)\b/.test(content)
       ? "command-output" : "bot";

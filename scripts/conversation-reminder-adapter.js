@@ -35,22 +35,34 @@ async function resolveAssignmentForChannel(channelId, options = {}) {
   const projects = registry.projects && typeof registry.projects === "object" ? registry.projects : {};
   const matches = [];
   for (const [projectName, project] of Object.entries(projects)) {
-    if (!project || project.channel_id !== channelId || !project.bot_id) continue;
-    const bots = Array.isArray(registry.pool)
-      ? registry.pool.filter((bot) => bot && bot.id === project.bot_id)
-      : [];
-    if (bots.length !== 1) continue;
-    const bot = bots[0];
-    if (options.botAppId && bot.app_id !== options.botAppId) continue;
+    if (!project || project.channel_id !== channelId) continue;
     const ownerId = String(registry.discord_user_id || "");
+    // A router project speaks through its webhook, and root delivers its
+    // reminders; `router:<webhook_id>` stands where a pool bot's ID would.
+    const router = project.transport === "router";
+    let botId, botAppId;
+    if (router) {
+      if (!project.webhook_id) continue;
+      botId = `router:${project.webhook_id}`;
+      botAppId = "";
+    } else {
+      if (!project.bot_id) continue;
+      const bots = Array.isArray(registry.pool)
+        ? registry.pool.filter((bot) => bot && bot.id === project.bot_id)
+        : [];
+      if (bots.length !== 1) continue;
+      if (options.botAppId && bots[0].app_id !== options.botAppId) continue;
+      botId = String(project.bot_id);
+      botAppId = String(bots[0].app_id || "");
+    }
     const generation = project.assignment_generation
       ? String(project.assignment_generation)
       : assignmentGeneration(
         projectName,
         ownerId,
         String(project.channel_id),
-        String(project.bot_id),
-        String(bot.app_id || ""),
+        botId,
+        botAppId,
         String(project.registered_at || ""),
       );
     matches.push({
@@ -58,8 +70,11 @@ async function resolveAssignmentForChannel(channelId, options = {}) {
       project_type: project.type || "claude",
       owner_id: ownerId,
       channel_id: String(project.channel_id),
-      bot_id: String(project.bot_id),
-      bot_app_id: String(bot.app_id || ""),
+      bot_id: botId,
+      bot_app_id: botAppId,
+      identity: router ? botId : `pool:${botId}`,
+      transport: router ? "router" : "pool",
+      webhook_id: router ? String(project.webhook_id) : null,
       assignment_generation: generation,
     });
   }

@@ -581,6 +581,13 @@ function routeDiscordApi(url, init = {}) {
     });
   }
 
+  // The bot's own user, as the root token's holder sees it.
+  if (url.hostname === "discord.com" && url.pathname === "/api/v10/users/@me" && method === "GET") {
+    return response(JSON.stringify({ id: "fixture-bot-user-id", username: "fixture-bot", bot: true }), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
   const webhookRoute = routeWebhooks(url, method, init);
   if (webhookRoute) return webhookRoute;
 

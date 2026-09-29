@@ -71,6 +71,11 @@ def pool_bot_id(identity: str) -> str | None:
     return identity[len("pool:"):] if identity.startswith("pool:") else None
 
 
+def event_speaker(identity: str) -> str:
+    """The `bot_id` an event names for an identity: the pool bot, or the router identity itself."""
+    return pool_bot_id(identity) or identity
+
+
 def backup_store(db: sqlite3.Connection, state_dir: Path, version: int) -> None:
     """Keep a private copy of the store as it was before its first schema change."""
     target = state_dir / f"conversations.v{version}.backup.sqlite3"
@@ -304,7 +309,7 @@ def usable_assignment(registry: dict, name: str) -> dict | None:
     assignment = EVENTS.assignment_for(registry, name)
     same_channel = [item for item in registry["projects"].values() if isinstance(item, dict)
                     and str(item.get("channel_id")) == assignment["channel_id"]]
-    return assignment if len(same_channel) == 1 and assignment["bot"].get("token") else None
+    return assignment if len(same_channel) == 1 and EVENTS.can_deliver(assignment) else None
 
 
 def retire_conversation(db: sqlite3.Connection, row: sqlite3.Row, reason: str) -> None:
@@ -989,7 +994,7 @@ def reconcile_restart(db: sqlite3.Connection, registry: dict, rows: list[sqlite3
     applied = 0
     for ref, kind in sorted(missed.values(), key=lambda item: (iso(item[0]["at"]), len(item[0]["id"]), item[0]["id"])):
         event = {"schema_version": 1, "event_id": f"history:{generation}:{ref['id']}", "project": project,
-                 "channel_id": row["channel_id"], "bot_id": pool_bot_id(row["identity"]),
+                 "channel_id": row["channel_id"], "bot_id": event_speaker(row["identity"]),
                  "assignment_generation": generation,
                  "provider": "ccdm-root", "event_time": ref["at"], "event_order": f"{ref['at']}:history:{ref['id']}",
                  "adapter_instance_id": "restart-reconciliation", "actor_id": row["owner_id"],
@@ -1025,7 +1030,7 @@ def reconcile_restart(db: sqlite3.Connection, registry: dict, rows: list[sqlite3
             apply_payload(db, registry, EVENTS.validate_event({
                 "schema_version": 1, "event_id": f"history-reaction:{generation}:{uuid.uuid4().hex}",
                 "event_type": "owner_activity", "project": project, "channel_id": row["channel_id"],
-                "bot_id": pool_bot_id(row["identity"]), "assignment_generation": generation,
+                "bot_id": event_speaker(row["identity"]), "assignment_generation": generation,
                 "provider": "ccdm-root",
                 "event_time": stamp(now), "event_order": f"{stamp(now)}:history-reaction",
                 "adapter_instance_id": "restart-reconciliation", "actor_id": row["owner_id"],
@@ -1209,7 +1214,7 @@ def claim_due(project_root: Path, state_dir: Path) -> dict:
                 continue
             if (assignment["generation"] != row["assignment_generation"] or
                     assignment["channel_id"] != row["channel_id"] or assignment["identity"] != row["identity"] or
-                    not assignment["bot"].get("token")):
+                    not EVENTS.can_deliver(assignment)):
                 continue
             if db.execute("SELECT 1 FROM catch_ups WHERE project=? AND assignment_generation=?",
                           (row["project"], row["assignment_generation"])).fetchone():
@@ -1254,7 +1259,7 @@ def validate_claim(project_root: Path, state_dir: Path, nonce: str) -> dict:
                 assignment = EVENTS.assignment_for(registry, intent["project"])
                 valid = (assignment["generation"] == intent["assignment_generation"] and
                          assignment["channel_id"] == row["channel_id"] and
-                         assignment["identity"] == row["identity"] and bool(assignment["bot"].get("token")))
+                         assignment["identity"] == row["identity"] and EVENTS.can_deliver(assignment))
             except (KeyError, ValueError):
                 valid = False
         if not valid and intent and intent["state"] == "sending":
