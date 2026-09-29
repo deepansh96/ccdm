@@ -23,6 +23,7 @@ async function status(ctx) {
       connected_at: session.connectedAt,
     })),
     projects,
+    scope_violations: ctx.violations(),
   };
 }
 

@@ -186,6 +186,7 @@ This audit maps the PRD workflow bullets from issue #4 to automated scenarios or
 | Router | Offline 💤 without replay, pool channels ignored, management commands and owner reactions as events | Covered | Asserts only fake-recorded reactions and socket events. |
 | Router | `reply` under the Project Identity, sanitized usernames, and `scope_violation` logging | Covered | Webhook execute with `wait=true`; `demo-claude · 42%`, `demo-claude`, and the `discord-root-agent` sanitized literal. |
 | Router | `ensure-webhook` idempotency and `router status` | Covered | One webhook create, `webhook_id` in the registry, no webhook token in the Test Workspace, status output, or logs; status exits non-zero when the Router is down. |
+| Router | Key rotation, protocol errors, reconnect after a Router kill, and scope violations in `router status` | Covered | `tests/e2e/router-lifecycle.test.js`: raw socket frames for stale keys, wrong version, malformed frames, pre-hello requests, and unknown ops; a SIGKILLed real Router restarted under env-shortened backoff, with the post-restart reply asserted in the fake; default backoff asserted once. |
 
 - DeepSeek Exa opt-in: hosted MCP configuration survives scoped Discord cleanup; default homes omit Exa and rotation rejects setup-only options.
 

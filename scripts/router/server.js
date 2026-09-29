@@ -3,12 +3,15 @@
 // The Router's private Unix socket: NDJSON frames, a versioned hello with a
 // per-project key, request/response by id, and events pushed to sessions.
 const crypto = require("node:crypto");
+const { watch } = require("node:fs");
 const { chmod, mkdir, readFile, unlink } = require("node:fs/promises");
 const net = require("node:net");
 const path = require("node:path");
 const { OPERATIONS } = require("./ops/index.js");
 
 const PROTOCOL_VERSION = 1;
+// How many recent scope violations `router status` keeps.
+const RECENT_VIOLATIONS = 20;
 
 function send(socket, frame) {
   if (!socket.destroyed) socket.write(`${JSON.stringify(frame)}\n`);
@@ -18,6 +21,19 @@ function keysMatch(expected, actual) {
   const a = Buffer.from(String(expected));
   const b = Buffer.from(String(actual ?? ""));
   return a.length > 0 && a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+// A frame is a JSON object with a string type; requests also need a string id.
+function parseFrame(line) {
+  let frame;
+  try {
+    frame = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (!frame || typeof frame !== "object" || Array.isArray(frame) || typeof frame.type !== "string") return null;
+  if (frame.type === "request" && (typeof frame.id !== "string" || !frame.id)) return null;
+  return frame;
 }
 
 // A live socket already owns the path: refuse rather than steal it.
@@ -34,12 +50,30 @@ async function claimSocketPath(socketPath) {
 function createRouterServer({ stateDir, socketPath, getTable, gateway, context, log }) {
   // project name -> the one session connected for it.
   const sessions = new Map();
+  const violations = [];
+  const keysDir = path.join(stateDir, "keys");
+  let keysWatcher = null;
 
   async function projectKey(project) {
     try {
-      return (await readFile(path.join(stateDir, "keys", `${path.basename(project)}.key`), "utf8")).trim();
+      return (await readFile(path.join(keysDir, `${path.basename(project)}.key`), "utf8")).trim();
     } catch {
       return null;
+    }
+  }
+
+  // The session loses its place: it is told why, then disconnected.
+  function revoke(connection, reason) {
+    if (sessions.get(connection.route.project) === connection) sessions.delete(connection.route.project);
+    log(`revoked project=${connection.route.project} reason=${reason}`);
+    send(connection.socket, { type: "event", event: "revoked", reason });
+    connection.socket.end();
+  }
+
+  // A launch wrote a new key: any session still holding the old one goes.
+  async function revokeStaleKeys() {
+    for (const connection of [...sessions.values()]) {
+      if (!keysMatch(await projectKey(connection.route.project), connection.key)) revoke(connection, "key_rotated");
     }
   }
 
@@ -58,7 +92,10 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, context, 
     if (!route || !keysMatch(await projectKey(route.project), frame.key)) {
       return reject("unauthorized", "unknown project or key");
     }
-    Object.assign(connection, { role: "project", route, connectedAt: new Date().toISOString() });
+    // One listener per project: a newer hello replaces whoever held the project.
+    const previous = sessions.get(route.project);
+    if (previous) revoke(previous, "replaced");
+    Object.assign(connection, { role: "project", route, key: frame.key, connectedAt: new Date().toISOString() });
     sessions.set(route.project, connection);
     send(connection.socket, {
       type: "hello_ok", v: PROTOCOL_VERSION,
@@ -76,10 +113,12 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, context, 
     const args = frame.args && typeof frame.args === "object" ? frame.args : {};
     if (operation.scoped && String(args.channel_id) !== connection.route.channel_id) {
       log(`scope_violation project=${connection.route.project} op=${frame.op} target=${args.channel_id}`);
+      violations.push({ project: connection.route.project, op: frame.op, target: String(args.channel_id), at: new Date().toISOString() });
+      if (violations.length > RECENT_VIOLATIONS) violations.shift();
       return fail("scope_violation", "channel_id is outside this session's scope");
     }
     try {
-      const result = await operation.run({ ...context, session: connection, sessions: listSessions, table: getTable(), gateway }, args);
+      const result = await operation.run({ ...context, session: connection, sessions: listSessions, violations: () => [...violations], table: getTable(), gateway }, args);
       respond({ ok: true, result });
     } catch (error) {
       if (error.code && !error.status) return fail(error.code, error.message);
@@ -95,7 +134,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, context, 
   }
 
   function onConnection(socket) {
-    const connection = { socket, role: null };
+    const connection = { socket, role: null, hello: null };
     let buffer = "";
     socket.setEncoding("utf8");
     socket.on("data", chunk => {
@@ -105,17 +144,20 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, context, 
         const line = buffer.slice(0, newline).trim();
         buffer = buffer.slice(newline + 1);
         if (!line) continue;
-        let frame;
-        try {
-          frame = JSON.parse(line);
-        } catch {
-          send(socket, { type: "error", error: { code: "malformed_frame" } });
-          socket.destroy();
-          return;
+        const frame = parseFrame(line);
+        if (!frame) {
+          send(socket, { type: "error", error: { code: "malformed_frame", message: "expected a JSON object with a type (and an id for requests)" } });
+          continue;
         }
-        const handled = frame.type === "hello" && !connection.role ? hello(connection, frame)
-          : frame.type === "request" ? request(connection, frame)
-            : Promise.resolve(send(socket, { type: "error", error: { code: "unexpected_frame" } }));
+        // Requests wait for an in-flight hello so they see its outcome, but not for each other.
+        let handled;
+        if (frame.type === "hello" && !connection.role && !connection.hello) {
+          handled = connection.hello = hello(connection, frame);
+        } else if (frame.type === "request") {
+          handled = (connection.hello ?? Promise.resolve()).catch(() => {}).then(() => request(connection, frame));
+        } else {
+          handled = Promise.resolve(send(socket, { type: "error", error: { code: "unexpected_frame" } }));
+        }
         handled.catch(error => log(`frame_failed error=${error.message}`));
       }
     });
@@ -137,6 +179,10 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, context, 
         server.listen(socketPath, resolve);
       });
       await chmod(socketPath, 0o600);
+      await mkdir(keysDir, { recursive: true, mode: 0o700 });
+      keysWatcher = watch(keysDir, () => {
+        revokeStaleKeys().catch(error => log(`key_check_failed error=${error.message}`));
+      });
     },
     // Delivers to the project's live session; false when none is connected.
     deliver(project, event) {
@@ -146,6 +192,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, context, 
       return true;
     },
     close() {
+      keysWatcher?.close();
       for (const connection of sessions.values()) connection.socket.destroy();
       server.close();
     },

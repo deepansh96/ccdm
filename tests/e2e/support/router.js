@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import { createRequire } from "node:module";
+import net from "node:net";
 import path from "node:path";
 
 import { bridgeChildEnv, collectProcess, createBridgeWorkspace } from "./bridge.js";
@@ -70,14 +71,47 @@ export async function startRouter(workspace) {
 }
 
 // A scripted session: the shared client library, loaded from the Test Workspace.
-export async function connectSession(workspace, project, key) {
+// `env` stands in for the session process environment (reconnect backoff bounds).
+export async function connectSession(workspace, project, key, { env = {} } = {}) {
   const { RouterClient } = createRequire(import.meta.url)(path.join(workspace.repoDir, "scripts/router/client.js"));
-  const client = new RouterClient({ socketPath: workspace.socketPath, project, key, role: "project" });
+  const client = new RouterClient({ socketPath: workspace.socketPath, project, key, role: "project", env });
   const events = [];
   client.on("event", (event) => events.push(event));
   const scope = await client.connect();
   registerTeardownCallback(() => client.close());
   return { client, events, scope };
+}
+
+// A raw socket for adversarial frames a well-behaved client can't produce.
+// `send` takes a frame object or a literal line; `frames` collects every
+// parsed frame the Router sends back; `closed` resolves when the Router hangs up.
+export async function rawRouterSocket(workspace) {
+  const socket = net.connect(workspace.socketPath);
+  registerTeardownCallback(() => socket.destroy());
+  await new Promise((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("error", reject);
+  });
+  const frames = [];
+  let buffer = "";
+  socket.setEncoding("utf8");
+  socket.on("data", (chunk) => {
+    buffer += chunk;
+    let newline;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      if (line.trim()) frames.push(JSON.parse(line));
+    }
+  });
+  const closed = new Promise((resolve) => socket.once("close", resolve));
+  return {
+    frames,
+    closed,
+    send(frame) {
+      socket.write(typeof frame === "string" ? frame : `${JSON.stringify(frame)}\n`);
+    },
+  };
 }
 
 export async function waitFor(predicate, describe, timeoutMs = 5000) {

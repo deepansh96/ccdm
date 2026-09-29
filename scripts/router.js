@@ -97,6 +97,10 @@ async function status() {
   for (const project of result.projects) {
     console.log(`  ${project.project} channel=${project.channel_id} webhook=${project.webhook ? "present" : "missing"}`);
   }
+  console.log(`scope violations: ${result.scope_violations.length}`);
+  for (const violation of result.scope_violations) {
+    console.log(`  ${violation.at} project=${violation.project} op=${violation.op} target=${violation.target}`);
+  }
 }
 
 async function ensureWebhookCommand(project) {
