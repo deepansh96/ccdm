@@ -55,8 +55,9 @@ export function runRouterCli(workspace, args, options = {}) {
   return runNodeEntrypoint(workspace, "scripts/router.js", { args, env: routerEnv(workspace), ...options });
 }
 
-export async function startRouter(workspace) {
-  const env = routerEnv(workspace);
+// `env` adds to the Router's environment (rate-limit bounds).
+export async function startRouter(workspace, { env: extraEnv = {} } = {}) {
+  const env = routerEnv(workspace, extraEnv);
   const command = [process.execPath, path.join(workspace.repoDir, "scripts/router.js"), "serve"];
   const child = spawn(command[0], command.slice(1), {
     cwd: workspace.repoDir,
@@ -71,13 +72,13 @@ export async function startRouter(workspace) {
 }
 
 // Each project gets its webhook and key, then the Router starts.
-export async function routerWithWebhooks(workspace, projects) {
+export async function routerWithWebhooks(workspace, projects, options = {}) {
   for (const project of projects) {
     const result = await runRouterCli(workspace, ["ensure-webhook", project]);
     if (result.exitCode !== 0) throw new Error(`ensure-webhook ${project} failed: ${result.stderr || result.stdout}`);
     writeProjectKey(workspace, project, `${project}-key`);
   }
-  return startRouter(workspace);
+  return startRouter(workspace, options);
 }
 
 // A scripted session: the shared client library, loaded from the Test Workspace.

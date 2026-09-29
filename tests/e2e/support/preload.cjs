@@ -146,6 +146,39 @@ function takeRestFailure(method, url, init = {}) {
   });
 }
 
+// Scripted rate limits: a rule `{ method, path, count, retryAfter, bucket, global }`
+// answers matching requests with Discord's 429 shape until `count` runs out
+// (`count: null` never does). Unlike `restFailures`, any rule may match, so one
+// limited route leaves the others alone. Each 429 is recorded in `rateLimitHits`.
+function takeRateLimit(method, url) {
+  const rules = readState().fixtures?.discord?.rateLimits;
+  if (!Array.isArray(rules) || rules.length === 0) return null;
+  const matches = rule => (!rule.method || rule.method === method) && rule.path === url.pathname
+    && (rule.count === null || rule.count > 0);
+  let rule = null;
+  updateState((state) => {
+    rule = (state.fixtures.discord.rateLimits ?? []).find(matches) ?? null;
+    if (!rule) return;
+    if (rule.count !== null) rule.count -= 1;
+    state.fixtures.discord.rateLimitHits ||= [];
+    state.fixtures.discord.rateLimitHits.push({ method, path: url.pathname });
+  });
+  if (!rule) return null;
+  const retryAfter = rule.retryAfter ?? 1;
+  const headers = {
+    "content-type": "application/json",
+    "retry-after": String(Math.ceil(retryAfter)),
+    "x-ratelimit-limit": "5",
+    "x-ratelimit-remaining": "0",
+    "x-ratelimit-reset-after": String(retryAfter),
+    "x-ratelimit-scope": rule.global ? "global" : "user",
+    ...(rule.bucket ? { "x-ratelimit-bucket": rule.bucket } : {}),
+    ...(rule.global ? { "x-ratelimit-global": "true" } : {}),
+  };
+  return response(JSON.stringify({ message: "You are being rate limited.", retry_after: retryAfter,
+    global: Boolean(rule.global) }), { headers, status: 429 });
+}
+
 // Discord knows a created message's author from the token that created it.
 function authorForToken(authorization) {
   try {
@@ -361,6 +394,8 @@ function routeWebhooks(url, method, init) {
 function routeDiscordApi(url, init = {}) {
   const method = (init.method || "GET").toUpperCase();
   if (url.hostname === "discord.com") {
+    const limited = takeRateLimit(method, url);
+    if (limited) return limited;
     const failure = takeRestFailure(method, url, init);
     if (failure) return failure;
   }
