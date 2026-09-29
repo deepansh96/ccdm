@@ -16,7 +16,7 @@ edges:
     condition: when changing lifecycle or process ownership
   - target: context/discord-security.md
     condition: when changing channel isolation or reply authority
-last_updated: 2026-09-28
+last_updated: 2026-09-29
 ---
 
 # Decisions
@@ -87,14 +87,22 @@ last_updated: 2026-09-28
 ### Use one central registry and generic lifecycle scripts
 **Date:** 2026-03-23
 **Status:** Active
-**Decision:** Store bot/project assignments in `registry.json` and manage every project with shared start/stop scripts.
+**Decision:** Store project registrations in `registry.json` and manage every project with shared start/stop scripts.
 **Reasoning:** Per-project scripts duplicated lifecycle logic and made assignment state difficult to audit.
 **Alternatives considered:** Keep one script per project; rejected because every new project copied operational code.
 **Consequences:** New session types and registry fields must remain backward-compatible with existing entries.
 
+### Serve every project through one root bot and the Router
+**Date:** 2026-09-29
+**Status:** Active
+**Decision:** One root bot, whose token only the local Router holds, serves root and every project channel. Sessions reach Discord only through the Router within their Session Scope, and post under per-project webhooks (ADR 0004).
+**Reasoning:** Per-project bot tokens sat on local disk readable by any session, so per-bot Discord isolation was weaker than it looked, and the pool needed manual creation, renaming, and role upkeep.
+**Alternatives considered:** Keep the Bot Pool beside the Router indefinitely; rejected because both transports would need maintaining. OS-level sandboxing; out of scope.
+**Consequences:** Isolation is software-enforced by the Router, which is a single point of failure mitigated by launchd, client reconnect, and root's emergency gateway. Registration creates a webhook instead of assigning a bot.
+
 ### Isolate every project bot to one Discord channel
 **Date:** 2026-03-23
-**Status:** Active
+**Status:** Superseded by "Serve every project through one root bot and the Router"
 **Decision:** Deny project bots category visibility and add a member allow override only on the assigned channel.
 **Reasoning:** Project agents may handle private repositories and must not read unrelated channels.
 **Alternatives considered:** Rely only on bot prompt/access allowlists; rejected because Discord permissions provide a stronger outer boundary.

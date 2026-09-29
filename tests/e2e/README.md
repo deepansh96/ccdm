@@ -117,7 +117,7 @@ The same tmux/process contract covers the Codex startup surface:
 - `scripts/resolve-codex-home.py` validates named and legacy selectors and supports the root restart's `ROOT_CODEX_HOME` → top-level named/raw selector → ambient `CODEX_HOME` → `~/.codex` precedence through the same executable surface. It expands `~`, normalizes path components without resolving symlinks, and requires a usable home plus any present `config.toml` before project startup mutates MCP config, or before either launch path mutates tmux or registry state.
 - Named-account startup scenarios seed `codex_accounts`, `default_codex_account`, and project `codex_account` selectors, then assert project overrides, Default Codex Account inheritance, root selection, `ROOT_CODEX_HOME` precedence, and registry re-read through the recorded `CODEX_HOME`.
 - Named-account failures cover malformed alias maps, null/empty/wrong-typed selectors, same-scope named/raw conflicts, unknown aliases, aliased-home usability, and broken unrelated-project selectors while preserving the existing failure-ordering assertions.
-- Fresh setup and registry example scenarios assert generic named-account fields, the absence of the legacy `codex_home` key from fresh output, and placeholder-only values; the operator documentation audit checks the account model, precedence, login, persistence, migration, restart, and rollback guidance.
+- Fresh setup and registry example scenarios assert generic named-account fields, the absence of the legacy `codex_home` key from fresh output, and placeholder-only values; the operator documentation audit checks the account model, precedence, login, persistence, migration, restart, and rollback guidance. They also assert the one-bot registry shape: fresh `setup.sh` output has `root_channels` and `root_allowed_user_ids` with no pool fields and writes no plugin `access.json`, its printed next steps name `scripts/install-router-service.sh`, `router status`, and `restart-root-agent.sh`, and `registry.example.json` shows a per-project `webhook_id` with no bot tokens.
 - Codex resolver scenarios cover null versus malformed selectors, actionable failures for missing/non-directory/inaccessible homes and unusable `config.toml`, broken versus valid symlinks, paths with spaces, unresolved paths, and ignored broken selectors on unrelated projects. Successful scenarios assert the resolved `CODEX_HOME` in the recorded tmux launch; failure scenarios assert no tmux session, MCP cleanup, or PID mutation.
 - Root restart scenarios additionally assert ambient fallback, emergency `ROOT_CODEX_HOME` recovery over a broken registry home, current-registry re-read on repeated restarts, and preservation of the existing `root_agent` tmux session and listener process when root validation fails.
 - The fixture runs the recorded bridge command against the fake app-server and a real Router so the launch can wait for the bridge's Router hello. App-server protocol behavior belongs to the Codex bridge scenarios.
@@ -161,7 +161,7 @@ The Claude usage-report scenarios drive `scripts/claude-usage.sh` with fixture h
 
 The tracked `scripts/usage-stats-poster.py` scenarios drive the manual Discord posting surface with the same Test Workspace and Keychain fixture plus a local HTTP fake for Anthropic and Discord:
 
-- The poster reads an ignored root `.usage-stats-poster.json`, derives `registry.json` from the repository location, and posts Claude and configured Codex sections with the registry root bot token.
+- The poster reads an ignored root `.usage-stats-poster.json`, derives `registry.json` from the repository location, and posts Claude and configured Codex sections with the root bot token from fixture root Discord state (`ROOT_DISCORD_STATE_DIR`).
 - Claude OAuth discovery reports the default login plus valid extra `~/.claude-*` config directories, using each directory's `.claude.json` organization/email label and derived Keychain service; malformed or non-directory candidates are ignored.
 - Named Codex Account discovery uses `codex_accounts` with the Default Codex Account first, alphabetical remaining aliases, one query per unique Codex Home, and deterministic shared-home labels. Registries without named accounts fall back to top-level and project Legacy Codex Home overrides; malformed named-account fields fail visibly.
 - Valid mixed registries retain named-account ordering, add non-conflicting top-level/project Legacy Codex Homes, and deduplicate shared paths; same-scope named/raw selector conflicts fail visibly.
@@ -194,6 +194,20 @@ The Conversation Reminder scenarios drive `scripts/conversation-reminder-service
 - The foreground worker runs against the stateful Discord fake in `preload.cjs`. That fake provides per-channel `history` with pagination, reaction membership, nonce-checked sends, deletions, and scripted failures. `CCDM_REMINDER_CLOCK_FILE` is a controllable clock, so expected times come from literal timelines instead of hour-long sleeps.
 - The fake Gateway hands each injected message to only one client. Scenarios that need both a coding adapter and the root observer run the adapter while the worker is stopped. The durable event ledger carries its events into the worker's restart reconciliation.
 - `conversation-reminder-launchagent.test.js` installs through the `launchctl` fixture, then launches the rendered plist's `ProgramArguments` with its rendered environment. It keeps the harness fixture `PATH` so the worker cannot fall through to host tools. It proves the single-worker lock across supervised and foreground launches, disable and re-enable, private state, and the both-provider reply, reminder, and reply-or-close workflow with stopped coding agents. No scenario loads a real LaunchAgent or contacts Discord.
+
+## One-Bot Router Surfaces
+
+The one-bot model's executables are covered against the real Router and the Contract-Checking Fake Discord (webhooks, `webhook_id` provenance, scripted 429s):
+
+- **Router**: `scripts/router.js serve`, the client library, `router status`, `preflight`, and the `ensure-webhook`, `delete-webhook`, `probe`, and `migrate-root-config` admin commands, driven through the discord.js shim and raw socket frames for adversarial cases (out-of-scope targets, stale keys, wrong versions, malformed frames, observer writes).
+- **Router installer**: `scripts/install-router-service.sh` against the `launchctl` Fixture Binary (preflight refusal, secret-free plist, rollback, one lock).
+- **Claude channel server**: `scripts/ccdm-channel-server.js` for projects and root under the fake `claude` Fixture Binary.
+- **Codex Router mode**: `scripts/codex-bridge.js` for projects and root against the fake app-server.
+- **Root fallback**: root's emergency gateway after a killed Router, under a shortened `CCDM_ROOT_FALLBACK_AFTER_MS`.
+- **Cutover**: `scripts/migrate-to-router.sh` migrate, verify, automatic rollback, and `--rollback` refusal.
+- **Retirement**: `scripts/retire-pool.sh` dry run, refusal while a project is off the Router, and `--apply` side effects in the fake.
+
+The documentation audit (`documentation-audit.test.js`) keeps the README, `CLAUDE.md.example`, `AGENTS.md`, `registry.example.json`, `setup.sh`, and `.mex` on the one-bot model and free of pool bot management instructions.
 
 ## Diagnostics
 
@@ -253,7 +267,7 @@ GitHub Actions runs the Default CI Suite on `push` and `pull_request` with Node 
 
 ## Extraction Follow-Ups
 
-Instruction-only root-agent workflows are outside issue #4 until they are extracted into deterministic executable surfaces. Follow-up extraction work should cover register, deregister, pool management, polls, and context report. Those workflows remain documented root-agent conversation behavior, not Default CI Suite coverage.
+Instruction-only root-agent workflows are outside issue #4 until they are extracted into deterministic executable surfaces. Follow-up extraction work should cover the conversational steps of register and deregister (their webhook steps are already the executable `router.js ensure-webhook`/`delete-webhook` admin commands), polls, and context report. Those workflows remain documented root-agent conversation behavior, not Default CI Suite coverage.
 
 ## Adding Scenarios
 

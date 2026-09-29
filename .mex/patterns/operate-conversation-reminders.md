@@ -11,13 +11,13 @@ edges:
     condition: when the reminder service's relationship to adapters or sessions is unclear
   - target: context/session-management.md
     condition: when a registration or deregistration also changes reminder assignments
-last_updated: 2026-09-25
+last_updated: 2026-09-29
 ---
 
 # Operate Conversation Reminders
 
 ## Context
-Read `docs/conversation-reminders.md`. The service runs independently of coding sessions and uses the root bot to observe. It sends through each project's assigned bot. The LaunchAgent supervises the same `run` worker, so foreground and supervised launches share one worker lock.
+Read `docs/conversation-reminders.md`. The service runs independently of coding sessions and uses the root bot to observe. It observes as the Router's read-only `observer` client and sends every reminder as the root bot. The LaunchAgent supervises the same `run` worker, so foreground and supervised launches share one worker lock.
 
 ## Steps
 1. Install supervision only when the operator asks: `scripts/install-conversation-reminder-service.sh`. It runs the read-only `preflight` and exits with status 2, with nothing changed, if a check fails.
@@ -26,7 +26,7 @@ Read `docs/conversation-reminders.md`. The service runs independently of coding 
 4. To stop, run `disable`. The supervised worker exits successfully and launchd does not relaunch it.
 5. To re-enable, run `enable`, then rerun the installer to start the supervised worker. Channels reconcile before sending.
 6. The running worker resolves uncertain sends by itself: it replays the intent's nonce inside Discord's duplicate-check window, and afterwards releases the channel only when history proves nothing was sent. If one stays unresolved, or cleanup is stuck, run `disable`, wait for `worker_running: false`, then `enable` and `recover`. Then rerun the installer. If `recover` lists unbound `candidates`, delete a stray reminder in Discord and recover again, or run `assignment-changed --project <project>`.
-7. After registration or deregistration, run `assignment-changed --project <project>`. It deletes retired reminders at once with the retired bot; check `retired_cleanup` in its output and delete any `inaccessible` message manually.
+7. After registration or deregistration, run `assignment-changed --project <project>`. It deletes retired reminders at once as root; check `retired_cleanup` in its output and delete any `inaccessible` message manually.
 
 ## Gotchas
 - Never edit or delete the private databases to clear state; a new owner message reopens a closed conversation.

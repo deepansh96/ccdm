@@ -8,7 +8,7 @@ triggers:
 edges:
   - target: context/discord-security.md
     condition: always before changing guest permissions
-last_updated: 2026-07-19
+last_updated: 2026-09-29
 ---
 
 # Manage Guest Access
@@ -26,7 +26,7 @@ last_updated: 2026-07-19
 
 ## Verify
 - [ ] Guest sees the target channel and no other managed project channel.
-- [ ] Registry and Claude/Codex bot allowlists include or exclude the user as intended.
+- [ ] The registry's `guest_user_ids` includes or excludes the user as intended (the Router reloads it live).
 - [ ] `npm test -- --test-name-pattern='guest'` passes when guest code changed.
 
 ## Update Scaffold
