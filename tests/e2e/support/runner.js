@@ -340,12 +340,11 @@ function activeOwnedProcesses(state) {
   );
 }
 
-function spawnPlaceholder(readyFile = "") {
-  const child = spawn(process.execPath, ["-e", "if (process.env.READY_FILE) setTimeout(() => require('fs').writeFileSync(process.env.READY_FILE, 'ready'), 300); setInterval(() => {}, 1000)"], {
+function spawnPlaceholder() {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
     detached: true,
     env: {
       CCDM_FIXTURE_PLACEHOLDER: "1",
-      READY_FILE: readyFile,
       CCDM_TEST_STATE: stateDir,
     },
     stdio: "ignore",
@@ -650,14 +649,13 @@ function runTmux() {
     const priorKillAttempts =
       tmuxState.lastKilledSessions?.[name]?.killAttempts ?? preexistingSession?.killAttempts ?? 0;
     const launch = parseTmuxLaunch(shellCommand);
-    const readyFile = tmuxState.startupMode ? "" : launch.env.CODEX_STARTUP_READY_FILE;
     // A CCDM channel launch runs the fake claude, which hosts the real channel
     // server once the development-channel confirmation is accepted.
     const routerChannel = launch.kind === "claude-listener" && launch.claudeArgs.includes("server:ccdm");
     const routerBridge = launch.kind === "codex-bridge" && Boolean(launch.env.CCDM_ROUTER_KEY_FILE);
     const pid = routerChannel
       ? spawnRouterClaude(name, launch)
-      : routerBridge ? spawnRouterBridge(launch) : spawnPlaceholder(readyFile);
+      : routerBridge ? spawnRouterBridge(launch) : spawnPlaceholder();
     const sessionId = \`fixture-session-\${pid}\`;
     const processCommand =
       routerBridge
