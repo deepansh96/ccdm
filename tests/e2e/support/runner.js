@@ -388,18 +388,21 @@ function parseCodexBridgeLaunch(shellCommand) {
   for (const envMatch of envText.matchAll(envRe)) {
     env[envMatch[1]] = envMatch[2] ?? envMatch[3];
   }
-  const required = [
-    "BOT_TOKEN",
-    "CHANNEL_ID",
-    "PROJECT_DIR",
-    "WS_PORT",
-    "ALLOWED_USER_IDS",
-    "GUILD_ID",
-    "ROOT_BOT_APP_ID",
-    "BOT_APP_ID",
-    "BOT_DISPLAY_NAME",
-    "CODEX_HOME",
-  ];
+  // A router launch carries the launch key file path instead of any bot identity.
+  const required = env.CCDM_ROUTER_KEY_FILE
+    ? ["CCDM_CODEX_PROJECT", "CCDM_ROUTER_STATE_DIR", "CHANNEL_ID", "PROJECT_DIR", "WS_PORT", "ALLOWED_USER_IDS", "GUILD_ID", "CODEX_HOME"]
+    : [
+      "BOT_TOKEN",
+      "CHANNEL_ID",
+      "PROJECT_DIR",
+      "WS_PORT",
+      "ALLOWED_USER_IDS",
+      "GUILD_ID",
+      "ROOT_BOT_APP_ID",
+      "BOT_APP_ID",
+      "BOT_DISPLAY_NAME",
+      "CODEX_HOME",
+    ];
   for (const name of required) {
     if (!env[name]) {
       throw new Error(\`\${name} is required for Codex bridge launch\`);
@@ -473,6 +476,21 @@ function spawnRouterClaude(name, launch) {
     env: { ...process.env, ...launch.env, CCDM_FIXTURE_TMUX_SESSION: name },
     stdio: "ignore",
   });
+  child.unref();
+  return child.pid;
+}
+
+// A router Codex launch runs the real bridge, detached like a tmux pane
+// process, against the fake Codex app-server registered for its port.
+function spawnRouterBridge(launch) {
+  const logFile = fs.openSync(path.join(stateDir, \`codex-bridge-\${Date.now()}.log\`), "a");
+  const child = spawn(process.execPath, [path.join(launch.cwd, "scripts/codex-bridge.js")], {
+    cwd: launch.cwd,
+    detached: true,
+    env: { ...process.env, ...launch.env },
+    stdio: ["ignore", logFile, logFile],
+  });
+  fs.closeSync(logFile);
   child.unref();
   return child.pid;
 }
@@ -614,10 +632,15 @@ function runTmux() {
     // A CCDM channel launch runs the fake claude, which hosts the real channel
     // server once the development-channel confirmation is accepted.
     const routerChannel = launch.kind === "claude-listener" && launch.claudeArgs.includes("server:ccdm");
-    const pid = routerChannel ? spawnRouterClaude(name, launch) : spawnPlaceholder(readyFile);
+    const routerBridge = launch.kind === "codex-bridge" && Boolean(launch.env.CCDM_ROUTER_KEY_FILE);
+    const pid = routerChannel
+      ? spawnRouterClaude(name, launch)
+      : routerBridge ? spawnRouterBridge(launch) : spawnPlaceholder(readyFile);
     const sessionId = \`fixture-session-\${pid}\`;
     const processCommand =
-      launch.kind === "codex-bridge"
+      routerBridge
+        ? \`node scripts/codex-bridge.js CHANNEL_ID='\${launch.env.CHANNEL_ID}' WS_PORT='\${launch.env.WS_PORT}' CCDM_ROUTER_KEY_FILE='\${launch.env.CCDM_ROUTER_KEY_FILE}'\`
+        : launch.kind === "codex-bridge"
         ? \`node scripts/codex-bridge.js CHANNEL_ID='\${launch.env.CHANNEL_ID}' BOT_APP_ID='\${launch.env.BOT_APP_ID}' WS_PORT='\${launch.env.WS_PORT}'\`
         : routerChannel
           ? \`claude \${launch.claudeArgs.join(" ")} CCDM_ROUTER_KEY_FILE='\${launch.env.CCDM_ROUTER_KEY_FILE}'\`

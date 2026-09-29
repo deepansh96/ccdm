@@ -9,6 +9,7 @@ const { writeFile, mkdir, mkdtemp, stat, readFile } = require("fs/promises");
 const { createReadStream } = require("fs");
 const { tmpdir } = require("os");
 const reminderAdapter = require("./conversation-reminder-adapter.js");
+const { RouterClient } = require("./router/client.js");
 
 const execFileAsync = promisify(execFile);
 const EXPORT_SCRIPT = path.resolve(__dirname, "export-discord-range.js");
@@ -33,9 +34,14 @@ const DISCORD_GLOBAL_USER_IDS = new Set(
     .map((id) => id.trim())
     .filter(Boolean)
 );
+// Router backend (a router-transport Codex project): the tools are Router
+// operations in this project's channel, reached with the launch key file.
+// No Discord token is configured.
+const ROUTER_KEY_FILE = process.env.CCDM_ROUTER_KEY_FILE;
+const ROUTER_PROJECT = process.env.CCDM_CODEX_PROJECT;
 
-if ((!BOT_TOKEN && !READ_ONLY) || !CHANNEL_ID) {
-  process.stderr.write(`Missing ${READ_ONLY ? "CHANNEL_ID" : "BOT_TOKEN or CHANNEL_ID"}\n`);
+if (ROUTER_KEY_FILE ? !ROUTER_PROJECT || !CHANNEL_ID : (!BOT_TOKEN && !READ_ONLY) || !CHANNEL_ID) {
+  process.stderr.write(`Missing ${ROUTER_KEY_FILE ? "CCDM_CODEX_PROJECT or CHANNEL_ID" : READ_ONLY ? "CHANNEL_ID" : "BOT_TOKEN or CHANNEL_ID"}\n`);
   process.exit(1);
 }
 
@@ -404,7 +410,125 @@ const TOOLS = READ_ONLY
   ? ALL_TOOLS.filter((tool) => READ_ONLY_TOOLS.has(tool.name))
   : ALL_TOOLS;
 
+// One op-only Router connection (`listener: false`), so the bridge keeps its
+// place as the project's listener. A failed or ended connection is retried on
+// the next tool call.
+let routerConnection = null;
+
+function routerClient() {
+  if (!routerConnection) {
+    routerConnection = (async () => {
+      const key = (await readFile(ROUTER_KEY_FILE, "utf8")).trim();
+      const client = new RouterClient({ project: ROUTER_PROJECT, key, role: "project", listener: false });
+      client.on("end", () => {
+        routerConnection = null;
+      });
+      await client.connect();
+      return client;
+    })().catch((error) => {
+      routerConnection = null;
+      throw error;
+    });
+  }
+  return routerConnection;
+}
+
+async function routerRequest(op, args) {
+  const client = await routerClient();
+  try {
+    return await client.request(op, { channel_id: CHANNEL_ID, ...args });
+  } catch (error) {
+    throw new Error(`Router ${op} failed: ${error.code || error.message}`);
+  }
+}
+
+// The bridge records its latest context percentage in the launch directory.
+async function routerContextPct() {
+  const file = path.join(process.env.CCDM_ROUTER_STATE_DIR || "", "launches", ROUTER_PROJECT, "context.json");
+  try {
+    const pct = JSON.parse(await readFile(file, "utf8")).context_pct;
+    return Number.isFinite(pct) ? pct : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function handleRouterToolCall(name, args) {
+  switch (name) {
+    case "reply": {
+      const { text, files, reply_to, scope_token, conversation_disposition } = args;
+      requireScopeToken(scope_token);
+      if (conversation_disposition && !["progress", "input-needed"].includes(conversation_disposition)) {
+        throw new Error("Unsupported conversation disposition");
+      }
+      const reminderContext = await reminderAdapter.readActiveContext(CHANNEL_ID);
+      const result = await routerRequest("reply", {
+        text: text || "", files, reply_to, context_pct: await routerContextPct(),
+      });
+      if (reminderContext) {
+        for (const id of result.message_ids) {
+          await reminderAdapter.recordDeliveredReply(reminderContext, id, conversation_disposition)
+            .catch((error) => {
+              process.stderr.write(`Discord MCP: reply ${id} was delivered but its Conversation Reminder receipt was not recorded: ${error.message}\n`);
+            });
+        }
+      }
+      return result.message_ids.length > 1
+        ? `sent ${result.message_ids.length} parts (ids: ${result.message_ids.join(", ")})`
+        : `sent (id: ${result.message_id})`;
+    }
+
+    case "edit_message": {
+      const { message_id, text, scope_token } = args;
+      requireScopeToken(scope_token);
+      await routerRequest("edit_message", { message_id, text, context_pct: await routerContextPct() });
+      return `edited (id: ${message_id})`;
+    }
+
+    case "react": {
+      const { message_id, emoji, scope_token } = args;
+      requireScopeToken(scope_token);
+      await routerRequest("react", { message_id, emoji });
+      return `reacted with ${emoji}`;
+    }
+
+    case "fetch_messages": {
+      const result = await routerRequest("fetch_messages", { limit: Math.min(args.limit || 20, 100) });
+      return result.text;
+    }
+
+    case "read_last_x_messages_in_channel": {
+      const result = await routerRequest("read_last_x_messages_in_channel", { count: args.count });
+      return result.path ? `saved ${result.count} messages to ${result.path}` : result.text;
+    }
+
+    case "export_message_range": {
+      const result = await routerRequest("export_message_range", {
+        start_message_id: args.start_message_id,
+        ...(args.end_message_id ? { end_message_id: args.end_message_id } : {}),
+      });
+      return `exported to ${result.path}`;
+    }
+
+    case "download_attachment": {
+      const { message_id, attachment_index = 0, save_dir } = args;
+      const att = await routerRequest("download_attachment", { message_id, attachment_index });
+      const dir = save_dir || process.cwd();
+      await mkdir(dir, { recursive: true });
+      const filePath = path.join(dir, path.basename(att.name || att.id));
+      const res = await fetch(att.url);
+      if (!res.ok) throw new Error(`Failed to download: ${res.status}`);
+      await writeFile(filePath, Buffer.from(await res.arrayBuffer()));
+      return filePath;
+    }
+
+    default:
+      throw new Error(`Unknown tool: ${name}`);
+  }
+}
+
 async function handleToolCall(name, args) {
+  if (ROUTER_KEY_FILE) return handleRouterToolCall(name, args);
   if (READ_ONLY && !READ_ONLY_TOOLS.has(name)) {
     throw new Error(`Tool unavailable in read-only mode: ${name}`);
   }
@@ -627,6 +751,12 @@ rl.on("line", (line) => {
   } catch (err) {
     process.stderr.write(`Parse error: ${err.message}\n`);
   }
+});
+
+// Codex closes stdin when it stops this server; the Router connection must not
+// keep the process alive.
+rl.on("close", () => {
+  if (ROUTER_KEY_FILE) process.exit(0);
 });
 
 process.stderr.write("Discord MCP server started\n");

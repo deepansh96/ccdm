@@ -4,6 +4,8 @@
 // timeouts, emit pushed events, and reconnect with capped exponential backoff.
 //
 //   const client = new RouterClient({ socketPath, project, key, role: "project" });
+//   // `listener: false` connects for operations only: no events, and the
+//   // project's listener keeps its place.
 //   const scope = await client.connect();      // the first connect does not retry
 //   client.on("event", event => ...);          // every pushed event frame
 //   client.on("message" | "reaction" | "command" | "revoked", event => ...);
@@ -39,10 +41,10 @@ function reconnectBackoff(env = process.env) {
 }
 
 class RouterClient extends EventEmitter {
-  constructor({ socketPath = defaultSocketPath(), project, key, role = "project", timeoutMs = 10000,
+  constructor({ socketPath = defaultSocketPath(), project, key, role = "project", listener = true, timeoutMs = 10000,
     reconnect = role !== "status", env = process.env } = {}) {
     super();
-    Object.assign(this, { socketPath, project, key, role, timeoutMs, reconnect, backoff: reconnectBackoff(env) });
+    Object.assign(this, { socketPath, project, key, role, listener, timeoutMs, reconnect, backoff: reconnectBackoff(env) });
     this.socket = null;
     this.ready = false;
     this.connectedOnce = false;
@@ -72,7 +74,8 @@ class RouterClient extends EventEmitter {
     socket.setEncoding("utf8");
     socket.once("connect", () => {
       this.write({ type: "hello", v: PROTOCOL_VERSION, role: this.role,
-        ...(this.project ? { project: this.project } : {}), ...(this.key ? { key: this.key } : {}) });
+        ...(this.project ? { project: this.project } : {}), ...(this.key ? { key: this.key } : {}),
+        ...(this.listener ? {} : { listener: false }) });
     });
     socket.on("data", chunk => {
       buffer += chunk;

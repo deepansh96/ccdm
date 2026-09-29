@@ -63,6 +63,10 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
   const sessions = new Map();
   // Root's one session, apart from the projects so no project name can take it.
   let rootSession = null;
+  // Op-only project connections (`listener: false`, such as a Codex bridge's
+  // scoped MCP server): they act in the project's scope but receive no events
+  // and never replace the project's listener.
+  const opConnections = new Set();
   const violations = [];
   const keysDir = path.join(stateDir, "keys");
   let keysWatcher = null;
@@ -81,6 +85,8 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
   function forget(connection) {
     if (connection.role === "root") {
       if (rootSession === connection) rootSession = null;
+    } else if (connection.listener === false) {
+      opConnections.delete(connection);
     } else if (connection.route && sessions.get(connection.route.project) === connection) {
       sessions.delete(connection.route.project);
     }
@@ -96,7 +102,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
 
   // A launch wrote a new key: any session still holding the old one goes.
   async function revokeStaleKeys() {
-    for (const connection of [...sessions.values(), ...(rootSession ? [rootSession] : [])]) {
+    for (const connection of [...sessions.values(), ...opConnections, ...(rootSession ? [rootSession] : [])]) {
       if (!keysMatch(await connectionKey(connection), connection.key)) revoke(connection, "key_rotated");
     }
   }
@@ -126,6 +132,14 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     const route = getTable().projects.get(String(frame.project));
     if (!route || !keysMatch(await projectKey(route.project), frame.key)) {
       return reject("unauthorized", "unknown project or key");
+    }
+    if (frame.listener === false) {
+      Object.assign(connection, { role: "project", listener: false, route, key: frame.key, connectedAt: new Date().toISOString() });
+      opConnections.add(connection);
+      return send(connection.socket, {
+        type: "hello_ok", v: PROTOCOL_VERSION,
+        scope: { project: route.project, channel_id: route.channel_id, type: route.type },
+      });
     }
     // One listener per project: a newer hello replaces whoever held the project.
     const previous = sessions.get(route.project);
@@ -243,14 +257,14 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     // A reloaded registry can move a connected project's channel or webhook.
     refreshRoutes() {
       const { projects } = getTable();
-      for (const connection of sessions.values()) {
+      for (const connection of [...sessions.values(), ...opConnections]) {
         const route = projects.get(connection.route.project);
         if (route) connection.route = route;
       }
     },
     close() {
       keysWatcher?.close();
-      for (const connection of sessions.values()) connection.socket.destroy();
+      for (const connection of [...sessions.values(), ...opConnections]) connection.socket.destroy();
       rootSession?.socket.destroy();
       server.close();
     },

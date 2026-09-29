@@ -190,14 +190,105 @@ print(f"Recorded PID {pid}")
 PY
 }
 
-IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME BOT_TOKEN CHANNEL_ID WS_PORT DISCORD_USER_IDS GUILD_ID ROOT_BOT_APP_ID BOT_APP_ID BOT_ID BOT_DISPLAY_OVERRIDE TEXT_REPLY_FALLBACK_FLAG CODEX_MODEL_VALUE CODEX_REASONING_EFFORT_VALUE CODEX_SERVICE_TIER_VALUE <<< "$(python3 -c "
+# Start a router-transport project: the bridge holds no Discord token. A fresh
+# launch key (which revokes the previous launch) lets the bridge say hello to
+# the Router; the PID is recorded only after that hello succeeds.
+start_router_session() {
+  local router_state="${CCDM_ROUTER_STATE_DIR:-$HOME/.local/state/ccdm/router}"
+  local key_file="$router_state/keys/$PROJECT.key"
+  local launch_dir="$router_state/launches/$PROJECT"
+  local ready_file="$launch_dir/ready.json"
+
+  python3 - "$PROJECT" "$router_state" "$launch_dir" <<'PY' || return 1
+import os
+import secrets
+import sys
+from pathlib import Path
+
+project, router_state, launch_dir = sys.argv[1:4]
+if not project or "/" in project or project.startswith("."):
+    sys.exit(f"Invalid project name for a Router launch: {project!r}")
+keys_dir = Path(router_state) / "keys"
+launch = Path(launch_dir)
+for directory in (Path(router_state), keys_dir, launch.parent, launch):
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+# A previous launch's outcome and context percentage are wrong for this one.
+(launch / "ready.json").unlink(missing_ok=True)
+(launch / "context.json").unlink(missing_ok=True)
+key_file = keys_dir / f"{project}.key"
+tmp = key_file.with_name(f".{key_file.name}.{os.getpid()}.tmp")
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write(secrets.token_urlsafe(32) + "\n")
+# Replacing the key revokes whichever session still holds the old one.
+os.replace(tmp, key_file)
+PY
+
+  tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' CCDM_CODEX_PROJECT='$PROJECT' CCDM_ROUTER_STATE_DIR='$router_state' CCDM_ROUTER_KEY_FILE='$key_file' CCDM_CHANNEL_READY_FILE='$ready_file' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$DISCORD_USER_IDS' GUILD_ID='$GUILD_ID'$AUDIO_TRANSCRIPTION_ENV$TEXT_REPLY_FALLBACK_ENV$CODEX_MODEL_ENV$CODEX_REASONING_ENV$CODEX_SERVICE_TIER_ENV node scripts/codex-bridge.js"
+  echo "Started Codex Router bridge in tmux session '$SCREEN_NAME'"
+
+  # The bridge reports its hello outcome once Codex is up and bootstrapped.
+  if ! python3 - "$SCREEN_NAME" "$ready_file" <<'PY'
+import json
+import os
+import subprocess
+import sys
+import time
+
+screen, ready_file = sys.argv[1:3]
+deadline = time.monotonic() + float(os.environ.get("CCDM_CODEX_LAUNCH_TIMEOUT_S") or 120)
+while time.monotonic() < deadline:
+    try:
+        with open(ready_file) as f:
+            outcome = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        if subprocess.run(["tmux", "has-session", "-t", "=" + screen],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+            sys.exit("Codex Router launch failed: bridge exited before saying hello")
+        time.sleep(0.2)
+        continue
+    if outcome.get("ok"):
+        print(f"Bridge connected to the Router (scope {outcome['scope']['channel_id']})")
+        sys.exit(0)
+    sys.exit(f"Codex Router launch failed: {outcome.get('error')}")
+sys.exit("Codex Router launch failed: the bridge never said hello to the Router")
+PY
+  then
+    echo "Launch of '$PROJECT' failed; cleaning up" >&2
+    tmux kill-session -t "=$SCREEN_NAME" 2>/dev/null || true
+    local leftover
+    leftover="$(find_codex_listener_pids "$CHANNEL_ID" "$WS_PORT" "$BOT_APP_ID")"
+    # A listener may exit on its own between the sweep and the kill.
+    if [[ -n "$leftover" ]]; then
+      kill -TERM ${(f)leftover} 2>/dev/null || true
+    fi
+    python3 - "$key_file" "$launch_dir" <<'PY'
+import shutil
+import sys
+from pathlib import Path
+
+key_file, launch_dir = sys.argv[1:3]
+Path(key_file).unlink(missing_ok=True)
+shutil.rmtree(launch_dir, ignore_errors=True)
+PY
+    return 1
+  fi
+
+  echo "Attach with: tmux attach -t $SCREEN_NAME"
+  record_codex_pid "$CHANNEL_ID" "$BOT_APP_ID"
+}
+
+# Router projects have no pool bot, so their bot fields print as __NONE__.
+IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME BOT_TOKEN CHANNEL_ID WS_PORT DISCORD_USER_IDS GUILD_ID ROOT_BOT_APP_ID BOT_APP_ID BOT_ID BOT_DISPLAY_OVERRIDE TEXT_REPLY_FALLBACK_FLAG CODEX_MODEL_VALUE CODEX_REASONING_EFFORT_VALUE CODEX_SERVICE_TIER_VALUE TRANSPORT <<< "$(python3 -c "
 import base64, json, os, re
 r = json.load(open('$REGISTRY'))
 p = r['projects']['$PROJECT']
-bot = next(b for b in r['pool'] if b['id'] == p['bot_id'])
-root_bot_app_id = r.get('root_bot_app_id', '')
+transport = 'router' if p.get('transport') == 'router' else 'pool'
+bot = {'state_dir': '__NONE__', 'token': '__NONE__', 'app_id': '__NONE__', 'id': '__NONE__'} if transport == 'router' else next(b for b in r['pool'] if b['id'] == p['bot_id'])
+root_bot_app_id = r.get('root_bot_app_id', '') or ('__NONE__' if transport == 'router' else '')
 root_env = os.path.join(os.path.expanduser(os.environ.get('ROOT_DISCORD_STATE_DIR') or '~/.claude/channels/discord'), '.env')
-if os.path.exists(root_env):
+if transport == 'pool' and os.path.exists(root_env):
     text = open(root_env).read()
     match = re.search(r'DISCORD_BOT_TOKEN=(\S+)', text)
     if match:
@@ -227,6 +318,7 @@ print('\t'.join([
     (p.get('codex_model') or p.get('model') or '__NONE__'),
     (p.get('codex_reasoning_effort') or p.get('model_reasoning_effort') or '__NONE__'),
     (p.get('codex_service_tier') or p.get('service_tier') or '__NONE__'),
+    transport,
 ]))
 ")"
 
@@ -308,6 +400,11 @@ if [[ -n "$CODEX_REASONING_EFFORT_VALUE" ]]; then
   CODEX_REASONING_ENV=" CODEX_REASONING_EFFORT='${CODEX_REASONING_EFFORT_VALUE}'"
 fi
 CODEX_SERVICE_TIER_ENV=" CODEX_SERVICE_TIER='${CODEX_SERVICE_TIER_VALUE}' CODEX_RESUME_THREAD_ID='${RESUME_THREAD_ID}'"
+
+if [[ "$TRANSPORT" == "router" ]]; then
+  start_router_session
+  exit $?
+fi
 
 # Each resume attempt gets a private signal, so old launches cannot mark it ready.
 STARTUP_READY_DIR=""

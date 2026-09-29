@@ -36,12 +36,19 @@
 //   removeOwnReaction(message, emoji) -> Promise<void>
 //   supportsNickname              -> whether setNickname(nick) can run
 //   setNickname(nick)             -> Promise<void>, logs its own outcome
+//   setContextPct(pct)            -> optional; records the context percentage
+//                                    that replies carry instead of a nickname
 //   destroy()
 //
-// createPoolTransport is the only implementation: the project's pool bot,
-// logged in with its own token through discord.js.
+// createPoolTransport: the project's pool bot, logged in with its own token
+// through discord.js. createRouterTransport: the local Router, reached with
+// the launch key read from its private file; it holds no Discord credential.
 
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
+const { renameSync, writeFileSync } = require("fs");
+const { readFile } = require("fs/promises");
+const path = require("path");
+const { RouterClient } = require("./router/client.js");
 
 function createPoolTransport({ token, primaryChannelId, guildId }) {
   let client = null;
@@ -202,4 +209,121 @@ function createPoolTransport({ token, primaryChannelId, guildId }) {
   };
 }
 
-module.exports = { createPoolTransport };
+// Router events carry plain fields; the bridge sees them in its message and
+// reaction shapes. A management command arrives as its plain `/command` text.
+function createRouterTransport({ project, keyFile, launchDir }) {
+  let router = null;
+  let scope = null;
+  let messageHandler = null;
+  let reactionHandler = null;
+  let contextPct;
+
+  const channel = (channelId) => ({ id: channelId, name: project });
+
+  function toMessage(event, content = event.content) {
+    return {
+      id: event.message_id,
+      content,
+      channel: channel(event.channel_id),
+      author: { id: event.author.id, bot: false, username: event.author.name },
+      mentionedUserIds: [],
+      attachments: (event.attachments || []).map((att) => ({
+        name: att.name,
+        url: att.url,
+        contentType: att.content_type,
+        size: att.size,
+      })),
+    };
+  }
+
+  function toReaction(event) {
+    const user = { id: event.user.id, bot: false, username: event.user.name, globalName: event.user.name };
+    return {
+      channelId: event.channel_id,
+      user: { id: user.id, bot: false },
+      async load() {
+        return {
+          emoji: { id: null, name: event.emoji },
+          user,
+          message: { id: event.message_id, content: "", channel: channel(event.channel_id), author: null },
+        };
+      },
+    };
+  }
+
+  return {
+    onMessage(handler) {
+      messageHandler = handler;
+    },
+
+    onReaction(handler) {
+      reactionHandler = handler;
+    },
+
+    async connect() {
+      const key = (await readFile(keyFile, "utf8")).trim();
+      router = new RouterClient({ project, key, role: "project" });
+      router.on("message", (event) => messageHandler?.(toMessage(event)));
+      router.on("command", (event) => messageHandler?.(toMessage(event, `/${event.command}`)));
+      router.on("reaction", (event) => reactionHandler?.(toReaction(event)));
+      router.on("disconnect", () => console.error("Router connection lost; reconnecting"));
+      router.on("reconnect", () => console.log("Router connection restored"));
+      router.on("end", (error) => console.error(`Router session ended${error ? `: ${error.code || error.message}` : ""}`));
+      scope = await router.connect();
+      return { userTag: `${project} via the CCDM Router`, scope };
+    },
+
+    // Project replies post through the project's webhook, not as a bot user.
+    botUserId() {
+      return null;
+    },
+
+    async fetchChannel(channelId) {
+      return scope && channelId === scope.channel_id ? channel(channelId) : null;
+    },
+
+    async send(channelId, chunks) {
+      const sent = [];
+      for (const chunk of chunks) {
+        const result = await router.request("reply", { channel_id: channelId, text: chunk, context_pct: contextPct });
+        sent.push(...result.message_ids.map((id) => ({ id })));
+      }
+      return sent;
+    },
+
+    async sendTyping(channelId) {
+      await router.request("typing", { channel_id: channelId });
+    },
+
+    async react(message, emoji) {
+      await router.request("react", { channel_id: message.channel.id, message_id: message.id, emoji });
+    },
+
+    // The Router has no reaction-removal operation.
+    async removeOwnReaction() {},
+
+    supportsNickname: false,
+
+    async setNickname() {},
+
+    // The bridge's scoped MCP server reads the same percentage from the launch
+    // directory, so its replies carry it too.
+    setContextPct(pct) {
+      contextPct = pct;
+      const file = path.join(launchDir, "context.json");
+      const tmp = `${file}.${process.pid}.tmp`;
+      try {
+        writeFileSync(tmp, `${JSON.stringify({ context_pct: pct })}\n`, { mode: 0o600 });
+        renameSync(tmp, file);
+      } catch (err) {
+        console.error(`Context percentage not recorded: ${err.message || err}`);
+      }
+    },
+
+    destroy() {
+      router?.close();
+    },
+  };
+}
+
+module.exports = { createPoolTransport, createRouterTransport };

@@ -3,7 +3,7 @@
 const { spawn } = require("child_process");
 const { createHmac, randomBytes } = require("crypto");
 const { writeFile, mkdir, mkdtemp, readFile, rm, rename } = require("fs/promises");
-const { rmSync } = require("fs");
+const { renameSync, rmSync, writeFileSync } = require("fs");
 const os = require("os");
 const path = require("path");
 const WebSocket = require("ws");
@@ -19,7 +19,8 @@ process.env.CCDM_REMINDER_STATE_DIR = REMINDER_STATE_DIR;
 process.env.CCDM_REMINDER_CONTEXT_FILE = REMINDER_CONTEXT_FILE;
 process.env.CCDM_REMINDER_RECEIPTS_DIR = REMINDER_RECEIPTS_DIR;
 const reminderAdapter = require("./conversation-reminder-adapter.js");
-const { createPoolTransport } = require("./codex-bridge-transport.js");
+const { createPoolTransport, createRouterTransport } = require("./codex-bridge-transport.js");
+const routerPaths = require("./router/paths.js");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
@@ -67,10 +68,20 @@ const TURN_ID_RECONCILIATION_METHODS = new Set([
   "item/agentMessage/delta",
 ]);
 const FORWARDED_REACTIONS = new Set(["👍", "👎"]);
+// Router mode (a router-transport project): the launcher passes the launch key
+// file path, never a Discord token, and the Router serves Discord.
+const ROUTER_KEY_FILE = process.env.CCDM_ROUTER_KEY_FILE || "";
+const ROUTER_MODE = Boolean(ROUTER_KEY_FILE);
+const ROUTER_PROJECT = process.env.CCDM_CODEX_PROJECT || "";
+const ROUTER_LAUNCH_DIR = ROUTER_MODE ? path.join(routerPaths.stateDir(), "launches", ROUTER_PROJECT) : null;
+// The launcher waits on this file for the bridge's startup outcome.
+const LAUNCH_READY_FILE = process.env.CCDM_CHANNEL_READY_FILE || "";
 
-if (!BOT_TOKEN || !CHANNEL_ID || !PROJECT_DIR) {
+if (ROUTER_MODE ? !ROUTER_PROJECT || !CHANNEL_ID || !PROJECT_DIR : !BOT_TOKEN || !CHANNEL_ID || !PROJECT_DIR) {
   console.error(
-    "Missing required env vars: BOT_TOKEN, CHANNEL_ID, PROJECT_DIR"
+    ROUTER_MODE
+      ? "Missing required env vars: CCDM_CODEX_PROJECT, CHANNEL_ID, PROJECT_DIR"
+      : "Missing required env vars: BOT_TOKEN, CHANNEL_ID, PROJECT_DIR"
   );
   process.exit(1);
 }
@@ -91,11 +102,13 @@ let pendingBootstrapInstructionReason = null;
 let pendingCompactionChannelId = null;
 let messageQueue = [];
 let bridgePaused = false;
-const discordTransport = createPoolTransport({
-  token: BOT_TOKEN,
-  primaryChannelId: CHANNEL_ID,
-  guildId: GUILD_ID,
-});
+const discordTransport = ROUTER_MODE
+  ? createRouterTransport({ project: ROUTER_PROJECT, keyFile: ROUTER_KEY_FILE, launchDir: ROUTER_LAUNCH_DIR })
+  : createPoolTransport({
+    token: BOT_TOKEN,
+    primaryChannelId: CHANNEL_ID,
+    guildId: GUILD_ID,
+  });
 let codexProcess = null;
 let typingInterval = null;
 let activeOutputChannelId = null;
@@ -478,12 +491,18 @@ function captureTextReplyFallback(item) {
 }
 
 async function updateNickname(totalTokens, contextWindow) {
-  if (!discordTransport.supportsNickname || !contextWindow) return;
+  if (!contextWindow) return;
+  const pct = Math.round((totalTokens / contextWindow) * 100);
+  // A Router transport carries the percentage on each reply instead.
+  if (discordTransport.setContextPct) {
+    discordTransport.setContextPct(pct);
+    return;
+  }
+  if (!discordTransport.supportsNickname) return;
   const now = Date.now();
   if (now - lastNicknameUpdate < NICKNAME_INTERVAL) return;
   lastNicknameUpdate = now;
 
-  const pct = Math.round((totalTokens / contextWindow) * 100);
   // Discord caps guild nicknames at 32 chars. Trim the base name to fit so the
   // % suffix always survives (otherwise long bot names make every update 400).
   const suffix = ` · ${pct}%`;
@@ -1380,7 +1399,13 @@ async function registerDiscordMcp() {
       command: "node",
       args: [MCP_SERVER_SCRIPT],
       env: {
-        BOT_TOKEN,
+        // Router mode: the MCP server reaches the Router with the launch key
+        // file, and holds no Discord token.
+        ...(ROUTER_MODE ? {
+          CCDM_ROUTER_KEY_FILE: ROUTER_KEY_FILE,
+          CCDM_ROUTER_STATE_DIR: routerPaths.stateDir(),
+          CCDM_CODEX_PROJECT: ROUTER_PROJECT,
+        } : { BOT_TOKEN }),
         CHANNEL_ID,
         DISCORD_REPLY_TOKEN,
         CCDM_REMINDER_PROJECT_ROOT: ROOT_DIR,
@@ -1683,11 +1708,13 @@ function startDiscordBot() {
         await writeFile(`${readyFile}.tmp`, "ready\n", { mode: 0o600 });
         await rename(`${readyFile}.tmp`, readyFile);
       }
+      reportLaunchReady({ ok: true, scope: { channel_id: channel.id } });
       if (ROOT_MULTI_CHANNEL) {
         console.log(`Root routing active for ${rootChannelAccess.size} configured channel(s)`);
       }
     } catch (err) {
       console.error("Discord startup failed:", err);
+      reportLaunchReady({ ok: false, error: ROUTER_MODE ? `Router hello failed: ${err.code || err.message}` : String(err.message || err) });
       process.exit(1);
     }
   })();
@@ -1725,7 +1752,20 @@ async function main() {
   console.log("Codex-Discord bridge running");
 }
 
+// The launcher reads the startup outcome from this file, written atomically.
+function reportLaunchReady(outcome) {
+  if (!LAUNCH_READY_FILE) return;
+  try {
+    const tmp = `${LAUNCH_READY_FILE}.${process.pid}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(outcome)}\n`, { mode: 0o600 });
+    renameSync(tmp, LAUNCH_READY_FILE);
+  } catch (err) {
+    console.error(`Launch outcome not recorded: ${err.message || err}`);
+  }
+}
+
 main().catch((err) => {
   console.error("Fatal:", err);
+  reportLaunchReady({ ok: false, error: String(err.message || err) });
   process.exit(1);
 });

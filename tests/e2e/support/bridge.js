@@ -129,6 +129,42 @@ function markCodexServer(workspace, port, values) {
   writeState(state, workspace.stateDir);
 }
 
+// Runs the MCP server the bridge registered, as Codex would, and calls one of
+// its tools over stdio. Its environment is the registered config's, on top of
+// the Test Workspace's.
+async function callRegisteredMcpTool(workspace, config, name, args) {
+  const command = config.command === "node" ? process.execPath : config.command;
+  const child = spawn(command, config.args ?? [], { env: bridgeChildEnv(workspace, config.env ?? {}), stdio: ["pipe", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const write = (message) => child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
+  const result = await new Promise((resolve, reject) => {
+    let buffer = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk;
+      let newline;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const message = JSON.parse(buffer.slice(0, newline));
+        buffer = buffer.slice(newline + 1);
+        if (message.id === 1) {
+          write({ method: "notifications/initialized" });
+          write({ id: 2, method: "tools/call", params: { name, arguments: args } });
+        } else if (message.id === 2) {
+          resolve(message.result);
+        }
+      }
+    });
+    child.on("exit", (code) => reject(new Error(`MCP server exited with ${code}: ${stderr}`)));
+    write({ id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "codex-fixture", version: "1" } } });
+  });
+  child.stdin.end();
+  return result;
+}
+
 export async function startFakeCodexServer(workspace, options = {}) {
   const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   await new Promise((resolve) => server.once("listening", resolve));
@@ -138,6 +174,7 @@ export async function startFakeCodexServer(workspace, options = {}) {
   let serverRequestId = 10000;
   let threadStartCount = 0;
   let registeredMcpName = `discord-${options.channelId ?? "channel-id"}`;
+  let registeredMcpConfig = null;
   let mcpStatusCount = 0;
   const interruptedTurnIds = new Set();
   const pendingTurnReleases = new Map();
@@ -196,7 +233,10 @@ export async function startFakeCodexServer(workspace, options = {}) {
           reply({});
           break;
         case "config/value/write":
-          if (message.params?.keyPath?.startsWith("mcp_servers.")) registeredMcpName = message.params.keyPath.slice("mcp_servers.".length);
+          if (message.params?.keyPath?.startsWith("mcp_servers.")) {
+            registeredMcpName = message.params.keyPath.slice("mcp_servers.".length);
+            registeredMcpConfig = message.params.value;
+          }
           if (options.failMcpRegistration) {
             replyError({ code: -32000, message: options.failMcpRegistration });
             break;
@@ -298,10 +338,28 @@ export async function startFakeCodexServer(workspace, options = {}) {
             }
             pendingTurnReleases.delete(turnId);
           };
+          // `mcpReplyText`: the agent replies through the registered Discord
+          // MCP server's reply tool before the turn completes.
+          const finishTurn = plan.mcpReplyText
+            ? () => {
+              notify("item/started", {
+                threadId: turnThreadId,
+                turnId: notificationTurnId,
+                item: { type: "mcpToolCall", server: registeredMcpName, tool: "reply" },
+              });
+              callRegisteredMcpTool(workspace, registeredMcpConfig, "reply", {
+                text: plan.mcpReplyText,
+                scope_token: registeredMcpConfig.env.DISCORD_REPLY_TOKEN,
+              }).then(
+                (result) => recordCodexEvent(workspace, { event: "mcp-tool-result", tool: "reply", result }),
+                (error) => recordCodexEvent(workspace, { event: "mcp-tool-result", tool: "reply", error: error.message }),
+              ).then(completeTurn);
+            }
+            : completeTurn;
           if (plan.waitForRelease) {
-            pendingTurnReleases.set(turnId, completeTurn);
+            pendingTurnReleases.set(turnId, finishTurn);
           } else {
-            const completionTimer = setTimeout(completeTurn, plan.delayMs ?? 10);
+            const completionTimer = setTimeout(finishTurn, plan.delayMs ?? 10);
             completionTimer.unref?.();
           }
           break;
@@ -345,6 +403,8 @@ export async function startFakeCodexServer(workspace, options = {}) {
   });
 
   registerTeardownCallback(async () => {
+    // A bridge still connected would otherwise hold the close open.
+    for (const client of server.clients) client.terminate();
     await new Promise((resolve) => server.close(resolve));
   });
 
