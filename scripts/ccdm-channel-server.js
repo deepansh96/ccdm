@@ -17,7 +17,9 @@
 // In the root role the server speaks for root: it receives root-channel
 // messages and the owner's bot mentions in project channels, may act in any
 // registered channel, posts as the bot, and records no Conversation Reminder
-// events or management commands.
+// events or management commands. If the Router stays unreachable past the
+// fallback threshold, root hears its own channels through an emergency
+// direct gateway until the Router is back (scripts/router/emergency.js).
 //
 // The statusline wrapper writes the latest context percentage to
 // `<state>/launches/<project>/context.json`; reply and edit_message send it as
@@ -43,6 +45,7 @@ const path = require("node:path");
 const { createInterface } = require("node:readline");
 const reminder = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
+const { createEmergencyGateway } = require("./router/emergency.js");
 
 const ROOT_DIR = path.dirname(__dirname);
 const PROTOCOL_VERSION = "2025-03-26";
@@ -410,7 +413,14 @@ function main() {
     process.stderr.write(`ccdm channel: launch key unavailable\n`);
     process.exit(1);
   }
-  const router = new RouterClient({ project, key, role: ROOT ? "root" : "project" });
+  // Root's emergency direct gateway delivers like the Router, until root rejoins it.
+  const fallback = ROOT ? createEmergencyGateway({
+    onMessage: event => deliver("message")(event),
+    log: line => process.stderr.write(`ccdm channel: ${line}\n`),
+  }) : null;
+  const router = new RouterClient({ project, key, role: ROOT ? "root" : "project",
+    ...(fallback ? { beforeHello: () => fallback.release() } : {}) });
+  fallback?.watch(router);
 
   // Channel notifications wait until Claude has finished initializing.
   let initialized = false;

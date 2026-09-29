@@ -17,6 +17,10 @@
 // with `router_unavailable`; nothing is queued. A `revoked` event, a refused
 // hello on reconnect, or close() ends the client for good (`end`).
 //
+// `beforeHello`, if given, is awaited each time the Router is reachable again
+// after a lost connection, before the hello goes out (root closes its
+// emergency direct gateway there, so both paths never deliver at once).
+//
 // Failed requests reject with an Error whose `code` is the Router's error code.
 const crypto = require("node:crypto");
 const { EventEmitter } = require("node:events");
@@ -42,9 +46,10 @@ function reconnectBackoff(env = process.env) {
 
 class RouterClient extends EventEmitter {
   constructor({ socketPath = defaultSocketPath(), project, key, role = "project", listener = true, timeoutMs = 10000,
-    reconnect = role !== "status", env = process.env } = {}) {
+    reconnect = role !== "status", beforeHello = null, env = process.env } = {}) {
     super();
-    Object.assign(this, { socketPath, project, key, role, listener, timeoutMs, reconnect, backoff: reconnectBackoff(env) });
+    Object.assign(this, { socketPath, project, key, role, listener, timeoutMs, reconnect, beforeHello,
+      backoff: reconnectBackoff(env) });
     this.socket = null;
     this.ready = false;
     this.connectedOnce = false;
@@ -72,7 +77,13 @@ class RouterClient extends EventEmitter {
     let revoked = false;
     let buffer = "";
     socket.setEncoding("utf8");
-    socket.once("connect", () => {
+    socket.once("connect", async () => {
+      if (this.connectedOnce && this.beforeHello) {
+        try {
+          await this.beforeHello();
+        } catch { /* The hello still goes out. */ }
+        if (socket.destroyed || this.ended) return;
+      }
       this.write({ type: "hello", v: PROTOCOL_VERSION, role: this.role,
         ...(this.project ? { project: this.project } : {}), ...(this.key ? { key: this.key } : {}),
         ...(this.listener ? {} : { listener: false }) });

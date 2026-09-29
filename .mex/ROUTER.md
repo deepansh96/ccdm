@@ -48,6 +48,7 @@ Then read this file fully before doing anything else in this session.
 - Codex startup waits for the scoped Discord reply tool, uses a no-action bootstrap, and tracks bootstrap completion or explicitly interrupts on timeout.
 - The Codex bridge retries a generic terminal `response.failed` once when the failed turn produced no agent work.
 - The Codex bridge can pause new turns in memory, queue incoming messages, and resume them in order.
+- Root stays reachable when the Router is down: after about 2 minutes of `router_unavailable` (`CCDM_ROOT_FALLBACK_AFTER_MS`), root Claude and root Codex open an emergency direct gateway restricted to root channels and allowed users, post a notice in the primary root channel, and close it before saying hello to the returning Router.
 - Root Codex sessions steer active turns for the same channel and author while preserving the active Discord grant; other channels/authors queue, and failed steering falls back to a fresh scoped turn.
 - The Codex bridge forwards allowed users' 👍 and 👎 reactions on its own messages to the active Codex thread.
 - The tracked Usage Stats Poster discovers named and legacy Codex Homes, deduplicates shared homes, and falls back from live rate limits to recent session JSONL data.

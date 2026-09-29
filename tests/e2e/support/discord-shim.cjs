@@ -229,7 +229,15 @@ class Client extends EventEmitter {
     return Promise.resolve(token);
   }
 
+  // A logged-in client going away is recorded with when it happened, so tests
+  // can order it against other events (root's Router hello, say).
   destroy() {
+    if (this._poller) {
+      updateState((state) => {
+        state.fixtures.discord.destroys ||= [];
+        state.fixtures.discord.destroys.push({ pid: process.pid, at: new Date().toISOString() });
+      });
+    }
     if (this._poller) clearInterval(this._poller);
     this._poller = null;
   }

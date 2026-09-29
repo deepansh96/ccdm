@@ -111,7 +111,7 @@ let bridgePaused = false;
 const discordTransport = ROUTER_MODE
   ? createRouterTransport({
     project: ROUTER_PROJECT, role: ROUTER_ROOT ? "root" : "project", keyFile: ROUTER_KEY_FILE,
-    launchDir: ROUTER_LAUNCH_DIR, registryPath: REGISTRY_PATH,
+    launchDir: ROUTER_LAUNCH_DIR, registryPath: REGISTRY_PATH, primaryChannelId: CHANNEL_ID,
   })
   : createPoolTransport({
     token: BOT_TOKEN,

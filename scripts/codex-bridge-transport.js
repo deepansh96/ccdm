@@ -51,6 +51,7 @@ const { renameSync, writeFileSync } = require("fs");
 const { readFile } = require("fs/promises");
 const path = require("path");
 const { RouterClient } = require("./router/client.js");
+const { createEmergencyGateway } = require("./router/emergency.js");
 
 function createPoolTransport({ token, primaryChannelId, guildId }) {
   let client = null;
@@ -219,8 +220,11 @@ function createPoolTransport({ token, primaryChannelId, guildId }) {
 // reaction shapes. A management command arrives as its plain `/command` text.
 // In the root role the transport is the Router's root client: it receives
 // root-channel messages and the owner's project-channel mentions, and may act
-// in any root or registered channel.
-function createRouterTransport({ project, role = "project", keyFile, launchDir, registryPath }) {
+// in any root or registered channel. If the Router stays unreachable past the
+// fallback threshold, root hears its own channels through an emergency direct
+// gateway until the Router is back (router/emergency.js); its notice goes to
+// `primaryChannelId`.
+function createRouterTransport({ project, role = "project", keyFile, launchDir, registryPath, primaryChannelId }) {
   let router = null;
   let scope = null;
   let messageHandler = null;
@@ -278,7 +282,15 @@ function createRouterTransport({ project, role = "project", keyFile, launchDir, 
 
     async connect() {
       const key = (await readFile(keyFile, "utf8")).trim();
-      router = root ? new RouterClient({ key, role: "root" }) : new RouterClient({ project, key, role: "project" });
+      if (root) {
+        const fallback = createEmergencyGateway({
+          primaryChannelId, onMessage: (event) => messageHandler?.(toMessage(event)), log: (line) => console.error(line),
+        });
+        router = new RouterClient({ key, role: "root", beforeHello: () => fallback.release() });
+        fallback.watch(router);
+      } else {
+        router = new RouterClient({ project, key, role: "project" });
+      }
       router.on("message", (event) => messageHandler?.(toMessage(event)));
       router.on("command", (event) => messageHandler?.(toMessage(event, `/${event.command}`)));
       router.on("reaction", (event) => reactionHandler?.(toReaction(event)));
