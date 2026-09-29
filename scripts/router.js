@@ -6,6 +6,7 @@
 //
 //   scripts/router.js serve                   run the Router daemon
 //   scripts/router.js status                  report Router health (non-zero if unreachable)
+//   scripts/router.js preflight               read-only supervision readiness as JSON (non-zero on blockers)
 //   scripts/router.js ensure-webhook <project>  find or create the project's webhook
 //   scripts/router.js migrate-root-config     copy root channels and users from root access.json
 const path = require("node:path");
@@ -13,7 +14,9 @@ const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const { createAttachmentCache } = require("./router/attachments.js");
 const { RouterClient } = require("./router/client.js");
 const { discordRequest } = require("./router/discord-rest.js");
+const { acquireRouterLock } = require("./router/lock.js");
 const { classifyMessage, classifyReaction } = require("./router/inbound.js");
+const { preflight } = require("./router/preflight.js");
 const { registryPath, rootStateDir, rootToken, socketPath, stateDir } = require("./router/paths.js");
 const { DEFAULT_RELOAD_DEBOUNCE_MS, loadRoutingTable, watchRegistry } = require("./router/registry.js");
 const { migrateRootConfig } = require("./router/root-config.js");
@@ -27,6 +30,9 @@ function log(line) {
 }
 
 async function serve() {
+  // Taken before anything else, so a refused start leaves the running Router's
+  // socket and state untouched.
+  acquireRouterLock(stateDir());
   const token = await rootToken();
   let table = await loadRoutingTable(registryPath());
   const gateway = { state: "connecting" };
@@ -130,6 +136,12 @@ async function status() {
   }
 }
 
+async function preflightCommand() {
+  const result = await preflight();
+  console.log(JSON.stringify(result));
+  if (!result.ready) process.exitCode = 1;
+}
+
 async function ensureWebhookCommand(project) {
   if (!project) throw new Error("usage: router.js ensure-webhook <project>");
   const result = await ensureWebhook({ project, registryFile: registryPath(), stateDir: stateDir(), token: await rootToken() });
@@ -145,11 +157,12 @@ async function migrateRootConfigCommand() {
 
 const [command = "serve", ...args] = process.argv.slice(2);
 const commands = {
-  serve, status, "ensure-webhook": () => ensureWebhookCommand(args[0]), "migrate-root-config": migrateRootConfigCommand,
+  serve, status, preflight: preflightCommand,
+  "ensure-webhook": () => ensureWebhookCommand(args[0]), "migrate-root-config": migrateRootConfigCommand,
 };
 
 if (!Object.hasOwn(commands, command)) {
-  console.error(`unknown command: ${command}\nusage: router.js serve | status | ensure-webhook <project> | migrate-root-config`);
+  console.error(`unknown command: ${command}\nusage: router.js serve | status | preflight | ensure-webhook <project> | migrate-root-config`);
   process.exit(2);
 }
 commands[command]().catch(error => {
