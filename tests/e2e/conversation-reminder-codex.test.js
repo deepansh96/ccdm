@@ -1,35 +1,140 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { createWorkspace, runNodeEntrypoint, runScript } from "./support/runner.js";
+import { createWorkspace, runScript } from "./support/runner.js";
 import { readState, writeState } from "./support/state.js";
-import { cleanup } from "./support/teardown.js";
-import { bridgeChildEnv, createBridgeWorkspace, injectDiscordMessage, injectDiscordReaction, startBridge, startFakeCodexServer, waitForState } from "./support/bridge.js";
+import { cleanup, registerTeardownCallback } from "./support/teardown.js";
+import { bridgeChildEnv, createBridgeWorkspace, injectDiscordMessage, injectDiscordReaction, startFakeCodexServer, waitForState } from "./support/bridge.js";
+import { routerEnv, runRouterCli, startBridge } from "./support/router.js";
 
 test.afterEach(async () => {
   await cleanup();
 });
 
-function writeRegistry(workspace, overrides = {}) {
+// Every Codex project is served through the Router and speaks through its
+// webhook, so its reminder identity is `router:<webhook_id>`. Receiver-only
+// tests record the webhook the Router would have created; bridge tests leave
+// it out so startBridge runs ensure-webhook, which creates `fake-webhook-1`.
+function writeRegistry(workspace, overrides = {}, { webhookId = "fake-webhook-1" } = {}) {
   const registry = {
     discord_user_id: "owner-id",
     guild_id: "guild-id",
-    pool: [{ id: "assigned-bot", app_id: "assigned-app", token: "fixture-bot-token" }],
     projects: {
       demo: {
         type: "codex",
+        transport: "router",
         path: workspace.repoDir,
-      screen_name: "demo_codex",
-      bot_id: "assigned-bot",
-      channel_id: "channel-id",
-      assignment_generation: "fixture-generation-1",
+        screen_name: "demo_codex",
+        channel_id: "channel-id",
+        assignment_generation: "fixture-generation-1",
+        ...(webhookId ? { webhook_id: webhookId } : {}),
       },
     },
     ...overrides,
   };
   fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), `${JSON.stringify(registry)}\n`, { mode: 0o600 });
+}
+
+// A bridge workspace whose demo project gets its webhook from the Router.
+function bridgeRegistry(workspace, overrides = {}) {
+  writeRegistry(workspace, { discord_user_id: "allowed-user-id", ...overrides }, { webhookId: null });
+}
+
+// Root's Discord state holds the only bot token, which the Router reads.
+function writeRootToken(workspace) {
+  const rootStateDir = path.join(workspace.homeDir, ".claude/channels/discord");
+  fs.mkdirSync(rootStateDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(rootStateDir, ".env"), "DISCORD_BOT_TOKEN=root-bot-token\n", { mode: 0o600 });
+}
+
+async function ensureWebhook(workspace, project) {
+  writeRootToken(workspace);
+  const result = await runRouterCli(workspace, ["ensure-webhook", project]);
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+}
+
+function startDemoBridge(workspace, options = {}) {
+  return startBridge(workspace, { project: "demo", ...options });
+}
+
+// The Router hands /close to the reminder service alone, through its observer
+// client; the service's worker runs that observer.
+function reminderWorker(workspace) {
+  const stateDir = path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders");
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  fs.writeFileSync(clockFile, new Date().toISOString().replace(/\.\d{3}Z$/, "Z"));
+  fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
+  const env = routerEnv(workspace, { CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile });
+  const service = async (name) => {
+    const result = await runScript(workspace, "scripts/conversation-reminder-service.py", {
+      args: [name, "--project-root", workspace.repoDir, "--state-dir", stateDir], env,
+    });
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+    return JSON.parse(result.stdout);
+  };
+  let running = null;
+  return {
+    async start(projects) {
+      const seed = readState(workspace.stateDir);
+      seed.fixtures.discord.history = Object.fromEntries(projects.map(([, channelId]) => [channelId, []]));
+      writeState(seed, workspace.stateDir);
+      await service("enable");
+      running = runScript(workspace, "scripts/conversation-reminder-service.py", {
+        args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir], env, timeoutMs: 60000,
+      });
+      for (let attempt = 0; attempt < 400; attempt++) {
+        const current = await service("status");
+        if (projects.every(([name]) => current.conversations[name]?.reconciliation_status === "ready")) return;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      throw new Error(`reminder worker not ready: ${JSON.stringify(await service("status"))}`);
+    },
+    async stop() {
+      await service("disable");
+      const result = await running;
+      assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+    },
+  };
+}
+
+// The bridge's scoped MCP server, as Codex runs it: a Router client that exits
+// when its stdin closes, so stdin stays open until the tool call is answered.
+async function runMcp(workspace, { env, input, timeoutMs = 10000 }) {
+  const child = spawn(process.execPath, [path.join(workspace.repoDir, "scripts/discord-mcp-server.js")], {
+    cwd: workspace.repoDir, detached: true, env, stdio: ["pipe", "pipe", "pipe"],
+  });
+  registerTeardownCallback(() => { try { process.kill(-child.pid, "SIGKILL"); } catch {} });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  const closed = new Promise((resolve) => child.on("close", resolve));
+  const answered = new Promise((resolve) => child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+    if (stdout.includes("\n")) resolve();
+  }));
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.stdin.write(input);
+  const timer = setTimeout(() => child.stdin.end(), timeoutMs);
+  await Promise.race([answered, closed]);
+  clearTimeout(timer);
+  child.stdin.end();
+  const exitCode = await closed;
+  return { exitCode, stdout, stderr };
+}
+
+async function waitForEvents(workspace, predicate, attempts = 200) {
+  let events = [];
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
+    events = JSON.parse(result.stdout).events;
+    if (predicate(events)) return events;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return events;
 }
 
 function lifecycleEvent(eventType, eventId, fields = {}) {
@@ -39,7 +144,7 @@ function lifecycleEvent(eventType, eventId, fields = {}) {
     event_type: eventType,
     project: "demo",
     channel_id: "channel-id",
-    bot_id: "assigned-bot",
+    bot_id: "router:fake-webhook-1",
     assignment_generation: "fixture-generation-1",
     provider: "codex",
     provider_session_id: "thread-1",
@@ -76,14 +181,13 @@ test("Codex readiness reports an assigned observe-only adapter without invoking 
   assert.equal(readiness.delivery_enabled, false);
   assert.equal(readiness.reminders_enabled, false);
   assert.equal(readiness.assignment.channel_id, "channel-id");
-  assert.equal(readiness.assignment.bot_id, "assigned-bot");
+  assert.equal(readiness.assignment.bot_id, "router:fake-webhook-1");
   assert.equal(readiness.assignment.generation, "fixture-generation-1");
   assert.deepEqual(readiness.missing_credentials, []);
   assert.deepEqual(readiness.assignment_mismatches, []);
   assert.deepEqual(readiness.unsupported_capabilities, []);
   assert.equal(readiness.event_receiver.available, true);
   assert.deepEqual(readiness.events, []);
-  assert.doesNotMatch(result.stdout, /fixture-bot-token/);
   assert.equal(readState(workspace.stateDir).fixtures.codex.appServerInvocations.length, 0);
 });
 
@@ -128,7 +232,7 @@ test("event receiver binds receipts to the registered assignment and requires a 
   const staleReceipt = lifecycleEvent(
     "response_delivered",
     "55555555-5555-4555-8555-555555555555",
-    { bot_id: "obsolete-bot", message_id: "stale-message", disposition: "progress" },
+    { bot_id: "router:obsolete-webhook", message_id: "stale-message", disposition: "progress" },
   );
   assert.equal((await ingestEvent(workspace, stateDir, staleReceipt)).status, "stale");
 
@@ -141,41 +245,45 @@ test("event receiver binds receipts to the registered assignment and requires a 
   assert.equal(readiness.events.at(-1).message_id, "discord-message-question");
   assert.equal(readiness.event_receiver.event_count, 3);
   assert.equal(fs.statSync(path.join(stateDir, "events.sqlite3")).mode & 0o777, 0o600);
-  assert.doesNotMatch(fs.readFileSync(path.join(stateDir, "events.sqlite3"), "utf8"), /question body|fixture-bot-token/);
+  assert.doesNotMatch(fs.readFileSync(path.join(stateDir, "events.sqlite3"), "utf8"), /question body/);
 });
 
 test("owner /close is recorded before Codex dispatch and does not start a turn", async () => {
   const workspace = createBridgeWorkspace();
-  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  bridgeRegistry(workspace);
   const codex = await startFakeCodexServer(workspace);
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app" });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const bridge = await startDemoBridge(workspace, { port: codex.port });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
+
+  const worker = reminderWorker(workspace);
+  await worker.start([["demo", "channel-id"]]);
 
   injectDiscordMessage(workspace, { id: "close-message-1", content: "  /close  " });
   await waitForState(workspace, (state) => state.fixtures.discord.deliveredMessages.some((message) => message.id === "close-message-1"));
-  const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  const readiness = JSON.parse(result.stdout);
-  assert.deepEqual(readiness.events.map((event) => event.event_type), ["close_requested"]);
-  assert.equal(readiness.events[0].source_message_id, "close-message-1");
+  const events = await waitForEvents(workspace, (rows) => rows.some((event) => event.event_type === "close_requested"));
+  assert.deepEqual(events.map((event) => event.event_type), ["close_requested"]);
+  assert.equal(events[0].source_message_id, "close-message-1");
+  await new Promise((resolve) => setTimeout(resolve, 150));
   assert.equal(codex.clientMessages.filter((message) => message.method === "turn/start").length, 1);
+  await worker.stop();
   await bridge.stop();
 });
 
 test("a successful scoped Codex reply produces a progress receipt and a completed response", async () => {
   const workspace = createBridgeWorkspace();
-  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  bridgeRegistry(workspace);
   const codex = await startFakeCodexServer(workspace, {
     turns: [{ turnId: "answer-turn", status: "completed", waitForRelease: true, mcpReply: true }],
   });
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app" });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const bridge = await startDemoBridge(workspace, { port: codex.port });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
   injectDiscordMessage(workspace, { id: "owner-message-1", content: "answer this" });
   await waitForState(workspace, (state) => state.fixtures.discord.deliveredMessages.some((message) => message.id === "owner-message-1"));
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
   for (let attempt = 0; attempt < 100 && !fs.existsSync(contextFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
   assert.ok(fs.existsSync(contextFile), `${bridge.stdout}\n${bridge.stderr}\n${JSON.stringify(codex.clientMessages.filter((message) => message.method === "turn/start"))}`);
-  const reply = await runNodeEntrypoint(workspace, "scripts/discord-mcp-server.js", {
+  const reply = await runMcp(workspace, {
     env: bridgeChildEnv(workspace, config.params.value.env),
     input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "reply", arguments: { text: "Here is the answer", scope_token: config.params.value.env.DISCORD_REPLY_TOKEN } } }) + "\n",
   });
@@ -195,16 +303,16 @@ test("a successful scoped Codex reply produces a progress receipt and a complete
 
 test("an input-needed reply during active work pauses when the owner resumes", async () => {
   const workspace = createBridgeWorkspace();
-  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  bridgeRegistry(workspace);
   const codex = await startFakeCodexServer(workspace, { turns: [{ turnId: "active-turn", status: "completed", waitForRelease: true }] });
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app" });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const bridge = await startDemoBridge(workspace, { port: codex.port });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
   injectDiscordMessage(workspace, { id: "first-message", content: "work on this" });
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
   for (let attempt = 0; attempt < 100 && !fs.existsSync(contextFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
   assert.ok(fs.existsSync(contextFile));
-  const reply = await runNodeEntrypoint(workspace, "scripts/discord-mcp-server.js", {
+  const reply = await runMcp(workspace, {
     env: bridgeChildEnv(workspace, config.params.value.env),
     input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "reply", arguments: { text: "Which option?", conversation_disposition: "input-needed", scope_token: config.params.value.env.DISCORD_REPLY_TOKEN } } }) + "\n",
   });
@@ -223,23 +331,28 @@ test("an input-needed reply during active work pauses when the owner resumes", a
 
 test("a failed Discord reply and tool start cannot qualify Codex completion", async () => {
   const workspace = createBridgeWorkspace();
-  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  bridgeRegistry(workspace);
   const codex = await startFakeCodexServer(workspace, { turns: [{ turnId: "failed-reply-turn", waitForRelease: true, mcpReply: true }] });
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app" });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const bridge = await startDemoBridge(workspace, { port: codex.port });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
   injectDiscordMessage(workspace, { id: "failed-reply-owner", content: "hello" });
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
   for (let attempt = 0; attempt < 100 && !fs.existsSync(contextFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
   assert.ok(fs.existsSync(contextFile));
   const seed = readState(workspace.stateDir);
-  seed.fixtures.discord.restFailures = [{ status: 503 }];
+  // The Router's execute of the project's webhook fails.
+  // The fake webhook token is spelled in parts because router.test.js
+  // scans every Test Workspace file, including this copied source, for that token.
+  const execute = `/api/v10/webhooks/fake-webhook-1/${"fake-webhook-"}token-1`;
+  seed.fixtures.discord.restFailures = [{ status: 503, method: "POST", path: execute }];
   writeState(seed, workspace.stateDir);
-  const reply = await runNodeEntrypoint(workspace, "scripts/discord-mcp-server.js", {
+  const reply = await runMcp(workspace, {
     env: bridgeChildEnv(workspace, config.params.value.env),
     input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "reply", arguments: { text: "failed", scope_token: config.params.value.env.DISCORD_REPLY_TOKEN } } }) + "\n",
   });
   assert.equal(JSON.parse(reply.stdout).result.isError, true);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.restFailureUses, [{ method: "POST", path: execute, status: 503 }]);
   codex.releaseTurn("failed-reply-turn");
   await new Promise((resolve) => setTimeout(resolve, 200));
   const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
@@ -249,25 +362,25 @@ test("a failed Discord reply and tool start cannot qualify Codex completion", as
 
 test("failed Codex turns do not send or record optional fallback text", async () => {
   const workspace = createBridgeWorkspace();
-  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  bridgeRegistry(workspace);
   const codex = await startFakeCodexServer(workspace, { turns: [{ turnId: "bad-turn", status: "failed", completedItem: { type: "agentMessage", text: "unsent draft" } }] });
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app", env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" } });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const bridge = await startDemoBridge(workspace, { port: codex.port, env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" } });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
   injectDiscordMessage(workspace, { id: "failed-turn-owner", content: "try this" });
   await waitForState(workspace, (state) => state.fixtures.discord.deliveredMessages.some((message) => message.id === "failed-turn-owner"));
   await new Promise((resolve) => setTimeout(resolve, 200));
   const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
   assert.deepEqual(JSON.parse(result.stdout).events.map((event) => event.event_type), ["owner_activity"]);
-  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.sends, []);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.messages ?? [], []);
   await bridge.stop();
 });
 
 test("owner reactions, including one on a recorded reminder, are activity but reminder reactions do not reach Codex", async () => {
   const workspace = createBridgeWorkspace();
-  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  bridgeRegistry(workspace);
   const codex = await startFakeCodexServer(workspace);
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app" });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const bridge = await startDemoBridge(workspace, { port: codex.port });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
   const excluded = path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders", "recorded-reminder-message-ids.json");
   fs.mkdirSync(path.dirname(excluded), { recursive: true });
   fs.writeFileSync(excluded, JSON.stringify({ schema_version: 1, message_ids: ["reminder-1"] }), { mode: 0o600 });
@@ -285,10 +398,10 @@ test("owner reactions, including one on a recorded reminder, are activity but re
 
 test("a bridge management command records owner activity without a response completion", async () => {
   const workspace = createBridgeWorkspace();
-  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  bridgeRegistry(workspace);
   const codex = await startFakeCodexServer(workspace);
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app" });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const bridge = await startDemoBridge(workspace, { port: codex.port });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
   injectDiscordMessage(workspace, { id: "pause-command", content: "/pause" });
   await waitForState(workspace, (state) => state.fixtures.discord.deliveredMessages.some((message) => message.id === "pause-command"));
   await new Promise((resolve) => setTimeout(resolve, 100));
@@ -302,16 +415,16 @@ test("a bridge management command records owner activity without a response comp
 
 test("a steered owner message gets a new response correlation within the active Codex turn", async () => {
   const workspace = createBridgeWorkspace();
-  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  bridgeRegistry(workspace);
   const codex = await startFakeCodexServer(workspace, { turns: [{ turnId: "steer-turn", status: "completed", waitForRelease: true }] });
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app" });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const bridge = await startDemoBridge(workspace, { port: codex.port });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
   injectDiscordMessage(workspace, { id: "first-owner", content: "first task" });
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
   for (let attempt = 0; attempt < 100 && !fs.existsSync(contextFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
   assert.ok(fs.existsSync(contextFile));
-  const send = (text) => runNodeEntrypoint(workspace, "scripts/discord-mcp-server.js", {
+  const send = (text) => runMcp(workspace, {
     env: bridgeChildEnv(workspace, config.params.value.env),
     input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "reply", arguments: { text, scope_token: config.params.value.env.DISCORD_REPLY_TOKEN } } }) + "\n",
   });
@@ -333,7 +446,9 @@ test("a steered owner message gets a new response correlation within the active 
 
 test("bridge startup replays a durable event after the receiver recovers", async () => {
   const workspace = createBridgeWorkspace();
-  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  bridgeRegistry(workspace);
+  // The event names the webhook the Router records for demo.
+  await ensureWebhook(workspace, "demo");
   const stateDir = path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders");
   const outbox = path.join(stateDir, "outbox");
   fs.mkdirSync(outbox, { recursive: true, mode: 0o700 });
@@ -350,8 +465,8 @@ test("bridge startup replays a durable event after the receiver recovers", async
   fs.rmdirSync(path.join(stateDir, "events.sqlite3"));
 
   const codex = await startFakeCodexServer(workspace);
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app" });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const bridge = await startDemoBridge(workspace, { port: codex.port });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
   const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
   const readiness = JSON.parse(result.stdout);
   assert.deepEqual(readiness.events.map((row) => row.source_message_id), ["outage-owner"]);
@@ -361,10 +476,10 @@ test("bridge startup replays a durable event after the receiver recovers", async
 
 test("stopping a Codex bridge records session termination for its assignment", async () => {
   const workspace = createBridgeWorkspace();
-  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  bridgeRegistry(workspace);
   const codex = await startFakeCodexServer(workspace);
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app" });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const bridge = await startDemoBridge(workspace, { port: codex.port });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
   await bridge.stop();
   const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
   const events = JSON.parse(result.stdout).events;
@@ -374,55 +489,61 @@ test("stopping a Codex bridge records session termination for its assignment", a
 
 test("attachment replies and successful optional text fallback produce confirmed receipts", async () => {
   const workspace = createBridgeWorkspace();
-  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  bridgeRegistry(workspace);
   const codex = await startFakeCodexServer(workspace, {
     turns: [
       { turnId: "upload-turn", status: "completed", waitForRelease: true, mcpReply: true },
       { turnId: "fallback-turn", status: "completed", completedItem: { type: "agentMessage", text: "fallback answer" } },
     ],
   });
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app", env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" } });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const bridge = await startDemoBridge(workspace, { port: codex.port, env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" } });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
   injectDiscordMessage(workspace, { id: "upload-owner", content: "send file" });
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
   for (let attempt = 0; attempt < 100 && !fs.existsSync(contextFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
   const file = path.join(workspace.tmpDir, "reply.txt");
   fs.writeFileSync(file, "attachment fixture");
-  const upload = await runNodeEntrypoint(workspace, "scripts/discord-mcp-server.js", {
+  const upload = await runMcp(workspace, {
     env: bridgeChildEnv(workspace, { ...config.params.value.env, CCDM_TEST_FORM_DATA_SHIM: "1" }),
     input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "reply", arguments: { text: "file attached", files: [file], scope_token: config.params.value.env.DISCORD_REPLY_TOKEN } } }) + "\n",
   });
-  assert.equal(JSON.parse(upload.stdout).result.content[0].text, "sent (id: fake-upload-1)");
+  assert.equal(JSON.parse(upload.stdout).result.content[0].text, "sent (id: fake-message-1)");
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.messages.map(({ content, uploads, webhookId }) => ({ content, uploads, webhookId })),
+    [{ content: "file attached", uploads: [{ name: "reply.txt", size: 18 }], webhookId: "fake-webhook-1" }]);
   codex.releaseTurn("upload-turn");
   await new Promise((resolve) => setTimeout(resolve, 100));
   injectDiscordMessage(workspace, { id: "fallback-owner", content: "plain answer" });
-  await waitForState(workspace, (state) => state.fixtures.discord.sends.some((row) => row.content === "fallback answer"));
+  await waitForState(workspace, (state) => state.fixtures.discord.messages.some((row) => row.content === "fallback answer" && row.webhookId === "fake-webhook-1"));
   const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
   const receipts = JSON.parse(result.stdout).events.filter((event) => event.event_type === "response_delivered");
   assert.equal(receipts.length, 2);
-  assert.equal(receipts[0].message_id, "fake-upload-1");
-  assert.match(receipts[1].message_id, /^sent-\d+$/);
+  assert.equal(receipts[0].message_id, "fake-message-1");
+  assert.equal(receipts[1].message_id, "fake-message-2");
   assert.deepEqual(receipts.map((event) => event.disposition), ["progress", "progress"]);
   await bridge.stop();
 });
 
+// Mentioning the bot addresses root, the Router's only bot user, so the
+// mention forms name it; a guest's /close reaches no one and is not recorded.
 test("exact mention forms of /close are consumed, including a guest command", async () => {
   const workspace = createBridgeWorkspace();
-  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  bridgeRegistry(workspace);
   const codex = await startFakeCodexServer(workspace);
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app", allowedUserIds: ["allowed-user-id", "guest-id"] });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
-  injectDiscordMessage(workspace, { id: "assigned-mention-close", content: "<@assigned-app> /close" });
-  injectDiscordMessage(workspace, { id: "root-mention-close", content: "<@!root-bot-app-id> /close" });
+  const bridge = await startDemoBridge(workspace, { port: codex.port, allowedUserIds: ["allowed-user-id", "guest-id"] });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
+  const worker = reminderWorker(workspace);
+  await worker.start([["demo", "channel-id"]]);
+  injectDiscordMessage(workspace, { id: "root-mention-close", content: "<@fixture-bot-user-id> /close" });
+  injectDiscordMessage(workspace, { id: "root-bang-mention-close", content: "<@!fixture-bot-user-id> /close" });
   injectDiscordMessage(workspace, { id: "guest-close", content: "/close", author: { id: "guest-id" } });
   await waitForState(workspace, (state) => state.fixtures.discord.deliveredMessages.length === 3);
+  const events = await waitForEvents(workspace, (rows) => rows.length >= 2);
   await new Promise((resolve) => setTimeout(resolve, 150));
-  const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  const events = JSON.parse(result.stdout).events;
-  assert.deepEqual(events.map((event) => event.source_message_id), ["assigned-mention-close", "root-mention-close"]);
+  assert.deepEqual(events.map((event) => event.source_message_id), ["root-mention-close", "root-bang-mention-close"]);
   assert.deepEqual(events.map((event) => event.event_type), ["close_requested", "close_requested"]);
   assert.equal(codex.clientMessages.filter((message) => message.method === "turn/start").length, 1);
+  await worker.stop();
   await bridge.stop();
 });
 
@@ -430,25 +551,20 @@ test("a Codex root consumes a root-mention /close in a Claude project channel wi
   const workspace = createBridgeWorkspace();
   writeRegistry(workspace, {
     discord_user_id: "allowed-user-id",
-    pool: [{ id: "claude-bot", app_id: "claude-app", token: "fixture-claude-token" }],
-    projects: { "claude-demo": { type: "claude", path: workspace.repoDir, screen_name: "claude-demo_claude",
-      bot_id: "claude-bot", channel_id: "project-channel", assignment_generation: "claude-generation-1" } },
+    projects: { "claude-demo": { type: "claude", transport: "router", path: workspace.repoDir, screen_name: "claude-demo_claude",
+      channel_id: "project-channel", assignment_generation: "claude-generation-1" } },
   });
-  const accessFile = path.join(workspace.tmpDir, "root-access.json");
-  fs.writeFileSync(accessFile, `${JSON.stringify({ allowFrom: ["allowed-user-id"], groups: {
-    "root-channel": { requireMention: false, allowFrom: ["allowed-user-id"] },
-    "project-channel": { requireMention: true, allowFrom: ["allowed-user-id"] },
-  } })}\n`);
+  await ensureWebhook(workspace, "claude-demo");
   const codex = await startFakeCodexServer(workspace, { channelId: "root-channel", turns: [{ complete: true }] });
-  const bridge = startBridge(workspace, { botAppId: "root-bot-id", rootBotAppId: "root-bot-id",
-    channelId: "root-channel", port: codex.port,
-    env: { ROOT_ACCESS_FILE: accessFile, ROOT_MULTI_CHANNEL: "1" } });
-  await bridge.waitForOutput(/Root routing active for 2 configured channel\(s\)/, 7000);
+  // The fake gateway's bot user is root's, so mentions name it.
+  const bridge = await startBridge(workspace, { root: true, rootBotAppId: "fixture-bot-user-id",
+    channelId: "root-channel", port: codex.port });
+  await bridge.waitForOutput(/Root routing active for 1 configured channel\(s\)/, 7000);
   const userTurns = () => codex.clientMessages.filter((message) => message.method === "turn/start" &&
     !message.params?.input?.[0]?.text?.startsWith("You are communicating with the user via Discord"));
-  injectDiscordMessage(workspace, { id: "root-close", channelId: "project-channel", content: "<@root-bot-id> /close" });
+  injectDiscordMessage(workspace, { id: "root-close", channelId: "project-channel", content: "<@fixture-bot-user-id> /close" });
   // A later root-management request proves the close was consumed rather than queued.
-  injectDiscordMessage(workspace, { id: "root-status", channelId: "project-channel", content: "<@root-bot-id> status" });
+  injectDiscordMessage(workspace, { id: "root-status", channelId: "project-channel", content: "<@fixture-bot-user-id> status" });
   for (let attempt = 0; attempt < 200 && userTurns().length === 0; attempt++) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
@@ -466,39 +582,50 @@ test("a Codex root consumes a root-mention /close in a Claude project channel wi
   await bridge.stop();
 });
 
-test("readiness reports missing credentials and assignment mismatch without exposing secrets", async () => {
+// Root delivers a router project's reminders, so no project credential can be
+// missing; an unrecorded webhook leaves the assignment incomplete instead.
+test("readiness reports a missing webhook and an ambiguous assignment without exposing secrets", async () => {
   const workspace = createWorkspace();
+  writeRootToken(workspace);
   writeRegistry(workspace, {
-    pool: [{ id: "assigned-bot", app_id: "assigned-app" }],
     projects: {
-      demo: { type: "codex", channel_id: "channel-id", bot_id: "assigned-bot" },
-      duplicate: { type: "codex", channel_id: "channel-id", bot_id: "assigned-bot" },
+      demo: { type: "codex", transport: "router", channel_id: "channel-id", webhook_id: "fake-webhook-1" },
+      duplicate: { type: "codex", transport: "router", channel_id: "channel-id", webhook_id: "fake-webhook-2" },
+      unhooked: { type: "codex", transport: "router", channel_id: "other-channel" },
     },
   });
   const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
   const readiness = JSON.parse(result.stdout);
   assert.equal(result.exitCode, 2);
   assert.equal(readiness.status, "blocked");
-  assert.deepEqual(readiness.missing_credentials, ["assigned_project_bot_token"]);
+  assert.deepEqual(readiness.missing_credentials, []);
   assert.deepEqual(readiness.assignment_mismatches, ["project channel assignment is ambiguous"]);
   assert.equal(readiness.delivery_enabled, false);
-  assert.doesNotMatch(result.stdout, /fixture-bot-token/);
+  assert.doesNotMatch(result.stdout, /root-bot-token/);
+
+  const unhooked = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["unhooked", "--json"] });
+  const blocked = JSON.parse(unhooked.stdout);
+  assert.equal(unhooked.exitCode, 2);
+  assert.equal(blocked.status, "blocked");
+  assert.deepEqual(blocked.assignment_mismatches, ["project assignment is incomplete or ambiguous"]);
+  assert.equal(blocked.delivery_enabled, false);
+  assert.doesNotMatch(unhooked.stdout, /root-bot-token/);
 });
 
 test("new Codex work after a completed input-needed turn emits a resumption pause", async () => {
   const workspace = createBridgeWorkspace();
-  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  bridgeRegistry(workspace);
   const codex = await startFakeCodexServer(workspace, { turns: [
     { turnId: "question-turn", status: "completed", waitForRelease: true, mcpReply: true },
     { turnId: "resumed-turn", status: "completed", waitForRelease: true },
   ] });
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app" });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const bridge = await startDemoBridge(workspace, { port: codex.port });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
   injectDiscordMessage(workspace, { id: "question-owner", content: "ask me" });
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
   for (let attempt = 0; attempt < 100 && !fs.existsSync(contextFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
-  const reply = await runNodeEntrypoint(workspace, "scripts/discord-mcp-server.js", {
+  const reply = await runMcp(workspace, {
     env: bridgeChildEnv(workspace, config.params.value.env),
     input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "reply", arguments: { text: "What do you prefer?", conversation_disposition: "input-needed", scope_token: config.params.value.env.DISCORD_REPLY_TOKEN } } }) + "\n",
   });
@@ -518,10 +645,10 @@ test("new Codex work after a completed input-needed turn emits a resumption paus
 
 test("unexpected Codex runtime exit records session termination", async () => {
   const workspace = createBridgeWorkspace();
-  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  bridgeRegistry(workspace);
   const codex = await startFakeCodexServer(workspace);
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app" });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const bridge = await startDemoBridge(workspace, { port: codex.port });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
   const state = await waitForState(workspace, (snapshot) => snapshot.fixtures.codex.appServerInvocations.length > 0);
   const fixturePid = state.fixtures.codex.appServerInvocations[0].pid;
   process.kill(fixturePid, "SIGTERM");
@@ -532,15 +659,15 @@ test("unexpected Codex runtime exit records session termination", async () => {
 
 test("a Codex completion without confirmed success status cannot qualify a response", async () => {
   const workspace = createBridgeWorkspace();
-  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  bridgeRegistry(workspace);
   const codex = await startFakeCodexServer(workspace, { turns: [{ turnId: "unknown-status-turn", waitForRelease: true, mcpReply: true }] });
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app" });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const bridge = await startDemoBridge(workspace, { port: codex.port });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
   injectDiscordMessage(workspace, { id: "unknown-status-owner", content: "hello" });
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
   for (let attempt = 0; attempt < 100 && !fs.existsSync(contextFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
-  const reply = await runNodeEntrypoint(workspace, "scripts/discord-mcp-server.js", {
+  const reply = await runMcp(workspace, {
     env: bridgeChildEnv(workspace, config.params.value.env),
     input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "reply", arguments: { text: "visible", scope_token: config.params.value.env.DISCORD_REPLY_TOKEN } } }) + "\n",
   });
@@ -554,10 +681,10 @@ test("a Codex completion without confirmed success status cannot qualify a respo
 
 test("clearing an active Codex turn removes its stale scoped reply context", async () => {
   const workspace = createBridgeWorkspace();
-  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  bridgeRegistry(workspace);
   const codex = await startFakeCodexServer(workspace, { turns: [{ turnId: "old-turn", waitForRelease: true }] });
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app" });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const bridge = await startDemoBridge(workspace, { port: codex.port });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
   injectDiscordMessage(workspace, { id: "old-owner", content: "old task" });
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
@@ -571,20 +698,20 @@ test("clearing an active Codex turn removes its stale scoped reply context", asy
 
 test("a completion notification without a turn ID cannot end the active Codex exchange", async () => {
   const workspace = createBridgeWorkspace();
-  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  bridgeRegistry(workspace);
   const codex = await startFakeCodexServer(workspace, { turns: [{
     turnId: "identified-turn", status: "completed", waitForRelease: true, mcpReply: true,
     notificationsBeforeStart: [{ method: "turn/completed", params: { turn: { status: "completed" } } }],
   }] });
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app" });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const bridge = await startDemoBridge(workspace, { port: codex.port });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
   injectDiscordMessage(workspace, { id: "identified-owner", content: "answer" });
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
   await waitForState(workspace, (state) => state.fixtures.discord.deliveredMessages.some((message) => message.id === "identified-owner"));
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert.ok(fs.existsSync(contextFile), "unidentified completion must leave the active reply grant intact");
-  const reply = await runNodeEntrypoint(workspace, "scripts/discord-mcp-server.js", {
+  const reply = await runMcp(workspace, {
     env: bridgeChildEnv(workspace, config.params.value.env),
     input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "reply", arguments: { text: "answer", scope_token: config.params.value.env.DISCORD_REPLY_TOKEN } } }) + "\n",
   });
@@ -598,24 +725,26 @@ test("a completion notification without a turn ID cannot end the active Codex ex
 
 test("an owner reaction that starts a Codex turn keeps its reminder correlation", async () => {
   const workspace = createBridgeWorkspace();
-  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  bridgeRegistry(workspace);
   const codex = await startFakeCodexServer(workspace, {
     turns: [
       { turnId: "answer-turn", status: "completed", completedItem: { type: "agentMessage", text: "first answer" } },
       { turnId: "reaction-turn", status: "completed", completedItem: { type: "agentMessage", text: "reaction answer" } },
     ],
   });
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app", env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" } });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const bridge = await startDemoBridge(workspace, { port: codex.port, env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" } });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
   injectDiscordMessage(workspace, { id: "owner-question", content: "answer this" });
-  await waitForState(workspace, (state) => state.fixtures.discord.sends?.some((row) => row.content === "first answer"));
+  await waitForState(workspace, (state) => state.fixtures.discord.messages?.some((row) => row.content === "first answer" && row.webhookId === "fake-webhook-1"));
   for (let attempt = 0; attempt < 50; attempt++) {
     const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
     if (JSON.parse(result.stdout).events.some((event) => event.event_type === "turn_completed")) break;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  injectDiscordReaction(workspace, { id: "owner-thumbs", emoji: "👍", messageId: "bot-answer" });
-  await waitForState(workspace, (state) => state.fixtures.discord.sends?.some((row) => row.content === "reaction answer"));
+  // The first answer is the project's own webhook message.
+  injectDiscordReaction(workspace, { id: "owner-thumbs", emoji: "👍", messageId: "fake-message-1",
+    message: { author: { bot: true, id: "fake-webhook-1" }, webhookId: "fake-webhook-1", content: "first answer" } });
+  await waitForState(workspace, (state) => state.fixtures.discord.messages?.some((row) => row.content === "reaction answer" && row.webhookId === "fake-webhook-1"));
   let events = [];
   for (let attempt = 0; attempt < 50; attempt++) {
     const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
@@ -624,7 +753,7 @@ test("an owner reaction that starts a Codex turn keeps its reminder correlation"
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   const reaction = events.find((event) => event.event_type === "owner_activity" && event.activity_kind === "reaction");
-  assert.deepEqual([reaction.source_message_id, reaction.reaction_emoji], ["bot-answer", "👍"]);
+  assert.deepEqual([reaction.source_message_id, reaction.reaction_emoji], ["fake-message-1", "👍"]);
   // The reaction-started turn continues the owner's current interaction, so its
   // confirmed reply and completion can re-arm a reminder.
   const receipt = events.find((event) => event.event_type === "response_delivered" && event.provider_turn_id === "reaction-turn");
@@ -637,17 +766,17 @@ test("an owner reaction that starts a Codex turn keeps its reminder correlation"
 
 test("the automatic terminal retry keeps the owner's reminder correlation on its new turn", async () => {
   const workspace = createBridgeWorkspace();
-  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  bridgeRegistry(workspace);
   const codex = await startFakeCodexServer(workspace, {
     turns: [
       { turnId: "failed-turn", error: "stream disconnected before completion: response.failed event received" },
       { turnId: "retry-turn", status: "completed", completedItem: { type: "agentMessage", text: "Recovered response" } },
     ],
   });
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app", env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" } });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const bridge = await startDemoBridge(workspace, { port: codex.port, env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" } });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
   injectDiscordMessage(workspace, { id: "owner-retry", content: "recover this turn" });
-  await waitForState(workspace, (state) => state.fixtures.discord.sends?.some((row) => row.content === "Recovered response"));
+  await waitForState(workspace, (state) => state.fixtures.discord.messages?.some((row) => row.content === "Recovered response" && row.webhookId === "fake-webhook-1"));
   await bridge.waitForOutput(/Retrying terminal response\.failed turn once/, 5000);
   let events = [];
   for (let attempt = 0; attempt < 50; attempt++) {
@@ -667,12 +796,12 @@ test("the automatic terminal retry keeps the owner's reminder correlation on its
 
 test("a delivered scoped reply stays successful when its reminder receipt cannot be recorded", async () => {
   const workspace = createBridgeWorkspace();
-  writeRegistry(workspace, { discord_user_id: "allowed-user-id" });
+  bridgeRegistry(workspace);
   const codex = await startFakeCodexServer(workspace, {
     turns: [{ turnId: "answer-turn", status: "completed", waitForRelease: true, mcpReply: true }],
   });
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "assigned-app" });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const bridge = await startDemoBridge(workspace, { port: codex.port });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
   injectDiscordMessage(workspace, { id: "owner-message-1", content: "answer this" });
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
@@ -681,7 +810,7 @@ test("a delivered scoped reply stays successful when its reminder receipt cannot
   // Receipt storage fails locally after Discord has accepted the reply.
   const blocked = path.join(workspace.tmpDir, "receipts-are-a-file");
   fs.writeFileSync(blocked, "not a directory");
-  const reply = await runNodeEntrypoint(workspace, "scripts/discord-mcp-server.js", {
+  const reply = await runMcp(workspace, {
     env: bridgeChildEnv(workspace, { ...config.params.value.env, CCDM_REMINDER_RECEIPTS_DIR: blocked }),
     input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "reply", arguments: { text: "Here is the answer", scope_token: config.params.value.env.DISCORD_REPLY_TOKEN } } }) + "\n",
   });

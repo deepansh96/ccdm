@@ -33,8 +33,12 @@ export function bridgeChildEnv(workspace, extraEnv = {}) {
   };
 }
 
+// The Router's private state lives inside the Test Workspace; a short path
+// keeps the socket under the platform's Unix-socket length limit.
 export function createBridgeWorkspace(options = {}) {
-  const workspace = createWorkspace(options);
+  const base = createWorkspace(options);
+  const routerStateDir = path.join(base.tmpRoot, "router");
+  const workspace = Object.freeze({ ...base, routerStateDir, socketPath: path.join(routerStateDir, "router.sock") });
   overlayRoots.set(workspace, writeOverlay(workspace));
   return workspace;
 }
@@ -434,33 +438,6 @@ export async function startFakeCodexServer(workspace, options = {}) {
       markCodexServer(workspace, port, { ready: false });
     },
   };
-}
-
-export function startBridge(workspace, options = {}) {
-  const env = bridgeChildEnv(workspace, {
-    ...(options.allowedUserIds
-      ? { ALLOWED_USER_IDS: options.allowedUserIds.join(",") }
-      : { ALLOWED_USER_ID: options.allowedUserId ?? "allowed-user-id" }),
-    BOT_APP_ID: options.botAppId ?? "bot-app-id",
-    BOT_DISPLAY_NAME: options.botDisplayName ?? "bot2-alpha-codex",
-    BOT_TOKEN: options.botToken ?? "bot-token",
-    CHANNEL_ID: options.channelId ?? "channel-id",
-    GUILD_ID: options.guildId ?? "guild-id",
-    PROJECT_DIR: options.projectDir ?? workspace.repoDir,
-    ROOT_BOT_APP_ID: options.rootBotAppId ?? "root-bot-app-id",
-    WS_PORT: String(options.port),
-    ...(options.env ?? {}),
-  });
-  const command = [process.execPath, path.join(workspace.repoDir, "scripts/codex-bridge.js")];
-  const child = spawn(command[0], [command[1]], {
-    cwd: workspace.repoDir,
-    detached: true,
-    env,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const running = collectProcess(child, { command, cwd: workspace.repoDir, detached: true, env }, workspace);
-  registerTeardownCallback(() => running.stop());
-  return running;
 }
 
 export function injectDiscordMessage(workspace, message = {}) {

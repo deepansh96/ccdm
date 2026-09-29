@@ -38,15 +38,14 @@ fi
 find_codex_listener_pids() {
   local channel_id="$1"
   local ws_port="$2"
-  local bot_app_id="$3"
-  python3 - "$channel_id" "$ws_port" "$bot_app_id" <<'PY'
+  python3 - "$channel_id" "$ws_port" <<'PY'
 import os
 import re
 import shlex
 import subprocess
 import sys
 
-channel_id, ws_port, bot_app_id = sys.argv[1:4]
+channel_id, ws_port = sys.argv[1:3]
 try:
     ps = subprocess.check_output(
         ["ps", "axeww", "-o", "pid=,command="],
@@ -79,7 +78,7 @@ def is_codex_bridge(command: str) -> bool:
     return (
         exe == "node"
         and script.endswith("scripts/codex-bridge.js")
-        and (has_env(command, "CHANNEL_ID", channel_id) or has_env(command, "BOT_APP_ID", bot_app_id))
+        and has_env(command, "CHANNEL_ID", channel_id)
     )
 
 def is_codex_app_server(command: str) -> bool:
@@ -107,8 +106,7 @@ PY
 
 record_codex_pid() {
   local channel_id="$1"
-  local bot_app_id="$2"
-  python3 - "$REGISTRY" "$PROJECT" "$channel_id" "$bot_app_id" "$RESUME_THREAD_ID" <<'PY'
+  python3 - "$REGISTRY" "$PROJECT" "$channel_id" "$RESUME_THREAD_ID" <<'PY'
 import json
 import os
 import re
@@ -117,7 +115,7 @@ import subprocess
 import sys
 import time
 
-registry_path, project, channel_id, bot_app_id = sys.argv[1:5]
+registry_path, project, channel_id = sys.argv[1:4]
 
 def has_env(command: str, name: str, value: str) -> bool:
     env_re = re.compile(rf"""(?:^|\s){re.escape(name)}=(?:"([^"]*)"|'([^']*)'|([^\s]+))""")
@@ -142,7 +140,7 @@ def is_codex_bridge(command: str) -> bool:
     return (
         exe == "node"
         and script.endswith("scripts/codex-bridge.js")
-        and (has_env(command, "CHANNEL_ID", channel_id) or has_env(command, "BOT_APP_ID", bot_app_id))
+        and has_env(command, "CHANNEL_ID", channel_id)
     )
 
 def find_pid() -> int | None:
@@ -176,7 +174,7 @@ for _ in range(20):
 
 if not pid:
     print("Warning: started session, but could not find Codex bridge PID to record")
-    sys.exit(1 if sys.argv[5] else 0)
+    sys.exit(1 if sys.argv[4] else 0)
 
 with open(registry_path) as f:
     registry = json.load(f)
@@ -190,9 +188,10 @@ print(f"Recorded PID {pid}")
 PY
 }
 
-# Start a router-transport project: the bridge holds no Discord token. A fresh
-# launch key (which revokes the previous launch) lets the bridge say hello to
-# the Router; the PID is recorded only after that hello succeeds.
+# Every Codex project is served through the Router, whatever its registry
+# `transport` field says: the bridge holds no Discord token. A fresh launch key
+# (which revokes the previous launch) lets the bridge say hello to the Router;
+# the PID is recorded only after that hello succeeds.
 start_router_session() {
   local router_state="${CCDM_ROUTER_STATE_DIR:-$HOME/.local/state/ccdm/router}"
   local key_file="$router_state/keys/$PROJECT.key"
@@ -225,7 +224,7 @@ with os.fdopen(fd, "w") as f:
 os.replace(tmp, key_file)
 PY
 
-  tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' CCDM_CODEX_PROJECT='$PROJECT' CCDM_ROUTER_STATE_DIR='$router_state' CCDM_ROUTER_KEY_FILE='$key_file' CCDM_CHANNEL_READY_FILE='$ready_file' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$DISCORD_USER_IDS' GUILD_ID='$GUILD_ID'$AUDIO_TRANSCRIPTION_ENV$TEXT_REPLY_FALLBACK_ENV$CODEX_MODEL_ENV$CODEX_REASONING_ENV$CODEX_SERVICE_TIER_ENV node scripts/codex-bridge.js"
+  tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' CCDM_CODEX_PROJECT='$PROJECT' CCDM_ROUTER_STATE_DIR='$router_state' CCDM_ROUTER_KEY_FILE='$key_file' CCDM_CHANNEL_READY_FILE='$ready_file' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$DISCORD_USER_IDS'$AUDIO_TRANSCRIPTION_ENV$TEXT_REPLY_FALLBACK_ENV$CODEX_MODEL_ENV$CODEX_REASONING_ENV$CODEX_SERVICE_TIER_ENV node scripts/codex-bridge.js"
   echo "Started Codex Router bridge in tmux session '$SCREEN_NAME'"
 
   # The bridge reports its hello outcome once Codex is up and bootstrapped.
@@ -258,67 +257,51 @@ PY
     echo "Launch of '$PROJECT' failed; cleaning up" >&2
     tmux kill-session -t "=$SCREEN_NAME" 2>/dev/null || true
     local leftover
-    leftover="$(find_codex_listener_pids "$CHANNEL_ID" "$WS_PORT" "$BOT_APP_ID")"
+    leftover="$(find_codex_listener_pids "$CHANNEL_ID" "$WS_PORT")"
     # A listener may exit on its own between the sweep and the kill.
     if [[ -n "$leftover" ]]; then
       kill -TERM ${(f)leftover} 2>/dev/null || true
     fi
-    python3 - "$key_file" "$launch_dir" <<'PY'
+    python3 - "$key_file" "$launch_dir" "$REGISTRY" "$PROJECT" <<'PY'
+import json
 import shutil
 import sys
 from pathlib import Path
 
-key_file, launch_dir = sys.argv[1:3]
+key_file, launch_dir, registry_path, project = sys.argv[1:5]
 Path(key_file).unlink(missing_ok=True)
 shutil.rmtree(launch_dir, ignore_errors=True)
+# No listener survives a failed launch, so none is recorded.
+with open(registry_path) as f:
+    registry = json.load(f)
+registry["projects"][project]["pid"] = None
+registry["projects"][project]["session_id"] = None
+with open(registry_path, "w") as f:
+    json.dump(registry, f, indent=2)
+    f.write("\n")
 PY
     return 1
   fi
 
   echo "Attach with: tmux attach -t $SCREEN_NAME"
-  record_codex_pid "$CHANNEL_ID" "$BOT_APP_ID"
+  record_codex_pid "$CHANNEL_ID"
 }
 
-# Router projects have no pool bot, so their bot fields print as __NONE__.
-IFS=$'\t' read -r PATH_DIR STATE_DIR SCREEN_NAME BOT_TOKEN CHANNEL_ID WS_PORT DISCORD_USER_IDS GUILD_ID ROOT_BOT_APP_ID BOT_APP_ID BOT_ID BOT_DISPLAY_OVERRIDE TEXT_REPLY_FALLBACK_FLAG CODEX_MODEL_VALUE CODEX_REASONING_EFFORT_VALUE CODEX_SERVICE_TIER_VALUE TRANSPORT <<< "$(python3 -c "
-import base64, json, os, re
+IFS=$'\t' read -r PATH_DIR SCREEN_NAME CHANNEL_ID WS_PORT DISCORD_USER_IDS TEXT_REPLY_FALLBACK_FLAG CODEX_MODEL_VALUE CODEX_REASONING_EFFORT_VALUE CODEX_SERVICE_TIER_VALUE <<< "$(python3 -c "
+import json, os
 r = json.load(open('$REGISTRY'))
 p = r['projects']['$PROJECT']
-transport = 'router' if p.get('transport') == 'router' else 'pool'
-bot = {'state_dir': '__NONE__', 'token': '__NONE__', 'app_id': '__NONE__', 'id': '__NONE__'} if transport == 'router' else next(b for b in r['pool'] if b['id'] == p['bot_id'])
-root_bot_app_id = r.get('root_bot_app_id', '') or ('__NONE__' if transport == 'router' else '')
-root_env = os.path.join(os.path.expanduser(os.environ.get('ROOT_DISCORD_STATE_DIR') or '~/.claude/channels/discord'), '.env')
-if transport == 'pool' and os.path.exists(root_env):
-    text = open(root_env).read()
-    match = re.search(r'DISCORD_BOT_TOKEN=(\S+)', text)
-    if match:
-        token_id = match.group(1).split('.')[0]
-        try:
-            token_id += '=' * ((4 - len(token_id) % 4) % 4)
-            root_bot_app_id = base64.urlsafe_b64decode(token_id).decode()
-        except Exception:
-            pass
-if not root_bot_app_id:
-    raise ValueError('Root bot identity missing; configure root Discord state or root_bot_app_id')
 allowed_user_ids = [r['discord_user_id']] + list(p.get('guest_user_ids') or [])
 print('\t'.join([
     os.path.expanduser(p['path']),
-    os.path.expanduser(bot['state_dir']),
     p['screen_name'],
-    bot['token'],
     p['channel_id'],
     str(p.get('ws_port', 18300)),
     ','.join(dict.fromkeys(str(user_id) for user_id in allowed_user_ids if str(user_id))),
-    r['guild_id'],
-    root_bot_app_id,
-    bot['app_id'],
-    bot['id'],
-    (p.get('bot_display_name') or '__NONE__'),
     '1' if p.get('text_reply_fallback') is True else '__NONE__',
     (p.get('codex_model') or p.get('model') or '__NONE__'),
     (p.get('codex_reasoning_effort') or p.get('model_reasoning_effort') or '__NONE__'),
     (p.get('codex_service_tier') or p.get('service_tier') or '__NONE__'),
-    transport,
 ]))
 ")"
 
@@ -334,7 +317,7 @@ if tmux has-session -t "=$SCREEN_NAME" 2>/dev/null; then
   exit 0
 fi
 
-EXISTING_PIDS="$(find_codex_listener_pids "$CHANNEL_ID" "$WS_PORT" "$BOT_APP_ID")"
+EXISTING_PIDS="$(find_codex_listener_pids "$CHANNEL_ID" "$WS_PORT")"
 if [[ -n "$EXISTING_PIDS" ]]; then
   echo "Refusing to start '$PROJECT': existing Codex Discord bridge process(es) already use channel $CHANNEL_ID or port $WS_PORT:"
   echo "$EXISTING_PIDS" | sed 's/^/  /'
@@ -374,14 +357,10 @@ if os.path.exists(config_path):
         f.writelines(result)
 PY
 
-# Optional per-project display name override (registry "bot_display_name").
-# Empty/absent -> default "<bot_id>-<project>-codex".
-[[ "$BOT_DISPLAY_OVERRIDE" == "__NONE__" ]] && BOT_DISPLAY_OVERRIDE=""
 [[ "$TEXT_REPLY_FALLBACK_FLAG" == "__NONE__" ]] && TEXT_REPLY_FALLBACK_FLAG=""
 [[ "$CODEX_MODEL_VALUE" == "__NONE__" ]] && CODEX_MODEL_VALUE=""
 [[ "$CODEX_REASONING_EFFORT_VALUE" == "__NONE__" ]] && CODEX_REASONING_EFFORT_VALUE=""
 [[ "$CODEX_SERVICE_TIER_VALUE" == "__NONE__" ]] && CODEX_SERVICE_TIER_VALUE="default"
-BOT_DISPLAY_NAME="${BOT_DISPLAY_OVERRIDE:-${BOT_ID}-${PROJECT}-codex}"
 AUDIO_TRANSCRIPTION_ENV=""
 TRANSCRIBE_AUDIO_FLAG="${CODEX_BRIDGE_TRANSCRIBE_AUDIO:-${USE_AUDIO_TRANSCRIPTION_IN_BRIDGE:-}}"
 if [[ -n "$TRANSCRIBE_AUDIO_FLAG" ]]; then
@@ -401,56 +380,4 @@ if [[ -n "$CODEX_REASONING_EFFORT_VALUE" ]]; then
 fi
 CODEX_SERVICE_TIER_ENV=" CODEX_SERVICE_TIER='${CODEX_SERVICE_TIER_VALUE}' CODEX_RESUME_THREAD_ID='${RESUME_THREAD_ID}'"
 
-if [[ "$TRANSPORT" == "router" ]]; then
-  start_router_session
-  exit $?
-fi
-
-# Each resume attempt gets a private signal, so old launches cannot mark it ready.
-STARTUP_READY_DIR=""
-STARTUP_READY_FILE=""
-STARTUP_PENDING=0
-cleanup_startup() {
-  if (( STARTUP_PENDING )); then
-    "$SCRIPT_DIR/stop-session.sh" "$PROJECT"
-  fi
-  if [[ -n "$STARTUP_READY_DIR" ]]; then
-    python3 - "$STARTUP_READY_DIR" <<'PY'
-import shutil, sys
-shutil.rmtree(sys.argv[1], ignore_errors=True)
-PY
-  fi
-}
-if [[ -n "$RESUME_THREAD_ID" ]]; then
-  STARTUP_READY_DIR="$(python3 -c 'import tempfile; print(tempfile.mkdtemp(prefix="ccdm-codex-start-"))')"
-  STARTUP_READY_FILE="$STARTUP_READY_DIR/ready"
-  trap cleanup_startup EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM HUP
-fi
-STARTUP_READY_ENV=" CODEX_STARTUP_READY_FILE=$(python3 -c 'import shlex, sys; print(shlex.quote(sys.argv[1]))' "$STARTUP_READY_FILE")"
-
-tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' BOT_TOKEN='$BOT_TOKEN' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$DISCORD_USER_IDS' GUILD_ID='$GUILD_ID' ROOT_BOT_APP_ID='$ROOT_BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' BOT_DISPLAY_NAME='$BOT_DISPLAY_NAME'$AUDIO_TRANSCRIPTION_ENV$TEXT_REPLY_FALLBACK_ENV$CODEX_MODEL_ENV$CODEX_REASONING_ENV$CODEX_SERVICE_TIER_ENV$STARTUP_READY_ENV node scripts/codex-bridge.js"
-if [[ -n "$RESUME_THREAD_ID" ]]; then
-  STARTUP_PENDING=1
-  if ! python3 - "$STARTUP_READY_FILE" "$SCREEN_NAME" <<'PY'
-import pathlib, subprocess, sys, time
-ready_file, screen_name = sys.argv[1:]
-deadline = time.monotonic() + 60
-while time.monotonic() < deadline:
-    if subprocess.run(["tmux", "has-session", "-t", "=" + screen_name],
-                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
-        sys.exit("Codex resume failed: bridge exited before becoming ready")
-    if pathlib.Path(ready_file).is_file():
-        sys.exit(0)
-    time.sleep(0.2)
-sys.exit("Codex resume failed: timed out waiting for listener readiness")
-PY
-  then
-    exit 1
-  fi
-fi
-record_codex_pid "$CHANNEL_ID" "$BOT_APP_ID"
-STARTUP_PENDING=0
-echo "Started Codex bridge in tmux session '$SCREEN_NAME'"
-echo "Attach with: tmux attach -t $SCREEN_NAME"
+start_router_session

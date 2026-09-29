@@ -5,19 +5,18 @@ const { execFile } = require("child_process");
 const { createHmac, timingSafeEqual } = require("crypto");
 const { promisify } = require("util");
 const path = require("path");
-const { writeFile, mkdir, mkdtemp, stat, readFile } = require("fs/promises");
-const { createReadStream } = require("fs");
+const { writeFile, mkdir, mkdtemp, readFile } = require("fs/promises");
 const { tmpdir } = require("os");
 const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
 
 const execFileAsync = promisify(execFile);
 const EXPORT_SCRIPT = path.resolve(__dirname, "export-discord-range.js");
-const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const DISCORD_REPLY_TOKEN = process.env.DISCORD_REPLY_TOKEN;
-// Claude sessions get replies and writes from the official plugin; this mode
-// adds only the channel-scoped read tools that plugin lacks.
+// Claude pool sessions get replies and writes from the official plugin; this
+// mode adds only the channel-scoped read tools that plugin lacks, reading the
+// bot token from its state directory.
 const READ_ONLY = ["1", "true", "yes", "on"].includes(
   (process.env.DISCORD_MCP_EXPORT_ONLY || "").toLowerCase()
 );
@@ -25,7 +24,6 @@ const READ_ONLY_TOOLS = new Set(["read_last_x_messages_in_channel", "export_mess
 const DISCORD_CHANNEL_OVERRIDE = ["1", "true", "yes", "on"].includes(
   (process.env.DISCORD_CHANNEL_OVERRIDE || "").toLowerCase()
 );
-const DISCORD_ACCESS_FILE = process.env.DISCORD_ACCESS_FILE;
 const DISCORD_CHANNEL_SCOPE_FILE = process.env.DISCORD_CHANNEL_SCOPE_FILE;
 const DISCORD_CHANNEL_SCOPE_SECRET = process.env.DISCORD_CHANNEL_SCOPE_SECRET;
 const DISCORD_GLOBAL_USER_IDS = new Set(
@@ -34,17 +32,17 @@ const DISCORD_GLOBAL_USER_IDS = new Set(
     .map((id) => id.trim())
     .filter(Boolean)
 );
-// Router backend (a router-transport Codex project): the tools are Router
-// operations in this project's channel, reached with the launch key file.
-// No Discord token is configured. For root Codex (`CCDM_ROUTER_ROLE=root`)
+// Router backend (every Codex session): the tools are Router operations in
+// this project's channel, reached with the launch key file. No Discord token
+// is configured. For root Codex (`CCDM_ROUTER_ROLE=root`)
 // they act as root in the channel each call names; the Router enforces root's
 // channel scope, and the turn's channel grant still applies.
 const ROUTER_KEY_FILE = process.env.CCDM_ROUTER_KEY_FILE;
 const ROUTER_ROOT = Boolean(ROUTER_KEY_FILE) && process.env.CCDM_ROUTER_ROLE === "root";
 const ROUTER_PROJECT = process.env.CCDM_CODEX_PROJECT;
 
-if (ROUTER_KEY_FILE ? (!ROUTER_ROOT && !ROUTER_PROJECT) || !CHANNEL_ID : (!BOT_TOKEN && !READ_ONLY) || !CHANNEL_ID) {
-  process.stderr.write(`Missing ${ROUTER_KEY_FILE ? "CCDM_CODEX_PROJECT or CHANNEL_ID" : READ_ONLY ? "CHANNEL_ID" : "BOT_TOKEN or CHANNEL_ID"}\n`);
+if (ROUTER_KEY_FILE ? (!ROUTER_ROOT && !ROUTER_PROJECT) || !CHANNEL_ID : !READ_ONLY || !CHANNEL_ID) {
+  process.stderr.write(`Missing ${ROUTER_KEY_FILE ? "CCDM_CODEX_PROJECT or CHANNEL_ID" : READ_ONLY ? "CHANNEL_ID" : "CCDM_ROUTER_KEY_FILE or CHANNEL_ID"}\n`);
   process.exit(1);
 }
 
@@ -62,7 +60,6 @@ function makeError(id, code, message) {
 // Read-only configs carry no token; like the range exporter, read it from the
 // bot's ignored state .env so the generated MCP config stays secret-free.
 async function readToken() {
-  if (BOT_TOKEN) return BOT_TOKEN;
   if (process.env.DISCORD_STATE_DIR) {
     try {
       const env = await readFile(path.join(process.env.DISCORD_STATE_DIR, ".env"), "utf8");
@@ -72,7 +69,7 @@ async function readToken() {
       if (error.code !== "ENOENT") throw error;
     }
   }
-  throw new Error("No bot token found; set BOT_TOKEN or DISCORD_STATE_DIR");
+  throw new Error("No bot token found; set DISCORD_STATE_DIR");
 }
 
 async function discordGet(endpoint, retryRateLimits = false) {
@@ -95,96 +92,6 @@ async function discordGet(endpoint, retryRateLimits = false) {
     }
     await new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
   }
-}
-
-async function discordPost(endpoint, body) {
-  const res = await fetch(`${API_BASE}${endpoint}`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bot ${BOT_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Discord API ${res.status}: ${text}`);
-  }
-  return res.json();
-}
-
-async function discordPatch(endpoint, body) {
-  const res = await fetch(`${API_BASE}${endpoint}`, {
-    method: "PATCH",
-    headers: {
-      Authorization: `Bot ${BOT_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Discord API ${res.status}: ${text}`);
-  }
-  return res.json();
-}
-
-async function discordPut(endpoint) {
-  const res = await fetch(`${API_BASE}${endpoint}`, {
-    method: "PUT",
-    headers: { Authorization: `Bot ${BOT_TOKEN}` },
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Discord API ${res.status}: ${text}`);
-  }
-  return res.status === 204 ? {} : res.json();
-}
-
-async function sendMessageWithFiles(channelId, content, files, replyTo) {
-  for (const f of files) {
-    await stat(f);
-  }
-
-  const FormData = (await import("form-data")).default;
-  const form = new FormData();
-
-  const payload = { content: content || "" };
-  if (replyTo) {
-    payload.message_reference = { message_id: replyTo };
-  }
-  form.append("payload_json", JSON.stringify(payload));
-
-  for (let i = 0; i < files.length; i++) {
-    const filePath = files[i];
-    const filename = path.basename(filePath);
-    form.append(`files[${i}]`, createReadStream(filePath), { filename });
-  }
-
-  const res = await new Promise((resolve, reject) => {
-    form.submit(
-      {
-        protocol: "https:",
-        host: "discord.com",
-        path: `/api/v10/channels/${channelId}/messages`,
-        method: "POST",
-        headers: { Authorization: `Bot ${BOT_TOKEN}` },
-      },
-      (err, response) => {
-        if (err) return reject(err);
-        let data = "";
-        response.on("data", (chunk) => (data += chunk));
-        response.on("end", () => {
-          if (response.statusCode >= 400) {
-            reject(new Error(`Discord API ${response.statusCode}: ${data}`));
-          } else {
-            resolve(JSON.parse(data));
-          }
-        });
-      }
-    );
-  });
-  return res;
 }
 
 const scopeTokenProperty = {
@@ -237,8 +144,8 @@ async function targetChannelId(args) {
   if (!args.channel_id) {
     throw new Error("channel_id is required in root multi-channel mode");
   }
-  if (!DISCORD_ACCESS_FILE && !ROUTER_ROOT) {
-    throw new Error("Discord access file is required in root multi-channel mode");
+  if (!ROUTER_ROOT) {
+    throw new Error("Root multi-channel mode needs the Router root role");
   }
   if (!DISCORD_CHANNEL_SCOPE_FILE || !DISCORD_CHANNEL_SCOPE_SECRET) {
     throw new Error("Discord channel scope is required in root multi-channel mode");
@@ -264,26 +171,8 @@ async function targetChannelId(args) {
   } catch {
     throw new Error("Discord channel scope is missing, expired, or invalid");
   }
-  if (ROUTER_ROOT) {
-    if (!DISCORD_GLOBAL_USER_IDS.has(String(scope.author_id)) && args.channel_id !== scope.channel_id) {
-      throw new Error(`Discord channel ${args.channel_id} is not allowed for this message`);
-    }
-    return args.channel_id;
-  }
-  const access = JSON.parse(await readFile(DISCORD_ACCESS_FILE, "utf8"));
-  if (!Object.hasOwn(access.groups || {}, args.channel_id)) {
-    throw new Error(`Discord channel ${args.channel_id} is not allowed`);
-  }
-  const globalUsers = new Set([
-    ...DISCORD_GLOBAL_USER_IDS,
-    ...(access.allowFrom || []).map(String),
-  ]);
-  if (!globalUsers.has(String(scope.author_id))) {
-    const sourceConfig = access.groups?.[scope.channel_id];
-    const sourceUsers = new Set((sourceConfig?.allowFrom || []).map(String));
-    if (!sourceUsers.has(String(scope.author_id)) || args.channel_id !== scope.channel_id) {
-      throw new Error(`Discord channel ${args.channel_id} is not allowed for this message`);
-    }
+  if (!DISCORD_GLOBAL_USER_IDS.has(String(scope.author_id)) && args.channel_id !== scope.channel_id) {
+    throw new Error(`Discord channel ${args.channel_id} is not allowed for this message`);
   }
   return args.channel_id;
 }
@@ -543,158 +432,57 @@ async function handleRouterToolCall(name, args) {
 
 async function handleToolCall(name, args) {
   if (ROUTER_KEY_FILE) return handleRouterToolCall(name, args);
-  if (READ_ONLY && !READ_ONLY_TOOLS.has(name)) {
+  if (!READ_ONLY_TOOLS.has(name)) {
     throw new Error(`Tool unavailable in read-only mode: ${name}`);
   }
+  const channelId = await targetChannelId(args);
 
-  switch (name) {
-    case "reply": {
-      const { text, files, reply_to, scope_token, conversation_disposition } = args;
-      requireScopeToken(scope_token);
-      const channelId = await targetChannelId(args);
-      if (conversation_disposition && !["progress", "input-needed"].includes(conversation_disposition)) {
-        throw new Error("Unsupported conversation disposition");
-      }
-      const reminderContext = await reminderAdapter.readActiveContext(channelId);
-      let result;
-      if (files && files.length > 0) {
-        result = await sendMessageWithFiles(channelId, text, files, reply_to);
-      } else {
-        const body = { content: text || "" };
-        if (reply_to) {
-          body.message_reference = { message_id: reply_to };
-        }
-        result = await discordPost(`/channels/${channelId}/messages`, body);
-      }
-      if (reminderContext) {
-        // Discord already accepted the reply. A local receipt failure only
-        // leaves this reply unable to qualify a reminder; reporting it as a
-        // tool error would invite a duplicate send.
-        await reminderAdapter.recordDeliveredReply(reminderContext, result.id, conversation_disposition)
-          .catch((error) => {
-            process.stderr.write(`Discord MCP: reply ${result.id} was delivered but its Conversation Reminder receipt was not recorded: ${error.message}\n`);
-          });
-      }
-      return `sent (id: ${result.id})`;
+  if (name === "read_last_x_messages_in_channel") {
+    const limit = args.count;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 10000) {
+      throw new Error("count must be an integer between 1 and 10,000");
     }
-
-    case "edit_message": {
-      const { message_id, text, scope_token } = args;
-      requireScopeToken(scope_token);
-      const channelId = await targetChannelId(args);
-      await discordPatch(`/channels/${channelId}/messages/${message_id}`, {
-        content: text,
-      });
-      return `edited (id: ${message_id})`;
-    }
-
-    case "react": {
-      const { message_id, emoji, scope_token } = args;
-      requireScopeToken(scope_token);
-      const channelId = await targetChannelId(args);
-      const encoded = encodeURIComponent(emoji);
-      await discordPut(
-        `/channels/${channelId}/messages/${message_id}/reactions/${encoded}/@me`
+    const messages = [];
+    let before;
+    // ponytail: 10,000-message cap matches export; raise only if MCP payload limits prove safe.
+    while (messages.length < limit) {
+      const pageLimit = Math.min(limit - messages.length, 100);
+      const page = await discordGet(
+        `/channels/${channelId}/messages?limit=${pageLimit}${before ? `&before=${before}` : ""}`,
+        true
       );
-      return `reacted with ${emoji}`;
+      messages.push(...page);
+      if (page.length < pageLimit) break;
+      before = page.at(-1).id;
     }
-
-    case "fetch_messages":
-    case "read_last_x_messages_in_channel": {
-      const channelId = await targetChannelId(args);
-      const limit = name === "read_last_x_messages_in_channel"
-        ? args.count
-        : Math.min(args.limit || 20, 100);
-      if (
-        name === "read_last_x_messages_in_channel"
-        && (!Number.isInteger(limit) || limit < 1 || limit > 10000)
-      ) {
-        throw new Error("count must be an integer between 1 and 10,000");
-      }
-      let messages;
-      if (name === "read_last_x_messages_in_channel") {
-        messages = [];
-        let before;
-        // ponytail: 10,000-message cap matches export; raise only if MCP payload limits prove safe.
-        while (messages.length < limit) {
-          const pageLimit = Math.min(limit - messages.length, 100);
-          const page = await discordGet(
-            `/channels/${channelId}/messages?limit=${pageLimit}${before ? `&before=${before}` : ""}`,
-            true
-          );
-          messages.push(...page);
-          if (page.length < pageLimit) break;
-          before = page.at(-1).id;
-        }
-      } else {
-        messages = await discordGet(
-          `/channels/${channelId}/messages?limit=${limit}`
-        );
-      }
-      messages.reverse();
-      const formatted = messages.map((m) => {
-        const ts = m.timestamp;
-        const author = m.author.bot ? "me" : m.author.username;
-        const attachments = m.attachments.length
-          ? ` +${m.attachments.length}att`
-          : "";
-        return `[${ts}] ${author}: ${m.content}${attachments} (id: ${m.id})`;
-      });
-      const output = formatted.join("\n");
-      if (name === "read_last_x_messages_in_channel" && limit > 100) {
-        const directory = await mkdtemp(path.join(tmpdir(), "discord-recent-"));
-        const transcript = path.join(directory, "messages.txt");
-        await writeFile(transcript, `${output}\n`, { mode: 0o600 });
-        return `saved ${messages.length} messages to ${transcript}`;
-      }
-      return output;
+    messages.reverse();
+    const output = messages.map((m) => {
+      const author = m.author.bot ? "me" : m.author.username;
+      const attachments = m.attachments.length ? ` +${m.attachments.length}att` : "";
+      return `[${m.timestamp}] ${author}: ${m.content}${attachments} (id: ${m.id})`;
+    }).join("\n");
+    if (limit > 100) {
+      const directory = await mkdtemp(path.join(tmpdir(), "discord-recent-"));
+      const transcript = path.join(directory, "messages.txt");
+      await writeFile(transcript, `${output}\n`, { mode: 0o600 });
+      return `saved ${messages.length} messages to ${transcript}`;
     }
+    return output;
+  }
 
-    case "export_message_range": {
-      const channelId = await targetChannelId(args);
-      const scriptArgs = [
-        EXPORT_SCRIPT,
-        channelId,
-        args.start_message_id,
-        ...(args.end_message_id ? [args.end_message_id] : []),
-      ];
-      try {
-        const { stdout } = await execFileAsync(process.execPath, scriptArgs, {
-          env: process.env,
-        });
-        return `exported to ${stdout.trim()}`;
-      } catch (error) {
-        throw new Error((error.stderr || error.message).trim());
-      }
-    }
-
-    case "download_attachment": {
-      const { message_id, attachment_index = 0, save_dir } = args;
-      const channelId = await targetChannelId(args);
-      const msg = await discordGet(
-        `/channels/${channelId}/messages/${message_id}`
-      );
-      if (!msg.attachments || msg.attachments.length === 0) {
-        throw new Error("Message has no attachments");
-      }
-      if (attachment_index >= msg.attachments.length) {
-        throw new Error(
-          `Attachment index ${attachment_index} out of range (message has ${msg.attachments.length})`
-        );
-      }
-      const att = msg.attachments[attachment_index];
-      const dir = save_dir || process.cwd();
-      await mkdir(dir, { recursive: true });
-      const filePath = path.join(dir, att.filename);
-      const res = await fetch(att.url);
-      if (!res.ok) throw new Error(`Failed to download: ${res.status}`);
-      const buf = Buffer.from(await res.arrayBuffer());
-      await writeFile(filePath, buf);
-      return filePath;
-    }
-
-    default:
-      throw new Error(`Unknown tool: ${name}`);
+  const scriptArgs = [
+    EXPORT_SCRIPT,
+    channelId,
+    args.start_message_id,
+    ...(args.end_message_id ? [args.end_message_id] : []),
+  ];
+  try {
+    const { stdout } = await execFileAsync(process.execPath, scriptArgs, {
+      env: process.env,
+    });
+    return `exported to ${stdout.trim()}`;
+  } catch (error) {
+    throw new Error((error.stderr || error.message).trim());
   }
 }
 

@@ -47,4 +47,4 @@ Project-specific user and channel access exceptions live in ignored `CLAUDE.loca
 
 ## Routing Rules
 
-Project bots ignore unrelated channels. Codex bridges ignore root-bot mentions to prevent duplicate responses. The root bot handles management commands and Claude slash-command relay; it must not forward those relay commands as ordinary agent prompts.
+Project bots ignore unrelated channels. Codex sessions never receive root-bot mentions: the Router delivers them to root only, preventing duplicate responses. The root bot handles management commands and Claude slash-command relay; it must not forward those relay commands as ordinary agent prompts.

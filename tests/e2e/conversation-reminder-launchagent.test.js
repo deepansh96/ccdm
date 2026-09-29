@@ -5,9 +5,10 @@ import test from "node:test";
 
 import { spawn, spawnSync } from "node:child_process";
 
-import { createWorkspace, runNodeEntrypoint, runScript } from "./support/runner.js";
+import { createWorkspace, runScript } from "./support/runner.js";
+import { startBridge } from "./support/router.js";
 import {
-  bridgeChildEnv, createBridgeWorkspace, injectDiscordMessage, startBridge, startFakeCodexServer, waitForState,
+  bridgeChildEnv, createBridgeWorkspace, injectDiscordMessage, startFakeCodexServer, waitForState,
 } from "./support/bridge.js";
 import { readState, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
@@ -330,31 +331,37 @@ test("the reminder supervisor leaves the Usage Stats Poster service, storage, an
   assert.deepEqual(readState(workspace.stateDir).fixtures.discord.sends, []);
 });
 
-// Both providers in one registry, each with its own assigned bot and channel.
+// Both providers in one registry, each with its own channel: the Claude
+// project has its assigned pool bot, and the Codex project is served through
+// the Router, which gives it webhook `fake-webhook-1` when its bridge starts.
 function setupBothProviders(workspace) {
   const claudeState = path.join(workspace.homeDir, ".claude", "channels", "discord-claude-demo");
   fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), JSON.stringify({
     discord_user_id: "owner-id", guild_id: "guild-id", root_bot_app_id: "root-app",
     pool: [
       { id: "claude-bot", app_id: "claude-app", token: "fixture-claude-token", state_dir: claudeState },
-      { id: "codex-bot", app_id: "codex-app", token: "fixture-codex-token" },
     ],
     projects: {
       "claude-demo": { type: "claude", path: workspace.repoDir, bot_id: "claude-bot", channel_id: "claude-channel",
         assignment_generation: "gen-claude", screen_name: "claude-demo_claude" },
-      "codex-demo": { type: "codex", path: workspace.repoDir, bot_id: "codex-bot", channel_id: "codex-channel",
+      "codex-demo": { type: "codex", transport: "router", path: workspace.repoDir, channel_id: "codex-channel",
         assignment_generation: "gen-codex", screen_name: "codex-demo_codex" },
     },
   }), { mode: 0o600 });
   const rootState = path.join(workspace.homeDir, "root-discord");
   fs.mkdirSync(rootState, { recursive: true });
   fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  // The Router logs in as the same root bot, from root's default Discord state.
+  const routerRootState = path.join(workspace.homeDir, ".claude", "channels", "discord");
+  fs.mkdirSync(routerRootState, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(routerRootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
   const clockFile = path.join(workspace.tmpDir, "reminder-clock");
   return {
     rootState, clockFile,
     stateDir: path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders"),
     env: { ROOT_DISCORD_STATE_DIR: rootState, CCDM_REMINDER_NODE: process.execPath },
-    extraEnv: { CCDM_REMINDER_CLOCK_FILE: clockFile },
+    // The worker observes the Codex channel through the Router.
+    extraEnv: { CCDM_REMINDER_CLOCK_FILE: clockFile, CCDM_ROUTER_STATE_DIR: workspace.routerStateDir },
     setClock: value => fs.writeFileSync(clockFile, value),
   };
 }
@@ -433,15 +440,49 @@ process.stdin.on("data", chunk => {
   return { stop };
 }
 
-// One Codex turn through the real bridge, a fake Codex app-server, and the
-// scoped Discord MCP reply tool; the bridge is stopped afterwards.
-async function codexTurn(workspace, messageId) {
+// The Codex bridge through the Router and a fake Codex app-server. Starting it
+// starts the Router the reminder worker observes the Codex channel through,
+// so it runs before the worker's first discovery.
+async function startCodexBridge(workspace) {
   const codex = await startFakeCodexServer(workspace, {
+    channelId: "codex-channel",
     turns: [{ turnId: "codex-turn", status: "completed", waitForRelease: true, mcpReply: true }],
   });
-  const bridge = startBridge(workspace, { port: codex.port, botAppId: "codex-app", botToken: "fixture-codex-token",
+  const bridge = await startBridge(workspace, { project: "codex-demo", port: codex.port,
     allowedUserId: "owner-id", channelId: "codex-channel" });
-  await bridge.waitForOutput(/Listening in #channel-codex-channel/, 7000);
+  await bridge.waitForOutput(/Listening in #codex-demo/, 7000);
+  return { codex, bridge };
+}
+
+// The bridge's scoped MCP server, as Codex runs it: a Router client that exits
+// when its stdin closes, so stdin stays open until the tool call is answered.
+async function runMcp(workspace, { env, input, timeoutMs = 10000 }) {
+  const child = spawn(process.execPath, [path.join(workspace.repoDir, "scripts/discord-mcp-server.js")], {
+    cwd: workspace.repoDir, detached: true, env, stdio: ["pipe", "pipe", "pipe"],
+  });
+  registerTeardownCallback(() => { try { process.kill(-child.pid, "SIGKILL"); } catch {} });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  const closed = new Promise(resolve => child.on("close", resolve));
+  const answered = new Promise(resolve => child.stdout.on("data", chunk => {
+    stdout += chunk;
+    if (stdout.includes("\n")) resolve();
+  }));
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  child.stdin.write(input);
+  const timer = setTimeout(() => child.stdin.end(), timeoutMs);
+  await Promise.race([answered, closed]);
+  clearTimeout(timer);
+  child.stdin.end();
+  const exitCode = await closed;
+  return { exitCode, stdout, stderr };
+}
+
+// One Codex turn through the real bridge, a fake Codex app-server, and the
+// scoped Discord MCP reply tool; the bridge is stopped afterwards.
+async function codexTurn(workspace, { codex, bridge }, messageId) {
   injectDiscordMessage(workspace, { id: messageId, channelId: "codex-channel", author: { id: "owner-id" },
     content: "answer this" });
   const config = await (async () => {
@@ -453,7 +494,7 @@ async function codexTurn(workspace, messageId) {
     }
     throw new Error(`Codex turn never started: ${bridge.stdout}\n${bridge.stderr}`);
   })();
-  const reply = await runNodeEntrypoint(workspace, "scripts/discord-mcp-server.js", {
+  const reply = await runMcp(workspace, {
     env: bridgeChildEnv(workspace, config.params.value.env),
     input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "reply",
       arguments: { text: "Here is the answer", scope_token: config.params.value.env.DISCORD_REPLY_TOKEN } } }) + "\n",
@@ -468,6 +509,21 @@ async function codexTurn(workspace, messageId) {
   }
   await bridge.stop();
   return { answerId, appServerInvocations: readState(workspace.stateDir).fixtures.codex.appServerInvocations.length };
+}
+
+// Discord sends every event to every gateway, but the fake gateway hands each
+// injected message to one logged-in client. With both the Router and the
+// worker's own Gateway (for the pool Claude channel) logged in, a message is
+// sent again until the client it is for has handled it; the other ignores it.
+async function injectUntilHandled(workspace, context, message, handled) {
+  for (let attempt = 0; attempt < 12; attempt++) {
+    injectDiscordMessage(workspace, message);
+    for (let poll = 0; poll < 20; poll++) {
+      if (handled(await service(workspace, context, "status"))) return;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+  }
+  throw new Error(`${message.id} was never handled: ${JSON.stringify(await service(workspace, context, "status"))}`);
 }
 
 async function waitForStatus(workspace, context, predicate) {
@@ -491,7 +547,10 @@ test("Claude and Codex complete reply, reminder, and reply or close through the 
   const seed = readState(workspace.stateDir);
   seed.fixtures.discord.history = { "claude-channel": [], "codex-channel": [] };
   writeState(seed, workspace.stateDir);
-  const installed = await install(workspace, context);
+  // The installer's preflight needs the Router up and the Codex webhook made.
+  const codexBridge = await startCodexBridge(workspace);
+  const installed = await install(workspace, context, {
+    env: { ...context.env, CCDM_ROUTER_STATE_DIR: workspace.routerStateDir }, timeoutMs: 30000 });
   assert.equal(installed.exitCode, 0, installed.stderr || installed.stdout);
 
   // First enablement: the Claude launch records its verified transport, then the
@@ -509,14 +568,17 @@ test("Claude and Codex complete reply, reminder, and reply or close through the 
   // turn and keeps running; the Codex bridge is stopped after its turn.
   await warmup.stop();
   const claude = await claudeTurn(workspace, context, { messageId: "claude-question", answerId: "claude-answer" });
-  const codex = await codexTurn(workspace, "codex-question");
+  const codex = await codexTurn(workspace, codexBridge, "codex-question");
   const history = readState(workspace.stateDir);
   history.fixtures.discord.history["claude-channel"].unshift(
     historyMessage("claude-answer", at(0), "claude-app"), historyMessage("claude-question", at(-1000), "owner-id"),
     historyMessage("claude-warmup-answer", at(-5 * 60000), "claude-app"),
     historyMessage("claude-warmup", at(-6 * 60000), "owner-id"));
   history.fixtures.discord.history["codex-channel"].unshift(
-    historyMessage(codex.answerId, at(0), "codex-app"), historyMessage("codex-question", at(-1000), "owner-id"));
+    // The Codex answer is the project's own webhook message.
+    { ...historyMessage(codex.answerId, at(0), "fake-webhook-1"), author: { id: "fake-webhook-1", bot: true },
+      webhook_id: "fake-webhook-1" },
+    historyMessage("codex-question", at(-1000), "owner-id"));
   writeState(history, workspace.stateDir);
 
   // Re-enable reconciles before any send; at +30 minutes nothing is due yet.
@@ -534,14 +596,16 @@ test("Claude and Codex complete reply, reminder, and reply or close through the 
   context.setClock(at(61 * 60000));
   const sent = await waitForState(workspace, state => reminders(state).length === 2, 20000);
   assert.deepEqual(reminders(sent).map(row => [row.channelId, row.authorization]).sort(), [
-    ["claude-channel", "Bot fixture-claude-token"], ["codex-channel", "Bot fixture-codex-token"]]);
+    ["claude-channel", "Bot fixture-claude-token"], ["codex-channel", "Bot fixture-root-token"]]);
 
   // The owner replies to Claude and closes Codex; the root observer handles both
   // without starting either coding agent.
-  injectDiscordMessage(workspace, { id: "claude-reply", channelId: "claude-channel", author: { id: "owner-id" },
-    content: "Option A" });
-  injectDiscordMessage(workspace, { id: "codex-close", channelId: "codex-channel", author: { id: "owner-id" },
-    content: "/close" });
+  await injectUntilHandled(workspace, context, { id: "claude-reply", channelId: "claude-channel",
+    author: { id: "owner-id" }, content: "Option A" },
+  current => current.conversations["claude-demo"].last_ack_message_id === "claude-reply");
+  await injectUntilHandled(workspace, context, { id: "codex-close", channelId: "codex-channel",
+    author: { id: "owner-id" }, content: "/close" },
+  current => current.conversations["codex-demo"].state === "closed");
   const settled = await waitForStatus(workspace, context, current =>
     current.conversations["claude-demo"].state === "open-paused" &&
     current.conversations["codex-demo"].state === "closed" &&
@@ -553,7 +617,7 @@ test("Claude and Codex complete reply, reminder, and reply or close through the 
   assert.deepEqual(acknowledged.fixtures.discord.deletes.map(row => row.messageId).sort(),
     reminders(sent).map(row => row.id).sort());
   const check = acknowledged.fixtures.discord.reactions.find(row => row.messageId === "codex-close");
-  assert.deepEqual([decodeURIComponent(check.emoji), check.authorization], ["✅", "Bot fixture-codex-token"]);
+  assert.deepEqual([decodeURIComponent(check.emoji), check.authorization], ["✅", "Bot fixture-root-token"]);
   assert.equal(acknowledged.fixtures.codex.appServerInvocations.length, codex.appServerInvocations);
 
   // A supervised restart preserves the closure and the paused conversation.

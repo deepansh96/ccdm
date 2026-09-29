@@ -60,6 +60,30 @@ test("start-codex-session launches a router Codex project whose bridge says hell
   assert.equal(typeof readRegistry(workspace).projects.demo.pid, "number");
 });
 
+test("a Codex project with no transport field launches through the Router and replies as its webhook", async () => {
+  const workspace = codexRouterWorkspace(0);
+  const registryFile = path.join(workspace.repoDir, "registry.json");
+  const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+  delete registry.projects.demo.transport;
+  fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
+  const codex = await startFakeCodexServer(workspace, { channelId: "demo-channel", turns: [{ mcpReplyText: "served by the Router" }] });
+  setPort(workspace, codex.port);
+  await routerWithWebhooks(workspace, ["demo"]);
+
+  const started = await startCodexSession(workspace);
+
+  assert.equal(started.exitCode, 0, started.stderr || started.stdout);
+  const status = await runRouterCli(workspace, ["status"]);
+  assert.match(status.stdout, /sessions: 1\n  project demo scope=demo-channel connected=/);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.demo_codex.env.CCDM_ROUTER_KEY_FILE,
+    path.join(workspace.routerStateDir, "keys", "demo.key"));
+  injectDiscordMessage(workspace, { id: "owner-1", channelId: "demo-channel", content: "hi", author: { id: OWNER_ID, username: "Owner" } });
+  const done = await waitForState(workspace, (next) => next.fixtures.discord.messages.length > 0, 15000);
+  assert.deepEqual(done.fixtures.discord.messages.map(({ content, webhookId }) => ({ content, webhookId })), [
+    { content: "served by the Router", webhookId: "fake-webhook-1" },
+  ]);
+});
+
 function setPort(workspace, port) {
   const registryFile = path.join(workspace.repoDir, "registry.json");
   const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));

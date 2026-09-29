@@ -388,22 +388,13 @@ function parseCodexBridgeLaunch(shellCommand) {
   for (const envMatch of envText.matchAll(envRe)) {
     env[envMatch[1]] = envMatch[2] ?? envMatch[3];
   }
-  // A router launch carries the launch key file path instead of any bot
-  // identity; root's names no project.
-  const required = env.CCDM_ROUTER_KEY_FILE
-    ? [env.CCDM_ROUTER_ROLE === "root" ? "CCDM_ROUTER_ROLE" : "CCDM_CODEX_PROJECT", "CCDM_ROUTER_STATE_DIR", "CHANNEL_ID", "PROJECT_DIR", "WS_PORT", "ALLOWED_USER_IDS", "GUILD_ID", "CODEX_HOME"]
-    : [
-      "BOT_TOKEN",
-      "CHANNEL_ID",
-      "PROJECT_DIR",
-      "WS_PORT",
-      "ALLOWED_USER_IDS",
-      "GUILD_ID",
-      "ROOT_BOT_APP_ID",
-      "BOT_APP_ID",
-      "BOT_DISPLAY_NAME",
-      "CODEX_HOME",
-    ];
+  // Every Codex launch is a Router launch: it carries the launch key file path
+  // instead of any bot identity; root's names no project.
+  const required = [
+    "CCDM_ROUTER_KEY_FILE",
+    env.CCDM_ROUTER_ROLE === "root" ? "CCDM_ROUTER_ROLE" : "CCDM_CODEX_PROJECT",
+    "CCDM_ROUTER_STATE_DIR", "CHANNEL_ID", "PROJECT_DIR", "WS_PORT", "ALLOWED_USER_IDS", "CODEX_HOME",
+  ];
   for (const name of required) {
     if (!env[name]) {
       throw new Error(\`\${name} is required for Codex bridge launch\`);

@@ -1,7 +1,7 @@
 "use strict";
 
-// Routing table derived from registry.json. Only router-transport projects
-// are routed; pool projects keep being served by their own bots. Root's
+// Routing table derived from registry.json. Codex projects and router-transport
+// projects are routed; pool Claude projects keep being served by their own bots. Root's
 // channels and allowed users come from the registry too.
 const { watch } = require("node:fs");
 const { readFile, rename, writeFile, stat } = require("node:fs/promises");
@@ -21,7 +21,8 @@ function buildRoutingTable(registry) {
   const registered = new Map();
   for (const [name, project] of Object.entries(registry.projects || {})) {
     if (project?.channel_id) registered.set(String(project.channel_id), name);
-    if (project?.transport !== "router" || !project.channel_id) continue;
+    // Codex has no pool mode, so a Codex project is routed whatever its `transport`.
+    if ((project?.transport !== "router" && project?.type !== "codex") || !project.channel_id) continue;
     const route = {
       project: name,
       type: project.type === "codex" ? "codex" : "claude",

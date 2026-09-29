@@ -16,7 +16,6 @@ ROOT_READY_FILE="$ROOT_LAUNCH_DIR/ready.json"
 
 CHANNEL_ID="${1:-${ROOT_CODEX_CHANNEL_ID:-}}"
 WS_PORT="${ROOT_CODEX_WS_PORT:-18399}"
-BOT_DISPLAY_NAME="${ROOT_CODEX_BOT_DISPLAY_NAME:-root-codex}"
 
 collect_tree() {
   local pid="$1"
@@ -157,7 +156,7 @@ PY
 }
 
 # Unit-separated, so an empty field (no root_bot_app_id) keeps its place.
-IFS=$'\x1f' read -r CHANNEL_ID REGISTRY_USER_ID GUILD_ID REGISTRY_ROOT_APP_ID REGISTRY_ALLOWED_USER_IDS <<< "$(python3 - "$REGISTRY" "$CHANNEL_ID" <<'PY'
+IFS=$'\x1f' read -r CHANNEL_ID REGISTRY_USER_ID REGISTRY_ROOT_APP_ID REGISTRY_ALLOWED_USER_IDS <<< "$(python3 - "$REGISTRY" "$CHANNEL_ID" <<'PY'
 import json
 import sys
 
@@ -189,7 +188,6 @@ for user_id in [owner, *(registry.get("root_allowed_user_ids") or [])]:
 print("\x1f".join([
     channel_id,
     owner,
-    str(registry.get("guild_id") or ""),
     str(registry.get("root_bot_app_id") or ""),
     ",".join(allowed),
 ]))
@@ -257,7 +255,7 @@ with os.fdopen(fd, "w") as f:
 os.replace(tmp, key_file)
 PY
 
-if ! tmux new-session -d -s root_agent -- zsh -ic "cd '$SCRIPT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' CCDM_ROUTER_ROLE='root' CCDM_ROUTER_STATE_DIR='$ROUTER_STATE_DIR' CCDM_ROUTER_KEY_FILE='$ROOT_KEY_FILE' CCDM_CHANNEL_READY_FILE='$ROOT_READY_FILE' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$SCRIPT_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$ALLOWED_USER_IDS' GUILD_ID='$GUILD_ID' ROOT_BOT_APP_ID='$BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' BOT_DISPLAY_NAME='$BOT_DISPLAY_NAME' ROOT_MULTI_CHANNEL='1' node scripts/codex-bridge.js"; then
+if ! tmux new-session -d -s root_agent -- zsh -ic "cd '$SCRIPT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' CCDM_ROUTER_ROLE='root' CCDM_ROUTER_STATE_DIR='$ROUTER_STATE_DIR' CCDM_ROUTER_KEY_FILE='$ROOT_KEY_FILE' CCDM_CHANNEL_READY_FILE='$ROOT_READY_FILE' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$SCRIPT_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$ALLOWED_USER_IDS' ROOT_BOT_APP_ID='$BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' node scripts/codex-bridge.js"; then
   echo "Failed to create tmux session 'root_agent'" >&2
   python3 -c 'import sys; from pathlib import Path; Path(sys.argv[1]).unlink(missing_ok=True)' "$ROOT_KEY_FILE"
   exit 1

@@ -33,22 +33,21 @@ function poolClaudeWorkspace() {
   return { workspace, poolStateDir };
 }
 
-// `beta` is a pool Codex project served by `bot3`, backed by the fake app-server.
-async function poolCodexWorkspace() {
+// `beta` is a Codex project with no `transport` field, no pool bot, and no
+// webhook yet, backed by the fake app-server.
+async function unmigratedCodexWorkspace() {
   const workspace = createRouterWorkspace({
     discord_user_id: OWNER_ID,
     guild_id: "guild-id",
-    root_bot_app_id: "root-app-id",
-    pool: [{ id: "bot3", app_id: "beta-app-id", token: "beta-pool-token", state_dir: "__STATE__", assigned_to: "beta" }],
+    pool: [],
     projects: {
-      beta: { channel_id: "beta-channel", type: "codex", bot_id: "bot3", screen_name: "beta_codex",
+      beta: { channel_id: "beta-channel", type: "codex", screen_name: "beta_codex",
         assignment_generation: "gen-1", session_id: null, pid: null },
     },
   });
   fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
   const codex = await startFakeCodexServer(workspace, { channelId: "beta-channel" });
   updateRegistry(workspace, (registry) => {
-    registry.pool[0].state_dir = path.join(workspace.homeDir, ".claude", "channels", "discord3");
     registry.projects.beta.path = workspace.tmpDir;
     registry.projects.beta.ws_port = codex.port;
   });
@@ -108,11 +107,13 @@ test("migrating a pool Claude project moves it to the Router, verifies a probe r
   assert.equal(session.env?.DISCORD_STATE_DIR, undefined);
 });
 
-test("migrating a pool Codex project moves it to the Router, verifies a probe round trip, and exits 0", async () => {
-  const { workspace } = await poolCodexWorkspace();
+test("migrating a Codex project with no transport field or webhook records it on the Router, verifies a probe round trip, and exits 0", async () => {
+  const { workspace } = await unmigratedCodexWorkspace();
+  assert.equal(readRegistry(workspace).projects.beta.transport, undefined);
+  assert.equal(readRegistry(workspace).projects.beta.webhook_id, undefined);
   await startRouter(workspace);
-  const pooled = await runScript(workspace, "scripts/start-codex-session.sh", { args: ["beta"], env: routerEnv(workspace) });
-  assert.equal(pooled.exitCode, 0, pooled.stderr || pooled.stdout);
+  const running = await runScript(workspace, "scripts/start-codex-session.sh", { args: ["beta"], env: routerEnv(workspace) });
+  assert.equal(running.exitCode, 0, running.stderr || running.stdout);
 
   const result = await migrate(workspace, ["beta"]);
 
@@ -123,7 +124,7 @@ test("migrating a pool Codex project moves it to the Router, verifies a probe ro
   assert.match(beta.assignment_generation, /^gen-[0-9a-f]{32}$/);
   assert.deepEqual(await routerSessions(workspace), [{ role: "project", project: "beta", channel_id: "beta-channel" }]);
   assert.deepEqual(webhookMessages(workspace), [{ channelId: "beta-channel", webhookId: "fake-webhook-1" }]);
-  // The router bridge holds no pool token.
+  // The bridge holds no bot token.
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.beta_codex.env?.BOT_TOKEN, undefined);
 });
 

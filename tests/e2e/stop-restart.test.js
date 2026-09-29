@@ -24,9 +24,10 @@ function runFixture(workspace, tool, args) {
 
 function buildRegistry(workspace, overrides = {}) {
   const sessionType = overrides.sessionType ?? "claude";
+  // Codex has no pool mode: a Codex project names no pool bot.
   const project = {
     path: path.join(workspace.tmpDir, "alpha project"),
-    bot_id: "bot2",
+    ...(sessionType === "codex" ? {} : { bot_id: "bot2" }),
     screen_name: sessionType === "codex" ? "alpha_codex" : "alpha_session",
     channel_id: "channel-id",
     type: sessionType,
@@ -55,7 +56,7 @@ function buildRegistry(workspace, overrides = {}) {
         app_id: "bot-app-id",
         token: "bot-token",
         state_dir: path.join(workspace.homeDir, ".claude", "channels", "discord2"),
-        assigned_to: "alpha",
+        assigned_to: sessionType === "codex" ? null : "alpha",
       },
     ],
     projects: {
@@ -120,7 +121,7 @@ function claudeCommand(registry) {
 }
 
 function codexBridgeCommand() {
-  return "node scripts/codex-bridge.js CHANNEL_ID='channel-id' BOT_APP_ID='bot-app-id' WS_PORT='18342'";
+  return "node scripts/codex-bridge.js CCDM_CODEX_PROJECT='alpha' CHANNEL_ID='channel-id' WS_PORT='18342'";
 }
 
 function codexAppServerCommand() {
@@ -288,7 +289,6 @@ test("stop-session skips Codex listener sweep when required registry fields are 
     sessionType: "codex",
     project: { channel_id: "", ws_port: "", pid: null },
   });
-  delete registry.pool[1].app_id;
   const orphanPid = spawnOwnedProcess(workspace, codexBridgeCommand());
   seedRegistry(workspace, registry);
 
@@ -444,17 +444,14 @@ test("restart-root-codex-agent starts the root bot through the Codex bridge in R
   assert.deepEqual(session.env, {
     ALLOWED_USER_IDS: "allowed-user-id,global-user-id",
     BOT_APP_ID: "root-app",
-    BOT_DISPLAY_NAME: "root-codex",
     CCDM_CHANNEL_READY_FILE: path.join(workspace.routerStateDir, "launches", ".root", "ready.json"),
     CCDM_ROUTER_KEY_FILE: path.join(workspace.routerStateDir, "keys", ".root.key"),
     CCDM_ROUTER_ROLE: "root",
     CCDM_ROUTER_STATE_DIR: workspace.routerStateDir,
     CHANNEL_ID: "root-channel-id",
     CODEX_HOME: codexHome,
-    GUILD_ID: "guild-id",
     PROJECT_DIR: workspace.repoDir,
     ROOT_BOT_APP_ID: "root-app",
-    ROOT_MULTI_CHANNEL: "1",
     WS_PORT: port,
   });
   assert.equal(session.bridgeCommand, "node scripts/codex-bridge.js");

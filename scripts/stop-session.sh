@@ -190,16 +190,15 @@ PY
 find_codex_listener_pids() {
   local channel_id="$1"
   local ws_port="$2"
-  local bot_app_id="$3"
-  python3 - "$channel_id" "$ws_port" "$bot_app_id" <<'PY'
+  python3 - "$channel_id" "$ws_port" <<'PY'
 import os
 import re
 import shlex
 import subprocess
 import sys
 
-channel_id, ws_port, bot_app_id = sys.argv[1:4]
-if not channel_id or not ws_port or not bot_app_id:
+channel_id, ws_port = sys.argv[1:3]
+if not channel_id or not ws_port:
     sys.exit(0)
 
 try:
@@ -234,7 +233,7 @@ def is_codex_bridge(command: str) -> bool:
     return (
         exe == "node"
         and script.endswith("scripts/codex-bridge.js")
-        and (has_env(command, "CHANNEL_ID", channel_id) or has_env(command, "BOT_APP_ID", bot_app_id))
+        and has_env(command, "CHANNEL_ID", channel_id)
     )
 
 def is_codex_app_server(command: str) -> bool:
@@ -260,16 +259,16 @@ for line in ps.splitlines():
 PY
 }
 
-IFS=$'\t' read -r SCREEN_NAME SESSION_TYPE STATE_DIR REGISTRY_PID CHANNEL_ID WS_PORT BOT_APP_ID TRANSPORT <<< "$(python3 -c "
+IFS=$'\t' read -r SCREEN_NAME SESSION_TYPE STATE_DIR REGISTRY_PID CHANNEL_ID WS_PORT TRANSPORT <<< "$(python3 -c "
 import json, os
 r = json.load(open('$REGISTRY'))
 p = r['projects']['$PROJECT']
-transport = 'router' if p.get('transport') == 'router' else 'pool'
-# Router projects have no pool bot.
+session_type = p.get('type', 'claude')
+# Codex has no pool mode; only a Claude project may still have a pool bot.
+transport = 'router' if p.get('transport') == 'router' or session_type == 'codex' else 'pool'
 bot = {} if transport == 'router' else next(b for b in r['pool'] if b['id'] == p['bot_id'])
 def field(value):
     return '__NONE__' if value in (None, '') else str(value)
-session_type = p.get('type', 'claude')
 ws_port = p.get('ws_port', 18300) if session_type == 'codex' else p.get('ws_port')
 print('\t'.join([
     field(p['screen_name']),
@@ -278,7 +277,6 @@ print('\t'.join([
     field(p.get('pid')),
     field(p.get('channel_id')),
     field(ws_port),
-    field(bot.get('app_id')),
     transport,
 ]))
 ")"
@@ -286,7 +284,6 @@ print('\t'.join([
 [[ "$REGISTRY_PID" == "__NONE__" ]] && REGISTRY_PID=""
 [[ "$CHANNEL_ID" == "__NONE__" ]] && CHANNEL_ID=""
 [[ "$WS_PORT" == "__NONE__" ]] && WS_PORT=""
-[[ "$BOT_APP_ID" == "__NONE__" ]] && BOT_APP_ID=""
 
 ROUTER_STATE_DIR="${CCDM_ROUTER_STATE_DIR:-$HOME/.local/state/ccdm/router}"
 ROUTER_KEY_FILE="$ROUTER_STATE_DIR/keys/$PROJECT.key"
@@ -295,11 +292,11 @@ find_owned_listener_pids() {
   if [[ "$SESSION_TYPE" != "codex" && "$TRANSPORT" == "router" ]]; then
     find_router_claude_pids "$ROUTER_KEY_FILE"
   elif [[ "$SESSION_TYPE" == "codex" ]]; then
-    if [[ -z "$CHANNEL_ID" || -z "$WS_PORT" || -z "$BOT_APP_ID" ]]; then
-      echo "Skipping Codex listener sweep for '$PROJECT': missing channel_id, ws_port, or bot_app_id" >&2
+    if [[ -z "$CHANNEL_ID" || -z "$WS_PORT" ]]; then
+      echo "Skipping Codex listener sweep for '$PROJECT': missing channel_id or ws_port" >&2
       return 0
     fi
-    find_codex_listener_pids "$CHANNEL_ID" "$WS_PORT" "$BOT_APP_ID"
+    find_codex_listener_pids "$CHANNEL_ID" "$WS_PORT"
   else
     find_claude_listener_pids "$STATE_DIR"
   fi

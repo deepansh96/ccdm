@@ -75,7 +75,8 @@ async function projectEntry(project) {
   const registry = await readRegistry(registryPath());
   const entry = registry.projects?.[project];
   if (!entry?.channel_id) throw new Error(`${project} is not a registered project with a channel_id`);
-  if (!(registry.pool || []).some(bot => bot.id === entry.bot_id)) {
+  // Codex has no pool mode: a Codex project's fallback is its previous registry state.
+  if (entry.type !== "codex" && !(registry.pool || []).some(bot => bot.id === entry.bot_id)) {
     throw new Error(`${project} has no pool bot to fall back to (bot_id ${entry.bot_id ?? "unset"})`);
   }
   return entry;
@@ -138,9 +139,10 @@ async function migrate(project) {
     await step("verify", () => verify(project, entry));
   } catch (error) {
     if (!(error instanceof StepFailure)) throw error;
-    console.log(`rolling back ${project} to its pool bot after the ${error.step} step failed`);
+    const previous = entry.type === "codex" ? "its previous registry state" : "its pool bot";
+    console.log(`rolling back ${project} to ${previous} after the ${error.step} step failed`);
     const rolledBack = await rollbackSteps(project, entry, { reassign: reassigned })
-      .then(() => "rolled back to its pool bot", failure => `rollback also failed at ${failure.step}: ${failure.message}`);
+      .then(() => `rolled back to ${previous}`, failure => `rollback also failed at ${failure.step}: ${failure.message}`);
     throw new Error(`migration of ${project} failed at ${error.step}: ${error.message}; ${rolledBack}`);
   }
   console.log(`migrated ${project} to the Router`);
@@ -158,6 +160,7 @@ async function rollback(project) {
   let entry;
   await step("preflight", async () => {
     entry = await projectEntry(project);
+    if (entry.type === "codex") throw new Error(`${project} is a Codex project, and Codex has no pool bot to return to`);
     if (entry.transport !== "router") throw new Error(`${project} is not on the Router`);
     return `pool bot ${entry.bot_id}`;
   });
