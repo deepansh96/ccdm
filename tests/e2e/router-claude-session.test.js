@@ -249,3 +249,237 @@ test("an unreadable context file drops the percentage rather than posting a wron
 
   assert.equal(await ownerMessageReply(workspace, "owner-message-1", 1), "demo-claude");
 });
+
+// Starts `demo` with the fake claude scripted to run `toolScript` on each
+// channel notification.
+async function scriptedSession(workspace, toolScript, seed = () => {}) {
+  const router = await routerWithWebhooks(workspace, ["demo"]);
+  const state = readState(workspace.stateDir);
+  state.fixtures.claude.toolScript = toolScript;
+  seed(state);
+  writeState(state, workspace.stateDir);
+  const started = await startSession(workspace);
+  assert.equal(started.exitCode, 0, started.stderr || started.stdout);
+  return router;
+}
+
+function ownerMessage(workspace, extra = {}) {
+  injectDiscordMessage(workspace, {
+    id: "owner-message-1", channelId: "demo-channel", content: "take a look",
+    createdTimestamp: Date.parse("2026-09-29T10:00:00.000Z"),
+    author: { id: OWNER_ID, username: "Owner" }, ...extra,
+  });
+}
+
+async function toolResults(workspace, count) {
+  const done = await waitForState(workspace, (next) => (next.fixtures.claude.toolResults?.length ?? 0) >= count);
+  return done.fixtures.claude.toolResults;
+}
+
+test("an owner's image and text file reach Claude as metadata and download_attachment writes both into the private inbox", async () => {
+  const workspace = claudeRouterWorkspace();
+  const shotUrl = "https://cdn.discordapp.com/attachments/demo-channel/att-1/shot.png";
+  const notesUrl = "https://cdn.discordapp.com/attachments/demo-channel/att-2/notes.txt";
+  await scriptedSession(workspace, [
+    { name: "download_attachment", arguments: { chat_id: "{{chat_id}}", message_id: "{{message_id}}" } },
+  ], (state) => {
+    state.fixtures.discord.attachments[shotUrl] = { body: "fake png bytes", contentType: "image/png" };
+    state.fixtures.discord.attachments[notesUrl] = { body: "remember the milk\n", contentType: "text/plain" };
+  });
+
+  ownerMessage(workspace, { attachments: [
+    { id: "att-1", name: "shot.png", contentType: "image/png", size: 1024, url: shotUrl },
+    { id: "att-2", name: "notes.txt", contentType: "text/plain", size: 2048, url: notesUrl },
+  ] });
+
+  const [result] = await toolResults(workspace, 1);
+  const { channelNotifications } = readState(workspace.stateDir).fixtures.claude;
+  assert.equal(channelNotifications[0].meta.attachment_count, "2");
+  assert.equal(channelNotifications[0].meta.attachments, "shot.png (image/png, 1KB); notes.txt (text/plain, 2KB)");
+  assert.equal(result.result.isError, undefined, JSON.stringify(result));
+  const match = /^downloaded 2 attachment\(s\):\n {2}(\S+) {2}\(shot\.png, image\/png, 1KB\)\n {2}(\S+) {2}\(notes\.txt, text\/plain, 2KB\)$/
+    .exec(result.result.content[0].text);
+  assert.ok(match, result.result.content[0].text);
+  const inbox = path.join(workspace.routerStateDir, "inbox", "demo");
+  const [shot, notes] = [match[1], match[2]];
+  assert.equal(path.dirname(shot), inbox);
+  assert.match(path.basename(shot), /^\d+-att-1\.png$/);
+  assert.match(path.basename(notes), /^\d+-att-2\.txt$/);
+  assert.equal(fs.readFileSync(shot, "utf8"), "fake png bytes");
+  assert.equal(fs.readFileSync(notes, "utf8"), "remember the milk\n");
+  assert.equal(fs.statSync(shot).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(notes).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(inbox).mode & 0o777, 0o700);
+});
+
+test("a reply with a file and reply_to posts as demo with the upload and a jump-link first line", async () => {
+  const workspace = claudeRouterWorkspace();
+  const log = path.join(workspace.tmpDir, "build.log");
+  fs.writeFileSync(log, "all green\n");
+  await scriptedSession(workspace, [
+    { name: "reply", arguments: { chat_id: "{{chat_id}}", text: "log attached", reply_to: "{{message_id}}", files: [log] } },
+  ]);
+
+  ownerMessage(workspace);
+
+  const [result] = await toolResults(workspace, 1);
+  assert.deepEqual(result.result, { content: [{ type: "text", text: "sent (id: fake-message-1)" }] });
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.messages
+    .map(({ channelId, content, username, webhookId, uploads }) => ({ channelId, content, username, webhookId, uploads })), [{
+    channelId: "demo-channel",
+    content: "↪ [jump](https://discord.com/channels/guild-id/demo-channel/owner-message-1)\nlog attached",
+    username: "demo-claude",
+    webhookId: "fake-webhook-1",
+    uploads: [{ name: "build.log", size: 10 }],
+  }]);
+});
+
+test("edit_message on the session's own reply and react on the owner's message are recorded", async () => {
+  const workspace = claudeRouterWorkspace();
+  await scriptedSession(workspace, [
+    { name: "reply", arguments: { chat_id: "{{chat_id}}", text: "working…" } },
+    { name: "edit_message", arguments: { chat_id: "{{chat_id}}", message_id: "{{last_id}}", text: "done" } },
+    { name: "react", arguments: { chat_id: "{{chat_id}}", message_id: "{{message_id}}", emoji: "👀" } },
+  ]);
+
+  ownerMessage(workspace);
+
+  const results = await toolResults(workspace, 3);
+  assert.deepEqual(results.map(({ name, result }) => [name, result]), [
+    ["reply", { content: [{ type: "text", text: "sent (id: fake-message-1)" }] }],
+    ["edit_message", { content: [{ type: "text", text: "edited (id: fake-message-1)" }] }],
+    ["react", { content: [{ type: "text", text: "reacted" }] }],
+  ]);
+  const { webhookEdits, reactions, messages } = readState(workspace.stateDir).fixtures.discord;
+  assert.deepEqual(webhookEdits, [{ webhookId: "fake-webhook-1", messageId: "fake-message-1", content: "done" }]);
+  assert.equal(messages[0].content, "done");
+  assert.deepEqual(reactions.map(({ channelId, messageId, emoji }) => ({ channelId, messageId, emoji })), [
+    { channelId: "demo-channel", messageId: "owner-message-1", emoji: encodeURIComponent("👀") },
+  ]);
+});
+
+test("an owner message shows the bot typing in the channel, as the Discord plugin does", async () => {
+  const workspace = claudeRouterWorkspace();
+  await scriptedSession(workspace, []);
+
+  ownerMessage(workspace);
+
+  const done = await waitForState(workspace, (next) => (next.fixtures.discord.typing?.length ?? 0) > 0);
+  assert.deepEqual(done.fixtures.discord.typing, [{ authorization: "Bot root-bot-token", channelId: "demo-channel" }]);
+});
+
+// Histories discord-mcp.test.js reads through the supplementary Discord MCP,
+// whose results are the shapes these tools keep.
+const MCP_READ_HISTORY = [
+  { id: "203", timestamp: "2026-09-27T10:02:00.000Z", content: "latest", author: { username: "Alice" }, attachments: [] },
+  { id: "202", timestamp: "2026-09-27T10:01:00.000Z", content: "reply", author: { username: "bot", bot: true }, attachments: [{}] },
+  { id: "201", timestamp: "2026-09-27T10:00:00.000Z", content: "older", author: { username: "Alice" }, attachments: [] },
+];
+const MCP_EXPORT_HISTORY = [
+  { id: "103", timestamp: "2026-07-13T10:02:00.000Z", content: "latest", author: { id: "2", username: "Bob" }, attachments: [] },
+  { id: "102", timestamp: "2026-07-13T10:01:00.000Z", content: "start", author: { id: "1", username: "Alice" }, attachments: [] },
+  { id: "101", timestamp: "2026-07-13T10:00:00.000Z", content: "older", author: { id: "1", username: "Alice" }, attachments: [] },
+];
+
+test("read_last_x_messages_in_channel returns the supplementary Discord MCP's inline lines", async () => {
+  const workspace = claudeRouterWorkspace();
+  await scriptedSession(workspace, [
+    { name: "read_last_x_messages_in_channel", arguments: { count: 2 } },
+  ], (state) => {
+    state.fixtures.discord.history = { "demo-channel": MCP_READ_HISTORY };
+  });
+
+  ownerMessage(workspace);
+
+  const [read] = await toolResults(workspace, 1);
+  assert.deepEqual(read.result, { content: [{ type: "text",
+    text: "[2026-09-27T10:01:00.000Z] me: reply +1att (id: 202)\n[2026-09-27T10:02:00.000Z] Alice: latest (id: 203)" }] });
+});
+
+test("fetch_messages returns history lines like the Discord plugin, or (no messages) for an empty channel", async () => {
+  const workspace = claudeRouterWorkspace();
+  await scriptedSession(workspace, [
+    { name: "fetch_messages", arguments: { channel: "{{chat_id}}", limit: 2 } },
+  ], (state) => {
+    state.fixtures.discord.history = { "demo-channel": MCP_READ_HISTORY };
+  });
+
+  ownerMessage(workspace);
+
+  const [fetched] = await toolResults(workspace, 1);
+  assert.deepEqual(fetched.result, { content: [{ type: "text",
+    text: "[2026-09-27T10:01:00.000Z] me: reply +1att (id: 202)\n[2026-09-27T10:02:00.000Z] Alice: latest (id: 203)" }] });
+  const state = readState(workspace.stateDir);
+  state.fixtures.discord.history = { "demo-channel": [] };
+  writeState(state, workspace.stateDir);
+  ownerMessage(workspace, { id: "owner-message-2" });
+  const [, empty] = await toolResults(workspace, 2);
+  assert.deepEqual(empty.result, { content: [{ type: "text", text: "(no messages)" }] });
+});
+
+test("export_message_range returns the supplementary Discord MCP's exported-to line and private transcript", async () => {
+  const workspace = claudeRouterWorkspace();
+  await scriptedSession(workspace, [
+    { name: "export_message_range", arguments: { start_message_id: "102" } },
+  ], (state) => {
+    state.fixtures.discord.history = { "demo-channel": MCP_EXPORT_HISTORY };
+  });
+
+  ownerMessage(workspace);
+
+  const [exported] = await toolResults(workspace, 1);
+  const exportText = exported.result.content[0].text;
+  assert.match(exportText, /^exported to \//, JSON.stringify(exported));
+  const exportPath = exportText.replace(/^exported to /, "");
+  const text = fs.readFileSync(exportPath, "utf8");
+  assert.match(text, /Message ID: 102/);
+  assert.match(text, /Message ID: 103/);
+  assert.doesNotMatch(text, /Message ID: 101/);
+  assert.equal(fs.statSync(exportPath).mode & 0o777, 0o600);
+});
+
+test("a read past 100 messages returns the supplementary Discord MCP's saved-transcript line", async () => {
+  const workspace = claudeRouterWorkspace();
+  const history = Array.from({ length: 150 }, (_, index) => ({
+    id: String(1149 - index), timestamp: "2026-09-27T10:00:00.000Z", content: `message ${1149 - index}`,
+    author: { username: "Alice" }, attachments: [],
+  }));
+  await scriptedSession(workspace, [
+    { name: "read_last_x_messages_in_channel", arguments: { count: 120 } },
+  ], (state) => {
+    state.fixtures.discord.history = { "demo-channel": history };
+  });
+
+  ownerMessage(workspace);
+
+  const [read] = await toolResults(workspace, 1);
+  const text = read.result.content[0].text;
+  assert.match(text, /^saved 120 messages to \//, JSON.stringify(read));
+  const transcript = text.replace(/^saved 120 messages to /, "");
+  const lines = fs.readFileSync(transcript, "utf8").trim().split("\n");
+  assert.equal(lines.length, 120);
+  assert.equal(lines[0], "[2026-09-27T10:00:00.000Z] Alice: message 1030 (id: 1030)");
+  assert.equal(lines.at(-1), "[2026-09-27T10:00:00.000Z] Alice: message 1149 (id: 1149)");
+  assert.equal(fs.statSync(transcript).mode & 0o777, 0o600);
+});
+
+test("tool calls aimed at another channel surface scope_violation to Claude and touch nothing in Discord", async () => {
+  const workspace = claudeRouterWorkspace();
+  await scriptedSession(workspace, [
+    { name: "reply", arguments: { chat_id: "beta-channel", text: "wrong room" } },
+    { name: "react", arguments: { chat_id: "beta-channel", message_id: "{{message_id}}", emoji: "👀" } },
+    { name: "edit_message", arguments: { chat_id: "beta-channel", message_id: "{{message_id}}", text: "x" } },
+    { name: "fetch_messages", arguments: { channel: "beta-channel" } },
+    { name: "download_attachment", arguments: { chat_id: "beta-channel", message_id: "{{message_id}}" } },
+  ]);
+
+  ownerMessage(workspace);
+
+  const results = await toolResults(workspace, 5);
+  for (const { name, result } of results) {
+    assert.equal(result.isError, true, name);
+    assert.match(result.content[0].text, new RegExp(`^${name} failed: scope_violation `), name);
+  }
+  const { messages, reactions, webhookEdits, attachmentFetches } = readState(workspace.stateDir).fixtures.discord;
+  assert.deepEqual([messages, reactions, webhookEdits ?? [], attachmentFetches], [[], [], [], []]);
+});

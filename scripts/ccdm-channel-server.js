@@ -17,6 +17,7 @@
 // `<state>/launches/<project>/context.json`; reply and edit_message send it as
 // `context_pct`, or omit it when the file is missing or unreadable.
 const { readFileSync, renameSync, writeFileSync } = require("node:fs");
+const { chmod, mkdir, writeFile } = require("node:fs/promises");
 const path = require("node:path");
 const { createInterface } = require("node:readline");
 const { RouterClient } = require("./router/client.js");
@@ -25,11 +26,11 @@ const PROTOCOL_VERSION = "2025-03-26";
 const INSTRUCTIONS = [
   "The sender reads Discord, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.",
   "",
-  'Messages from Discord arrive as <channel source="ccdm" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+  'Messages from Discord arrive as <channel source="ccdm" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
   "",
   "Use react to add emoji reactions, and edit_message for interim progress updates. Edits don't trigger push notifications — when a long task completes, send a new reply so the user's device pings.",
   "",
-  "fetch_messages pulls recent channel history. This session can read and act only in its own project channel.",
+  "fetch_messages pulls recent channel history; read_last_x_messages_in_channel reads up to 10,000 recent messages and export_message_range exports an inclusive range to a file. This session can read and act only in its own project channel.",
 ].join("\n");
 
 function contextPct() {
@@ -42,7 +43,60 @@ function contextPct() {
   }
 }
 
-// Each tool forwards to one Router operation; `args` maps tool input to op args.
+// The Router's hello scope: this session's one channel.
+let scope = {};
+
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+
+// Attachment names are uploader-controlled; strip the delimiters that would
+// let one break out of the listing, as the Discord plugin does.
+function safeName(attachment) {
+  return (attachment.name ?? attachment.id).replace(/[\[\]\r\n;]/g, "_");
+}
+
+function sizeKb(attachment) {
+  return (attachment.size / 1024).toFixed(0);
+}
+
+// The session's private inbox: `<state>/inbox/<project>` (0700), files 0600,
+// named `<epoch ms>-<attachment id>.<ext>` like the plugin's inbox.
+async function saveAttachment(attachment) {
+  if (attachment.size > MAX_ATTACHMENT_BYTES) {
+    throw new Error(`attachment too large: ${(attachment.size / 1024 / 1024).toFixed(1)}MB, max ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB`);
+  }
+  const response = await fetch(attachment.url);
+  if (!response.ok) throw new Error(`download failed: HTTP ${response.status}`);
+  const bytes = Buffer.from(await response.arrayBuffer());
+  const name = attachment.name ?? attachment.id;
+  const ext = (name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : "bin").replace(/[^a-zA-Z0-9]/g, "") || "bin";
+  const inbox = path.join(process.env.CCDM_ROUTER_STATE_DIR || "", "inbox", process.env.CCDM_CLAUDE_PROJECT || "");
+  await mkdir(inbox, { recursive: true, mode: 0o700 });
+  await chmod(inbox, 0o700);
+  const file = path.join(inbox, `${Date.now()}-${attachment.id}.${ext}`);
+  await writeFile(file, bytes, { mode: 0o600 });
+  return file;
+}
+
+// The Router resolves one attachment per call; ask by index until it has none.
+async function downloadAttachments(router, { chat_id, message_id }) {
+  const lines = [];
+  for (let index = 0; ; index++) {
+    let attachment;
+    try {
+      attachment = await router.request("download_attachment", { channel_id: chat_id, message_id, attachment_index: index });
+    } catch (error) {
+      if (error.code === "not_found") break;
+      throw error;
+    }
+    const file = await saveAttachment(attachment);
+    lines.push(`  ${file}  (${safeName(attachment)}, ${attachment.content_type ?? "unknown"}, ${sizeKb(attachment)}KB)`);
+  }
+  if (lines.length === 0) return "message has no attachments";
+  return `downloaded ${lines.length} attachment(s):\n${lines.join("\n")}`;
+}
+
+// Each tool forwards to one Router operation; `args` maps tool input to op
+// args. A tool with `run` does its own work instead.
 const TOOLS = {
   reply: {
     description: "Reply on Discord. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) to link the message you are answering, and files (absolute paths) to attach.",
@@ -72,7 +126,7 @@ const TOOLS = {
     required: ["chat_id", "message_id", "text"],
     op: "edit_message",
     args: ({ chat_id, message_id, text }) => ({ channel_id: chat_id, message_id, text, context_pct: contextPct() }),
-    format: () => "edited",
+    format: result => `edited (id: ${result.message_id})`,
   },
   fetch_messages: {
     description: "Fetch recent messages from this session's Discord channel, oldest first with message IDs.",
@@ -80,7 +134,34 @@ const TOOLS = {
     required: ["channel"],
     op: "fetch_messages",
     args: ({ channel, limit }) => ({ channel_id: channel, limit }),
-    format: result => JSON.stringify(result),
+    format: result => result.text || "(no messages)",
+  },
+  // The read tools keep the supplementary Discord MCP's arguments and results;
+  // they always read this session's channel.
+  read_last_x_messages_in_channel: {
+    description: "Read the last X messages in the Discord channel, oldest-first with message IDs. Reads up to 100 inline; larger reads return a temporary transcript path.",
+    properties: { count: { type: "number", description: "Number of recent messages to read (1-10,000)." } },
+    required: ["count"],
+    op: "read_last_x_messages_in_channel",
+    args: ({ count }) => ({ channel_id: scope.channel_id, count }),
+    format: result => result.path ? `saved ${result.count} messages to ${result.path}` : result.text,
+  },
+  export_message_range: {
+    description: "Export up to 10,000 Discord messages and their attachments to a temporary transcript. The range is inclusive; omit the end ID to continue through the latest message. Read the returned file, then delete its temporary directory.",
+    properties: {
+      start_message_id: { type: "string", description: "First message ID to export (inclusive)." },
+      end_message_id: { type: "string", description: "Last message ID to export (inclusive). Omit to export through the latest message." },
+    },
+    required: ["start_message_id"],
+    op: "export_message_range",
+    args: ({ start_message_id, end_message_id }) => ({ channel_id: scope.channel_id, start_message_id, end_message_id }),
+    format: result => `exported to ${result.path}`,
+  },
+  download_attachment: {
+    description: "Download attachments from a Discord message in this channel to the local inbox. Use when the inbound <channel> meta shows attachment_count. Returns file paths ready to Read.",
+    properties: { chat_id: { type: "string" }, message_id: { type: "string" } },
+    required: ["chat_id", "message_id"],
+    run: downloadAttachments,
   },
 };
 
@@ -99,7 +180,7 @@ function reportReady(outcome) {
 
 function attachmentMeta(attachments = []) {
   if (attachments.length === 0) return {};
-  const listed = attachments.map(item => `${item.name} (${item.content_type || "unknown"}, ${(item.size / 1024).toFixed(0)}KB)`);
+  const listed = attachments.map(item => `${safeName(item)} (${item.content_type || "unknown"}, ${sizeKb(item)}KB)`);
   return { attachment_count: String(attachments.length), attachments: listed.join("; ") };
 }
 
@@ -142,6 +223,8 @@ function main() {
     if (initialized) send({ method: "notifications/claude/channel", params });
     else queued.push(params);
   };
+  // Like the plugin, show the bot typing while Claude takes the message in.
+  router.on("message", event => router.request("typing", { channel_id: event.channel_id }).catch(() => {}));
   router.on("message", notify("message"));
   router.on("reaction", notify("reaction"));
   router.on("disconnect", () => process.stderr.write("ccdm channel: Router connection lost; reconnecting\n"));
@@ -149,7 +232,10 @@ function main() {
   router.on("end", error => process.stderr.write(`ccdm channel: Router session ended${error ? `: ${error.code || error.message}` : ""}\n`));
 
   router.connect().then(
-    scope => reportReady({ ok: true, scope }),
+    granted => {
+      scope = granted;
+      reportReady({ ok: true, scope: granted });
+    },
     error => {
       reportReady({ ok: false, error: error.code || error.message });
       process.stderr.write(`ccdm channel: Router hello failed: ${error.code || error.message}\n`);
@@ -160,8 +246,8 @@ function main() {
     const tool = Object.hasOwn(TOOLS, name) ? TOOLS[name] : null;
     if (!tool) return send({ id, error: { code: -32602, message: `unknown tool: ${name}` } });
     try {
-      const result = await router.request(tool.op, tool.args(input));
-      send({ id, result: { content: [{ type: "text", text: tool.format(result) }] } });
+      const text = tool.run ? await tool.run(router, input) : tool.format(await router.request(tool.op, tool.args(input)));
+      send({ id, result: { content: [{ type: "text", text }] } });
     } catch (error) {
       send({ id, result: { isError: true, content: [{ type: "text", text: `${name} failed: ${error.code || ""} ${error.message}`.trim() }] } });
     }

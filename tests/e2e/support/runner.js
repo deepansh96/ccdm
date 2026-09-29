@@ -521,6 +521,22 @@ function runRouterClaudeHost() {
     const write = (message) => child.stdin.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\\n");
     const call = (method, params) => { const id = nextId++; write({ id, method, params }); return id; };
     const toolCalls = new Map();
+    // \`fixtures.claude.toolScript\` runs its tool calls in order for each
+    // notification. String arguments expand {{chat_id}} and {{message_id}} from
+    // the notification and {{last_id}} from the previous result's "(id: X)".
+    async function runToolScript(steps, meta) {
+      let lastId = "";
+      const expand = (value) => typeof value === "string"
+        ? value.replace(/\\{\\{(chat_id|message_id|last_id)\\}\\}/g, (_, key) => key === "last_id" ? lastId : meta[key])
+        : Array.isArray(value) ? value.map(expand) : value;
+      for (const step of steps) {
+        const input = Object.fromEntries(Object.entries(step.arguments || {}).map(([key, value]) => [key, expand(value)]));
+        const result = await new Promise((done) => {
+          toolCalls.set(call("tools/call", { name: step.name, arguments: input }), { name: step.name, done });
+        });
+        lastId = /\\(id: ([^)]+)\\)/.exec(result?.content?.[0]?.text || "")?.[1] || lastId;
+      }
+    }
     const initializeId = call("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "claude-fixture", version: "1" } });
     let buffer = "";
     child.stdout.setEncoding("utf8");
@@ -537,14 +553,17 @@ function runRouterClaudeHost() {
           write({ method: "notifications/initialized" });
         } else if (message.method === "notifications/claude/channel") {
           record("channelNotifications", message.params);
-          const replyText = readState().fixtures.claude.replyText;
+          const { replyText, toolScript } = readState().fixtures.claude;
           if (replyText) {
             const id = call("tools/call", { name: "reply", arguments: { chat_id: message.params.meta.chat_id, text: replyText } });
-            toolCalls.set(id, "reply");
+            toolCalls.set(id, { name: "reply" });
           }
+          if (toolScript) runToolScript(toolScript, message.params.meta);
         } else if (toolCalls.has(message.id)) {
-          record("toolResults", { name: toolCalls.get(message.id), result: message.result, error: message.error });
+          const pending = toolCalls.get(message.id);
           toolCalls.delete(message.id);
+          record("toolResults", { name: pending.name, result: message.result, error: message.error });
+          pending.done?.(message.result);
         }
       }
     });
