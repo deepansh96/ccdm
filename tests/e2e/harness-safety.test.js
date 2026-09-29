@@ -4,8 +4,9 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { bridgeChildEnv, createBridgeWorkspace } from "./support/bridge.js";
 import { assertFixtureExecutable, assertIsolatedPath, redactSecrets } from "./support/diagnostics.js";
-import { createWorkspace, runScript } from "./support/runner.js";
+import { createWorkspace, runNodeEntrypoint, runScript } from "./support/runner.js";
 import {
   readState,
   recordCommandInvocation,
@@ -145,4 +146,27 @@ test("failure diagnostics include command details and redact secrets", async () 
     registry: { token: "ghp_x" },
   });
   assert.doesNotMatch(JSON.stringify(redactedBody), /ghp_|sk-ant-|Authorization: Bot [A-Za-z0-9_.-]+/);
+});
+
+test("the Router live smoke test is skipped and touches nothing without the Live Gate", async () => {
+  const workspace = createBridgeWorkspace();
+  const fixturesBefore = readState(workspace.stateDir).fixtures;
+
+  // Live secrets alone do not open the gate; the preload fails closed on any egress.
+  const result = await runNodeEntrypoint(workspace, "tests/e2e/live-smoke.test.js", {
+    args: ["--test-reporter=tap"],
+    env: bridgeChildEnv(workspace, {
+      CCDM_LIVE_DISCORD_BOT_TOKEN: "placeholder-live-token",
+      CCDM_LIVE_DISCORD_CHANNEL_ID: "placeholder-channel",
+      CCDM_LIVE_DISCORD_USER_ID: "placeholder-owner",
+    }),
+    timeoutMs: 20000,
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /^ok 1 - live Router smoke: Claude and Codex round trips, webhook provenance, root mention, and cleanup # SKIP/m);
+  assert.match(result.stdout, /^# skipped 1$/m);
+  assert.match(result.stdout, /^# pass 0$/m);
+  assert.deepEqual(readState(workspace.stateDir).fixtures, fixturesBefore);
+  assert.deepEqual(fs.readdirSync(workspace.tmpDir), []);
 });

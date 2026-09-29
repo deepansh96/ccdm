@@ -217,6 +217,32 @@ The default CI suite never requires live credentials.
 
 All documented live secrets must be non-empty before a live smoke test may run. Issue #4 does not require a live-smoke scenario matrix; live coverage remains a narrow opt-in drift check for real boundaries.
 
+## Live Smoke
+
+`tests/e2e/live-smoke.test.js` mirrors the 2026-09-29 Router feasibility test against real Discord, Claude, and Codex. It detects drift in Discord webhooks and gateway routing, in Claude's development-channel flag and its confirmation prompt, and in the Codex bridge. It does not repeat the local-fake scenarios. The operator runs it by hand from a checkout with `tmux`, `claude`, and `codex` on `PATH` and logged in:
+
+```sh
+CCDM_LIVE_DISCORD_BOT_TOKEN=<root bot token> \
+CCDM_LIVE_DISCORD_CHANNEL_ID=<any channel in the CCDM server> \
+CCDM_LIVE_DISCORD_USER_ID=<owner user id> \
+CCDM_LIVE_E2E=1 node --test tests/e2e/live-smoke.test.js
+```
+
+- `CCDM_LIVE_DISCORD_CHANNEL_ID` names the guild, and the throwaway channels are created in its category. The root bot needs Manage Channels and Manage Webhooks there.
+- The Router drops bot-authored messages, so the owner sends the inbound messages. The test pings the owner in each throwaway channel and waits up to `CCDM_LIVE_OWNER_WAIT_MS` (default 10 minutes) for each one. It waits up to `CCDM_LIVE_REPLY_WAIT_MS` (default 5 minutes) for each agent reply, and `CCDM_LIVE_QUIET_MS` (default 30 seconds) for silence after the mention.
+- Optional: `CCDM_LIVE_CODEX_HOME` selects the Codex home, and `CCDM_LIVE_CLAUDE_HOME` becomes the Claude project's `claude_home`. Otherwise the operator's defaults are used.
+
+The test runs the following steps:
+
+1. It copies the Git-visible source into a private `ccdm-live-*` temp directory. The registry, Router state, root `.env`, reminder state, and a private tmux server (`TMUX_TMPDIR`) all live there, so the checkout's `registry.json` and the operator's running sessions are never touched.
+2. It starts a real Router (`scripts/router.js serve`) and creates two throwaway text channels (`ccdm-live-claude-*`, `ccdm-live-codex-*`). It gives the `live-claude` and `live-codex` router-transport projects their webhooks through `ensure-webhook`, and connects a root client with a root key.
+3. It launches `start-session.sh live-claude` against the real `claude` binary and requires `Channel server connected to the Router`, which prints only after the development-channel confirmation was auto-accepted and the channel server's hello succeeded. It then launches `start-codex-session.sh live-codex` and requires `Bridge connected to the Router`. `router status --json` must list both project sessions with their scopes, and no file under the Router state, reminder state, or workspace may contain the bot token.
+4. For each project, the owner sends a message with an attachment. The reply must name the attachment, carry the project's registry `webhook_id`, and appear as `live-claude-claude` or `live-codex-codex` (with an optional ` · N%` suffix).
+5. The owner mentions the bot in the Claude channel. The message must reach the root client, and no webhook reply may follow, so the mention reaches root only.
+6. Cleanup runs even when an assertion fails, and on `SIGINT`/`SIGTERM`. It stops both sessions, deletes both webhooks, stops the Router, deletes both channels, kills the private tmux server and any process naming the temp directory, and removes the temp directory with its key files and token. The test then fails if any channel or webhook still resolves in Discord or the temp directory remains.
+
+Without the Live Gate the test is reported skipped before it creates anything. `harness-safety.test.js` verifies this with placeholder secrets under the fail-closed preload.
+
 ## CI Behavior
 
 GitHub Actions runs the Default CI Suite on `push` and `pull_request` with Node 22, `npm ci`, zsh, python3, jq, and `npm test`. CI executes the same local-fake command shown above and does not require live Discord, Claude, Codex, tmux, Keychain, OAuth, or npm-network credentials during scenario execution.

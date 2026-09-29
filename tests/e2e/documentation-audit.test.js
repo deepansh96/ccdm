@@ -103,3 +103,19 @@ test("e2e README records the named-account setup and documentation scenarios", (
     assert.match(readme, new RegExp(phrase, "i"));
   }
 });
+
+test("live-smoke docs and matrix describe the gated Router live smoke test", () => {
+  for (const phrase of [
+    "## Live Smoke",
+    "CCDM_LIVE_E2E=1 node --test tests/e2e/live-smoke.test.js",
+    "development-channel confirmation",
+    "webhook_id",
+    "reaches root only",
+    "CCDM_LIVE_OWNER_WAIT_MS",
+    "CCDM_LIVE_CODEX_HOME",
+    "even when an assertion fails",
+  ]) {
+    assert.match(readme, new RegExp(phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+  assert.match(matrix, /\| Live smoke \| Router live smoke against real Discord, Claude, and Codex \| Covered \|/);
+});
