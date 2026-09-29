@@ -22,12 +22,20 @@
 // send-claude-command.sh, /pause queues inbound events until /unpause, and
 // /restart relaunches this project (never root) through stop-session.sh and
 // start-session.sh.
+//
+// Conversation Reminder events are recorded here through the reminder
+// adapter module (owner interactions, delivered replies, input requests, and
+// resumed work); the launch's command hooks record turn completion. The
+// capability marker `<reminder state>/capabilities/<project>.json` proves this
+// live process only: it is written after the Router hello and removed when
+// this process exits or its Router session ends.
 const { execFile, spawn } = require("node:child_process");
-const { readFileSync, renameSync, writeFileSync } = require("node:fs");
-const { chmod, mkdir, writeFile } = require("node:fs/promises");
+const { readFileSync, renameSync, rmSync, writeFileSync } = require("node:fs");
+const { chmod, mkdir, readFile, rm, stat, writeFile } = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const { createInterface } = require("node:readline");
+const reminder = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
 
 const ROOT_DIR = path.dirname(__dirname);
@@ -40,7 +48,121 @@ const INSTRUCTIONS = [
   "Use react to add emoji reactions, and edit_message for interim progress updates. Edits don't trigger push notifications — when a long task completes, send a new reply so the user's device pings.",
   "",
   "fetch_messages pulls recent channel history; read_last_x_messages_in_channel reads up to 10,000 recent messages and export_message_range exports an inclusive range to a file. This session can read and act only in its own project channel.",
+  "",
+  "For every reply, pass conversation_interaction_id copied from the owner message_id being answered. Set conversation_disposition to input-needed only when the delivered reply explicitly asks the owner for input; otherwise use progress. A reply without a valid interaction ID is delivered normally but does not count as a confirmed Conversation Reminder response.",
 ].join("\n");
+
+const REMINDER_PROJECT_ROOT = process.env.CCDM_REMINDER_PROJECT_ROOT || path.dirname(__dirname);
+const REMINDER_STATE_DIR = process.env.CCDM_REMINDER_STATE_DIR || path.join(os.homedir(), ".local", "state", "ccdm", "conversation-reminders");
+const REGISTRY_PATH = path.join(REMINDER_PROJECT_ROOT, "registry.json");
+const LAUNCH_ID = process.env.CCDM_CLAUDE_LAUNCH_ID || "";
+const capabilityPath = path.join(REMINDER_STATE_DIR, "capabilities", `${process.env.CCDM_CLAUDE_PROJECT || ""}.json`);
+
+// Owner messages this session may answer, by message ID.
+const interactions = new Map();
+// The last delivered input-needed reply, until the owner answers it.
+let inputNeededMarker = null;
+
+function removeCapabilityMarker() {
+  try {
+    if (JSON.parse(readFileSync(capabilityPath, "utf8")).pid === process.pid) rmSync(capabilityPath, { force: true });
+  } catch { /* Absent or replaced markers need no cleanup. */ }
+}
+
+async function hasCommandHooks() {
+  const file = process.env.CCDM_CLAUDE_HOOK_SETTINGS;
+  if (!file) return false;
+  try {
+    if ((await stat(file)).mode & 0o077) return false;
+    const settings = JSON.parse(await readFile(file, "utf8"));
+    if (settings.enabledPlugins?.["discord@claude-plugins-official"] !== false) return false;
+    const expected = `node '${path.join(REMINDER_PROJECT_ROOT, "scripts", "claude-reminder-hook.js")}'`;
+    return ["SessionStart", "Stop", "StopFailure", "SessionEnd"].every(event =>
+      settings.hooks?.[event]?.some(group => group.hooks?.some(hook =>
+        hook.type === "command" && hook.command === expected,
+      )),
+    );
+  } catch { return false; }
+}
+
+// This project's router Claude assignment, or null when the registry no
+// longer assigns the channel to it.
+async function reminderAssignment(channelId) {
+  const assignment = await reminder.resolveAssignmentForChannel(channelId, { registryPath: REGISTRY_PATH }).catch(() => null);
+  return assignment?.project === process.env.CCDM_CLAUDE_PROJECT && assignment.project_type === "claude" &&
+    assignment.transport === "router" ? assignment : null;
+}
+
+async function writeCapabilityMarker(granted) {
+  const assignment = LAUNCH_ID ? await reminderAssignment(granted.channel_id) : null;
+  if (!assignment) {
+    await rm(capabilityPath, { force: true });
+    return;
+  }
+  const directory = path.dirname(capabilityPath);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
+  const tmp = `${capabilityPath}.${process.pid}.tmp`;
+  await writeFile(tmp, JSON.stringify({
+    schema_version: 1,
+    project: assignment.project,
+    channel_id: assignment.channel_id,
+    assignment_generation: assignment.assignment_generation,
+    server_version: "1.0.0",
+    transport: "ccdm-channel-server",
+    hooks_configured: await hasCommandHooks(),
+    reply_tool_verified: true,
+    launch_id: LAUNCH_ID,
+    pid: process.pid,
+  }) + "\n", { mode: 0o600 });
+  renameSync(tmp, capabilityPath);
+}
+
+// An owner message opens an interaction the reply tool can name; answering
+// after an input-needed reply records that the work resumed.
+async function recordOwnerMessage(event) {
+  const assignment = await reminderAssignment(event.channel_id);
+  if (!assignment || event.author?.id !== assignment.owner_id) return;
+  interactions.set(event.message_id, {
+    ...assignment,
+    provider: "claude",
+    provider_session_id: LAUNCH_ID,
+    provider_turn_id: event.message_id,
+    interaction_id: event.message_id,
+    source_message_id: event.message_id,
+    initiator_id: event.author.id,
+  });
+  await reminder.emitEvent("owner_activity", { ...assignment, provider: "claude" }, {
+    actor_id: event.author.id,
+    source_message_id: event.message_id,
+    activity_kind: event.attachments?.length ? "attachment" : "message",
+  });
+  if (inputNeededMarker && inputNeededMarker.context.interaction_id !== event.message_id) {
+    const { marker, context } = inputNeededMarker;
+    inputNeededMarker = null;
+    const receipt = path.join(process.env.CCDM_REMINDER_RECEIPTS_DIR || path.join(REMINDER_STATE_DIR, "claude-receipts"), `${marker.event_id}.json`);
+    if (await stat(receipt).then(() => true, () => false)) {
+      await reminder.emitEvent("work_resumed", context, {
+        source_message_id: event.message_id,
+        resumed_from_turn_id: context.provider_turn_id,
+      });
+    }
+  }
+}
+
+// A delivered reply that names an owner interaction in this channel is a
+// Conversation Reminder receipt; the last part of an input-needed reply arms
+// the question.
+async function recordDeliveredReply(input, result) {
+  const context = interactions.get(input.conversation_interaction_id);
+  if (!context || input.chat_id !== context.channel_id) return;
+  const ids = result.message_ids?.length ? result.message_ids : [result.message_id];
+  for (const id of ids) {
+    const disposition = input.conversation_disposition === "input-needed" && id === ids.at(-1) ? "input-needed" : "progress";
+    const marker = await reminder.recordDeliveredReply(context, id, disposition);
+    if (marker && disposition === "input-needed") inputNeededMarker = { marker, context };
+  }
+}
 
 function contextPct() {
   const file = path.join(process.env.CCDM_ROUTER_STATE_DIR || "", "launches", process.env.CCDM_CLAUDE_PROJECT || "", "context.json");
@@ -113,10 +235,18 @@ const TOOLS = {
       chat_id: { type: "string" }, text: { type: "string" },
       reply_to: { type: "string", description: "Message ID to link to. Use message_id from the inbound <channel> block." },
       files: { type: "array", items: { type: "string" }, description: "Absolute file paths to attach. Max 10 files." },
+      conversation_interaction_id: {
+        type: "string", description: "Required for Conversation Reminder readiness: copy message_id from the owner channel message being answered.",
+      },
+      conversation_disposition: {
+        type: "string", enum: ["progress", "input-needed"],
+        description: "Set input-needed only when this delivered reply asks the owner for input while work may continue; otherwise progress.",
+      },
     },
-    required: ["chat_id", "text"],
+    required: ["chat_id", "text", "conversation_interaction_id"],
     op: "reply",
     args: ({ chat_id, text, reply_to, files }) => ({ channel_id: chat_id, text, reply_to, files, context_pct: contextPct() }),
+    delivered: recordDeliveredReply,
     format: result => result.message_ids.length > 1
       ? `sent ${result.message_ids.length} parts (ids: ${result.message_ids.join(", ")})`
       : `sent (id: ${result.message_id})`,
@@ -239,6 +369,11 @@ function scheduleRestart(project) {
   return logPath;
 }
 
+// Reminder events are recorded in arrival order, after any stranded outbox.
+let reminderEvents = reminder.drainOutbox();
+process.on("exit", removeCapabilityMarker);
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(signal, () => process.exit(0));
+
 function main() {
   const project = process.env.CCDM_CLAUDE_PROJECT;
   let key;
@@ -268,7 +403,12 @@ function main() {
     if (paused) pausedEvents.push([kind, event]);
     else notify(kind, event);
   };
-  router.on("message", deliver("message"));
+  router.on("message", event => {
+    reminderEvents = reminderEvents.then(() => recordOwnerMessage(event)).catch(error => {
+      process.stderr.write(`ccdm channel: reminder activity recording failed: ${error.message}\n`);
+    });
+    deliver("message")(event);
+  });
   router.on("reaction", deliver("reaction"));
 
   // Commands run one at a time, in arrival order, and acknowledge like the
@@ -315,11 +455,17 @@ function main() {
   });
   router.on("disconnect", () => process.stderr.write("ccdm channel: Router connection lost; reconnecting\n"));
   router.on("reconnect", () => process.stderr.write("ccdm channel: Router connection restored\n"));
-  router.on("end", error => process.stderr.write(`ccdm channel: Router session ended${error ? `: ${error.code || error.message}` : ""}\n`));
+  router.on("end", error => {
+    removeCapabilityMarker();
+    process.stderr.write(`ccdm channel: Router session ended${error ? `: ${error.code || error.message}` : ""}\n`);
+  });
 
   router.connect().then(
-    granted => {
+    async granted => {
       scope = granted;
+      await writeCapabilityMarker(granted).catch(error => {
+        process.stderr.write(`ccdm channel: capability marker failed: ${error.message}\n`);
+      });
       reportReady({ ok: true, scope: granted });
     },
     error => {
@@ -332,7 +478,19 @@ function main() {
     const tool = Object.hasOwn(TOOLS, name) ? TOOLS[name] : null;
     if (!tool) return send({ id, error: { code: -32602, message: `unknown tool: ${name}` } });
     try {
-      const text = tool.run ? await tool.run(router, input) : tool.format(await router.request(tool.op, tool.args(input)));
+      let text;
+      if (tool.run) {
+        text = await tool.run(router, input);
+      } else {
+        const result = await router.request(tool.op, tool.args(input));
+        // Record the receipt before Claude sees the result, so the Stop hook
+        // that follows the turn finds it.
+        await reminderEvents;
+        await tool.delivered?.(input, result).catch(error => {
+          process.stderr.write(`ccdm channel: receipt recording failed: ${error.message}\n`);
+        });
+        text = tool.format(result);
+      }
       send({ id, result: { content: [{ type: "text", text }] } });
     } catch (error) {
       send({ id, result: { isError: true, content: [{ type: "text", text: `${name} failed: ${error.code || ""} ${error.message}`.trim() }] } });

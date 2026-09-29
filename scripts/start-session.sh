@@ -294,14 +294,15 @@ start_router_session() {
   fi
 
   clear_claude_capability_marker
-  python3 - "$PROJECT" "$router_state" "$launch_dir" "$SCRIPT_DIR/ccdm-channel-server.js" <<'PY' || return 1
+  python3 - "$PROJECT" "$router_state" "$launch_dir" "$SCRIPT_DIR/ccdm-channel-server.js" "$ROOT_DIR" "$CHANNEL_ID" <<'PY' || return 1
 import json
 import os
 import secrets
 import sys
 from pathlib import Path
+from uuid import uuid4
 
-project, router_state, launch_dir, server_script = sys.argv[1:5]
+project, router_state, launch_dir, server_script, root_dir, channel_id = sys.argv[1:7]
 if not project or "/" in project or project.startswith("."):
     sys.exit(f"Invalid project name for a Router launch: {project!r}")
 keys_dir = Path(router_state) / "keys"
@@ -321,24 +322,50 @@ def write_private(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 key_file = keys_dir / f"{project}.key"
+# The channel server records Conversation Reminder events itself; Claude and
+# its command hooks share this launch's reminder context.
+reminder_dir = Path(os.environ.get("CCDM_REMINDER_STATE_DIR") or Path.home() / ".local" / "state" / "ccdm" / "conversation-reminders")
+reminder_env = {
+    "CCDM_REMINDER_PROJECT_ROOT": root_dir,
+    "CCDM_REMINDER_STATE_DIR": str(reminder_dir),
+    "CCDM_REMINDER_RECEIPTS_DIR": str(reminder_dir / "claude-receipts"),
+    "CCDM_CLAUDE_PROJECT": project,
+    "CCDM_CLAUDE_CHANNEL_ID": channel_id,
+    "CCDM_CLAUDE_LAUNCH_ID": str(uuid4()),
+    "CCDM_CLAUDE_HOOK_SETTINGS": str(launch / "settings.json"),
+}
 config = {"mcpServers": {"ccdm": {
     "command": "node",
     "args": [server_script],
     "env": {
-        "CCDM_CLAUDE_PROJECT": project,
+        **reminder_env,
         "CCDM_ROUTER_STATE_DIR": router_state,
         "CCDM_ROUTER_KEY_FILE": str(key_file),
         "CCDM_CHANNEL_READY_FILE": str(launch / "ready.json"),
     },
 }}}
 write_private(launch / "mcp.json", json.dumps(config, indent=2) + "\n")
-# The official Discord plugin must not load beside the CCDM channel.
-write_private(launch / "settings.json", json.dumps({"enabledPlugins": {"discord@claude-plugins-official": False}}, indent=2) + "\n")
+# The official Discord plugin must not load beside the CCDM channel. Hook
+# commands are command hooks: no prompt/agent hook can invoke a model.
+hook = str(Path(root_dir) / "scripts" / "claude-reminder-hook.js")
+write_private(launch / "settings.json", json.dumps({
+    "enabledPlugins": {"discord@claude-plugins-official": False},
+    "hooks": {event: [{"hooks": [{"type": "command", "command": f"node '{hook}'"}]}]
+              for event in ("SessionStart", "Stop", "StopFailure", "SessionEnd")},
+}, indent=2) + "\n")
+write_private(launch / "reminder-env.json", json.dumps(reminder_env) + "\n")
 # Replacing the key revokes whichever session still holds the old one.
 write_private(key_file, secrets.token_urlsafe(32) + "\n")
 PY
 
-  tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$PATH_DIR' && CCDM_ROUTER_KEY_FILE='$key_file'$CONFIG_DIR_ENV claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions --mcp-config '$mcp_config' --settings '$settings'$MODEL_FLAG$EFFORT_FLAG"
+  local reminder_env
+  reminder_env="$(python3 - "$launch_dir/reminder-env.json" <<'PY'
+import json,sys
+e=json.load(open(sys.argv[1]))
+print(''.join(f" {k}='{v}'" for k,v in e.items()))
+PY
+)"
+  tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$PATH_DIR' && CCDM_ROUTER_KEY_FILE='$key_file'$reminder_env$CONFIG_DIR_ENV claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions --mcp-config '$mcp_config' --settings '$settings'$MODEL_FLAG$EFFORT_FLAG"
   echo "Started Claude Router session in tmux session '$SCREEN_NAME'"
 
   # Accept the per-launch development-channel confirmation, then wait for the

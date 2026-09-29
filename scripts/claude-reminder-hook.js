@@ -40,13 +40,15 @@ async function removeReceipts(receipts) {
 }
 
 async function main() {
-  if (!project || !channel || !appId || !launchId) return;
+  if (!project || !channel || !launchId) return;
   const input = await readInput();
   if (!input.session_id || input.agent_id) return;
   const assignment = await reminder.resolveAssignmentForChannel(channel, {
-    registryPath: path.join(root, "registry.json"), botAppId: appId,
+    registryPath: path.join(root, "registry.json"), ...(appId ? { botAppId: appId } : {}),
   });
   if (!assignment || assignment.project !== project || assignment.project_type !== "claude") return;
+  // A pool launch proves its bot app ID; a router launch has no bot of its own.
+  if (!appId && assignment.transport !== "router") return;
   const context = { ...assignment, provider: "claude", provider_session_id: launchId };
   if (input.hook_event_name === "SessionStart") {
     await fs.mkdir(path.dirname(bindingPath), { recursive: true, mode: 0o700 });

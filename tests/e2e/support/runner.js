@@ -502,7 +502,9 @@ function unquote(value) {
 // A fake claude that speaks MCP stdio to its "ccdm" server: it waits for the
 // development-channel confirmation, initializes the server, records every
 // channel notification, and calls the reply tool when a test scripts
-// \`fixtures.claude.replyText\`.
+// \`fixtures.claude.replyText\`. Like Claude, it runs the command hooks from
+// \`--settings\`: SessionStart once the server is up, and Stop after each
+// notification's tool calls finish.
 function runRouterClaudeHost() {
   const sessionName = process.env.CCDM_FIXTURE_TMUX_SESSION;
   const record = (field, value) => updateState((state) => {
@@ -516,6 +518,27 @@ function runRouterClaudeHost() {
     clearInterval(waitForAccept);
     startServer();
   }, 50);
+
+  const sessionId = \`fixture-session-\${process.pid}\`;
+  let hooks = {};
+  try {
+    hooks = JSON.parse(fs.readFileSync(unquote(args[args.indexOf("--settings") + 1]), "utf8")).hooks || {};
+  } catch {
+    // No settings, no hooks.
+  }
+  const hookEnv = { ...process.env, PATH: \`\${path.dirname(process.execPath)}:\${process.env.PATH || ""}\` };
+  async function runHooks(event, fields = {}) {
+    const input = JSON.stringify({ hook_event_name: event, session_id: sessionId, ...fields });
+    for (const hook of (hooks[event] || []).flatMap((group) => group.hooks || [])) {
+      if (hook.type !== "command") continue;
+      const exitCode = await new Promise((done) => {
+        const child = spawn("/bin/sh", ["-c", hook.command], { env: hookEnv, stdio: ["pipe", "ignore", "ignore"] });
+        child.on("exit", done);
+        child.stdin.end(input);
+      });
+      record("hookRuns", { event, exitCode });
+    }
+  }
 
   function startServer() {
     const configPath = unquote(args[args.indexOf("--mcp-config") + 1]);
@@ -555,6 +578,8 @@ function runRouterClaudeHost() {
         lastId = /\\(id: ([^)]+)\\)/.exec(result?.content?.[0]?.text || "")?.[1] || lastId;
       }
     }
+    // One turn at a time: each notification's tool calls, then the Stop hook.
+    let turns = runHooks("SessionStart", { source: "startup" });
     const initializeId = call("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "claude-fixture", version: "1" } });
     let buffer = "";
     child.stdout.setEncoding("utf8");
@@ -572,11 +597,16 @@ function runRouterClaudeHost() {
         } else if (message.method === "notifications/claude/channel") {
           record("channelNotifications", message.params);
           const { replyText, toolScript } = readState().fixtures.claude;
-          if (replyText) {
-            const id = call("tools/call", { name: "reply", arguments: { chat_id: message.params.meta.chat_id, text: replyText } });
-            toolCalls.set(id, { name: "reply" });
-          }
-          if (toolScript) runToolScript(toolScript, message.params.meta);
+          const { meta } = message.params;
+          turns = turns.then(async () => {
+            if (replyText) {
+              await new Promise((done) => {
+                toolCalls.set(call("tools/call", { name: "reply", arguments: { chat_id: meta.chat_id, text: replyText } }), { name: "reply", done });
+              });
+            }
+            if (toolScript) await runToolScript(toolScript, meta);
+            await runHooks("Stop", { stop_hook_active: false, background_tasks: [], session_crons: [] });
+          });
         } else if (toolCalls.has(message.id)) {
           const pending = toolCalls.get(message.id);
           toolCalls.delete(message.id);
