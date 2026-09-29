@@ -103,7 +103,9 @@ let pendingCompactionChannelId = null;
 let messageQueue = [];
 let bridgePaused = false;
 const discordTransport = ROUTER_MODE
-  ? createRouterTransport({ project: ROUTER_PROJECT, keyFile: ROUTER_KEY_FILE, launchDir: ROUTER_LAUNCH_DIR })
+  ? createRouterTransport({
+    project: ROUTER_PROJECT, keyFile: ROUTER_KEY_FILE, launchDir: ROUTER_LAUNCH_DIR, registryPath: REGISTRY_PATH,
+  })
   : createPoolTransport({
     token: BOT_TOKEN,
     primaryChannelId: CHANNEL_ID,
@@ -1296,7 +1298,8 @@ async function buildInput(msg, textOverride = null) {
   } else if (text) {
     input.push({ type: "text", text });
   }
-  for (const att of msg.attachments) {
+  for (const delivered of msg.attachments) {
+    const att = { ...delivered, url: await discordTransport.attachmentUrl(msg, delivered) };
     if (att.contentType && att.contentType.startsWith("image/")) {
       const dataUrl = await fetchAttachmentDataUrl(att.url, att.contentType);
       if (dataUrl) input.push({ type: "image", url: dataUrl });
@@ -1509,7 +1512,7 @@ function startDiscordBot() {
       });
     }
     if (recordedReminder) return;
-    if (!FORWARDED_REACTIONS.has(reaction.emoji.name) || reaction.message.author?.id !== discordTransport.botUserId()) return;
+    if (!FORWARDED_REACTIONS.has(reaction.emoji.name) || !(await discordTransport.isOwnMessage(reaction.message))) return;
 
     const { input, channelId, channelScopeToken } = buildReactionInput(reaction, user);
     console.log(`[discord] ${user.username}: ${reaction.emoji.name} on ${reaction.message.id}`);

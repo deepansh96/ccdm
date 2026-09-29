@@ -148,8 +148,11 @@ function fixtureReaction(client, raw) {
     content: raw.message?.content ?? "",
     id: raw.messageId,
     partial: raw.message?.partial ?? false,
+    // A partial message knows nothing of its webhook until fetched.
+    webhookId: raw.message?.partial ? null : raw.message?.webhookId ?? null,
     async fetch() {
       this.partial = false;
+      this.webhookId = raw.message?.webhookId ?? null;
       return this;
     },
   };

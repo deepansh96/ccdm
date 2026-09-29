@@ -82,6 +82,8 @@ async function classifyReaction(table, reaction, user) {
   if (!route) return null;
   const author = allowedAuthor(new Set(route.guests), table, user);
   if (!author) return null;
+  // An uncached message arrives partial, without its webhook or content.
+  if (reaction.message.partial) await reaction.message.fetch();
   return {
     route,
     event: {
@@ -89,6 +91,10 @@ async function classifyReaction(table, reaction, user) {
       message_id: reaction.message.id,
       channel_id: route.channel_id,
       emoji: reaction.emoji.name,
+      // Which webhook posted the message, if any, so a session can tell its
+      // own Project Identity's messages apart.
+      message_webhook_id: reaction.message.webhookId ? String(reaction.message.webhookId) : null,
+      message_content: String(reaction.message.content || ""),
       user: author,
       ts: new Date().toISOString(),
     },

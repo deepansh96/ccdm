@@ -28,12 +28,14 @@
 //
 // Operations out:
 //   connect()                     -> Promise<{ userTag }> once the gateway is ready
-//   botUserId()                   -> this bot's user ID, for "own message" checks
+//   isOwnMessage(message)         -> Promise<boolean>, whether this session
+//                                    posted it (reaction forwarding)
 //   fetchChannel(channelId)       -> Promise<{ id, name } | null>
 //   send(channelId, chunks)       -> Promise<[{ id }] | undefined>, one message per chunk
 //   sendTyping(channelId)         -> Promise<void>
 //   react(message, emoji)         -> Promise<void>, message from onMessage
 //   removeOwnReaction(message, emoji) -> Promise<void>
+//   attachmentUrl(message, attachment) -> Promise<string>, a URL to fetch it from
 //   supportsNickname              -> whether setNickname(nick) can run
 //   setNickname(nick)             -> Promise<void>, logs its own outcome
 //   setContextPct(pct)            -> optional; records the context percentage
@@ -142,8 +144,8 @@ function createPoolTransport({ token, primaryChannelId, guildId }) {
       return client.login(token).then(() => ready);
     },
 
-    botUserId() {
-      return client?.user?.id;
+    async isOwnMessage(message) {
+      return Boolean(client?.user?.id) && message.author?.id === client.user.id;
     },
 
     async fetchChannel(channelId) {
@@ -173,6 +175,10 @@ function createPoolTransport({ token, primaryChannelId, guildId }) {
 
     async removeOwnReaction(message, emoji) {
       await rawMessages.get(message)?.reactions.cache.get(emoji)?.users.remove(client.user.id);
+    },
+
+    async attachmentUrl(_message, attachment) {
+      return attachment.url;
     },
 
     supportsNickname: Boolean(guildId && token),
@@ -211,7 +217,7 @@ function createPoolTransport({ token, primaryChannelId, guildId }) {
 
 // Router events carry plain fields; the bridge sees them in its message and
 // reaction shapes. A management command arrives as its plain `/command` text.
-function createRouterTransport({ project, keyFile, launchDir }) {
+function createRouterTransport({ project, keyFile, launchDir, registryPath }) {
   let router = null;
   let scope = null;
   let messageHandler = null;
@@ -228,6 +234,7 @@ function createRouterTransport({ project, keyFile, launchDir }) {
       author: { id: event.author.id, bot: false, username: event.author.name },
       mentionedUserIds: [],
       attachments: (event.attachments || []).map((att) => ({
+        id: att.id,
         name: att.name,
         url: att.url,
         contentType: att.content_type,
@@ -245,7 +252,12 @@ function createRouterTransport({ project, keyFile, launchDir }) {
         return {
           emoji: { id: null, name: event.emoji },
           user,
-          message: { id: event.message_id, content: "", channel: channel(event.channel_id), author: null },
+          message: {
+            id: event.message_id,
+            content: event.message_content || "",
+            channel: channel(event.channel_id),
+            webhookId: event.message_webhook_id || null,
+          },
         };
       },
     };
@@ -273,9 +285,17 @@ function createRouterTransport({ project, keyFile, launchDir }) {
       return { userTag: `${project} via the CCDM Router`, scope };
     },
 
-    // Project replies post through the project's webhook, not as a bot user.
-    botUserId() {
-      return null;
+    // Project replies post through the project's webhook, not as a bot user,
+    // so its own messages are those of the webhook the registry records now.
+    async isOwnMessage(message) {
+      if (!message.webhookId) return false;
+      try {
+        const registry = JSON.parse(await readFile(registryPath, "utf8"));
+        return String(registry.projects?.[project]?.webhook_id ?? "") === message.webhookId;
+      } catch (err) {
+        console.error(`Registry unreadable for own-message check: ${err.message || err}`);
+        return false;
+      }
     },
 
     async fetchChannel(channelId) {
@@ -297,6 +317,21 @@ function createRouterTransport({ project, keyFile, launchDir }) {
 
     async react(message, emoji) {
       await router.request("react", { channel_id: message.channel.id, message_id: message.id, emoji });
+    },
+
+    // The Router hands back a still-valid signed URL, re-signing one that has
+    // expired since delivery (a message queued while paused, say). If it
+    // can't, the delivered URL is still worth trying.
+    async attachmentUrl(message, attachment) {
+      try {
+        const resolved = await router.request("download_attachment", {
+          channel_id: message.channel.id, message_id: message.id, attachment_id: attachment.id,
+        });
+        return resolved.url;
+      } catch (err) {
+        console.error(`Router download_attachment failed for ${attachment.name}: ${err.code || err.message}`);
+        return attachment.url;
+      }
     },
 
     // The Router has no reaction-removal operation.

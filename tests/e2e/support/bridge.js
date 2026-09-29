@@ -339,21 +339,31 @@ export async function startFakeCodexServer(workspace, options = {}) {
             pendingTurnReleases.delete(turnId);
           };
           // `mcpReplyText`: the agent replies through the registered Discord
-          // MCP server's reply tool before the turn completes.
+          // MCP server's reply tool before the turn completes. `mcpEditText`
+          // then edits that reply with its edit_message tool.
+          const callTool = (tool, args) => {
+            notify("item/started", {
+              threadId: turnThreadId,
+              turnId: notificationTurnId,
+              item: { type: "mcpToolCall", server: registeredMcpName, tool },
+            });
+            return callRegisteredMcpTool(workspace, registeredMcpConfig, tool, {
+              ...args,
+              scope_token: registeredMcpConfig.env.DISCORD_REPLY_TOKEN,
+            }).then(
+              (result) => {
+                recordCodexEvent(workspace, { event: "mcp-tool-result", tool, result });
+                return result;
+              },
+              (error) => recordCodexEvent(workspace, { event: "mcp-tool-result", tool, error: error.message }),
+            );
+          };
           const finishTurn = plan.mcpReplyText
             ? () => {
-              notify("item/started", {
-                threadId: turnThreadId,
-                turnId: notificationTurnId,
-                item: { type: "mcpToolCall", server: registeredMcpName, tool: "reply" },
-              });
-              callRegisteredMcpTool(workspace, registeredMcpConfig, "reply", {
-                text: plan.mcpReplyText,
-                scope_token: registeredMcpConfig.env.DISCORD_REPLY_TOKEN,
-              }).then(
-                (result) => recordCodexEvent(workspace, { event: "mcp-tool-result", tool: "reply", result }),
-                (error) => recordCodexEvent(workspace, { event: "mcp-tool-result", tool: "reply", error: error.message }),
-              ).then(completeTurn);
+              callTool("reply", { text: plan.mcpReplyText }).then((result) => {
+                const messageId = /\(id: ([^)]+)\)/.exec(result?.content?.[0]?.text ?? "")?.[1];
+                if (plan.mcpEditText && messageId) return callTool("edit_message", { message_id: messageId, text: plan.mcpEditText });
+              }).then(completeTurn);
             }
             : completeTurn;
           if (plan.waitForRelease) {
@@ -478,6 +488,7 @@ export function injectDiscordReaction(workspace, reaction = {}) {
       author: { bot: true, id: "fixture-bot-user-id", username: "Fixture Bot", ...(reaction.message?.author ?? {}) },
       content: reaction.message?.content ?? "",
       partial: reaction.message?.partial ?? false,
+      ...(reaction.message?.webhookId ? { webhookId: reaction.message.webhookId } : {}),
     },
     messageId: reaction.messageId ?? "bot-message-id",
     partial: reaction.partial ?? false,
