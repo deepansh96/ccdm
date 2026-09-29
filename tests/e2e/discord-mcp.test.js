@@ -260,68 +260,31 @@ test("Discord MCP reads 500 recent messages across API pages", async () => {
   );
 });
 
-test("Discord MCP read-only mode exposes only the read tools and hides all others", async () => {
+// Claude sessions read history through the CCDM channel server's Router
+// operations, so the retired Claude read-only mode no longer starts a server
+// that reads a bot token from a state directory.
+test("Discord MCP without a Router launch key refuses the retired read-only mode and reads no bot token", async () => {
   const workspace = createBridgeWorkspace();
+  const botStateDir = fs.mkdtempSync(path.join(workspace.homeDir, "bot-state-"));
+  fs.writeFileSync(path.join(botStateDir, ".env"), "DISCORD_BOT_TOKEN=state-token\n");
+
   const result = await runNodeEntrypoint(workspace, "scripts/discord-mcp-server.js", {
     env: bridgeChildEnv(workspace, {
       BOT_TOKEN: "",
       CHANNEL_ID: "channel-id",
       DISCORD_MCP_EXPORT_ONLY: "1",
+      DISCORD_STATE_DIR: botStateDir,
     }),
     input: [
       rpc(1, "tools/list", {}),
-      toolCall(2, "reply", { text: "hidden" }),
-      toolCall(3, "fetch_messages", {}),
-      toolCall(4, "download_attachment", { message_id: "1" }),
+      toolCall(2, "read_last_x_messages_in_channel", { count: 2 }),
     ].join("\n") + "\n",
   });
 
-  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  const output = responseById(result);
-  assert.deepEqual(
-    output.get(1).result.tools.map((tool) => tool.name),
-    ["read_last_x_messages_in_channel", "export_message_range"],
-  );
-  for (const id of [2, 3, 4]) {
-    assert.equal(output.get(id).result.isError, true);
-    assert.match(output.get(id).result.content[0].text, /unavailable in read-only mode/);
-  }
-  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.messages ?? [], []);
-});
-
-test("Discord MCP read-only mode reads recent messages with the state-directory token", async () => {
-  const workspace = createBridgeWorkspace();
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.restMessages = [
-    { id: "203", timestamp: "2026-09-27T10:02:00.000Z", content: "latest", author: { username: "Alice" }, attachments: [] },
-    { id: "202", timestamp: "2026-09-27T10:01:00.000Z", content: "reply", author: { username: "bot", bot: true }, attachments: [{}] },
-    { id: "201", timestamp: "2026-09-27T10:00:00.000Z", content: "older", author: { username: "Alice" }, attachments: [] },
-  ];
-  writeState(state, workspace.stateDir);
-  const botStateDir = fs.mkdtempSync(path.join(workspace.homeDir, "bot-state-"));
-  fs.writeFileSync(path.join(botStateDir, ".env"), "DISCORD_BOT_TOKEN=state-token\n");
-  const env = { BOT_TOKEN: "", CHANNEL_ID: "channel-id", DISCORD_MCP_EXPORT_ONLY: "1" };
-
-  const result = await runNodeEntrypoint(workspace, "scripts/discord-mcp-server.js", {
-    env: bridgeChildEnv(workspace, { ...env, DISCORD_STATE_DIR: botStateDir }),
-    input: `${toolCall(1, "read_last_x_messages_in_channel", { count: 2 })}\n`,
-  });
-  const missing = await runNodeEntrypoint(workspace, "scripts/discord-mcp-server.js", {
-    env: bridgeChildEnv(workspace, { ...env, DISCORD_STATE_DIR: path.join(botStateDir, "missing") }),
-    input: `${toolCall(1, "read_last_x_messages_in_channel", { count: 2 })}\n`,
-  });
-
-  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  assert.equal(
-    responseById(result).get(1).result.content[0].text,
-    "[2026-09-27T10:01:00.000Z] me: reply +1att (id: 202)\n[2026-09-27T10:02:00.000Z] Alice: latest (id: 203)",
-  );
-  assert.deepEqual(
-    readState(workspace.stateDir).fixtures.discord.fetches,
-    [{ authorization: "Bot state-token", channelId: "channel-id", limit: 2 }],
-  );
-  assert.equal(responseById(missing).get(1).result.isError, true);
-  assert.match(responseById(missing).get(1).result.content[0].text, /No bot token found/);
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /Missing CCDM_ROUTER_KEY_FILE or CHANNEL_ID/);
+  assert.equal(result.stdout, "");
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.fetches ?? [], []);
 });
 
 test("Discord MCP writes require the bridge scope token when configured", async () => {

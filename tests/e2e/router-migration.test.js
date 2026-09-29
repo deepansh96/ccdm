@@ -6,15 +6,17 @@ import test from "node:test";
 import { startFakeCodexServer } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import { OWNER_ID, createRouterWorkspace, routerEnv, runRouterCli, startRouter } from "./support/router.js";
-import { readState, writeState } from "./support/state.js";
+import { readState, seedTmuxSession, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => {
   await cleanup();
 });
 
-// `demo` is a pool Claude project served by `bot2` from `discord2`; the
-// Router is not serving it yet. `ensure-webhook` gives it `fake-webhook-1`.
+// `demo` is an unmigrated Claude project: no `transport` field or webhook
+// yet, and a stale entry for its former pool bot `bot2`. Claude has no pool
+// mode, so its session is already a Router session. `ensure-webhook` gives it
+// `fake-webhook-1`.
 function poolClaudeWorkspace() {
   const workspace = createRouterWorkspace({
     discord_user_id: OWNER_ID,
@@ -70,7 +72,7 @@ function migrate(workspace, args, extraEnv = {}) {
   });
 }
 
-function startPoolClaude(workspace) {
+function startClaude(workspace) {
   return runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace) });
 }
 
@@ -84,10 +86,10 @@ const webhookMessages = (workspace) => (readState(workspace.stateDir).fixtures.d
   .filter((message) => message.webhookId)
   .map(({ channelId, webhookId }) => ({ channelId, webhookId }));
 
-test("migrating a pool Claude project moves it to the Router, verifies a probe round trip, and exits 0", async () => {
+test("migrating an unmigrated Claude project records it on the Router, verifies a probe round trip, and exits 0", async () => {
   const { workspace } = poolClaudeWorkspace();
   await startRouter(workspace);
-  const pooled = await startPoolClaude(workspace);
+  const pooled = await startClaude(workspace);
   assert.equal(pooled.exitCode, 0, pooled.stderr || pooled.stdout);
 
   const result = await migrate(workspace, ["demo"]);
@@ -102,7 +104,7 @@ test("migrating a pool Claude project moves it to the Router, verifies a probe r
   assert.match(demo.assignment_generation, /^gen-[0-9a-f]{32}$/);
   assert.deepEqual(await routerSessions(workspace), [{ role: "project", project: "demo", channel_id: "demo-channel" }]);
   assert.deepEqual(webhookMessages(workspace), [{ channelId: "demo-channel", webhookId: "fake-webhook-1" }]);
-  // The pool bot's Claude listener is gone; the router launch holds the tmux session.
+  // The router launch holds the tmux session.
   const session = readState(workspace.stateDir).fixtures.tmux.sessions.demo_claude;
   assert.equal(session.env?.DISCORD_STATE_DIR, undefined);
 });
@@ -128,10 +130,9 @@ test("migrating a Codex project with no transport field or webhook records it on
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.beta_codex.env?.BOT_TOKEN, undefined);
 });
 
-test("a preflight failure with the Router down exits non-zero before stopping the pool session", async () => {
+test("a preflight failure with the Router down exits non-zero before stopping the running session", async () => {
   const { workspace } = poolClaudeWorkspace();
-  const pooled = await startPoolClaude(workspace);
-  assert.equal(pooled.exitCode, 0, pooled.stderr || pooled.stdout);
+  seedTmuxSession("demo_claude", { paneOutput: "running\n" }, { stateDir: workspace.stateDir });
   const before = readRegistry(workspace);
 
   const result = await migrate(workspace, ["demo"]);
@@ -141,8 +142,7 @@ test("a preflight failure with the Router down exits non-zero before stopping th
   assert.doesNotMatch(result.stdout, /^stop:/m);
   assert.match(result.stderr, /stopped at preflight: .*nothing changed/);
   assert.deepEqual(readRegistry(workspace), before);
-  const session = readState(workspace.stateDir).fixtures.tmux.sessions.demo_claude;
-  assert.equal(session.env.DISCORD_STATE_DIR, path.join(workspace.homeDir, ".claude", "channels", "discord2"));
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.demo_claude.paneOutput, "running\n");
 });
 
 test("a preflight failure names root's missing permissions in the project channel", async () => {
@@ -159,52 +159,45 @@ test("a preflight failure names root's missing permissions in the project channe
   assert.equal(readRegistry(workspace).projects.demo.transport, undefined);
 });
 
-test("a launcher failure after the stop rolls back to pool, restarts the pool session, and names the failed step", async () => {
-  const { workspace, poolStateDir } = poolClaudeWorkspace();
+test("a verify failure after the stop rolls back to the previous registry state, restarts the session, and names the failed step", async () => {
+  const { workspace } = poolClaudeWorkspace();
   await startRouter(workspace);
-  const pooled = await startPoolClaude(workspace);
-  assert.equal(pooled.exitCode, 0, pooled.stderr || pooled.stdout);
-  // The fixture Claude never confirms the development channel, so the router launch fails.
+  const running = await startClaude(workspace);
+  assert.equal(running.exitCode, 0, running.stderr || running.stdout);
+  // The probe comes back under another webhook, so verification fails.
   const state = readState(workspace.stateDir);
-  state.fixtures.tmux.devChannelPrompt = "never";
+  state.fixtures.discord.webhookExecuteReturnsWebhookId = "someone-elses-webhook";
   writeState(state, workspace.stateDir);
 
-  const result = await migrate(workspace, ["demo"], { CCDM_CLAUDE_LAUNCH_TIMEOUT_S: "1" });
+  const result = await migrate(workspace, ["demo"]);
 
   assert.notEqual(result.exitCode, 0);
-  assert.match(result.stdout, /^start: failed — start-session.sh exited 1: Launch of 'demo' failed/m);
-  assert.match(result.stdout, /^rolling back demo to its pool bot after the start step failed$/m);
-  assert.match(result.stderr, /migration of demo failed at start/);
+  assert.match(result.stdout, /^verify: failed — .*someone-elses-webhook/m);
+  assert.match(result.stdout, /^rolling back demo to its previous registry state after the verify step failed$/m);
+  assert.match(result.stderr, /migration of demo failed at verify: .*; rolled back to its previous registry state/);
   const demo = readRegistry(workspace).projects.demo;
   assert.deepEqual({ transport: demo.transport, bot_id: demo.bot_id }, { transport: undefined, bot_id: "bot2" });
   assert.match(demo.assignment_generation, /^gen-[0-9a-f]{32}$/);
   assert.equal(typeof demo.pid, "number");
   const session = readState(workspace.stateDir).fixtures.tmux.sessions.demo_claude;
-  assert.equal(session.env.DISCORD_STATE_DIR, poolStateDir);
-  assert.deepEqual(await routerSessions(workspace), []);
+  assert.equal(session.env.DISCORD_STATE_DIR, undefined);
+  assert.deepEqual(await routerSessions(workspace), [{ role: "project", project: "demo", channel_id: "demo-channel" }]);
 });
 
-test("--rollback returns a migrated project to its pool bot, which serves it again", async () => {
-  const { workspace, poolStateDir } = poolClaudeWorkspace();
+test("--rollback refuses a migrated Claude project, which has no pool bot to return to", async () => {
+  const { workspace } = poolClaudeWorkspace();
   await startRouter(workspace);
   const migrated = await migrate(workspace, ["demo"]);
   assert.equal(migrated.exitCode, 0, migrated.stderr || migrated.stdout);
-  const forward = readRegistry(workspace).projects.demo.assignment_generation;
+  const before = readRegistry(workspace);
 
   const result = await migrate(workspace, ["--rollback", "demo"]);
 
-  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  for (const step of ["preflight", "stop", "transport", "assignment-changed", "start"]) {
-    assert.match(result.stdout, new RegExp(`^${step}: ok`, "m"), result.stdout);
-  }
-  const demo = readRegistry(workspace).projects.demo;
-  assert.deepEqual({ transport: demo.transport, bot_id: demo.bot_id }, { transport: undefined, bot_id: "bot2" });
-  assert.match(demo.assignment_generation, /^gen-[0-9a-f]{32}$/);
-  assert.notEqual(demo.assignment_generation, forward);
-  const session = readState(workspace.stateDir).fixtures.tmux.sessions.demo_claude;
-  assert.equal(session.env.DISCORD_STATE_DIR, poolStateDir);
-  assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", "demo.key")), false);
-  assert.deepEqual(await routerSessions(workspace), []);
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stdout, /^preflight: failed — demo is a Claude project, and Claude has no pool bot to return to/m);
+  assert.doesNotMatch(result.stdout, /^stop:/m);
+  assert.deepEqual(readRegistry(workspace), before);
+  assert.deepEqual(await routerSessions(workspace), [{ role: "project", project: "demo", channel_id: "demo-channel" }]);
 });
 
 test("probe fails clearly when Discord returns the message under another webhook_id", async () => {

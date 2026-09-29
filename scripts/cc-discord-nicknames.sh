@@ -1,7 +1,8 @@
 #!/bin/bash
-# Updates bot Discord nicknames with context window usage (e.g. "bot4-quiz · 42%").
+# Records a Router session's context window usage, which its replies carry.
+# It never PATCHes a Discord nickname.
 # Set as the statusLine command in ~/.claude/settings.json.
-# Requires: DISCORD_STATE_DIR env var (set automatically for Discord sessions).
+# Uses CCDM_ROUTER_KEY_FILE (set automatically for CCDM Claude sessions).
 # Use cc-statusline-wrapper.sh instead if you also want the ccstatusline terminal UI.
 
 source "$(dirname "$0")/_update-nickname.sh"

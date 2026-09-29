@@ -9,7 +9,7 @@ This service records owner acknowledgment, `/close`, reopening, and qualifying C
 - The root bot must be able to view and read project channels. Assigned project bots need view, history, send, and reaction permissions in their own channels. The service checks these permissions and does not change them.
 - Claude projects require the verified launch-scoped reminder adapter to be running; its capability marker proves only that live launch. Codex projects require the current bridge adapter. Unsupported and remote Claude assignments remain excluded.
 - Python 3 and Node 22 or newer. The supervised worker uses the interpreters the installer resolved, not the login shell's `PATH`.
-- Both provider adapters must be installed: `scripts/codex-bridge.js`, `scripts/discord-mcp-server.js`, `scripts/claude-reminder-channel.js`, `scripts/claude-reminder-hook.js`, and `scripts/conversation-reminder-adapter.js`. If any is missing, no channel receives reminders, including Codex channels. There is no Codex-only override.
+- Both provider adapters must be installed: `scripts/codex-bridge.js`, `scripts/discord-mcp-server.js`, `scripts/ccdm-channel-server.js`, `scripts/claude-reminder-hook.js`, and `scripts/conversation-reminder-adapter.js`. If any is missing, no channel receives reminders, including Codex channels. There is no Codex-only override.
 
 ## Enabling reminders
 

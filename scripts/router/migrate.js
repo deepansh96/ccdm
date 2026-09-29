@@ -75,16 +75,12 @@ async function projectEntry(project) {
   const registry = await readRegistry(registryPath());
   const entry = registry.projects?.[project];
   if (!entry?.channel_id) throw new Error(`${project} is not a registered project with a channel_id`);
-  // Codex has no pool mode: a Codex project's fallback is its previous registry state.
-  if (entry.type !== "codex" && !(registry.pool || []).some(bot => bot.id === entry.bot_id)) {
-    throw new Error(`${project} has no pool bot to fall back to (bot_id ${entry.bot_id ?? "unset"})`);
-  }
   return entry;
 }
 
 async function preflight(project) {
   const entry = await projectEntry(project);
-  if (entry.transport === "router") throw new Error(`${project} is already on the Router; use --rollback to return it to its pool bot`);
+  if (entry.transport === "router") throw new Error(`${project} is already on the Router`);
   const status = await routerStatus(project);
   if (status.gateway !== "ready") throw new Error(`the Router's gateway is ${status.gateway}, not ready`);
   const missing = status.target?.missing_permissions;
@@ -139,7 +135,8 @@ async function migrate(project) {
     await step("verify", () => verify(project, entry));
   } catch (error) {
     if (!(error instanceof StepFailure)) throw error;
-    const previous = entry.type === "codex" ? "its previous registry state" : "its pool bot";
+    // Neither Claude nor Codex has a pool mode: the fallback is the project's previous registry state.
+    const previous = "its previous registry state";
     console.log(`rolling back ${project} to ${previous} after the ${error.step} step failed`);
     const rolledBack = await rollbackSteps(project, entry, { reassign: reassigned })
       .then(() => `rolled back to ${previous}`, failure => `rollback also failed at ${failure.step}: ${failure.message}`);
@@ -148,28 +145,22 @@ async function migrate(project) {
   console.log(`migrated ${project} to the Router`);
 }
 
-// Stops whatever serves the project, then restores its pool bot.
+// Stops whatever serves the project, then restores its previous registry state.
 async function rollbackSteps(project, entry, { reassign: issue = true } = {}) {
   await step("stop", () => script("stop-session.sh", project));
-  await step("transport", async () => { await setTransport(project, null); return "pool"; });
+  await step("transport", async () => { await setTransport(project, null); return "previous"; });
   if (issue) await step("assignment-changed", async () => `generation ${await reassign(project)}`);
   await step("start", () => script(launcher(entry), project));
 }
 
+// Neither Claude nor Codex has a pool bot to return to, so a rollback only
+// explains that and changes nothing.
 async function rollback(project) {
-  let entry;
   await step("preflight", async () => {
-    entry = await projectEntry(project);
-    if (entry.type === "codex") throw new Error(`${project} is a Codex project, and Codex has no pool bot to return to`);
-    if (entry.transport !== "router") throw new Error(`${project} is not on the Router`);
-    return `pool bot ${entry.bot_id}`;
+    const entry = await projectEntry(project);
+    const provider = entry.type === "codex" ? "Codex" : "Claude";
+    throw new Error(`${project} is a ${provider} project, and ${provider} has no pool bot to return to`);
   });
-  try {
-    await rollbackSteps(project, entry);
-  } catch (error) {
-    throw new Error(`rollback of ${project} failed at ${error.step ?? "an unknown step"}: ${error.message}`);
-  }
-  console.log(`rolled ${project} back to its pool bot ${entry.bot_id}`);
 }
 
 const args = process.argv.slice(2);

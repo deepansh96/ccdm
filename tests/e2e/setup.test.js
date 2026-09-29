@@ -33,6 +33,9 @@ test("setup creates a first-run registry, state files, and executable scripts", 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.match(result.stdout, /Created registry\.json/);
   assert.match(result.stdout, /Setup complete/);
+  // Root Claude starts as a Router client, never through the official Discord plugin.
+  assert.match(result.stdout, /restart-root-agent\.sh/);
+  assert.doesNotMatch(result.stdout, /plugin:discord|DISCORD_STATE_DIR=/);
 
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8")), {
     discord_user_id: "123456789",

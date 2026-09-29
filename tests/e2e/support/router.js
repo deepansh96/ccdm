@@ -13,8 +13,9 @@ import { registerTeardownCallback } from "./teardown.js";
 export const OWNER_ID = "owner-id";
 export const ROOT_TOKEN = "root-bot-token";
 
-// A router-transport Claude project, a router-transport Codex project, and a
-// pool project whose bot still serves its own channel.
+// A router-transport Claude project, a router-transport Codex project, and an
+// unmigrated Claude project that still names its former pool bot. Neither
+// Claude nor Codex has a pool mode, so the Router routes all three.
 export function routerRegistry(overrides = {}) {
   return {
     discord_user_id: OWNER_ID,

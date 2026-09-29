@@ -356,21 +356,16 @@ function spawnPlaceholder() {
 function parseClaudeLaunch(shellCommand) {
   const quoted =
     /^cd '([\\s\\S]*)' && ([\\s\\S]*?) claude ([\\s\\S]+)$/.exec(shellCommand);
-  const unquoted = quoted ? null : /^cd ([^&]+) && DISCORD_STATE_DIR=([^\\s]+) claude ([\\s\\S]+)$/.exec(shellCommand);
-  if (!quoted && !unquoted) {
+  if (!quoted) {
     throw new Error(\`unsupported tmux launch command: \${shellCommand}\`);
   }
   const env = {};
-  if (quoted) {
-    const envRe = /([A-Z_]+)=(?:'([^']*)'|([^\\s]+))/g;
-    for (const match of quoted[2].matchAll(envRe)) env[match[1]] = match[2] ?? match[3];
-  } else {
-    env.DISCORD_STATE_DIR = unquoted[2];
-  }
-  const claudeArgs = (quoted ? quoted[3] : unquoted[3]).trim().split(/\\s+/);
+  const envRe = /([A-Z_]+)=(?:'([^']*)'|([^\\s]+))/g;
+  for (const match of quoted[2].matchAll(envRe)) env[match[1]] = match[2] ?? match[3];
+  const claudeArgs = quoted[3].trim().split(/\\s+/);
   validateClaudeInvocation(claudeArgs, env);
   return {
-    cwd: quoted ? quoted[1] : unquoted[1],
+    cwd: quoted[1],
     env,
     claudeArgs,
   };
@@ -413,22 +408,18 @@ function parseTmuxLaunch(shellCommand) {
   return { kind: "claude-listener", ...parseClaudeLaunch(shellCommand) };
 }
 
+// Every Claude launch is a Router launch: the CCDM channel and a launch key
+// file path, never the official Discord plugin or a bot state directory.
 function validateClaudeInvocation(claudeArgs, env) {
-  const channelsIndex = claudeArgs.indexOf("--channels");
   const developmentIndex = claudeArgs.indexOf("--dangerously-load-development-channels");
-  const routerChannel = developmentIndex !== -1 && claudeArgs[developmentIndex + 1] === "server:ccdm";
-  if (!(
-    (channelsIndex !== -1 && claudeArgs[channelsIndex + 1]?.startsWith("plugin:discord")) ||
-    (developmentIndex !== -1 && claudeArgs[developmentIndex + 1] === "server:discord") ||
-    routerChannel
-  )) {
-    throw new Error("claude listener must use the official, filtered Discord, or CCDM channel");
+  if (developmentIndex === -1 || claudeArgs[developmentIndex + 1] !== "server:ccdm" || claudeArgs.includes("--channels")) {
+    throw new Error("claude listener must use the CCDM channel");
   }
   if (!claudeArgs.includes("--dangerously-skip-permissions")) {
     throw new Error("claude listener must use --dangerously-skip-permissions");
   }
-  if (!routerChannel && !env.DISCORD_STATE_DIR) {
-    throw new Error("DISCORD_STATE_DIR is required for claude listener");
+  if (!env.CCDM_ROUTER_KEY_FILE || env.DISCORD_STATE_DIR) {
+    throw new Error("CCDM_ROUTER_KEY_FILE, and no DISCORD_STATE_DIR, is required for claude listener");
   }
 }
 
@@ -662,9 +653,7 @@ function runTmux() {
         ? \`node scripts/codex-bridge.js CHANNEL_ID='\${launch.env.CHANNEL_ID}' WS_PORT='\${launch.env.WS_PORT}' CCDM_ROUTER_KEY_FILE='\${launch.env.CCDM_ROUTER_KEY_FILE}'\`
         : launch.kind === "codex-bridge"
         ? \`node scripts/codex-bridge.js CHANNEL_ID='\${launch.env.CHANNEL_ID}' BOT_APP_ID='\${launch.env.BOT_APP_ID}' WS_PORT='\${launch.env.WS_PORT}'\`
-        : routerChannel
-          ? \`claude \${launch.claudeArgs.join(" ")} CCDM_ROUTER_KEY_FILE='\${launch.env.CCDM_ROUTER_KEY_FILE}'\`
-          : \`claude \${launch.claudeArgs.join(" ")} DISCORD_STATE_DIR='\${launch.env.DISCORD_STATE_DIR}'\${launch.env.CLAUDE_CONFIG_DIR ? \` CLAUDE_CONFIG_DIR='\${launch.env.CLAUDE_CONFIG_DIR}'\` : ""}\`;
+        : \`claude \${launch.claudeArgs.join(" ")} CCDM_ROUTER_KEY_FILE='\${launch.env.CCDM_ROUTER_KEY_FILE}'\`;
     const devChannelPrompt = routerChannel ? (tmuxState.devChannelPrompt === "never" ? "never" : "pending") : undefined;
     const paneOutput =
       launch.kind === "codex-bridge"
@@ -839,8 +828,7 @@ function runPkill() {
 
 function runClaude() {
   if (args.length === 1 && args[0] === "--version") {
-    console.log(process.env.CCDM_FIXTURE_CLAUDE_VERSION ||
-      (process.env.CCDM_CLAUDE_REMINDER_ADAPTER === "1" ? "2.1.281 (Claude Code fixture)" : "Claude Code fixture 1.0.0"));
+    console.log(process.env.CCDM_FIXTURE_CLAUDE_VERSION || "Claude Code fixture 1.0.0");
     return;
   }
   try {

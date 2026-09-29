@@ -52,7 +52,7 @@ V5_CONVERSATION_COLUMNS = V6_CONVERSATION_COLUMNS - {"consecutive_reminders"}
 # reminder; there is no Codex-only release.
 PROVIDER_COMPONENTS = {
     "codex": ("scripts/codex-bridge.js", "scripts/discord-mcp-server.js", "scripts/conversation-reminder-adapter.js"),
-    "claude": ("scripts/claude-reminder-channel.js", "scripts/claude-reminder-hook.js",
+    "claude": ("scripts/ccdm-channel-server.js", "scripts/claude-reminder-hook.js",
                "scripts/conversation-reminder-adapter.js"),
 }
 

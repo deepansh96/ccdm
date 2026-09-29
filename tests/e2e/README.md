@@ -103,12 +103,12 @@ Scenario `PATH` contains only harness-owned fixture binaries and approved host w
 The tmux/process fixture contract covers the Claude start surface:
 
 - `tmux has-session` returns the current fixture session state with production-compatible exit codes.
-- `tmux new-session -d -s <name> -- zsh -ic <command>` validates the Claude Discord launch shape, records the session command, cwd, environment, pane output, and a harness-owned placeholder PID.
+- `tmux new-session -d -s <name> -- zsh -ic <command>` validates the Claude Router launch shape (the `server:ccdm` channel with `CCDM_ROUTER_KEY_FILE`, never the official plugin or `DISCORD_STATE_DIR`), records the session command, cwd, environment, and pane output, and runs a fake `claude` that hosts the real channel server.
 - `tmux capture-pane` returns recorded pane output, and `tmux send-keys` is recorded so tests can assert the current start surface does not send trust-dialog keys.
 - `ps axeww -o pid=,command=` and `pgrep -P <pid>` expose only rows owned by the current `$CCDM_TEST_STATE`; fabricated or foreign PID rows in fixture state are omitted.
 - `pkill -TERM -P <pid>` sends SIGTERM only to harness-owned child rows exposed by the same process model.
 - `sleep` is a fixture-mode no-op linked to the host `true` binary so background restart paths such as `sleep 8 && tmux send-keys` complete without waiting.
-- The Claude fixture supports `claude --version`, validates `--channels plugin:discord...` listener invocations, records the invocation, and writes fixture session metadata under fixture `HOME/.claude/sessions`.
+- The Claude fixture supports `claude --version`, validates `server:ccdm` listener invocations, records the invocation, and writes fixture session metadata under fixture `HOME/.claude/sessions` (or the launch's `CLAUDE_CONFIG_DIR`).
 
 The same tmux/process contract covers the Codex startup surface:
 
@@ -173,10 +173,9 @@ The tracked `scripts/usage-stats-poster.py` scenarios drive the manual Discord p
 
 The nickname/statusline scenarios drive `scripts/cc-discord-nicknames.sh`, `scripts/cc-statusline-wrapper.sh`, and their shared `_update-nickname.sh` helper:
 
-- Project sessions read the fixture root bot token from fixture `HOME/.claude/channels/discord/.env`, resolve the project bot app id through the fixture registry, and send `PATCH /api/v10/guilds/:guild/members/:appId` through the shell-level fake `curl`.
-- Root-like sessions whose state dir has no registry app id send `PATCH /api/v10/guilds/:guild/members/@me` with the session bot token. Scripted fake-curl failures are recorded without making the wrapper fail, matching the current background-subshell behavior.
-- Skip scenarios cover `DISABLE_DISCORD_MESSAGE=true`, missing `DISCORD_STATE_DIR`, and missing `context_window.used_percentage`.
-- Rate-limit scenarios use unique fixture Discord state directory basenames so the production hardcoded `/tmp/cc-context-<state>` files do not collide across tests. The files are cleaned up explicitly after each scenario because this path is not redirected by fixture `TMPDIR`.
+- No session PATCHes a nickname: project and root state directories that still hold bot tokens, a stale registry pool entry, and repeated renders all leave the shell-level fake `curl` and the fake Discord nickname store empty, and write no `/tmp/cc-context-<state>` file.
+- Pass-through scenarios cover `DISABLE_DISCORD_MESSAGE=true`, missing `DISCORD_STATE_DIR`, and missing `context_window.used_percentage`.
+- Router sessions (`CCDM_ROUTER_KEY_FILE`) write the latest context percentage to their launch directory instead (`router-claude-session.test.js`).
 - `cc-statusline-wrapper.sh` pipes stdin JSON to the `npx` fixture as `npx -y ccstatusline@latest`; the fixture returns deterministic output and blocks unapproved package execution without npm network access.
 - Shell-level fake `curl` routing is separate from JS-level Discord interception: these shell scripts use the fixture binary on `PATH`, while bridge and MCP tests route Discord REST and gateway behavior through the child-scoped preload and JavaScript shims.
 
@@ -249,7 +248,7 @@ GitHub Actions runs the Default CI Suite on `push` and `pull_request` with Node 
 
 ## Hardcoded-Boundary Inventory
 
-- `/tmp/cc-context-<state>` nickname files are created by the production nickname helper outside fixture `TMPDIR`. Tests use unique state directory basenames, assert the boundary, and clean the files explicitly.
+- `/tmp/cc-context-<state>` was the retired nickname rate-limit file outside fixture `TMPDIR`. Tests use unique state directory basenames, assert that no such file is written, and clean up explicitly.
 - Shell builtin `kill` is not intercepted. Stop/restart tests constrain fake process discovery to harness-owned placeholder PIDs and assert observable process cleanup instead of command-order internals.
 
 ## Extraction Follow-Ups

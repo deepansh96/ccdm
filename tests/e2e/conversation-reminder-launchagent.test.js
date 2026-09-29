@@ -6,7 +6,7 @@ import test from "node:test";
 import { spawn, spawnSync } from "node:child_process";
 
 import { createWorkspace, runScript } from "./support/runner.js";
-import { startBridge } from "./support/router.js";
+import { routerEnv, runRouterCli, startBridge, waitFor, writeProjectKey } from "./support/router.js";
 import {
   bridgeChildEnv, createBridgeWorkspace, injectDiscordMessage, startFakeCodexServer, waitForState,
 } from "./support/bridge.js";
@@ -331,18 +331,16 @@ test("the reminder supervisor leaves the Usage Stats Poster service, storage, an
   assert.deepEqual(readState(workspace.stateDir).fixtures.discord.sends, []);
 });
 
-// Both providers in one registry, each with its own channel: the Claude
-// project has its assigned pool bot, and the Codex project is served through
-// the Router, which gives it webhook `fake-webhook-1` when its bridge starts.
+// Both providers in one registry, each with its own channel, both served
+// through the Router: the Codex project gets webhook `fake-webhook-1` when its
+// bridge starts, and the Claude project `fake-webhook-2` after it.
+const CLAUDE_WEBHOOK = "fake-webhook-2";
+
 function setupBothProviders(workspace) {
-  const claudeState = path.join(workspace.homeDir, ".claude", "channels", "discord-claude-demo");
   fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), JSON.stringify({
     discord_user_id: "owner-id", guild_id: "guild-id", root_bot_app_id: "root-app",
-    pool: [
-      { id: "claude-bot", app_id: "claude-app", token: "fixture-claude-token", state_dir: claudeState },
-    ],
     projects: {
-      "claude-demo": { type: "claude", path: workspace.repoDir, bot_id: "claude-bot", channel_id: "claude-channel",
+      "claude-demo": { type: "claude", transport: "router", path: workspace.repoDir, channel_id: "claude-channel",
         assignment_generation: "gen-claude", screen_name: "claude-demo_claude" },
       "codex-demo": { type: "codex", transport: "router", path: workspace.repoDir, channel_id: "codex-channel",
         assignment_generation: "gen-codex", screen_name: "codex-demo_codex" },
@@ -366,36 +364,18 @@ function setupBothProviders(workspace) {
   };
 }
 
-// One Claude turn through the launch-scoped reminder channel around a Local
-// Fake of the official Discord plugin: the owner's message reaches Claude, and
-// Claude's reply asks for input and is confirmed by the plugin. The launch
-// stays up until stopped, because readiness requires its live adapter.
-async function claudeTurn(workspace, context, { messageId, answerId }) {
-  const fake = path.join(workspace.tmpDir, "fake-official-discord.cjs");
-  fs.writeFileSync(fake, `
-process.stdin.setEncoding("utf8");
-let buffer = "";
-const write = value => process.stdout.write(JSON.stringify(value) + "\\n");
-process.stdin.on("data", chunk => {
-  buffer += chunk;
-  for (let end; (end = buffer.indexOf("\\n")) >= 0;) {
-    const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
-    if (!line) continue;
-    const request = JSON.parse(line);
-    if (request.method === "initialize") write({ jsonrpc: "2.0", id: request.id, result: {
-      protocolVersion: "2025-03-26", capabilities: { experimental: { "claude/channel": {} }, tools: {} },
-      serverInfo: { name: "discord", version: "1.0.0" }, instructions: "Official Discord reply" } });
-    if (request.method === "notifications/initialized") write({ jsonrpc: "2.0", method: "notifications/claude/channel",
-      params: { content: "please decide", meta: { chat_id: "claude-channel", message_id: ${JSON.stringify(messageId)},
-        user_id: "owner-id" } } });
-    if (request.method === "tools/list") write({ jsonrpc: "2.0", id: request.id, result: { tools: [{ name: "reply",
-      inputSchema: { type: "object", properties: { chat_id: { type: "string" }, text: { type: "string" } },
-        required: ["chat_id", "text"] } }] } });
-    if (request.method === "tools/call") write({ jsonrpc: "2.0", id: request.id,
-      result: { content: [{ type: "text", text: ${JSON.stringify(`sent (id: ${answerId})`)} }] } });
-  }
-});
-`);
+// The Claude project's webhook and launch key, once the Router is up.
+async function serveClaude(workspace) {
+  const result = await runRouterCli(workspace, ["ensure-webhook", "claude-demo"]);
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  writeProjectKey(workspace, "claude-demo", "claude-demo-key");
+}
+
+// One Claude turn through the real CCDM channel server behind the Router: the
+// owner's message reaches Claude, and Claude's reply asks for input and posts
+// through the project webhook. The launch stays up until stopped, because
+// readiness requires its live channel server.
+async function claudeTurn(workspace, context, { messageId }) {
   const hookSettings = path.join(workspace.tmpDir, "claude-reminder-hooks.json");
   const hook = `node '${path.join(workspace.repoDir, "scripts", "claude-reminder-hook.js")}'`;
   fs.writeFileSync(hookSettings, JSON.stringify({
@@ -403,18 +383,25 @@ process.stdin.on("data", chunk => {
     hooks: Object.fromEntries(["SessionStart", "Stop", "StopFailure", "SessionEnd"]
       .map(event => [event, [{ hooks: [{ type: "command", command: hook }] }]])),
   }), { mode: 0o600 });
-  const child = spawn(process.execPath, [path.join(workspace.repoDir, "scripts", "claude-reminder-channel.js")], {
+  const readyFile = path.join(workspace.tmpDir, `claude-ready-${messageId}.json`);
+  const child = spawn(process.execPath, [path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js")], {
     cwd: workspace.repoDir, stdio: ["pipe", "pipe", "pipe"],
-    env: { ...workspace.env, CCDM_REMINDER_PROJECT_ROOT: workspace.repoDir, CCDM_REMINDER_STATE_DIR: context.stateDir,
-      CCDM_CLAUDE_PLUGIN_COMMAND: process.execPath, CCDM_CLAUDE_PLUGIN_ARGS: JSON.stringify([fake]),
-      CCDM_CLAUDE_PROJECT: "claude-demo", CCDM_CLAUDE_CHANNEL_ID: "claude-channel", CCDM_CLAUDE_BOT_APP_ID: "claude-app",
-      CCDM_CLAUDE_ROOT_APP_ID: "root-app", CCDM_CLAUDE_LAUNCH_ID: "fixture-claude-launch",
+    env: routerEnv(workspace, { CCDM_REMINDER_PROJECT_ROOT: workspace.repoDir, CCDM_REMINDER_STATE_DIR: context.stateDir,
+      CCDM_ROUTER_KEY_FILE: path.join(workspace.routerStateDir, "keys", "claude-demo.key"),
+      CCDM_CHANNEL_READY_FILE: readyFile,
+      CCDM_CLAUDE_PROJECT: "claude-demo", CCDM_CLAUDE_CHANNEL_ID: "claude-channel",
+      CCDM_CLAUDE_LAUNCH_ID: "fixture-claude-launch",
       CCDM_CLAUDE_HOOK_SETTINGS: hookSettings,
-      CCDM_REMINDER_RECEIPTS_DIR: path.join(context.stateDir, "claude-receipts") },
+      CCDM_REMINDER_RECEIPTS_DIR: path.join(context.stateDir, "claude-receipts") }),
   });
   const exited = new Promise(resolve => child.once("exit", resolve));
   let output = "";
   child.stdout.on("data", chunk => { output += chunk; });
+  const stop = async (signal = "SIGTERM") => {
+    if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+    await exited;
+  };
+  registerTeardownCallback(() => stop("SIGKILL"));
   const until = async text => {
     for (let attempt = 0; attempt < 200 && !output.includes(text); attempt++) {
       await new Promise(resolve => setTimeout(resolve, 20));
@@ -427,17 +414,17 @@ process.stdin.on("data", chunk => {
   await until('"id":1');
   send({ method: "notifications/initialized" });
   send({ id: 3, method: "tools/list" });
+  await until('"id":3');
+  await waitFor(() => fs.existsSync(readyFile), () => "the Claude channel server's Router hello");
+  injectDiscordMessage(workspace, { id: messageId, channelId: "claude-channel", author: { id: "owner-id" },
+    content: "please decide" });
   await until("notifications/claude/channel");
   send({ id: 2, method: "tools/call", params: { name: "reply", arguments: { chat_id: "claude-channel",
     text: "Which option?", conversation_interaction_id: messageId, conversation_disposition: "input-needed" } } });
-  await until(answerId);
+  await until("sent (id: ");
+  const answerId = /sent \(id: ([^)]+)\)/.exec(output)[1];
   await new Promise(resolve => setTimeout(resolve, 150));
-  const stop = async (signal = "SIGTERM") => {
-    if (child.exitCode === null && child.signalCode === null) child.kill(signal);
-    await exited;
-  };
-  registerTeardownCallback(() => stop("SIGKILL"));
-  return { stop };
+  return { answerId, stop };
 }
 
 // The Codex bridge through the Router and a fake Codex app-server. Starting it
@@ -511,10 +498,8 @@ async function codexTurn(workspace, { codex, bridge }, messageId) {
   return { answerId, appServerInvocations: readState(workspace.stateDir).fixtures.codex.appServerInvocations.length };
 }
 
-// Discord sends every event to every gateway, but the fake gateway hands each
-// injected message to one logged-in client. With both the Router and the
-// worker's own Gateway (for the pool Claude channel) logged in, a message is
-// sent again until the client it is for has handled it; the other ignores it.
+// A message is sent again until the worker, observing through the Router, has
+// handled it.
 async function injectUntilHandled(workspace, context, message, handled) {
   for (let attempt = 0; attempt < 12; attempt++) {
     injectDiscordMessage(workspace, message);
@@ -538,6 +523,9 @@ async function waitForStatus(workspace, context, predicate) {
 const reminders = state => (state.fixtures.discord.messages ?? []).filter(row => row.content === "👀" && !row.deleted);
 const historyMessage = (id, timestamp, author, content = "text") =>
   ({ id, timestamp, content, type: 0, attachments: [], author: { id: author, bot: author.endsWith("-app") } });
+// A project's own webhook message.
+const webhookMessage = (id, timestamp, webhookId) =>
+  ({ ...historyMessage(id, timestamp, webhookId), author: { id: webhookId, bot: true }, webhook_id: webhookId });
 
 test("Claude and Codex complete reply, reminder, and reply or close through the supervised worker", async () => {
   const workspace = createBridgeWorkspace();
@@ -549,13 +537,14 @@ test("Claude and Codex complete reply, reminder, and reply or close through the 
   writeState(seed, workspace.stateDir);
   // The installer's preflight needs the Router up and the Codex webhook made.
   const codexBridge = await startCodexBridge(workspace);
+  await serveClaude(workspace);
   const installed = await install(workspace, context, {
     env: { ...context.env, CCDM_ROUTER_STATE_DIR: workspace.routerStateDir }, timeoutMs: 30000 });
   assert.equal(installed.exitCode, 0, installed.stderr || installed.stdout);
 
   // First enablement: the Claude launch records its verified transport, then the
   // supervised worker discovers both (empty) channels before any delivery.
-  const warmup = await claudeTurn(workspace, context, { messageId: "claude-warmup", answerId: "claude-warmup-answer" });
+  const warmup = await claudeTurn(workspace, context, { messageId: "claude-warmup" });
   await service(workspace, context, "enable");
   context.setClock(at(-10 * 60000));
   let supervised = launchAsSupervisor(workspace, context);
@@ -567,17 +556,16 @@ test("Claude and Codex complete reply, reminder, and reply or close through the 
   // Each provider answers its owner. The Claude session is relaunched for its
   // turn and keeps running; the Codex bridge is stopped after its turn.
   await warmup.stop();
-  const claude = await claudeTurn(workspace, context, { messageId: "claude-question", answerId: "claude-answer" });
+  const claude = await claudeTurn(workspace, context, { messageId: "claude-question" });
   const codex = await codexTurn(workspace, codexBridge, "codex-question");
   const history = readState(workspace.stateDir);
   history.fixtures.discord.history["claude-channel"].unshift(
-    historyMessage("claude-answer", at(0), "claude-app"), historyMessage("claude-question", at(-1000), "owner-id"),
-    historyMessage("claude-warmup-answer", at(-5 * 60000), "claude-app"),
+    webhookMessage(claude.answerId, at(0), CLAUDE_WEBHOOK), historyMessage("claude-question", at(-1000), "owner-id"),
+    webhookMessage(warmup.answerId, at(-5 * 60000), CLAUDE_WEBHOOK),
     historyMessage("claude-warmup", at(-6 * 60000), "owner-id"));
   history.fixtures.discord.history["codex-channel"].unshift(
     // The Codex answer is the project's own webhook message.
-    { ...historyMessage(codex.answerId, at(0), "fake-webhook-1"), author: { id: "fake-webhook-1", bot: true },
-      webhook_id: "fake-webhook-1" },
+    webhookMessage(codex.answerId, at(0), "fake-webhook-1"),
     historyMessage("codex-question", at(-1000), "owner-id"));
   writeState(history, workspace.stateDir);
 
@@ -596,7 +584,7 @@ test("Claude and Codex complete reply, reminder, and reply or close through the 
   context.setClock(at(61 * 60000));
   const sent = await waitForState(workspace, state => reminders(state).length === 2, 20000);
   assert.deepEqual(reminders(sent).map(row => [row.channelId, row.authorization]).sort(), [
-    ["claude-channel", "Bot fixture-claude-token"], ["codex-channel", "Bot fixture-root-token"]]);
+    ["claude-channel", "Bot fixture-root-token"], ["codex-channel", "Bot fixture-root-token"]]);
 
   // The owner replies to Claude and closes Codex; the root observer handles both
   // without starting either coding agent.

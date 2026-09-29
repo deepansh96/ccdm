@@ -14,22 +14,10 @@ function buildRegistry(workspace, overrides = {}) {
   return {
     discord_user_id: "allowed-user-id",
     guild_id: "guild-id",
-    max_pool_size: 50,
-    project_bot_role_id: null,
     category_ids: [],
-    pool: [
-      {
-        id: "bot2",
-        app_id: "bot-app-id",
-        token: "bot-token",
-        state_dir: path.join(workspace.homeDir, ".claude", "channels", "discord2"),
-        assigned_to: "alpha",
-      },
-    ],
     projects: {
       alpha: {
         path: path.join(workspace.tmpDir, "alpha project"),
-        bot_id: "bot2",
         screen_name: "alpha_session",
         channel_id: "channel-alpha",
         type: "claude",

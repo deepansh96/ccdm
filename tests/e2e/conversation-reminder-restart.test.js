@@ -586,7 +586,7 @@ test("unmet Claude prerequisites block enablement and cannot be bypassed into Co
   const workspace = createWorkspace();
   const context = setup(workspace, { alpha: "alpha-channel" });
   seedHistory(workspace, { "alpha-channel": answered("alpha") });
-  const adapter = path.join(workspace.repoDir, "scripts", "claude-reminder-channel.js");
+  const adapter = path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js");
   const saved = fs.readFileSync(adapter);
   fs.rmSync(adapter);
 
@@ -596,7 +596,7 @@ test("unmet Claude prerequisites block enablement and cannot be bypassed into Co
   assert.equal(refused.exitCode, 2);
   const blocked = JSON.parse(refused.stdout);
   assert.equal(blocked.status, "blocked");
-  assert.match(blocked.reason, /provider prerequisites are unmet: claude missing scripts\/claude-reminder-channel\.js/);
+  assert.match(blocked.reason, /provider prerequisites are unmet: claude missing scripts\/ccdm-channel-server\.js/);
   assert.deepEqual(blocked.preflight.provider_prerequisites.providers.codex, { met: true, missing: [] });
   assert.equal(blocked.preflight.root_credentials, "present");
   assert.doesNotMatch(refused.stdout, /fixture-root-token|token-alpha/);

@@ -20,8 +20,8 @@ _EVENTS = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_EVENTS)
 
 
-def adapter_process_live(pid: object, script: str = "claude-reminder-channel.js") -> bool:
-    """True only while the recorded launch-scoped Claude channel adapter is running."""
+def adapter_process_live(pid: object, script: str = "ccdm-channel-server.js") -> bool:
+    """True only while the recorded launch-scoped Claude channel server is running."""
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
     try:
@@ -36,7 +36,7 @@ def adapter_process_live(pid: object, script: str = "claude-reminder-channel.js"
                                  text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
         return False
-    # A reused PID belongs to some other program, never the adapter.
+    # A reused PID belongs to some other program, never the channel server.
     return script in command
 
 
@@ -78,29 +78,22 @@ def build_readiness(project_name: str, project_root: Path, state_dir: Path) -> d
                 capability = json.loads((state_dir / "capabilities" / f"{project_name}.json").read_text())
             except (OSError, json.JSONDecodeError):
                 capability = {}
-            # A router launch's CCDM channel server records reminder events
-            # itself; a pool launch needs the opt-in proxy in front of the plugin.
-            router = assignment["identity"].startswith("router:")
+            # Every Claude launch is a Router launch whose CCDM channel server
+            # records reminder events itself.
             verified = (
                 capability.get("assignment_generation") == assignment["generation"]
                 and capability.get("channel_id") == assignment["channel_id"]
-                and (capability.get("transport") == "ccdm-channel-server" if router else (
-                    capability.get("transport") == "official-discord-stdio-proxy"
-                    and capability.get("plugin_version") == "0.0.4"))
+                and capability.get("transport") == "ccdm-channel-server"
                 and capability.get("server_version") == "1.0.0"
                 and capability.get("hooks_configured") is True
                 and capability.get("reply_tool_verified") is True
             )
-            relaunch = (f"; restart the session with scripts/start-session.sh {project_name}" if router
-                        else f"; restart the session with CCDM_CLAUDE_REMINDER_ADAPTER=1 "
-                        f"scripts/start-session.sh {project_name}")
+            relaunch = f"; restart the session with scripts/start-session.sh {project_name}"
             if not verified:
                 unsupported_capabilities.append(
                     "Claude launch-scoped transport is not verified for this assignment" + relaunch)
-            elif not adapter_process_live(capability.get("pid"),
-                                          "ccdm-channel-server.js" if router else "claude-reminder-channel.js"):
-                # A plain restart runs the unfiltered official plugin; an exited
-                # adapter launch no longer filters /close or records completions.
+            elif not adapter_process_live(capability.get("pid")):
+                # An exited channel server no longer records owner activity or replies.
                 unsupported_capabilities.append(
                     "Claude launch-scoped transport is not running for this assignment" + relaunch)
         # Root delivers a router project's reminders; a pool project needs its bot.

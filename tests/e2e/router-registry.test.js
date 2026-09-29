@@ -111,21 +111,22 @@ test("an invalid registry keeps the last good routing table and shows in router 
   assert.doesNotMatch(restored.stdout, new RegExp(`registry loaded: ${loadedBefore}\n`));
 });
 
-test("flipping a project's transport to router starts routing its channel without a restart", async () => {
+test("registering a new project starts routing its channel without a restart", async () => {
   const workspace = createRouterWorkspace();
-  writeProjectKey(workspace, "legacy", "legacy-key");
+  writeProjectKey(workspace, "newbie", "newbie-key");
   const router = await startRouter(workspace, { env: RELOAD_ENV });
-  await assert.rejects(connectSession(workspace, "legacy", "legacy-key"), { code: "unauthorized" });
+  await assert.rejects(connectSession(workspace, "newbie", "newbie-key"), { code: "unauthorized" });
 
+  // A newly registered project needs no `transport` field.
   replaceRegistry(workspace, routerRegistry({
-    legacy: { channel_id: "legacy-channel", type: "claude", transport: "router" },
+    newbie: { channel_id: "newbie-channel", type: "claude" },
   }));
-  await router.waitForOutput(/registry reloaded: 3 router project/);
-  const legacy = await connectSession(workspace, "legacy", "legacy-key");
-  injectMessage(workspace, "now-routed", { id: OWNER_ID, username: "Owner" }, "legacy-channel");
-  await waitFor(() => legacy.events.length > 0, () => `legacy message:\n${router.stdout}`);
+  await router.waitForOutput(/registry reloaded: 4 router project/);
+  const newbie = await connectSession(workspace, "newbie", "newbie-key");
+  injectMessage(workspace, "now-routed", { id: OWNER_ID, username: "Owner" }, "newbie-channel");
+  await waitFor(() => newbie.events.length > 0, () => `newbie message:\n${router.stdout}`);
 
-  assert.deepEqual(legacy.events.map(event => [event.message_id, event.channel_id]), [["now-routed", "legacy-channel"]]);
+  assert.deepEqual(newbie.events.map(event => [event.message_id, event.channel_id]), [["now-routed", "newbie-channel"]]);
   assert.match(router.stdout, /router ready/);
   assert.equal(router.stdout.split("router ready").length - 1, 1);
 });

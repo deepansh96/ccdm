@@ -1,26 +1,14 @@
 #!/usr/bin/env node
 
 const { createInterface } = require("readline");
-const { execFile } = require("child_process");
 const { createHmac, timingSafeEqual } = require("crypto");
-const { promisify } = require("util");
 const path = require("path");
-const { writeFile, mkdir, mkdtemp, readFile } = require("fs/promises");
-const { tmpdir } = require("os");
+const { writeFile, mkdir, readFile } = require("fs/promises");
 const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
 
-const execFileAsync = promisify(execFile);
-const EXPORT_SCRIPT = path.resolve(__dirname, "export-discord-range.js");
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const DISCORD_REPLY_TOKEN = process.env.DISCORD_REPLY_TOKEN;
-// Claude pool sessions get replies and writes from the official plugin; this
-// mode adds only the channel-scoped read tools that plugin lacks, reading the
-// bot token from its state directory.
-const READ_ONLY = ["1", "true", "yes", "on"].includes(
-  (process.env.DISCORD_MCP_EXPORT_ONLY || "").toLowerCase()
-);
-const READ_ONLY_TOOLS = new Set(["read_last_x_messages_in_channel", "export_message_range"]);
 const DISCORD_CHANNEL_OVERRIDE = ["1", "true", "yes", "on"].includes(
   (process.env.DISCORD_CHANNEL_OVERRIDE || "").toLowerCase()
 );
@@ -32,7 +20,7 @@ const DISCORD_GLOBAL_USER_IDS = new Set(
     .map((id) => id.trim())
     .filter(Boolean)
 );
-// Router backend (every Codex session): the tools are Router operations in
+// Every Codex session's tools are Router operations in
 // this project's channel, reached with the launch key file. No Discord token
 // is configured. For root Codex (`CCDM_ROUTER_ROLE=root`)
 // they act as root in the channel each call names; the Router enforces root's
@@ -41,12 +29,10 @@ const ROUTER_KEY_FILE = process.env.CCDM_ROUTER_KEY_FILE;
 const ROUTER_ROOT = Boolean(ROUTER_KEY_FILE) && process.env.CCDM_ROUTER_ROLE === "root";
 const ROUTER_PROJECT = process.env.CCDM_CODEX_PROJECT;
 
-if (ROUTER_KEY_FILE ? (!ROUTER_ROOT && !ROUTER_PROJECT) || !CHANNEL_ID : !READ_ONLY || !CHANNEL_ID) {
-  process.stderr.write(`Missing ${ROUTER_KEY_FILE ? "CCDM_CODEX_PROJECT or CHANNEL_ID" : READ_ONLY ? "CHANNEL_ID" : "CCDM_ROUTER_KEY_FILE or CHANNEL_ID"}\n`);
+if (!ROUTER_KEY_FILE || !CHANNEL_ID || (!ROUTER_ROOT && !ROUTER_PROJECT)) {
+  process.stderr.write(`Missing ${ROUTER_KEY_FILE ? "CCDM_CODEX_PROJECT or CHANNEL_ID" : "CCDM_ROUTER_KEY_FILE or CHANNEL_ID"}\n`);
   process.exit(1);
 }
-
-const API_BASE = "https://discord.com/api/v10";
 
 function sendResponse(msg) {
   const json = JSON.stringify(msg);
@@ -55,43 +41,6 @@ function sendResponse(msg) {
 
 function makeError(id, code, message) {
   return { jsonrpc: "2.0", id, error: { code, message } };
-}
-
-// Read-only configs carry no token; like the range exporter, read it from the
-// bot's ignored state .env so the generated MCP config stays secret-free.
-async function readToken() {
-  if (process.env.DISCORD_STATE_DIR) {
-    try {
-      const env = await readFile(path.join(process.env.DISCORD_STATE_DIR, ".env"), "utf8");
-      const match = env.match(/^DISCORD_BOT_TOKEN=(.+)$/m);
-      if (match) return match[1].trim();
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-    }
-  }
-  throw new Error("No bot token found; set DISCORD_STATE_DIR");
-}
-
-async function discordGet(endpoint, retryRateLimits = false) {
-  const token = await readToken();
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const res = await fetch(`${API_BASE}${endpoint}`, {
-      headers: { Authorization: `Bot ${token}` },
-    });
-    if (res.ok) return res.json();
-
-    const text = await res.text();
-    if (!retryRateLimits || res.status !== 429 || attempt === 4) {
-      throw new Error(`Discord API ${res.status}: ${text}`);
-    }
-    let retryAfter = 1;
-    try {
-      retryAfter = Number(JSON.parse(text).retry_after ?? retryAfter);
-    } catch {
-      // Discord normally returns JSON for rate limits; use a short fallback delay.
-    }
-    await new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
-  }
 }
 
 const scopeTokenProperty = {
@@ -304,9 +253,6 @@ const ALL_TOOLS = [
     },
   },
 ];
-const TOOLS = READ_ONLY
-  ? ALL_TOOLS.filter((tool) => READ_ONLY_TOOLS.has(tool.name))
-  : ALL_TOOLS;
 
 // One op-only Router connection (`listener: false`), so the bridge keeps its
 // place as the project's listener. A failed or ended connection is retried on
@@ -355,7 +301,7 @@ async function routerContextPct() {
   }
 }
 
-async function handleRouterToolCall(name, args) {
+async function handleToolCall(name, args) {
   const channelId = await targetChannelId(args);
   switch (name) {
     case "reply": {
@@ -430,62 +376,6 @@ async function handleRouterToolCall(name, args) {
   }
 }
 
-async function handleToolCall(name, args) {
-  if (ROUTER_KEY_FILE) return handleRouterToolCall(name, args);
-  if (!READ_ONLY_TOOLS.has(name)) {
-    throw new Error(`Tool unavailable in read-only mode: ${name}`);
-  }
-  const channelId = await targetChannelId(args);
-
-  if (name === "read_last_x_messages_in_channel") {
-    const limit = args.count;
-    if (!Number.isInteger(limit) || limit < 1 || limit > 10000) {
-      throw new Error("count must be an integer between 1 and 10,000");
-    }
-    const messages = [];
-    let before;
-    // ponytail: 10,000-message cap matches export; raise only if MCP payload limits prove safe.
-    while (messages.length < limit) {
-      const pageLimit = Math.min(limit - messages.length, 100);
-      const page = await discordGet(
-        `/channels/${channelId}/messages?limit=${pageLimit}${before ? `&before=${before}` : ""}`,
-        true
-      );
-      messages.push(...page);
-      if (page.length < pageLimit) break;
-      before = page.at(-1).id;
-    }
-    messages.reverse();
-    const output = messages.map((m) => {
-      const author = m.author.bot ? "me" : m.author.username;
-      const attachments = m.attachments.length ? ` +${m.attachments.length}att` : "";
-      return `[${m.timestamp}] ${author}: ${m.content}${attachments} (id: ${m.id})`;
-    }).join("\n");
-    if (limit > 100) {
-      const directory = await mkdtemp(path.join(tmpdir(), "discord-recent-"));
-      const transcript = path.join(directory, "messages.txt");
-      await writeFile(transcript, `${output}\n`, { mode: 0o600 });
-      return `saved ${messages.length} messages to ${transcript}`;
-    }
-    return output;
-  }
-
-  const scriptArgs = [
-    EXPORT_SCRIPT,
-    channelId,
-    args.start_message_id,
-    ...(args.end_message_id ? [args.end_message_id] : []),
-  ];
-  try {
-    const { stdout } = await execFileAsync(process.execPath, scriptArgs, {
-      env: process.env,
-    });
-    return `exported to ${stdout.trim()}`;
-  } catch (error) {
-    throw new Error((error.stderr || error.message).trim());
-  }
-}
-
 function handleMessage(msg) {
   if (!msg.method) {
     return;
@@ -511,7 +401,7 @@ function handleMessage(msg) {
       sendResponse({
         jsonrpc: "2.0",
         id: msg.id,
-        result: { tools: TOOLS },
+        result: { tools: ALL_TOOLS },
       });
       break;
 
@@ -558,7 +448,7 @@ rl.on("line", (line) => {
 // Codex closes stdin when it stops this server; the Router connection must not
 // keep the process alive.
 rl.on("close", () => {
-  if (ROUTER_KEY_FILE) process.exit(0);
+  process.exit(0);
 });
 
 process.stderr.write("Discord MCP server started\n");

@@ -196,15 +196,15 @@ test("a message to a router channel with no session gets 💤 and is not replaye
   assert.deepEqual(demo.events, []);
 });
 
-test("a pool-transport project's channel is ignored entirely", async () => {
+test("an unregistered channel is ignored entirely", async () => {
   const workspace = createRouterWorkspace();
   writeProjectKey(workspace, "demo", "demo-key");
   await startRouter(workspace);
   const demo = await connectSession(workspace, "demo", "demo-key");
 
-  injectDiscordMessage(workspace, { id: "pool-message", channelId: "legacy-channel", content: "hi",
+  injectDiscordMessage(workspace, { id: "stray-message", channelId: "unregistered-channel", content: "hi",
     author: { id: OWNER_ID, username: "Owner" } });
-  await waitForDelivered(workspace, "pool-message");
+  await waitForDelivered(workspace, "stray-message");
 
   assert.deepEqual(readState(workspace.stateDir).fixtures.discord.reactions, []);
   assert.deepEqual(demo.events, []);
@@ -275,7 +275,8 @@ test("router status reports connected sessions and webhook presence without leak
   assert.match(status.stdout, /sessions: 1\n  project demo scope=demo-channel connected=\d{4}-/);
   assert.match(status.stdout, /demo channel=demo-channel webhook=present/);
   assert.match(status.stdout, /beta channel=beta-channel webhook=missing/);
-  assert.doesNotMatch(status.stdout, /legacy/);
+  // The unmigrated project is routed too; it has no webhook yet.
+  assert.match(status.stdout, /legacy channel=legacy-channel webhook=missing/);
 
   // The token Discord issued lives only in the Router's private webhook state.
   const [{ token }] = readState(workspace.stateDir).fixtures.discord.webhooks;

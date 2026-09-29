@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Usage: ./scripts/migrate-to-router.sh [--rollback] <project_name>
 # Cuts one project over to the Router (verified, rolled back on failure), or
-# returns a migrated project to its pool bot with --rollback.
+# explains with --rollback that no pool bot remains to return to.
 
 set -euo pipefail
 

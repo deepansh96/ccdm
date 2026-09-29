@@ -1,7 +1,7 @@
 #!/bin/bash
-# Wraps ccstatusline to also update bot nickname with context % periodically.
+# Wraps ccstatusline to also record a Router session's context % for its replies.
 # Set as the statusLine command in ~/.claude/settings.json.
-# Requires: DISCORD_STATE_DIR env var (set automatically for Discord sessions).
+# Uses CCDM_ROUTER_KEY_FILE (set automatically for CCDM Claude sessions).
 
 # Ensure Homebrew + node@22 bins are on PATH; the statusLine command may run
 # with a minimal environment that lacks them.

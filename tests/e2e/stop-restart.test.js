@@ -24,10 +24,9 @@ function runFixture(workspace, tool, args) {
 
 function buildRegistry(workspace, overrides = {}) {
   const sessionType = overrides.sessionType ?? "claude";
-  // Codex has no pool mode: a Codex project names no pool bot.
+  // Neither Claude nor Codex has a pool mode: no project names a pool bot.
   const project = {
     path: path.join(workspace.tmpDir, "alpha project"),
-    ...(sessionType === "codex" ? {} : { bot_id: "bot2" }),
     screen_name: sessionType === "codex" ? "alpha_codex" : "alpha_session",
     channel_id: "channel-id",
     type: sessionType,
@@ -39,26 +38,8 @@ function buildRegistry(workspace, overrides = {}) {
   return {
     discord_user_id: "allowed-user-id",
     guild_id: "guild-id",
-    max_pool_size: 50,
-    project_bot_role_id: null,
     category_ids: [],
     ...(overrides.codexHome ? { codex_home: overrides.codexHome } : {}),
-    pool: [
-      {
-        id: "bot1",
-        app_id: "root-app-id",
-        token: "root-token",
-        state_dir: path.join(workspace.homeDir, ".claude", "channels", "discord"),
-        assigned_to: null,
-      },
-      {
-        id: "bot2",
-        app_id: "bot-app-id",
-        token: "bot-token",
-        state_dir: path.join(workspace.homeDir, ".claude", "channels", "discord2"),
-        assigned_to: sessionType === "codex" ? null : "alpha",
-      },
-    ],
     projects: {
       alpha: project,
     },
@@ -115,9 +96,13 @@ function spawnOwnedProcess(workspace, command, options = {}) {
   return child.pid;
 }
 
-function claudeCommand(registry) {
-  const stateDir = registry.pool.find((bot) => bot.id === "bot2").state_dir;
-  return `claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions DISCORD_STATE_DIR='${stateDir}'`;
+// The default Router state under the Test Workspace home holds alpha's launch key.
+function alphaKeyFile(workspace) {
+  return path.join(workspace.homeDir, ".local", "state", "ccdm", "router", "keys", "alpha.key");
+}
+
+function claudeCommand(workspace) {
+  return `claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions CCDM_ROUTER_KEY_FILE='${alphaKeyFile(workspace)}'`;
 }
 
 function codexBridgeCommand() {
@@ -161,7 +146,7 @@ test("sleep fixture resolves fixture-mode delays quickly", () => {
 test("stop-session stops a Claude session and clears registry metadata", async () => {
   const workspace = createWorkspace();
   const registry = buildRegistry(workspace);
-  const pid = spawnOwnedProcess(workspace, claudeCommand(registry));
+  const pid = spawnOwnedProcess(workspace, claudeCommand(workspace));
   registry.projects.alpha.pid = pid;
   seedRegistry(workspace, registry);
   seedTmuxSession("alpha_session", { pid, paneOutput: "Listening\n" }, { stateDir: workspace.stateDir });
@@ -226,7 +211,7 @@ test("stop-session handles already-stopped projects", async () => {
 test("stop-session sweeps orphan Claude and Codex listener processes", async () => {
   const claudeWorkspace = createWorkspace();
   const claudeRegistry = buildRegistry(claudeWorkspace);
-  const claudePid = spawnOwnedProcess(claudeWorkspace, claudeCommand(claudeRegistry));
+  const claudePid = spawnOwnedProcess(claudeWorkspace, claudeCommand(claudeWorkspace));
   seedRegistry(claudeWorkspace, claudeRegistry);
 
   const claudeResult = await stopProject(claudeWorkspace);
@@ -253,25 +238,28 @@ test("stop-session sweeps orphan Claude and Codex listener processes", async () 
   assert.equal(isAlive(appServerPid), false);
 });
 
-test("stop-session sweeps an orphaned direct Bun Discord plugin server", async () => {
+test("stop-session sweeps an orphaned CCDM channel server and removes the launch key", async () => {
   const workspace = createWorkspace();
   const registry = buildRegistry(workspace);
   seedRegistry(workspace, registry);
-  const stateDir = registry.pool.find(bot => bot.id === "bot2").state_dir;
-  const pluginServer = path.join(workspace.homeDir, ".claude", "plugins", "cache", "claude-plugins-official", "discord", "0.0.4", "server.ts");
-  const orphanPid = spawnOwnedProcess(workspace, `bun '${pluginServer}' DISCORD_STATE_DIR='${stateDir}'`);
+  const keyFile = alphaKeyFile(workspace);
+  fs.mkdirSync(path.dirname(keyFile), { recursive: true });
+  fs.writeFileSync(keyFile, "old-key\n", { mode: 0o600 });
+  const server = path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js");
+  const orphanPid = spawnOwnedProcess(workspace, `node '${server}' CCDM_ROUTER_KEY_FILE='${keyFile}'`);
 
   const result = await stopProject(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.match(result.stdout, new RegExp(String(orphanPid)));
   assert.equal(isAlive(orphanPid), false);
+  assert.equal(fs.existsSync(keyFile), false);
 });
 
 test("stop-session escalates SIGTERM-resistant child processes to SIGKILL", async () => {
   const workspace = createWorkspace();
   const registry = buildRegistry(workspace);
-  const parentPid = spawnOwnedProcess(workspace, claudeCommand(registry));
+  const parentPid = spawnOwnedProcess(workspace, claudeCommand(workspace));
   const childPid = spawnOwnedProcess(workspace, "claude child worker", { ppid: parentPid, ignoreTerm: true });
   registry.projects.alpha.pid = parentPid;
   seedRegistry(workspace, registry);
@@ -322,79 +310,35 @@ test("restart-root-agent simulates root_agent cleanup, retry, fresh launch, and 
   assert.equal(session.killAttempts, 2);
 });
 
-test("opt-in root Claude launch filters project /close through the same channel", async () => {
-  const workspace = createWorkspace();
-  const registry = buildRegistry(workspace);
-  registry.root_bot_app_id = "root-app-id";
-  seedRegistry(workspace, registry);
-  const pluginDir = path.join(workspace.homeDir, ".claude", "plugins", "cache", "claude-plugins-official", "discord", "0.0.4");
-  fs.mkdirSync(pluginDir, { recursive: true });
-  fs.writeFileSync(path.join(pluginDir, "server.ts"), "// fixture official plugin\n");
-
-  const result = await runScript(workspace, "restart-root-agent.sh", { env: { CCDM_CLAUDE_REMINDER_ADAPTER: "1" } });
-  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  const session = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
-  assert.match(session.shellCommand, /--dangerously-load-development-channels server:discord/);
-  assert.doesNotMatch(session.shellCommand, /--channels plugin:discord/);
-  const config = JSON.parse(fs.readFileSync(path.join(workspace.homeDir, ".claude", "channels", "discord", "ccdm-root-reminder-mcp.json"), "utf8"));
-  assert.deepEqual(config.mcpServers.discord.args, [path.join(workspace.repoDir, "scripts", "claude-reminder-channel.js")]);
-  assert.equal(config.mcpServers.discord.env.CCDM_CLAUDE_ROOT_APP_ID, "root-app-id");
-  const settings = JSON.parse(fs.readFileSync(path.join(workspace.homeDir, ".claude", "channels", "discord", "ccdm-root-reminder-settings.json"), "utf8"));
-  assert.equal(settings.enabledPlugins["discord@claude-plugins-official"], false);
-});
-
-test("root Claude reminder launch passes a selected root state directory to its listener", async () => {
-  const workspace = createWorkspace();
-  const registry = buildRegistry(workspace);
-  registry.root_bot_app_id = "root-app-id";
-  seedRegistry(workspace, registry);
-  const pluginDir = path.join(workspace.homeDir, ".claude", "plugins", "cache", "claude-plugins-official", "discord", "0.0.4");
-  fs.mkdirSync(pluginDir, { recursive: true });
-  fs.writeFileSync(path.join(pluginDir, "server.ts"), "// fixture official plugin\n");
+test("the retired reminder-adapter opt-in and a selected root state directory leave root Claude on the Router", async () => {
+  const workspace = createRouterWorkspace();
+  await startRouter(workspace);
   const selectedState = path.join(workspace.homeDir, "selected-root-discord");
+  const pluginDir = path.join(workspace.homeDir, ".claude", "plugins", "cache", "claude-plugins-official", "discord", "0.0.4");
+  fs.mkdirSync(pluginDir, { recursive: true });
+  fs.writeFileSync(path.join(pluginDir, "server.ts"), "// fixture official plugin\n");
 
   const result = await runScript(workspace, "restart-root-agent.sh", {
-    env: { CCDM_CLAUDE_REMINDER_ADAPTER: "1", ROOT_DISCORD_STATE_DIR: selectedState },
+    env: routerEnv(workspace, {
+      CCDM_CLAUDE_REMINDER_ADAPTER: "1",
+      ROOT_DISCORD_STATE_DIR: selectedState,
+      CCDM_FIXTURE_CLAUDE_VERSION: "1.0.0 (Claude Code fixture)",
+    }),
   });
+
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /Root channel server connected to the Router/);
   const session = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
-  assert.ok(session.shellCommand.includes(`DISCORD_STATE_DIR='${selectedState}'`));
-  const config = JSON.parse(fs.readFileSync(path.join(selectedState, "ccdm-root-reminder-mcp.json"), "utf8"));
-  assert.equal(config.mcpServers.discord.env.DISCORD_STATE_DIR, selectedState);
-});
-
-test("root Claude reminder launch derives its mention identity from root state", async () => {
-  const workspace = createWorkspace();
-  seedRegistry(workspace, buildRegistry(workspace));
-  const pluginDir = path.join(workspace.homeDir, ".claude", "plugins", "cache", "claude-plugins-official", "discord", "0.0.4");
-  fs.mkdirSync(pluginDir, { recursive: true });
-  fs.writeFileSync(path.join(pluginDir, "server.ts"), "// fixture official plugin\n");
-  const rootState = path.join(workspace.homeDir, ".claude", "channels", "discord");
-  fs.mkdirSync(rootState, { recursive: true });
-  fs.writeFileSync(path.join(rootState, ".env"), `DISCORD_BOT_TOKEN=${Buffer.from("87654321").toString("base64url")}.fixture.fixture\n`);
-
-  const result = await runScript(workspace, "restart-root-agent.sh", { env: { CCDM_CLAUDE_REMINDER_ADAPTER: "1" } });
-  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  const config = JSON.parse(fs.readFileSync(path.join(rootState, "ccdm-root-reminder-mcp.json"), "utf8"));
-  assert.equal(config.mcpServers.discord.env.CCDM_CLAUDE_ROOT_APP_ID, "87654321");
-});
-
-test("root Claude reminder launch rejects an unproven version before teardown", async () => {
-  const workspace = createWorkspace();
-  const registry = buildRegistry(workspace);
-  registry.root_bot_app_id = "root-app-id";
-  seedRegistry(workspace, registry);
-  const pluginDir = path.join(workspace.homeDir, ".claude", "plugins", "cache", "claude-plugins-official", "discord", "0.0.4");
-  fs.mkdirSync(pluginDir, { recursive: true });
-  fs.writeFileSync(path.join(pluginDir, "server.ts"), "// fixture official plugin\n");
-  seedTmuxSession("root_agent", { paneOutput: "existing root\n" }, { stateDir: workspace.stateDir });
-
-  const result = await runScript(workspace, "restart-root-agent.sh", {
-    env: { CCDM_CLAUDE_REMINDER_ADAPTER: "1", CCDM_FIXTURE_CLAUDE_VERSION: "1.0.0 (Claude Code fixture)" },
-  });
-  assert.equal(result.exitCode, 1);
-  assert.match(result.stderr, /unsupported Claude Code version/);
-  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent.paneOutput, "existing root\n");
+  assert.match(session.shellCommand, /--dangerously-load-development-channels server:ccdm/);
+  assert.equal(session.env.CCDM_ROUTER_KEY_FILE, path.join(workspace.routerStateDir, "keys", ".root.key"));
+  for (const forbidden of ["DISCORD_STATE_DIR", "plugin:discord", "server:discord"]) {
+    assert.equal(session.shellCommand.includes(forbidden), false, forbidden);
+  }
+  const config = JSON.parse(fs.readFileSync(path.join(workspace.routerStateDir, "launches", ".root", "mcp.json"), "utf8"));
+  assert.deepEqual(Object.keys(config.mcpServers), ["ccdm"]);
+  assert.deepEqual(config.mcpServers.ccdm.args, [path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js")]);
+  assert.equal(fs.existsSync(selectedState), false);
+  assert.equal(fs.existsSync(path.join(workspace.homeDir, ".claude", "channels", "discord", "ccdm-root-reminder-mcp.json")), false);
 });
 
 test("restart-root-codex-agent starts the root bot through the Codex bridge in Router root mode", async () => {
