@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import net from "node:net";
@@ -132,4 +132,11 @@ export async function waitFor(predicate, describe, timeoutMs = 5000) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`Timed out waiting for ${describe()}`);
+}
+
+// Fetches a URL the way a session process would, through the fake CDN.
+export function fetchThroughFakeCdn(workspace, url) {
+  const script = `fetch(${JSON.stringify(url)}).then(async r => process.stdout.write(JSON.stringify({ status: r.status, body: await r.text() })))`;
+  const output = execFileSync(process.execPath, ["-e", script], { cwd: workspace.repoDir, env: routerEnv(workspace), encoding: "utf8" });
+  return JSON.parse(output);
 }

@@ -232,7 +232,8 @@ function routeChannelHistory(url, method, init) {
   return json(page);
 }
 
-// A message the fake created or injected, shaped as Discord's GET returns it.
+// A message the fake created, seeded in channel history, or injected, shaped
+// as Discord's GET returns it.
 function channelMessage(state, messageId) {
   const discord = state.fixtures?.discord ?? {};
   const sent = (discord.messages ?? []).find(message => message.id === messageId && !message.deleted);
@@ -242,11 +243,18 @@ function channelMessage(state, messageId) {
       author: sent.webhookId ? { id: sent.webhookId, username: sent.username, bot: true }
         : { id: authorForToken(sent.authorization), bot: true } };
   }
+  for (const [channelId, history] of Object.entries(discord.history ?? {})) {
+    const seeded = Array.isArray(history) && history.find(message => message.id === messageId);
+    if (seeded) return { ...seeded, channel_id: channelId };
+  }
   const injected = (discord.injectedMessages ?? []).find(message => message.id === messageId);
   if (!injected) return null;
+  // Discord re-signs attachment URLs on every fetch: `refreshedUrl` stands in for that.
   return { id: injected.id, channel_id: injected.channelId, content: injected.content,
     ...(injected.webhookId ? { webhook_id: injected.webhookId } : {}),
-    author: { id: injected.author.id, username: injected.author.username, bot: Boolean(injected.author.bot) } };
+    author: { id: injected.author.id, username: injected.author.username, bot: Boolean(injected.author.bot) },
+    attachments: (injected.attachments ?? []).map(attachment => ({ id: attachment.id, filename: attachment.name,
+      content_type: attachment.contentType, size: attachment.size, url: attachment.refreshedUrl ?? attachment.url })) };
 }
 
 // Discord refuses webhook names and username overrides that contain these
@@ -651,15 +659,6 @@ function routeDiscordApi(url, init = {}) {
   }
   if (url.hostname === "discord.com" && getMessageMatch && method === "GET") {
     const state = readState();
-    // Messages the fake knows the channel of: sent through it or injected.
-    const known = channelMessage(state, getMessageMatch[2]);
-    if (known) {
-      return response(JSON.stringify(known.channel_id === getMessageMatch[1] ? known : { code: 10008, message: "Unknown Message" }), {
-        headers: { "content-type": "application/json" },
-        status: known.channel_id === getMessageMatch[1] ? 200 : 404,
-      });
-    }
-    const message = (state.fixtures?.discord?.restMessages ?? []).find((entry) => entry.id === getMessageMatch[2]);
     updateState((nextState) => {
       nextState.fixtures.discord.messageFetches ||= [];
       nextState.fixtures.discord.messageFetches.push({
@@ -668,6 +667,15 @@ function routeDiscordApi(url, init = {}) {
         messageId: getMessageMatch[2],
       });
     });
+    // Messages the fake knows the channel of: sent through it, seeded, or injected.
+    const known = channelMessage(state, getMessageMatch[2]);
+    if (known) {
+      return response(JSON.stringify(known.channel_id === getMessageMatch[1] ? known : { code: 10008, message: "Unknown Message" }), {
+        headers: { "content-type": "application/json" },
+        status: known.channel_id === getMessageMatch[1] ? 200 : 404,
+      });
+    }
+    const message = (state.fixtures?.discord?.restMessages ?? []).find((entry) => entry.id === getMessageMatch[2]);
     if (!message) {
       return response(JSON.stringify({ message: "Unknown Message" }), {
         headers: { "content-type": "application/json" },

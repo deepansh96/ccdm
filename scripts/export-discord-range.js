@@ -8,14 +8,13 @@ const { Readable } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
 
 const API_BASE = "https://discord.com/api/v10";
-const [channelId, startId, endId] = process.argv.slice(2);
 const MAX_MESSAGES = 10_000;
 
 function usage() {
   throw new Error("Usage: export-discord-range.js <channel-id> <start-message-id> [end-message-id]");
 }
 
-function validateIds() {
+function validateIds(channelId, startId, endId) {
   if (![channelId, startId].every((id) => /^\d+$/.test(id || ""))) usage();
   if (endId && !/^\d+$/.test(endId)) usage();
   if (endId && BigInt(startId) > BigInt(endId)) {
@@ -23,7 +22,7 @@ function validateIds() {
   }
 }
 
-async function botToken() {
+async function botToken(channelId) {
   if (process.env.DISCORD_BOT_TOKEN || process.env.BOT_TOKEN) {
     return process.env.DISCORD_BOT_TOKEN || process.env.BOT_TOKEN;
   }
@@ -64,7 +63,7 @@ async function discordGet(token, endpoint) {
   }
 }
 
-async function fetchMessages(token) {
+async function fetchMessages(token, channelId, startId, endId) {
   const messages = [
     await discordGet(token, `/channels/${channelId}/messages/${startId}`),
   ];
@@ -131,18 +130,28 @@ function transcript(messages, saved) {
   }).join("\n\n---\n\n") + "\n";
 }
 
-async function main() {
-  validateIds();
-  const token = await botToken();
-  const messages = await fetchMessages(token);
+// Exports the inclusive range to a private temporary transcript; returns its path.
+async function exportRange({ token, channelId, startId, endId }) {
+  const messages = await fetchMessages(token, channelId, startId, endId);
   const directory = await mkdtemp(path.join(tmpdir(), "discord-export-"));
   const saved = await downloadAttachments(messages, directory);
   const output = path.join(directory, "messages.txt");
   await writeFile(output, transcript(messages, saved), { mode: 0o600 });
+  return output;
+}
+
+async function main() {
+  const [channelId, startId, endId] = process.argv.slice(2);
+  validateIds(channelId, startId, endId);
+  const output = await exportRange({ token: await botToken(channelId), channelId, startId, endId });
   process.stdout.write(`${output}\n`);
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error.message}\n`);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch((error) => {
+    process.stderr.write(`${error.message}\n`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { exportRange };

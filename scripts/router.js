@@ -8,6 +8,7 @@
 //   scripts/router.js status                  report Router health (non-zero if unreachable)
 //   scripts/router.js ensure-webhook <project>  find or create the project's webhook
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
+const { createAttachmentCache } = require("./router/attachments.js");
 const { RouterClient } = require("./router/client.js");
 const { discordRequest } = require("./router/discord-rest.js");
 const { classifyMessage, classifyReaction } = require("./router/inbound.js");
@@ -26,9 +27,10 @@ async function serve() {
   const token = await rootToken();
   const table = await loadRoutingTable(registryPath());
   const gateway = { state: "connecting" };
+  const attachments = createAttachmentCache();
   const server = createRouterServer({
     stateDir: stateDir(), socketPath: socketPath(), getTable: () => table, gateway,
-    context: { stateDir: stateDir(), token }, log,
+    context: { stateDir: stateDir(), token, attachments }, log,
   });
   await server.listen();
 
@@ -42,7 +44,9 @@ async function serve() {
   client.on("messageCreate", async message => {
     try {
       const routed = classifyMessage(table, message);
-      if (!routed || server.deliver(routed.route.project, routed.event)) return;
+      if (!routed) return;
+      attachments.remember(routed.event);
+      if (server.deliver(routed.route.project, routed.event)) return;
       // No live session: mark the message and drop it. Nothing is replayed later.
       await discordRequest("PUT",
         `/channels/${routed.route.channel_id}/messages/${message.id}/reactions/${encodeURIComponent(OFFLINE_EMOJI)}/@me`,
