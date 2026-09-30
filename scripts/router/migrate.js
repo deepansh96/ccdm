@@ -2,9 +2,11 @@
 
 // Cuts one project over from its pool bot to the Router, verified and
 // reversible; `--rollback` refuses, since no pool bot remains. Each step prints
-// `<step>: ok` or `<step>: failed — <reason>`.
+// `<step>: ok` or `<step>: failed — <reason>`. With `--resume`, the start (and
+// a rollback's start) continues the project's saved conversation when one can
+// be found, and otherwise prints `resume: skipped — <reason>` and starts fresh.
 //
-//   scripts/migrate-to-router.sh <project>
+//   scripts/migrate-to-router.sh [--resume] <project>
 //   scripts/migrate-to-router.sh --rollback <project>
 const { spawnSync } = require("node:child_process");
 const path = require("node:path");
@@ -13,6 +15,7 @@ const { registryPath, rootToken, socketPath, stateDir } = require("./paths.js");
 const { probe } = require("./probe.js");
 const { readRegistry, updateRegistry } = require("./registry.js");
 const { assignmentChanged } = require("./reminders.js");
+const { resolveResume } = require("./resume.js");
 const { ensureWebhook } = require("./webhooks.js");
 
 const SCRIPTS = path.resolve(__dirname, "..");
@@ -39,8 +42,8 @@ async function step(name, action) {
 
 // A lifecycle script, run to completion; its last error line (or, lacking
 // one, its last output line) explains a failure.
-function script(name, project) {
-  const result = spawnSync(path.join(SCRIPTS, name), [project], { encoding: "utf8", env: process.env });
+function script(name, project, ...extra) {
+  const result = spawnSync(path.join(SCRIPTS, name), [project, ...extra], { encoding: "utf8", env: process.env });
   if (result.status === 0) return;
   const lastLine = text => (text || "").trim().split("\n").filter(Boolean).at(-1);
   const reason = lastLine(result.stderr) || lastLine(result.stdout);
@@ -110,13 +113,38 @@ async function verify(project, entry) {
   return `session connected in ${entry.channel_id}; probe message ${result.message_id} webhook_id=${result.webhook_id}`;
 }
 
-async function migrate(project) {
+// Resolved before the stop step, which clears the project's pid and session_id.
+function findResume(project, entry) {
+  const found = resolveResume(project, entry, { registryFile: registryPath() });
+  if (found.id) console.log(`resume: ${found.id} (${found.source})`);
+  else console.log(`resume: skipped — ${found.skip}`);
+  return found.id || null;
+}
+
+// Starts the project's launcher, resuming `resumeId` when given. A resume the
+// launcher cannot complete (it cleans up after itself) falls back to a fresh
+// start: resuming is best effort and never fails the migration by itself.
+function start(project, entry, resumeId) {
+  if (resumeId) {
+    try {
+      script(launcher(entry), project, "--resume", resumeId);
+      return `resumed ${resumeId}`;
+    } catch (error) {
+      console.log(`resume: skipped — the launcher could not resume ${resumeId}: ${error.message}; starting fresh`);
+    }
+  }
+  script(launcher(entry), project);
+  return resumeId ? "fresh" : undefined;
+}
+
+async function migrate(project, { resume = false } = {}) {
   let entry;
   await step("preflight", async () => {
     const detail = await preflight(project);
     entry = await projectEntry(project);
     return detail;
   });
+  const resumeId = resume ? findResume(project, entry) : null;
   let reassigned = false;
   try {
     await step("stop", () => script("stop-session.sh", project));
@@ -131,14 +159,14 @@ async function migrate(project) {
     });
     reassigned = true;
     await step("assignment-changed", async () => `generation ${await reassign(project)}`);
-    await step("start", () => script(launcher(entry), project));
+    await step("start", () => start(project, entry, resumeId));
     await step("verify", () => verify(project, entry));
   } catch (error) {
     if (!(error instanceof StepFailure)) throw error;
     // Neither Claude nor Codex has a pool mode: the fallback is the project's previous registry state.
     const previous = "its previous registry state";
     console.log(`rolling back ${project} to ${previous} after the ${error.step} step failed`);
-    const rolledBack = await rollbackSteps(project, entry, { reassign: reassigned })
+    const rolledBack = await rollbackSteps(project, entry, { reassign: reassigned, resumeId })
       .then(() => `rolled back to ${previous}`, failure => `rollback also failed at ${failure.step}: ${failure.message}`);
     throw new Error(`migration of ${project} failed at ${error.step}: ${error.message}; ${rolledBack}`);
   }
@@ -146,11 +174,11 @@ async function migrate(project) {
 }
 
 // Stops whatever serves the project, then restores its previous registry state.
-async function rollbackSteps(project, entry, { reassign: issue = true } = {}) {
+async function rollbackSteps(project, entry, { reassign: issue = true, resumeId = null } = {}) {
   await step("stop", () => script("stop-session.sh", project));
   await step("transport", async () => { await setTransport(project, null); return "previous"; });
   if (issue) await step("assignment-changed", async () => `generation ${await reassign(project)}`);
-  await step("start", () => script(launcher(entry), project));
+  await step("start", () => start(project, entry, resumeId));
 }
 
 // Neither Claude nor Codex has a pool bot to return to, so a rollback only
@@ -165,12 +193,13 @@ async function rollback(project) {
 
 const args = process.argv.slice(2);
 const rollingBack = args[0] === "--rollback";
-const project = rollingBack ? args[1] : args[0];
-if (!project || args.length !== (rollingBack ? 2 : 1)) {
-  console.error("usage: migrate-to-router.sh [--rollback] <project>");
+const resume = !rollingBack && args[0] === "--resume";
+const project = rollingBack || resume ? args[1] : args[0];
+if (!project || project.startsWith("--") || args.length !== (rollingBack || resume ? 2 : 1)) {
+  console.error("usage: migrate-to-router.sh [--resume] <project> | --rollback <project>");
   process.exit(2);
 }
-(rollingBack ? rollback(project) : migrate(project)).catch(error => {
+(rollingBack ? rollback(project) : migrate(project, { resume })).catch(error => {
   if (!(error instanceof StepFailure) || error.step !== "preflight") console.error(error.message);
   else console.error(`${rollingBack ? "rollback" : "migration"} of ${project} stopped at preflight: ${error.message}; nothing changed`);
   process.exit(1);

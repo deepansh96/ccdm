@@ -35,7 +35,7 @@ The root agent is a Claude Code or Codex session that is itself a Router client.
 
 Each project has its own channel, its own session, and its own **Project Identity**: a per-channel webhook `ccdm-<project>` whose messages post as `<project>-<claude|codex> · N%`, with live context usage in the name. You chat with each project in its own channel, no `@mention` needed. The root agent listens in `#root` without `@mention`, and `@mentioning` the bot in a project channel reaches root only, never the project.
 
-Each session has a **Session Scope**: the one channel it may read and act in. The Router rejects anything outside it with `scope_violation` and logs the attempt. A new launch writes a new key, which disconnects the previous listener, so two sessions never answer the same channel. Messages to a channel with no live session get 💤 and are not replayed later.
+Each session has a **Session Scope**: the one channel it may read and act in. The Router rejects anything outside it with `scope_violation` and logs the attempt. A new launch writes a new key, which disconnects the previous listener, so two sessions never answer the same channel. Messages to a channel with no live session get 💤 and are not replayed later (a project not yet migrated, with no `webhook_id`, gets no 💤).
 
 ## Prerequisites
 
@@ -495,6 +495,23 @@ file and account selection for recovery. The target account must already be
 logged in; do not copy credentials between homes. This preserves the saved
 conversation, not running tools or child-agent processes.
 
+### Resuming a Claude conversation
+
+Claude launches take the same explicit resume, with the Claude session UUID
+(the registry's recorded `session_id`, or the transcript's file name):
+
+```bash
+scripts/stop-session.sh my-project
+scripts/start-session.sh my-project --resume <session_id>
+```
+
+The transcript must exist in the Claude home the project launches with
+(`claude_home`, else `CLAUDE_CONFIG_DIR`, else `~/.claude`) at
+`projects/<project path with each non-alphanumeric character as ->/<session_id>.jsonl`;
+a missing transcript, a non-UUID, or an already running session is refused
+before anything starts. A resume launch that fails to reach the Router cleans up
+and exits non-zero instead of starting a fresh conversation.
+
 ### Registering a New Project
 
 Once the root agent and the Router are running, message root in `#root`:
@@ -610,6 +627,8 @@ These tools move an existing Bot Pool install to the Router, and are kept for in
 4. **Retire the pool.** Run `scripts/retire-pool.sh` (a dry run), review it, then `scripts/retire-pool.sh --apply`.
 
 `scripts/migrate-to-router.sh <project>` records one project on the Router. It checks that the Router is healthy, the project is registered and not yet on the Router, and root has its channel permissions. It then stops the session (including a leftover pool listener), runs `ensure-webhook`, records the project on the Router, issues the reminder `assignment-changed`, starts the session through its launcher, and verifies the round trip: `router status` shows it connected in its channel, and `router.js probe <project>` posts a notice under the project's `webhook_id`. Each step prints `<step>: ok` or `<step>: failed — <reason>`. A preflight failure changes nothing, and any later failure restores the project's previous registry state, restarts its session, and exits non-zero naming the failed step. `--rollback` refuses, since no pool bot remains to return to. The script runs `node` unless `CCDM_ROUTER_NODE` names another binary.
+
+`scripts/migrate-to-router.sh --resume <project>` also keeps the conversation. Before the stop step (which clears `pid` and `session_id`) it prints `resume: <id> (<source>)` or `resume: skipped — <reason>`, and the start step, and a rollback's start, pass that id to the launcher's `--resume`. For Claude the id is the running session's own `sessionId` from `<claude home>/sessions/<pid>.json`, else the registry's `session_id`, and its transcript must exist in the project's Claude home. Codex launches record no thread id (`session_id` stays `null`), so the id is the newest `codex-discord-bridge` rollout (not a subagent's) whose `cwd` is the project directory in the project's resolved Codex home, skipped when another Codex project or the CCDM checkout shares that directory. Without an id or transcript/rollout, or when the launcher cannot resume it, the project starts fresh and the migration continues. Because the step-1 stop clears `session_id`, run `--resume` on projects that are still running (the migration stops them itself).
 
 `scripts/retire-pool.sh` removes what is left of a Bot Pool. It refuses (naming the projects) while any project still tied to a pool bot (by `bot_id`, `bot_display_name`, or a pool entry's `assigned_to`) lacks `transport: "router"`; a project registered after the cutover needs no `transport`. By default it is a dry run that prints each action and changes nothing. With `--apply` it uses the root token to remove every old pool bot from the server and moves their state directories (`~/...` paths included) into a private backup at `~/.local/state/ccdm/pool-retirement/` (0700; `CCDM_POOL_BACKUP_DIR` overrides it). It also deletes the obsolete `project-bot` role, saves a 0600 copy of the registry in the backup, and strips the pool fields from `registry.json`. Bot applications are kept. A state directory it cannot move (none recorded, not an absolute path, or missing) is reported as skipped, and `--apply` then exits 2 with the list instead of claiming success. An interrupted `--apply` finishes the remaining work when rerun, and a rerun after retirement does nothing.
 

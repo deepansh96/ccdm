@@ -38,7 +38,7 @@ function poolClaudeWorkspace() {
 
 // `beta` is a Codex project with no `transport` field, no pool bot, and no
 // webhook yet, backed by the fake app-server.
-async function unmigratedCodexWorkspace() {
+async function unmigratedCodexWorkspace(codexOptions = {}) {
   const workspace = createRouterWorkspace({
     discord_user_id: OWNER_ID,
     guild_id: "guild-id",
@@ -49,12 +49,12 @@ async function unmigratedCodexWorkspace() {
     },
   });
   fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
-  const codex = await startFakeCodexServer(workspace, { channelId: "beta-channel" });
+  const codex = await startFakeCodexServer(workspace, { channelId: "beta-channel", ...codexOptions });
   updateRegistry(workspace, (registry) => {
     registry.projects.beta.path = workspace.tmpDir;
     registry.projects.beta.ws_port = codex.port;
   });
-  return { workspace };
+  return { workspace, codex };
 }
 
 const registryFile = (workspace) => path.join(workspace.repoDir, "registry.json");
@@ -250,4 +250,202 @@ test("probe fails clearly when Discord returns the message under another webhook
   assert.notEqual(result.exitCode, 0);
   assert.match(result.stderr,
     /router probe failed: probe message fake-message-1 came back with webhook_id someone-elses-webhook, expected fake-webhook-1/);
+});
+
+// --resume: the saved conversation is found before the stop step clears the
+// runtime fields, and a missing one falls back to a fresh start.
+const CLAUDE_SESSION = "3f1c2b7a-9d4e-4c1a-8b2f-5e6d7c8a9b0c";
+const LIVE_SESSION = "7a0e9c1d-2b3f-4e5a-9c8d-1f2e3d4c5b6a";
+const CODEX_THREAD = "01a0f38d-b24b-7cf2-8c6a-3dafcb29d169";
+
+function writeClaudeTranscript(workspace, id, claudeHome = path.join(workspace.homeDir, ".claude")) {
+  const dir = path.join(claudeHome, "projects", workspace.tmpDir.replace(/[^A-Za-z0-9]/g, "-"));
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${id}.jsonl`), "{}\n");
+}
+
+function writeCodexRollout(workspace, id, { cwd = workspace.tmpDir, originator = "codex-discord-bridge", source = "vscode", mtime } = {}) {
+  const dir = path.join(workspace.homeDir, ".codex", "sessions", "2026", "10", "01");
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `rollout-2026-10-01T00-00-00-${id}.jsonl`);
+  fs.writeFileSync(file, `${JSON.stringify({ type: "session_meta", payload: { id, cwd, originator, source } })}\n{}\n`);
+  if (mtime) fs.utimesSync(file, mtime, mtime);
+}
+
+const claudeLaunches = (workspace) => readState(workspace.stateDir).fixtures.claude.invocations.map((invocation) => invocation.args.join(" "));
+const threadRequests = (codex) => codex.clientMessages
+  .filter((message) => message.method === "thread/resume" || message.method === "thread/start")
+  .map((message) => [message.method, message.params.threadId]);
+
+test("--resume resumes a Claude project's recorded session_id after the stop clears it", async () => {
+  const { workspace } = poolClaudeWorkspace();
+  updateRegistry(workspace, (registry) => { registry.projects.demo.session_id = CLAUDE_SESSION; });
+  writeClaudeTranscript(workspace, CLAUDE_SESSION);
+  await startRouter(workspace);
+
+  const result = await migrate(workspace, ["--resume", "demo"]);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, new RegExp(`^resume: ${CLAUDE_SESSION} \\(registry session_id\\)$`, "m"));
+  assert.ok(result.stdout.indexOf("resume:") < result.stdout.indexOf("stop: ok"), result.stdout);
+  assert.match(result.stdout, new RegExp(`^start: ok \\(resumed ${CLAUDE_SESSION}\\)$`, "m"));
+  assert.match(result.stdout, /^verify: ok/m);
+  const launches = claudeLaunches(workspace);
+  assert.equal(launches.length, 1);
+  assert.match(launches[0], new RegExp(`--resume '?${CLAUDE_SESSION}`));
+  assert.equal(readRegistry(workspace).projects.demo.session_id, CLAUDE_SESSION);
+});
+
+test("--resume prefers the running Claude session's own id over a stale recorded one", async () => {
+  const { workspace } = poolClaudeWorkspace();
+  const running = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+  running.unref();
+  registerTeardownCallback(() => { try { process.kill(running.pid, "SIGKILL"); } catch { /* gone */ } });
+  const sessions = path.join(workspace.homeDir, ".claude", "sessions");
+  fs.mkdirSync(sessions, { recursive: true });
+  fs.writeFileSync(path.join(sessions, `${running.pid}.json`), JSON.stringify({ sessionId: LIVE_SESSION, cwd: workspace.tmpDir }));
+  updateRegistry(workspace, (registry) => {
+    registry.projects.demo.session_id = CLAUDE_SESSION;
+    registry.projects.demo.pid = running.pid;
+  });
+  writeClaudeTranscript(workspace, CLAUDE_SESSION);
+  writeClaudeTranscript(workspace, LIVE_SESSION);
+  await startRouter(workspace);
+
+  const result = await migrate(workspace, ["--resume", "demo"]);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, new RegExp(`^resume: ${LIVE_SESSION} \\(live Claude session file\\)$`, "m"));
+  assert.match(claudeLaunches(workspace)[0], new RegExp(`--resume '?${LIVE_SESSION}`));
+});
+
+for (const [name, setup, reason] of [
+  ["no recorded session_id", () => {}, /^resume: skipped — no recorded Claude session_id$/m],
+  ["a transcript missing from the project's claude_home", (workspace) => {
+    updateRegistry(workspace, (registry) => {
+      registry.projects.demo.session_id = CLAUDE_SESSION;
+      registry.projects.demo.claude_home = "~/.claude-work";
+    });
+    // Only the default home has it; the project's own home is what counts.
+    writeClaudeTranscript(workspace, CLAUDE_SESSION);
+  }, new RegExp(`^resume: skipped — transcript for ${CLAUDE_SESSION} \\(registry session_id\\) is missing from .*\\.claude-work$`, "m")],
+]) {
+  test(`--resume with ${name} starts a Claude project fresh and still migrates`, async () => {
+    const { workspace } = poolClaudeWorkspace();
+    setup(workspace);
+    await startRouter(workspace);
+
+    const result = await migrate(workspace, ["--resume", "demo"]);
+
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, reason);
+    assert.match(result.stdout, /^start: ok$/m);
+    assert.match(result.stdout, /^verify: ok/m);
+    const launches = claudeLaunches(workspace);
+    assert.equal(launches.length, 1);
+    assert.doesNotMatch(launches[0], /--resume/);
+  });
+}
+
+test("without --resume a recorded Claude session is not resumed", async () => {
+  const { workspace } = poolClaudeWorkspace();
+  updateRegistry(workspace, (registry) => { registry.projects.demo.session_id = CLAUDE_SESSION; });
+  writeClaudeTranscript(workspace, CLAUDE_SESSION);
+  await startRouter(workspace);
+
+  const result = await migrate(workspace, ["demo"]);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.doesNotMatch(result.stdout, /^resume:/m);
+  assert.doesNotMatch(claudeLaunches(workspace)[0], /--resume/);
+});
+
+test("a rollback after --resume resumes the same Claude session again", async () => {
+  const { workspace } = poolClaudeWorkspace();
+  updateRegistry(workspace, (registry) => { registry.projects.demo.session_id = CLAUDE_SESSION; });
+  writeClaudeTranscript(workspace, CLAUDE_SESSION);
+  await startRouter(workspace);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.webhookExecuteReturnsWebhookId = "someone-elses-webhook";
+  });
+
+  const result = await migrate(workspace, ["--resume", "demo"]);
+
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stdout, /^rolling back demo to its previous registry state after the verify step failed$/m);
+  assert.equal(result.stdout.match(new RegExp(`^start: ok \\(resumed ${CLAUDE_SESSION}\\)$`, "gm"))?.length, 2, result.stdout);
+  const launches = claudeLaunches(workspace);
+  assert.equal(launches.length, 2);
+  for (const launch of launches) assert.match(launch, new RegExp(`--resume '?${CLAUDE_SESSION}`));
+  assert.equal(readRegistry(workspace).projects.demo.session_id, CLAUDE_SESSION);
+});
+
+test("--resume resumes a Codex project's newest bridge rollout for its directory, since the registry records no thread id", async () => {
+  const { workspace, codex } = await unmigratedCodexWorkspace();
+  const older = new Date("2026-09-30T00:00:00Z");
+  const newer = new Date("2026-10-01T00:00:00Z");
+  writeCodexRollout(workspace, CODEX_THREAD, { mtime: older });
+  // Newer, but not the bridge's own thread for this directory.
+  writeCodexRollout(workspace, "01a0f39d-f0a0-7000-8000-000000000001", { source: { subagent: {} }, mtime: newer });
+  writeCodexRollout(workspace, "01a0f39d-f0a0-7000-8000-000000000002", { originator: "codex_exec", source: "exec", mtime: newer });
+  writeCodexRollout(workspace, "01a0f39d-f0a0-7000-8000-000000000003", { cwd: "/elsewhere", mtime: newer });
+  await startRouter(workspace);
+
+  const result = await migrate(workspace, ["--resume", "beta"]);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, new RegExp(`^resume: ${CODEX_THREAD} \\(newest codex-discord-bridge rollout for the project directory in .*\\.codex\\)$`, "m"));
+  assert.match(result.stdout, new RegExp(`^start: ok \\(resumed ${CODEX_THREAD}\\)$`, "m"));
+  assert.match(result.stdout, /^verify: ok/m);
+  assert.deepEqual(threadRequests(codex), [["thread/resume", CODEX_THREAD]]);
+});
+
+test("--resume with no Codex rollout starts the Codex project fresh and still migrates", async () => {
+  const { workspace, codex } = await unmigratedCodexWorkspace();
+  await startRouter(workspace);
+
+  const result = await migrate(workspace, ["--resume", "beta"]);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /^resume: skipped — no recorded Codex thread id, and no codex-discord-bridge rollout for the project directory in /m);
+  assert.match(result.stdout, /^start: ok$/m);
+  assert.deepEqual(threadRequests(codex), [["thread/start", undefined]]);
+});
+
+test("--resume skips a Codex rollout whose directory another Codex project shares, since it cannot say whose thread it is", async () => {
+  const { workspace, codex } = await unmigratedCodexWorkspace();
+  updateRegistry(workspace, (registry) => {
+    registry.projects.gamma = { channel_id: "gamma-channel", type: "codex", screen_name: "gamma_codex", path: workspace.tmpDir };
+  });
+  writeCodexRollout(workspace, CODEX_THREAD);
+  await startRouter(workspace);
+
+  const result = await migrate(workspace, ["--resume", "beta"]);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /^resume: skipped — no recorded Codex thread id, and Codex project\(s\) gamma share the project directory$/m);
+  assert.deepEqual(threadRequests(codex), [["thread/start", undefined]]);
+});
+
+test("--resume falls back to a fresh start when the launcher cannot resume the Codex thread", async () => {
+  const { workspace, codex } = await unmigratedCodexWorkspace({ resumeError: "no rollout found for thread" });
+  writeCodexRollout(workspace, CODEX_THREAD);
+  await startRouter(workspace);
+
+  const result = await migrate(workspace, ["--resume", "beta"]);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, new RegExp(`^resume: skipped — the launcher could not resume ${CODEX_THREAD}: start-codex-session\\.sh exited 1: .*; starting fresh$`, "m"));
+  assert.match(result.stdout, /^start: ok \(fresh\)$/m);
+  assert.match(result.stdout, /^verify: ok/m);
+  assert.deepEqual(threadRequests(codex), [["thread/resume", CODEX_THREAD], ["thread/start", undefined]]);
+});
+
+test("migrate-to-router.sh rejects unknown flags and a --resume without a project", async () => {
+  const { workspace } = poolClaudeWorkspace();
+  for (const args of [["--resume"], ["--resume", "--rollback", "demo"], ["demo", "--resume"], ["--fork", "demo"]]) {
+    const result = await migrate(workspace, args);
+    assert.equal(result.exitCode, 2, `${args}: ${result.stdout}`);
+    assert.match(result.stderr, /usage: migrate-to-router\.sh \[--resume\] <project> \| --rollback <project>/);
+  }
 });

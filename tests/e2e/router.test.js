@@ -210,7 +210,9 @@ test("bot, webhook, and stranger messages are never forwarded, while a registere
 });
 
 test("a message to a router channel with no session gets 💤 and is not replayed to a later session", async () => {
-  const workspace = createRouterWorkspace();
+  const workspace = createRouterWorkspace(routerRegistry({
+    demo: { channel_id: "demo-channel", type: "claude", transport: "router", webhook_id: "demo-webhook" },
+  }));
   writeProjectKey(workspace, "demo", "demo-key");
   await startRouter(workspace);
 
@@ -223,6 +225,35 @@ test("a message to a router channel with no session gets 💤 and is not replaye
     authorization: `Bot ${ROOT_TOKEN}`, channelId: "demo-channel", emoji: encodeURIComponent("💤"), messageId: "while-offline",
   }]);
   assert.deepEqual(demo.events, []);
+});
+
+test("a message to an unmigrated project (no webhook_id) with no session is dropped without 💤 but still observed", async () => {
+  const workspace = createRouterWorkspace(routerRegistry({
+    demo: { channel_id: "demo-channel", type: "claude", transport: "router", webhook_id: "demo-webhook" },
+  }));
+  const keysDir = path.join(workspace.routerStateDir, "keys");
+  fs.mkdirSync(keysDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(keysDir, ".observer.key"), "observer-key\n", { mode: 0o600 });
+  await startRouter(workspace);
+  const { RouterClient } = (await import("node:module")).createRequire(import.meta.url)(
+    path.join(workspace.repoDir, "scripts/router/client.js"));
+  const observer = new RouterClient({ socketPath: workspace.socketPath, key: "observer-key", role: "observer" });
+  const observed = [];
+  observer.on("event", (event) => observed.push(event));
+  await observer.connect();
+
+  injectDiscordMessage(workspace, { id: "legacy-message", channelId: "legacy-channel", content: "still on the pool bot",
+    author: { id: OWNER_ID, username: "Owner" } });
+  injectMessage(workspace, "migrated-message", { id: OWNER_ID, username: "Owner" });
+  await waitFor(() => readState(workspace.stateDir).fixtures.discord.reactions.length > 0, () => "offline reaction");
+  await waitFor(() => observed.length >= 2, () => `observer events: ${JSON.stringify(observed)}`);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  observer.close();
+
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.reactions.map(row => [row.channelId, row.messageId]),
+    [["demo-channel", "migrated-message"]]);
+  assert.deepEqual(observed.map(event => [event.event, event.message_id, event.channel_id]).sort(),
+    [["message", "legacy-message", "legacy-channel"], ["message", "migrated-message", "demo-channel"]]);
 });
 
 test("an unregistered channel is ignored entirely", async () => {
