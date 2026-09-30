@@ -19,7 +19,8 @@
 // registered channel, posts as the bot, and records no Conversation Reminder
 // events or management commands. If the Router stays unreachable past the
 // fallback threshold, root hears its own channels through an emergency
-// direct gateway until the Router is back (scripts/router/emergency.js).
+// direct gateway until the Router is back (scripts/router/emergency.js), and
+// its reply, react, edit_message, and typing go there too.
 //
 // The statusline wrapper writes the latest context percentage to
 // `<state>/launches/<project>/context.json`; reply and edit_message send it as
@@ -421,13 +422,14 @@ function main() {
   const router = new RouterClient({ project, key, role: ROOT ? "root" : "project",
     ...(fallback ? { beforeHello: () => fallback.release() } : {}) });
   fallback?.watch(router);
+  const request = fallback ? fallback.request(router) : (op, args) => router.request(op, args);
 
   // Channel notifications wait until Claude has finished initializing.
   let initialized = false;
   const queued = [];
   const notify = (kind, event) => {
     // Like the plugin, show the bot typing while Claude takes the message in.
-    if (kind === "message") router.request("typing", { channel_id: event.channel_id }).catch(() => {});
+    if (kind === "message") request("typing", { channel_id: event.channel_id }).catch(() => {});
     const params = notification(kind, event);
     if (initialized) send({ method: "notifications/claude/channel", params });
     else queued.push(params);
@@ -520,7 +522,7 @@ function main() {
       if (tool.run) {
         text = await tool.run(router, input);
       } else {
-        const result = await router.request(tool.op, tool.args(input));
+        const result = await request(tool.op, tool.args(input));
         // Record the receipt before Claude sees the result, so the Stop hook
         // that follows the turn finds it.
         await reminderEvents;

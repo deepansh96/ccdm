@@ -132,7 +132,7 @@ Run `node scripts/router.js status`. It shows the gateway state, the registry's 
 
 If the Router is down, launchd restarts it (`com.ccdm.router`, logs in `~/.local/state/ccdm/router/router.err`). To reinstall it, run `scripts/install-router-service.sh`; its read-only preflight names any blocker.
 
-**Emergency fallback:** if the Router stays unreachable for about 2 minutes, you open an emergency direct gateway connection with the root token for root channels only (owner and `root_allowed_user_ids`) and post a one-line notice in the primary root channel. Project channels are not served until the Router returns. Use that window to diagnose and restart the Router. When it is back, you drop the emergency connection before reconnecting.
+**Emergency fallback:** if the Router stays unreachable for about 2 minutes, you open an emergency direct gateway connection with the root token for root channels only (owner and `root_allowed_user_ids`) and post a one-line notice in the primary root channel. You can still reply, react, and edit your own messages in root channels; project channels, reads, and attachments are not served until the Router returns. Use that window to diagnose and restart the Router, not root: the root restart scripts refuse to run while the Router is down. When it is back, you drop the emergency connection before reconnecting.
 
 #### 8. Probe a project (`probe <project>`)
 

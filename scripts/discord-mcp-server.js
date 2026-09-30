@@ -6,6 +6,7 @@ const path = require("path");
 const { writeFile, mkdir, readFile } = require("fs/promises");
 const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
+const { stateDir } = require("./router/paths.js");
 
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const DISCORD_REPLY_TOKEN = process.env.DISCORD_REPLY_TOKEN;
@@ -279,11 +280,28 @@ function routerClient() {
   return routerConnection;
 }
 
-async function routerRequest(op, channelId, args) {
-  const client = await routerClient();
+// Root Codex's bridge records an engaged emergency fallback in root's launch
+// directory. While the Router is down and that bridge is live, root's reply,
+// react, and edit_message go straight to Discord as the bot, in root channels
+// only (router/emergency.js); the scope token and channel grant still apply.
+async function emergencyRequest(op, channelId, args) {
+  if (!ROUTER_ROOT) return null;
+  const { directRequester, emergencyEngaged } = require("./router/emergency.js");
+  if (!emergencyEngaged(path.join(stateDir(), "launches", ".root", "emergency.json"))) return null;
   try {
+    return { result: await (await directRequester())(op, { channel_id: channelId, ...args }) };
+  } catch (error) {
+    throw new Error(`Emergency ${op} failed: ${error.code || error.message}`);
+  }
+}
+
+async function routerRequest(op, channelId, args) {
+  try {
+    const client = await routerClient();
     return await client.request(op, { channel_id: channelId, ...args });
   } catch (error) {
+    const direct = error.code === "router_unavailable" ? await emergencyRequest(op, channelId, args) : null;
+    if (direct) return direct.result;
     throw new Error(`Router ${op} failed: ${error.code || error.message}`);
   }
 }
