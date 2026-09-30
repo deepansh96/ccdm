@@ -4,7 +4,7 @@ import path from "node:path";
 import { WebSocketServer } from "ws";
 
 import { createWorkspace } from "./runner.js";
-import { readState, recordCommandInvocation, writeState } from "./state.js";
+import { readState, recordCommandInvocation, updateState } from "./state.js";
 import { registerTeardownCallback } from "./teardown.js";
 
 const overlayRoots = new WeakMap();
@@ -119,18 +119,18 @@ export function runPreloadProbe(workspace, code, extraEnv = {}) {
 }
 
 function recordCodexEvent(workspace, event) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.codex.protocolEvents.push({ at: new Date().toISOString(), ...event });
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.codex.protocolEvents.push({ at: new Date().toISOString(), ...event });
+  });
 }
 
 function markCodexServer(workspace, port, values) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.codex.servers[String(port)] = {
-    ...(state.fixtures.codex.servers[String(port)] ?? {}),
-    ...values,
-  };
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.codex.servers[String(port)] = {
+      ...(state.fixtures.codex.servers[String(port)] ?? {}),
+      ...values,
+    };
+  });
 }
 
 // Runs the MCP server the bridge registered, as Codex would, and calls one of
@@ -440,46 +440,48 @@ export async function startFakeCodexServer(workspace, options = {}) {
   };
 }
 
+// Injection runs while the bridge's fake gateway poller marks messages
+// delivered, so it must hold the state lock like every other writer.
 export function injectDiscordMessage(workspace, message = {}) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.injectedMessages.push({
-    author: { bot: false, id: "allowed-user-id", username: "Allowed User", ...(message.author ?? {}) },
-    channelId: message.channelId ?? "channel-id",
-    content: message.content ?? "hello",
-    delivered: false,
-    id: message.id ?? `message-${Date.now()}`,
-    attachments: message.attachments ?? [],
-    ...(message.webhookId ? { webhookId: message.webhookId } : {}),
-    ...(message.createdTimestamp ? { createdTimestamp: message.createdTimestamp } : {}),
-    ...(message.replyTo ? { replyTo: message.replyTo } : {}),
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.injectedMessages.push({
+      author: { bot: false, id: "allowed-user-id", username: "Allowed User", ...(message.author ?? {}) },
+      channelId: message.channelId ?? "channel-id",
+      content: message.content ?? "hello",
+      delivered: false,
+      id: message.id ?? `message-${Date.now()}`,
+      attachments: message.attachments ?? [],
+      ...(message.webhookId ? { webhookId: message.webhookId } : {}),
+      ...(message.createdTimestamp ? { createdTimestamp: message.createdTimestamp } : {}),
+      ...(message.replyTo ? { replyTo: message.replyTo } : {}),
+    });
   });
-  writeState(state, workspace.stateDir);
 }
 
 export function injectDiscordReaction(workspace, reaction = {}) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.injectedReactions.push({
-    channelId: reaction.channelId ?? "channel-id",
-    delivered: false,
-    emoji: reaction.emoji ?? "👍",
-    id: reaction.id ?? `reaction-${Date.now()}`,
-    message: {
-      author: { bot: true, id: "fixture-bot-user-id", username: "Fixture Bot", ...(reaction.message?.author ?? {}) },
-      content: reaction.message?.content ?? "",
-      partial: reaction.message?.partial ?? false,
-      ...(reaction.message?.webhookId ? { webhookId: reaction.message.webhookId } : {}),
-    },
-    messageId: reaction.messageId ?? "bot-message-id",
-    partial: reaction.partial ?? false,
-    user: {
-      bot: false,
-      id: "allowed-user-id",
-      partial: false,
-      username: "Allowed User",
-      ...(reaction.user ?? {}),
-    },
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.injectedReactions.push({
+      channelId: reaction.channelId ?? "channel-id",
+      delivered: false,
+      emoji: reaction.emoji ?? "👍",
+      id: reaction.id ?? `reaction-${Date.now()}`,
+      message: {
+        author: { bot: true, id: "fixture-bot-user-id", username: "Fixture Bot", ...(reaction.message?.author ?? {}) },
+        content: reaction.message?.content ?? "",
+        partial: reaction.message?.partial ?? false,
+        ...(reaction.message?.webhookId ? { webhookId: reaction.message.webhookId } : {}),
+      },
+      messageId: reaction.messageId ?? "bot-message-id",
+      partial: reaction.partial ?? false,
+      user: {
+        bot: false,
+        id: "allowed-user-id",
+        partial: false,
+        username: "Allowed User",
+        ...(reaction.user ?? {}),
+      },
+    });
   });
-  writeState(state, workspace.stateDir);
 }
 
 export async function waitForState(workspace, predicate, timeoutMs = 5000) {

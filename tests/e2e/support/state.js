@@ -239,7 +239,10 @@ export function writeState(nextState, explicitStateDir) {
   return readState(dir);
 }
 
-function updateState(explicitStateDir, updater) {
+// Read-modify-write under the cross-process state lock. Harness helpers that
+// run while fixture children (such as the fake Discord gateway poller) also
+// write state must use this, or one writer silently drops the other's change.
+export function updateState(explicitStateDir, updater) {
   return withStateLock(stateDir(explicitStateDir), () => {
     const current = readState(explicitStateDir);
     const next = updater(current) ?? current;

@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { createWorkspace, runScript } from "./support/runner.js";
-import { readState, writeState } from "./support/state.js";
+import { readState, updateState, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 import { bridgeChildEnv, createBridgeWorkspace, injectDiscordMessage, injectDiscordReaction, startFakeCodexServer, waitForState } from "./support/bridge.js";
 import { routerEnv, runRouterCli, startBridge } from "./support/router.js";
@@ -340,13 +340,14 @@ test("a failed Discord reply and tool start cannot qualify Codex completion", as
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
   for (let attempt = 0; attempt < 100 && !fs.existsSync(contextFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
   assert.ok(fs.existsSync(contextFile));
-  const seed = readState(workspace.stateDir);
   // The Router's execute of the project's webhook fails.
   // The fake webhook token is spelled in parts because router.test.js
   // scans every Test Workspace file, including this copied source, for that token.
   const execute = `/api/v10/webhooks/fake-webhook-1/${"fake-webhook-"}token-1`;
-  seed.fixtures.discord.restFailures = [{ status: 503, method: "POST", path: execute }];
-  writeState(seed, workspace.stateDir);
+  // The bridge is live, so the seed goes through the state lock.
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.restFailures = [{ status: 503, method: "POST", path: execute }];
+  });
   const reply = await runMcp(workspace, {
     env: bridgeChildEnv(workspace, config.params.value.env),
     input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "reply", arguments: { text: "failed", scope_token: config.params.value.env.DISCORD_REPLY_TOKEN } } }) + "\n",
@@ -709,6 +710,10 @@ test("a completion notification without a turn ID cannot end the active Codex ex
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
   await waitForState(workspace, (state) => state.fixtures.discord.deliveredMessages.some((message) => message.id === "identified-owner"));
+  // The bridge writes the grant once turn/start returns; a loaded machine can
+  // take longer than a fixed delay to get there.
+  for (let attempt = 0; attempt < 250 && !fs.existsSync(contextFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+  // The unidentified completion follows the turn/start reply; let it land.
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert.ok(fs.existsSync(contextFile), "unidentified completion must leave the active reply grant intact");
   const reply = await runMcp(workspace, {
