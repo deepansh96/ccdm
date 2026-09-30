@@ -10,7 +10,8 @@
 // Codex: the launcher records `session_id: null`, so the registry's value is
 // used only when it is a UUID; otherwise the newest non-subagent
 // `codex-discord-bridge` rollout for the project directory in the project's
-// resolved Codex home, whose rollout file must exist.
+// resolved Codex home, whose rollout file must exist. A directory shared with
+// another Codex project or the CCDM checkout (root's threads) is ambiguous and skipped.
 const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -142,6 +143,21 @@ function resolveCodex(project, entry, registryFile) {
   }
   if (!entry.path) return { skip: "the project has no path" };
   const dirs = sameDirectories(expandHome(String(entry.path)));
+  // A rollout names only its directory, so a directory another Codex thread
+  // source also uses (another Codex project, or root's bridge in the CCDM
+  // checkout) cannot say whose thread is newest.
+  const overlaps = dir => sameDirectories(dir).some(candidate => dirs.includes(candidate));
+  if (overlaps(path.dirname(path.resolve(registryFile)))) {
+    return { skip: "no recorded Codex thread id, and the project directory is the CCDM checkout, where root's bridge threads also run" };
+  }
+  let registry = {};
+  try { registry = JSON.parse(fs.readFileSync(registryFile, "utf8")); } catch { /* checked by the resolver */ }
+  const sharing = Object.entries(registry.projects || {})
+    .filter(([name, other]) => name !== project && other?.type === "codex" && other.path && overlaps(expandHome(String(other.path))))
+    .map(([name]) => name);
+  if (sharing.length) {
+    return { skip: `no recorded Codex thread id, and Codex project(s) ${sharing.join(", ")} share the project directory` };
+  }
   const byNewest = files
     .map(file => { try { return { file, mtime: fs.statSync(file).mtimeMs }; } catch { return null; } })
     .filter(Boolean)

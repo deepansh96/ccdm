@@ -412,6 +412,21 @@ test("--resume with no Codex rollout starts the Codex project fresh and still mi
   assert.deepEqual(threadRequests(codex), [["thread/start", undefined]]);
 });
 
+test("--resume skips a Codex rollout whose directory another Codex project shares, since it cannot say whose thread it is", async () => {
+  const { workspace, codex } = await unmigratedCodexWorkspace();
+  updateRegistry(workspace, (registry) => {
+    registry.projects.gamma = { channel_id: "gamma-channel", type: "codex", screen_name: "gamma_codex", path: workspace.tmpDir };
+  });
+  writeCodexRollout(workspace, CODEX_THREAD);
+  await startRouter(workspace);
+
+  const result = await migrate(workspace, ["--resume", "beta"]);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /^resume: skipped — no recorded Codex thread id, and Codex project\(s\) gamma share the project directory$/m);
+  assert.deepEqual(threadRequests(codex), [["thread/start", undefined]]);
+});
+
 test("--resume falls back to a fresh start when the launcher cannot resume the Codex thread", async () => {
   const { workspace, codex } = await unmigratedCodexWorkspace({ resumeError: "no rollout found for thread" });
   writeCodexRollout(workspace, CODEX_THREAD);
