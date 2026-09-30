@@ -920,6 +920,12 @@ async function guardedFetch(input, init = {}) {
       await new Promise(resolve => setTimeout(resolve, delay));
       updateState(state => { state.fixtures.discord.responsePending = false; });
     }
+    // Real Discord's round trip for one page of channel history.
+    const pageDelay = readState().fixtures?.discord?.historyPageDelayMs || 0;
+    if (pageDelay && (init.method || "GET").toUpperCase() === "GET" &&
+        /^\/api\/v10\/channels\/[^/]+\/messages$/.test(url.pathname)) {
+      await new Promise(resolve => setTimeout(resolve, pageDelay));
+    }
     return routed;
   }
   recordBlocked("fetch", url.href);

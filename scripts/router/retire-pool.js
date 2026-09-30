@@ -12,14 +12,14 @@ const { chmod, copyFile, mkdir, rename } = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const { discordRequest } = require("./discord-rest.js");
-const { registryPath, rootToken } = require("./paths.js");
+const { expandHome, registryPath, rootToken } = require("./paths.js");
 const { readRegistry, updateRegistry } = require("./registry.js");
 
 const REGISTRY_FIELDS = ["pool", "max_pool_size", "project_bot_role_id"];
 const PROJECT_FIELDS = ["bot_id", "bot_display_name", "transport"];
 
 function backupDir() {
-  return process.env.CCDM_POOL_BACKUP_DIR || path.join(os.homedir(), ".local/state/ccdm/pool-retirement");
+  return expandHome(process.env.CCDM_POOL_BACKUP_DIR) || path.join(os.homedir(), ".local/state/ccdm/pool-retirement");
 }
 
 async function privateDir(dir) {
@@ -56,14 +56,29 @@ function plan(registry, file) {
     });
   }
   for (const bot of pool) {
-    if (!bot.state_dir || !existsSync(bot.state_dir)) continue;
+    // Registry paths may start with `~`; every other lifecycle script expands it.
+    const source = expandHome(bot.state_dir);
     const target = path.join(backup, "state", String(bot.id));
+    if (!source) {
+      actions.push({ skip: true, describe: `move the state directory of ${bot.id}: the registry names none` });
+      continue;
+    }
+    if (!path.isAbsolute(source)) {
+      actions.push({ skip: true, describe: `move state directory ${bot.state_dir} of ${bot.id}: not an absolute path` });
+      continue;
+    }
+    if (!existsSync(source)) {
+      // An interrupted run already moved it into the backup.
+      if (existsSync(target)) continue;
+      actions.push({ skip: true, describe: `move state directory ${source} of ${bot.id}: it does not exist` });
+      continue;
+    }
     actions.push({
-      describe: `move state directory ${bot.state_dir} to ${target}`,
+      describe: `move state directory ${source} to ${target}`,
       run: async () => {
         if (existsSync(target)) throw new Error(`${target} already exists; not overwriting it`);
         await privateDir(path.dirname(target));
-        await rename(bot.state_dir, target);
+        await rename(source, target);
         await chmod(target, 0o700);
       },
     });
@@ -114,7 +129,8 @@ async function main(args) {
   const file = registryPath();
   const registry = await readRegistry(file);
   const actions = plan(registry, file);
-  if (!actions.length) {
+  if (!actions.some(action => !action.skip)) {
+    for (const action of actions) console.log(`skipped: ${action.describe}`);
     console.log("the Bot Pool is already retired; nothing to do");
     return;
   }
@@ -124,13 +140,18 @@ async function main(args) {
   if (pooled.length) {
     throw new Error(`refusing to retire the Bot Pool: ${pooled.join(", ")} ${pooled.length === 1 ? "is" : "are"} not on the Router (transport: "router")`);
   }
+  const skipped = actions.filter(action => action.skip);
   if (!apply) {
     console.log("dry run: nothing changes until this is re-run with --apply");
-    for (const action of actions) console.log(`would ${action.describe}`);
+    for (const action of actions) console.log(`${action.skip ? "would skip" : "would"} ${action.describe}`);
     return;
   }
   const token = await rootToken();
   for (const action of actions) {
+    if (action.skip) {
+      console.log(`skipped: ${action.describe}`);
+      continue;
+    }
     try {
       await action.run(token);
     } catch (error) {
@@ -138,9 +159,15 @@ async function main(args) {
     }
     console.log(`done: ${action.describe}`);
   }
+  // Skipped work is not success: say what was left behind and exit non-zero.
+  if (skipped.length) {
+    const error = new Error(`the Bot Pool was retired, but ${skipped.length} item${skipped.length === 1 ? " was" : "s were"} skipped and need${skipped.length === 1 ? "s" : ""} manual review:\n${skipped.map(action => `  ${action.describe}`).join("\n")}`);
+    error.exitCode = 2;
+    throw error;
+  }
 }
 
 main(process.argv.slice(2)).catch(error => {
   console.error(error.message);
-  process.exit(1);
+  process.exit(error.exitCode || 1);
 });

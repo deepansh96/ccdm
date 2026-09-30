@@ -59,18 +59,19 @@ async function discordGet(token, endpoint) {
   }
 }
 
-async function fetchMessages(token, channelId, startId, endId) {
+// `get(route, query)` makes one Discord GET: this tool's own fetch by default,
+// or the Router's rate-limited, deadline-bounded REST queue.
+async function fetchMessages(get, channelId, startId, endId) {
   const messages = [
-    await discordGet(token, `/channels/${channelId}/messages/${startId}`),
+    await get(`/channels/${channelId}/messages/${startId}`),
   ];
   if (endId && startId !== endId) {
-    messages.push(await discordGet(token, `/channels/${channelId}/messages/${endId}`));
+    messages.push(await get(`/channels/${channelId}/messages/${endId}`));
   }
   let before = endId;
 
   while (startId !== endId) {
-    const query = before ? `?before=${before}&limit=100` : "?limit=100";
-    const page = await discordGet(token, `/channels/${channelId}/messages${query}`);
+    const page = await get(`/channels/${channelId}/messages`, before ? { before, limit: 100 } : { limit: 100 });
     if (!page.length) break;
     const inRange = page.filter(({ id }) =>
       BigInt(id) > BigInt(startId) && (!endId || BigInt(id) < BigInt(endId))
@@ -127,8 +128,12 @@ function transcript(messages, saved) {
 }
 
 // Exports the inclusive range to a private temporary transcript; returns its path.
-async function exportRange({ token, channelId, startId, endId }) {
-  const messages = await fetchMessages(token, channelId, startId, endId);
+async function exportRange({ token, channelId, startId, endId, get }) {
+  const directGet = (route, query = {}) => {
+    const search = new URLSearchParams(Object.entries(query).map(([key, value]) => [key, String(value)])).toString();
+    return discordGet(token, `${route}${search ? `?${search}` : ""}`);
+  };
+  const messages = await fetchMessages(get || directGet, channelId, startId, endId);
   const directory = await mkdtemp(path.join(tmpdir(), "discord-export-"));
   const saved = await downloadAttachments(messages, directory);
   const output = path.join(directory, "messages.txt");

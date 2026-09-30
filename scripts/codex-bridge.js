@@ -21,6 +21,7 @@ process.env.CCDM_REMINDER_RECEIPTS_DIR = REMINDER_RECEIPTS_DIR;
 const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { createRouterTransport } = require("./codex-bridge-transport.js");
 const routerPaths = require("./router/paths.js");
+const { MAX_TIMEOUT_MS: ROUTER_MAX_TIMEOUT_MS } = require("./router/deadlines.js");
 
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const PROJECT_DIR = process.env.PROJECT_DIR;
@@ -1336,6 +1337,9 @@ async function registerDiscordMcp() {
     value: {
       command: "node",
       args: [MCP_SERVER_SCRIPT],
+      // Codex stops waiting for a tool after 60 s by default; large reads and
+      // exports may take up to the Router's longest per-op deadline.
+      tool_timeout_sec: Math.ceil(ROUTER_MAX_TIMEOUT_MS / 1000) + 30,
       env: {
         // The MCP server reaches the Router with the launch key file, and
         // holds no Discord token.

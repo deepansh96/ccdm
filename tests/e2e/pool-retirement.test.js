@@ -245,3 +245,55 @@ test("a retirement interrupted between project strips finishes on the rerun, and
   assert.equal(again.stdout.trim(), "the Bot Pool is already retired; nothing to do");
   assert.equal(fs.readFileSync(registryFile(workspace), "utf8"), retired);
 });
+
+test("state directories written with a leading ~ are expanded and moved, not skipped", async () => {
+  const workspace = poolWorkspace();
+  const registry = readRegistry(workspace);
+  for (const bot of registry.pool) bot.state_dir = bot.state_dir.replace(workspace.homeDir, "~");
+  writeRegistry(workspace, registry);
+
+  const dryRun = await retire(workspace);
+  assert.equal(dryRun.exitCode, 0, dryRun.stderr);
+  assert.deepEqual(dryRun.stdout.trim().split("\n").slice(1), expectedActions(workspace).map(action => `would ${action}`));
+
+  const result = await retire(workspace, ["--apply"]);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.deepEqual(result.stdout.trim().split("\n"), expectedActions(workspace).map(action => `done: ${action}`));
+  const backup = path.join(workspace.homeDir, ".local/state/ccdm/pool-retirement");
+  for (const n of [2, 3, 9]) {
+    assert.equal(fs.existsSync(stateDirOf(workspace, n)), false, `discord${n} is still in place`);
+    assert.equal(fs.readFileSync(path.join(backup, "state", `bot${n}`, ".env"), "utf8"), `DISCORD_BOT_TOKEN=bot${n}-token\n`);
+  }
+});
+
+test("a state directory that cannot be retired is reported as skipped and the run exits non-zero", async () => {
+  const workspace = poolWorkspace();
+  const registry = readRegistry(workspace);
+  registry.pool[0].state_dir = "channels/discord2"; // relative: not resolvable
+  registry.pool[1].state_dir = "~/.claude/channels/missing3"; // expanded, but absent
+  delete registry.pool[2].state_dir;
+  writeRegistry(workspace, registry);
+  const home = workspace.homeDir;
+  const skips = [
+    "move state directory channels/discord2 of bot2: not an absolute path",
+    `move state directory ${home}/.claude/channels/missing3 of bot3: it does not exist`,
+    "move the state directory of bot9: the registry names none",
+  ];
+
+  const dryRun = await retire(workspace);
+  assert.equal(dryRun.exitCode, 0, dryRun.stderr);
+  for (const skip of skips) assert.ok(dryRun.stdout.includes(`would skip ${skip}\n`), dryRun.stdout);
+  assert.doesNotMatch(dryRun.stdout, /would move state directory/);
+
+  const result = await retire(workspace, ["--apply"]);
+
+  assert.equal(result.exitCode, 2, result.stdout);
+  for (const skip of skips) assert.ok(result.stdout.includes(`skipped: ${skip}\n`), result.stdout);
+  assert.match(result.stderr, /the Bot Pool was retired, but 3 items were skipped and need manual review:/);
+  for (const skip of skips) assert.ok(result.stderr.includes(`  ${skip}`), result.stderr);
+  assert.doesNotMatch(result.stdout, /done: move state directory/);
+  // Everything else still happened, and the untouched directories stay in place.
+  assert.equal("pool" in readRegistry(workspace), false);
+  for (const n of [2, 3, 9]) assert.ok(fs.existsSync(stateDirOf(workspace, n)), `discord${n} was moved`);
+});

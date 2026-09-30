@@ -25,6 +25,7 @@
 const crypto = require("node:crypto");
 const { EventEmitter } = require("node:events");
 const net = require("node:net");
+const { requestTimeoutMs } = require("./deadlines.js");
 const { socketPath: defaultSocketPath } = require("./paths.js");
 
 const PROTOCOL_VERSION = 1;
@@ -161,7 +162,9 @@ class RouterClient extends EventEmitter {
     this.socket.write(`${JSON.stringify(frame)}\n`);
   }
 
-  request(op, args = {}, { timeoutMs = this.timeoutMs } = {}) {
+  // Without an explicit `timeoutMs`, large reads and exports get a longer
+  // per-op budget (deadlines.js); every other op keeps the client's default.
+  request(op, args = {}, { timeoutMs = requestTimeoutMs(op, args, this.timeoutMs) } = {}) {
     if (!this.ready || this.socket.destroyed) return Promise.reject(routerError("router_unavailable", "not connected"));
     const id = crypto.randomUUID();
     // The Router drops work still unsent at this deadline, so a request that
