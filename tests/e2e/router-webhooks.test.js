@@ -9,6 +9,7 @@ import {
   createRouterWorkspace,
   routerWithWebhooks,
   runRouterCli,
+  waitFor,
 } from "./support/router.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
@@ -26,6 +27,20 @@ function deleteWebhookInDiscord(workspace, webhookId) {
 
 function registry(workspace) {
   return JSON.parse(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"));
+}
+
+// Moves only the project's registered channel, keeping its webhook_id, as an
+// atomic replace, and waits for the Router to reload it.
+async function moveChannel(workspace, router, project, channelId) {
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const reloads = () => router.stdout.split("registry reloaded").length - 1;
+  const before = reloads();
+  const next = registry(workspace);
+  next.projects[project].channel_id = channelId;
+  const file = path.join(workspace.repoDir, "registry.json");
+  fs.writeFileSync(`${file}.edit`, `${JSON.stringify(next, null, 2)}\n`);
+  fs.renameSync(`${file}.edit`, file);
+  await waitFor(() => reloads() > before, () => `registry reload:\n${router.stdout}\n${router.stderr}`);
 }
 
 function webhookMessages(workspace) {
@@ -122,4 +137,49 @@ test("edit_message also refetches a lost private webhook token", async () => {
 
   assert.deepEqual(result, { message_id: "fake-message-1" });
   assert.deepEqual(webhookMessages(workspace).map(message => message.content), ["done"]);
+});
+
+for (const [name, loseToken] of [["", false], [" and its private token is lost", true]]) {
+  test(`a reply after the project's channel moved${name} lands in the new channel under a webhook kept there`, async () => {
+    const workspace = createRouterWorkspace();
+    const router = await routerWithWebhooks(workspace, ["demo"], { env: { CCDM_ROUTER_REGISTRY_DEBOUNCE_MS: "20" } });
+    const demo = await connectSession(workspace, "demo", "demo-key");
+    assert.equal(registry(workspace).projects.demo.webhook_id, "fake-webhook-1");
+    await moveChannel(workspace, router, "demo", "moved-channel");
+    const secretFile = path.join(workspace.routerStateDir, "webhooks", "demo.json");
+    if (loseToken) fs.rmSync(secretFile);
+
+    const result = await demo.client.request("reply", { channel_id: "moved-channel", text: "over here now" });
+
+    assert.deepEqual(result, { message_id: "fake-message-1", message_ids: ["fake-message-1"] });
+    assert.deepEqual(webhookMessages(workspace).map(({ content, channelId, webhookId }) => ({ content, channelId, webhookId })),
+      [{ content: "over here now", channelId: "moved-channel", webhookId: "fake-webhook-2" }]);
+    const discord = readState(workspace.stateDir).fixtures.discord;
+    assert.deepEqual(discord.webhookCreates.map(({ channelId, name }) => ({ channelId, name })),
+      [{ channelId: "demo-channel", name: "ccdm-demo" }, { channelId: "moved-channel", name: "ccdm-demo" }]);
+    const demoEntry = registry(workspace).projects.demo;
+    assert.equal(demoEntry.webhook_id, "fake-webhook-2");
+    assert.match(demoEntry.assignment_generation, /^gen-[0-9a-f]{32}$/);
+    const secret = JSON.parse(fs.readFileSync(secretFile, "utf8"));
+    assert.deepEqual([secret.webhook_id, secret.token], ["fake-webhook-2", "fake-webhook-token-2"]);
+    assert.equal(fs.statSync(secretFile).mode & 0o777, 0o600);
+  });
+}
+
+test("a private webhook secret kept before channels were recorded learns its channel once and keeps its webhook", async () => {
+  const workspace = createRouterWorkspace();
+  await routerWithWebhooks(workspace, ["demo"]);
+  const demo = await connectSession(workspace, "demo", "demo-key");
+  const secretFile = path.join(workspace.routerStateDir, "webhooks", "demo.json");
+  const { channel_id: _channel, ...legacy } = JSON.parse(fs.readFileSync(secretFile, "utf8"));
+  fs.writeFileSync(secretFile, `${JSON.stringify(legacy)}\n`, { mode: 0o600 });
+
+  await demo.client.request("reply", { channel_id: "demo-channel", text: "same place" });
+
+  assert.deepEqual(webhookMessages(workspace).map(({ channelId, webhookId }) => ({ channelId, webhookId })),
+    [{ channelId: "demo-channel", webhookId: "fake-webhook-1" }]);
+  assert.equal(readState(workspace.stateDir).fixtures.discord.webhookCreates.length, 1);
+  assert.equal(registry(workspace).projects.demo.assignment_generation, undefined);
+  assert.deepEqual(JSON.parse(fs.readFileSync(secretFile, "utf8")),
+    { ...legacy, channel_id: "demo-channel" });
 });

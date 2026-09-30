@@ -16,6 +16,9 @@ async function probe({ project, registryFile, stateDir, token }) {
   const expected = String(entry.webhook_id);
   const secret = await projectWebhookSecret({ project, registryFile, stateDir, token });
   if (!secret) throw new Error(`no webhook token for ${project}; run ensure-webhook ${project}`);
+  if (secret.channel_id !== String(entry.channel_id)) {
+    throw new Error(`${project}'s webhook posts to channel ${secret.channel_id}, not ${entry.channel_id}; run ensure-webhook ${project}`);
+  }
   const type = entry.type === "codex" ? "codex" : "claude";
   const message = await discordRequest("POST", `/webhooks/${secret.webhook_id}/${secret.token}`, {
     query: { wait: "true" },
