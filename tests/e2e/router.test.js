@@ -274,7 +274,8 @@ test("owner reactions in the channel reach the session as reaction events", asyn
 
   assert.deepEqual(demo.events.map(({ ts, ...event }) => event), [{
     type: "event", event: "reaction", message_id: "reply-1", channel_id: "demo-channel", emoji: "👍",
-    message_webhook_id: null, message_content: "", user: { id: OWNER_ID, name: "Owner", is_owner: true },
+    message_webhook_id: null, message_author_id: "fixture-bot-user-id", message_from_bot: true,
+    message_content: "", user: { id: OWNER_ID, name: "Owner", is_owner: true },
   }]);
 });
 

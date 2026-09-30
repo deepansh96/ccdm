@@ -98,8 +98,10 @@ async function serve() {
   });
   client.on("messageReactionAdd", async (reaction, user) => {
     try {
-      const routed = await classifyReaction(table, reaction, user);
+      const routed = await classifyReaction(table, reaction, user, client.user?.id);
       if (!routed) return;
+      // Root-channel reactions are root's alone: no project or observer sees them.
+      if (routed.root) return void server.deliverRoot(routed.event);
       server.deliver(routed.route.project, routed.event);
       server.deliverObserver({ ...routed.event, project: routed.route.project });
     } catch (error) {

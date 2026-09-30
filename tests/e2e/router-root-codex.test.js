@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { injectDiscordMessage, startFakeCodexServer, waitForState } from "./support/bridge.js";
+import { injectDiscordMessage, injectDiscordReaction, startFakeCodexServer, waitForState } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import {
   OWNER_ID,
@@ -172,6 +172,34 @@ test("root Codex's reply into a project channel posts as the root bot, not a web
   // The MCP server's reply did not take the bridge's place as root's listener.
   discordMessage(workspace, { id: "after-reply", channelId: "root-channel", content: "still there?" });
   await waitFor(() => routedTurns(codex).length === 2, () => "a turn after the reply", 10000);
+});
+
+test("an owner 👍 on root's own bot reply in a root channel reaches root Codex, and one on another message does not", async () => {
+  const { workspace, codex } = await rootCodex();
+  const owner = { id: OWNER_ID, username: "Owner" };
+
+  injectDiscordReaction(workspace, {
+    id: "on-owner-message", channelId: "root-channel", emoji: "👍", messageId: "4001", user: owner,
+    message: { author: { bot: false, id: OWNER_ID, username: "Owner" }, content: "my own note" },
+  });
+  injectDiscordReaction(workspace, {
+    id: "on-webhook-message", channelId: "root-channel", emoji: "👍", messageId: "4002", user: owner,
+    message: { author: { bot: true, id: "fake-webhook-1", username: "demo-codex" }, webhookId: "fake-webhook-1", content: "demo said" },
+  });
+  await waitForState(workspace, (next) => ["on-owner-message", "on-webhook-message"].every((id) =>
+    next.fixtures.discord.deliveredReactions?.some((reaction) => reaction.id === id)), 10000);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.equal(routedTurns(codex).length, 0);
+
+  injectDiscordReaction(workspace, {
+    id: "on-root-reply", channelId: "root-channel", emoji: "👍", messageId: "4003", user: owner,
+    message: { author: { bot: true, id: BOT_ID, username: "Root" }, content: "All projects are healthy.", partial: true },
+  });
+  await waitFor(() => routedTurns(codex).length === 1, () => "the reaction turn", 10000);
+
+  const [turn] = routedTurns(codex).map((message) => message.params.input[0].text);
+  assert.match(turn, /^channel_id: root-channel$/m);
+  assert.match(turn, /User Owner reacted 👍 to your message: "All projects are healthy." \(message ID: 4003\)\.$/);
 });
 
 test("/restart in the primary root channel relaunches root Codex through the restart script", async () => {

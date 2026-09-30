@@ -22,14 +22,16 @@
 //       load(): Promise<{
 //         emoji: { id, name },
 //         user: { id, bot, username, globalName },
-//         message: { id, content, channel: { id, name }, author: { id } | null },
+//         message: { id, content, channel: { id, name }, author: { id } | null,
+//                    webhookId: string | null, fromBot: boolean },
 //       }>,
 //     }
 //
 // Operations out:
 //   connect()                     -> Promise<{ userTag }> once the gateway is ready
 //   isOwnMessage(message)         -> Promise<boolean>, whether this session
-//                                    posted it (reaction forwarding)
+//                                    posted it (reaction forwarding): the
+//                                    project's webhook, or for root the bot
 //   fetchChannel(channelId)       -> Promise<{ id, name } | null>
 //   send(channelId, chunks)       -> Promise<[{ id }] | undefined>, one message per chunk
 //   sendTyping(channelId)         -> Promise<void>
@@ -99,7 +101,9 @@ function createRouterTransport({ project, role = "project", keyFile, launchDir, 
             id: event.message_id,
             content: event.message_content || "",
             channel: channel(event.channel_id),
+            author: event.message_author_id ? { id: event.message_author_id } : null,
             webhookId: event.message_webhook_id || null,
+            fromBot: event.message_from_bot === true,
           },
         };
       },
@@ -139,9 +143,12 @@ function createRouterTransport({ project, role = "project", keyFile, launchDir, 
       return { userTag: `${root ? "root" : project} via the CCDM Router`, scope };
     },
 
-    // Project replies post through the project's webhook, not as a bot user,
-    // so its own messages are those of the webhook the registry records now.
+    // Root replies post as the root bot, which the Router marks on the
+    // reaction. Project replies post through the project's webhook, not as a
+    // bot user, so its own messages are those of the webhook the registry
+    // records now.
     async isOwnMessage(message) {
+      if (root) return !message.webhookId && message.fromBot === true;
       if (!message.webhookId) return false;
       try {
         const registry = JSON.parse(await readFile(registryPath, "utf8"));
