@@ -199,16 +199,17 @@ test("status and preflight name each missing router prerequisite with its fix, a
   assert.equal(blocked.status, "blocked");
   assert.deepEqual(blocked.blockers, missing);
 
-  // The Router is up and the webhook exists, but root lacks two permissions in the channel.
+  // The Router is up and the webhook exists, but root lacks three permissions in the channel.
   const ensured = await runRouterCli(context.workspace, ["ensure-webhook", "demo"]);
   assert.equal(ensured.exitCode, 0, ensured.stderr || ensured.stdout);
   const denied = readState(context.workspace.stateDir);
-  denied.fixtures.discord.permissionDenials = { "fixture-bot-user-id": ["AddReactions", "ManageMessages"] };
+  denied.fixtures.discord.permissionDenials = { "fixture-bot-user-id": ["AddReactions", "ManageMessages", "ManageWebhooks"] };
   writeState(denied, context.workspace.stateDir);
   await startRouter(context.workspace);
   const permissions = [
     "demo: root lacks Add Reactions in the project channel; grant root permission Add Reactions in demo-channel",
     "demo: root lacks Manage Messages in the project channel; grant root permission Manage Messages in demo-channel",
+    "demo: root lacks Manage Webhooks in the project channel; grant root permission Manage Webhooks in demo-channel",
   ];
   assert.deepEqual(routerBlockers(await service(context, "status")),
     { ready: false, blockers: permissions.map((line) => line.slice("demo: ".length)) });
