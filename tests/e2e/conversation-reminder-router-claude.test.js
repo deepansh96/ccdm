@@ -69,7 +69,13 @@ async function waitForStatus(context, predicate, attempts = 400) {
     if (predicate(current)) return current;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  throw new Error(`Timed out waiting for status: ${JSON.stringify(await service(context, "status"))}`);
+  // What the fake Claude and Discord saw, so a timeout names the missing step.
+  const { claude, discord } = readState(context.workspace.stateDir).fixtures;
+  const channelLogs = fs.readdirSync(context.workspace.stateDir).filter((name) => name.startsWith("claude-channel-"))
+    .map((name) => fs.readFileSync(path.join(context.workspace.stateDir, name), "utf8").slice(-4000));
+  throw new Error(`Timed out waiting for status: ${JSON.stringify(await service(context, "status"))}\n` +
+    `claude: ${JSON.stringify({ notifications: claude.channelNotifications, toolResults: claude.toolResults, hookRuns: claude.hookRuns })}\n` +
+    `discord messages: ${JSON.stringify(discord.messages)}\nchannel server logs: ${channelLogs.join("\n---\n")}`);
 }
 
 function startSession(context) {
