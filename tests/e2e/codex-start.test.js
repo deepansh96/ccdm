@@ -959,14 +959,16 @@ test("start-codex-session reports current executable failures for registry looku
   assertNoLaunch(staleBot);
 });
 
-test("start-codex-session preserves current duplicate channel and port registry behavior", async () => {
+// The Router rejects a registry that gives two projects one channel, so beta
+// has its own channel; the shared ws_port is what this test preserves.
+test("start-codex-session preserves current duplicate port registry behavior", async () => {
   const workspace = createCodexWorkspace();
   const registrySeed = buildCodexRegistry(workspace, {
     extraProjects: {
       beta: {
         path: path.join(workspace.tmpDir, "beta project"),
         screen_name: "beta_codex",
-        channel_id: "channel-id",
+        channel_id: "beta-channel-id",
         type: "codex",
         ws_port: 18342,
         session_id: null,
