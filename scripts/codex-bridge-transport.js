@@ -189,8 +189,10 @@ function createRouterTransport({ project, role = "project", keyFile, launchDir, 
       }
     },
 
-    // The Router has no reaction-removal operation.
-    async removeOwnReaction() {},
+    // Removes the bot's own reaction through the Router's `react` with `remove`.
+    async removeOwnReaction(message, emoji) {
+      await request("react", { channel_id: message.channel.id, message_id: message.id, emoji, remove: true });
+    },
 
     // The bridge's scoped MCP server reads the same percentage from the launch
     // directory, so its replies carry it too.
