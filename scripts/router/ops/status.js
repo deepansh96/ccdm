@@ -3,8 +3,9 @@
 // status: Router health for `router status`. Never includes webhook tokens.
 const { readWebhookSecret } = require("../webhooks.js");
 
-// What root needs in a project channel to send, read, react, and clean up.
-const ROOT_PERMISSIONS = ["SendMessages", "ReadMessageHistory", "AddReactions", "ManageMessages"];
+// What root needs in a project channel to send, read, react, clean up, and
+// create or heal the project's webhook.
+const ROOT_PERMISSIONS = ["SendMessages", "ReadMessageHistory", "AddReactions", "ManageMessages", "ManageWebhooks"];
 
 // Root's missing permissions in a channel, or null before the gateway is ready.
 async function missingPermissions(ctx, channelId) {

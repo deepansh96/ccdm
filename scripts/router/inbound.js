@@ -97,17 +97,25 @@ function observedMessage(table, message) {
   };
 }
 
-async function classifyReaction(table, reaction, user) {
+// A reaction in a root channel is root's, under root's allowlist, and never a
+// project's; one in a project channel is that project's, under its guests.
+// `botId` is the root bot's user id, for telling root's own messages apart.
+async function classifyReaction(table, reaction, user, botId = null) {
   if (user.partial) await user.fetch();
   if (user.bot) return null;
-  const route = table.channels.get(String(reaction.message.channelId ?? reaction.message.channel?.id));
+  const channelId = String(reaction.message.channelId ?? reaction.message.channel?.id);
+  const root = table.rootChannels.has(channelId);
+  const route = root ? { project: "root", channel_id: channelId } : table.channels.get(channelId);
   if (!route) return null;
-  const author = allowedAuthor(new Set(route.guests), table, user);
+  const author = allowedAuthor(root ? table.rootAllowedUserIds : new Set(route.guests), table, user);
   if (!author) return null;
-  // An uncached message arrives partial, without its webhook or content.
+  // An uncached message arrives partial, without its author, webhook, or content.
   if (reaction.message.partial) await reaction.message.fetch();
+  const webhookId = reaction.message.webhookId ? String(reaction.message.webhookId) : null;
+  const authorId = reaction.message.author?.id ? String(reaction.message.author.id) : null;
   return {
     route,
+    ...(root ? { root: true } : {}),
     event: {
       event: "reaction",
       message_id: reaction.message.id,
@@ -115,7 +123,11 @@ async function classifyReaction(table, reaction, user) {
       emoji: reaction.emoji.name,
       // Which webhook posted the message, if any, so a session can tell its
       // own Project Identity's messages apart.
-      message_webhook_id: reaction.message.webhookId ? String(reaction.message.webhookId) : null,
+      message_webhook_id: webhookId,
+      // Whether the root bot itself posted it (not through a webhook), so root
+      // can tell its own replies apart.
+      message_author_id: authorId,
+      message_from_bot: Boolean(botId) && !webhookId && authorId === String(botId),
       message_content: String(reaction.message.content || ""),
       user: author,
       ts: new Date().toISOString(),

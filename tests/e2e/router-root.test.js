@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { injectDiscordMessage } from "./support/bridge.js";
+import { injectDiscordMessage, injectDiscordReaction } from "./support/bridge.js";
 import {
   OWNER_ID,
   ROOT_TOKEN,
@@ -113,6 +113,42 @@ test("root-channel messages reach root only from the owner and root's allowed us
     { message_id: "from-helper", channel_id: "root-channel", is_owner: false },
   ]);
   assert.deepEqual(ids(demo.events), []);
+});
+
+test("root-channel reactions reach only root, under root's allowlist, with the root bot's provenance", async () => {
+  const { workspace, root, demo } = await rootAndDemo();
+  const users = {
+    owner: { id: OWNER_ID, username: "Owner" }, helper: { id: "helper-id", username: "Helper" },
+    guest: { id: "guest-id", username: "Guest" }, stranger: { id: "stranger-id", username: "Stranger" },
+  };
+  const botMessage = { author: { id: BOT_ID, username: "Root", bot: true }, content: "root said" };
+  const webhookMessage = { author: { id: "fake-webhook-1", username: "demo-codex", bot: true }, webhookId: "fake-webhook-1" };
+  const inject = (id, channelId, user, message) =>
+    injectDiscordReaction(workspace, { id, channelId, emoji: "👍", messageId: `${id}-message`, user, message });
+  inject("owner-on-bot", "root-channel", users.owner, { ...botMessage, partial: true });
+  inject("helper-on-owner", "root-channel", users.helper, { author: { id: OWNER_ID, username: "Owner", bot: false } });
+  inject("owner-on-webhook", "root-channel", users.owner, webhookMessage);
+  inject("guest-in-root", "root-channel", users.guest, botMessage);
+  inject("stranger-in-root", "root-channel", users.stranger, botMessage);
+  // The project's own reaction is the fence: everything before it has been routed.
+  inject("owner-in-demo", "demo-channel", users.owner, webhookMessage);
+  await waitFor(() => demo.events.length > 0, () => "the demo reaction");
+  await waitFor(() => root.events.length === 3, () => "three root reactions");
+
+  const shape = ({ message_id, channel_id, message_author_id, message_webhook_id, message_from_bot, user }) =>
+    ({ message_id, channel_id, message_author_id, message_webhook_id, message_from_bot, user: user.id });
+  assert.deepEqual(root.events.map(shape), [
+    { message_id: "owner-on-bot-message", channel_id: "root-channel", message_author_id: BOT_ID,
+      message_webhook_id: null, message_from_bot: true, user: OWNER_ID },
+    { message_id: "helper-on-owner-message", channel_id: "root-channel", message_author_id: OWNER_ID,
+      message_webhook_id: null, message_from_bot: false, user: "helper-id" },
+    { message_id: "owner-on-webhook-message", channel_id: "root-channel", message_author_id: "fake-webhook-1",
+      message_webhook_id: "fake-webhook-1", message_from_bot: false, user: OWNER_ID },
+  ]);
+  assert.deepEqual(demo.events.map(shape), [
+    { message_id: "owner-in-demo-message", channel_id: "demo-channel", message_author_id: "fake-webhook-1",
+      message_webhook_id: "fake-webhook-1", message_from_bot: false, user: OWNER_ID },
+  ]);
 });
 
 test("a guest's bot mention in a project channel reaches neither root nor the project", async () => {

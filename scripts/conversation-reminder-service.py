@@ -651,7 +651,8 @@ def root_credentials_present() -> bool:
 
 
 ROOT_PERMISSION_NAMES = {"SendMessages": "Send Messages", "ReadMessageHistory": "Read Message History",
-                         "AddReactions": "Add Reactions", "ManageMessages": "Manage Messages"}
+                         "AddReactions": "Add Reactions", "ManageMessages": "Manage Messages",
+                         "ManageWebhooks": "Manage Webhooks"}
 
 
 def router_prerequisites(projects: object) -> dict:

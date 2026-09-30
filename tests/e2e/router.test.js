@@ -17,7 +17,7 @@ import {
   waitFor,
   writeProjectKey,
 } from "./support/router.js";
-import { readState } from "./support/state.js";
+import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => {
@@ -274,7 +274,8 @@ test("owner reactions in the channel reach the session as reaction events", asyn
 
   assert.deepEqual(demo.events.map(({ ts, ...event }) => event), [{
     type: "event", event: "reaction", message_id: "reply-1", channel_id: "demo-channel", emoji: "👍",
-    message_webhook_id: null, message_content: "", user: { id: OWNER_ID, name: "Owner", is_owner: true },
+    message_webhook_id: null, message_author_id: "fixture-bot-user-id", message_from_bot: true,
+    message_content: "", user: { id: OWNER_ID, name: "Owner", is_owner: true },
   }]);
 });
 
@@ -328,6 +329,20 @@ test("router status reports connected sessions and webhook presence without leak
   assert.equal(fs.statSync(secretFile).mode & 0o777, 0o600);
   assert.equal(fs.statSync(workspace.routerStateDir).mode & 0o777, 0o700);
   assert.equal(fs.statSync(workspace.socketPath).mode & 0o777, 0o600);
+});
+
+test("router status names a missing Manage Webhooks permission in a project channel", async () => {
+  const workspace = createRouterWorkspace();
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.permissionDenials = { "fixture-bot-user-id": ["ManageWebhooks"] };
+  });
+  await startRouter(workspace);
+
+  const status = await runRouterCli(workspace, ["status", "--json"]);
+
+  assert.equal(status.exitCode, 0, status.stderr || status.stdout);
+  const demo = JSON.parse(status.stdout).projects.find(({ project }) => project === "demo");
+  assert.deepEqual(demo.missing_permissions, ["ManageWebhooks"]);
 });
 
 test("router status exits non-zero when the Router is not running", async () => {

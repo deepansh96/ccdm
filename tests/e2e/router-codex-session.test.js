@@ -258,6 +258,13 @@ test("/pause queues router Codex messages and /unpause runs them in order", asyn
   assert.deepEqual(botReactions(done), [
     ["cmd-pause", "⏸️"], ["first-queued", "⏳"], ["second-queued", "⏳"], ["cmd-unpause", "▶️"],
   ]);
+  // Each queued message loses its ⏳ once its turn starts, as the root bot through the Router.
+  const cleared = await waitForState(workspace, (next) => (next.fixtures.discord.reactionDeletes ?? []).length === 2, 15000);
+  assert.deepEqual(cleared.fixtures.discord.reactionDeletes.map(({ authorization, channelId, messageId, emoji }) =>
+    [authorization, channelId, messageId, decodeURIComponent(emoji)]), [
+    ["Bot root-bot-token", "demo-channel", "first-queued", "⏳"],
+    ["Bot root-bot-token", "demo-channel", "second-queued", "⏳"],
+  ]);
 });
 
 test("/compact and /clear compact and replace the router Codex thread with webhook acknowledgments", async () => {
