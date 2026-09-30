@@ -113,6 +113,41 @@ test("an invalid registry keeps the last good routing table and shows in router 
   assert.doesNotMatch(restored.stdout, new RegExp(`registry loaded: ${loadedBefore}\n`));
 });
 
+test("a registry with valid JSON but an invalid schema keeps the last good routes and revokes no session", async () => {
+  const workspace = createRouterWorkspace();
+  writeProjectKey(workspace, "demo", "demo-key");
+  const router = await startRouter(workspace, { env: RELOAD_ENV });
+  const demo = await connectSession(workspace, "demo", "demo-key");
+  const loadedBefore = (await runRouterCli(workspace, ["status"])).stdout.match(/registry loaded: (\S+)/)[1];
+  const good = routerRegistry();
+  const invalid = [
+    [{ ...good, projects: "demo" }, /projects must be an object/],
+    [{ ...good, discord_user_id: undefined }, /discord_user_id \(the owner\) must be a Discord ID/],
+    [{ ...good, projects: { ...good.projects, demo: { type: "claude" } } }, /project demo: channel_id must be a Discord ID/],
+    [{ ...good, projects: { ...good.projects, beta: { ...good.projects.beta, channel_id: "demo-channel" } } },
+      /project beta: channel_id is already project demo's channel/],
+    [{ ...good, root_channels: ["demo-channel"] }, /project demo: channel_id is already a root channel/],
+    [{ ...good, projects: { ...good.projects, demo: { ...good.projects.demo, guest_user_ids: "guest-id" } } },
+      /project demo: guest_user_ids must be a list/],
+  ];
+
+  for (const [registry, message] of invalid) {
+    const failures = () => router.stdout.split("registry_reload_failed").length - 1;
+    const before = failures();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    replaceRegistry(workspace, registry);
+    await waitFor(() => failures() > before, () => `schema failure for ${message}:\n${router.stdout}`);
+    const status = await runRouterCli(workspace, ["status"]);
+    assert.match(status.stdout, new RegExp(`registry loaded: ${loadedBefore}\n`));
+    assert.match(status.stdout, new RegExp(`registry error: \\S+ invalid registry: .*${message.source}`));
+  }
+  injectMessage(workspace, "while-invalid", { id: OWNER_ID, username: "Owner" });
+  await waitFor(() => demo.events.length > 0, () => `owner message while invalid:\n${router.stdout}`);
+
+  assert.deepEqual(demo.events.map(event => event.event === "revoked" ? "revoked" : event.message_id), ["while-invalid"]);
+  assert.doesNotMatch(router.stdout, /registry reloaded/);
+});
+
 test("registering a new project starts routing its channel without a restart", async () => {
   const workspace = createRouterWorkspace();
   writeProjectKey(workspace, "newbie", "newbie-key");

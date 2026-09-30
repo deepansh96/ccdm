@@ -15,13 +15,55 @@ async function readRegistry(file) {
   return JSON.parse(await readFile(file, "utf8"));
 }
 
+const isObject = value => value !== null && typeof value === "object" && !Array.isArray(value);
+const isId = value => (typeof value === "string" && value.trim() !== "") || (Number.isInteger(value) && value > 0);
+
+// Rejects a registry the Router cannot route safely, so a reload keeps the
+// last good table instead of publishing (and revoking sessions over) a
+// half-understood one: the owner, collection types, each project's channel,
+// and one owner per channel.
+function validateRegistry(registry) {
+  const problems = [];
+  if (!isObject(registry)) throw new Error("invalid registry: the top level must be a JSON object");
+  if (!isId(registry.discord_user_id)) problems.push("discord_user_id (the owner) must be a Discord ID");
+  if (registry.guild_id != null && !isId(registry.guild_id)) problems.push("guild_id must be a Discord ID");
+  for (const field of ["root_channels", "root_allowed_user_ids"]) {
+    if (registry[field] != null && !(Array.isArray(registry[field]) && registry[field].every(isId))) {
+      problems.push(`${field} must be a list of Discord IDs`);
+    }
+  }
+  if (!isObject(registry.projects)) problems.push("projects must be an object keyed by project name");
+  const owners = new Map((Array.isArray(registry.root_channels) ? registry.root_channels : [])
+    .filter(isId).map(id => [String(id), "root"]));
+  for (const [name, project] of Object.entries(isObject(registry.projects) ? registry.projects : {})) {
+    if (!isObject(project)) {
+      problems.push(`project ${name} must be an object`);
+      continue;
+    }
+    if (!isId(project.channel_id)) problems.push(`project ${name}: channel_id must be a Discord ID`);
+    if (project.type != null && project.type !== "claude" && project.type !== "codex") {
+      problems.push(`project ${name}: type must be "claude" or "codex"`);
+    }
+    if (project.webhook_id != null && !isId(project.webhook_id)) problems.push(`project ${name}: webhook_id must be a Discord ID`);
+    if (project.guest_user_ids != null && !(Array.isArray(project.guest_user_ids) && project.guest_user_ids.every(isId))) {
+      problems.push(`project ${name}: guest_user_ids must be a list of Discord IDs`);
+    }
+    if (!isId(project.channel_id)) continue;
+    const channel = String(project.channel_id);
+    const other = owners.get(channel);
+    if (other) problems.push(`project ${name}: channel_id is already ${other === "root" ? "a root channel" : `project ${other}'s channel`}`);
+    else owners.set(channel, name);
+  }
+  if (problems.length) throw new Error(`invalid registry: ${problems.join("; ")}`);
+}
+
 function buildRoutingTable(registry) {
+  validateRegistry(registry);
   const channels = new Map();
   const projects = new Map();
   // Every registered project channel: root may act in any.
   const registered = new Map();
-  for (const [name, project] of Object.entries(registry.projects || {})) {
-    if (!project?.channel_id) continue;
+  for (const [name, project] of Object.entries(registry.projects)) {
     registered.set(String(project.channel_id), name);
     const route = {
       project: name,
@@ -231,5 +273,6 @@ async function updateRegistry(file, updater) {
 }
 
 module.exports = {
-  DEFAULT_RELOAD_DEBOUNCE_MS, buildRoutingTable, loadRoutingTable, readRegistry, updateRegistry, watchRegistry, withRegistryLock,
+  DEFAULT_RELOAD_DEBOUNCE_MS, buildRoutingTable, loadRoutingTable, readRegistry, updateRegistry, validateRegistry, watchRegistry,
+  withRegistryLock,
 };
