@@ -364,7 +364,20 @@ export async function startFakeCodexServer(workspace, options = {}) {
               (error) => recordCodexEvent(workspace, { event: "mcp-tool-result", tool, error: error.message }),
             );
           };
-          const finishTurn = plan.mcpReplyText
+          // `mcpCalls(input)`: the agent calls these `[tool, args]` in order;
+          // a string argument "{{last_id}}" becomes the last "(id: X)" result.
+          const runCalls = async () => {
+            let lastId = "";
+            for (const [tool, args] of plan.mcpCalls(message.params.input)) {
+              const expanded = Object.fromEntries(Object.entries(args).map(([key, value]) =>
+                [key, value === "{{last_id}}" ? lastId : value]));
+              const result = await callTool(tool, expanded);
+              lastId = /\(id: ([^)]+)\)/.exec(result?.content?.[0]?.text ?? "")?.[1] ?? lastId;
+            }
+          };
+          const finishTurn = plan.mcpCalls
+            ? () => runCalls().then(completeTurn)
+            : plan.mcpReplyText
             ? () => {
               callTool("reply", { text: plan.mcpReplyText, ...plan.mcpReplyArgs?.(message.params.input) }).then((result) => {
                 const messageId = /\(id: ([^)]+)\)/.exec(result?.content?.[0]?.text ?? "")?.[1];

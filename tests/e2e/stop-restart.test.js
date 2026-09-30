@@ -298,7 +298,7 @@ test("restart-root-agent simulates root_agent cleanup, retry, fresh launch, and 
     { stateDir: workspace.stateDir },
   );
 
-  const result = await runScript(workspace, "restart-root-agent.sh", { env: routerEnv(workspace) });
+  const result = await runScript(workspace, "restart-root-agent.sh", { env: routerEnv(workspace), timeoutMs: 20000 });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.match(result.stdout, /Restarted root agent in tmux session 'root_agent'/);
@@ -324,6 +324,7 @@ test("the retired reminder-adapter opt-in and a selected root state directory le
       ROOT_DISCORD_STATE_DIR: selectedState,
       CCDM_FIXTURE_CLAUDE_VERSION: "1.0.0 (Claude Code fixture)",
     }),
+    timeoutMs: 20000,
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
@@ -415,6 +416,7 @@ test("restart-root-codex-agent uses the Default Codex Account when no emergency 
   const result = await runScript(workspace, "restart-root-codex-agent.sh", {
     args: ["root-channel-id"],
     env: await rootCodexRouterEnv(workspace),
+    timeoutMs: 30000,
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
@@ -524,6 +526,7 @@ test("restart-root-codex-agent keeps ROOT_CODEX_HOME above the shared home", asy
   const result = await runScript(workspace, "restart-root-codex-agent.sh", {
     args: ["root-channel-id"],
     env: await rootCodexRouterEnv(workspace, { ROOT_CODEX_HOME: rootHome }),
+    timeoutMs: 30000,
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
@@ -646,6 +649,7 @@ test("restart-root-codex-agent uses ambient CODEX_HOME when the registry has no 
   const result = await runScript(workspace, "restart-root-codex-agent.sh", {
     args: ["root-channel-id"],
     env: await rootCodexRouterEnv(workspace, { CODEX_HOME: ambientHome }),
+    timeoutMs: 30000,
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
@@ -664,6 +668,7 @@ test("restart-root-codex-agent lets ROOT_CODEX_HOME recover from a broken regist
   const result = await runScript(workspace, "restart-root-codex-agent.sh", {
     args: ["root-channel-id"],
     env: await rootCodexRouterEnv(workspace, { ROOT_CODEX_HOME: rootHome }),
+    timeoutMs: 30000,
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
@@ -686,6 +691,7 @@ test("restart-root-codex-agent re-reads the registry home on every restart", asy
   const firstResult = await runScript(workspace, "restart-root-codex-agent.sh", {
     args: ["root-channel-id"],
     env,
+    timeoutMs: 30000,
   });
   assert.equal(firstResult.exitCode, 0, firstResult.stderr || firstResult.stdout);
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent.env.CODEX_HOME, firstHome);
@@ -697,6 +703,7 @@ test("restart-root-codex-agent re-reads the registry home on every restart", asy
   const secondResult = await runScript(workspace, "restart-root-codex-agent.sh", {
     args: ["root-channel-id"],
     env,
+    timeoutMs: 30000,
   });
   assert.equal(secondResult.exitCode, 0, secondResult.stderr || secondResult.stdout);
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent.env.CODEX_HOME, secondHome);
@@ -711,6 +718,7 @@ test("restart-root-codex-agent keeps the legacy default without home overrides",
   const result = await runScript(workspace, "restart-root-codex-agent.sh", {
     args: ["root-channel-id"],
     env: await rootCodexRouterEnv(workspace),
+    timeoutMs: 30000,
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
@@ -740,12 +748,13 @@ test("restart-root-codex-agent rejects a channel missing from the registry's roo
 });
 
 test("restart-root-agent launch failures include command diagnostics", async () => {
-  const workspace = createWorkspace();
+  const workspace = createRouterWorkspace();
+  await startRouter(workspace);
   const state = readState(workspace.stateDir);
   state.fixtures.tmux.newSessionFailures = { root_agent: 1 };
   writeState(state, workspace.stateDir);
 
-  const result = await runScript(workspace, "restart-root-agent.sh");
+  const result = await runScript(workspace, "restart-root-agent.sh", { env: routerEnv(workspace), timeoutMs: 20000 });
 
   assert.notEqual(result.exitCode, 0);
   assert.match(result.stderr, /Failed to create tmux session 'root_agent'|fixture tmux new-session failure/);
@@ -760,7 +769,7 @@ test("restart-root-agent teardown failures are recorded as diagnostics", async (
     throw new Error("restart cleanup failure");
   });
 
-  const result = await runScript(workspace, "restart-root-agent.sh", { env: routerEnv(workspace) });
+  const result = await runScript(workspace, "restart-root-agent.sh", { env: routerEnv(workspace), timeoutMs: 20000 });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   await cleanup({ stateDir: workspace.stateDir });

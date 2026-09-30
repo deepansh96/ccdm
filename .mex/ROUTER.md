@@ -18,7 +18,7 @@ edges:
     condition: when changing Session Scope, root permissions, guest access, channel routing, or credentials
   - target: patterns/INDEX.md
     condition: when starting a task — check the pattern index for a matching pattern file
-last_updated: 2026-09-29
+last_updated: 2026-09-30
 ---
 
 # Session Bootstrap
@@ -49,7 +49,8 @@ Then read this file fully before doing anything else in this session.
 - Codex startup waits for the scoped Discord reply tool, uses a no-action bootstrap, and tracks bootstrap completion or explicitly interrupts on timeout.
 - The Codex bridge retries a generic terminal `response.failed` once when the failed turn produced no agent work.
 - The Codex bridge can pause new turns in memory, queue incoming messages, and resume them in order.
-- Root stays reachable when the Router is down: after about 2 minutes of `router_unavailable` (`CCDM_ROOT_FALLBACK_AFTER_MS`), root Claude and root Codex open an emergency direct gateway restricted to root channels and allowed users, post a notice in the primary root channel, and close it before saying hello to the returning Router.
+- Root stays reachable when the Router is down: after about 2 minutes of `router_unavailable` (`CCDM_ROOT_FALLBACK_AFTER_MS`), root Claude and root Codex open an emergency direct gateway restricted to root channels and allowed users, post a notice in the primary root channel, and close it before saying hello to the returning Router. While engaged, root's `reply`, `react`, `typing`, and `edit_message` (the bot's own messages only) go straight to Discord as the bot in root channels only, through the Router's own root operations; root Codex's scoped MCP server does the same while the bridge's emergency marker file in root's launch directory names a live process, with its scope token and channel grant still checked. Reads and attachments wait for the Router. Both root launchers first run a bounded, read-only `router status` check and, if the Router does not answer, exit non-zero leaving the running root, its tmux session, and its key untouched.
+- Each Router request carries its client's deadline (`deadline_at`, from the client's timeout, 10 s by default); queued or rate-limited Discord calls for a request whose client has already given up fail as `timeout` before their next send, so a caller's retry never duplicates it. Coalesced edits last as long as their latest waiting client.
 - Root Codex sessions steer active turns for the same channel and author while preserving the active Discord grant; other channels/authors queue, and failed steering falls back to a fresh scoped turn.
 - The Codex bridge forwards allowed users' 👍 and 👎 reactions on its own messages to the active Codex thread.
 - The tracked Usage Stats Poster discovers named and legacy Codex Homes, deduplicates shared homes, and falls back from live rate limits to recent session JSONL data.

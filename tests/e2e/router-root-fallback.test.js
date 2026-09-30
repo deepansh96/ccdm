@@ -17,7 +17,7 @@ import {
   startRouter,
   waitFor,
 } from "./support/router.js";
-import { readState } from "./support/state.js";
+import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => {
@@ -62,8 +62,9 @@ async function rootSessionAfterRestart(workspace, timeoutMs = 15000) {
 
 const MODES = {
   claude: {
+    restart: (workspace) => runScript(workspace, "restart-root-agent.sh", { env: routerEnv(workspace, FALLBACK_ENV), timeoutMs: 20000 }),
     async launch(workspace) {
-      const restarted = await runScript(workspace, "restart-root-agent.sh", { env: routerEnv(workspace, FALLBACK_ENV) });
+      const restarted = await runScript(workspace, "restart-root-agent.sh", { env: routerEnv(workspace, FALLBACK_ENV), timeoutMs: 20000 });
       assert.equal(restarted.exitCode, 0, restarted.stderr || restarted.stdout);
       return {
         delivered: () => (readState(workspace.stateDir).fixtures.claude.channelNotifications ?? [])
@@ -72,8 +73,11 @@ const MODES = {
     },
   },
   codex: {
-    async launch(workspace) {
-      const codex = await startFakeCodexServer(workspace);
+    restart: (workspace) => runScript(workspace, "restart-root-codex-agent.sh", {
+      args: ["root-channel"], env: routerEnv(workspace, FALLBACK_ENV), timeoutMs: 30000,
+    }),
+    async launch(workspace, codexOptions = {}) {
+      const codex = await startFakeCodexServer(workspace, codexOptions);
       const restarted = await runScript(workspace, "restart-root-codex-agent.sh", {
         args: ["root-channel"],
         env: routerEnv(workspace, { ROOT_CODEX_WS_PORT: String(codex.port), ...FALLBACK_ENV }),
@@ -91,7 +95,7 @@ const MODES = {
   },
 };
 
-for (const [mode, { launch }] of Object.entries(MODES)) {
+for (const [mode, { launch, restart }] of Object.entries(MODES)) {
   test(`root ${mode} falls back to a direct gateway for root channels while the Router is down, and hands back before rejoining`, async () => {
     const workspace = rootWorkspace();
     const router = await routerWithWebhooks(workspace, ["demo"]);
@@ -140,6 +144,142 @@ for (const [mode, { launch }] of Object.entries(MODES)) {
     assert.equal(readState(workspace.stateDir).fixtures.discord.messages.filter((m) => m.content === NOTICE).length, 1);
   });
 }
+
+for (const [mode, { launch, restart }] of Object.entries(MODES)) {
+  test(`restarting root ${mode} while the Router is down fails and leaves the emergency root running with its key`, async () => {
+    const workspace = rootWorkspace();
+    const router = await routerWithWebhooks(workspace, ["demo"]);
+    const root = await launch(workspace);
+    process.kill(-router.child.pid, "SIGKILL");
+    await router.closed;
+    await waitForState(workspace, (next) => next.fixtures.discord.messages.some((m) => m.content === NOTICE), 15000);
+    const keyFile = path.join(workspace.routerStateDir, "keys", ".root.key");
+    const key = fs.readFileSync(keyFile, "utf8");
+    const session = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
+
+    const restarted = await restart(workspace);
+
+    assert.notEqual(restarted.exitCode, 0, restarted.stdout);
+    assert.match(restarted.stderr, /Router is not answering/);
+    const after = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
+    assert.equal(after?.pid, session.pid);
+    assert.equal(after.killAttempts, session.killAttempts);
+    process.kill(session.pid, 0);
+    assert.equal(fs.readFileSync(keyFile, "utf8"), key);
+    owner(workspace, { id: "after-restart", channelId: "root-channel", content: "still there?" });
+    await waitFor(() => root.delivered().includes("after-restart"), () => "the message after the refused restart", 15000);
+  });
+}
+
+// Stops the Router and waits for root's fallback notice.
+async function routerDown(workspace, router) {
+  process.kill(-router.child.pid, "SIGKILL");
+  await router.closed;
+  await waitForState(workspace, (next) => next.fixtures.discord.messages.some((m) => m.content === NOTICE), 15000);
+}
+
+// What root sent to Discord itself, as the bot.
+function botActivity(workspace) {
+  const { messages, edits = [], reactions = [], typing = [] } = readState(workspace.stateDir).fixtures.discord;
+  return {
+    messages: messages.filter((m) => m.content !== NOTICE).map(({ channelId, content, authorization, webhookId }) =>
+      ({ channelId, content, authorization, webhookId })),
+    edits: edits.map(({ channelId, messageId, content, authorization }) => ({ channelId, messageId, content, authorization })),
+    reactions: reactions.map(({ channelId, messageId, emoji, authorization }) => ({ channelId, messageId, emoji, authorization })),
+    typing,
+  };
+}
+
+const EYES = encodeURIComponent("👀");
+const BOT = `Bot ${ROOT_TOKEN}`;
+
+test("root claude replies, edits, reacts, and types in root channels through the fallback, and goes back to the Router once it returns", async () => {
+  const workspace = rootWorkspace();
+  const router = await routerWithWebhooks(workspace, ["demo"]);
+  await MODES.claude.launch(workspace);
+  await routerDown(workspace, router);
+  const script = (steps) => updateState(workspace.stateDir, (state) => { state.fixtures.claude.toolScript = steps; });
+  const results = () => (readState(workspace.stateDir).fixtures.claude.toolResults ?? [])
+    .map(({ result }) => result.content[0].text);
+
+  script([
+    { name: "reply", arguments: { chat_id: "{{chat_id}}", text: "answered directly" } },
+    { name: "edit_message", arguments: { chat_id: "{{chat_id}}", message_id: "{{last_id}}", text: "edited directly" } },
+    { name: "react", arguments: { chat_id: "{{chat_id}}", message_id: "{{message_id}}", emoji: "👀" } },
+    { name: "edit_message", arguments: { chat_id: "{{chat_id}}", message_id: "{{message_id}}", text: "not root's" } },
+    { name: "reply", arguments: { chat_id: "demo-channel", text: "into a project" } },
+  ]);
+  owner(workspace, { id: "in-fallback", channelId: "root-channel", content: "status?" });
+  await waitFor(() => results().length >= 5, () => `the fallback tool results; got ${JSON.stringify(results())}`, 15000);
+
+  const [reply, edit, react, foreignEdit, projectReply] = results();
+  assert.deepEqual([reply, edit, react], ["sent (id: fake-message-2)", "edited (id: fake-message-2)", "reacted"]);
+  assert.match(foreignEdit, /^edit_message failed: scope_violation/);
+  assert.match(projectReply, /^reply failed: scope_violation/);
+  const direct = botActivity(workspace);
+  assert.deepEqual(direct.messages, [{ channelId: "root-channel", content: "answered directly", authorization: BOT, webhookId: undefined }]);
+  assert.deepEqual(direct.edits, [{ channelId: "root-channel", messageId: "fake-message-2", content: "edited directly", authorization: BOT }]);
+  assert.deepEqual(direct.reactions, [{ channelId: "root-channel", messageId: "in-fallback", emoji: EYES, authorization: BOT }]);
+  assert.ok(direct.typing.some((entry) => entry.channelId === "root-channel" && entry.authorization === BOT), JSON.stringify(direct.typing));
+
+  // Back on the Router, root reaches registered project channels again.
+  script([{ name: "reply", arguments: { chat_id: "demo-channel", text: "back through the Router" } }]);
+  await startRouter(workspace);
+  await rootSessionAfterRestart(workspace);
+  owner(workspace, { id: "after-switch", channelId: "root-channel", content: "back?" });
+  await waitFor(() => results().length >= 6, () => `the tool result after the switch; got ${JSON.stringify(results())}`, 15000);
+  assert.equal(results()[5], "sent (id: fake-message-3)");
+  assert.deepEqual(botActivity(workspace).messages.at(-1),
+    { channelId: "demo-channel", content: "back through the Router", authorization: BOT, webhookId: undefined });
+});
+
+test("root codex replies, edits, reacts, and types in root channels through the fallback, and goes back to the Router once it returns", async () => {
+  const workspace = rootWorkspace();
+  const router = await routerWithWebhooks(workspace, ["demo"]);
+  const grant = (input) => input[0].text.match(/channel_scope_token: (\S+)/)[1];
+  await MODES.codex.launch(workspace, { turns: [
+    { mcpCalls: (input) => {
+      const scope = { channel_id: "root-channel", channel_scope_token: grant(input) };
+      return [
+        ["reply", { ...scope, text: "answered directly" }],
+        ["edit_message", { ...scope, message_id: "{{last_id}}", text: "edited directly" }],
+        ["react", { ...scope, message_id: "in-fallback", emoji: "👀" }],
+        ["edit_message", { ...scope, message_id: "in-fallback", text: "not root's" }],
+        ["reply", { channel_id: "demo-channel", channel_scope_token: grant(input), text: "into a project" }],
+      ];
+    } },
+    { mcpCalls: (input) => [["reply", { channel_id: "demo-channel", channel_scope_token: grant(input), text: "back through the Router" }]] },
+  ] });
+  const results = () => readState(workspace.stateDir).fixtures.codex.protocolEvents
+    .filter((event) => event.event === "mcp-tool-result")
+    .map(({ result, error }) => result?.content?.[0]?.text ?? error);
+  await routerDown(workspace, router);
+
+  owner(workspace, { id: "in-fallback", channelId: "root-channel", content: "status?" });
+  await waitFor(() => results().length >= 5, () => `the fallback tool results; got ${JSON.stringify(results())}`, 20000);
+
+  const [reply, edit, react, foreignEdit, projectReply] = results();
+  assert.deepEqual([reply, edit, react], ["sent (id: fake-message-2)", "edited (id: fake-message-2)", "reacted with 👀"]);
+  assert.match(foreignEdit, /^Error: Emergency edit_message failed: scope_violation/);
+  // The owner's grant may name any channel, but the fallback reaches only root channels.
+  assert.match(projectReply, /^Error: Emergency reply failed: scope_violation/);
+  const direct = botActivity(workspace);
+  assert.deepEqual(direct.messages, [{ channelId: "root-channel", content: "answered directly", authorization: BOT, webhookId: undefined }]);
+  assert.deepEqual(direct.edits, [{ channelId: "root-channel", messageId: "fake-message-2", content: "edited directly", authorization: BOT }]);
+  assert.deepEqual(direct.reactions.filter((entry) => entry.emoji === EYES),
+    [{ channelId: "root-channel", messageId: "in-fallback", emoji: EYES, authorization: BOT }]);
+  assert.ok(direct.typing.some((entry) => entry.channelId === "root-channel" && entry.authorization === BOT), JSON.stringify(direct.typing));
+
+  // Back on the Router, a project-channel mention's grant reaches that channel again.
+  await startRouter(workspace);
+  await rootSessionAfterRestart(workspace);
+  owner(workspace, { id: "after-switch", channelId: "demo-channel", content: `<@${BOT_ID}> back?` });
+  await waitFor(() => results().length >= 6, () => `the tool result after the switch; got ${JSON.stringify(results())}`, 20000);
+  assert.equal(results()[5], "sent (id: fake-message-3)");
+  assert.deepEqual(botActivity(workspace).messages.at(-1),
+    { channelId: "demo-channel", content: "back through the Router", authorization: BOT, webhookId: undefined });
+  assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "launches", ".root", "emergency.json")), false);
+});
 
 // The one place the real fallback threshold is asserted; every other test shortens it.
 test("root's emergency fallback engages after about two minutes by default, overridable by environment", () => {

@@ -8,6 +8,11 @@
 // `Retry-After`, and pauses every route on a global 429. A call that cannot be
 // sent within the wait bound fails with the typed `rate_limited` code, so
 // callers never see a raw 429.
+//
+// A Router request also carries its client's deadline (`withDeadline`): once
+// the client has given up, queued or rate-limited work for that request fails
+// as `timeout` before its next send, so a caller's retry never duplicates it.
+const { AsyncLocalStorage } = require("node:async_hooks");
 const { OpError } = require("./ops/errors.js");
 
 const API = "https://discord.com/api/v10";
@@ -53,6 +58,17 @@ const bucketResets = new Map();
 // route key -> the tail of that route's queue.
 const queues = new Map();
 let globalResetAt = 0;
+// The deadline (ms epoch) of the client request being served, if it sent one.
+const requestDeadline = new AsyncLocalStorage();
+
+// Runs `fn` with every Discord call it makes bounded by `deadline` (none if not a number).
+function withDeadline(deadline, fn) {
+  return requestDeadline.run(Number.isFinite(deadline) ? deadline : null, fn);
+}
+
+function currentDeadline() {
+  return requestDeadline.getStore() ?? null;
+}
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -66,10 +82,16 @@ function seconds(value) {
   return value !== null && value !== undefined && value !== "" && Number.isFinite(number) && number >= 0 ? number * 1000 : null;
 }
 
-// Waits until `until`, or fails as rate_limited when that passes the deadline.
-async function waitUntil(until, deadline, route) {
+function expired(route) {
+  return new OpError("timeout", `the client gave up before ${route.split("/")[1]} could be sent`);
+}
+
+// Waits until `until`, or fails when that passes the wait bound (rate_limited)
+// or the client's deadline (timeout).
+async function waitUntil(until, deadline, clientDeadline, route) {
   const wait = until - Date.now();
   if (wait <= 0) return;
+  if (clientDeadline !== null && until > clientDeadline) throw expired(route);
   if (until > deadline) throw new OpError("rate_limited", `Discord rate limit on ${route.split("/")[1]} outlasted the wait bound`);
   await sleep(wait);
 }
@@ -86,11 +108,12 @@ async function send(method, url, headers, payload) {
   return { res, parsed };
 }
 
-async function sendWithinLimits(method, route, url, headers, payload, deadline, settings) {
+async function sendWithinLimits(method, route, url, headers, payload, deadline, clientDeadline, settings) {
   const key = routeKey(method, route);
   for (;;) {
-    await waitUntil(globalResetAt, deadline, route);
-    await waitUntil(bucketResets.get(bucketId(key, route)) ?? 0, deadline, route);
+    await waitUntil(globalResetAt, deadline, clientDeadline, route);
+    await waitUntil(bucketResets.get(bucketId(key, route)) ?? 0, deadline, clientDeadline, route);
+    if (clientDeadline !== null && Date.now() >= clientDeadline) throw expired(route);
     const { res, parsed } = await send(method, url, headers, payload);
     const hash = res.headers.get("x-ratelimit-bucket");
     if (hash) bucketHashes.set(key, hash);
@@ -119,6 +142,7 @@ async function sendWithinLimits(method, route, url, headers, payload, deadline, 
 async function discordRequest(method, route, { token, body, query } = {}) {
   const settings = rateLimitSettings();
   const deadline = Date.now() + settings.maxWaitMs;
+  const clientDeadline = currentDeadline();
   const url = new URL(`${API}${route}`);
   for (const [key, value] of Object.entries(query || {})) url.searchParams.set(key, String(value));
   const headers = {};
@@ -129,11 +153,11 @@ async function discordRequest(method, route, { token, body, query } = {}) {
   // One request at a time per route, in arrival order.
   const key = routeKey(method, route);
   const previous = queues.get(key) ?? Promise.resolve();
-  const run = previous.then(() => sendWithinLimits(method, route, url, headers, payload, deadline, settings));
+  const run = previous.then(() => sendWithinLimits(method, route, url, headers, payload, deadline, clientDeadline, settings));
   const tail = run.catch(() => {});
   queues.set(key, tail);
   tail.then(() => { if (queues.get(key) === tail) queues.delete(key); });
   return run;
 }
 
-module.exports = { DEFAULT_RATE_LIMIT, DiscordError, discordRequest, rateLimitSettings };
+module.exports = { DEFAULT_RATE_LIMIT, DiscordError, currentDeadline, discordRequest, rateLimitSettings, withDeadline };

@@ -54,10 +54,13 @@ const { createEmergencyGateway } = require("./router/emergency.js");
 // root-channel messages and the owner's project-channel mentions, and may act
 // in any root or registered channel. If the Router stays unreachable past the
 // fallback threshold, root hears its own channels through an emergency direct
-// gateway until the Router is back (router/emergency.js); its notice goes to
-// `primaryChannelId`.
+// gateway until the Router is back (router/emergency.js), which also carries
+// its sends, typing, and reactions; its notice goes to `primaryChannelId`, and
+// its engagement is recorded in the launch directory for the scoped MCP server.
 function createRouterTransport({ project, role = "project", keyFile, launchDir, registryPath, primaryChannelId }) {
   let router = null;
+  // Router operations, or root's direct ones while its fallback is engaged.
+  let request = null;
   let scope = null;
   let messageHandler = null;
   let reactionHandler = null;
@@ -116,12 +119,15 @@ function createRouterTransport({ project, role = "project", keyFile, launchDir, 
       const key = (await readFile(keyFile, "utf8")).trim();
       if (root) {
         const fallback = createEmergencyGateway({
-          primaryChannelId, onMessage: (event) => messageHandler?.(toMessage(event)), log: (line) => console.error(line),
+          primaryChannelId, markerFile: path.join(launchDir, "emergency.json"),
+          onMessage: (event) => messageHandler?.(toMessage(event)), log: (line) => console.error(line),
         });
         router = new RouterClient({ key, role: "root", beforeHello: () => fallback.release() });
         fallback.watch(router);
+        request = fallback.request(router);
       } else {
         router = new RouterClient({ project, key, role: "project" });
+        request = (op, args) => router.request(op, args);
       }
       router.on("message", (event) => messageHandler?.(toMessage(event)));
       router.on("command", (event) => messageHandler?.(toMessage(event, `/${event.command}`)));
@@ -154,18 +160,18 @@ function createRouterTransport({ project, role = "project", keyFile, launchDir, 
     async send(channelId, chunks) {
       const sent = [];
       for (const chunk of chunks) {
-        const result = await router.request("reply", { channel_id: channelId, text: chunk, context_pct: contextPct });
+        const result = await request("reply", { channel_id: channelId, text: chunk, context_pct: contextPct });
         sent.push(...result.message_ids.map((id) => ({ id })));
       }
       return sent;
     },
 
     async sendTyping(channelId) {
-      await router.request("typing", { channel_id: channelId });
+      await request("typing", { channel_id: channelId });
     },
 
     async react(message, emoji) {
-      await router.request("react", { channel_id: message.channel.id, message_id: message.id, emoji });
+      await request("react", { channel_id: message.channel.id, message_id: message.id, emoji });
     },
 
     // The Router hands back a still-valid signed URL, re-signing one that has

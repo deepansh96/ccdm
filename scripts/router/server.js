@@ -7,6 +7,7 @@ const { watch } = require("node:fs");
 const { chmod, mkdir, readFile, unlink } = require("node:fs/promises");
 const net = require("node:net");
 const path = require("node:path");
+const { withDeadline } = require("./discord-rest.js");
 const { ScopeViolation } = require("./ops/errors.js");
 const { OPERATIONS } = require("./ops/index.js");
 
@@ -204,7 +205,9 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       return violation(args.channel_id, "channel_id is outside this session's scope");
     }
     try {
-      const result = await operation.run({ ...context, session, sessions: listSessions, violations: () => [...violations], table: getTable(), gateway, registry }, args);
+      // Discord calls stop once the client's own timeout has passed.
+      const result = await withDeadline(frame.deadline_at, () => operation.run({ ...context, session, sessions: listSessions,
+        violations: () => [...violations], table: getTable(), gateway, registry }, args));
       respond({ ok: true, result });
     } catch (error) {
       if (error instanceof ScopeViolation) return violation(error.target, error.message);

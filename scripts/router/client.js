@@ -164,13 +164,16 @@ class RouterClient extends EventEmitter {
   request(op, args = {}, { timeoutMs = this.timeoutMs } = {}) {
     if (!this.ready || this.socket.destroyed) return Promise.reject(routerError("router_unavailable", "not connected"));
     const id = crypto.randomUUID();
+    // The Router drops work still unsent at this deadline, so a request that
+    // timed out here never lands after the caller has retried it.
+    const deadlineAt = Date.now() + timeoutMs;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(routerError("timeout", `${op} timed out after ${timeoutMs}ms`));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
-      this.write({ type: "request", id, op, args });
+      this.write({ type: "request", id, op, args, deadline_at: deadlineAt });
     });
   }
 
