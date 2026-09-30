@@ -70,7 +70,10 @@ async function exportMessageRange(ctx, args) {
     throw new OpError("invalid_args", "start_message_id must not be after end_message_id");
   }
   for (const id of endId === undefined ? [startId] : [startId, endId]) await scopedMessage(ctx, id);
-  const output = await exportRange({ token: ctx.token, channelId: ctx.session.route.channel_id, startId, endId });
+  // Paging goes through the Router's REST queue, so it shares its rate limits
+  // and stops once the client's deadline has passed.
+  const output = await exportRange({ channelId: ctx.session.route.channel_id, startId, endId,
+    get: (route, query) => discordRequest("GET", route, { token: ctx.token, query }) });
   return { path: output };
 }
 

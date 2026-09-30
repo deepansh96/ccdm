@@ -214,3 +214,83 @@ test("each read op aimed at another channel or its message is a logged scope vio
   assert.deepEqual((discord.historyFetches ?? []).filter(fetch => fetch.channelId === "beta-channel"), []);
   assert.deepEqual(discord.attachmentFetches ?? [], []);
 });
+
+// 10,000 messages, newest first, ids 20000 (newest) down to 10001.
+function largeHistory(total = 10_000) {
+  return Array.from({ length: total }, (_, index) => ({
+    id: String(10_000 + total - index), channel_id: "demo-channel", timestamp: "2026-09-01T10:00:00.000Z",
+    content: `message ${10_000 + total - index}`, author: { id: "owner-id", username: "Owner" }, attachments: [],
+  }));
+}
+
+// Each page of history takes as long as a real Discord round trip, so the
+// 100 pages of a 10,000-message read outlast a short op's 10 s default deadline.
+const PAGE_DELAY_MS = 120;
+
+test("a 10,000-message read at realistic page latency completes within its deadline", async () => {
+  const workspace = createRouterWorkspace();
+  seedHistory(workspace, "demo-channel", largeHistory());
+  updateState(workspace.stateDir, (state) => { state.fixtures.discord.historyPageDelayMs = PAGE_DELAY_MS; });
+  await routerWithWebhooks(workspace, ["demo"]);
+  const demo = await connectSession(workspace, "demo", "demo-key");
+
+  const started = Date.now();
+  const result = await demo.client.request("read_last_x_messages_in_channel", { channel_id: "demo-channel", count: 10_000 });
+
+  assert.ok(Date.now() - started > 10_000, `the read took ${Date.now() - started}ms, not past the short-op default`);
+  assert.equal(result.count, 10_000);
+  const lines = fs.readFileSync(result.path, "utf8").trimEnd().split("\n");
+  assert.equal(lines.length, 10_000);
+  assert.equal(lines[0], "[2026-09-01T10:00:00.000Z] Owner: message 10001 (id: 10001)");
+  assert.equal(lines.at(-1), "[2026-09-01T10:00:00.000Z] Owner: message 20000 (id: 20000)");
+});
+
+test("a 10,000-message export at realistic page latency completes within its deadline", async () => {
+  const workspace = createRouterWorkspace();
+  seedHistory(workspace, "demo-channel", largeHistory());
+  updateState(workspace.stateDir, (state) => { state.fixtures.discord.historyPageDelayMs = PAGE_DELAY_MS; });
+  await routerWithWebhooks(workspace, ["demo"]);
+  const demo = await connectSession(workspace, "demo", "demo-key");
+
+  const started = Date.now();
+  const result = await demo.client.request("export_message_range", {
+    channel_id: "demo-channel", start_message_id: "10001", end_message_id: "20000",
+  });
+
+  assert.ok(Date.now() - started > 10_000, `the export took ${Date.now() - started}ms, not past the short-op default`);
+  const ids = fs.readFileSync(result.path, "utf8").match(/^Message ID: \d+$/gm);
+  assert.equal(ids.length, 10_000);
+  assert.equal(ids[0], "Message ID: 10001");
+  assert.equal(ids.at(-1), "Message ID: 20000");
+});
+
+test("only large reads and exports get a longer deadline; other ops keep the 10 s default", async () => {
+  const workspace = createRouterWorkspace();
+  seedHistory(workspace, "demo-channel", DEMO_HISTORY);
+  await routerWithWebhooks(workspace, ["demo"]);
+  const demo = await connectSession(workspace, "demo", "demo-key");
+  const budgets = {};
+  const write = demo.client.write.bind(demo.client);
+  demo.client.write = (frame) => {
+    if (frame.type === "request") budgets[`${frame.op} ${frame.args.count ?? ""}`.trim()] = frame.deadline_at - Date.now();
+    write(frame);
+  };
+
+  await demo.client.request("fetch_messages", { channel_id: "demo-channel", limit: 3 });
+  await demo.client.request("typing", { channel_id: "demo-channel" });
+  await demo.client.request("read_last_x_messages_in_channel", { channel_id: "demo-channel", count: 3 });
+  await demo.client.request("read_last_x_messages_in_channel", { channel_id: "demo-channel", count: 10_000 });
+  await demo.client.request("export_message_range", { channel_id: "demo-channel", start_message_id: "1003", end_message_id: "1003" });
+
+  const near = (actual, expected) => actual <= expected && actual > expected - 1000;
+  const expected = {
+    fetch_messages: 10_000,
+    typing: 10_000,
+    "read_last_x_messages_in_channel 3": 11_000,
+    "read_last_x_messages_in_channel 10000": 110_000,
+    export_message_range: 600_000,
+  };
+  for (const [op, budget] of Object.entries(expected)) {
+    assert.ok(near(budgets[op], budget), `${op}: ${budgets[op]}ms, expected about ${budget}ms`);
+  }
+});

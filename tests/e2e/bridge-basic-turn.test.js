@@ -1017,6 +1017,8 @@ test("bridge queues compact during an active turn and runs it after completion",
   assert.ok(clientMessages.some((message) => message.method === "thread/compact/start"));
   const mcpWrite = clientMessages.find((message) => message.method === "config/value/write");
   assert.equal(mcpWrite.params.keyPath, "mcp_servers.discord-channel-id");
+  // Codex waits out the Router's longest per-op deadline (a 10-minute export).
+  assert.equal(mcpWrite.params.value.tool_timeout_sec, 630);
   assert.equal(mcpWrite.params.value.env.CHANNEL_ID, "channel-id");
   assert.match(mcpWrite.params.value.env.DISCORD_REPLY_TOKEN, /^[a-f0-9]{32}$/);
   const bootstrapTurns = clientMessages.filter((message) =>
