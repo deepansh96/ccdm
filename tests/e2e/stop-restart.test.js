@@ -238,6 +238,32 @@ test("stop-session sweeps orphan Claude and Codex listener processes", async () 
   assert.equal(isAlive(appServerPid), false);
 });
 
+test("during cutover, stop-session also sweeps a legacy pool Claude listener for the project's former pool bot", async () => {
+  const workspace = createWorkspace();
+  const stateDir = (n) => path.join(workspace.homeDir, ".claude", "channels", `discord${n}`);
+  // alpha still names its former pool bot; bot3 serves another project.
+  const registry = buildRegistry(workspace, { project: { bot_id: "bot2" } });
+  registry.pool = [
+    { id: "bot2", app_id: "app-2", state_dir: stateDir(2), assigned_to: "alpha" },
+    { id: "bot3", app_id: "app-3", state_dir: stateDir(3), assigned_to: "other" },
+  ];
+  seedRegistry(workspace, registry);
+  const legacy = (n) => `claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions DISCORD_STATE_DIR='${stateDir(n)}'`;
+  const orphanPid = spawnOwnedProcess(workspace, legacy(2));
+  const otherPid = spawnOwnedProcess(workspace, legacy(3));
+  const pluginPid = spawnOwnedProcess(workspace,
+    `bun run --cwd ${workspace.homeDir}/.claude/plugins/cache/claude-plugins-official/discord/0.0.1 start DISCORD_STATE_DIR=${stateDir(2)}`);
+
+  const result = await stopProject(workspace);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /Cleaning remaining listener process\(es\):/);
+  assert.equal(isAlive(orphanPid), false);
+  assert.equal(isAlive(pluginPid), false);
+  assert.equal(isAlive(otherPid), true);
+  assert.equal(readRegistry(workspace).projects.alpha.pid, null);
+});
+
 test("stop-session sweeps an orphaned CCDM channel server and removes the launch key", async () => {
   const workspace = createWorkspace();
   const registry = buildRegistry(workspace);

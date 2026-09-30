@@ -148,7 +148,12 @@ test("a launch whose development-channel confirmation never appears exits non-ze
 
 test("a launch whose Router hello fails exits non-zero and cleans up", async () => {
   const workspace = claudeRouterWorkspace();
-  // No Router is running, so the channel server's hello cannot succeed.
+  // demo has its webhook, but no Router is running, so the channel server's
+  // hello cannot succeed.
+  const registryFile = path.join(workspace.repoDir, "registry.json");
+  const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+  registry.projects.demo.webhook_id = "webhook-demo";
+  fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
 
   const started = await startSession(workspace, { CCDM_CLAUDE_LAUNCH_TIMEOUT_S: "10" });
 

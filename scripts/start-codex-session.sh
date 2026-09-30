@@ -176,13 +176,14 @@ if not pid:
     print("Warning: started session, but could not find Codex bridge PID to record")
     sys.exit(1 if sys.argv[4] else 0)
 
-with open(registry_path) as f:
-    registry = json.load(f)
-registry["projects"][project]["pid"] = pid
-registry["projects"][project]["session_id"] = None
-with open(registry_path, "w") as f:
-    json.dump(registry, f, indent=2)
-    f.write("\n")
+# Under the registry lock every writer shares (scripts/registry-update.py).
+import importlib.util
+sys.dont_write_bytecode = True  # no __pycache__ beside the scripts
+spec = importlib.util.spec_from_file_location(
+    "ccdm_registry_update", os.path.join(os.path.dirname(registry_path), "scripts", "registry-update.py"))
+registry_update = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(registry_update)
+registry_update.set_project_fields(registry_path, project, {"pid": pid, "session_id": None})
 
 print(f"Recorded PID {pid}")
 PY
@@ -262,23 +263,23 @@ PY
     if [[ -n "$leftover" ]]; then
       kill -TERM ${(f)leftover} 2>/dev/null || true
     fi
-    python3 - "$key_file" "$launch_dir" "$REGISTRY" "$PROJECT" <<'PY'
-import json
+    python3 - "$key_file" "$launch_dir" "$REGISTRY" "$PROJECT" "$SCRIPT_DIR/registry-update.py" <<'PY'
+import importlib.util
 import shutil
 import sys
 from pathlib import Path
 
-key_file, launch_dir, registry_path, project = sys.argv[1:5]
+sys.dont_write_bytecode = True  # no __pycache__ beside the scripts
+
+key_file, launch_dir, registry_path, project, helper = sys.argv[1:6]
 Path(key_file).unlink(missing_ok=True)
 shutil.rmtree(launch_dir, ignore_errors=True)
-# No listener survives a failed launch, so none is recorded.
-with open(registry_path) as f:
-    registry = json.load(f)
-registry["projects"][project]["pid"] = None
-registry["projects"][project]["session_id"] = None
-with open(registry_path, "w") as f:
-    json.dump(registry, f, indent=2)
-    f.write("\n")
+# No listener survives a failed launch, so none is recorded (under the
+# registry lock every writer shares).
+spec = importlib.util.spec_from_file_location("ccdm_registry_update", helper)
+registry_update = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(registry_update)
+registry_update.set_project_fields(registry_path, project, {"pid": None, "session_id": None})
 PY
     return 1
   fi
@@ -287,7 +288,7 @@ PY
   record_codex_pid "$CHANNEL_ID"
 }
 
-IFS=$'\t' read -r PATH_DIR SCREEN_NAME CHANNEL_ID WS_PORT DISCORD_USER_IDS TEXT_REPLY_FALLBACK_FLAG CODEX_MODEL_VALUE CODEX_REASONING_EFFORT_VALUE CODEX_SERVICE_TIER_VALUE <<< "$(python3 -c "
+IFS=$'\t' read -r PATH_DIR SCREEN_NAME CHANNEL_ID WS_PORT DISCORD_USER_IDS TEXT_REPLY_FALLBACK_FLAG CODEX_MODEL_VALUE CODEX_REASONING_EFFORT_VALUE CODEX_SERVICE_TIER_VALUE WEBHOOK_ID <<< "$(python3 -c "
 import json, os
 r = json.load(open('$REGISTRY'))
 p = r['projects']['$PROJECT']
@@ -302,6 +303,7 @@ print('\t'.join([
     (p.get('codex_model') or p.get('model') or '__NONE__'),
     (p.get('codex_reasoning_effort') or p.get('model_reasoning_effort') or '__NONE__'),
     (p.get('codex_service_tier') or p.get('service_tier') or '__NONE__'),
+    (str(p.get('webhook_id') or '') or '__NONE__'),
 ]))
 ")"
 
@@ -322,6 +324,14 @@ if [[ -n "$EXISTING_PIDS" ]]; then
   echo "Refusing to start '$PROJECT': existing Codex Discord bridge process(es) already use channel $CHANNEL_ID or port $WS_PORT:"
   echo "$EXISTING_PIDS" | sed 's/^/  /'
   echo "Run scripts/stop-session.sh '$PROJECT' first, then retry."
+  exit 1
+fi
+
+# The Router posts replies only through the project's webhook: a project
+# without one is refused before any runtime change (MCP cleanup, key, tmux,
+# PID).
+if [[ "$WEBHOOK_ID" == "__NONE__" ]]; then
+  echo "Refusing to start '$PROJECT': it has no webhook_id, so its replies could not be posted. Run scripts/migrate-to-router.sh $PROJECT (or node scripts/router.js ensure-webhook $PROJECT), then retry." >&2
   exit 1
 fi
 

@@ -140,9 +140,11 @@ If the Router is down, launchd restarts it (`com.ccdm.router`, logs in `~/.local
 
 #### 9. Cutover and retirement
 
-For an install that still has Bot Pool fields in `registry.json`:
-- `scripts/migrate-to-router.sh <project>` records one project on the Router with a preflight, per-step `ok`/`failed` output, a `router status` plus `probe` round-trip check, and automatic rollback to the project's previous registry state on failure. `--rollback` refuses, since no pool bot remains.
-- `scripts/retire-pool.sh` is a dry run by default. It refuses while any project is not on the Router. With `--apply` it removes the old pool bots from the server, backs up their state directories privately, deletes the obsolete `project-bot` role, and strips the pool fields from the registry after a private backup. It never deletes bot applications. Run it only when the user asks, and show them the dry run first.
+For an install that still has Bot Pool fields in `registry.json`, cut over in this order:
+1. Stop every pool session with `scripts/stop-session.sh <project>` (it also sweeps a project's leftover pool-bot listener while the project still names its `bot_id`).
+2. Move root's configuration: `node scripts/router.js migrate-root-config`, `scripts/install-router-service.sh`, `node scripts/router.js status`, then restart root.
+3. Migrate each project with `scripts/migrate-to-router.sh <project>`: a preflight, per-step `ok`/`failed` output, a `router status` plus `probe` round-trip check, and automatic rollback to the project's previous registry state on failure. `--rollback` refuses, since no pool bot remains. Launchers refuse a project without `webhook_id`, so an unmigrated project comes back only this way.
+4. Retire the pool with `scripts/retire-pool.sh`, a dry run by default. It refuses while a project still tied to a pool bot is not on the Router; projects registered after the cutover need no `transport`. With `--apply` it removes the old pool bots from the server, backs up their state directories privately, deletes the obsolete `project-bot` role, and strips the pool fields from the registry after a private backup; an interrupted run finishes on a rerun. It never deletes bot applications. Run it only when the user asks, and show them the dry run first.
 
 #### 10. Context report (`context report`, `context for all`)
 

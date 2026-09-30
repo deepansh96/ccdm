@@ -113,13 +113,14 @@ for _ in range(20):
     except Exception:
         time.sleep(0.5)
 
-with open(registry_path) as f:
-    registry = json.load(f)
-registry["projects"][project]["pid"] = pid
-registry["projects"][project]["session_id"] = session_id
-with open(registry_path, "w") as f:
-    json.dump(registry, f, indent=2)
-    f.write("\n")
+# Under the registry lock every writer shares (scripts/registry-update.py).
+import importlib.util
+sys.dont_write_bytecode = True  # no __pycache__ beside the scripts
+spec = importlib.util.spec_from_file_location(
+    "ccdm_registry_update", os.path.join(os.path.dirname(registry_path), "scripts", "registry-update.py"))
+registry_update = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(registry_update)
+registry_update.set_project_fields(registry_path, project, {"pid": pid, "session_id": session_id})
 
 if session_id:
     print(f"Recorded PID {pid} and session {session_id}")
@@ -185,6 +186,13 @@ start_router_session() {
     echo "Refusing to start '$PROJECT': existing Claude Router listener process(es) already use $key_file:"
     echo "$existing" | sed 's/^/  /'
     echo "Run scripts/stop-session.sh '$PROJECT' first, then retry."
+    return 1
+  fi
+
+  # The Router posts replies only through the project's webhook: a project
+  # without one is refused before any runtime change (key, tmux, PID).
+  if [[ "$WEBHOOK_ID" == "__NONE__" ]]; then
+    echo "Refusing to start '$PROJECT': it has no webhook_id, so its replies could not be posted. Run scripts/migrate-to-router.sh $PROJECT (or node scripts/router.js ensure-webhook $PROJECT), then retry." >&2
     return 1
   fi
 
@@ -343,10 +351,10 @@ if effort is None or effort == '':
 elif not isinstance(effort, str) or effort not in ('low', 'medium', 'high', 'xhigh', 'max'):
     sys.exit('Invalid claude_effort (expected low, medium, high, xhigh, or max)')
 claude_home = os.path.expanduser(p['claude_home']) if p.get('claude_home') else '__NONE__'
-print(os.path.expanduser(p['path']) + '\t' + p['screen_name'] + '\t' + (p.get('model') or '__NONE__') + '\t' + effort + '\t' + claude_home + '\t' + str(p['channel_id']))
+print(os.path.expanduser(p['path']) + '\t' + p['screen_name'] + '\t' + (p.get('model') or '__NONE__') + '\t' + effort + '\t' + claude_home + '\t' + str(p['channel_id']) + '\t' + (str(p.get('webhook_id') or '') or '__NONE__'))
 PY
 )" || exit $?
-IFS=$'\t' read -r PATH_DIR SCREEN_NAME MODEL CLAUDE_EFFORT CLAUDE_HOME CHANNEL_ID <<< "$PROJECT_CONFIG_FIELDS"
+IFS=$'\t' read -r PATH_DIR SCREEN_NAME MODEL CLAUDE_EFFORT CLAUDE_HOME CHANNEL_ID WEBHOOK_ID <<< "$PROJECT_CONFIG_FIELDS"
 
 [[ "$MODEL" == "__NONE__" ]] && MODEL=""
 [[ "$CLAUDE_EFFORT" == "__NONE__" ]] && CLAUDE_EFFORT=""

@@ -586,6 +586,23 @@ test("start-codex-session ignores a broken Codex Account Alias on an unrelated p
   assert.equal(readRegistry(workspace).projects.beta.pid, null);
 });
 
+test("a Codex project without a webhook_id is refused before MCP cleanup, a key, a tmux session, or a PID", async () => {
+  const workspace = createCodexWorkspace();
+  seedRegistry(workspace, buildCodexRegistry(workspace));
+  const config = path.join(workspace.homeDir, ".codex", "config.toml");
+  const staleConfig = '[mcp_servers.discord-old]\ncommand = "node"\n';
+  fs.writeFileSync(config, staleConfig);
+
+  const result = await startCodex(workspace);
+
+  assert.equal(result.exitCode, 1, result.stderr || result.stdout);
+  assert.match(result.stderr, /Refusing to start 'alpha': it has no webhook_id, so its replies could not be posted\. Run scripts\/migrate-to-router\.sh alpha/);
+  assertNoLaunch(workspace, "no webhook_id");
+  assert.equal(readState(workspace.stateDir).fixtures.codex.bridgeInvocations.length, 0);
+  assert.equal(fs.readFileSync(config, "utf8"), staleConfig);
+  assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "launches", "alpha")), false);
+});
+
 test("start-codex-session rejects a missing Codex home before lifecycle mutation", async () => {
   const workspace = createCodexWorkspace();
   const missingHome = path.join(workspace.homeDir, ".codex-missing");
@@ -932,6 +949,7 @@ test("start-codex-session reports current executable failures for registry looku
   const staleBot = createCodexWorkspace();
   const staleBotRegistry = buildCodexRegistry(staleBot);
   staleBotRegistry.projects.alpha.bot_id = "bot2";
+  staleBotRegistry.projects.alpha.webhook_id = "webhook-alpha";
   seedRegistry(staleBot, staleBotRegistry);
   const staleBotResult = await startCodex(staleBot, { env: { CCDM_CODEX_LAUNCH_TIMEOUT_S: "2" } });
   assert.notEqual(staleBotResult.exitCode, 0);

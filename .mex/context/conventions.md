@@ -15,7 +15,7 @@ edges:
     condition: when code changes permissions, credentials, or message routing
   - target: context/session-management.md
     condition: when changing lifecycle scripts or registry runtime state
-last_updated: 2026-09-29
+last_updated: 2026-09-30
 ---
 
 # Conventions
@@ -35,6 +35,7 @@ last_updated: 2026-09-29
 
 ## Patterns
 - Parse and rewrite JSON structurally with `JSON.parse`/`JSON.stringify` or Python's `json` module; never edit registry/access JSON with regex.
+- Rewrite `registry.json` only through the shared registry lock: `updateRegistry` (`scripts/router/registry.js`) from Node, `scripts/registry-update.py` from shell and Python. Change only the fields you own inside the updater; never write back a copy read before the lock.
 - Before launching, check both the exact tmux session and listener processes tied to the project's Router launch key, channel, or WebSocket port.
 - Stop descendants before parents, terminate tmux, sweep remaining listeners, then clear registry PID/session state.
 - Discord writes from Codex require the bridge-issued scope token; delegated agents never receive it.
@@ -44,5 +45,5 @@ last_updated: 2026-09-29
 - [ ] No token, credential, `registry.json` value, or local channel ID was added to tracked output unintentionally.
 - [ ] Start/stop changes preserve duplicate-listener detection and cleanup.
 - [ ] Every project session stays within its Session Scope (one channel), enforced by the Router.
-- [ ] Registry and access files are handled with structured JSON parsing.
+- [ ] Registry and access files are handled with structured JSON parsing, and registry writes hold the registry lock.
 - [ ] Relevant mex context or patterns were updated when behavior changed.

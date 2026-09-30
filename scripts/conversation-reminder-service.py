@@ -29,6 +29,10 @@ READINESS_PATH = Path(__file__).with_name("conversation-reminder-readiness.py")
 READINESS_SPEC = importlib.util.spec_from_file_location("ccdm_conversation_readiness", READINESS_PATH)
 READINESS = importlib.util.module_from_spec(READINESS_SPEC)
 READINESS_SPEC.loader.exec_module(READINESS)
+REGISTRY_UPDATE_PATH = Path(__file__).with_name("registry-update.py")
+REGISTRY_UPDATE_SPEC = importlib.util.spec_from_file_location("ccdm_registry_update", REGISTRY_UPDATE_PATH)
+REGISTRY_UPDATE = importlib.util.module_from_spec(REGISTRY_UPDATE_SPEC)
+REGISTRY_UPDATE_SPEC.loader.exec_module(REGISTRY_UPDATE)
 SCHEMA_VERSION = 7
 # The first reminder follows a qualifying response by an hour; each further
 # ignored reminder waits longer, up to a daily reminder.
@@ -562,13 +566,8 @@ def assignment_changed(project_root: Path, state_dir: Path, name: str) -> dict:
                 retired.append(assignment["generation"])
             generation = "gen-" + uuid.uuid4().hex
             projects[name]["assignment_generation"] = generation
-            mode = stat.S_IMODE(registry_path.stat().st_mode)
-            temporary = registry_path.with_name(f".registry.json.{os.getpid()}.tmp")
-            with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode), "w") as target:
-                json.dump(registry, target, indent=2)
-                target.write("\n")
-            os.chmod(temporary, mode)
-            os.replace(temporary, registry_path)
+            # Only this field changes, under the registry lock every writer shares.
+            REGISTRY_UPDATE.set_project_fields(registry_path, name, {"assignment_generation": generation})
             try:
                 renewed = usable_assignment(registry, name)
             except (KeyError, ValueError):
