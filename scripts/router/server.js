@@ -289,12 +289,16 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       send(observerSession.socket, { type: "event", ...event });
       return true;
     },
-    // A reloaded registry can move a connected project's channel or webhook.
+    // A reloaded registry can move a connected project's channel or webhook,
+    // or deregister the project, which revokes its connections. Root's own
+    // connections are not projects and keep their place.
     refreshRoutes() {
       const { projects } = getTable();
       for (const connection of [...sessions.values(), ...opConnections]) {
+        if (connection.role !== "project") continue;
         const route = projects.get(connection.route.project);
         if (route) connection.route = route;
+        else revoke(connection, "deregistered");
       }
     },
     close() {

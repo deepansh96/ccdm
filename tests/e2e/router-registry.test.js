@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import test from "node:test";
 
@@ -14,10 +15,11 @@ import {
   startRouter,
   waitFor,
   writeProjectKey,
+  writeRootKey,
 } from "./support/router.js";
 import { runNodeEntrypoint } from "./support/runner.js";
 import { readState } from "./support/state.js";
-import { cleanup } from "./support/teardown.js";
+import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 
 const RELOAD_ENV = { CCDM_ROUTER_REGISTRY_DEBOUNCE_MS: "20" };
 
@@ -155,4 +157,45 @@ test("guest-access.js grant and revoke change who reaches a connected session wi
 
   assert.deepEqual(demo.events.map(event => event.message_id), ["after-cli-grant"]);
   assert.equal(router.stdout.split("router ready").length - 1, 1);
+});
+
+// An op-only client (`listener: false`), as a Codex bridge's scoped MCP server connects.
+async function connectOpOnly(workspace, options) {
+  const { RouterClient } = createRequire(import.meta.url)(path.join(workspace.repoDir, "scripts/router/client.js"));
+  const client = new RouterClient({ socketPath: workspace.socketPath, listener: false, ...options });
+  const events = [];
+  client.on("event", (event) => events.push(event));
+  await client.connect();
+  registerTeardownCallback(() => client.close());
+  return { client, events, ended: new Promise((resolve) => client.once("end", resolve)) };
+}
+
+test("deregistering a project revokes its listener and op-only connections while other projects and root keep working", async () => {
+  const workspace = createRouterWorkspace();
+  writeProjectKey(workspace, "demo", "demo-key");
+  writeProjectKey(workspace, "beta", "beta-key");
+  writeRootKey(workspace, "root-key");
+  const router = await startRouter(workspace, { env: RELOAD_ENV });
+  const demo = await connectSession(workspace, "demo", "demo-key");
+  const demoEnded = new Promise((resolve) => demo.client.once("end", resolve));
+  const demoOps = await connectOpOnly(workspace, { project: "demo", key: "demo-key", role: "project" });
+  const beta = await connectSession(workspace, "beta", "beta-key");
+  const rootOps = await connectOpOnly(workspace, { key: "root-key", role: "root" });
+
+  // The project's key stays behind; only its registry entry goes.
+  const { demo: _removed, ...remaining } = routerRegistry().projects;
+  await afterReload(router, () => replaceRegistry(workspace, { ...routerRegistry(), projects: remaining }));
+  await waitFor(() => demo.events.some(event => event.event === "revoked")
+    && demoOps.events.some(event => event.event === "revoked"), () => `revoked events:\n${router.stdout}`);
+  await Promise.all([demoEnded, demoOps.ended]);
+
+  await assert.rejects(demoOps.client.request("fetch_messages", { channel_id: "demo-channel", limit: 5 }));
+  await assert.rejects(connectSession(workspace, "demo", "demo-key"), { code: "unauthorized" });
+  assert.deepEqual([...demo.events, ...demoOps.events].map(event => [event.event, event.reason]),
+    [["revoked", "deregistered"], ["revoked", "deregistered"]]);
+  assert.deepEqual(await beta.client.request("fetch_messages", { channel_id: "beta-channel", limit: 5 }),
+    await rootOps.client.request("fetch_messages", { channel_id: "beta-channel", limit: 5 }));
+  await assert.rejects(rootOps.client.request("fetch_messages", { channel_id: "demo-channel", limit: 5 }),
+    { code: "scope_violation" });
+  assert.deepEqual(beta.events, []);
 });
