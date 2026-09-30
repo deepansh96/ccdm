@@ -89,8 +89,20 @@ function requireScopeToken(scopeToken) {
   }
 }
 
+// A project's tools act in the channel the Router currently grants it, which
+// follows a registry channel move (the client adopts the Router's
+// `scope_changed`); the launch channel stands in only while the Router is
+// unreachable, where the request fails anyway.
+async function projectChannelId() {
+  try {
+    return (await routerClient()).scope?.channel_id || CHANNEL_ID;
+  } catch {
+    return CHANNEL_ID;
+  }
+}
+
 async function targetChannelId(args) {
-  if (!DISCORD_CHANNEL_OVERRIDE) return CHANNEL_ID;
+  if (!DISCORD_CHANNEL_OVERRIDE) return projectChannelId();
   if (!args.channel_id) {
     throw new Error("channel_id is required in root multi-channel mode");
   }

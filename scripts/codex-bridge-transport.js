@@ -25,6 +25,9 @@
 //         message: { id, content, channel: { id, name }, author: { id } | null },
 //       }>,
 //     }
+//   onScopeChange(handler) handler(scope), scope = { project, channel_id, type }
+//     The Router moved this project's Session Scope (a registry channel move);
+//     only its authenticated connection can, and never in the root role.
 //
 // Operations out:
 //   connect()                     -> Promise<{ userTag }> once the gateway is ready
@@ -64,6 +67,7 @@ function createRouterTransport({ project, role = "project", keyFile, launchDir, 
   let scope = null;
   let messageHandler = null;
   let reactionHandler = null;
+  let scopeHandler = null;
   let contextPct;
 
   const root = role === "root";
@@ -115,6 +119,10 @@ function createRouterTransport({ project, role = "project", keyFile, launchDir, 
       reactionHandler = handler;
     },
 
+    onScopeChange(handler) {
+      scopeHandler = handler;
+    },
+
     async connect() {
       const key = (await readFile(keyFile, "utf8")).trim();
       if (root) {
@@ -132,6 +140,14 @@ function createRouterTransport({ project, role = "project", keyFile, launchDir, 
       router.on("message", (event) => messageHandler?.(toMessage(event)));
       router.on("command", (event) => messageHandler?.(toMessage(event, `/${event.command}`)));
       router.on("reaction", (event) => reactionHandler?.(toReaction(event)));
+      // The client validates the change (this project, a channel) before it
+      // fires; root has no project scope to move.
+      if (!root) {
+        router.on("scope_changed", (next) => {
+          scope = next;
+          scopeHandler?.(next);
+        });
+      }
       router.on("disconnect", () => console.error("Router connection lost; reconnecting"));
       router.on("reconnect", () => console.log("Router connection restored"));
       router.on("end", (error) => console.error(`Router session ended${error ? `: ${error.code || error.message}` : ""}`));

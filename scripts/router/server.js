@@ -52,6 +52,12 @@ function rootTarget(table, channelId) {
   return project ? { project, channel_id: channelId } : null;
 }
 
+// The Session Scope a project connection is granted: in its hello_ok, and in
+// a `scope_changed` event when a registry reload moves it.
+function projectScope(route) {
+  return { project: route.project, channel_id: route.channel_id, type: route.type };
+}
+
 // A live socket already owns the path: refuse rather than steal it.
 async function claimSocketPath(socketPath) {
   const live = await new Promise(resolve => {
@@ -165,20 +171,14 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     if (frame.listener === false) {
       Object.assign(connection, { role: "project", listener: false, route, key: frame.key, connectedAt: new Date().toISOString() });
       opConnections.add(connection);
-      return send(connection.socket, {
-        type: "hello_ok", v: PROTOCOL_VERSION,
-        scope: { project: route.project, channel_id: route.channel_id, type: route.type },
-      });
+      return send(connection.socket, { type: "hello_ok", v: PROTOCOL_VERSION, scope: projectScope(route) });
     }
     // One listener per project: a newer hello replaces whoever held the project.
     const previous = sessions.get(route.project);
     if (previous) revoke(previous, "replaced");
     Object.assign(connection, { role: "project", route, key: frame.key, connectedAt: new Date().toISOString() });
     sessions.set(route.project, connection);
-    send(connection.socket, {
-      type: "hello_ok", v: PROTOCOL_VERSION,
-      scope: { project: route.project, channel_id: route.channel_id, type: route.type },
-    });
+    send(connection.socket, { type: "hello_ok", v: PROTOCOL_VERSION, scope: projectScope(route) });
   }
 
   async function request(connection, frame) {
@@ -293,15 +293,27 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       return true;
     },
     // A reloaded registry can move a connected project's channel or webhook,
-    // or deregister the project, which revokes its connections. Root's own
+    // or deregister the project, which revokes its connections. A moved
+    // channel (or changed type) is pushed to each of the project's
+    // connections, listener and op-only alike, as a `scope_changed` event, so
+    // the adapter retargets its inbound filter and tool defaults. Root's own
     // connections are not projects and keep their place.
     refreshRoutes() {
       const { projects } = getTable();
       for (const connection of [...sessions.values(), ...opConnections]) {
         if (connection.role !== "project") continue;
         const route = projects.get(connection.route.project);
-        if (route) connection.route = route;
-        else revoke(connection, "deregistered");
+        if (!route) {
+          revoke(connection, "deregistered");
+          continue;
+        }
+        const before = projectScope(connection.route);
+        connection.route = route;
+        const scope = projectScope(route);
+        if (scope.channel_id !== before.channel_id || scope.type !== before.type) {
+          log(`scope_changed project=${route.project} channel=${scope.channel_id}`);
+          send(connection.socket, { type: "event", event: "scope_changed", scope });
+        }
       }
     },
     close() {
