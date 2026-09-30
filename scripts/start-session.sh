@@ -113,13 +113,15 @@ for _ in range(20):
     except Exception:
         time.sleep(0.5)
 
-with open(registry_path) as f:
-    registry = json.load(f)
-registry["projects"][project]["pid"] = pid
-registry["projects"][project]["session_id"] = session_id
-with open(registry_path, "w") as f:
-    json.dump(registry, f, indent=2)
-    f.write("\n")
+# Under the registry lock every writer shares (scripts/registry-update.py).
+import importlib.util
+sys.dont_write_bytecode = True  # no __pycache__ beside the scripts
+spec = importlib.util.spec_from_file_location(
+    "ccdm_registry_update", os.path.join(os.path.dirname(registry_path), "scripts", "registry-update.py"))
+registry_update = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(registry_update)
+registry_update.set_project_fields(registry_path, project, {"pid": pid, "session_id": session_id})
+
 
 if session_id:
     print(f"Recorded PID {pid} and session {session_id}")

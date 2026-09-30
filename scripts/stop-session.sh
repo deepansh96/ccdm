@@ -246,17 +246,6 @@ if "/" not in project and project not in {"", ".", ".."}:
 PY
 fi
 
-python3 -c "
-import json
-path = '$REGISTRY'
-project = '$PROJECT'
-with open(path) as f:
-    registry = json.load(f)
-registry['projects'][project]['session_id'] = None
-registry['projects'][project]['pid'] = None
-with open(path, 'w') as f:
-    json.dump(registry, f, indent=2)
-    f.write('\n')
-"
+python3 "$SCRIPT_DIR/registry-update.py" set-project-fields "$REGISTRY" "$PROJECT" '{"session_id": null, "pid": null}'
 
 echo "Stopped Discord session '$PROJECT'"
