@@ -52,9 +52,9 @@ const writeRegistry = (workspace, registry) =>
   fs.writeFileSync(registryFile(workspace), `${JSON.stringify(registry, null, 2)}\n`);
 const stateDirOf = (workspace, n) => path.join(workspace.homeDir, ".claude/channels", `discord${n}`);
 
-function retire(workspace, args = []) {
+function retire(workspace, args = [], extraEnv = {}) {
   return runScript(workspace, "scripts/retire-pool.sh", {
-    args, env: routerEnv(workspace, { CCDM_ROUTER_NODE: process.execPath }),
+    args, env: routerEnv(workspace, { CCDM_ROUTER_NODE: process.execPath, ...extraEnv }), timeoutMs: 30000,
   });
 }
 
@@ -178,4 +178,70 @@ test("re-running --apply after retirement is a clean no-op", async () => {
   assert.equal(fs.readFileSync(registryFile(workspace), "utf8"), retired);
   assert.deepEqual(discordMutations(workspace), mutations);
   assert.deepEqual(mutations.applicationDeletes, []);
+});
+
+test("a freshly registered project with no transport or pool markers does not block retirement", async () => {
+  const workspace = poolWorkspace();
+  const registry = readRegistry(workspace);
+  // Registration writes no `transport`, and the project never had a pool bot.
+  registry.projects.fresh = { channel_id: "fresh-channel", type: "claude", webhook_id: "webhook-fresh" };
+  writeRegistry(workspace, registry);
+
+  const result = await retire(workspace, ["--apply"]);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.deepEqual(result.stdout.trim().split("\n"), expectedActions(workspace).map(action => `done: ${action}`));
+  assert.deepEqual(readRegistry(workspace).projects.fresh,
+    { channel_id: "fresh-channel", type: "claude", webhook_id: "webhook-fresh" });
+});
+
+test("a retirement interrupted between project strips finishes on the rerun, and a further rerun is a no-op", async () => {
+  const workspace = poolWorkspace();
+  const hold = path.join(workspace.tmpDir, "registry-hold");
+  const waitForPause = async () => {
+    const deadline = Date.now() + 20000;
+    while (!fs.existsSync(`${hold}.waiting`) || fs.existsSync(`${hold}.release`)
+      || !/^\d+\n$/.test(fs.readFileSync(`${hold}.waiting`, "utf8"))) {
+      assert.ok(Date.now() < deadline, "retirement never paused at its next registry write");
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    return Number(fs.readFileSync(`${hold}.waiting`, "utf8"));
+  };
+  // Pause at the top-level strip, then at demo's strip, then at beta's, and
+  // kill the run there: demo is stripped, beta is not.
+  fs.writeFileSync(`${hold}.armed`, "");
+  const interrupted = retire(workspace, ["--apply"], { CCDM_TEST_REGISTRY_HOLD: hold });
+  for (let write = 0; write < 2; write++) {
+    await waitForPause();
+    fs.writeFileSync(`${hold}.armed`, "");
+    fs.writeFileSync(`${hold}.release`, "");
+  }
+  process.kill(await waitForPause(), "SIGKILL");
+  assert.notEqual((await interrupted).exitCode, 0);
+  const partial = readRegistry(workspace);
+  assert.equal("pool" in partial, false);
+  assert.deepEqual(partial.projects.demo,
+    { channel_id: "demo-channel", type: "claude", webhook_id: "webhook-demo", guest_user_ids: ["guest-id"] });
+  assert.deepEqual({ bot_id: partial.projects.beta.bot_id, transport: partial.projects.beta.transport },
+    { bot_id: "bot3", transport: "router" });
+
+  const rerun = await retire(workspace, ["--apply"]);
+
+  assert.equal(rerun.exitCode, 0, rerun.stderr || rerun.stdout);
+  const backup = `${workspace.homeDir}/.local/state/ccdm/pool-retirement`;
+  assert.deepEqual(rerun.stdout.trim().split("\n"), [
+    `done: back up the registry to ${backup}/registry.json`,
+    "done: strip bot_id, transport from project beta",
+  ]);
+  const retired = fs.readFileSync(registryFile(workspace), "utf8");
+  assert.deepEqual(JSON.parse(retired).projects.beta,
+    { channel_id: "beta-channel", type: "codex", webhook_id: "webhook-beta", ws_port: 4501 });
+  // The first run's backup, made before anything was stripped, is kept.
+  assert.equal(JSON.parse(fs.readFileSync(`${backup}/registry.json`, "utf8")).pool.length, 3);
+
+  const again = await retire(workspace, ["--apply"]);
+
+  assert.equal(again.exitCode, 0, again.stderr || again.stdout);
+  assert.equal(again.stdout.trim(), "the Bot Pool is already retired; nothing to do");
+  assert.equal(fs.readFileSync(registryFile(workspace), "utf8"), retired);
 });

@@ -36,6 +36,14 @@ async function deleteIfPresent(route, token) {
   }
 }
 
+// A project still tied to a pool bot. Registration writes no `transport`, and
+// an interrupted retirement leaves stripped projects without one: neither
+// blocks retirement.
+function hasPoolMarkers(registry, name, project) {
+  if (project?.bot_id || project?.bot_display_name) return true;
+  return (Array.isArray(registry.pool) ? registry.pool : []).some(bot => bot?.assigned_to === name);
+}
+
 function plan(registry, file) {
   const backup = backupDir();
   const guild = registry.guild_id;
@@ -111,7 +119,8 @@ async function main(args) {
     return;
   }
   const pooled = Object.entries(registry.projects || {})
-    .filter(([, project]) => project?.transport !== "router").map(([name]) => name);
+    .filter(([name, project]) => hasPoolMarkers(registry, name, project) && project?.transport !== "router")
+    .map(([name]) => name);
   if (pooled.length) {
     throw new Error(`refusing to retire the Bot Pool: ${pooled.join(", ")} ${pooled.length === 1 ? "is" : "are"} not on the Router (transport: "router")`);
   }
