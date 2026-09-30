@@ -191,7 +191,8 @@ function contextPct() {
   }
 }
 
-// The Router's hello scope: this session's one channel.
+// The Router's hello scope: this session's one channel, replaced when the
+// Router moves it (a registry channel move, see `scope_changed` below).
 let scope = {};
 
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
@@ -491,6 +492,16 @@ function main() {
     if (!run) return;
     commands = commands.then(() => run(event)).catch(error => {
       process.stderr.write(`ccdm channel: /${event.command} failed: ${error.code || error.message}\n`);
+    });
+  });
+  // Only the Router's authenticated connection moves the scope, and the
+  // client validates it (this project, a channel) first. The implicit read
+  // tools and the reminder capability marker follow the new channel.
+  router.on("scope_changed", next => {
+    scope = next;
+    process.stderr.write(`ccdm channel: Router moved this session to channel ${next.channel_id}\n`);
+    if (!ROOT) writeCapabilityMarker(next).catch(error => {
+      process.stderr.write(`ccdm channel: capability marker failed: ${error.message}\n`);
     });
   });
   router.on("disconnect", () => process.stderr.write("ccdm channel: Router connection lost; reconnecting\n"));

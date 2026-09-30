@@ -9,7 +9,9 @@
 //   const scope = await client.connect();      // the first connect does not retry
 //   client.on("event", event => ...);          // every pushed event frame
 //   client.on("message" | "reaction" | "command" | "revoked", event => ...);
+//   client.on("scope_changed", scope => ...);  // the Router moved this session
 //   client.on("disconnect" | "reconnect" | "end", ...);
+//   client.scope                               // the current Session Scope
 //   const result = await client.request("reply", { channel_id, text, context_pct });
 //
 // After the Router goes away the client says hello again on its own and emits
@@ -20,6 +22,12 @@
 // `beforeHello`, if given, is awaited each time the Router is reachable again
 // after a lost connection, before the hello goes out (root closes its
 // emergency direct gateway there, so both paths never deliver at once).
+//
+// The Router is the only authority for a project's Session Scope: `scope` is
+// taken from its hello_ok and replaced only by a `scope_changed` event on this
+// authenticated connection, or by a reconnect's hello_ok naming another
+// channel. A scope change that names another project, lacks a channel, or
+// arrives before hello_ok is ignored, and is never emitted.
 //
 // Failed requests reject with an Error whose `code` is the Router's error code.
 const crypto = require("node:crypto");
@@ -58,6 +66,24 @@ class RouterClient extends EventEmitter {
     this.attempt = 0;
     this.retryTimer = null;
     this.pending = new Map();
+    this.scope = null;
+  }
+
+  // A project scope from the Router, for this client's own project only.
+  validScope(scope) {
+    return Boolean(this.role === "project" && scope && typeof scope === "object" && !Array.isArray(scope)
+      && scope.project === this.project && typeof scope.channel_id === "string" && scope.channel_id
+      && (scope.type === "claude" || scope.type === "codex"));
+  }
+
+  // Adopts a validated scope; `scope_changed` fires only when it moved.
+  adoptScope(scope) {
+    const previous = this.scope;
+    this.scope = scope;
+    if (previous && this.validScope(scope)
+      && (previous.channel_id !== scope.channel_id || previous.type !== scope.type)) {
+      this.emit("scope_changed", scope);
+    }
   }
 
   connect() {
@@ -107,6 +133,7 @@ class RouterClient extends EventEmitter {
           this.attempt = 0;
           const reconnected = this.connectedOnce;
           this.connectedOnce = true;
+          this.adoptScope(frame.scope);
           settle(resolve, frame.scope);
           if (reconnected) this.emit("reconnect", frame.scope);
         } else if (frame.type === "hello_error") {
@@ -114,7 +141,9 @@ class RouterClient extends EventEmitter {
           if (this.connectedOnce) this.end(error);
           settle(reject, error);
         } else if (frame.type === "response") this.settleRequest(frame);
-        else if (frame.type === "event") {
+        else if (frame.type === "event" && frame.event === "scope_changed") {
+          if (this.ready && this.validScope(frame.scope)) this.adoptScope(frame.scope);
+        } else if (frame.type === "event") {
           if (frame.event === "revoked") revoked = true;
           this.emit("event", frame);
           const { type, event, ...fields } = frame;

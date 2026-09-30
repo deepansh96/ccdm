@@ -23,7 +23,12 @@ const { createRouterTransport } = require("./codex-bridge-transport.js");
 const routerPaths = require("./router/paths.js");
 const { MAX_TIMEOUT_MS: ROUTER_MAX_TIMEOUT_MS } = require("./router/deadlines.js");
 
+// The launch channel: root's primary channel, and the name of a project's
+// Discord MCP server.
 const CHANNEL_ID = process.env.CHANNEL_ID;
+// A project's current channel. The Router may move it after a registry
+// channel move (applyProjectScope); root's never changes.
+let projectChannelId = CHANNEL_ID;
 const PROJECT_DIR = process.env.PROJECT_DIR;
 const WS_PORT = parseInt(process.env.WS_PORT || "18300", 10);
 // Root mode only: a project bridge trusts the Router, which authorizes the
@@ -152,8 +157,8 @@ function shellQuote(value) {
 async function findCurrentProject() {
   const registry = JSON.parse(await readFile(REGISTRY_PATH, "utf8"));
   const project = registry.projects?.[ROUTER_PROJECT];
-  if (project?.type !== "codex" || project.channel_id !== CHANNEL_ID) {
-    throw new Error(`No codex project ${ROUTER_PROJECT} in registry.json matches channel ${CHANNEL_ID}`);
+  if (project?.type !== "codex" || project.channel_id !== projectChannelId) {
+    throw new Error(`No codex project ${ROUTER_PROJECT} in registry.json matches channel ${projectChannelId}`);
   }
   return { projectName: ROUTER_PROJECT, screenName: project.screen_name };
 }
@@ -344,12 +349,28 @@ async function loadRootAccess(log = true) {
   if (log) console.log(`Root multi-channel routing enabled for ${rootChannelAccess.size} channel(s)`);
 }
 
+// The Router moved this project's Session Scope (a registry channel move):
+// later messages arrive from the new channel, and work already bound to the
+// old one (the active turn's output, typing, queued turns, a queued
+// compaction) follows it, since the Router now refuses the old channel.
+function applyProjectScope(scope) {
+  if (ROOT_MULTI_CHANNEL || scope.channel_id === projectChannelId) return;
+  const previous = projectChannelId;
+  const follow = (channelId) => (channelId === previous ? scope.channel_id : channelId);
+  projectChannelId = scope.channel_id;
+  activeOutputChannelId = activeOutputChannelId && follow(activeOutputChannelId);
+  activeTypingChannelId = activeTypingChannelId && follow(activeTypingChannelId);
+  pendingCompactionChannelId = pendingCompactionChannelId && follow(pendingCompactionChannelId);
+  for (const queued of messageQueue) queued.channelId = follow(queued.channelId);
+  console.log(`Router moved this session to channel ${projectChannelId}`);
+}
+
 async function shouldHandleDiscordMessage(msg) {
   if (msg.author.bot) return false;
   // The Router delivers root only what addresses it: root-channel messages
   // from allowed users and the owner's mentions in project channels.
   if (ROOT_MULTI_CHANNEL) return true;
-  if (msg.channel.id !== CHANNEL_ID) return false;
+  if (msg.channel.id !== projectChannelId) return false;
   // The Router authorizes authors from the registry it hot-reloads, so it
   // forwards only the owner and the channel's current guests; a launch-time
   // allowlist here would drop guests granted after launch.
@@ -361,7 +382,7 @@ async function shouldHandleDiscordReaction(channelId, user) {
   if (user.bot) return false;
   if (!channelId) return false;
   // A project's reactors are authorized by the Router, like its messages.
-  if (!ROOT_MULTI_CHANNEL) return channelId === CHANNEL_ID;
+  if (!ROOT_MULTI_CHANNEL) return channelId === projectChannelId;
 
   try {
     await loadRootAccess(false);
@@ -447,7 +468,7 @@ function recordContextPct(totalTokens, contextWindow) {
   discordTransport.setContextPct(Math.round((totalTokens / contextWindow) * 100));
 }
 
-async function startTyping(channelId = CHANNEL_ID) {
+async function startTyping(channelId = projectChannelId) {
   const channel = await discordTransport.fetchChannel(channelId);
   activeTypingChannelId = channel?.id ?? null;
   if (!channel) return;
@@ -465,7 +486,7 @@ function stopTyping() {
   activeTypingChannelId = null;
 }
 
-async function sendToDiscord(text, channelId = activeOutputChannelId || CHANNEL_ID) {
+async function sendToDiscord(text, channelId = activeOutputChannelId || projectChannelId) {
   if (!text.trim()) return;
   return await discordTransport.send(channelId, splitMessage(text));
 }
@@ -476,7 +497,7 @@ function recordSessionTermination() {
     const endingThreadId = threadId;
     const endingTurnId = activeTurnId;
     sessionTerminationPromise = (async () => {
-      const assignment = await reminderAdapter.resolveAssignmentForChannel(CHANNEL_ID, {
+      const assignment = await reminderAdapter.resolveAssignmentForChannel(projectChannelId, {
         requireCodex: true,
         ...(BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
       }).catch(() => null);
@@ -765,7 +786,7 @@ async function onTurnCompleted(turn = {}) {
     : null);
   const recoveryAttempt = activeTurnRecoveryAttempt;
   const channelScopeToken = activeTurnChannelScopeToken;
-  const channelId = activeOutputChannelId || CHANNEL_ID;
+  const channelId = activeOutputChannelId || projectChannelId;
   if (terminalError || outputSuppressed) {
     deltaBuffer = "";
     fallbackText = "";
@@ -930,7 +951,7 @@ async function routeInput(input, msg, channelId, channelScopeToken) {
 
 async function sendTurn(
   input,
-  channelId = CHANNEL_ID,
+  channelId = projectChannelId,
   channelScopeToken = null,
   recoveryAttempt = 0,
   sourceMessage = null
@@ -1419,6 +1440,7 @@ async function initializeCodex() {
 }
 
 function startDiscordBot() {
+  discordTransport.onScopeChange(applyProjectScope);
   discordTransport.onReaction(async (event) => {
     if (!(await shouldHandleDiscordReaction(event.channelId, event.user))) return;
     let reaction;
@@ -1637,9 +1659,11 @@ function startDiscordBot() {
 
   void (async () => {
     try {
-      const { userTag } = await discordTransport.connect();
+      const { userTag, scope } = await discordTransport.connect();
       console.log(`Discord bot logged in as ${userTag}`);
-      const channel = await discordTransport.fetchChannel(CHANNEL_ID);
+      // The Router's grant wins over the launch channel if they differ.
+      if (!ROOT_MULTI_CHANNEL && scope?.channel_id) applyProjectScope(scope);
+      const channel = await discordTransport.fetchChannel(projectChannelId);
       if (!channel) throw new Error("Discord channel unavailable");
       console.log(`Listening in #${channel.name}`);
       reportLaunchReady({ ok: true, scope: { channel_id: channel.id } });
