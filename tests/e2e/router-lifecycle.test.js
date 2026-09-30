@@ -143,3 +143,22 @@ test("reconnect backoff defaults to a 500 ms first delay and a 30 s cap, overrid
   assert.deepEqual(reconnectBackoff({ CCDM_ROUTER_RECONNECT_MIN_MS: "50", CCDM_ROUTER_RECONNECT_MAX_MS: "200" }),
     { minMs: 50, maxMs: 200 });
 });
+
+test("with no key file for root, the observer, or a project, a hello with key \"null\", no key, or an empty key is refused", async () => {
+  const workspace = createRouterWorkspace();
+  await startRouter(workspace);
+  const hellos = [
+    { role: "root" },
+    { role: "observer" },
+    { role: "project", project: "demo" },
+  ].flatMap((hello) => [{ ...hello, key: "null" }, { ...hello }, { ...hello, key: "" }]);
+
+  for (const hello of hellos) {
+    const socket = await rawRouterSocket(workspace);
+    socket.send({ type: "hello", v: 1, ...hello });
+    await waitFor(() => socket.frames.length > 0, () => `a hello answer for ${JSON.stringify(hello)}`);
+    assert.deepEqual(socket.frames.map((frame) => [frame.type, frame.error?.code]), [["hello_error", "unauthorized"]],
+      JSON.stringify(hello));
+    await socket.closed;
+  }
+});
