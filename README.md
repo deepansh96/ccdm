@@ -495,6 +495,23 @@ file and account selection for recovery. The target account must already be
 logged in; do not copy credentials between homes. This preserves the saved
 conversation, not running tools or child-agent processes.
 
+### Resuming a Claude conversation
+
+Claude launches take the same explicit resume, with the Claude session UUID
+(the registry's recorded `session_id`, or the transcript's file name):
+
+```bash
+scripts/stop-session.sh my-project
+scripts/start-session.sh my-project --resume <session_id>
+```
+
+The transcript must exist in the Claude home the project launches with
+(`claude_home`, else `CLAUDE_CONFIG_DIR`, else `~/.claude`) at
+`projects/<project path with each non-alphanumeric character as ->/<session_id>.jsonl`;
+a missing transcript, a non-UUID, or an already running session is refused
+before anything starts. A resume launch that fails to reach the Router cleans up
+and exits non-zero instead of starting a fresh conversation.
+
 ### Registering a New Project
 
 Once the root agent and the Router are running, message root in `#root`:

@@ -6,7 +6,7 @@ import test from "node:test";
 
 import { createWorkspace, runScript } from "./support/runner.js";
 import { OWNER_ID, createRouterWorkspace, routerEnv, routerWithWebhooks, runRouterCli } from "./support/router.js";
-import { readState, seedFixtureProcess, seedRegistry, seedTmuxSession } from "./support/state.js";
+import { readState, seedFixtureProcess, seedRegistry, seedTmuxSession, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => {
@@ -311,6 +311,103 @@ test("start-session honors claude_home: launches with CLAUDE_CONFIG_DIR and reco
   assert.equal(state.fixtures.tmux.sessions.alpha_session.env.DISCORD_STATE_DIR, undefined);
   assert.ok(fs.existsSync(path.join(claudeHome, "sessions", `${pid}.json`)));
   assert.equal(fs.existsSync(path.join(workspace.homeDir, ".claude", "sessions", `${pid}.json`)), false);
+});
+
+const RESUME_ID = "3f1c2b7a-9d4e-4c1a-8b2f-5e6d7c8a9b0c";
+
+// Claude keeps each transcript at <home>/projects/<cwd, non-alphanumerics as "-">/<id>.jsonl.
+function writeTranscript(claudeHome, projectPath, sessionId = RESUME_ID) {
+  const dir = path.join(claudeHome, "projects", projectPath.replace(/[^A-Za-z0-9]/g, "-"));
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${sessionId}.jsonl`), "{}\n");
+}
+
+function startResume(workspace, id = RESUME_ID, extraEnv = {}) {
+  return runScript(workspace, "scripts/start-session.sh", { args: ["alpha", "--resume", id], env: routerEnv(workspace, extraEnv) });
+}
+
+function assertNothingLaunched(workspace, registryBefore) {
+  const state = readState(workspace.stateDir);
+  assert.equal(state.fixtures.claude.invocations.length, 0);
+  assert.deepEqual(state.fixtures.tmux.sessions, {});
+  assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", "alpha.key")), false);
+  assert.equal(fs.existsSync(launchDir(workspace)), false);
+  assert.equal(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"), registryBefore);
+}
+
+test("start-session --resume launches claude --resume <id> from the project's claude_home and records that session", async () => {
+  const { workspace, registry: seeded } = await claudeRouterWorkspace({
+    mutate: (registry) => { registry.projects.alpha.claude_home = "~/.claude-work"; },
+  });
+  writeTranscript(path.join(workspace.homeDir, ".claude-work"), seeded.projects.alpha.path);
+
+  const result = await startResume(workspace);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, new RegExp(`Started Claude Router session in tmux session 'alpha_session' \\(resuming ${RESUME_ID}\\)`));
+  assert.match(result.stdout, /Channel server connected to the Router/);
+  const state = readState(workspace.stateDir);
+  assert.equal(state.fixtures.claude.invocations.length, 1);
+  assert.match(state.fixtures.tmux.sessions.alpha_session.shellCommand, new RegExp(`--resume '${RESUME_ID}'`));
+  assert.equal(readRegistry(workspace).projects.alpha.session_id, RESUME_ID);
+});
+
+test("start-session --resume refuses a transcript missing from the project's Claude home before any side effect", async () => {
+  const workspace = seededWorkspace({ mutate: (registry) => {
+    registry.projects.alpha.webhook_id = "webhook-alpha";
+    registry.projects.alpha.claude_home = "~/.claude-work";
+  } });
+  // Present in the default home only: the project's own home is what counts.
+  writeTranscript(path.join(workspace.homeDir, ".claude"), readRegistry(workspace).projects.alpha.path);
+  const registryBefore = fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8");
+
+  const result = await startResume(workspace);
+
+  assert.equal(result.exitCode, 1, result.stdout);
+  assert.match(result.stderr, new RegExp(`No saved Claude transcript for session ${RESUME_ID} in ${escapeRegex(path.join(workspace.homeDir, ".claude-work"))}`));
+  assert.match(result.stderr, /Refusing to resume 'alpha': its transcript is missing/);
+  assertNothingLaunched(workspace, registryBefore);
+});
+
+for (const args of [["alpha", "--resume", "not-a-uuid"], ["alpha", "--resume", RESUME_ID.toUpperCase()], ["alpha", "--resume"], ["alpha", "--fork", RESUME_ID]]) {
+  test(`start-session rejects ${JSON.stringify(args.slice(1))} before side effects`, async () => {
+    const workspace = seededWorkspace({ mutate: (registry) => { registry.projects.alpha.webhook_id = "webhook-alpha"; } });
+    const registryBefore = fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8");
+
+    const result = await runScript(workspace, "scripts/start-session.sh", { args, env: routerEnv(workspace) });
+
+    assert.equal(result.exitCode, 1, result.stdout);
+    assert.match(result.stderr, /Resume session must be a canonical UUID|Usage: .* <project_name> \[--resume <session_id>\]/);
+    assertNothingLaunched(workspace, registryBefore);
+  });
+}
+
+test("start-session --resume whose launch fails exits non-zero, cleans up, and does not start a fresh session", async () => {
+  const { workspace, registry: seeded } = await claudeRouterWorkspace();
+  writeTranscript(path.join(workspace.homeDir, ".claude"), seeded.projects.alpha.path);
+  updateState(workspace.stateDir, (state) => { state.fixtures.tmux.devChannelPrompt = "never"; });
+
+  const result = await startResume(workspace, RESUME_ID, { CCDM_CLAUDE_LAUNCH_TIMEOUT_S: "1" });
+
+  assert.notEqual(result.exitCode, 0, result.stdout);
+  assert.match(result.stderr, /Launch of 'alpha' failed; cleaning up/);
+  const state = readState(workspace.stateDir);
+  assert.equal(state.fixtures.claude.invocations.length, 1);
+  assert.ok(state.fixtures.claude.invocations[0].args.some((arg) => arg.includes(RESUME_ID)));
+  assert.equal(state.fixtures.tmux.sessions.alpha_session, undefined);
+  assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", "alpha.key")), false);
+  assert.equal(readRegistry(workspace).projects.alpha.pid, null);
+});
+
+test("start-session --resume refuses, rather than silently skipping the resume, when the session is already running", async () => {
+  const workspace = seededWorkspace();
+  seedTmuxSession("alpha_session", { paneOutput: "already running\n" }, { stateDir: workspace.stateDir });
+
+  const result = await startResume(workspace);
+
+  assert.equal(result.exitCode, 1, result.stdout);
+  assert.match(result.stderr, /Refusing to resume 'alpha': session 'alpha_session' is already running/);
+  assert.equal(readState(workspace.stateDir).fixtures.claude.invocations.length, 0);
 });
 
 test("start-session exits successfully when the target tmux session is already running", async () => {

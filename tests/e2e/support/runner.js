@@ -647,7 +647,9 @@ function runTmux() {
     const pid = routerChannel
       ? spawnRouterClaude(name, launch)
       : routerBridge ? spawnRouterBridge(launch) : spawnPlaceholder();
-    const sessionId = \`fixture-session-\${pid}\`;
+    // A \`--resume <id>\` launch continues that session, as Claude does.
+    const resumeIndex = launch.kind === "claude-listener" ? launch.claudeArgs.indexOf("--resume") : -1;
+    const sessionId = resumeIndex >= 0 ? unquote(launch.claudeArgs[resumeIndex + 1]) : \`fixture-session-\${pid}\`;
     const processCommand =
       routerBridge
         ? \`node scripts/codex-bridge.js CHANNEL_ID='\${launch.env.CHANNEL_ID}' WS_PORT='\${launch.env.WS_PORT}' CCDM_ROUTER_KEY_FILE='\${launch.env.CCDM_ROUTER_KEY_FILE}'\`

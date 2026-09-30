@@ -1,6 +1,7 @@
 #!/bin/zsh
-# Usage: ./scripts/start-session.sh <project_name>
+# Usage: ./scripts/start-session.sh <project_name> [--resume <session_id>]
 # Reads registry.json to get project config and starts a Claude Code session served through the Router.
+# --resume continues a saved Claude conversation instead of starting a fresh one.
 
 set -euo pipefail
 
@@ -9,9 +10,29 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 REGISTRY="$ROOT_DIR/registry.json"
 
 PROJECT="${1:-}"
+RESUME_SESSION_ID=""
+if (( $# > 1 )); then
+  if [[ $# != 3 || "$2" != "--resume" ]]; then
+    echo "Usage: $0 <project_name> [--resume <session_id>]" >&2
+    exit 1
+  fi
+  RESUME_SESSION_ID="$3"
+  if ! python3 - "$RESUME_SESSION_ID" <<'PY'
+import sys, uuid
+try:
+    if str(uuid.UUID(sys.argv[1])) != sys.argv[1]:
+        sys.exit(1)
+except ValueError:
+    sys.exit(1)
+PY
+  then
+    echo "Resume session must be a canonical UUID" >&2
+    exit 1
+  fi
+fi
 
 if [[ -z "$PROJECT" ]]; then
-  echo "Usage: $0 <project_name>"
+  echo "Usage: $0 <project_name> [--resume <session_id>]"
   exit 1
 fi
 
@@ -268,8 +289,8 @@ e=json.load(open(sys.argv[1]))
 print(''.join(f" {k}='{v}'" for k,v in e.items()))
 PY
 )"
-  tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$PATH_DIR' && CCDM_ROUTER_KEY_FILE='$key_file'$reminder_env$CONFIG_DIR_ENV claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions --mcp-config '$mcp_config' --settings '$settings'$MODEL_FLAG$EFFORT_FLAG"
-  echo "Started Claude Router session in tmux session '$SCREEN_NAME'"
+  tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$PATH_DIR' && CCDM_ROUTER_KEY_FILE='$key_file'$reminder_env$CONFIG_DIR_ENV claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions --mcp-config '$mcp_config' --settings '$settings'$MODEL_FLAG$EFFORT_FLAG$RESUME_FLAG"
+  echo "Started Claude Router session in tmux session '$SCREEN_NAME'${RESUME_SESSION_ID:+ (resuming $RESUME_SESSION_ID)}"
 
   # Accept the per-launch development-channel confirmation, then wait for the
   # channel server's Router hello.
@@ -386,8 +407,39 @@ if [[ -n "$CLAUDE_HOME" ]]; then
 fi
 
 if tmux has-session -t "=$SCREEN_NAME" 2>/dev/null; then
+  if [[ -n "$RESUME_SESSION_ID" ]]; then
+    echo "Refusing to resume '$PROJECT': session '$SCREEN_NAME' is already running. Run scripts/stop-session.sh '$PROJECT' first, then retry." >&2
+    exit 1
+  fi
   echo "Session '$SCREEN_NAME' is already running."
   exit 0
+fi
+
+# A resume needs the saved transcript in the Claude home this launch uses:
+# <home>/projects/<cwd with every non-alphanumeric character as "-">/<id>.jsonl.
+# A missing transcript fails here, before any key, tmux session, or PID,
+# rather than letting Claude start a fresh conversation.
+RESUME_FLAG=""
+if [[ -n "$RESUME_SESSION_ID" ]]; then
+  if ! python3 - "$PATH_DIR" "${CLAUDE_HOME:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}}" "$RESUME_SESSION_ID" <<'PY'
+import os
+import re
+import sys
+
+project_dir, claude_home, session_id = sys.argv[1:4]
+home = os.path.expanduser(claude_home)
+candidates = []
+for cwd in dict.fromkeys([project_dir, os.path.realpath(project_dir)]):
+    candidates.append(os.path.join(home, "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd), f"{session_id}.jsonl"))
+if any(os.path.isfile(candidate) for candidate in candidates):
+    sys.exit(0)
+sys.exit(f"No saved Claude transcript for session {session_id} in {home} (looked for {candidates[0]})")
+PY
+  then
+    echo "Refusing to resume '$PROJECT': its transcript is missing from the project's Claude home." >&2
+    exit 1
+  fi
+  RESUME_FLAG=" --resume '$RESUME_SESSION_ID'"
 fi
 
 start_router_session
