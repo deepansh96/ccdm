@@ -84,6 +84,15 @@ test("a Codex project with no transport field launches through the Router and re
   ]);
 });
 
+// Atomic replace, the way guest-access.js and editors land a registry.
+function updateRegistry(workspace, change) {
+  const registryFile = path.join(workspace.repoDir, "registry.json");
+  const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+  change(registry);
+  fs.writeFileSync(`${registryFile}.edit`, `${JSON.stringify(registry, null, 2)}\n`);
+  fs.renameSync(`${registryFile}.edit`, registryFile);
+}
+
 function setPort(workspace, port) {
   const registryFile = path.join(workspace.repoDir, "registry.json");
   const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
@@ -94,11 +103,12 @@ function setPort(workspace, port) {
 // 64,600 of a 258,400-token window is 25%.
 const SEEDED_USAGE = { last: { inputTokens: 64600 }, modelContextWindow: 258400 };
 
-async function routerCodexSession(turns, codexOptions = {}) {
+async function routerCodexSession(turns, codexOptions = {}, { guests, routerEnv: routerExtraEnv } = {}) {
   const workspace = codexRouterWorkspace(0);
+  if (guests) updateRegistry(workspace, (registry) => { registry.projects.demo.guest_user_ids = guests; });
   const codex = await startFakeCodexServer(workspace, { channelId: "demo-channel", turns, ...codexOptions });
   setPort(workspace, codex.port);
-  const router = await routerWithWebhooks(workspace, ["demo"]);
+  const router = await routerWithWebhooks(workspace, ["demo"], { env: routerExtraEnv ?? {} });
   const started = await startCodexSession(workspace);
   assert.equal(started.exitCode, 0, started.stderr || started.stdout);
   return { workspace, codex, router };
@@ -373,4 +383,56 @@ test("a router Codex turn types as the bot and edits its reply through the demo 
   assert.ok(done.fixtures.discord.typing.length >= 1);
   assert.deepEqual([...new Set(done.fixtures.discord.typing.map(({ authorization, channelId }) => `${authorization} ${channelId}`))],
     ["Bot root-bot-token demo-channel"]);
+});
+
+// Runs a registry change and waits for the Router reload it causes. Earlier
+// writes settle first so their own reloads are not mistaken for this one.
+async function afterRouterReload(router, change) {
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const reloads = () => router.stdout.split("registry reloaded").length - 1;
+  const before = reloads();
+  change();
+  await waitFor(() => reloads() > before, () => `registry reload:\n${router.stdout}\n${router.stderr}`);
+}
+
+test("a guest granted after a router Codex launch reaches the thread without a restart, and stops once revoked", async () => {
+  const { workspace, codex, router } = await routerCodexSession([
+    { mcpReplyText: "hello guest" },
+    { mcpReplyText: "glad it helps" },
+  ], {}, { guests: [], routerEnv: { CCDM_ROUTER_REGISTRY_DEBOUNCE_MS: "20" } });
+  const guest = { id: "late-guest-id", username: "Guest" };
+  const pid = readRegistry(workspace).projects.demo.pid;
+
+  await afterRouterReload(router, () => updateRegistry(workspace, (registry) => {
+    registry.projects.demo.guest_user_ids = [guest.id];
+  }));
+
+  injectDiscordMessage(workspace, { id: "guest-message", channelId: "demo-channel", content: "can you help?", author: guest });
+  const replied = await waitForState(workspace, (next) => webhookContents(next).includes("hello guest"), 15000);
+  const [reply] = replied.fixtures.discord.messages;
+  injectDiscordReaction(workspace, {
+    id: "guest-thumbs-up", channelId: "demo-channel", emoji: "👍", messageId: reply.id, user: guest,
+    message: { author: { bot: true, id: "fake-webhook-1", username: "demo-codex" }, webhookId: "fake-webhook-1", content: "hello guest" },
+  });
+  await waitForState(workspace, (next) => webhookContents(next).includes("glad it helps"), 15000);
+
+  assert.deepEqual(userTurnInputs(codex), [
+    [{ type: "text", text: "can you help?" }],
+    [{ type: "text", text: `User Guest reacted 👍 to your message: "hello guest" (message ID: ${reply.id}).` }],
+  ]);
+  assert.equal(readRegistry(workspace).projects.demo.pid, pid);
+
+  await afterRouterReload(router, () => updateRegistry(workspace, (registry) => {
+    registry.projects.demo.guest_user_ids = [];
+  }));
+
+  injectDiscordMessage(workspace, { id: "revoked-message", channelId: "demo-channel", content: "still there?", author: guest });
+  injectDiscordReaction(workspace, {
+    id: "revoked-thumbs-up", channelId: "demo-channel", emoji: "👍", messageId: reply.id, user: guest,
+    message: { author: { bot: true, id: "fake-webhook-1", username: "demo-codex" }, webhookId: "fake-webhook-1", content: "hello guest" },
+  });
+  await waitForState(workspace, (next) => next.fixtures.discord.deliveredMessages.some(({ id }) => id === "revoked-message") &&
+    next.fixtures.discord.deliveredReactions.some(({ id }) => id === "revoked-thumbs-up"), 15000);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.equal(userTurnInputs(codex).length, 2);
 });
