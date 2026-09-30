@@ -23,8 +23,10 @@ function send(socket, frame) {
   if (!socket.destroyed) socket.write(`${JSON.stringify(frame)}\n`);
 }
 
+// A missing key file (null) or an empty one matches nothing, not even "null".
 function keysMatch(expected, actual) {
-  const a = Buffer.from(String(expected));
+  if (typeof expected !== "string" || !expected) return false;
+  const a = Buffer.from(expected);
   const b = Buffer.from(String(actual ?? ""));
   return a.length > 0 && a.length === b.length && crypto.timingSafeEqual(a, b);
 }
