@@ -2,15 +2,16 @@
 
 // Project Identity: the webhook username and avatar a project's replies use.
 const MAX_USERNAME = 80;
-const ZWJ = "‍";
 const AVATARS = {
   claude: "https://cdn.discordapp.com/embed/avatars/0.png",
   codex: "https://cdn.discordapp.com/embed/avatars/1.png",
 };
 
-// Discord rejects webhook usernames containing these words.
+// Discord rejects webhook names and usernames containing these words, and
+// matches loosely: zero-width joiners and look-alike spellings ("dlscord") are
+// rejected too, so the word is shortened instead.
 function breakForbidden(text) {
-  return text.replace(/discord|clyde/gi, word => `${word[0]}${ZWJ}${word.slice(1)}`);
+  return text.replace(/discord/gi, "dc").replace(/clyde/gi, "cl");
 }
 
 // `<project>-<type> · N%`, or `<project>-<type>` without a context percentage.
