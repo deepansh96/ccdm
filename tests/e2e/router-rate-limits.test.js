@@ -102,6 +102,24 @@ test("a global 429 pauses every route until Retry-After, not just the route that
   assert.deepEqual(webhookMessages(workspace).map(message => message.content).sort(), ["hit the global limit", "waited for it"]);
 });
 
+test("a reply the client gave up on while its route waited out a 429 never posts, so a retry delivers exactly once", async () => {
+  const workspace = createRouterWorkspace();
+  await routerWithWebhooks(workspace, ["demo"]);
+  const demo = await connectSession(workspace, "demo", "demo-key");
+  const DEMO_EXECUTE = demoExecutePath(workspace);
+  // Retry-After outlasts the client's timeout but not the Router's 30 s wait bound.
+  scriptRateLimit(workspace, { method: "POST", path: DEMO_EXECUTE, count: 1, retryAfter: 1.2, bucket: "execute-bucket" });
+
+  await assert.rejects(demo.client.request("reply", { channel_id: "demo-channel", text: "once" }, { timeoutMs: 400 }),
+    { code: "timeout" });
+  const retried = await demo.client.request("reply", { channel_id: "demo-channel", text: "once" });
+  // Long enough for an expired original still queued behind the limit to have posted.
+  await new Promise(resolve => setTimeout(resolve, 500));
+
+  assert.deepEqual(retried, { message_id: "fake-message-1", message_ids: ["fake-message-1"] });
+  assert.deepEqual(webhookMessages(workspace).map(message => message.content), ["once"]);
+});
+
 // The one place the real rate-limit defaults are asserted; tests shorten them.
 test("rate-limit waits default to a 30 s bound and a 1 s fallback retry, overridable by environment", () => {
   const { rateLimitSettings } = createRequire(import.meta.url)("../../scripts/router/discord-rest.js");

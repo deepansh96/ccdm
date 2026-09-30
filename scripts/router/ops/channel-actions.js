@@ -4,7 +4,7 @@
 // project's own webhook messages (root: the bot's own messages), the bot's
 // reactions, and typing.
 const { MESSAGE_LIMIT } = require("../chunks.js");
-const { discordRequest } = require("../discord-rest.js");
+const { currentDeadline, discordRequest, withDeadline } = require("../discord-rest.js");
 const { projectWebhookSecret } = require("../webhooks.js");
 const { OpError, ScopeViolation } = require("./errors.js");
 const { scopedMessage } = require("./targets.js");
@@ -13,7 +13,8 @@ const { scopedMessage } = require("./targets.js");
 // queued or in flight, newer edits replace the one waiting behind it, so only
 // the latest content is sent next; every caller gets that send's result.
 // `latest` is the arrival order of the newest edit sent or queued, so an older
-// edit that finishes its lookups late never overwrites newer content.
+// edit that finishes its lookups late never overwrites newer content. A
+// coalesced send lasts as long as its latest waiting client's deadline.
 const edits = new Map();
 // Idle entries kept to recognise late older edits; pruned past this many.
 const IDLE_EDITS = 1000;
@@ -21,7 +22,7 @@ let editArrivals = 0;
 
 function coalescedEdit(key, arrival, text, send) {
   return new Promise((resolve, reject) => {
-    const waiter = { resolve, reject };
+    const waiter = { resolve, reject, deadline: currentDeadline() };
     let entry = edits.get(key);
     if (!entry) edits.set(key, entry = { latest: 0, sending: null, next: null });
     if (arrival < entry.latest) {
@@ -47,7 +48,9 @@ async function drainEdits(entry, send) {
     entry.sending = entry.next;
     entry.next = null;
     try {
-      entry.result = await send(entry.sending.text);
+      const deadlines = entry.sending.waiters.map(waiter => waiter.deadline);
+      const deadline = deadlines.includes(null) ? null : Math.max(...deadlines);
+      entry.result = await withDeadline(deadline, () => send(entry.sending.text));
       entry.error = null;
       for (const waiter of entry.sending.waiters) waiter.resolve(entry.result);
     } catch (error) {
