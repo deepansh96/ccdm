@@ -191,6 +191,21 @@ test("Codex readiness reports an assigned observe-only adapter without invoking 
   assert.equal(readState(workspace.stateDir).fixtures.codex.appServerInvocations.length, 0);
 });
 
+// Adapters drain their outbox after every emit, so two events emitted at once
+// open a new store from two processes. Both must commit, not leave one stranded.
+test("concurrent drains of a new event store commit every event", async () => {
+  const workspace = createWorkspace();
+  writeRegistry(workspace);
+  for (let round = 0; round < 5; round++) {
+    const stateDir = path.join(workspace.homeDir, `concurrent-store-${round}`);
+    const events = [0, 1, 2].map((index) => lifecycleEvent("owner_activity", `2222222${round}-2222-4222-8222-22222222222${index}`,
+      { actor_id: "owner-id", source_message_id: `concurrent-${round}-${index}`, activity_kind: "message",
+        event_order: `000000000100000${index}:fixture-adapter:00000000000${index}` }));
+    const results = await Promise.all(events.map((event) => ingestEvent(workspace, stateDir, event)));
+    assert.deepEqual(results.map((result) => result.status), ["committed", "committed", "committed"], JSON.stringify(results));
+  }
+});
+
 test("event receiver binds receipts to the registered assignment and requires a successful input-needed delivery", async () => {
   const workspace = createWorkspace();
   writeRegistry(workspace);
