@@ -35,22 +35,22 @@ async function resolveAssignmentForChannel(channelId, options = {}) {
   const projects = registry.projects && typeof registry.projects === "object" ? registry.projects : {};
   const matches = [];
   for (const [projectName, project] of Object.entries(projects)) {
-    if (!project || project.channel_id !== channelId || !project.bot_id) continue;
-    const bots = Array.isArray(registry.pool)
-      ? registry.pool.filter((bot) => bot && bot.id === project.bot_id)
-      : [];
-    if (bots.length !== 1) continue;
-    const bot = bots[0];
-    if (options.botAppId && bot.app_id !== options.botAppId) continue;
+    if (!project || project.channel_id !== channelId) continue;
     const ownerId = String(registry.discord_user_id || "");
+    // Every project speaks through its Router webhook, whatever its
+    // `transport`, and root delivers its reminders; `router:<webhook_id>` is
+    // the speaking identity.
+    if (!project.webhook_id) continue;
+    const botId = `router:${project.webhook_id}`;
+    const botAppId = "";
     const generation = project.assignment_generation
       ? String(project.assignment_generation)
       : assignmentGeneration(
         projectName,
         ownerId,
         String(project.channel_id),
-        String(project.bot_id),
-        String(bot.app_id || ""),
+        botId,
+        botAppId,
         String(project.registered_at || ""),
       );
     matches.push({
@@ -58,8 +58,11 @@ async function resolveAssignmentForChannel(channelId, options = {}) {
       project_type: project.type || "claude",
       owner_id: ownerId,
       channel_id: String(project.channel_id),
-      bot_id: String(project.bot_id),
-      bot_app_id: String(bot.app_id || ""),
+      bot_id: botId,
+      bot_app_id: botAppId,
+      identity: botId,
+      transport: "router",
+      webhook_id: String(project.webhook_id),
       assignment_generation: generation,
     });
   }

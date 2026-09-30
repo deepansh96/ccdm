@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import stat
 import sys
+import time
 from datetime import datetime
 
 
@@ -88,18 +89,18 @@ def assignment_for(registry: dict, project_name: str) -> dict:
         raise KeyError("project is not registered")
     owner_id = registry.get("discord_user_id")
     channel_id = project.get("channel_id")
-    bot_id = project.get("bot_id")
-    pool = registry.get("pool")
-    matching_bots = [bot for bot in pool if isinstance(bot, dict) and bot.get("id") == bot_id] if isinstance(pool, list) else []
-    if not owner_id or not channel_id or not bot_id or len(matching_bots) != 1:
+    # Every project speaks through its Router webhook, whatever its
+    # `transport`, and root delivers its reminders.
+    webhook_id = project.get("webhook_id")
+    if not owner_id or not channel_id or not webhook_id:
         raise ValueError("project assignment is incomplete or ambiguous")
-    bot = matching_bots[0]
+    speaker, app_id = f"router:{webhook_id}", ""
     identity = "\0".join((
         project_name,
         str(owner_id),
         str(channel_id),
-        str(bot_id),
-        str(bot.get("app_id") or ""),
+        speaker,
+        app_id,
         str(project.get("registered_at") or ""),
     ))
     configured_generation = project.get("assignment_generation")
@@ -110,8 +111,10 @@ def assignment_for(registry: dict, project_name: str) -> dict:
         "project": project,
         "owner_id": str(owner_id),
         "channel_id": str(channel_id),
-        "bot_id": str(bot_id),
-        "bot": bot,
+        # Events name the speaker in `bot_id`: `router:<webhook_id>`.
+        "bot_id": speaker,
+        # The identity that speaks for the project; the Conversation store keys on it.
+        "identity": speaker,
         "generation": generation,
     }
 
@@ -125,14 +128,36 @@ def database_path(state_dir: Path) -> Path:
     return state_dir / "events.sqlite3"
 
 
+DATABASE_BUSY_TIMEOUT_SECONDS = 2
+
+
+def _enable_wal(connection: sqlite3.Connection) -> None:
+    """Switch to WAL, waiting out another process doing the same.
+
+    Two adapters draining at once can both open a new store. Switching the
+    journal mode needs an exclusive lock and SQLite fails it at once with
+    "database is locked" instead of using the busy timeout, which stranded an
+    event in the outbox until some later emit drained it again.
+    """
+    deadline = time.monotonic() + DATABASE_BUSY_TIMEOUT_SECONDS
+    while True:
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as error:
+            if "locked" not in str(error) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
 def connect_database(state_dir: Path, *, create: bool) -> sqlite3.Connection | None:
     db_path = database_path(state_dir)
     if not db_path.exists() and not create:
         return None
     private_directory(state_dir)
-    connection = sqlite3.connect(db_path, timeout=2, isolation_level=None)
+    connection = sqlite3.connect(db_path, timeout=DATABASE_BUSY_TIMEOUT_SECONDS, isolation_level=None)
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
+    _enable_wal(connection)
     connection.execute("PRAGMA synchronous=FULL")
     connection.execute("PRAGMA secure_delete=ON")
     connection.execute(

@@ -20,8 +20,8 @@ _EVENTS = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_EVENTS)
 
 
-def adapter_process_live(pid: object) -> bool:
-    """True only while the recorded launch-scoped Claude channel adapter is running."""
+def adapter_process_live(pid: object, script: str = "ccdm-channel-server.js") -> bool:
+    """True only while the recorded launch-scoped Claude channel server is running."""
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
     try:
@@ -36,8 +36,8 @@ def adapter_process_live(pid: object) -> bool:
                                  text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
         return False
-    # A reused PID belongs to some other program, never the adapter.
-    return "claude-reminder-channel.js" in command
+    # A reused PID belongs to some other program, never the channel server.
+    return script in command
 
 
 def build_readiness(project_name: str, project_root: Path, state_dir: Path) -> dict:
@@ -78,29 +78,24 @@ def build_readiness(project_name: str, project_root: Path, state_dir: Path) -> d
                 capability = json.loads((state_dir / "capabilities" / f"{project_name}.json").read_text())
             except (OSError, json.JSONDecodeError):
                 capability = {}
+            # Every Claude launch is a Router launch whose CCDM channel server
+            # records reminder events itself.
             verified = (
                 capability.get("assignment_generation") == assignment["generation"]
                 and capability.get("channel_id") == assignment["channel_id"]
-                and capability.get("transport") == "official-discord-stdio-proxy"
-                and capability.get("plugin_version") == "0.0.4"
+                and capability.get("transport") == "ccdm-channel-server"
                 and capability.get("server_version") == "1.0.0"
                 and capability.get("hooks_configured") is True
                 and capability.get("reply_tool_verified") is True
             )
-            relaunch = (f"; restart the session with CCDM_CLAUDE_REMINDER_ADAPTER=1 "
-                        f"scripts/start-session.sh {project_name}")
+            relaunch = f"; restart the session with scripts/start-session.sh {project_name}"
             if not verified:
                 unsupported_capabilities.append(
                     "Claude launch-scoped transport is not verified for this assignment" + relaunch)
             elif not adapter_process_live(capability.get("pid")):
-                # A plain restart runs the unfiltered official plugin; an exited
-                # adapter launch no longer filters /close or records completions.
+                # An exited channel server no longer records owner activity or replies.
                 unsupported_capabilities.append(
                     "Claude launch-scoped transport is not running for this assignment" + relaunch)
-        if not assignment["bot"].get("token"):
-            missing_credentials.append("assigned_project_bot_token")
-        if not assignment["bot"].get("app_id"):
-            assignment_mismatches.append("assigned project bot app ID is missing")
         channel_matches = [
             name for name, candidate in (registry.get("projects") or {}).items()
             if isinstance(candidate, dict) and candidate.get("channel_id") == assignment["channel_id"]

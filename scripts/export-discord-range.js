@@ -2,20 +2,19 @@
 
 const { createWriteStream } = require("node:fs");
 const { mkdir, mkdtemp, readFile, writeFile } = require("node:fs/promises");
-const { tmpdir } = require("node:os");
+const { homedir, tmpdir } = require("node:os");
 const path = require("node:path");
 const { Readable } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
 
 const API_BASE = "https://discord.com/api/v10";
-const [channelId, startId, endId] = process.argv.slice(2);
 const MAX_MESSAGES = 10_000;
 
 function usage() {
   throw new Error("Usage: export-discord-range.js <channel-id> <start-message-id> [end-message-id]");
 }
 
-function validateIds() {
+function validateIds(channelId, startId, endId) {
   if (![channelId, startId].every((id) => /^\d+$/.test(id || ""))) usage();
   if (endId && !/^\d+$/.test(endId)) usage();
   if (endId && BigInt(startId) > BigInt(endId)) {
@@ -23,24 +22,20 @@ function validateIds() {
   }
 }
 
-async function botToken() {
-  if (process.env.DISCORD_BOT_TOKEN || process.env.BOT_TOKEN) {
-    return process.env.DISCORD_BOT_TOKEN || process.env.BOT_TOKEN;
+// Operator-run exports read only the root token from root's Discord state
+// directory; there are no per-project bot tokens.
+async function rootToken() {
+  const stateDir = (process.env.ROOT_DISCORD_STATE_DIR || "~/.claude/channels/discord").replace(/^~(?=$|\/)/, homedir());
+  let contents;
+  try {
+    contents = await readFile(path.join(stateDir, ".env"), "utf8");
+  } catch {
+    throw new Error("Cannot read root Discord credentials; check ROOT_DISCORD_STATE_DIR");
   }
-  if (process.env.DISCORD_STATE_DIR) {
-    try {
-      const env = await readFile(path.join(process.env.DISCORD_STATE_DIR, ".env"), "utf8");
-      const match = env.match(/^DISCORD_BOT_TOKEN=(.+)$/m);
-      if (match) return match[1].trim();
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-    }
-  }
-  const registry = JSON.parse(await readFile(path.join(__dirname, "..", "registry.json"), "utf8"));
-  const project = Object.values(registry.projects || {}).find((entry) => String(entry.channel_id) === channelId);
-  const bot = (registry.pool || []).find((entry) => entry.id === project?.bot_id);
-  if (!bot?.token) throw new Error("No bot token found; set DISCORD_BOT_TOKEN");
-  return bot.token;
+  const line = contents.split(/\r?\n/).find((entry) => entry.startsWith("DISCORD_BOT_TOKEN="));
+  const token = line?.slice("DISCORD_BOT_TOKEN=".length).trim().replace(/^(["'])(.*)\1$/, "$2");
+  if (!token || /\s/.test(token)) throw new Error("Root Discord state has no valid DISCORD_BOT_TOKEN");
+  return token;
 }
 
 async function discordGet(token, endpoint) {
@@ -64,18 +59,19 @@ async function discordGet(token, endpoint) {
   }
 }
 
-async function fetchMessages(token) {
+// `get(route, query)` makes one Discord GET: this tool's own fetch by default,
+// or the Router's rate-limited, deadline-bounded REST queue.
+async function fetchMessages(get, channelId, startId, endId) {
   const messages = [
-    await discordGet(token, `/channels/${channelId}/messages/${startId}`),
+    await get(`/channels/${channelId}/messages/${startId}`),
   ];
   if (endId && startId !== endId) {
-    messages.push(await discordGet(token, `/channels/${channelId}/messages/${endId}`));
+    messages.push(await get(`/channels/${channelId}/messages/${endId}`));
   }
   let before = endId;
 
   while (startId !== endId) {
-    const query = before ? `?before=${before}&limit=100` : "?limit=100";
-    const page = await discordGet(token, `/channels/${channelId}/messages${query}`);
+    const page = await get(`/channels/${channelId}/messages`, before ? { before, limit: 100 } : { limit: 100 });
     if (!page.length) break;
     const inRange = page.filter(({ id }) =>
       BigInt(id) > BigInt(startId) && (!endId || BigInt(id) < BigInt(endId))
@@ -131,18 +127,32 @@ function transcript(messages, saved) {
   }).join("\n\n---\n\n") + "\n";
 }
 
-async function main() {
-  validateIds();
-  const token = await botToken();
-  const messages = await fetchMessages(token);
+// Exports the inclusive range to a private temporary transcript; returns its path.
+async function exportRange({ token, channelId, startId, endId, get }) {
+  const directGet = (route, query = {}) => {
+    const search = new URLSearchParams(Object.entries(query).map(([key, value]) => [key, String(value)])).toString();
+    return discordGet(token, `${route}${search ? `?${search}` : ""}`);
+  };
+  const messages = await fetchMessages(get || directGet, channelId, startId, endId);
   const directory = await mkdtemp(path.join(tmpdir(), "discord-export-"));
   const saved = await downloadAttachments(messages, directory);
   const output = path.join(directory, "messages.txt");
   await writeFile(output, transcript(messages, saved), { mode: 0o600 });
+  return output;
+}
+
+async function main() {
+  const [channelId, startId, endId] = process.argv.slice(2);
+  validateIds(channelId, startId, endId);
+  const output = await exportRange({ token: await rootToken(), channelId, startId, endId });
   process.stdout.write(`${output}\n`);
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error.message}\n`);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch((error) => {
+    process.stderr.write(`${error.message}\n`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { exportRange };

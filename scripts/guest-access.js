@@ -3,6 +3,7 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const { updateRegistry } = require("./router/registry.js");
 
 const ROOT_DIR = path.resolve(__dirname, "..");
 const REGISTRY_PATH = path.join(ROOT_DIR, "registry.json");
@@ -39,17 +40,36 @@ function readJson(file, fallback) {
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
-function writeJson(file, value) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
-}
-
 function loadRegistry() {
   return readJson(REGISTRY_PATH);
 }
 
-function saveRegistry(registry) {
-  writeJson(REGISTRY_PATH, registry);
+// Applies `mutate` to this project's fresh registry entry under the registry
+// lock every writer shares, so a concurrent PID or webhook update, and a
+// concurrent grant, revoke, or invite for another guest, is kept.
+function updateGuestEntry(projectName, mutate) {
+  return updateRegistry(REGISTRY_PATH, next => {
+    const entry = next.projects?.[projectName];
+    if (!entry) throw new Error(`Project ${projectName} is no longer registered`);
+    mutate(entry);
+  });
+}
+
+function addGuest(entry, roleId, userId, inviteCode = null) {
+  entry.guest_role_id = roleId;
+  entry.guest_user_ids = unique([...(entry.guest_user_ids || []), userId]);
+  if (inviteCode) {
+    entry.guest_invites = entry.guest_invites || {};
+    entry.guest_invites[userId] = unique([...(entry.guest_invites[userId] || []), inviteCode]);
+  }
+}
+
+function removeGuest(entry, userId) {
+  entry.guest_user_ids = unique(entry.guest_user_ids || []).filter((id) => id !== String(userId));
+  if (entry.guest_invites?.[userId]) {
+    delete entry.guest_invites[userId];
+    if (Object.keys(entry.guest_invites).length === 0) delete entry.guest_invites;
+  }
 }
 
 function unique(values) {
@@ -70,12 +90,6 @@ function rootToken() {
   return token;
 }
 
-function projectBot(registry, project) {
-  const bot = (registry.pool || []).find((entry) => entry.id === project.bot_id);
-  if (!bot) throw new Error(`registry.json is missing bot ${project.bot_id}`);
-  return bot;
-}
-
 function resolveProjects(registry, target) {
   const projects = Object.entries(registry.projects || {});
   if (!target) return projects;
@@ -92,33 +106,6 @@ function safeName(value) {
 
 function roleName(projectName, project) {
   return `ccdm-guest-${safeName(projectName)}-${safeName(project.channel_id)}`.slice(0, 100);
-}
-
-function effectiveUsers(registry, project) {
-  return unique([registry.discord_user_id, ...(project.guest_user_ids || [])]);
-}
-
-function updateAccessJson(registry, project) {
-  const bot = projectBot(registry, project);
-  const stateDir = expandHome(bot.state_dir);
-  const file = path.join(stateDir, "access.json");
-  const access = readJson(file, {
-    dmPolicy: "allowlist",
-    allowFrom: [],
-    groups: {},
-    pending: {},
-  });
-  const users = effectiveUsers(registry, project);
-  access.dmPolicy = access.dmPolicy || "allowlist";
-  access.allowFrom = unique([registry.discord_user_id]);
-  access.groups = access.groups || {};
-  access.groups[project.channel_id] = {
-    ...(access.groups[project.channel_id] || {}),
-    requireMention: false,
-    allowFrom: users,
-  };
-  access.pending = access.pending || {};
-  writeJson(file, access);
 }
 
 async function discordApi(token, route, options = {}) {
@@ -208,13 +195,6 @@ async function tryDeleteMemberRole(registry, userId, roleId, token) {
   });
 }
 
-function persistGuestAccess(registry, project, roleId, userIds) {
-  project.guest_role_id = roleId;
-  project.guest_user_ids = unique(userIds);
-  saveRegistry(registry);
-  updateAccessJson(registry, project);
-}
-
 async function prepareGuestAccess(registry, target, userId, options = {}) {
   const token = rootToken();
   const [[projectName, project]] = resolveProjects(registry, target);
@@ -227,7 +207,7 @@ async function prepareGuestAccess(registry, target, userId, options = {}) {
 
 async function grant(registry, target, userId, options = {}) {
   const result = await prepareGuestAccess(registry, target, userId, options);
-  persistGuestAccess(registry, result.project, result.roleId, result.guestUserIds);
+  await updateGuestEntry(result.projectName, entry => addGuest(entry, result.roleId, userId));
   console.log(`Granted ${userId} guest access to ${result.projectName}.`);
   return result;
 }
@@ -275,12 +255,7 @@ async function createInvite(registry, project, userId, roleId, token) {
 async function invite(registry, target, userId) {
   const result = await prepareGuestAccess(registry, target, userId, { allowMissingMember: true });
   const inviteResult = await createInvite(registry, result.project, userId, result.roleId, result.token);
-  result.project.guest_invites = result.project.guest_invites || {};
-  result.project.guest_invites[userId] = unique([
-    ...(result.project.guest_invites[userId] || []),
-    inviteResult.code,
-  ]);
-  persistGuestAccess(registry, result.project, result.roleId, result.guestUserIds);
+  await updateGuestEntry(result.projectName, entry => addGuest(entry, result.roleId, userId, inviteResult.code));
   console.log(`Granted ${userId} guest access to ${result.projectName}.`);
   console.log(`Invite: ${inviteResult.url}`);
 }
@@ -298,13 +273,7 @@ async function revoke(registry, target, userId) {
   for (const code of project.guest_invites?.[userId] || []) {
     await deleteInvite(token, code);
   }
-  project.guest_user_ids = unique(project.guest_user_ids || []).filter((id) => id !== String(userId));
-  if (project.guest_invites?.[userId]) {
-    delete project.guest_invites[userId];
-    if (Object.keys(project.guest_invites).length === 0) delete project.guest_invites;
-  }
-  saveRegistry(registry);
-  updateAccessJson(registry, project);
+  await updateGuestEntry(projectName, entry => removeGuest(entry, userId));
   console.log(`Revoked ${userId} guest access from ${projectName}.`);
 }
 
@@ -313,10 +282,12 @@ async function sync(registry, target) {
   for (const [projectName, project] of resolveProjects(registry, target)) {
     if (!project.channel_id) continue;
     if ((project.guest_user_ids || []).length > 0 && !project.guest_role_id) {
-      project.guest_role_id = await ensureGuestRole(registry, projectName, project, token);
-      saveRegistry(registry);
+      const roleId = await ensureGuestRole(registry, projectName, project, token);
+      await updateGuestEntry(projectName, entry => {
+        entry.guest_role_id = entry.guest_role_id || roleId;
+        project.guest_role_id = entry.guest_role_id;
+      });
     }
-    updateAccessJson(registry, project);
     if (project.guest_role_id) {
       await syncDiscordPermissions(registry, project, project.guest_role_id, token);
       for (const userId of project.guest_user_ids || []) {

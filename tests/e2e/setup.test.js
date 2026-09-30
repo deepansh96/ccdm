@@ -23,6 +23,23 @@ test("registry example exposes generic named Codex account fields", () => {
   assert.equal("codex_home" in registryExample, false);
 });
 
+test("registry example shows the one-bot Router fields and no pool or bot tokens", () => {
+  const source = fs.readFileSync("registry.example.json", "utf8");
+  const registryExample = JSON.parse(source);
+
+  assert.deepEqual(registryExample.root_channels, ["YOUR_ROOT_CHANNEL_ID"]);
+  assert.deepEqual(registryExample.root_allowed_user_ids, []);
+  const projects = Object.values(registryExample.projects);
+  assert.ok(projects.length > 0, "the example shows at least one project");
+  for (const project of projects) {
+    assert.equal(typeof project.channel_id, "string");
+    assert.equal(typeof project.webhook_id, "string");
+  }
+  for (const field of ["pool", "max_pool_size", "project_bot_role_id", "bot_id", "bot_display_name", "transport", "token"]) {
+    assert.doesNotMatch(source, new RegExp(`"${field}"`), `registry.example.json must not contain "${field}"`);
+  }
+});
+
 test("setup creates a first-run registry, state files, and executable scripts", async () => {
   const workspace = createWorkspace();
 
@@ -33,27 +50,28 @@ test("setup creates a first-run registry, state files, and executable scripts", 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.match(result.stdout, /Created registry\.json/);
   assert.match(result.stdout, /Setup complete/);
+  // The output guides one-bot setup: root channels in the registry, the Router
+  // installed, then root started as a Router client.
+  assert.match(result.stdout, /root_channels/);
+  assert.match(result.stdout, /scripts\/install-router-service\.sh/);
+  assert.match(result.stdout, /restart-root-agent\.sh/);
+  assert.doesNotMatch(result.stdout, /plugin:discord|DISCORD_STATE_DIR=|pool/i);
 
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8")), {
     discord_user_id: "123456789",
     guild_id: "987654321",
-    max_pool_size: 50,
+    root_channels: [],
+    root_allowed_user_ids: [],
     codex_accounts: {},
     default_codex_account: null,
-    project_bot_role_id: null,
     category_ids: [],
-    pool: [],
     projects: {},
   });
 
   const stateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
   assert.equal(fs.readFileSync(path.join(stateDir, ".env"), "utf8"), "DISCORD_BOT_TOKEN=fixture-root-token\n");
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(stateDir, "access.json"), "utf8")), {
-    dmPolicy: "allowlist",
-    allowFrom: ["123456789"],
-    groups: {},
-    pending: {},
-  });
+  // Root's channels and users live in the registry; no plugin allowlist is written.
+  assert.ok(!fs.existsSync(path.join(stateDir, "access.json")));
 
   assert.ok(fs.statSync(path.join(workspace.repoDir, "restart-root-agent.sh")).mode & 0o111);
   assert.ok(fs.statSync(path.join(workspace.repoDir, "scripts", "claude-usage.sh")).mode & 0o111);
@@ -75,10 +93,9 @@ test("setup keeps an existing registry when overwrite is declined", async () => 
   const existingRegistry = {
     discord_user_id: "existing-user",
     guild_id: "existing-guild",
-    max_pool_size: 7,
-    project_bot_role_id: null,
+    root_channels: ["existing-root-channel"],
+    root_allowed_user_ids: [],
     category_ids: [],
-    pool: [],
     projects: {},
   };
   seedRegistry(workspace, existingRegistry);
@@ -97,10 +114,9 @@ test("setup overwrites an existing registry when requested", async () => {
   seedRegistry(workspace, {
     discord_user_id: "old-user",
     guild_id: "old-guild",
-    max_pool_size: 7,
-    project_bot_role_id: "old-role",
+    root_channels: ["old-root-channel"],
+    root_allowed_user_ids: ["old-helper"],
     category_ids: ["old-category"],
-    pool: [{ id: "bot2" }],
     projects: { old: {} },
   });
 
@@ -112,12 +128,11 @@ test("setup overwrites an existing registry when requested", async () => {
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8")), {
     discord_user_id: "new-user",
     guild_id: "new-guild",
-    max_pool_size: 50,
+    root_channels: [],
+    root_allowed_user_ids: [],
     codex_accounts: {},
     default_codex_account: null,
-    project_bot_role_id: null,
     category_ids: [],
-    pool: [],
     projects: {},
   });
 });

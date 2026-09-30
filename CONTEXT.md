@@ -1,6 +1,6 @@
 # CCDM
 
-CCDM manages Discord-connected coding-agent sessions by assigning project bots, isolating them to project channels, and starting or stopping their local runtimes.
+CCDM manages Discord-connected coding-agent sessions through one root bot and a local **Router** that scopes each session to its project channel, and starting or stopping their local runtimes.
 
 ## Language
 
@@ -120,8 +120,28 @@ _Avoid_: Codex Account Alias, named account
 The scheduled CCDM executable that reports configured Claude and Codex account usage to one Discord channel.
 _Avoid_: local poster script, usage daemon
 
+**Router**:
+The single local service that holds CCDM's only Discord bot credential, receives every Discord event, delivers each **Project Conversation** message to the session serving that channel, and performs Discord actions on a session's behalf.
+_Avoid_: root agent, bot, gateway (when meaning the service)
+
+**Session Scope**:
+The one Discord channel a session may read from and act in through the **Router**; the Router rejects any action outside it.
+_Avoid_: bot isolation, channel permissions (when meaning router enforcement)
+
+**Project Identity**:
+The per-project name under which a project session's messages appear in Discord, distinct from the root bot's own name.
+_Avoid_: project bot, bot nickname
+
+**Bot Pool**:
+The legacy set of separate Discord bot applications, one assigned per project channel, that the **Router** replaces.
+_Avoid_: router, project identity
+
 ## Relationships
 
+- The **Router** is the only CCDM component that holds a Discord bot credential; sessions reach Discord only through it within their **Session Scope**.
+- A project session posts under its **Project Identity**; root management messages post as the root bot.
+- A message that mentions the bot in a project channel belongs to the **Root-Agent Conversation**; every other owner or guest message there belongs to the **Project Conversation**.
+- The **Bot Pool** exists only until every project has migrated to the **Router**.
 - The **End-to-End Test Suite** uses **Local Fakes** by default.
 - The **Live Smoke Suite** verifies a narrow subset of workflows against real external services.
 - The **End-to-End Test Suite** drives **Executable Surfaces** directly by default.

@@ -4,674 +4,602 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { createWorkspace, runNodeEntrypoint, runScript } from "./support/runner.js";
-import { bridgeChildEnv, waitForState } from "./support/bridge.js";
-import { readState, seedRegistry, writeState } from "./support/state.js";
+import { runNodeEntrypoint, runScript } from "./support/runner.js";
+import { injectDiscordMessage, waitForState } from "./support/bridge.js";
+import {
+  OWNER_ID,
+  ROOT_TOKEN,
+  createRouterWorkspace,
+  routerEnv,
+  routerWithWebhooks,
+  waitFor,
+  writeRootKey,
+} from "./support/router.js";
+import { readState, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 
 test.afterEach(async () => { await cleanup(); });
 
+// Conversation Reminder events of a Claude project session. Every Claude
+// session is served through the Router, and its CCDM channel server records
+// the events itself: the real Router and channel server run against the fake
+// Discord, and a scripted MCP client stands in for Claude. `ensure-webhook`
+// gives demo `fake-webhook-1`.
+const WEBHOOK_ID = "fake-webhook-1";
+// The fake gateway's bot user: root, as the Router logs in.
+const ROOT_BOT_ID = "fixture-bot-user-id";
+// Spelled in parts because router.test.js scans Test Workspace files for the fake webhook token.
+const WEBHOOK_EXECUTE = `/api/v10/webhooks/${WEBHOOK_ID}/${"fake-webhook-"}token-1`;
+
 function seedClaudeAssignment(workspace) {
-  const registry = {
-    discord_user_id: "owner-id",
-    root_bot_app_id: "root-app",
-    pool: [{ id: "bot-1", app_id: "app-1", token: "fixture-token", state_dir: path.join(workspace.homeDir, ".claude", "channels", "discord-demo") }],
-    projects: { demo: {
-      type: "claude", path: workspace.repoDir, bot_id: "bot-1",
-      channel_id: "channel-1", assignment_generation: "generation-1",
-      screen_name: "demo_claude",
-    } },
-  };
-  fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), JSON.stringify(registry));
+  const registryPath = path.join(workspace.repoDir, "registry.json");
+  const registry = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+  registry.projects.demo.path = workspace.repoDir;
+  fs.writeFileSync(registryPath, JSON.stringify(registry));
   return registry;
 }
 
-async function runChannel(workspace, notification, options = {}) {
-  const fake = path.join(workspace.tmpDir, "fake-claude-discord-plugin.cjs");
-  const pluginRoot = path.join(workspace.tmpDir, "official-plugin");
-  const bunArgsFile = path.join(workspace.tmpDir, "bun-args.txt");
-  if (options.defaultPluginLaunch) {
-    fs.mkdirSync(pluginRoot, { recursive: true });
-    fs.writeFileSync(path.join(pluginRoot, "server.ts"), "// fixture server entrypoint\n");
-    const fakeBun = path.join(workspace.fixtureDir, "bun");
-    fs.writeFileSync(fakeBun, `#!/bin/sh\nprintf '%s\\n' "$@" > '${bunArgsFile}'\nexec '${process.execPath}' '${fake}'\n`, { mode: 0o755 });
-  }
-  const hookSettings = path.join(workspace.tmpDir, "claude-reminder-hooks.json");
+async function claudeWorkspace() {
+  const workspace = createRouterWorkspace({
+    discord_user_id: OWNER_ID,
+    guild_id: "guild-id",
+    root_bot_app_id: "root-app",
+    projects: { demo: {
+      type: "claude", transport: "router", channel_id: "channel-1", assignment_generation: "generation-1",
+      screen_name: "demo_claude", guest_user_ids: ["guest-id"], session_id: null, pid: null,
+    } },
+  });
+  const router = await routerWithWebhooks(workspace, ["demo"]);
+  const registry = seedClaudeAssignment(workspace);
+  return { workspace, router, registry };
+}
+
+function reminderStateDir(workspace) {
+  return path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders");
+}
+
+let launchCounter = 0;
+
+// The real channel server as Claude runs it: initialized, tools listed, and
+// connected to the Router. `root` runs it in root's role.
+async function startChannel(workspace, options = {}) {
+  launchCounter += 1;
+  const hookSettings = path.join(workspace.tmpDir, `claude-reminder-hooks-${launchCounter}.json`);
   if (!options.noHooksConfig) {
     const command = `node '${path.join(workspace.repoDir, "scripts", "claude-reminder-hook.js")}'`;
     fs.writeFileSync(hookSettings, JSON.stringify({
       ...(options.noSingleListenerConfig ? {} : { enabledPlugins: { "discord@claude-plugins-official": false } }),
       hooks: Object.fromEntries(
-      ["SessionStart", "Stop", "StopFailure", "SessionEnd"].map(event => [event, [{ hooks: [{ type: "command", command }] }]]),
+        ["SessionStart", "Stop", "StopFailure", "SessionEnd"].map(event => [event, [{ hooks: [{ type: "command", command }] }]]),
       ),
     }), { mode: 0o600 });
   }
-  fs.writeFileSync(fake, `
-process.stdin.setEncoding('utf8');
-let buffer = '';
-process.stdin.on('data', chunk => {
-  buffer += chunk;
-  for (let end; (end = buffer.indexOf('\\n')) >= 0;) {
-    const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
-    if (!line) continue;
-    const request = JSON.parse(line);
-    if (request.method === 'initialize') {
-      process.stdout.write(JSON.stringify({jsonrpc:'2.0', id:request.id, result:{protocolVersion:'2025-03-26', capabilities:{experimental:{'claude/channel':{}}, tools:{}}, serverInfo:{name:'discord', version:${JSON.stringify(options.serverVersion || "1.0.0")}}, instructions:'Official Discord reply'}})+'\\n');
-    }
-    if (request.method === 'notifications/initialized') {
-      ${options.noNotification ? "" : `process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'notifications/claude/channel',params:${JSON.stringify(notification)}})+'\\n');`}
-    }
-    if (request.method === 'tools/list') {
-      process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{tools:${options.noReplyTool ? "[]" : "[{name:'reply',inputSchema:{type:'object',properties:{chat_id:{type:'string'},text:{type:'string'}},required:['chat_id','text']}}]"}}})+'\\n');
-    }
-    if (request.method === 'tools/call') {
-      const unexpectedMetadata = 'conversation_disposition' in request.params.arguments || 'conversation_interaction_id' in request.params.arguments;
-      process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result: unexpectedMetadata || ${Boolean(options.failReply)}
-        ? {isError:true,content:[{type:'text',text:'delivery failed'}]}
-        : {content:[{type:'text',text:${JSON.stringify(options.multipart ? "sent 2 parts (ids: fake-message-1, fake-message-2)" : "sent (id: fake-message-1)")}}]}})+'\\n');
-      ${options.resumeNotification ? `process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'notifications/claude/channel',params:${JSON.stringify(options.resumeNotification)}})+'\\n');` : ""}
-    }
-  }
-});
-`);
-  const child = spawn(process.execPath, [path.join(workspace.repoDir, "scripts/claude-reminder-channel.js")], {
-    cwd: workspace.repoDir,
-    env: {
-      ...workspace.env,
-      CCDM_REMINDER_PROJECT_ROOT: workspace.repoDir,
-      CCDM_REMINDER_STATE_DIR: path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders"),
-      CCDM_CLAUDE_PLUGIN_COMMAND: process.execPath,
-      CCDM_CLAUDE_PLUGIN_ARGS: JSON.stringify([fake]),
-      CCDM_CLAUDE_PROJECT: options.root ? "" : "demo",
-      CCDM_CLAUDE_CHANNEL_ID: options.root ? "" : "channel-1",
-      CCDM_CLAUDE_BOT_APP_ID: options.root ? "" : "app-1",
-      CCDM_CLAUDE_ROOT_APP_ID: "root-app",
-      CCDM_CLAUDE_LAUNCH_ID: "fixture-claude-launch",
-      ...(options.noHooksConfig ? {} : { CCDM_CLAUDE_HOOK_SETTINGS: hookSettings }),
-      CCDM_REMINDER_RECEIPTS_DIR: path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders", "claude-receipts"),
-      ...(options.receiverOutage ? { CCDM_REMINDER_PYTHON: "/missing/ralph-57-python" } : {}),
-      ...(options.launchEnv || {}),
-      ...(options.defaultPluginLaunch
-        ? { CCDM_CLAUDE_PLUGIN_ROOT: pluginRoot, CCDM_CLAUDE_PLUGIN_COMMAND: "bun", CCDM_CLAUDE_PLUGIN_ARGS: "" }
-        : { CCDM_CLAUDE_PLUGIN_COMMAND: process.execPath, CCDM_CLAUDE_PLUGIN_ARGS: JSON.stringify([fake]) }),
-    },
-    stdio: ["pipe", "pipe", "pipe"],
+  const readyFile = path.join(workspace.tmpDir, `channel-ready-${launchCounter}.json`);
+  const stateDir = reminderStateDir(workspace);
+  const env = routerEnv(workspace, {
+    CCDM_CHANNEL_READY_FILE: readyFile,
+    CCDM_ROUTER_KEY_FILE: path.join(workspace.routerStateDir, "keys", options.root ? ".root.key" : "demo.key"),
+    ...(options.root ? { CCDM_ROUTER_ROLE: "root" } : { CCDM_CLAUDE_PROJECT: "demo", CCDM_CLAUDE_CHANNEL_ID: "channel-1" }),
+    CCDM_CLAUDE_LAUNCH_ID: "fixture-claude-launch",
+    CCDM_REMINDER_PROJECT_ROOT: workspace.repoDir,
+    CCDM_REMINDER_STATE_DIR: stateDir,
+    CCDM_REMINDER_RECEIPTS_DIR: path.join(stateDir, "claude-receipts"),
+    ...(options.noHooksConfig ? {} : { CCDM_CLAUDE_HOOK_SETTINGS: hookSettings }),
+    ...(options.receiverOutage ? { CCDM_REMINDER_PYTHON: "/missing/ralph-57-python" } : {}),
+    ...(options.launchEnv || {}),
+  });
+  const child = spawn(process.execPath, [path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js")], {
+    cwd: workspace.repoDir, env, stdio: ["pipe", "pipe", "pipe"],
   });
   const exited = new Promise(resolve => child.once("exit", resolve));
   let output = "";
   let errors = "";
+  child.stdout.setEncoding("utf8");
   child.stdout.on("data", chunk => { output += chunk; });
   child.stderr.on("data", chunk => { errors += chunk; });
-  child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "fixture", version: "1" } } }) + "\n");
-  for (let attempt = 0; attempt < 100 && !output.includes('"id":1'); attempt++) {
-    await new Promise(resolve => setTimeout(resolve, 20));
-  }
+  const stop = async (signal = "SIGTERM") => {
+    if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+    await exited;
+  };
+  registerTeardownCallback(() => stop("SIGKILL"));
+  const frames = () => output.split("\n").filter(Boolean).map(line => JSON.parse(line));
+  const response = id => frames().find(frame => frame.id === id);
+  let nextId = 1;
+  const request = async (method, params) => {
+    const id = nextId++;
+    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    await waitFor(() => response(id), () => `response ${id} to ${method}; stderr:\n${errors}`, 10000);
+    return response(id);
+  };
+  const initialize = await request("initialize", { protocolVersion: "2025-03-26", capabilities: {},
+    clientInfo: { name: "fixture", version: "1" } });
   child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
-  child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" }) + "\n");
-  let expectedReply = null;
-  if (options.reply) {
-    for (let attempt = 0; attempt < 100 && !output.includes("notifications/claude/channel"); attempt++) {
-      await new Promise(resolve => setTimeout(resolve, 20));
-    }
-    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: {
-      name: options.callName || "reply",
-      arguments: options.callName === "fetch_messages"
-        ? { channel: options.replyChatId || "channel-1", limit: 5 }
-        : { chat_id: options.replyChatId || "channel-1", text: "Which option?", conversation_interaction_id: "owner-message-1", conversation_disposition: options.disposition || "input-needed" },
-    } }) + "\n");
-  }
-  if (options.reply) {
-    expectedReply = options.replyChatId === "channel-elsewhere" ? "channel not assigned" : options.failReply ? "delivery failed" : options.multipart ? "fake-message-2" : "fake-message-1";
-    for (let attempt = 0; attempt < 100 && !output.includes(expectedReply); attempt++) {
-      await new Promise(resolve => setTimeout(resolve, 20));
-    }
-  }
-  if (options.expectNotification) {
-    for (let attempt = 0; attempt < 100 && !output.includes("notifications/claude/channel"); attempt++) {
-      await new Promise(resolve => setTimeout(resolve, 20));
-    }
-  }
-  if (options.serverVersion === undefined || options.serverVersion === "1.0.0") {
-    for (let attempt = 0; attempt < 100 && !output.includes('"id":3'); attempt++) {
-      await new Promise(resolve => setTimeout(resolve, 20));
-    }
-  }
-  await new Promise(resolve => setTimeout(resolve, 100));
-  if (options.keepAlive) {
-    // The launch stays up; readiness requires its live adapter process.
-    const stop = async (signal = "SIGTERM") => {
-      if (child.exitCode === null && child.signalCode === null) child.kill(signal);
-      await exited;
-    };
-    registerTeardownCallback(() => stop("SIGKILL"));
-    return { pid: child.pid, get output() { return output; }, get errors() { return errors; }, stop };
-  }
-  child.kill();
-  await exited;
-  if (options.reply || options.expectNotification) assert.match(output, /notifications\/claude\/channel/, errors);
-  if (expectedReply) assert.ok(output.includes(expectedReply), errors);
-  if (options.serverVersion === undefined || options.serverVersion === "1.0.0") assert.match(output, /"id":3/, errors);
-  return { output, errors, bunArgs: options.defaultPluginLaunch ? fs.readFileSync(bunArgsFile, "utf8").trim().split("\n") : [] };
+  const tools = await request("tools/list", {});
+  await waitFor(() => fs.existsSync(readyFile), () => `the channel server's Router hello; stderr:\n${errors}`, 10000);
+  const ready = JSON.parse(fs.readFileSync(readyFile, "utf8"));
+  assert.equal(ready.ok, true, errors);
+  const notifications = () => frames().filter(frame => frame.method === "notifications/claude/channel").map(frame => frame.params);
+  return {
+    pid: child.pid,
+    initialize,
+    tools,
+    notifications,
+    get errors() { return errors; },
+    call: async (name, args) => (await request("tools/call", { name, arguments: args })).result,
+    stop,
+  };
 }
+
+// An owner, guest, or stranger message through the fake gateway, then the
+// Router's classification; `notified` waits for the session to hear it.
+async function deliver(workspace, channel, message, { notified = false } = {}) {
+  injectDiscordMessage(workspace, { channelId: "channel-1", ...message,
+    author: { id: OWNER_ID, username: "Owner", ...(message.author ?? {}) } });
+  await waitFor(() => readState(workspace.stateDir).fixtures.discord.deliveredMessages.some(entry => entry.id === message.id),
+    () => `gateway delivery of ${message.id}`);
+  if (notified) {
+    await waitFor(() => channel.notifications().some(item => item.meta.message_id === message.id),
+      () => `notification of ${message.id}; stderr:\n${channel.errors}`);
+  }
+  // Classification and event recording are asynchronous to the gateway emit.
+  await new Promise(resolve => setTimeout(resolve, 300));
+}
+
+function replyArgs(extra = {}) {
+  return { chat_id: "channel-1", text: "Which option?", conversation_interaction_id: "owner-message-1",
+    conversation_disposition: "input-needed", ...extra };
+}
+
+function sentId(result) {
+  return /\(id: ([^)]+)\)/.exec(result.content[0].text)?.[1];
+}
+
+async function readiness(workspace) {
+  const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", {
+    args: ["demo", "--json"], env: routerEnv(workspace),
+  });
+  return { exitCode: result.exitCode, stderr: result.stderr, report: JSON.parse(result.stdout) };
+}
+
+const eventTypes = report => report.events.map(event => event.event_type);
 
 async function runHook(workspace, hook_event_name, fields = {}, extraEnv = {}) {
   return runNodeEntrypoint(workspace, "scripts/claude-reminder-hook.js", {
     env: {
       CCDM_CLAUDE_PROJECT: "demo",
       CCDM_CLAUDE_CHANNEL_ID: "channel-1",
-      CCDM_CLAUDE_BOT_APP_ID: "app-1",
       CCDM_CLAUDE_LAUNCH_ID: "fixture-claude-launch",
       CCDM_REMINDER_PROJECT_ROOT: workspace.repoDir,
-      CCDM_REMINDER_STATE_DIR: path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders"),
-      CCDM_REMINDER_RECEIPTS_DIR: path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders", "claude-receipts"),
+      CCDM_REMINDER_STATE_DIR: reminderStateDir(workspace),
+      CCDM_REMINDER_RECEIPTS_DIR: path.join(reminderStateDir(workspace), "claude-receipts"),
       ...extraEnv,
     },
     input: JSON.stringify({ hook_event_name, session_id: "fixture-session", ...fields }),
   });
 }
 
-test("Claude project channel consumes owner /close before model notification", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  const adapter = await runChannel(workspace, {
-    content: "  <@!app-1>   /close  ",
-    meta: { chat_id: "channel-1", message_id: "owner-close-1", user_id: "owner-id" },
-  }, { keepAlive: true });
-  const { output, errors } = adapter;
-  assert.match(output, /"id":1/);
-  assert.doesNotMatch(output, /notifications\/claude\/channel/);
-  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  await adapter.stop();
-  assert.equal(readiness.exitCode, 0, errors || readiness.stderr);
-  assert.deepEqual(JSON.parse(readiness.stdout).events.map(event => event.event_type), ["close_requested"]);
-  assert.match(JSON.parse(readiness.stdout).tested_runtime.bridge_contract, /Claude Code/);
+// One owner question answered by one Claude reply, as a turn.
+async function answeredTurn(workspace, channel, args = {}) {
+  await deliver(workspace, channel, { id: "owner-message-1", content: "choose an option" }, { notified: true });
+  return channel.call("reply", replyArgs(args));
+}
+
+test("an owner /close in the project channel never reaches the Claude channel server", async () => {
+  const { workspace } = await claudeWorkspace();
+  const channel = await startChannel(workspace);
+  await deliver(workspace, channel, { id: "owner-close-1", content: "  /close  " });
+  const { exitCode, report } = await readiness(workspace);
+  await channel.stop();
+  assert.deepEqual(channel.notifications(), []);
+  assert.equal(exitCode, 0, JSON.stringify(report));
+  // The reminder service records the closure through its observer, not the session.
+  assert.deepEqual(eventTypes(report), []);
+  assert.match(report.tested_runtime.bridge_contract, /Claude Code/);
 });
 
-test("Claude channel starts the installed server without a package install script", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  const { bunArgs } = await runChannel(workspace, {
-    content: "hello",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  }, { defaultPluginLaunch: true, expectNotification: true });
-  assert.deepEqual(bunArgs, [path.join(workspace.tmpDir, "official-plugin", "server.ts")]);
+test("the Claude channel server serves Discord itself, with no official plugin process", async () => {
+  const { workspace } = await claudeWorkspace();
+  const bunLog = path.join(workspace.tmpDir, "bun-invocations.txt");
+  fs.writeFileSync(path.join(workspace.fixtureDir, "bun"), `#!/bin/sh\nprintf '%s\\n' "$@" >> '${bunLog}'\n`, { mode: 0o755 });
+  const channel = await startChannel(workspace);
+  await deliver(workspace, channel, { id: "owner-message-1", content: "hello" }, { notified: true });
+  await channel.stop();
+  assert.deepEqual(channel.initialize.result.serverInfo, { name: "ccdm", version: "1.0.0" });
+  assert.equal(fs.existsSync(bunLog), false);
 });
 
-test("Claude project channel rejects an incomplete assignment before starting its listener", async () => {
-  const workspace = createWorkspace();
-  const result = await runNodeEntrypoint(workspace, "scripts/claude-reminder-channel.js", {
-    env: { CCDM_CLAUDE_PROJECT: "demo", CCDM_CLAUDE_CHANNEL_ID: "", CCDM_CLAUDE_BOT_APP_ID: "app-1" },
+test("the Claude channel server refuses to start without its launch key and reports the failed hello", async () => {
+  const { workspace } = await claudeWorkspace();
+  const readyFile = path.join(workspace.tmpDir, "ready.json");
+  const result = await runNodeEntrypoint(workspace, "scripts/ccdm-channel-server.js", {
+    env: routerEnv(workspace, { CCDM_CLAUDE_PROJECT: "demo", CCDM_CHANNEL_READY_FILE: readyFile,
+      CCDM_ROUTER_KEY_FILE: path.join(workspace.routerStateDir, "keys", "missing.key") }),
   });
-  assert.equal(result.exitCode, 2);
-  assert.match(result.stderr, /incomplete Claude project assignment/);
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /launch key unavailable/);
+  assert.equal(JSON.parse(fs.readFileSync(readyFile, "utf8")).ok, false);
 });
 
-test("Claude project channel forwards normal owner input after the official gate", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  const adapter = await runChannel(workspace, {
-    content: "please continue",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  }, { expectNotification: true, keepAlive: true });
-  assert.match(adapter.output, /notifications\/claude\/channel/);
-  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  await adapter.stop();
-  assert.equal(readiness.exitCode, 0, readiness.stderr);
-  assert.deepEqual(JSON.parse(readiness.stdout).events.map(event => event.event_type), ["owner_activity"]);
+test("Claude project channel forwards normal owner input", async () => {
+  const { workspace } = await claudeWorkspace();
+  const channel = await startChannel(workspace);
+  await deliver(workspace, channel, { id: "owner-message-1", content: "please continue" }, { notified: true });
+  const { exitCode, stderr, report } = await readiness(workspace);
+  await channel.stop();
+  assert.equal(exitCode, 0, stderr);
+  assert.deepEqual(eventTypes(report), ["owner_activity"]);
 });
 
 test("Claude project channel forwards allowed guest input without owner activity", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  const { output } = await runChannel(workspace, {
-    content: "guest question",
-    meta: { chat_id: "channel-1", message_id: "guest-message-1", user_id: "guest-id" },
-  }, { expectNotification: true });
-  assert.match(output, /guest question/);
-  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  assert.deepEqual(JSON.parse(readiness.stdout).events, []);
+  const { workspace } = await claudeWorkspace();
+  const channel = await startChannel(workspace);
+  await deliver(workspace, channel, { id: "guest-message-1", content: "guest question", author: { id: "guest-id", username: "Guest" } },
+    { notified: true });
+  await channel.stop();
+  assert.equal(channel.notifications()[0].content, "guest question");
+  const { report } = await readiness(workspace);
+  assert.deepEqual(report.events, []);
 });
 
 test("Claude successful reply exposes a confirmed input-needed receipt", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  const adapter = await runChannel(workspace, {
-    content: "choose an option",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  }, { reply: true, keepAlive: true });
-  assert.match(adapter.output, /fake-message-1/);
-  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  await adapter.stop();
-  assert.equal(readiness.exitCode, 0, readiness.stderr);
-  const events = JSON.parse(readiness.stdout).events;
-  assert.deepEqual(events.map(event => event.event_type), ["owner_activity", "response_delivered", "input_needed"]);
-  assert.equal(events[1].message_id, "fake-message-1");
-  assert.equal(events[1].provider_session_id, "fixture-claude-launch");
-  const stateDir = path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders");
+  const { workspace } = await claudeWorkspace();
+  const channel = await startChannel(workspace);
+  const result = await answeredTurn(workspace, channel);
+  const replyId = sentId(result);
+  assert.ok(replyId, JSON.stringify(result));
+  const { exitCode, stderr, report } = await readiness(workspace);
+  await channel.stop();
+  assert.equal(exitCode, 0, stderr);
+  assert.deepEqual(eventTypes(report), ["owner_activity", "response_delivered", "input_needed"]);
+  assert.equal(report.events[1].message_id, replyId);
+  assert.equal(report.events[1].provider_session_id, "fixture-claude-launch");
+  const stateDir = reminderStateDir(workspace);
   const sync = await runScript(workspace, "scripts/conversation-reminder-service.py", {
-    args: ["sync", "--project-root", workspace.repoDir, "--state-dir", stateDir],
+    args: ["sync", "--project-root", workspace.repoDir, "--state-dir", stateDir], env: routerEnv(workspace),
   });
   assert.equal(sync.exitCode, 0, sync.stderr || sync.stdout);
   const status = await runScript(workspace, "scripts/conversation-reminder-service.py", {
-    args: ["status", "--project-root", workspace.repoDir, "--state-dir", stateDir],
+    args: ["status", "--project-root", workspace.repoDir, "--state-dir", stateDir], env: routerEnv(workspace),
   });
   assert.equal(JSON.parse(status.stdout).conversations.demo.state, "awaiting-owner");
   assert.equal(JSON.parse(status.stdout).delivery_enabled, false);
 });
 
 test("Claude progress reply remains non-qualifying until a Stop hook", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  await runChannel(workspace, {
-    content: "begin",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  }, { reply: true, disposition: "progress" });
-  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  assert.deepEqual(JSON.parse(readiness.stdout).events.map(event => event.event_type), ["owner_activity", "response_delivered"]);
-  assert.equal(JSON.parse(readiness.stdout).events[1].disposition, "progress");
+  const { workspace } = await claudeWorkspace();
+  const channel = await startChannel(workspace);
+  await answeredTurn(workspace, channel, { conversation_disposition: "progress" });
+  await channel.stop();
+  const { report } = await readiness(workspace);
+  assert.deepEqual(eventTypes(report), ["owner_activity", "response_delivered"]);
+  assert.equal(report.events[1].disposition, "progress");
 });
 
 test("a multipart Claude question arms input-needed only after its last confirmed chunk", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  await runChannel(workspace, {
-    content: "begin",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  }, { reply: true, multipart: true });
-  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  const events = JSON.parse(readiness.stdout).events;
-  assert.deepEqual(events.map(event => event.event_type), ["owner_activity", "response_delivered", "response_delivered", "input_needed"]);
-  assert.equal(events.at(-1).message_id, "fake-message-2");
+  const { workspace } = await claudeWorkspace();
+  const channel = await startChannel(workspace);
+  const result = await answeredTurn(workspace, channel, { text: `${"a".repeat(1500)}\n${"b".repeat(1500)}` });
+  await channel.stop();
+  const ids = /ids: (.+)\)/.exec(result.content[0].text)[1].split(", ");
+  assert.equal(ids.length, 2, result.content[0].text);
+  const { report } = await readiness(workspace);
+  assert.deepEqual(eventTypes(report), ["owner_activity", "response_delivered", "response_delivered", "input_needed"]);
+  assert.equal(report.events.at(-1).message_id, ids[1]);
 });
 
 test("Claude Stop hook qualifies a confirmed reply after foreground work finishes", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
+  const { workspace } = await claudeWorkspace();
   const start = await runHook(workspace, "SessionStart");
   assert.equal(start.exitCode, 0, start.stderr);
-  await runChannel(workspace, {
-    content: "choose an option",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  }, { reply: true });
+  const channel = await startChannel(workspace);
+  const replyId = sentId(await answeredTurn(workspace, channel));
+  await channel.stop();
   const stop = await runHook(workspace, "Stop", { stop_hook_active: false, background_tasks: [], session_crons: [] });
   assert.equal(stop.exitCode, 0, stop.stderr);
-  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  assert.deepEqual(JSON.parse(readiness.stdout).events.map(event => event.event_type), ["owner_activity", "response_delivered", "input_needed", "turn_completed"]);
-  assert.deepEqual(JSON.parse(readiness.stdout).events.at(-1).delivered_message_ids, ["fake-message-1"]);
+  const { report } = await readiness(workspace);
+  assert.deepEqual(eventTypes(report), ["owner_activity", "response_delivered", "input_needed", "turn_completed"]);
+  assert.deepEqual(report.events.at(-1).delivered_message_ids, [replyId]);
 });
 
 test("owner continuation after an active Claude question records resumed work", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  await runChannel(workspace, {
-    content: "choose an option",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  }, { reply: true, resumeNotification: {
-    content: "Option A",
-    meta: { chat_id: "channel-1", message_id: "owner-message-2", user_id: "owner-id" },
-  } });
-  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  assert.deepEqual(JSON.parse(readiness.stdout).events.map(event => event.event_type), [
+  const { workspace } = await claudeWorkspace();
+  const channel = await startChannel(workspace);
+  await answeredTurn(workspace, channel);
+  await deliver(workspace, channel, { id: "owner-message-2", content: "Option A" }, { notified: true });
+  await channel.stop();
+  const { report } = await readiness(workspace);
+  assert.deepEqual(eventTypes(report), [
     "owner_activity", "response_delivered", "input_needed", "owner_activity", "work_resumed",
   ]);
 });
 
-test("Claude readiness rejects an unsupported official transport version", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  await runChannel(workspace, {
-    content: "hello",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  }, { serverVersion: "9.9.9" });
-  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  assert.equal(readiness.exitCode, 2);
-  assert.match(JSON.parse(readiness.stdout).unsupported_capabilities.join(" "), /Claude launch-scoped transport/);
-});
-
-test("Claude readiness rejects a channel without the official reply tool", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  await runChannel(workspace, {
-    content: "hello",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  }, { noReplyTool: true });
-  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  assert.equal(readiness.exitCode, 2);
-  assert.match(JSON.parse(readiness.stdout).unsupported_capabilities.join(" "), /Claude launch-scoped transport/);
-});
+// A pre-contract launch's reminder-proxy marker, or any marker the live
+// channel server didn't write, never proves the Router transport.
+for (const [name, change] of [
+  ["a reminder-proxy transport", { transport: "official-discord-stdio-proxy", plugin_version: "0.0.4" }],
+  ["an unverified reply tool", { reply_tool_verified: false }],
+  ["an unsupported server version", { server_version: "9.9.9" }],
+]) {
+  test(`Claude readiness rejects a capability marker with ${name}`, async () => {
+    const { workspace } = await claudeWorkspace();
+    const channel = await startChannel(workspace);
+    assert.equal((await readiness(workspace)).exitCode, 0);
+    const marker = path.join(reminderStateDir(workspace), "capabilities", "demo.json");
+    fs.writeFileSync(marker, JSON.stringify({ ...JSON.parse(fs.readFileSync(marker, "utf8")), ...change }), { mode: 0o600 });
+    const { exitCode, report } = await readiness(workspace);
+    await channel.stop();
+    assert.equal(exitCode, 2);
+    assert.match(report.unsupported_capabilities.join(" "),
+      /Claude launch-scoped transport is not verified for this assignment; restart the session with scripts\/start-session\.sh demo/);
+  });
+}
 
 test("Claude readiness does not treat a local marker as proof of remote deployment", async () => {
-  const workspace = createWorkspace();
-  const registry = seedClaudeAssignment(workspace);
-  await runChannel(workspace, {
-    content: "hello",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  });
+  const { workspace, registry } = await claudeWorkspace();
+  const channel = await startChannel(workspace);
   registry.projects.demo.path = "remote:example-host:/srv/demo";
   fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), JSON.stringify(registry));
-  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  assert.equal(readiness.exitCode, 2);
-  assert.match(JSON.parse(readiness.stdout).unsupported_capabilities.join(" "), /remote Claude adapter deployment/);
+  const { exitCode, report } = await readiness(workspace);
+  await channel.stop();
+  assert.equal(exitCode, 2);
+  assert.match(report.unsupported_capabilities.join(" "), /remote Claude adapter deployment/);
 });
 
-test("root Claude routing consumes an allowed mention /close without a model notification", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  const { output } = await runChannel(workspace, {
-    content: "<@root-app> /close",
-    meta: { chat_id: "channel-1", message_id: "root-close-1", user_id: "owner-id" },
-  }, { root: true });
-  assert.doesNotMatch(output, /notifications\/claude\/channel/);
+test("root Claude hears the owner's root mentions in a project channel and records no reminder events", async () => {
+  const { workspace } = await claudeWorkspace();
+  writeRootKey(workspace, "root-key");
+  const root = await startChannel(workspace, { root: true });
+  const project = await startChannel(workspace);
+  await deliver(workspace, root, { id: "root-close-1", content: `<@${ROOT_BOT_ID}> /close` }, { notified: true });
+  await deliver(workspace, root, { id: "root-management-1", content: `<@${ROOT_BOT_ID}> status` }, { notified: true });
+  await root.stop();
+  await project.stop();
+  assert.deepEqual(project.notifications(), []);
   const status = await runScript(workspace, "scripts/conversation-reminder-events.py", {
-    args: ["status", "--project", "demo", "--state-dir", path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders")],
+    args: ["status", "--project", "demo", "--state-dir", reminderStateDir(workspace)],
   });
   assert.equal(status.exitCode, 0, status.stderr);
-  assert.deepEqual(JSON.parse(status.stdout).events.map(event => event.event_type), ["close_requested"]);
-  assert.equal(JSON.parse(status.stdout).events[0].provider, "ccdm-root");
-});
-
-test("root Claude mention management stays an acknowledgment rather than a reopening message", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  await runChannel(workspace, {
-    content: "<@root-app> status",
-    meta: { chat_id: "channel-1", message_id: "root-management-1", user_id: "owner-id" },
-  }, { root: true, expectNotification: true });
-  const result = await runScript(workspace, "scripts/conversation-reminder-events.py", {
-    args: ["status", "--project", "demo", "--state-dir", path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders")],
-  });
-  assert.equal(JSON.parse(result.stdout).events[0].activity_kind, "management-command");
+  // The reminder service's observer classifies root management; the sessions record none of it.
+  assert.deepEqual(JSON.parse(status.stdout).events, []);
 });
 
 test("an allowed guest /close never reaches Claude or changes owner readiness", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  const { output } = await runChannel(workspace, {
-    content: "/close",
-    meta: { chat_id: "channel-1", message_id: "guest-close-1", user_id: "guest-id" },
-  });
-  assert.doesNotMatch(output, /notifications\/claude\/channel/);
-  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  assert.deepEqual(JSON.parse(readiness.stdout).events, []);
+  const { workspace } = await claudeWorkspace();
+  const channel = await startChannel(workspace);
+  await deliver(workspace, channel, { id: "guest-close-1", content: "/close", author: { id: "guest-id", username: "Guest" } });
+  await channel.stop();
+  assert.deepEqual(channel.notifications(), []);
+  const { report } = await readiness(workspace);
+  assert.deepEqual(report.events, []);
 });
 
 test("Claude background work and failed turns do not qualify completion", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
+  const { workspace } = await claudeWorkspace();
   assert.equal((await runHook(workspace, "SessionStart")).exitCode, 0);
-  await runChannel(workspace, {
-    content: "start work",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  }, { reply: true });
+  const channel = await startChannel(workspace);
+  await answeredTurn(workspace, channel);
+  await channel.stop();
   const paused = await runHook(workspace, "Stop", {
     stop_hook_active: false, background_tasks: [{ id: "task-1", type: "shell", status: "running" }], session_crons: [],
   });
   assert.equal(paused.exitCode, 0, paused.stderr);
   const failed = await runHook(workspace, "StopFailure", { error: "rate_limit" });
   assert.equal(failed.exitCode, 0, failed.stderr);
-  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  assert.deepEqual(JSON.parse(readiness.stdout).events.map(event => event.event_type), ["owner_activity", "response_delivered", "input_needed"]);
+  const { report } = await readiness(workspace);
+  assert.deepEqual(eventTypes(report), ["owner_activity", "response_delivered", "input_needed"]);
 });
 
 test("a failed Claude reply cannot supply an input-needed receipt", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  const { output } = await runChannel(workspace, {
-    content: "hello",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  }, { reply: true, failReply: true });
-  assert.match(output, /delivery failed/);
-  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  assert.deepEqual(JSON.parse(readiness.stdout).events.map(event => event.event_type), ["owner_activity"]);
+  const { workspace } = await claudeWorkspace();
+  const channel = await startChannel(workspace);
+  await deliver(workspace, channel, { id: "owner-message-1", content: "hello" }, { notified: true });
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.restFailures = [{ method: "POST", path: WEBHOOK_EXECUTE, status: 500 }];
+  writeState(seed, workspace.stateDir);
+  const result = await channel.call("reply", replyArgs());
+  await channel.stop();
+  assert.equal(result.isError, true, JSON.stringify(result));
+  assert.equal(readState(workspace.stateDir).fixtures.discord.restFailureUses.length, 1);
+  const { report } = await readiness(workspace);
+  assert.deepEqual(eventTypes(report), ["owner_activity"]);
 });
 
 test("Claude channel instructions require reply correlation without modifying inbound text", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  const { output } = await runChannel(workspace, {
-    content: "work on this",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  }, { expectNotification: true });
-  const initialize = output.split("\n").filter(Boolean).map(line => JSON.parse(line)).find(message => message.id === 1);
-  assert.match(initialize.result.instructions, /conversation_interaction_id/);
-  assert.match(output, /work on this/);
+  const { workspace } = await claudeWorkspace();
+  const channel = await startChannel(workspace);
+  await deliver(workspace, channel, { id: "owner-message-1", content: "work on this" }, { notified: true });
+  await channel.stop();
+  assert.match(channel.initialize.result.instructions, /conversation_interaction_id/);
+  assert.equal(channel.notifications()[0].content, "work on this");
 });
 
 test("Claude reply tool exposes explicit interaction and input-needed fields", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  const { output } = await runChannel(workspace, {
-    content: "work on this",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  }, { discover: true });
-  const listing = output.split("\n").filter(Boolean).map(line => JSON.parse(line)).find(message => message.id === 3);
-  assert.deepEqual(listing.result.tools[0].inputSchema.required, ["chat_id", "text", "conversation_interaction_id"]);
-  assert.deepEqual(listing.result.tools[0].inputSchema.properties.conversation_disposition.enum, ["progress", "input-needed"]);
+  const { workspace } = await claudeWorkspace();
+  const channel = await startChannel(workspace);
+  await channel.stop();
+  const reply = channel.tools.result.tools.find(tool => tool.name === "reply");
+  assert.deepEqual(reply.inputSchema.required, ["chat_id", "text", "conversation_interaction_id"]);
+  assert.deepEqual(reply.inputSchema.properties.conversation_disposition.enum, ["progress", "input-needed"]);
 });
 
 test("Claude event outbox replays after a receiver outage", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  await runChannel(workspace, {
-    content: "hello",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  }, { receiverOutage: true });
-  const before = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  assert.equal(JSON.parse(before.stdout).event_receiver.pending_count, 1);
+  const { workspace } = await claudeWorkspace();
+  const channel = await startChannel(workspace, { receiverOutage: true });
+  await deliver(workspace, channel, { id: "owner-message-1", content: "hello" }, { notified: true });
+  await channel.stop();
+  const before = await readiness(workspace);
+  assert.equal(before.report.event_receiver.pending_count, 1);
   const replay = await runScript(workspace, "scripts/conversation-reminder-events.py", {
-    args: ["drain", "--project-root", workspace.repoDir, "--state-dir", path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders")],
+    args: ["drain", "--project-root", workspace.repoDir, "--state-dir", reminderStateDir(workspace)],
   });
   assert.equal(replay.exitCode, 0, replay.stderr);
-  const after = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  assert.deepEqual(JSON.parse(after.stdout).events.map(event => event.event_type), ["owner_activity"]);
-  assert.equal(JSON.parse(after.stdout).event_receiver.pending_count, 0);
+  const after = await readiness(workspace);
+  assert.deepEqual(eventTypes(after.report), ["owner_activity"]);
+  assert.equal(after.report.event_receiver.pending_count, 0);
 });
 
-test("Claude adapter startup replays an outbox event without new conversation input", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  await runChannel(workspace, {
-    content: "hello",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  }, { receiverOutage: true });
-  await runChannel(workspace, {}, { noNotification: true });
-  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  assert.deepEqual(JSON.parse(readiness.stdout).events.map(event => event.event_type), ["owner_activity"]);
-  assert.equal(JSON.parse(readiness.stdout).event_receiver.pending_count, 0);
+test("Claude channel startup replays an outbox event without new conversation input", async () => {
+  const { workspace } = await claudeWorkspace();
+  const outage = await startChannel(workspace, { receiverOutage: true });
+  await deliver(workspace, outage, { id: "owner-message-1", content: "hello" }, { notified: true });
+  await outage.stop();
+  const relaunched = await startChannel(workspace);
+  await waitFor(() => fs.readdirSync(path.join(reminderStateDir(workspace), "outbox"), { recursive: true })
+    .every(name => !String(name).endsWith(".json")), () => "the startup outbox drain");
+  await relaunched.stop();
+  const { report } = await readiness(workspace);
+  assert.deepEqual(eventTypes(report), ["owner_activity"]);
+  assert.equal(report.event_receiver.pending_count, 0);
 });
 
 test("Claude SessionEnd reports termination without promoting progress to completion", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
+  const { workspace } = await claudeWorkspace();
   assert.equal((await runHook(workspace, "SessionStart")).exitCode, 0);
-  await runChannel(workspace, {
-    content: "hello",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  });
+  const channel = await startChannel(workspace);
+  await deliver(workspace, channel, { id: "owner-message-1", content: "hello" }, { notified: true });
+  await channel.stop();
   const ended = await runHook(workspace, "SessionEnd", { reason: "logout" });
   assert.equal(ended.exitCode, 0, ended.stderr);
-  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  assert.deepEqual(JSON.parse(readiness.stdout).events.map(event => event.event_type), ["owner_activity", "session_terminated"]);
-});
-
-test("root Claude filter rejects unsupported official transport before routing", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  const { output, errors } = await runChannel(workspace, {
-    content: "<@root-app> /close",
-    meta: { chat_id: "channel-1", message_id: "root-close-1", user_id: "owner-id" },
-  }, { root: true, serverVersion: "9.9.9" });
-  assert.match(errors, /unsupported official Discord transport contract/);
-  assert.doesNotMatch(output, /notifications\/claude\/channel/);
+  const { report } = await readiness(workspace);
+  assert.deepEqual(eventTypes(report), ["owner_activity", "session_terminated"]);
 });
 
 test("Claude readiness rejects a launch without command completion hooks", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  await runChannel(workspace, {
-    content: "hello",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  }, { noHooksConfig: true });
-  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  assert.equal(readiness.exitCode, 2);
-  assert.match(JSON.parse(readiness.stdout).unsupported_capabilities.join(" "), /Claude launch-scoped transport/);
+  const { workspace } = await claudeWorkspace();
+  const channel = await startChannel(workspace, { noHooksConfig: true });
+  const { exitCode, report } = await readiness(workspace);
+  await channel.stop();
+  assert.equal(exitCode, 2);
+  assert.match(report.unsupported_capabilities.join(" "), /Claude launch-scoped transport/);
 });
 
-test("Claude readiness rejects an unfiltered parallel official channel configuration", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  await runChannel(workspace, {
-    content: "hello",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  }, { noSingleListenerConfig: true });
-  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  assert.equal(readiness.exitCode, 2);
-  assert.match(JSON.parse(readiness.stdout).unsupported_capabilities.join(" "), /Claude launch-scoped transport/);
+test("Claude readiness rejects a launch that leaves the official Discord plugin enabled", async () => {
+  const { workspace } = await claudeWorkspace();
+  const channel = await startChannel(workspace, { noSingleListenerConfig: true });
+  const { exitCode, report } = await readiness(workspace);
+  await channel.stop();
+  assert.equal(exitCode, 2);
+  assert.match(report.unsupported_capabilities.join(" "), /Claude launch-scoped transport/);
 });
 
-test("Claude project filter refuses notifications outside its assigned channel", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  const { output } = await runChannel(workspace, {
-    content: "hello from elsewhere",
-    meta: { chat_id: "channel-elsewhere", message_id: "other-message", user_id: "owner-id" },
-  });
-  assert.doesNotMatch(output, /notifications\/claude\/channel/);
+test("Claude project channel never hears a message outside its assigned channel", async () => {
+  const { workspace } = await claudeWorkspace();
+  const channel = await startChannel(workspace);
+  await deliver(workspace, channel, { id: "other-message", channelId: "channel-elsewhere", content: "hello from elsewhere" });
+  await channel.stop();
+  assert.deepEqual(channel.notifications(), []);
 });
 
 test("Claude project reply cannot target an unassigned channel", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  const { output } = await runChannel(workspace, {
-    content: "hello",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  }, { reply: true, replyChatId: "channel-elsewhere" });
-  assert.match(output, /channel not assigned/);
-  assert.doesNotMatch(output, /fake-message-1/);
-  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  assert.deepEqual(JSON.parse(readiness.stdout).events.map(event => event.event_type), ["owner_activity"]);
+  const { workspace } = await claudeWorkspace();
+  const channel = await startChannel(workspace);
+  await deliver(workspace, channel, { id: "owner-message-1", content: "hello" }, { notified: true });
+  const result = await channel.call("reply", replyArgs({ chat_id: "channel-elsewhere" }));
+  await channel.stop();
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /scope_violation/);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.messages ?? [], []);
+  const { report } = await readiness(workspace);
+  assert.deepEqual(eventTypes(report), ["owner_activity"]);
 });
 
 test("Claude project history tool cannot read an unassigned channel", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  const { output } = await runChannel(workspace, {
-    content: "hello",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  }, { reply: true, callName: "fetch_messages", replyChatId: "channel-elsewhere" });
-  assert.match(output, /channel not assigned/);
-  assert.doesNotMatch(output, /fake-message-1/);
+  const { workspace } = await claudeWorkspace();
+  const channel = await startChannel(workspace);
+  const result = await channel.call("fetch_messages", { channel: "channel-elsewhere", limit: 5 });
+  await channel.stop();
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /scope_violation/);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.fetches ?? [], []);
 });
 
 test("shared receiver rejects a Claude owner event after provider reassignment", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  const registryPath = path.join(workspace.repoDir, "registry.json");
-  const registry = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+  const { workspace, registry } = await claudeWorkspace();
   registry.projects.demo.type = "codex";
-  fs.writeFileSync(registryPath, JSON.stringify(registry));
+  fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), JSON.stringify(registry));
   const event = {
     schema_version: 1, event_id: "fixture-claude-stale-1", event_type: "owner_activity",
-    project: "demo", channel_id: "channel-1", bot_id: "bot-1", assignment_generation: "generation-1",
+    project: "demo", channel_id: "channel-1", bot_id: `router:${WEBHOOK_ID}`, assignment_generation: "generation-1",
     provider: "claude", provider_session_id: "fixture-claude-launch",
     event_time: "2026-09-24T10:00:00.000Z", event_order: "0000000001000000:fixture:000000000001",
-    adapter_instance_id: "fixture", actor_id: "owner-id", source_message_id: "owner-message-1", activity_kind: "message",
+    adapter_instance_id: "fixture", actor_id: OWNER_ID, source_message_id: "owner-message-1", activity_kind: "message",
   };
   const result = await runScript(workspace, "scripts/conversation-reminder-events.py", {
-    args: ["ingest", "--project-root", workspace.repoDir, "--state-dir", path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders")],
+    args: ["ingest", "--project-root", workspace.repoDir, "--state-dir", reminderStateDir(workspace)],
     input: JSON.stringify(event),
   });
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(JSON.parse(result.stdout).status, "rejected");
 });
 
-test("Claude launcher, filtered channel, command hooks and readiness share one launch identity", async () => {
-  const workspace = createWorkspace();
-  const registry = seedClaudeAssignment(workspace);
-  seedRegistry(workspace, registry);
-  const pluginDir = path.join(workspace.homeDir, ".claude", "plugins", "cache", "claude-plugins-official", "discord", "0.0.4");
-  fs.mkdirSync(pluginDir, { recursive: true });
-  fs.writeFileSync(path.join(pluginDir, "server.ts"), "// fixture official plugin\n");
-  const launched = await runScript(workspace, "scripts/start-session.sh", {
-    args: ["demo"], env: { CCDM_CLAUDE_REMINDER_ADAPTER: "1" },
-  });
+function startSession(workspace) {
+  return runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace), timeoutMs: 30000 });
+}
+
+test("Claude launcher, channel server, command hooks and readiness share one launch identity", async () => {
+  const { workspace } = await claudeWorkspace();
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.claude.toolScript = [{ name: "reply", arguments: {
+    chat_id: "{{chat_id}}", text: "working on it", conversation_interaction_id: "{{message_id}}",
+    conversation_disposition: "progress",
+  } }];
+  writeState(seed, workspace.stateDir);
+  const launched = await startSession(workspace);
   assert.equal(launched.exitCode, 0, launched.stderr || launched.stdout);
-  const config = JSON.parse(fs.readFileSync(path.join(registry.pool[0].state_dir, "ccdm-message-export-mcp.json"), "utf8"));
-  const launchEnv = config.mcpServers.discord.env;
-  assert.equal((await runHook(workspace, "SessionStart", {}, launchEnv)).exitCode, 0);
-  const adapter = await runChannel(workspace, {
-    content: "answer this",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" },
-  }, { reply: true, disposition: "progress", launchEnv, noHooksConfig: true, keepAlive: true });
-  const stopped = await runHook(workspace, "Stop", { background_tasks: [], session_crons: [] }, launchEnv);
-  assert.equal(stopped.exitCode, 0, stopped.stderr);
-  const readiness = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  assert.equal(readiness.exitCode, 0, readiness.stderr);
-  assert.deepEqual(JSON.parse(readiness.stdout).events.map(event => event.event_type), ["owner_activity", "response_delivered", "turn_completed"]);
-  const marker = path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders", "capabilities", "demo.json");
-  assert.deepEqual([JSON.parse(fs.readFileSync(marker, "utf8")).launch_id, JSON.parse(fs.readFileSync(marker, "utf8")).pid],
-    [launchEnv.CCDM_CLAUDE_LAUNCH_ID, adapter.pid]);
-  await adapter.stop();
-  assert.equal(fs.existsSync(marker), false, "an exiting adapter removes its own capability marker");
-  const exited = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
+  const launchEnv = JSON.parse(fs.readFileSync(path.join(workspace.routerStateDir, "launches", "demo", "reminder-env.json"), "utf8"));
+
+  injectDiscordMessage(workspace, { id: "owner-message-1", channelId: "channel-1", content: "answer this",
+    author: { id: OWNER_ID, username: "Owner" } });
+  await waitForState(workspace, state => (state.fixtures.claude.hookRuns ?? []).some(run => run.event === "Stop"), 15000);
+  const { exitCode, stderr, report } = await readiness(workspace);
+  assert.equal(exitCode, 0, stderr);
+  assert.deepEqual(eventTypes(report), ["owner_activity", "response_delivered", "turn_completed"]);
+  assert.deepEqual(report.events.slice(1).map(event => event.provider_session_id),
+    [launchEnv.CCDM_CLAUDE_LAUNCH_ID, launchEnv.CCDM_CLAUDE_LAUNCH_ID]);
+  const marker = path.join(reminderStateDir(workspace), "capabilities", "demo.json");
+  assert.equal(JSON.parse(fs.readFileSync(marker, "utf8")).launch_id, launchEnv.CCDM_CLAUDE_LAUNCH_ID);
+
+  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"], env: routerEnv(workspace) });
+  assert.equal(stopped.exitCode, 0, stopped.stderr || stopped.stdout);
+  assert.equal(fs.existsSync(marker), false, "stopping the launch removes its capability marker");
+  const exited = await readiness(workspace);
   assert.equal(exited.exitCode, 2);
-  assert.match(JSON.parse(exited.stdout).unsupported_capabilities.join(" "), /Claude launch-scoped transport/);
+  assert.match(exited.report.unsupported_capabilities.join(" "), /Claude launch-scoped transport/);
 });
 
-test("a plain Claude restart after an adapter launch never reports a stale ready transport", async () => {
-  const workspace = createWorkspace();
-  const registry = seedClaudeAssignment(workspace);
-  seedRegistry(workspace, registry);
-  const pluginDir = path.join(workspace.homeDir, ".claude", "plugins", "cache", "claude-plugins-official", "discord", "0.0.4");
-  fs.mkdirSync(pluginDir, { recursive: true });
-  fs.writeFileSync(path.join(pluginDir, "server.ts"), "// fixture official plugin\n");
-  const readiness = async () => {
-    const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-    return { exitCode: result.exitCode, unsupported: JSON.parse(result.stdout).unsupported_capabilities.join(" ") };
-  };
-  const launched = await runScript(workspace, "scripts/start-session.sh", {
-    args: ["demo"], env: { CCDM_CLAUDE_REMINDER_ADAPTER: "1" },
-  });
+test("a killed Claude channel server never leaves a stale ready transport", async () => {
+  const { workspace } = await claudeWorkspace();
+  const launched = await startSession(workspace);
   assert.equal(launched.exitCode, 0, launched.stderr || launched.stdout);
-  const launchEnv = JSON.parse(fs.readFileSync(path.join(registry.pool[0].state_dir, "ccdm-message-export-mcp.json"),
-    "utf8")).mcpServers.discord.env;
-  const adapter = await runChannel(workspace, {}, { noNotification: true, launchEnv, keepAlive: true });
-  assert.equal((await readiness()).exitCode, 0);
+  assert.equal((await readiness(workspace)).exitCode, 0);
 
-  // The adapter dies without cleanup, as with SIGKILL: its marker survives but
-  // no longer proves a live launch.
-  await adapter.stop("SIGKILL");
-  const marker = path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders", "capabilities", "demo.json");
+  // The channel server dies without cleanup, as with SIGKILL: its marker
+  // survives but no longer proves a live launch.
+  const marker = path.join(reminderStateDir(workspace), "capabilities", "demo.json");
+  process.kill(JSON.parse(fs.readFileSync(marker, "utf8")).pid, "SIGKILL");
+  await new Promise(resolve => setTimeout(resolve, 300));
   assert.equal(fs.existsSync(marker), true);
-  const dead = await readiness();
+  const dead = await readiness(workspace);
   assert.equal(dead.exitCode, 2);
-  assert.match(dead.unsupported, /Claude launch-scoped transport is not running/);
-  assert.match(dead.unsupported, /restart the session with CCDM_CLAUDE_REMINDER_ADAPTER=1 scripts\/start-session\.sh demo/);
+  assert.match(dead.report.unsupported_capabilities.join(" "),
+    /Claude launch-scoped transport is not running for this assignment; restart the session with scripts\/start-session\.sh demo/);
 
-  // The documented plain restart runs the unfiltered official plugin.
-  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"] });
+  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"], env: routerEnv(workspace) });
   assert.equal(stopped.exitCode, 0, stopped.stderr || stopped.stdout);
   assert.equal(fs.existsSync(marker), false, "stop-session removes the launch's capability marker");
+  // A relaunch replaces any earlier marker with its own live channel server's.
   fs.writeFileSync(marker, JSON.stringify({ stale: true }), { mode: 0o600 });
-  const plain = await runScript(workspace, "scripts/start-session.sh", { args: ["demo"] });
-  assert.equal(plain.exitCode, 0, plain.stderr || plain.stdout);
-  assert.equal(fs.existsSync(marker), false, "a plain launch clears any earlier capability marker");
-  const unfiltered = await readiness();
-  assert.equal(unfiltered.exitCode, 2);
-  assert.match(unfiltered.unsupported, /Claude launch-scoped transport is not verified/);
-  assert.match(unfiltered.unsupported, /CCDM_CLAUDE_REMINDER_ADAPTER=1 scripts\/start-session\.sh demo/);
+  const relaunched = await startSession(workspace);
+  assert.equal(relaunched.exitCode, 0, relaunched.stderr || relaunched.stdout);
+  assert.equal(JSON.parse(fs.readFileSync(marker, "utf8")).transport, "ccdm-channel-server");
+  assert.equal((await readiness(workspace)).exitCode, 0);
 });
 
-test("a Claude input-needed receipt replayed after downtime gets one catch-up from the Claude bot", async () => {
-  const workspace = createWorkspace();
-  seedClaudeAssignment(workspace);
-  const rootState = path.join(workspace.homeDir, "root-discord");
-  fs.mkdirSync(rootState, { recursive: true });
-  fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
-  const stateDir = path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders");
+test("a Claude input-needed receipt replayed after downtime gets one catch-up from root", async () => {
+  const { workspace } = await claudeWorkspace();
+  const stateDir = reminderStateDir(workspace);
   const clockFile = path.join(workspace.tmpDir, "reminder-clock");
-  const env = bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
-    CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile });
+  const env = routerEnv(workspace, { CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile });
   const service = async (name, expected = 0) => {
     const result = await runScript(workspace, "scripts/conversation-reminder-service.py", {
       args: [name, "--project-root", workspace.repoDir, "--state-dir", stateDir], env });
@@ -682,7 +610,7 @@ test("a Claude input-needed receipt replayed after downtime gets one catch-up fr
     args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir], env, timeoutMs: 30000 });
   const at = offset => new Date(now + offset).toISOString();
   const message = (id, timestamp, author) => ({ id, timestamp, content: "text", type: 0, attachments: [],
-    author: { id: author, bot: author === "app-1" } });
+    author: { id: author, bot: author === WEBHOOK_ID }, ...(author === WEBHOOK_ID ? { webhook_id: WEBHOOK_ID } : {}) });
   const waitForStatus = async predicate => {
     for (let attempt = 0; attempt < 200; attempt++) {
       const current = await service("status");
@@ -692,14 +620,13 @@ test("a Claude input-needed receipt replayed after downtime gets one catch-up fr
     throw new Error(JSON.stringify(await service("status")));
   };
   const now = Date.now();
-  // Before downtime the owner thanked the bot, so the conversation is paused.
+  // Before downtime the owner thanked the session, so the conversation is paused.
   const seed = readState(workspace.stateDir);
-  seed.fixtures.discord.history = { "channel-1": [message("old-3", at(-2 * 3600000), "owner-id"),
-    message("old-2", at(-3 * 3600000 + 300000), "app-1"), message("old-1", at(-3 * 3600000), "owner-id")] };
+  seed.fixtures.discord.history = { "channel-1": [message("old-3", at(-2 * 3600000), OWNER_ID),
+    message("old-2", at(-3 * 3600000 + 300000), WEBHOOK_ID), message("old-1", at(-3 * 3600000), OWNER_ID)] };
   writeState(seed, workspace.stateDir);
-  // The launch-scoped adapter records its verified transport while it runs.
-  const warmup = await runChannel(workspace, { content: "warm up", meta: { chat_id: "channel-1", message_id: "old-3",
-    user_id: "owner-id" } }, { expectNotification: true, keepAlive: true });
+  // The live channel server records its verified transport while it runs.
+  const warmup = await startChannel(workspace);
   await service("enable");
   fs.writeFileSync(clockFile, at(-90 * 60000));
   let running = worker();
@@ -710,25 +637,26 @@ test("a Claude input-needed receipt replayed after downtime gets one catch-up fr
   assert.equal((await running).exitCode, 0);
   await warmup.stop();
 
-  // Downtime: the stopped service misses a Claude question the adapter durably recorded.
+  // Downtime: the stopped service misses a Claude question the channel server durably recorded.
+  const asked = await startChannel(workspace);
+  const replyId = sentId(await answeredTurn(workspace, asked));
+  await asked.stop();
   const history = readState(workspace.stateDir);
-  history.fixtures.discord.history["channel-1"].unshift(message("fake-message-1", at(0), "app-1"),
-    message("owner-message-1", at(-1000), "owner-id"));
+  history.fixtures.discord.history["channel-1"].unshift(message(replyId, at(0), WEBHOOK_ID),
+    message("owner-message-1", at(-1000), OWNER_ID));
   writeState(history, workspace.stateDir);
-  await runChannel(workspace, { content: "choose an option",
-    meta: { chat_id: "channel-1", message_id: "owner-message-1", user_id: "owner-id" } }, { reply: true });
-  // The Claude session is relaunched with its adapter before reminders resume.
-  const relaunched = await runChannel(workspace, {}, { noNotification: true, keepAlive: true });
+  // The Claude session is relaunched before reminders resume.
+  const relaunched = await startChannel(workspace);
   await service("enable");
   fs.writeFileSync(clockFile, at(2 * 3600000));
   running = worker();
   const sent = await waitForState(workspace, state =>
     (state.fixtures.discord.messages ?? []).some(row => row.content === "👀"), 20000);
   const reminder = sent.fixtures.discord.messages.find(row => row.content === "👀");
-  assert.deepEqual([reminder.channelId, reminder.authorization], ["channel-1", "Bot fixture-token"]);
+  assert.deepEqual([reminder.channelId, reminder.authorization], ["channel-1", `Bot ${ROOT_TOKEN}`]);
   const released = await waitForStatus(current => current.conversations.demo.reminder_message_id);
   assert.equal(released.conversations.demo.state, "awaiting-owner");
-  assert.equal(released.conversations.demo.response_message_id, "fake-message-1");
+  assert.equal(released.conversations.demo.response_message_id, replyId);
   // The catch-up anchors the next gap (two hours after one reminder) to its own
   // send time, not to the missed interval.
   assert.equal(released.conversations.demo.due_at, at(4 * 3600000).replace(".000Z", "Z"));

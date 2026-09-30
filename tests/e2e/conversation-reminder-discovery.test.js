@@ -4,56 +4,64 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { createWorkspace, runScript } from "./support/runner.js";
-import { bridgeChildEnv, injectDiscordMessage, injectDiscordReaction, waitForState } from "./support/bridge.js";
-import { readState, writeState } from "./support/state.js";
+import { runScript } from "./support/runner.js";
+import { createBridgeWorkspace, injectDiscordMessage, injectDiscordReaction, waitForState } from "./support/bridge.js";
+import { routerEnv, startRouter } from "./support/router.js";
+import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => cleanup());
 
 // History discovery scenarios drive the real foreground service against a
 // stateful paginated Discord history fake. Timestamps are literal timelines.
+// Every project is a Router project: the observer watches through the real
+// Router, root reads history and sends with its own token, and each project's
+// agent speaks through its webhook `hook-<name>`, so its identity is
+// `router:hook-<name>`.
 
-function setup(workspace, projects = { demo: "channel" }) {
+async function setup(workspace, projects = { demo: "channel" }) {
   const names = Object.keys(projects);
   fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), JSON.stringify({
     discord_user_id: "owner", guild_id: "guild",
-    pool: names.map(name => ({ id: `bot-${name}`, app_id: `app-${name}`, token: `token-${name}` })),
     projects: Object.fromEntries(names.map(name => [name, {
-      type: "codex", bot_id: `bot-${name}`, channel_id: projects[name], assignment_generation: `gen-${name}`,
+      type: "codex", channel_id: projects[name], webhook_id: `hook-${name}`, assignment_generation: `gen-${name}`,
     }])),
   }), { mode: 0o600 });
-  const rootState = path.join(workspace.homeDir, "root-discord");
-  fs.mkdirSync(rootState, { recursive: true });
+  // Root's Discord state holds the only bot token, which the Router and the observer read.
+  const rootState = path.join(workspace.homeDir, ".claude", "channels", "discord");
+  fs.mkdirSync(rootState, { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(rootState, ".env"), "DISCORD_BOT_TOKEN=fixture-root-token\n", { mode: 0o600 });
+  await startRouter(workspace);
   return path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders");
 }
 
+// An author named `hook-<name>` is that project's agent, posting through its webhook.
 function message(id, timestamp, author, content = "text", extra = {}) {
+  const webhook = author.startsWith("hook-");
   return { id, timestamp, content, type: 0, attachments: [],
-    author: { id: author, bot: author.startsWith("app-") }, ...extra };
+    author: { id: author, bot: webhook }, ...(webhook ? { webhook_id: author } : {}), ...extra };
 }
 
-// A live arrival is visible both to the Gateway observer and to later history reads.
+// A live arrival is visible both to the Router's observer and to later history reads.
 function arrive(workspace, channelId, raw) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.history[channelId].unshift(raw);
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.history[channelId].unshift(raw);
+  });
   if (!raw.author.bot) {
     injectDiscordMessage(workspace, { channelId, id: raw.id, author: { id: raw.author.id }, content: raw.content });
   }
 }
 
 function seedHistory(workspace, history, extra = {}) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.history = history;
-  Object.assign(state.fixtures.discord, extra);
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.history = history;
+    Object.assign(state.fixtures.discord, extra);
+  });
 }
 
 async function command(workspace, stateDir, name, extra = {}) {
   const result = await runScript(workspace, "scripts/conversation-reminder-service.py", {
-    args: [name, "--project-root", workspace.repoDir, "--state-dir", stateDir], ...extra,
+    args: [name, "--project-root", workspace.repoDir, "--state-dir", stateDir], env: routerEnv(workspace), ...extra,
   });
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   return JSON.parse(result.stdout);
@@ -62,11 +70,12 @@ async function command(workspace, stateDir, name, extra = {}) {
 async function adapterEvent(workspace, stateDir, type, id, time, fields = {}) {
   const value = {
     schema_version: 1, event_id: id, event_type: type, project: "demo", channel_id: "channel",
-    bot_id: "bot-demo", assignment_generation: "gen-demo", provider: "codex",
+    bot_id: "router:hook-demo", assignment_generation: "gen-demo", provider: "codex",
     event_time: time, event_order: `${time}:${id}`, adapter_instance_id: "test-adapter", ...fields,
   };
   const result = await runScript(workspace, "scripts/conversation-reminder-events.py", {
-    args: ["ingest", "--project-root", workspace.repoDir, "--state-dir", stateDir], input: JSON.stringify(value),
+    args: ["ingest", "--project-root", workspace.repoDir, "--state-dir", stateDir], env: routerEnv(workspace),
+    input: JSON.stringify(value),
   });
   assert.equal(JSON.parse(result.stdout).status, "committed", result.stderr || result.stdout);
 }
@@ -76,8 +85,7 @@ function startWorker(workspace, stateDir, time) {
   fs.writeFileSync(clockFile, time);
   const running = runScript(workspace, "scripts/conversation-reminder-service.py", {
     args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir],
-    env: bridgeChildEnv(workspace, { ROOT_DISCORD_STATE_DIR: path.join(workspace.homeDir, "root-discord"),
-      CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile }),
+    env: routerEnv(workspace, { CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile }),
     timeoutMs: 20000,
   });
   return { running, setClock: value => fs.writeFileSync(clockFile, value) };
@@ -110,11 +118,11 @@ async function stop(workspace, stateDir, worker) {
 }
 
 test("discovery arms an old completed-looking answer from its answer time, then delivers", async () => {
-  const workspace = createWorkspace();
-  const stateDir = setup(workspace);
+  const workspace = createBridgeWorkspace();
+  const stateDir = await setup(workspace);
   seedHistory(workspace, { channel: [
-    message("1003", "2026-09-20T08:05:00Z", "app-demo", "Done — the report is ready."),
-    message("1002", "2026-09-20T08:01:00Z", "app-demo", "Working on it."),
+    message("1003", "2026-09-20T08:05:00Z", "hook-demo", "Done — the report is ready."),
+    message("1002", "2026-09-20T08:01:00Z", "hook-demo", "Working on it."),
     message("1001", "2026-09-20T08:00:00Z", "owner", "Please build the report"),
   ] });
   const requested = await command(workspace, stateDir, "discover");
@@ -143,7 +151,7 @@ test("discovery arms an old completed-looking answer from its answer time, then 
   worker.setClock("2026-09-20T09:05:00Z");
   const sent = await waitForState(workspace, state => state.fixtures.discord.messages?.length === 1);
   assert.equal(sent.fixtures.discord.messages[0].content, "👀");
-  assert.equal(sent.fixtures.discord.messages[0].authorization, "Bot token-demo");
+  assert.equal(sent.fixtures.discord.messages[0].authorization, "Bot fixture-root-token");
   await waitForStatus(workspace, stateDir, current => current.conversations.demo.due_at === "2026-09-20T11:05:00Z" &&
     current.conversations.demo.consecutive_reminders === 1);
   assert.equal(readState(workspace.stateDir).fixtures.codex.appServerInvocations.length, 0);
@@ -158,13 +166,13 @@ function longHistory(count, prefix = 100000) {
   return Array.from({ length: count }, (_, index) => {
     const at = new Date(start + index * 1000).toISOString().replace(".000Z", "Z");
     return index === 0 ? message(String(prefix), at, "owner", "Please run the migration")
-      : message(String(prefix + index), at, "app-demo", `progress ${index}`);
+      : message(String(prefix + index), at, "hook-demo", `progress ${index}`);
   }).reverse();
 }
 
 test("discovery pages channels fairly in bounded passes and resumes from the saved cursor", async () => {
-  const workspace = createWorkspace();
-  const stateDir = setup(workspace, { demo: "channel", other: "other-channel" });
+  const workspace = createBridgeWorkspace();
+  const stateDir = await setup(workspace, { demo: "channel", other: "other-channel" });
   seedHistory(workspace, {
     channel: longHistory(1150),
     "other-channel": [message("2001", "2026-09-21T10:00:00Z", "owner", "Anything new?")],
@@ -205,10 +213,10 @@ test("discovery pages channels fairly in bounded passes and resumes from the sav
 });
 
 test("a throttled channel backs off for Discord's retry window while others continue", async () => {
-  const workspace = createWorkspace();
-  const stateDir = setup(workspace, { demo: "channel", other: "other-channel" });
+  const workspace = createBridgeWorkspace();
+  const stateDir = await setup(workspace, { demo: "channel", other: "other-channel" });
   seedHistory(workspace, {
-    channel: [message("1002", "2026-09-20T08:05:00Z", "app-demo", "Done"),
+    channel: [message("1002", "2026-09-20T08:05:00Z", "hook-demo", "Done"),
       message("1001", "2026-09-20T08:00:00Z", "owner", "Ship it")],
     "other-channel": [message("2001", "2026-09-21T10:00:00Z", "owner", "Anything new?")],
   }, { restFailures: [{ method: "GET", path: "/api/v10/channels/channel/messages", status: 429,
@@ -245,8 +253,8 @@ async function scanFirstPass(workspace, stateDir, clock) {
 }
 
 test("a newer owner reaction observed during scanning wins over the historical answer", async () => {
-  const workspace = createWorkspace();
-  const stateDir = setup(workspace);
+  const workspace = createBridgeWorkspace();
+  const stateDir = await setup(workspace);
   const worker = await scanFirstPass(workspace, stateDir, "2026-09-20T09:00:00Z");
   injectDiscordReaction(workspace, { channelId: "channel", id: "live-reaction", messageId: "101149",
     emoji: "custom:42", user: { id: "owner" } });
@@ -267,12 +275,12 @@ test("a newer owner reaction observed during scanning wins over the historical a
 });
 
 test("messages arriving during scanning are reconciled forward without counting the owner twice", async () => {
-  const workspace = createWorkspace();
-  const stateDir = setup(workspace);
+  const workspace = createBridgeWorkspace();
+  const stateDir = await setup(workspace);
   const worker = await scanFirstPass(workspace, stateDir, "2026-09-20T09:00:00Z");
   arrive(workspace, "channel", message("102000", "2026-09-20T09:00:10Z", "owner", "One more thing"));
   await waitForState(workspace, state => state.fixtures.discord.deliveredMessages?.some(row => row.id === "102000"));
-  arrive(workspace, "channel", message("102001", "2026-09-20T09:00:20Z", "app-demo", "Handled."));
+  arrive(workspace, "channel", message("102001", "2026-09-20T09:00:20Z", "hook-demo", "Handled."));
   await new Promise(resolve => setTimeout(resolve, 400));
   worker.setClock("2026-09-20T09:00:30Z");
   const ready = await waitForStatus(workspace, stateDir, current =>
@@ -285,8 +293,8 @@ test("messages arriving during scanning are reconciled forward without counting 
 });
 
 test("an owner /close during scanning closes the conversation and still receives its checkmark", async () => {
-  const workspace = createWorkspace();
-  const stateDir = setup(workspace);
+  const workspace = createBridgeWorkspace();
+  const stateDir = await setup(workspace);
   const worker = await scanFirstPass(workspace, stateDir, "2026-09-20T09:00:00Z");
   arrive(workspace, "channel", message("102000", "2026-09-20T09:00:10Z", "owner", "/close"));
   await waitForState(workspace, state => state.fixtures.discord.deliveredMessages?.some(row => row.id === "102000"));
@@ -298,14 +306,14 @@ test("an owner /close during scanning closes the conversation and still receives
   const acknowledged = await waitForState(workspace, state => state.fixtures.discord.reactions?.some(row =>
     row.messageId === "102000" && decodeURIComponent(row.emoji) === "✅"));
   assert.equal(acknowledged.fixtures.discord.reactions.find(row => row.messageId === "102000").authorization,
-    "Bot token-demo");
+    "Bot fixture-root-token");
   assert.equal(acknowledged.fixtures.discord.messages?.length ?? 0, 0);
   assert.equal(acknowledged.fixtures.codex.appServerInvocations.length, 0);
   await stop(workspace, stateDir, worker);
 });
 
 test("historical eligibility requires an owner reply answered by the assigned bot", async () => {
-  const workspace = createWorkspace();
+  const workspace = createBridgeWorkspace();
   const cases = {
     guestonly: { history: [["11", "08:01", "bot", "Sure"], ["10", "08:00", "guest", "Can you help?"]],
       state: "open-paused", basis: "no-owner-participation" },
@@ -329,10 +337,10 @@ test("historical eligibility requires an owner reply answered by the assigned bo
     eyes: { history: [["81", "08:05", "bot", "👀"], ["80", "08:00", "owner", "Look at this"]],
       state: "awaiting-owner", basis: "historical-owner-then-bot-approximation", response: "81" },
   };
-  const stateDir = setup(workspace, Object.fromEntries(Object.keys(cases).map(name => [name, `${name}-channel`])));
+  const stateDir = await setup(workspace, Object.fromEntries(Object.keys(cases).map(name => [name, `${name}-channel`])));
   seedHistory(workspace, Object.fromEntries(Object.entries(cases).map(([name, row]) => [`${name}-channel`,
     row.history.map(([id, time, author, content]) => message(`${name}-${id}`, `2026-09-20T${time}:00Z`,
-      author === "bot" ? `app-${name}` : author, content))])));
+      author === "bot" ? `hook-${name}` : author, content))])));
   await command(workspace, stateDir, "discover");
   const worker = startWorker(workspace, stateDir, "2026-09-20T08:10:00Z");
   const ready = await waitForStatus(workspace, stateDir, current => Object.keys(cases).every(name =>
@@ -348,10 +356,10 @@ test("historical eligibility requires an owner reply answered by the assigned bo
 });
 
 test("known active-turn progress is not a historical completion until the live turn completes", async () => {
-  const workspace = createWorkspace();
-  const stateDir = setup(workspace);
+  const workspace = createBridgeWorkspace();
+  const stateDir = await setup(workspace);
   seedHistory(workspace, { channel: [
-    message("92", "2026-09-20T08:01:00Z", "app-demo", "Still running the tests…"),
+    message("92", "2026-09-20T08:01:00Z", "hook-demo", "Still running the tests…"),
     message("91", "2026-09-20T08:00:00Z", "owner", "Run the suite"),
   ] });
   await adapterEvent(workspace, stateDir, "owner_activity", "owner-91", "2026-09-20T08:00:00Z", {
@@ -376,13 +384,13 @@ test("known active-turn progress is not a historical completion until the live t
 });
 
 test("owner reaction membership acknowledges only when its ordering is established", async () => {
-  const workspace = createWorkspace();
+  const workspace = createBridgeWorkspace();
   const names = ["onanswer", "older", "guestreact", "selfonly", "recorded"];
-  const stateDir = setup(workspace, Object.fromEntries(names.map(name => [name, `${name}-channel`])));
+  const stateDir = await setup(workspace, Object.fromEntries(names.map(name => [name, `${name}-channel`])));
   const reacted = (emoji, count = 1, me = false) => ({ reactions: [{ emoji, count, me }] });
   const exchange = (name, progressExtra, answerExtra) => [
-    message(`${name}-3`, "2026-09-20T08:05:00Z", `app-${name}`, "Done", answerExtra),
-    message(`${name}-2`, "2026-09-20T08:01:00Z", `app-${name}`, "Working", progressExtra),
+    message(`${name}-3`, "2026-09-20T08:05:00Z", `hook-${name}`, "Done", answerExtra),
+    message(`${name}-2`, "2026-09-20T08:01:00Z", `hook-${name}`, "Working", progressExtra),
     message(`${name}-1`, "2026-09-20T08:00:00Z", "owner", "Please do it"),
   ];
   seedHistory(workspace, {
@@ -396,7 +404,7 @@ test("owner reaction membership acknowledges only when its ordering is establish
     "recorded-2|👀": ["owner"],
   } });
   await adapterEvent(workspace, stateDir, "owner_activity", "recorded-reaction", "2026-09-20T08:02:00Z", {
-    project: "recorded", channel_id: "recorded-channel", bot_id: "bot-recorded",
+    project: "recorded", channel_id: "recorded-channel", bot_id: "router:hook-recorded",
     assignment_generation: "gen-recorded", actor_id: "owner", source_message_id: "recorded-2",
     activity_kind: "reaction" });
   await command(workspace, stateDir, "discover");
@@ -420,12 +428,12 @@ test("owner reaction membership acknowledges only when its ordering is establish
 });
 
 test("denied history suspends the channel with resumable progress instead of skipping it", async () => {
-  const workspace = createWorkspace();
-  const stateDir = setup(workspace);
+  const workspace = createBridgeWorkspace();
+  const stateDir = await setup(workspace);
   const worker = await scanFirstPass(workspace, stateDir, "2026-09-24T12:00:00Z");
-  const seed = readState(workspace.stateDir);
-  seed.fixtures.discord.restFailures = [{ method: "GET", path: "/api/v10/channels/channel/messages", status: 403 }];
-  writeState(seed, workspace.stateDir);
+  updateState(workspace.stateDir, (seed) => {
+    seed.fixtures.discord.restFailures = [{ method: "GET", path: "/api/v10/channels/channel/messages", status: 403 }];
+  });
   worker.setClock("2026-09-24T12:00:30Z");
   await waitForFixture(workspace, state => state.fixtures.discord.restFailureUses?.length === 1);
   await new Promise(resolve => setTimeout(resolve, 400));
@@ -448,8 +456,8 @@ test("denied history suspends the channel with resumable progress instead of ski
 });
 
 test("a crashed scan resumes from its last recorded cursor after restart", async () => {
-  const workspace = createWorkspace();
-  const stateDir = setup(workspace);
+  const workspace = createBridgeWorkspace();
+  const stateDir = await setup(workspace);
   seedHistory(workspace, { channel: longHistory(1150) }, { crashAfterHistoryPages: 5 });
   await command(workspace, stateDir, "discover");
   const first = startWorker(workspace, stateDir, "2026-09-24T12:00:00Z");
@@ -472,8 +480,8 @@ test("a crashed scan resumes from its last recorded cursor after restart", async
 });
 
 test("an assignment change before commit discards the old scan and rescans the new generation", async () => {
-  const workspace = createWorkspace();
-  const stateDir = setup(workspace);
+  const workspace = createBridgeWorkspace();
+  const stateDir = await setup(workspace);
   const worker = await scanFirstPass(workspace, stateDir, "2026-09-24T12:00:00Z");
   const changed = await command(workspace, stateDir, "assignment-changed", { args: ["assignment-changed",
     "--project-root", workspace.repoDir, "--state-dir", stateDir, "--project", "demo"] });
@@ -495,19 +503,19 @@ test("an assignment change before commit discards the old scan and rescans the n
 });
 
 test("history keeps a persisted closure unless it shows a later normal owner message", async () => {
-  const workspace = createWorkspace();
-  const stateDir = setup(workspace, { kept: "kept-channel", reopened: "reopened-channel" });
+  const workspace = createBridgeWorkspace();
+  const stateDir = await setup(workspace, { kept: "kept-channel", reopened: "reopened-channel" });
   seedHistory(workspace, {
     // The /close message itself was deleted; only the recorded closure knows it.
-    "kept-channel": [message("kept-3", "2026-09-20T09:30:00Z", "app-kept", "Late answer"),
+    "kept-channel": [message("kept-3", "2026-09-20T09:30:00Z", "hook-kept", "Late answer"),
       message("kept-1", "2026-09-20T08:00:00Z", "owner", "Question")],
-    "reopened-channel": [message("reopened-3", "2026-09-20T09:30:00Z", "app-reopened", "Answer"),
+    "reopened-channel": [message("reopened-3", "2026-09-20T09:30:00Z", "hook-reopened", "Answer"),
       message("reopened-2", "2026-09-20T09:20:00Z", "owner", "Actually, one more"),
       message("reopened-1", "2026-09-20T08:00:00Z", "owner", "Question")],
   });
   for (const name of ["kept", "reopened"]) {
     await adapterEvent(workspace, stateDir, "close_requested", `${name}-close`, "2026-09-20T09:00:00Z", {
-      project: name, channel_id: `${name}-channel`, bot_id: `bot-${name}`, assignment_generation: `gen-${name}`,
+      project: name, channel_id: `${name}-channel`, bot_id: `router:hook-${name}`, assignment_generation: `gen-${name}`,
       actor_id: "owner", source_message_id: `${name}-deleted-close`, command: "/close" });
   }
   await command(workspace, stateDir, "discover");

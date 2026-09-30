@@ -173,8 +173,8 @@ def next_request(db: sqlite3.Connection, usable: dict, now: datetime) -> dict | 
         assignment = usable.get(row["project"])
         status = row["reconciliation_status"]
         if status not in STARTABLE or assignment is None or (
-                assignment["generation"], assignment["channel_id"], assignment["bot_id"]) != (
-                row["assignment_generation"], row["channel_id"], row["bot_id"]):
+                assignment["generation"], assignment["channel_id"], assignment["identity"]) != (
+                row["assignment_generation"], row["channel_id"], row["identity"]):
             continue
         found = db.execute("SELECT * FROM discoveries WHERE project=? AND assignment_generation=?",
                            (row["project"], row["assignment_generation"])).fetchone()

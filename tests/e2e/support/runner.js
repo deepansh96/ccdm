@@ -43,6 +43,7 @@ const HOST_WRAPPERS = new Map([
   ["head", "/usr/bin/head"],
   ["ls", "/bin/ls"],
   ["mkdir", "/bin/mkdir"],
+  ["mv", "/bin/mv"],
   ["python3", null],
   ["sed", null],
   ["tr", "/usr/bin/tr"],
@@ -219,7 +220,7 @@ function normalizeState(value) {
     fixtures: {
       ...base.fixtures,
       ...(value?.fixtures || {}),
-      claude: { invocations: value?.fixtures?.claude?.invocations || [] },
+      claude: { ...(value?.fixtures?.claude || {}), invocations: value?.fixtures?.claude?.invocations || [] },
       curl: {
         requests: value?.fixtures?.curl?.requests || [],
         routes: value?.fixtures?.curl?.routes || [],
@@ -339,12 +340,11 @@ function activeOwnedProcesses(state) {
   );
 }
 
-function spawnPlaceholder(readyFile = "") {
-  const child = spawn(process.execPath, ["-e", "if (process.env.READY_FILE) setTimeout(() => require('fs').writeFileSync(process.env.READY_FILE, 'ready'), 300); setInterval(() => {}, 1000)"], {
+function spawnPlaceholder() {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
     detached: true,
     env: {
       CCDM_FIXTURE_PLACEHOLDER: "1",
-      READY_FILE: readyFile,
       CCDM_TEST_STATE: stateDir,
     },
     stdio: "ignore",
@@ -356,21 +356,16 @@ function spawnPlaceholder(readyFile = "") {
 function parseClaudeLaunch(shellCommand) {
   const quoted =
     /^cd '([\\s\\S]*)' && ([\\s\\S]*?) claude ([\\s\\S]+)$/.exec(shellCommand);
-  const unquoted = quoted ? null : /^cd ([^&]+) && DISCORD_STATE_DIR=([^\\s]+) claude ([\\s\\S]+)$/.exec(shellCommand);
-  if (!quoted && !unquoted) {
+  if (!quoted) {
     throw new Error(\`unsupported tmux launch command: \${shellCommand}\`);
   }
   const env = {};
-  if (quoted) {
-    const envRe = /([A-Z_]+)=(?:'([^']*)'|([^\\s]+))/g;
-    for (const match of quoted[2].matchAll(envRe)) env[match[1]] = match[2] ?? match[3];
-  } else {
-    env.DISCORD_STATE_DIR = unquoted[2];
-  }
-  const claudeArgs = (quoted ? quoted[3] : unquoted[3]).trim().split(/\\s+/);
+  const envRe = /([A-Z_]+)=(?:'([^']*)'|([^\\s]+))/g;
+  for (const match of quoted[2].matchAll(envRe)) env[match[1]] = match[2] ?? match[3];
+  const claudeArgs = quoted[3].trim().split(/\\s+/);
   validateClaudeInvocation(claudeArgs, env);
   return {
-    cwd: quoted ? quoted[1] : unquoted[1],
+    cwd: quoted[1],
     env,
     claudeArgs,
   };
@@ -387,17 +382,12 @@ function parseCodexBridgeLaunch(shellCommand) {
   for (const envMatch of envText.matchAll(envRe)) {
     env[envMatch[1]] = envMatch[2] ?? envMatch[3];
   }
+  // Every Codex launch is a Router launch: it carries the launch key file path
+  // instead of any bot identity; root's names no project.
   const required = [
-    "BOT_TOKEN",
-    "CHANNEL_ID",
-    "PROJECT_DIR",
-    "WS_PORT",
-    "ALLOWED_USER_IDS",
-    "GUILD_ID",
-    "ROOT_BOT_APP_ID",
-    "BOT_APP_ID",
-    "BOT_DISPLAY_NAME",
-    "CODEX_HOME",
+    "CCDM_ROUTER_KEY_FILE",
+    env.CCDM_ROUTER_ROLE === "root" ? "CCDM_ROUTER_ROLE" : "CCDM_CODEX_PROJECT",
+    "CCDM_ROUTER_STATE_DIR", "CHANNEL_ID", "PROJECT_DIR", "WS_PORT", "ALLOWED_USER_IDS", "CODEX_HOME",
   ];
   for (const name of required) {
     if (!env[name]) {
@@ -418,20 +408,18 @@ function parseTmuxLaunch(shellCommand) {
   return { kind: "claude-listener", ...parseClaudeLaunch(shellCommand) };
 }
 
+// Every Claude launch is a Router launch: the CCDM channel and a launch key
+// file path, never the official Discord plugin or a bot state directory.
 function validateClaudeInvocation(claudeArgs, env) {
-  const channelsIndex = claudeArgs.indexOf("--channels");
   const developmentIndex = claudeArgs.indexOf("--dangerously-load-development-channels");
-  if (!(
-    (channelsIndex !== -1 && claudeArgs[channelsIndex + 1]?.startsWith("plugin:discord")) ||
-    (developmentIndex !== -1 && claudeArgs[developmentIndex + 1] === "server:discord")
-  )) {
-    throw new Error("claude listener must use the official or filtered Discord channel");
+  if (developmentIndex === -1 || claudeArgs[developmentIndex + 1] !== "server:ccdm" || claudeArgs.includes("--channels")) {
+    throw new Error("claude listener must use the CCDM channel");
   }
   if (!claudeArgs.includes("--dangerously-skip-permissions")) {
     throw new Error("claude listener must use --dangerously-skip-permissions");
   }
-  if (!env.DISCORD_STATE_DIR) {
-    throw new Error("DISCORD_STATE_DIR is required for claude listener");
+  if (!env.CCDM_ROUTER_KEY_FILE || env.DISCORD_STATE_DIR) {
+    throw new Error("CCDM_ROUTER_KEY_FILE, and no DISCORD_STATE_DIR, is required for claude listener");
   }
 }
 
@@ -458,6 +446,158 @@ function writeClaudeSession(pid, sessionId, configDir) {
   const sessionsDir = path.join(baseDir, "sessions");
   fs.mkdirSync(sessionsDir, { recursive: true });
   fs.writeFileSync(path.join(sessionsDir, \`\${pid}.json\`), \`\${JSON.stringify({ sessionId }, null, 2)}\\n\`);
+}
+
+const DEV_CHANNEL_PROMPT = "WARNING: Loading development channels\\n\\n--dangerously-load-development-channels is for local channel development only.\\n\\n❯ 1. I am using this for local development\\n  2. Exit\\n";
+
+// The fake claude for a CCDM channel launch, detached like a tmux pane process.
+function spawnRouterClaude(name, launch) {
+  const child = spawn(process.execPath, [__filename, "claude", ...launch.claudeArgs], {
+    cwd: launch.cwd,
+    detached: true,
+    env: { ...process.env, ...launch.env, CCDM_FIXTURE_TMUX_SESSION: name },
+    stdio: "ignore",
+  });
+  child.unref();
+  return child.pid;
+}
+
+// A router Codex launch runs the real bridge, detached like a tmux pane
+// process, against the fake Codex app-server registered for its port.
+function spawnRouterBridge(launch) {
+  const logFile = fs.openSync(path.join(stateDir, \`codex-bridge-\${Date.now()}.log\`), "a");
+  const child = spawn(process.execPath, [path.join(launch.cwd, "scripts/codex-bridge.js")], {
+    cwd: launch.cwd,
+    detached: true,
+    env: { ...process.env, ...launch.env },
+    stdio: ["ignore", logFile, logFile],
+  });
+  fs.closeSync(logFile);
+  child.unref();
+  return child.pid;
+}
+
+function unquote(value) {
+  return String(value || "").replace(/^'([\\s\\S]*)'$/, "$1");
+}
+
+// A fake claude that speaks MCP stdio to its "ccdm" server: it waits for the
+// development-channel confirmation, initializes the server, records every
+// channel notification, and calls the reply tool when a test scripts
+// \`fixtures.claude.replyText\`. Like Claude, it runs the command hooks from
+// \`--settings\`: SessionStart once the server is up, and Stop after each
+// notification's tool calls finish.
+function runRouterClaudeHost() {
+  const sessionName = process.env.CCDM_FIXTURE_TMUX_SESSION;
+  const record = (field, value) => updateState((state) => {
+    state.fixtures.claude[field] = [...(state.fixtures.claude[field] || []), value];
+    return state;
+  });
+  const waitForAccept = setInterval(() => {
+    const session = readState().fixtures.tmux.sessions[sessionName];
+    if (!session) process.exit(0);
+    if (session.devChannelPrompt !== "accepted") return;
+    clearInterval(waitForAccept);
+    startServer();
+  }, 50);
+
+  const sessionId = \`fixture-session-\${process.pid}\`;
+  let hooks = {};
+  try {
+    hooks = JSON.parse(fs.readFileSync(unquote(args[args.indexOf("--settings") + 1]), "utf8")).hooks || {};
+  } catch {
+    // No settings, no hooks.
+  }
+  const hookEnv = { ...process.env, PATH: \`\${path.dirname(process.execPath)}:\${process.env.PATH || ""}\` };
+  async function runHooks(event, fields = {}) {
+    const input = JSON.stringify({ hook_event_name: event, session_id: sessionId, ...fields });
+    for (const hook of (hooks[event] || []).flatMap((group) => group.hooks || [])) {
+      if (hook.type !== "command") continue;
+      const exitCode = await new Promise((done) => {
+        const child = spawn("/bin/sh", ["-c", hook.command], { env: hookEnv, stdio: ["pipe", "ignore", "ignore"] });
+        child.on("exit", done);
+        child.stdin.end(input);
+      });
+      record("hookRuns", { event, exitCode });
+    }
+  }
+
+  function startServer() {
+    const configPath = unquote(args[args.indexOf("--mcp-config") + 1]);
+    const server = JSON.parse(fs.readFileSync(configPath, "utf8")).mcpServers.ccdm;
+    const command = server.command === "node" ? process.execPath : server.command;
+    const serverEnv = { ...process.env, ...(server.env || {}) };
+    // Both process environments, so tests can grep them for credentials.
+    record("sessionEnvironments", { process: "claude", env: process.env });
+    record("sessionEnvironments", { process: "ccdm", env: serverEnv });
+    const child = spawn(command, server.args || [], {
+      env: serverEnv,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const logFile = path.join(stateDir, \`claude-channel-\${process.pid}.log\`);
+    child.stderr.on("data", (chunk) => fs.appendFileSync(logFile, chunk));
+    const stop = () => { child.kill("SIGTERM"); process.exit(0); };
+    process.on("SIGTERM", stop);
+    process.on("SIGINT", stop);
+    child.on("exit", () => record("channelServerExits", { pid: child.pid }));
+    let nextId = 1;
+    const write = (message) => child.stdin.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\\n");
+    const call = (method, params) => { const id = nextId++; write({ id, method, params }); return id; };
+    const toolCalls = new Map();
+    // \`fixtures.claude.toolScript\` runs its tool calls in order for each
+    // notification. String arguments expand {{chat_id}} and {{message_id}} from
+    // the notification and {{last_id}} from the previous result's "(id: X)".
+    async function runToolScript(steps, meta) {
+      let lastId = "";
+      const expand = (value) => typeof value === "string"
+        ? value.replace(/\\{\\{(chat_id|message_id|last_id)\\}\\}/g, (_, key) => key === "last_id" ? lastId : meta[key])
+        : Array.isArray(value) ? value.map(expand) : value;
+      for (const step of steps) {
+        const input = Object.fromEntries(Object.entries(step.arguments || {}).map(([key, value]) => [key, expand(value)]));
+        const result = await new Promise((done) => {
+          toolCalls.set(call("tools/call", { name: step.name, arguments: input }), { name: step.name, done });
+        });
+        lastId = /\\(id: ([^)]+)\\)/.exec(result?.content?.[0]?.text || "")?.[1] || lastId;
+      }
+    }
+    // One turn at a time: each notification's tool calls, then the Stop hook.
+    let turns = runHooks("SessionStart", { source: "startup" });
+    const initializeId = call("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "claude-fixture", version: "1" } });
+    let buffer = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk;
+      let newline;
+      while ((newline = buffer.indexOf("\\n")) >= 0) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (!line.trim()) continue;
+        const message = JSON.parse(line);
+        if (message.id === initializeId) {
+          record("channelServers", { serverInfo: message.result.serverInfo, capabilities: message.result.capabilities });
+          write({ method: "notifications/initialized" });
+        } else if (message.method === "notifications/claude/channel") {
+          record("channelNotifications", message.params);
+          const { replyText, toolScript } = readState().fixtures.claude;
+          const { meta } = message.params;
+          turns = turns.then(async () => {
+            if (replyText) {
+              await new Promise((done) => {
+                toolCalls.set(call("tools/call", { name: "reply", arguments: { chat_id: meta.chat_id, text: replyText } }), { name: "reply", done });
+              });
+            }
+            if (toolScript) await runToolScript(toolScript, meta);
+            await runHooks("Stop", { stop_hook_active: false, background_tasks: [], session_crons: [] });
+          });
+        } else if (toolCalls.has(message.id)) {
+          const pending = toolCalls.get(message.id);
+          toolCalls.delete(message.id);
+          record("toolResults", { name: pending.name, result: message.result, error: message.error });
+          pending.done?.(message.result);
+        }
+      }
+    });
+  }
 }
 
 function runTmux() {
@@ -500,17 +640,31 @@ function runTmux() {
     const priorKillAttempts =
       tmuxState.lastKilledSessions?.[name]?.killAttempts ?? preexistingSession?.killAttempts ?? 0;
     const launch = parseTmuxLaunch(shellCommand);
-    const readyFile = tmuxState.startupMode ? "" : launch.env.CODEX_STARTUP_READY_FILE;
-    const pid = spawnPlaceholder(readyFile);
-    const sessionId = \`fixture-session-\${pid}\`;
+    // A CCDM channel launch runs the fake claude, which hosts the real channel
+    // server once the development-channel confirmation is accepted.
+    const routerChannel = launch.kind === "claude-listener" && launch.claudeArgs.includes("server:ccdm");
+    const routerBridge = launch.kind === "codex-bridge" && Boolean(launch.env.CCDM_ROUTER_KEY_FILE);
+    const pid = routerChannel
+      ? spawnRouterClaude(name, launch)
+      : routerBridge ? spawnRouterBridge(launch) : spawnPlaceholder();
+    // A \`--resume <id>\` launch continues that session, as Claude does.
+    const resumeIndex = launch.kind === "claude-listener" ? launch.claudeArgs.indexOf("--resume") : -1;
+    const sessionId = resumeIndex >= 0 ? unquote(launch.claudeArgs[resumeIndex + 1]) : \`fixture-session-\${pid}\`;
     const processCommand =
-      launch.kind === "codex-bridge"
+      routerBridge
+        ? \`node scripts/codex-bridge.js CHANNEL_ID='\${launch.env.CHANNEL_ID}' WS_PORT='\${launch.env.WS_PORT}' CCDM_ROUTER_KEY_FILE='\${launch.env.CCDM_ROUTER_KEY_FILE}'\`
+        : launch.kind === "codex-bridge"
         ? \`node scripts/codex-bridge.js CHANNEL_ID='\${launch.env.CHANNEL_ID}' BOT_APP_ID='\${launch.env.BOT_APP_ID}' WS_PORT='\${launch.env.WS_PORT}'\`
-        : \`claude \${launch.claudeArgs.join(" ")} DISCORD_STATE_DIR='\${launch.env.DISCORD_STATE_DIR}'\${launch.env.CLAUDE_CONFIG_DIR ? \` CLAUDE_CONFIG_DIR='\${launch.env.CLAUDE_CONFIG_DIR}'\` : ""}\`;
+        : \`claude \${launch.claudeArgs.join(" ")} CCDM_ROUTER_KEY_FILE='\${launch.env.CCDM_ROUTER_KEY_FILE}'\`;
+    const devChannelPrompt = routerChannel ? (tmuxState.devChannelPrompt === "never" ? "never" : "pending") : undefined;
     const paneOutput =
       launch.kind === "codex-bridge"
         ? "Codex-Discord bridge running\\nListening in #channel-id\\n"
-        : "Listening for channel messages\\n";
+        : devChannelPrompt === "pending"
+          ? DEV_CHANNEL_PROMPT
+          : devChannelPrompt === "never"
+            ? "Starting Claude Code\\n"
+            : "Listening for channel messages\\n";
 
     updateState((state) => {
       if (state.fixtures.tmux.sessions[name]) {
@@ -526,6 +680,7 @@ function runTmux() {
         env: launch.env,
         bridgeCommand: launch.bridgeCommand,
         paneOutput,
+        ...(devChannelPrompt ? { devChannelPrompt } : {}),
         pid,
         killAttempts: priorKillAttempts,
         shellCommand,
@@ -618,6 +773,10 @@ function runTmux() {
     updateState((state) => {
       const session = state.fixtures.tmux.sessions[name] || { name };
       session.sendKeys = [...(session.sendKeys || []), args.slice(targetIndex + 2)];
+      if (session.devChannelPrompt === "pending" && args[targetIndex + 2] === "Enter") {
+        session.devChannelPrompt = "accepted";
+        session.paneOutput = "Listening for channel messages from: server:ccdm\\n";
+      }
       state.fixtures.tmux.sessions[name] = session;
       return state;
     });
@@ -671,8 +830,7 @@ function runPkill() {
 
 function runClaude() {
   if (args.length === 1 && args[0] === "--version") {
-    console.log(process.env.CCDM_FIXTURE_CLAUDE_VERSION ||
-      (process.env.CCDM_CLAUDE_REMINDER_ADAPTER === "1" ? "2.1.281 (Claude Code fixture)" : "Claude Code fixture 1.0.0"));
+    console.log(process.env.CCDM_FIXTURE_CLAUDE_VERSION || "Claude Code fixture 1.0.0");
     return;
   }
   try {
@@ -680,6 +838,10 @@ function runClaude() {
   } catch (error) {
     console.error(error.message);
     process.exit(2);
+  }
+  if (args.includes("server:ccdm")) {
+    runRouterClaudeHost();
+    return;
   }
   const sessionId = \`fixture-session-\${process.pid}\`;
   const invocationEnv = { DISCORD_STATE_DIR: process.env.DISCORD_STATE_DIR };

@@ -1,10 +1,9 @@
 #!/usr/bin/env node
 
-const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const { spawn } = require("child_process");
 const { createHmac, randomBytes } = require("crypto");
-const { writeFile, mkdir, mkdtemp, readFile, rm, rename } = require("fs/promises");
-const { rmSync } = require("fs");
+const { writeFile, mkdir, mkdtemp, readFile, rm } = require("fs/promises");
+const { renameSync, rmSync, writeFileSync } = require("fs");
 const os = require("os");
 const path = require("path");
 const WebSocket = require("ws");
@@ -20,21 +19,28 @@ process.env.CCDM_REMINDER_STATE_DIR = REMINDER_STATE_DIR;
 process.env.CCDM_REMINDER_CONTEXT_FILE = REMINDER_CONTEXT_FILE;
 process.env.CCDM_REMINDER_RECEIPTS_DIR = REMINDER_RECEIPTS_DIR;
 const reminderAdapter = require("./conversation-reminder-adapter.js");
+const { createRouterTransport } = require("./codex-bridge-transport.js");
+const routerPaths = require("./router/paths.js");
+const { MAX_TIMEOUT_MS: ROUTER_MAX_TIMEOUT_MS } = require("./router/deadlines.js");
 
-const BOT_TOKEN = process.env.BOT_TOKEN;
+// The launch channel: root's primary channel, and the name of a project's
+// Discord MCP server.
 const CHANNEL_ID = process.env.CHANNEL_ID;
+// A project's current channel. The Router may move it after a registry
+// channel move (applyProjectScope); root's never changes.
+let projectChannelId = CHANNEL_ID;
 const PROJECT_DIR = process.env.PROJECT_DIR;
 const WS_PORT = parseInt(process.env.WS_PORT || "18300", 10);
+// Root mode only: a project bridge trusts the Router, which authorizes the
+// owner and current guests from the hot-reloaded registry.
 const ALLOWED_USER_IDS = new Set(
   (process.env.ALLOWED_USER_IDS || process.env.ALLOWED_USER_ID || "")
     .split(",")
     .map((id) => id.trim())
     .filter(Boolean)
 );
-const GUILD_ID = process.env.GUILD_ID;
 const ROOT_BOT_APP_ID = process.env.ROOT_BOT_APP_ID;
 const BOT_APP_ID = process.env.BOT_APP_ID;
-const BOT_DISPLAY_NAME = process.env.BOT_DISPLAY_NAME || "codex";
 const CODEX_MODEL = process.env.CODEX_MODEL || "";
 const CODEX_REASONING_EFFORT = process.env.CODEX_REASONING_EFFORT || "";
 const CODEX_SERVICE_TIER = process.env.CODEX_SERVICE_TIER || "";
@@ -51,14 +57,6 @@ const AUDIO_TRANSCRIPTION_LANGUAGE =
   process.env.CODEX_BRIDGE_AUDIO_TRANSCRIPTION_LANGUAGE || "en";
 const TEXT_REPLY_FALLBACK =
   process.env.CODEX_BRIDGE_TEXT_REPLY_FALLBACK === "1";
-const ROOT_MULTI_CHANNEL = envFlag(
-  false,
-  "ROOT_MULTI_CHANNEL",
-  "CODEX_BRIDGE_ROOT_MULTI_CHANNEL"
-);
-const ROOT_ACCESS_FILE =
-  process.env.ROOT_ACCESS_FILE ||
-  path.join(os.homedir(), ".claude", "channels", "discord", "access.json");
 const DISCORD_REPLY_TOKEN = randomBytes(16).toString("hex");
 const DISCORD_CHANNEL_SCOPE_SECRET = randomBytes(32).toString("hex");
 const TURN_ID_RECONCILIATION_METHODS = new Set([
@@ -67,11 +65,20 @@ const TURN_ID_RECONCILIATION_METHODS = new Set([
   "item/agentMessage/delta",
 ]);
 const FORWARDED_REACTIONS = new Set(["👍", "👎"]);
+// The Router serves Discord: the launcher passes the launch key file path,
+// never a Discord token.
+const ROUTER_KEY_FILE = process.env.CCDM_ROUTER_KEY_FILE || "";
+// Root mode (restart-root-codex-agent.sh): the bridge is the Router's root
+// client, and root channels and allowed users come from the registry.
+const ROUTER_ROOT = process.env.CCDM_ROUTER_ROLE === "root";
+const ROOT_MULTI_CHANNEL = ROUTER_ROOT;
+const ROUTER_PROJECT = ROUTER_ROOT ? "" : process.env.CCDM_CODEX_PROJECT || "";
+const ROUTER_LAUNCH_DIR = path.join(routerPaths.stateDir(), "launches", ROUTER_ROOT ? ".root" : ROUTER_PROJECT);
+// The launcher waits on this file for the bridge's startup outcome.
+const LAUNCH_READY_FILE = process.env.CCDM_CHANNEL_READY_FILE || "";
 
-if (!BOT_TOKEN || !CHANNEL_ID || !PROJECT_DIR) {
-  console.error(
-    "Missing required env vars: BOT_TOKEN, CHANNEL_ID, PROJECT_DIR"
-  );
+if (!ROUTER_KEY_FILE || (!ROUTER_ROOT && !ROUTER_PROJECT) || !CHANNEL_ID || !PROJECT_DIR) {
+  console.error("Missing required env vars: CCDM_ROUTER_KEY_FILE, CCDM_CODEX_PROJECT, CHANNEL_ID, PROJECT_DIR");
   process.exit(1);
 }
 
@@ -91,14 +98,15 @@ let pendingBootstrapInstructionReason = null;
 let pendingCompactionChannelId = null;
 let messageQueue = [];
 let bridgePaused = false;
-let discordClient = null;
-let discordChannel = null;
+const discordTransport = createRouterTransport({
+  project: ROUTER_PROJECT, role: ROUTER_ROOT ? "root" : "project", keyFile: ROUTER_KEY_FILE,
+  launchDir: ROUTER_LAUNCH_DIR, registryPath: REGISTRY_PATH, primaryChannelId: CHANNEL_ID,
+});
 let codexProcess = null;
 let typingInterval = null;
 let activeOutputChannelId = null;
-let activeTypingChannel = null;
+let activeTypingChannelId = null;
 let threadResetting = false;
-let lastNicknameUpdate = 0;
 let fallbackLoggedCompletedItemTypes = new Set();
 let pendingTerminalError = null;
 let activeTurnHadProgress = false;
@@ -110,13 +118,11 @@ let activeReminderContext = null;
 let lastOwnerInteraction = null;
 let lastResumedInputReceiptId = null;
 let pendingInputNeededResumeTurnId = null;
-let rootAccess = null;
 let rootChannelAccess = new Map();
 let bridgeStopping = false;
 let sessionTerminationPromise = null;
 let discordChannelScopeDir = null;
 let discordChannelScopeFile = null;
-const NICKNAME_INTERVAL = 60000;
 const STREAM_FAILURE_MESSAGE =
   "stream disconnected before completion: response.failed event received";
 const STREAM_RECOVERY_PROMPT =
@@ -150,14 +156,11 @@ function shellQuote(value) {
 
 async function findCurrentProject() {
   const registry = JSON.parse(await readFile(REGISTRY_PATH, "utf8"));
-  for (const [projectName, project] of Object.entries(registry.projects || {})) {
-    if ((project.type || "claude") !== "codex") continue;
-    const bot = (registry.pool || []).find((entry) => entry.id === project.bot_id);
-    if (project.channel_id === CHANNEL_ID && (!BOT_APP_ID || bot?.app_id === BOT_APP_ID)) {
-      return { projectName, screenName: project.screen_name };
-    }
+  const project = registry.projects?.[ROUTER_PROJECT];
+  if (project?.type !== "codex" || project.channel_id !== projectChannelId) {
+    throw new Error(`No codex project ${ROUTER_PROJECT} in registry.json matches channel ${projectChannelId}`);
   }
-  throw new Error(`No codex project in registry.json matches channel ${CHANNEL_ID}`);
+  return { projectName: ROUTER_PROJECT, screenName: project.screen_name };
 }
 
 function scheduleRestart(projectName, screenName) {
@@ -303,17 +306,13 @@ function escapeRegExp(value) {
 
 function mentionsApp(msg, appId) {
   if (!appId) return false;
-  if (msg.mentions?.users?.has?.(appId)) return true;
+  if (msg.mentionedUserIds?.includes(appId)) return true;
   const mentionPattern = new RegExp(`<@!?${escapeRegExp(appId)}>`);
   return mentionPattern.test(msg.content || "");
 }
 
 function mentionsRootBot(msg) {
   return mentionsApp(msg, ROOT_BOT_APP_ID);
-}
-
-function mentionsThisBot(msg) {
-  return mentionsApp(msg, BOT_APP_ID);
 }
 
 function isCloseCommand(content) {
@@ -341,59 +340,49 @@ function stripThisBotMention(text) {
 
 async function loadRootAccess(log = true) {
   if (!ROOT_MULTI_CHANNEL) return;
-  const access = JSON.parse(await readFile(ROOT_ACCESS_FILE, "utf8"));
-  const channelAccess = new Map(Object.entries(access.groups || {}));
-  if (channelAccess.get(CHANNEL_ID)?.requireMention !== false) {
-    throw new Error(`Primary root channel ${CHANNEL_ID} is not configured as a no-mention channel in ${ROOT_ACCESS_FILE}`);
+  const registry = JSON.parse(await readFile(REGISTRY_PATH, "utf8"));
+  const rootChannels = (registry.root_channels || []).map(String);
+  if (!rootChannels.includes(CHANNEL_ID)) {
+    throw new Error(`Primary root channel ${CHANNEL_ID} is not in root_channels in ${REGISTRY_PATH}`);
   }
-  rootAccess = access;
-  rootChannelAccess = channelAccess;
-  if (log) {
-    console.log(`Root multi-channel routing enabled for ${rootChannelAccess.size} channel(s)`);
-  }
+  rootChannelAccess = new Map(rootChannels.map((channelId) => [channelId, { requireMention: false }]));
+  if (log) console.log(`Root multi-channel routing enabled for ${rootChannelAccess.size} channel(s)`);
 }
 
-function allowedRootUsersFor(channelConfig) {
-  const ids = [
-    ...ALLOWED_USER_IDS,
-    ...(rootAccess?.allowFrom || []),
-    ...(channelConfig?.allowFrom || []),
-  ].map((id) => String(id).trim()).filter(Boolean);
-  return new Set(ids);
+// The Router moved this project's Session Scope (a registry channel move):
+// later messages arrive from the new channel, and work already bound to the
+// old one (the active turn's output, typing, queued turns, a queued
+// compaction) follows it, since the Router now refuses the old channel.
+function applyProjectScope(scope) {
+  if (ROOT_MULTI_CHANNEL || scope.channel_id === projectChannelId) return;
+  const previous = projectChannelId;
+  const follow = (channelId) => (channelId === previous ? scope.channel_id : channelId);
+  projectChannelId = scope.channel_id;
+  activeOutputChannelId = activeOutputChannelId && follow(activeOutputChannelId);
+  activeTypingChannelId = activeTypingChannelId && follow(activeTypingChannelId);
+  pendingCompactionChannelId = pendingCompactionChannelId && follow(pendingCompactionChannelId);
+  for (const queued of messageQueue) queued.channelId = follow(queued.channelId);
+  console.log(`Router moved this session to channel ${projectChannelId}`);
 }
 
 async function shouldHandleDiscordMessage(msg) {
   if (msg.author.bot) return false;
-  if (!ROOT_MULTI_CHANNEL) {
-    if (msg.channel.id !== CHANNEL_ID) return false;
-    if (ALLOWED_USER_IDS.size > 0 && !ALLOWED_USER_IDS.has(msg.author.id)) return false;
-    if (mentionsRootBot(msg)) return false;
-    return true;
-  }
-
-  try {
-    await loadRootAccess(false);
-  } catch (err) {
-    console.error(`Root access reload failed: ${err.message || err}`);
-    return false;
-  }
-
-  const channelConfig = rootChannelAccess.get(msg.channel.id);
-  if (!channelConfig) return false;
-  const allowed = allowedRootUsersFor(channelConfig);
-  if (allowed.size > 0 && !allowed.has(msg.author.id)) return false;
-  if (channelConfig.requireMention !== false && !mentionsThisBot(msg)) return false;
+  // The Router delivers root only what addresses it: root-channel messages
+  // from allowed users and the owner's mentions in project channels.
+  if (ROOT_MULTI_CHANNEL) return true;
+  if (msg.channel.id !== projectChannelId) return false;
+  // The Router authorizes authors from the registry it hot-reloads, so it
+  // forwards only the owner and the channel's current guests; a launch-time
+  // allowlist here would drop guests granted after launch.
+  if (mentionsRootBot(msg)) return false;
   return true;
 }
 
-async function shouldHandleDiscordReaction(reaction, user) {
+async function shouldHandleDiscordReaction(channelId, user) {
   if (user.bot) return false;
-  const channelId = reaction.message.channelId || reaction.message.channel?.id;
   if (!channelId) return false;
-  if (!ROOT_MULTI_CHANNEL) {
-    return channelId === CHANNEL_ID &&
-      (ALLOWED_USER_IDS.size === 0 || ALLOWED_USER_IDS.has(user.id));
-  }
+  // A project's reactors are authorized by the Router, like its messages.
+  if (!ROOT_MULTI_CHANNEL) return channelId === projectChannelId;
 
   try {
     await loadRootAccess(false);
@@ -401,11 +390,8 @@ async function shouldHandleDiscordReaction(reaction, user) {
     console.error(`Root access reload failed: ${err.message || err}`);
     return false;
   }
-
-  const channelConfig = rootChannelAccess.get(channelId);
-  if (!channelConfig) return false;
-  const allowed = allowedRootUsersFor(channelConfig);
-  return allowed.size === 0 || allowed.has(user.id);
+  return rootChannelAccess.has(channelId) &&
+    (ALLOWED_USER_IDS.size === 0 || ALLOWED_USER_IDS.has(user.id));
 }
 
 function splitMessage(text, limit = 2000) {
@@ -475,57 +461,20 @@ function captureTextReplyFallback(item) {
   );
 }
 
-async function updateNickname(totalTokens, contextWindow) {
-  if (!GUILD_ID || !BOT_TOKEN || !contextWindow) return;
-  const now = Date.now();
-  if (now - lastNicknameUpdate < NICKNAME_INTERVAL) return;
-  lastNicknameUpdate = now;
-
-  const pct = Math.round((totalTokens / contextWindow) * 100);
-  // Discord caps guild nicknames at 32 chars. Trim the base name to fit so the
-  // % suffix always survives (otherwise long bot names make every update 400).
-  const suffix = ` · ${pct}%`;
-  const base = BOT_DISPLAY_NAME.slice(0, Math.max(0, 32 - suffix.length)).replace(/[\s·_-]+$/, "");
-  const nick = `${base}${suffix}`;
-  try {
-    const res = await fetch(
-      `https://discord.com/api/v10/guilds/${GUILD_ID}/members/@me`,
-      {
-        method: "PATCH",
-        headers: {
-          Authorization: `Bot ${BOT_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ nick }),
-      }
-    );
-    if (res.ok) {
-      console.log(`Nickname updated: ${nick}`);
-    } else {
-      const body = await res.text().catch(() => "");
-      console.error(
-        `Nickname update failed: Discord API ${res.status}${res.statusText ? ` ${res.statusText}` : ""}${body ? `: ${body}` : ""}`
-      );
-    }
-  } catch (err) {
-    console.error(`Nickname update failed: ${err.message || err}`);
-  }
+// Replies carry the context percentage; the Router formats it into the
+// webhook username.
+function recordContextPct(totalTokens, contextWindow) {
+  if (!contextWindow) return;
+  discordTransport.setContextPct(Math.round((totalTokens / contextWindow) * 100));
 }
 
-async function channelById(channelId) {
-  if (!channelId || !discordClient) return discordChannel;
-  if (discordChannel?.id === channelId) return discordChannel;
-  const cached = discordClient.channels.cache.get(channelId);
-  if (cached) return cached;
-  return await discordClient.channels.fetch(channelId);
-}
-
-async function startTyping(channelId = CHANNEL_ID) {
-  activeTypingChannel = await channelById(channelId);
-  if (!activeTypingChannel) return;
-  activeTypingChannel.sendTyping().catch(() => {});
+async function startTyping(channelId = projectChannelId) {
+  const channel = await discordTransport.fetchChannel(channelId);
+  activeTypingChannelId = channel?.id ?? null;
+  if (!channel) return;
+  discordTransport.sendTyping(channel.id).catch(() => {});
   typingInterval = setInterval(() => {
-    if (activeTypingChannel) activeTypingChannel.sendTyping().catch(() => {});
+    if (activeTypingChannelId) discordTransport.sendTyping(activeTypingChannelId).catch(() => {});
   }, 8000);
 }
 
@@ -534,18 +483,12 @@ function stopTyping() {
     clearInterval(typingInterval);
     typingInterval = null;
   }
-  activeTypingChannel = null;
+  activeTypingChannelId = null;
 }
 
-async function sendToDiscord(text, channelId = activeOutputChannelId || CHANNEL_ID) {
-  const channel = await channelById(channelId);
-  if (!channel || !text.trim()) return;
-  const chunks = splitMessage(text);
-  const sent = [];
-  for (const chunk of chunks) {
-    sent.push(await channel.send(chunk));
-  }
-  return sent;
+async function sendToDiscord(text, channelId = activeOutputChannelId || projectChannelId) {
+  if (!text.trim()) return;
+  return await discordTransport.send(channelId, splitMessage(text));
 }
 
 function recordSessionTermination() {
@@ -554,7 +497,7 @@ function recordSessionTermination() {
     const endingThreadId = threadId;
     const endingTurnId = activeTurnId;
     sessionTerminationPromise = (async () => {
-      const assignment = await reminderAdapter.resolveAssignmentForChannel(CHANNEL_ID, {
+      const assignment = await reminderAdapter.resolveAssignmentForChannel(projectChannelId, {
         requireCodex: true,
         ...(BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
       }).catch(() => null);
@@ -761,7 +704,7 @@ function handleNotification(msg) {
       if (msg.params?.tokenUsage) {
         const { last, modelContextWindow } = msg.params.tokenUsage;
         if (last && modelContextWindow) {
-          updateNickname(last.inputTokens, modelContextWindow);
+          recordContextPct(last.inputTokens, modelContextWindow);
         }
       }
       break;
@@ -843,7 +786,7 @@ async function onTurnCompleted(turn = {}) {
     : null);
   const recoveryAttempt = activeTurnRecoveryAttempt;
   const channelScopeToken = activeTurnChannelScopeToken;
-  const channelId = activeOutputChannelId || CHANNEL_ID;
+  const channelId = activeOutputChannelId || projectChannelId;
   if (terminalError || outputSuppressed) {
     deltaBuffer = "";
     fallbackText = "";
@@ -884,6 +827,8 @@ async function onTurnCompleted(turn = {}) {
   activeOutputChannelId = null;
   await clearDiscordChannelScope();
   turnActive = false;
+  // From here a new Discord message starts a turn instead of steering this one.
+  console.log(`[turn] Finished (${turn.status ?? "no status"}); bridge idle`);
   if (outputSuppressed && bootstrapCompletion) {
     const complete = bootstrapCompletion;
     bootstrapCompletion = null;
@@ -931,7 +876,7 @@ async function processQueue() {
   if (bridgePaused || threadResetting || turnActive || !threadId || messageQueue.length === 0) return;
   const { input, msg: queuedMsg, channelId, channelScopeToken } = messageQueue.shift();
   if (queuedMsg && !queuedMsg.synthetic) {
-    queuedMsg.reactions.cache.get("⏳")?.users.remove(queuedMsg.client.user.id).catch(() => {});
+    discordTransport.removeOwnReaction(queuedMsg, "⏳").catch(() => {});
   }
   await sendTurn(input, channelId, channelScopeToken, 0, queuedMsg);
 }
@@ -951,7 +896,7 @@ function canSteerRootScope(channelId, token) {
 async function routeInput(input, msg, channelId, channelScopeToken) {
   const queueInput = async () => {
     messageQueue.push({ input, msg, channelId, channelScopeToken });
-    if (msg && !msg.synthetic) await msg.react("⏳");
+    if (msg && !msg.synthetic) await discordTransport.react(msg, "⏳");
   };
 
   const rootScopeMatches = ROOT_MULTI_CHANNEL && canSteerRootScope(channelId, channelScopeToken);
@@ -1006,7 +951,7 @@ async function routeInput(input, msg, channelId, channelScopeToken) {
 
 async function sendTurn(
   input,
-  channelId = CHANNEL_ID,
+  channelId = projectChannelId,
   channelScopeToken = null,
   recoveryAttempt = 0,
   sourceMessage = null
@@ -1310,7 +1255,8 @@ async function buildInput(msg, textOverride = null) {
   } else if (text) {
     input.push({ type: "text", text });
   }
-  for (const att of msg.attachments.values()) {
+  for (const delivered of msg.attachments) {
+    const att = { ...delivered, url: await discordTransport.attachmentUrl(msg, delivered) };
     if (att.contentType && att.contentType.startsWith("image/")) {
       const dataUrl = await fetchAttachmentDataUrl(att.url, att.contentType);
       if (dataUrl) input.push({ type: "image", url: dataUrl });
@@ -1356,14 +1302,14 @@ async function buildInput(msg, textOverride = null) {
 }
 
 function buildReactionInput(reaction, user) {
-  const channelId = reaction.message.channelId || reaction.message.channel.id;
+  const channelId = reaction.message.channel.id;
   const source = reaction.message.content.trim().replace(/\s+/g, " ");
   const excerpt = source.length > 80 ? `${source.slice(0, 77)}...` : source;
   const text = `User ${user.globalName || user.username || user.id} reacted ${reaction.emoji.name} to your message${excerpt ? `: "${excerpt}"` : ""} (message ID: ${reaction.message.id}).`;
   const msg = {
     id: reaction.message.id,
     author: user,
-    channel: { id: channelId, name: reaction.message.channel?.name },
+    channel: { id: channelId, name: reaction.message.channel.name },
   };
   const channelScopeToken = ROOT_MULTI_CHANNEL
     ? createDiscordChannelScopeToken(msg)
@@ -1412,8 +1358,15 @@ async function registerDiscordMcp() {
     value: {
       command: "node",
       args: [MCP_SERVER_SCRIPT],
+      // Codex stops waiting for a tool after 60 s by default; large reads and
+      // exports may take up to the Router's longest per-op deadline.
+      tool_timeout_sec: Math.ceil(ROUTER_MAX_TIMEOUT_MS / 1000) + 30,
       env: {
-        BOT_TOKEN,
+        // The MCP server reaches the Router with the launch key file, and
+        // holds no Discord token.
+        CCDM_ROUTER_KEY_FILE: ROUTER_KEY_FILE,
+        CCDM_ROUTER_STATE_DIR: routerPaths.stateDir(),
+        ...(ROUTER_ROOT ? { CCDM_ROUTER_ROLE: "root" } : { CCDM_CODEX_PROJECT: ROUTER_PROJECT }),
         CHANNEL_ID,
         DISCORD_REPLY_TOKEN,
         CCDM_REMINDER_PROJECT_ROOT: ROOT_DIR,
@@ -1422,7 +1375,6 @@ async function registerDiscordMcp() {
         CCDM_REMINDER_RECEIPTS_DIR: REMINDER_RECEIPTS_DIR,
         ...(ROOT_MULTI_CHANNEL ? {
           DISCORD_CHANNEL_OVERRIDE: "1",
-          DISCORD_ACCESS_FILE: ROOT_ACCESS_FILE,
           DISCORD_CHANNEL_SCOPE_FILE: discordChannelScopeFile,
           DISCORD_CHANNEL_SCOPE_SECRET,
           DISCORD_GLOBAL_USER_IDS: [...ALLOWED_USER_IDS].join(","),
@@ -1488,49 +1440,19 @@ async function initializeCodex() {
 }
 
 function startDiscordBot() {
-  const client = new Client({
-    intents: [
-      GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.GuildMessageReactions,
-      GatewayIntentBits.MessageContent,
-    ],
-    partials: [Partials.Message, Partials.Reaction, Partials.User],
-  });
-  discordClient = client;
-
-  client.once("ready", async () => {
+  discordTransport.onScopeChange(applyProjectScope);
+  discordTransport.onReaction(async (event) => {
+    if (!(await shouldHandleDiscordReaction(event.channelId, event.user))) return;
+    let reaction;
     try {
-      console.log(`Discord bot logged in as ${client.user.tag}`);
-      discordChannel = client.channels.cache.get(CHANNEL_ID) || await client.channels.fetch(CHANNEL_ID);
-      if (!discordChannel) throw new Error("Discord channel unavailable");
-      console.log(`Listening in #${discordChannel.name}`);
-      if (process.env.CODEX_STARTUP_READY_FILE) {
-        const readyFile = process.env.CODEX_STARTUP_READY_FILE;
-        await writeFile(`${readyFile}.tmp`, "ready\n", { mode: 0o600 });
-        await rename(`${readyFile}.tmp`, readyFile);
-      }
-      if (ROOT_MULTI_CHANNEL) {
-        console.log(`Root routing active for ${rootChannelAccess.size} configured channel(s)`);
-      }
-    } catch (err) {
-      console.error("Discord startup failed:", err);
-      process.exit(1);
-    }
-  });
-
-  client.on("messageReactionAdd", async (reaction, user) => {
-    if (!(await shouldHandleDiscordReaction(reaction, user))) return;
-    try {
-      if (user.partial) await user.fetch();
-      if (reaction.partial) await reaction.fetch();
-      if (reaction.message.partial) await reaction.message.fetch();
+      reaction = await event.load();
     } catch (err) {
       console.log(`[discord] Failed to fetch reaction context: ${err.message || err}`);
       return;
     }
+    const { user } = reaction;
     if (user.bot) return;
-    const reactionChannelId = reaction.message.channelId || reaction.message.channel?.id;
+    const reactionChannelId = reaction.message.channel.id;
     const assignment = await reminderAdapter.resolveAssignmentForChannel(reactionChannelId, {
       requireCodex: true,
       ...(!ROOT_MULTI_CHANNEL && BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
@@ -1548,7 +1470,7 @@ function startDiscordBot() {
       });
     }
     if (recordedReminder) return;
-    if (!FORWARDED_REACTIONS.has(reaction.emoji.name) || reaction.message.author?.id !== client.user.id) return;
+    if (!FORWARDED_REACTIONS.has(reaction.emoji.name) || !(await discordTransport.isOwnMessage(reaction.message))) return;
 
     const { input, channelId, channelScopeToken } = buildReactionInput(reaction, user);
     console.log(`[discord] ${user.username}: ${reaction.emoji.name} on ${reaction.message.id}`);
@@ -1562,7 +1484,7 @@ function startDiscordBot() {
     await routeInput(input, reactionSource, channelId, channelScopeToken);
   });
 
-  client.on("messageCreate", async (msg) => {
+  discordTransport.onMessage(async (msg) => {
     if (!msg.author.bot && isCloseCommand(msg.content)) {
       // Root management routing reserves /close in every registered project
       // channel, whichever provider serves it; a project bridge only its own.
@@ -1603,7 +1525,7 @@ function startDiscordBot() {
     if (bridgeSlashCommand && text === "/pause") {
       console.log("[discord] /pause requested");
       bridgePaused = true;
-      await msg.react("⏸️");
+      await discordTransport.react(msg, "⏸️");
       await sendToDiscord("Bridge paused. New messages will be queued.", channelId);
       return;
     }
@@ -1612,14 +1534,14 @@ function startDiscordBot() {
       console.log("[discord] /unpause requested");
       bridgePaused = false;
       processQueue();
-      await msg.react("▶️");
+      await discordTransport.react(msg, "▶️");
       await sendToDiscord("Bridge unpaused.", channelId);
       return;
     }
 
     if (bridgeSlashCommand && text === "/compact") {
       console.log("[discord] /compact requested");
-      await msg.react("🔄");
+      await discordTransport.react(msg, "🔄");
       if (turnActive) {
         pendingCompactionChannelId = channelId;
         await sendToDiscord("Compaction queued.", channelId);
@@ -1631,7 +1553,7 @@ function startDiscordBot() {
 
     if (bridgeSlashCommand && text === "/clear") {
       console.log("[discord] /clear requested");
-      await msg.react("🔄");
+      await discordTransport.react(msg, "🔄");
       threadResetting = true;
       activeOutputChannelId = channelId;
       const previousThreadId = threadId;
@@ -1687,7 +1609,7 @@ function startDiscordBot() {
 
     if (bridgeSlashCommand && text === "/restart") {
       console.log("[discord] /restart requested");
-      await msg.react("🔄");
+      await discordTransport.react(msg, "🔄");
       try {
         if (ROOT_MULTI_CHANNEL) {
           const logPath = scheduleRootRestart();
@@ -1726,7 +1648,7 @@ function startDiscordBot() {
           `<@${ROOT_BOT_APP_ID}>`, `<@!${ROOT_BOT_APP_ID}>`,
         ].some(mention => ROOT_BOT_APP_ID && msg.content.includes(mention))
           ? "management-command"
-          : msg.attachments.size > 0 && !text ? "attachment" : "message",
+          : msg.attachments.length > 0 && !text ? "attachment" : "message",
       });
     }
 
@@ -1735,7 +1657,25 @@ function startDiscordBot() {
     await routeInput(input, msg, channelId, channelScopeToken);
   });
 
-  client.login(BOT_TOKEN);
+  void (async () => {
+    try {
+      const { userTag, scope } = await discordTransport.connect();
+      console.log(`Discord bot logged in as ${userTag}`);
+      // The Router's grant wins over the launch channel if they differ.
+      if (!ROOT_MULTI_CHANNEL && scope?.channel_id) applyProjectScope(scope);
+      const channel = await discordTransport.fetchChannel(projectChannelId);
+      if (!channel) throw new Error("Discord channel unavailable");
+      console.log(`Listening in #${channel.name}`);
+      reportLaunchReady({ ok: true, scope: { channel_id: channel.id } });
+      if (ROOT_MULTI_CHANNEL) {
+        console.log(`Root routing active for ${rootChannelAccess.size} configured channel(s)`);
+      }
+    } catch (err) {
+      console.error("Discord startup failed:", err);
+      reportLaunchReady({ ok: false, error: `Router hello failed: ${err.code || err.message}` });
+      process.exit(1);
+    }
+  })();
 
   let stopping = false;
   async function cleanup() {
@@ -1745,7 +1685,7 @@ function startDiscordBot() {
     console.log("Shutting down...");
     await recordSessionTermination();
     await reminderAdapter.clearActiveContext().catch(() => {});
-    client.destroy();
+    discordTransport.destroy();
     if (ws) ws.close();
     if (codexProcess) codexProcess.kill();
     if (discordChannelScopeDir) {
@@ -1770,7 +1710,20 @@ async function main() {
   console.log("Codex-Discord bridge running");
 }
 
+// The launcher reads the startup outcome from this file, written atomically.
+function reportLaunchReady(outcome) {
+  if (!LAUNCH_READY_FILE) return;
+  try {
+    const tmp = `${LAUNCH_READY_FILE}.${process.pid}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(outcome)}\n`, { mode: 0o600 });
+    renameSync(tmp, LAUNCH_READY_FILE);
+  } catch (err) {
+    console.error(`Launch outcome not recorded: ${err.message || err}`);
+  }
+}
+
 main().catch((err) => {
   console.error("Fatal:", err);
+  reportLaunchReady({ ok: false, error: String(err.message || err) });
   process.exit(1);
 });

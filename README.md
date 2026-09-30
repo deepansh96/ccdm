@@ -1,37 +1,41 @@
 # CCDM — Claude Code Discord Manager
 
-Manage multiple [Claude Code](https://docs.anthropic.com/en/docs/claude-code) instances from Discord. A **pool of Discord bots** is managed centrally — assign one to a project when needed, return it when done.
+Manage multiple [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and Codex sessions from Discord through **one bot**. A local **Router** holds that bot's token and connects each project channel to the one session serving it.
 
 ```
-Discord Server
+Discord Server (one bot: root)
   │
-  ├── #root              ← Root Agent listens here (no @mention needed)
+  ├── #root              ← root agent listens here (no @mention needed)
   │
-  ├── #my-app            ← bot2-my-app ONLY sees this channel
+  ├── #my-app            ← posts as "my-app-claude · 42%" (webhook ccdm-my-app)
   │     Claude Code running in ~/my-app/
   │
-  ├── #website           ← bot3-website ONLY sees this channel
-  │     Claude Code running in ~/website/
-  │
-  └── bot4, bot5, ...    (available in pool, not assigned)
+  └── #website           ← posts as "website-codex · 17%" (webhook ccdm-website)
+        Codex running in ~/website/
+
+Router (local daemon, holds the root token)
+  ├── root session       ← root channels + @mentions in project channels
+  ├── my-app session     ← Session Scope: #my-app only
+  └── website session    ← Session Scope: #website only
 ```
 
 ## How It Works
 
-The root agent is a Claude Code instance connected to Discord. It manages a **pool of Discord bots** (default limit: 50, configurable in `registry.json`). When you message it in `#root`, it can:
+The **Router** (`scripts/router.js`) is a local daemon supervised by launchd. It is the only CCDM component that holds a Discord bot credential: the root bot token. It receives every Discord event and delivers each message to the one session serving that channel. It also performs Discord actions (replies, edits, reactions, typing, reads, attachment downloads) on a session's behalf. Sessions talk to it over a private Unix socket with a per-launch key and never see a Discord token.
 
-- **Register bots** to specific Discord channels (each bot is isolated to only see its assigned channel)
-- **Deregister bots** and return them to the pool (channel stays, bot goes back)
-- **Start/stop/restart** Claude Code sessions for assigned projects
+The root agent is a Claude Code or Codex session that is itself a Router client. When you message it in `#root`, it can:
+
+- **Register projects** to Discord channels (it creates the channel and the project's webhook)
+- **Deregister projects** (it deletes the webhook and the registry entry; the channel stays)
+- **Start/stop/restart** Claude Code and Codex sessions for registered projects
 - **Report context usage** across all running sessions
 - **Show rate limits and usage stats** with visual progress bars
 - **Restart itself** without manual intervention
-- **Show live context usage** in bot Discord nicknames (e.g. `bot4-my-app · 42%`)
 - **Transcribe voice messages** using Whisper
 
-Each project gets its own Discord channel and bot. The bot is **locked to that one channel** via Discord permission overrides — it can't see anything else. You chat with each project in its own channel, no `@mention` needed. The root agent listens in `#root` without `@mention`, and can be `@mentioned` in project channels for management tasks.
+Each project has its own channel, its own session, and its own **Project Identity**: a per-channel webhook `ccdm-<project>` whose messages post as `<project>-<claude|codex> · N%`, with live context usage in the name. You chat with each project in its own channel, no `@mention` needed. The root agent listens in `#root` without `@mention`, and `@mentioning` the bot in a project channel reaches root only, never the project.
 
-CCDM is built on the [official Anthropic Discord plugin for Claude Code](https://github.com/anthropics/claude-plugins-official/blob/main/external_plugins/discord/README.md). Refer to that README for details on the plugin itself, including how the MCP server works, pairing flow, and access control.
+Each session has a **Session Scope**: the one channel it may read and act in. The Router rejects anything outside it with `scope_violation` and logs the attempt. A new launch writes a new key, which disconnects the previous listener, so two sessions never answer the same channel. Messages to a channel with no live session get 💤 and are not replayed later (a project not yet migrated, with no `webhook_id`, gets no 💤).
 
 ## Prerequisites
 
@@ -41,6 +45,7 @@ CCDM is built on the [official Anthropic Discord plugin for Claude Code](https:/
 | `tmux` | Yes | `brew install tmux` / `apt install tmux` |
 | `zsh` | Yes | Default on macOS / `apt install zsh` on Linux |
 | `python3` | Yes | `brew install python3` / `apt install python3` |
+| Node.js 22+ | Yes | `brew install node`, then `npm install` in this repo (the Router, channel server, and Codex bridge) |
 | `jq` | Yes | `brew install jq` / `apt install jq` |
 | `whisper` | Optional | `pip install openai-whisper` (for voice messages) |
 
@@ -144,7 +149,7 @@ project with `scripts/stop-session.sh <project>`, then start it with
 `scripts/start-codex-session.sh <project>`. Other sessions need no restart.
 To switch back, restore that project's previous selector and restart it.
 
-Before assigning a bot, test the home in a disposable directory:
+Before selecting the home on a project, test it in a disposable directory:
 
 ```bash
 CODEX_HOME=$HOME/.codex-mimo codex exec --strict-config --skip-git-repo-check \
@@ -232,7 +237,7 @@ configured Computer Use tool/plugin. Supported reasoning efforts are `low`,
 quota window, so its usage dashboard shows the account-wide balance returned by
 the official `GET /user/balance` API plus this machine's local DeepSeek token
 totals instead of a rate-limit graph. The helper does not make billable
-inference calls; test the home separately before assigning a bot.
+inference calls; test the home separately before selecting it on a project.
 
 To add web search and page reading through [Exa MCP](https://exa.ai/docs/get-started/exa-mcp),
 pass `--with-exa` when creating a new home. For an existing home, add this table to its `config.toml`:
@@ -344,30 +349,37 @@ Sol/Terra/Luna are model slugs.
 You also need:
 - A Discord account
 - A Discord server where you can add bots
-- At least one Discord bot (for the root agent) — see [Adding bots to the pool](#adding-bots-to-the-pool)
+- One Discord bot for root — see [Creating the root bot](#creating-the-root-bot)
 
 ## Quick Start
 
 ```bash
-# 1. Clone the repo
+# 1. Clone the repo and install Node dependencies
 git clone https://github.com/<owner>/ccdm.git
 cd ccdm
+npm install
 
-# 2. Run the setup script
+# 2. Run the setup script (asks for your user ID, server ID, and the root bot token)
 ./setup.sh
 
-# 3. Start the root agent
-tmux new-session -d -s root_agent -- zsh -ic 'cd /path/to/ccdm && DISCORD_STATE_DIR=~/.claude/channels/discord claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
+# 3. Put your root channel's ID in registry.json "root_channels"
+
+# 4. Install and check the Router
+scripts/install-router-service.sh
+node scripts/router.js status
+
+# 5. Start the root agent
+./restart-root-agent.sh
 ```
 
 The setup script will:
 1. Check that all prerequisites are installed
 2. Ask for your Discord user ID and server ID
-3. Create `registry.json` with all required fields
-4. Ask for your root agent's bot token
-5. Set up the state directory with credentials and access control
+3. Create `registry.json` with the one-bot fields (`root_channels`, `root_allowed_user_ids`, `projects`, and the Codex account fields)
+4. Ask for the root bot's token and write it to `~/.claude/channels/discord/.env`, the only place it is stored
+5. Print the remaining steps: add your root channel, install the Router, and start root
 
-Then message your bot on Discord to start managing projects!
+Then message root in your root channel to start managing projects!
 
 ## Manual Setup
 
@@ -378,84 +390,81 @@ If you prefer to set things up by hand:
    cp registry.example.json registry.json
    ```
 
-2. **Edit `registry.json`** — fill in your Discord user ID and server ID:
+2. **Edit `registry.json`** — fill in your Discord user ID, server ID, and root channel, and replace the example project with `"projects": {}`:
    ```json
    {
      "discord_user_id": "123456789012345678",
      "guild_id": "YOUR_DISCORD_SERVER_ID",
-     "max_pool_size": 50,
+     "root_channels": ["YOUR_ROOT_CHANNEL_ID"],
+     "root_allowed_user_ids": [],
      "codex_accounts": {},
      "default_codex_account": null,
-     "project_bot_role_id": null,
      "category_ids": [],
-     "pool": [],
      "projects": {}
    }
    ```
-   To find your Discord user ID: Settings > Advanced > enable Developer Mode, then right-click your name > Copy User ID. For the server ID, right-click the server name > Copy Server ID.
+   To find your Discord user ID: Settings > Advanced > enable Developer Mode, then right-click your name > Copy User ID. For the server ID, right-click the server name > Copy Server ID; for a channel ID, right-click the channel > Copy Channel ID.
 
-3. **Create the state directory:**
+   - `root_channels` are the channels where root listens without an `@mention`. The first is the primary root channel.
+   - `root_allowed_user_ids` are extra users (besides you, the owner) who may talk to root there. Channel guests can never reach root.
+   - `category_ids` are the CCDM-managed categories that guest roles are denied on.
+   - Each project entry gets its `webhook_id` from `scripts/router.js ensure-webhook <project>`, which registration runs. The registry never holds a bot or webhook token.
+
+3. **Store the root bot token** (the only token CCDM uses):
    ```bash
    mkdir -p ~/.claude/channels/discord
+   (umask 077; echo "DISCORD_BOT_TOKEN=your_token_here" > ~/.claude/channels/discord/.env)
+   ```
+   `ROOT_DISCORD_STATE_DIR` selects a different directory. The Router, guest management, message exports, and the usage poster all read the token from here.
+
+4. **Install the Router** — see [The Router](#the-router):
+   ```bash
+   scripts/install-router-service.sh
+   node scripts/router.js status
    ```
 
-4. **Add your bot token:**
+5. **Start the root agent:**
    ```bash
-   echo "DISCORD_BOT_TOKEN=your_token_here" > ~/.claude/channels/discord/.env
+   ./restart-root-agent.sh
    ```
-
-5. **Set up access control:**
-   ```bash
-   cat > ~/.claude/channels/discord/access.json << 'EOF'
-   {
-     "dmPolicy": "allowlist",
-     "allowFrom": ["YOUR_DISCORD_USER_ID"],
-     "groups": {
-       "YOUR_ROOT_CHANNEL_ID": {
-         "requireMention": false,
-         "allowFrom": ["YOUR_DISCORD_USER_ID"]
-       }
-     },
-     "pending": {}
-   }
-   EOF
-   ```
-
-6. **Start the root agent:**
-   ```bash
-   tmux new-session -d -s root_agent -- zsh -ic 'cd /path/to/ccdm && DISCORD_STATE_DIR=~/.claude/channels/discord claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
-   ```
+   This launches root Claude as a Router client: the CCDM channel server (`scripts/ccdm-channel-server.js`) in the root role, with root's own Router key and no Discord token. It accepts the per-launch development-channel confirmation and succeeds only once root has connected to the Router.
 
    To run the root bot through Codex instead:
    ```bash
    ./restart-root-codex-agent.sh [channel_id]
    ```
-   The selected channel must already be in the root `access.json` `groups` map. The script checks this before stopping the current root agent. It keeps `restart-root-agent.sh` as the Claude rollback path.
+   Root Codex runs `scripts/codex-bridge.js` in root mode as a Router client. The selected channel must be in `root_channels` (omit it when there is only one); allowed users are the owner and `root_allowed_user_ids`. The script checks this before stopping the current root agent. `restart-root-agent.sh` switches back to Claude.
+
+   An older install that kept root's channels in root's `access.json` can move them into the registry once with `node scripts/router.js migrate-root-config`.
 
 ## Commands
 
-Message the root agent bot on Discord with any of these:
+Message the root agent on Discord with any of these:
 
 | Command | Description |
 |---------|-------------|
 | `list` / `status` | Show all registered projects and their status |
-| `start <project>` | Start a project's Claude Code Discord session |
+| `start <project>` | Start a project's Claude Code or Codex session |
 | `stop <project>` | Stop a project's session |
 | `restart <project>` | Restart a project's session |
-| `register` / `setup` | Register a bot to a channel (interactive — asks for channel and path) |
-| `deregister` / `remove` / `unregister` | Deregister a project and return its bot to the pool |
-| `pool` / `pool status` | Show all bots and their assignment status |
-| `pool add` | Create a new bot and add it to the pool |
-| `pool remove <bot_id>` | Remove an unassigned bot from the pool |
+| `register` / `setup` | Register a project to a channel (interactive — asks for channel, path, and provider) |
+| `deregister` / `remove` / `unregister` | Deregister a project: stop it, delete its webhook and registry entry (the channel stays) |
+| `router status` | Show the Router's gateway state, connected sessions and scopes, webhook health, and recent scope violations |
 | `guest invite <project> <user_id>` | Create a project-scoped guest invite |
 | `guest revoke <project> <user_id>` | Remove project guest access |
 | `context report` | Get context window usage for all running sessions (via tmux) |
 | `usage` / `limits` | Show rate limits, usage stats, and account info |
 | `restart yourself` | Self-restart the root agent |
 | `create a poll` | Create a native Discord poll in any channel |
-| `/compact` / `/clear` / `/restart` | From a Codex project channel, manage that Codex session directly |
-| `/pause` / `/unpause` | Queue new Codex messages without interrupting the active turn, then resume them in order |
-| `@root /compact` / `@root /clear` | From a Claude project channel, relay the slash command into that project's tmux session |
+
+In a project channel, these plain commands are handled by that project's session for both Claude and Codex, never as an agent turn:
+
+| Command | Description |
+|---------|-------------|
+| `/pause` / `/unpause` | Queue new messages without interrupting the active turn, then deliver them in order |
+| `/compact` / `/clear` | Compact or clear that project's conversation |
+| `/restart` | Restart that project's session only (never root) |
+| `/close` | End Conversation Reminders for the channel; it reaches only the reminder service |
 
 ### Resuming a Codex conversation
 
@@ -486,9 +495,26 @@ file and account selection for recovery. The target account must already be
 logged in; do not copy credentials between homes. This preserves the saved
 conversation, not running tools or child-agent processes.
 
+### Resuming a Claude conversation
+
+Claude launches take the same explicit resume, with the Claude session UUID
+(the registry's recorded `session_id`, or the transcript's file name):
+
+```bash
+scripts/stop-session.sh my-project
+scripts/start-session.sh my-project --resume <session_id>
+```
+
+The transcript must exist in the Claude home the project launches with
+(`claude_home`, else `CLAUDE_CONFIG_DIR`, else `~/.claude`) at
+`projects/<project path with each non-alphanumeric character as ->/<session_id>.jsonl`;
+a missing transcript, a non-UUID, or an already running session is refused
+before anything starts. A resume launch that fails to reach the Router cleans up
+and exits non-zero instead of starting a fresh conversation.
+
 ### Registering a New Project
 
-Once the root agent is running and you have bots in the pool, message it in `#root`:
+Once the root agent and the Router are running, message root in `#root`:
 
 ```
 register
@@ -497,27 +523,31 @@ register
 The root agent will ask you:
 1. **Which channel?** — provide a channel name or ID (it can also create one)
 2. **Project path?** — the local directory for the project
+3. **Claude or Codex?**
 
-Then it automatically:
-1. Claims an available bot from the pool
-2. Renames it to `botN-project_name`
-3. **Isolates the bot** to only see the assigned channel (via Discord permission overrides)
-4. Configures the bot's state directory and access control
-5. Updates the root bot's config so you can `@mention` it in the project channel
-6. Starts the Claude Code session
+Then it:
+1. Creates or resolves the channel with the root bot's credentials
+2. Writes the project entry (`path`, `screen_name`, `channel_id`, `type`)
+3. Runs `scripts/router.js ensure-webhook <project>`, which finds or creates the `ccdm-<project>` webhook, records `webhook_id` in the registry, and keeps the webhook token only in private Router state
+4. Issues a fresh Conversation Reminder assignment
+5. Starts the session
 
-No need to provide a token — bots are managed in the pool. If the pool is empty, add more bots with `pool add`.
+There is no bot to create, assign, or rename. The Router reloads `registry.json` on change, so the new channel is routed without restarting anything.
 
-### Channel Isolation
+Deregistering stops the session, runs `scripts/router.js delete-webhook <project>` (deleting the webhook and its token and clearing `webhook_id`; a rerun is a no-op), removes the registry entry, and retires the project's reminders. The Discord channel is not deleted.
 
-Each project bot is locked to a single Discord channel using:
-- A **"project-bot" role** with zero permissions and VIEW_CHANNEL denied on all categories
-- A **member-level override** that allows the bot on its one assigned channel
+If a project's webhook is deleted in Discord, the Router recreates it once on the next reply and updates `webhook_id`. A second deletion in a row fails replies with `webhook_deleted` until `ensure-webhook` runs again.
 
-This means:
-- Project bots **cannot see** any other channel, `#root`, or other project channels
-- The root bot **can see everything** and responds in `#root` without `@mention`
-- You can `@mention` the root bot in any project channel for management tasks
+### Session Scope
+
+The Router enforces each session's scope on every operation:
+- A project session may read, post, edit, react, and type only in its registered channel, and `message_id` targets must belong to that channel. Anything else is rejected with `scope_violation` and logged; `router status` lists recent violations.
+- A project's replies post through its own webhook and it may edit only its own webhook messages. Reactions and typing show as the root bot.
+- The root session may act in root channels and every registered project channel.
+- Only messages and reactions from the owner (`discord_user_id`) and that channel's guests are forwarded. Bot and webhook messages are never forwarded to sessions.
+- An `@mention` of the bot in a project channel, or a native reply to a root message, reaches root only. A reply to a project's webhook message goes to the project. Guests' mentions reach no one.
+
+Discord permissions are no longer the isolation boundary: the old `project-bot` role and per-channel override model is obsolete. The root bot needs Send Messages, Read Message History, Add Reactions, and Manage Messages in every project channel, plus Manage Webhooks; `router status` names any that are missing.
 
 ### Project Guests
 
@@ -527,46 +557,82 @@ To invite someone into one project channel only, run:
 scripts/guest-access.js invite <project-or-channel-id> <discord-user-id>
 ```
 
-This creates a one-use invite and a per-project `ccdm-guest-<project>` role. The role is denied on CCDM-managed categories and other project channels, then allowed on the target channel with text, message history, attachments, reactions, and thread replies. The guest user ID is also added to the project bot allowlist so Claude/Codex can read their messages.
+This creates a one-use invite and a per-project `ccdm-guest-<project>` role. The role is denied on CCDM-managed categories and other project channels, then allowed on the target channel with text, message history, attachments, reactions, and thread replies. The guest user ID is recorded in the project's `guest_user_ids`. The Router reloads guests from `registry.json`, so the guest reaches the project session on their next message without a restart. Guests can never reach root.
 
-For users already in the server, use `grant` instead of `invite`. Use `revoke` to remove their project guest role and bot access.
+For users already in the server, use `grant` instead of `invite`. Use `revoke` to remove their project guest role, registry entry, and outstanding invites.
 
-## Managing the Bot Pool
+## Creating the root bot
 
-CCDM uses a **bot pool** — a set of pre-created Discord bots that get assigned to projects on demand. The default pool limit is 50 bots (configurable via `max_pool_size` in `registry.json`).
-
-### Adding bots to the pool
-
-The easiest way is to message the root agent: `pool add`. This uses browser automation to create a bot, get its token, and invite it to your server automatically. Note: the automation relies on bypassing Discord's hCaptcha, which is flaky — it may pass through sometimes and fail others. If it fails, fall back to manual creation below.
-
-Alternatively, create bots manually:
+CCDM needs exactly one Discord bot application, used by root and the Router.
 
 1. **Create an application**: Go to the [Discord Developer Portal](https://discord.com/developers/applications) and click **New Application**.
 
 2. **Set up the bot**: In the sidebar, go to **Bot**. Scroll down to **Privileged Gateway Intents** and enable **Message Content Intent** — without this, the bot receives messages with empty content.
 
-3. **Copy the token**: On the **Bot** page, click **Reset Token** and copy it immediately — it's only shown once.
+3. **Copy the token**: On the **Bot** page, click **Reset Token** and copy it immediately — it's only shown once. `setup.sh` stores it in root's state directory; never put it in `registry.json`.
 
 4. **Generate an invite link**: Go to **OAuth2** > **URL Generator**. Select the `bot` scope. Under **Bot Permissions**, enable:
-   - View Channels
-   - Send Messages
-   - Send Messages in Threads
-   - Read Message History
-   - Attach Files
-   - Add Reactions
+   - View Channels, Send Messages, Send Messages in Threads, Read Message History
+   - Attach Files, Add Reactions, Manage Messages
+   - Manage Webhooks (Project Identity webhooks)
+   - Manage Channels, Manage Roles, Create Instant Invite (registration and guest access)
 
    Set Integration type to **Guild Install**. Copy the generated URL.
 
 5. **Invite the bot**: Open the URL in a browser and add the bot to your Discord server.
 
-6. **Add to pool**: Provide the token to the root agent and it will add the bot to the pool.
+## The Router
 
-### How assignment works
+The Router is a Node daemon (`scripts/router.js serve`, modules in `scripts/router/`) with one discord.js gateway connection. Its private state lives in `~/.local/state/ccdm/router/` (0700; `CCDM_ROUTER_STATE_DIR` overrides it): the socket `router.sock` (0600), per-session keys, webhook tokens, launch files, and logs.
 
-- `register` → interactive flow: picks a bot, locks it to a channel, starts the session
-- `deregister <project>` → stops the session, removes channel lock, renames the bot back, returns it to the pool
-- Bots are interchangeable — any available bot can be assigned to any project
-- The Discord channel is **not deleted** on deregister — only the bot assignment is removed
+**Install it** as the `com.ccdm.router` LaunchAgent:
+
+```bash
+scripts/install-router-service.sh
+```
+
+The installer first runs the read-only `node scripts/router.js preflight` (Node 22+, registry with `discord_user_id`, root token present, socket directory ownership and 0700 mode) and touches nothing if a blocker remains. It then renders a secret-free plist with private logs (`router.log` and `router.err` in the state directory), relaunches the Router only after a crash, and restores the prior plist and loaded service if the new load fails. Foreground and supervised Routers share one lock, so a second `router.js serve` exits non-zero without disturbing the running one.
+
+**Check it** with `router status`:
+
+```bash
+node scripts/router.js status         # human-readable
+node scripts/router.js status --json  # for scripts
+```
+
+It reports the gateway state, the registry's last good load time and any load error, connected sessions with role, project, scope, and connect time, webhook presence and root's missing channel permissions per project, and recent scope violations. It exits non-zero when the Router is unreachable.
+
+**Admin commands** (run by root's register and deregister workflows):
+
+| Command | What it does |
+|---------|-------------|
+| `node scripts/router.js ensure-webhook <project>` | Find or create `ccdm-<project>` in the project's channel and record its `webhook_id` |
+| `node scripts/router.js delete-webhook <project>` | Delete the project's webhook and its private token and clear `webhook_id` |
+| `node scripts/router.js probe <project>` | Post one short connection notice through the project's webhook and check Discord returned the expected `webhook_id` |
+| `node scripts/router.js migrate-root-config` | Copy root channels and users from root's legacy `access.json` into the registry, once |
+
+**Registry reloads**: the Router watches `registry.json` and applies guest, channel, and project changes to the next message. An invalid registry (malformed JSON, or valid JSON with a missing owner, a non-object `projects`, a project without `channel_id`, or one channel claimed twice) keeps the last good routing table without disconnecting any session, and `router status` shows the error.
+
+**Router down**: launchd restarts a crashed Router, and every session reconnects on its own with capped backoff. While disconnected, Discord operations fail with `router_unavailable` instead of queueing. If the Router stays unreachable for about 2 minutes (`CCDM_ROOT_FALLBACK_AFTER_MS`, default 120000), root opens an **emergency** direct gateway connection with the root token for root channels only (owner and `root_allowed_user_ids`), and posts a one-line notice in the primary root channel, so you can diagnose and restart the Router from Discord. While it is engaged, root replies, reacts, types, and edits its own messages in root channels directly as the bot; reads and attachments wait for the Router. When the Router is back, root stops those direct operations and closes the emergency connection before reconnecting, so both paths never deliver at once. `restart-root-agent.sh` and `restart-root-codex-agent.sh` refuse to run while the Router is not answering, so a restart never takes down the emergency root.
+
+**Rate limits** stop at the Router: it queues REST per route bucket, honors `Retry-After`, and coalesces repeated edits to one message. Sessions see eventual success or a typed `rate_limited` failure.
+
+### Cutover and retirement
+
+These tools move an existing Bot Pool install to the Router, and are kept for installs that still have pool fields in `registry.json`. A project launch now requires the project's `webhook_id`: `start-session.sh` and `start-codex-session.sh` refuse a project without one before writing a key, starting tmux, or recording a PID, and point at `migrate-to-router.sh`. Do the cutover in this order:
+
+1. **Stop every pool session.** Run `scripts/stop-session.sh <project>` for each project. While a project still names its former pool bot (`bot_id`), the stop also sweeps that bot's leftover official-plugin listener by its `DISCORD_STATE_DIR`.
+2. **Move root's configuration.** Run `node scripts/router.js migrate-root-config` once, install the Router with `scripts/install-router-service.sh`, check `node scripts/router.js status`, and restart root with `./restart-root-agent.sh` (or `./restart-root-codex-agent.sh`).
+3. **Migrate each project.** Run `scripts/migrate-to-router.sh <project>` per project (details below). It records the webhook and starts the session on the Router.
+4. **Retire the pool.** Run `scripts/retire-pool.sh` (a dry run), review it, then `scripts/retire-pool.sh --apply`.
+
+`scripts/migrate-to-router.sh <project>` records one project on the Router. It checks that the Router is healthy, the project is registered and not yet on the Router, and root has its channel permissions. It then stops the session (including a leftover pool listener), runs `ensure-webhook`, records the project on the Router, issues the reminder `assignment-changed`, starts the session through its launcher, and verifies the round trip: `router status` shows it connected in its channel, and `router.js probe <project>` posts a notice under the project's `webhook_id`. Each step prints `<step>: ok` or `<step>: failed — <reason>`. A preflight failure changes nothing, and any later failure restores the project's previous registry state, restarts its session, and exits non-zero naming the failed step. `--rollback` refuses, since no pool bot remains to return to. The script runs `node` unless `CCDM_ROUTER_NODE` names another binary.
+
+`scripts/migrate-to-router.sh --resume <project>` also keeps the conversation. Before the stop step (which clears `pid` and `session_id`) it prints `resume: <id> (<source>)` or `resume: skipped — <reason>`, and the start step, and a rollback's start, pass that id to the launcher's `--resume`. For Claude the id is the running session's own `sessionId` from `<claude home>/sessions/<pid>.json`, else the registry's `session_id`, and its transcript must exist in the project's Claude home. Codex launches record no thread id (`session_id` stays `null`), so the id is the newest `codex-discord-bridge` rollout (not a subagent's) whose `cwd` is the project directory in the project's resolved Codex home, skipped when another Codex project or the CCDM checkout shares that directory. Without an id or transcript/rollout, or when the launcher cannot resume it, the project starts fresh and the migration continues. Because the step-1 stop clears `session_id`, run `--resume` on projects that are still running (the migration stops them itself).
+
+`scripts/retire-pool.sh` removes what is left of a Bot Pool. It refuses (naming the projects) while any project still tied to a pool bot (by `bot_id`, `bot_display_name`, or a pool entry's `assigned_to`) lacks `transport: "router"`; a project registered after the cutover needs no `transport`. By default it is a dry run that prints each action and changes nothing. With `--apply` it uses the root token to remove every old pool bot from the server and moves their state directories (`~/...` paths included) into a private backup at `~/.local/state/ccdm/pool-retirement/` (0700; `CCDM_POOL_BACKUP_DIR` overrides it). It also deletes the obsolete `project-bot` role, saves a 0600 copy of the registry in the backup, and strips the pool fields from `registry.json`. Bot applications are kept. A state directory it cannot move (none recorded, not an absolute path, or missing) is reported as skipped, and `--apply` then exits 2 with the list instead of claiming success. An interrupted `--apply` finishes the remaining work when rerun, and a rerun after retirement does nothing.
+
+Every registry rewrite (the lifecycle scripts, webhook recreation, migration, retirement, guest access, and reminder reassignment) holds one lock, a `registry.json.lock` directory beside the registry, and commits through an adjacent temporary file renamed into place with the registry's mode kept, so concurrent writers never drop each other's changes and the Router's reload never reads a partial file. A lock left by a writer that died is reclaimed; a writer waits up to 30 s for a live holder (`CCDM_REGISTRY_LOCK_TIMEOUT_MS`) and then fails naming its pid.
 
 ## Usage Report
 
@@ -581,7 +647,7 @@ Ask the root agent for a usage report by messaging `usage`, `limits`, or `how mu
 
 ## Project Conversation state
 
-The opt-in foreground [Project Conversation state service](docs/conversation-reminders.md) records owner replies, `/close`, reopening, and due times for registered Claude and Codex channels. It sends a `👀` from each channel's assigned bot one hour after a conversation starts awaiting the owner; while reminders are ignored, the gap grows to 2, 4, 6 … hours and settles at one a day. Run `scripts/conversation-reminder-service.py enable` to check prerequisites and opt in, then `run` to start the worker. On macOS, `scripts/install-conversation-reminder-service.sh` can supervise the same worker as an opt-in LaunchAgent. It validates configuration first and keeps credentials out of the plist. It never changes the Usage Stats Poster. After a restart, reconnect, or re-enable, the service reconciles missed activity before sending. Each overdue channel then gets at most one catch-up, spaced at least five seconds apart.
+The opt-in foreground [Project Conversation state service](docs/conversation-reminders.md) records owner replies, `/close`, reopening, and due times for registered Claude and Codex channels. It watches every project channel as a read-only Router client and sends a `👀` as the root bot one hour after a conversation starts awaiting the owner; while reminders are ignored, the gap grows to 2, 4, 6 … hours and settles at one a day. Run `scripts/conversation-reminder-service.py enable` to check prerequisites and opt in, then `run` to start the worker. On macOS, `scripts/install-conversation-reminder-service.sh` can supervise the same worker as an opt-in LaunchAgent. It validates configuration first and keeps credentials out of the plist. It never changes the Usage Stats Poster. After a restart, reconnect, or re-enable, the service reconciles missed activity before sending. Each overdue channel then gets at most one catch-up, spaced at least five seconds apart.
 
 ## Scheduled Usage Stats Poster
 
@@ -652,7 +718,7 @@ tail -120 "${TMPDIR:-/tmp}/usage-stats-poster.log"
 tail -120 "${TMPDIR:-/tmp}/usage-stats-poster.err"
 ```
 
-Guest management and the usage poster read `DISCORD_BOT_TOKEN` from the root bot’s `.env` at `~/.claude/channels/discord/.env`. Set `ROOT_DISCORD_STATE_DIR` to select a different root state directory (also set it in the poster LaunchAgent environment when applicable). They never borrow a project bot token or infer root from `bot1`; the old poster `root_bot_id` pool selector is no longer used. Missing root credentials cause an error before Discord requests. Project launches derive root’s identity from that state, with an explicit `root_bot_app_id` registry fallback, and do not pass management credentials to project bridges. Message exports require explicit credentials or a bot registered for the requested channel.
+Guest management, message exports, and the usage poster read `DISCORD_BOT_TOKEN` from the root bot’s `.env` at `~/.claude/channels/discord/.env`. Set `ROOT_DISCORD_STATE_DIR` to select a different root state directory (also set it in the poster LaunchAgent environment when applicable). Missing root credentials cause an error before Discord requests. Project sessions never receive a Discord token; they export history only through the Router's `export_message_range` operation, while the operator-run `scripts/export-discord-range.js` reads the root token.
 
 Configuration stays in the ignored root `.usage-stats-poster.json`. Start from the tracked placeholder example, edit the destination channel and any Claude API-account transcript paths, then validate it:
 
@@ -694,13 +760,12 @@ launchctl unload ~/Library/LaunchAgents/com.discord.usage-stats-poster.plist
 rm ~/Library/LaunchAgents/com.discord.usage-stats-poster.plist
 ```
 
-## Context Nicknames
+## Context Usage in the Project Identity
 
-CCDM can update each bot's Discord nickname to show its current context window usage — for example, `bot4-my-app · 42%`. This lets you see at a glance how much context each session has used, right from the Discord member list or channel messages.
+Each project reply posts as `<project>-<claude|codex> · N%`, where `N` is the session's context window usage at send time. No bot nickname is changed.
 
-This works via Claude Code's `statusLine` setting. Claude Code pipes status JSON to a command on every update; the script extracts the context percentage and PATCHes the bot's server nickname via the Discord API.
-
-### Setup
+- **Codex** sessions report `N` from the bridge's tracked token usage.
+- **Claude** sessions report it through Claude Code's `statusLine` setting: the status script writes the latest percentage to a private file in the project's Router launch directory, and the CCDM channel server sends it with each reply.
 
 Add this to `~/.claude/settings.json`:
 
@@ -712,27 +777,16 @@ Add this to `~/.claude/settings.json`:
 }
 ```
 
-Two scripts are available:
-
 | Script | What it does |
 |--------|-------------|
-| `scripts/cc-discord-nicknames.sh` | Updates Discord nicknames only — no terminal UI dependency |
-| `scripts/cc-statusline-wrapper.sh` | Updates Discord nicknames AND pipes through [ccstatusline](https://github.com/sirmalloc/ccstatusline) for a terminal status bar |
+| `scripts/cc-discord-nicknames.sh` | Records the context percentage only — no terminal UI dependency |
+| `scripts/cc-statusline-wrapper.sh` | Records the percentage AND pipes through [ccstatusline](https://github.com/sirmalloc/ccstatusline) for a terminal status bar |
 
-Use the wrapper if you also use Claude Code in the terminal and want the status bar. Use the nicknames-only script if you only interact via Discord.
-
-### Configuration
-
-| Env var | Default | Description |
-|---------|---------|-------------|
-| `CONTEXT_DISCORD_INTERVAL` | `60` | Minimum seconds between nickname updates (avoids Discord rate limits) |
-| `DISABLE_DISCORD_MESSAGE` | `false` | Set to `true` to disable nickname updates entirely |
-
-Both env vars are optional. The scripts also require `DISCORD_STATE_DIR` to be set, which happens automatically when Claude Code starts with the Discord plugin.
+Both scripts use the `CCDM_ROUTER_KEY_FILE` that CCDM sets for its Claude sessions, and do nothing in other Claude sessions. When no percentage is available, replies post as `<project>-claude` with no suffix. Discord rejects webhook names containing `discord` or `clyde`, so the Router breaks those substrings with a zero-width joiner and truncates the project name first so the ` · N%` suffix survives the 80-character limit.
 
 ## Preventing Sleep
 
-CCDM needs your machine to stay awake — if it sleeps, all tmux sessions (and their Discord bots) go offline.
+CCDM needs your machine to stay awake — if it sleeps, the Router and all tmux sessions go offline.
 
 **macOS:**
 - Install [Amphetamine](https://apps.apple.com/app/amphetamine/id937984704) (free) and set it to keep the Mac awake indefinitely
@@ -745,7 +799,7 @@ CCDM needs your machine to stay awake — if it sleeps, all tmux sessions (and t
 
 ## Auto-Start on Reboot (macOS)
 
-By default, tmux sessions don't survive reboots. Set up a macOS Launch Agent so the root agent starts automatically on login:
+The Router's `com.ccdm.router` LaunchAgent (see [The Router](#the-router)) starts on login by itself. tmux sessions don't survive reboots, so set up a macOS Launch Agent to start the root agent on login too:
 
 ```bash
 # Create the Launch Agent plist
@@ -794,6 +848,8 @@ CCDM uses the `--dangerously-skip-permissions` flag when starting Claude Code se
 
 This means Claude Code will have unrestricted access to the file system and shell within each project directory. Only run CCDM on machines you trust, and be mindful of what projects you connect.
 
+Discord access is contained by the Router instead: the root bot token lives only in root's state directory and the Router, webhook tokens live only in private Router state (0600), and no session environment, file, or MCP config holds a Discord token. Session Scope is software-enforced by the Router, not an OS sandbox: local sessions run as your user, so keep the Router state directory private.
+
 ## Global Skills
 
 CCDM includes reusable skills (custom slash commands) that any Claude Code agent can use. Copy them to `~/.claude/commands/` on any machine to make them available globally.
@@ -818,34 +874,9 @@ mkdir -p ~/.claude/commands
 
 Or just send the files to the agent on Discord and ask it to save them to `~/.claude/commands/`.
 
-## Remote VM Setup
+## Remote VM Sessions
 
-You can run Claude Code sessions on remote Linux VMs connected to Discord channels. The root agent handles bot registration and Discord permissions locally — only the Claude Code runtime runs on the VM.
-
-### Prerequisites
-- Node.js/npm installed on the VM
-- Claude Code installed (`npm install -g @anthropic-ai/claude-code`) and logged in
-- `tmux` installed
-- **`IS_SANDBOX=1`** is required when running as root (Claude Code blocks `--dangerously-skip-permissions` as root without it)
-
-### Steps
-
-1. **Install Bun** (required by Discord plugin): `npm install -g bun`
-2. **Install Discord plugin:**
-   ```bash
-   claude plugin marketplace add anthropics/claude-plugins-official
-   claude plugin install discord@claude-plugins-official
-   ```
-3. **Ask the root agent** to register a bot and create a channel — it will provide the bot token and channel ID
-4. **Create the state directory** on the VM with `.env` (bot token) and `access.json` (channel + user allowlist)
-5. **Start the session:**
-   ```bash
-   tmux new-session -d -s <name> -- bash -ic 'cd /project && IS_SANDBOX=1 DISCORD_STATE_DIR=~/.claude/channels/discord_<name> claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
-   sleep 8 && tmux send-keys -t <name> Enter
-   ```
-6. **Install skills** (optional): copy `skills/*.md` to `~/.claude/commands/` on the VM
-
-See `CLAUDE.md` for the full detailed instructions with all config file templates.
+Remote VM sessions are not supported with the Router yet: a remote session would need its own connection to the local Router ([#125](https://github.com/deepansh96/ccdm/issues/125)). Deregister unused VM projects rather than giving a VM a Discord token.
 
 ## File Structure
 
@@ -856,17 +887,28 @@ ccdm/
   LICENSE                    # MIT
   .gitignore                 # Excludes registry.json, .claude/, .env
   registry.example.json      # Template — copy to registry.json
-  registry.json              # Your config (not committed)
-  restart-root-agent.sh      # Self-restart script
+  registry.json              # Your config (not committed; holds no tokens)
+  restart-root-agent.sh      # Start or restart root Claude as a Router client
+  restart-root-codex-agent.sh # Start or restart root Codex as a Router client
   setup.sh                   # Interactive first-run setup
   scripts/
-    _update-nickname.sh      # Shared helper — Discord nickname update logic
-    cc-discord-nicknames.sh  # StatusLine script — updates bot nicknames with context %
-    cc-statusline-wrapper.sh # StatusLine script — nicknames + ccstatusline terminal UI
+    router.js                # The Router daemon and its CLI (status, preflight, webhooks, probe)
+    router/                  # Router modules: socket server, client library, ops, webhooks, emergency fallback
+    install-router-service.sh # Install the com.ccdm.router LaunchAgent
+    ccdm-channel-server.js   # CCDM channel server for Claude sessions (project and root)
+    codex-bridge.js          # Codex app-server bridge (project and root) in Router mode
+    discord-mcp-server.js    # Scoped Discord tools for Codex, backed by the Router
+    migrate-to-router.sh     # One-project cutover onto the Router
+    retire-pool.sh           # Remove leftover pool bots, state, role, and registry fields
+    guest-access.js          # Project-scoped guest invites, grants, and revokes
+    _update-nickname.sh      # Shared statusline helper — records context %
+    cc-discord-nicknames.sh  # StatusLine script — records context %
+    cc-statusline-wrapper.sh # StatusLine script — context % + ccstatusline terminal UI
     claude-usage.sh          # Usage reporting script
-    send-claude-command.sh   # Root relay helper — sends /compact or /clear into a Claude tmux session
-    start-session.sh         # Generic script to start any registered project
-    stop-session.sh          # Generic script to stop any registered project
+    send-claude-command.sh   # Types /compact or /clear into a Claude tmux session
+    start-session.sh         # Start a registered Claude project
+    start-codex-session.sh   # Start a registered Codex project
+    stop-session.sh          # Stop any registered project
   skills/
     restart-self.md          # /restart-self skill — agent self-restart
     check-context.md         # /check-context skill — context window usage check
@@ -875,9 +917,12 @@ ccdm/
 ## Troubleshooting
 
 **Bot doesn't respond to messages**
+- Run `node scripts/router.js status`: the Router must be reachable with its gateway ready, and the project's session connected in its channel
+- A 💤 reaction means the channel has no live session — start it
 - Ensure **Message Content Intent** is enabled in the Discord Developer Portal (Bot settings)
-- Check the bot is in the same server as you
-- Verify your Discord user ID is in `access.json`
+- Check the bot is in the same server as you, and your user ID is `discord_user_id` in `registry.json`
+- In a root channel, check the channel is in `root_channels`
+- Check the Router logs in `~/.local/state/ccdm/router/router.err`
 
 **`tmux` session dies immediately**
 - Run the command directly without tmux to see the actual error
@@ -902,10 +947,11 @@ ccdm/
 
 - Sessions do not persist across machine restarts (root agent can [auto-start](#auto-start-on-reboot-macos), project sessions must be started manually)
 - Live usage API data requires macOS Keychain (local stats work everywhere)
-- Each project needs its own bot from the pool — two projects cannot share a bot (default limit: 50, configurable)
+- One session serves one project channel; a project cannot span channels
 - Voice message transcription requires `whisper` (optional)
-- Pool bots with admin managed roles bypass channel isolation — bot roles must have non-admin permissions for isolation to work
-- When new Discord categories are created, the "project-bot" role deny must be applied to them
+- Webhooks cannot send native replies, so a project's reply to a specific message starts with a `↪ [jump](…)` link
+- The Router is a single point of failure, mitigated by launchd restarts, session reconnects, and root's emergency fallback
+- Claude sessions load the CCDM channel with `--dangerously-load-development-channels`, a research preview that may change between Claude releases
 
 ## License
 

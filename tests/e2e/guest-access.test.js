@@ -16,6 +16,8 @@ test.afterEach(async () => {
   await cleanup();
 });
 
+// A router-only registry: no bot pool and no `transport` fields, since every
+// project is served through the Router.
 function buildRegistry(workspace) {
   const rootState = path.join(workspace.homeDir, ".claude", "channels", "discord");
   fs.mkdirSync(rootState, { recursive: true });
@@ -23,36 +25,18 @@ function buildRegistry(workspace) {
   return {
     discord_user_id: OWNER_ID,
     guild_id: "guild-id",
-    max_pool_size: 50,
+    // A leftover pool-era role id: guest access must never touch it.
     project_bot_role_id: "project-bot-role-id",
     category_ids: ["category-a"],
-    pool: [
-      {
-        id: "bot1",
-        app_id: "root-app-id",
-        token: "project-only-token",
-        state_dir: path.join(workspace.homeDir, ".claude", "channels", "discord"),
-        assigned_to: null,
-      },
-      {
-        id: "bot2",
-        app_id: "project-app-id",
-        token: "project-token",
-        state_dir: path.join(workspace.homeDir, ".claude", "channels", "discord2"),
-        assigned_to: "alpha",
-      },
-    ],
     projects: {
       alpha: {
         path: path.join(workspace.tmpDir, "alpha"),
-        bot_id: "bot2",
         screen_name: "alpha_session",
         channel_id: "channel-alpha",
         type: "claude",
       },
       beta: {
         path: path.join(workspace.tmpDir, "beta"),
-        bot_id: "bot2",
         screen_name: "beta_session",
         channel_id: "channel-beta",
         type: "codex",
@@ -60,6 +44,13 @@ function buildRegistry(workspace) {
       },
     },
   };
+}
+
+function perBotAccessFiles(workspace) {
+  const channels = path.join(workspace.homeDir, ".claude", "channels");
+  return fs.readdirSync(channels)
+    .map((dir) => path.join(channels, dir, "access.json"))
+    .filter((file) => fs.existsSync(file));
 }
 
 function preloadEnv(workspace) {
@@ -98,11 +89,7 @@ test("guest invite configures role-gated channel access before returning the lin
   assert.deepEqual(registry.projects.alpha.guest_user_ids, [GUEST_ID]);
   assert.deepEqual(registry.projects.alpha.guest_invites, { [GUEST_ID]: ["fake-invite-1"] });
 
-  const access = JSON.parse(
-    fs.readFileSync(path.join(workspace.homeDir, ".claude", "channels", "discord2", "access.json"), "utf8"),
-  );
-  assert.deepEqual(access.allowFrom, [OWNER_ID]);
-  assert.deepEqual(access.groups["channel-alpha"].allowFrom, [OWNER_ID, GUEST_ID]);
+  assert.deepEqual(perBotAccessFiles(workspace), []);
 
   const discord = readState(workspace.stateDir).fixtures.discord;
   assert.deepEqual(discord.roleCreates, [
@@ -195,6 +182,7 @@ test("guest invite configures role-gated channel access before returning the lin
   assert.deepEqual(discord.inviteTargetJobFetches, [
     { authorization: "Bot root-token", code: "fake-invite-1" },
   ]);
+  assert.equal(JSON.stringify(discord).includes("project-bot-role-id"), false);
 });
 
 test("guest revoke removes the user from config and their project role", async () => {
@@ -216,11 +204,7 @@ test("guest revoke removes the user from config and their project role", async (
   const updated = readRegistry(workspace);
   assert.deepEqual(updated.projects.alpha.guest_user_ids, []);
   assert.equal(updated.projects.alpha.guest_invites, undefined);
-  const access = JSON.parse(
-    fs.readFileSync(path.join(workspace.homeDir, ".claude", "channels", "discord2", "access.json"), "utf8"),
-  );
-  assert.deepEqual(access.allowFrom, [OWNER_ID]);
-  assert.deepEqual(access.groups["channel-alpha"].allowFrom, [OWNER_ID]);
+  assert.deepEqual(perBotAccessFiles(workspace), []);
   assert.deepEqual(readState(workspace.stateDir).fixtures.discord.memberRoleDeletes, [
     {
       authorization: "Bot root-token",
@@ -233,6 +217,7 @@ test("guest revoke removes the user from config and their project role", async (
     { authorization: "Bot root-token", code: "fake-invite-1" },
     { authorization: "Bot root-token", code: "fake-invite-2" },
   ]);
+  assert.equal(JSON.stringify(readState(workspace.stateDir).fixtures.discord).includes("project-bot-role-id"), false);
 });
 
 test("guest invite tolerates permission setup before the user joins the guild", async () => {
@@ -272,10 +257,7 @@ test("guest grant fails when the user is not in the guild", async () => {
   assert.notEqual(result.exitCode, 0);
   assert.match(result.stderr, /Unknown Member/);
   assert.equal(readRegistry(workspace).projects.alpha.guest_user_ids, undefined);
-  assert.equal(
-    fs.existsSync(path.join(workspace.homeDir, ".claude", "channels", "discord2", "access.json")),
-    false,
-  );
+  assert.deepEqual(perBotAccessFiles(workspace), []);
 });
 
 test("guest invite fails closed when managed channel discovery fails", async () => {
@@ -318,7 +300,7 @@ test("guest revoke keeps local access when Discord cleanup fails", async () => {
   assert.deepEqual(updated.projects.alpha.guest_invites, { [GUEST_ID]: ["fake-invite-1"] });
 });
 
-test("guest access fails before Discord writes when root credentials are missing, even with bot1 present", async () => {
+test("guest access fails before Discord writes when root credentials are missing", async () => {
   const workspace = createWorkspace();
   seedRegistry(workspace, buildRegistry(workspace));
   fs.unlinkSync(path.join(workspace.homeDir, ".claude/channels/discord/.env"));
@@ -329,7 +311,6 @@ test("guest access fails before Discord writes when root credentials are missing
   assert.match(result.stderr, /Cannot read root Discord credentials/);
   assert.deepEqual(readState(workspace.stateDir).fixtures.discord.roleCreates, []);
   assert.deepEqual(readState(workspace.stateDir).fixtures.discord.permissionOverwrites, []);
-  assert.doesNotMatch(result.stderr, /project-only-token/);
 });
 
 test("guest access reads an explicitly selected root state directory", async () => {
@@ -344,4 +325,51 @@ test("guest access reads an explicitly selected root state directory", async () 
   });
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(readState(workspace.stateDir).fixtures.discord.roleCreates[0].authorization, "Bot custom-root-token");
+});
+
+// Two guest changes overlap: `first` pauses holding the registry lock with its
+// write not yet in place, and `second` (which read the registry before that
+// write landed) waits for the lock. Both changes must survive.
+async function overlappingGuestChanges(first, second) {
+  const workspace = createWorkspace();
+  const registry = buildRegistry(workspace);
+  registry.projects.alpha.guest_role_id = "existing-role";
+  registry.projects.alpha.guest_user_ids = [GUEST_ID];
+  registry.projects.alpha.guest_invites = { [GUEST_ID]: ["fake-invite-1"] };
+  seedRegistry(workspace, registry);
+  const hold = path.join(workspace.tmpDir, "registry-hold");
+  const env = { ...preloadEnv(workspace), CCDM_TEST_REGISTRY_HOLD: hold };
+  const run = args => runNodeEntrypoint(workspace, "scripts/guest-access.js", { args, env, timeoutMs: 20000 });
+  const waitForFile = async (file) => {
+    const deadline = Date.now() + 10000;
+    while (!fs.existsSync(file)) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${file}`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+
+  fs.writeFileSync(`${hold}.armed`, "");
+  const firstRun = run(first);
+  await waitForFile(`${hold}.waiting`);
+  const secondRun = run(second);
+  await waitForFile(`${hold}.blocked`);
+  fs.writeFileSync(`${hold}.release`, "");
+  for (const result of await Promise.all([firstRun, secondRun])) {
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  }
+  return readRegistry(workspace).projects.alpha;
+}
+
+test("concurrent guest grants both survive", async () => {
+  const alpha = await overlappingGuestChanges(["grant", "alpha", "333333333333333333"], ["grant", "alpha", "444444444444444444"]);
+
+  assert.deepEqual([...alpha.guest_user_ids].sort(), [GUEST_ID, "333333333333333333", "444444444444444444"]);
+  assert.equal(alpha.guest_role_id, "existing-role");
+});
+
+test("an invite overlapping a revoke does not restore the revoked guest or their invites", async () => {
+  const alpha = await overlappingGuestChanges(["revoke", "alpha", GUEST_ID], ["invite", "alpha", "333333333333333333"]);
+
+  assert.deepEqual(alpha.guest_user_ids, ["333333333333333333"]);
+  assert.deepEqual(Object.keys(alpha.guest_invites), ["333333333333333333"]);
 });

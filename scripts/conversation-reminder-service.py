@@ -29,7 +29,11 @@ READINESS_PATH = Path(__file__).with_name("conversation-reminder-readiness.py")
 READINESS_SPEC = importlib.util.spec_from_file_location("ccdm_conversation_readiness", READINESS_PATH)
 READINESS = importlib.util.module_from_spec(READINESS_SPEC)
 READINESS_SPEC.loader.exec_module(READINESS)
-SCHEMA_VERSION = 6
+REGISTRY_UPDATE_PATH = Path(__file__).with_name("registry-update.py")
+REGISTRY_UPDATE_SPEC = importlib.util.spec_from_file_location("ccdm_registry_update", REGISTRY_UPDATE_PATH)
+REGISTRY_UPDATE = importlib.util.module_from_spec(REGISTRY_UPDATE_SPEC)
+REGISTRY_UPDATE_SPEC.loader.exec_module(REGISTRY_UPDATE)
+SCHEMA_VERSION = 7
 # The first reminder follows a qualifying response by an hour; each further
 # ignored reminder waits longer, up to a daily reminder.
 FIRST_REMINDER_GAP = timedelta(hours=1)
@@ -40,16 +44,19 @@ CATCH_UP_SPACING = timedelta(seconds=5)
 # inside this window are one acknowledgment; a later re-add is a new one.
 REACTION_DUPLICATE_WINDOW = timedelta(minutes=2)
 STATES = {"closed", "open-paused", "awaiting-owner"}
-CONVERSATION_COLUMNS = {"project", "channel_id", "bot_id", "assignment_generation", "owner_id",
+CONVERSATION_COLUMNS = {"project", "channel_id", "identity", "assignment_generation", "owner_id",
                         "state", "revision", "last_ack_at", "last_ack_message_id",
                         "current_interaction_id", "response_message_id", "response_at", "due_at",
                         "reminder_message_id", "cleanup_message_ids", "last_event_order",
-                        "reconciliation_status", "checkpoint"}
+                        "reconciliation_status", "checkpoint", "consecutive_reminders"}
+# Before v7 a conversation was keyed by its pool bot; before v6 it had no streak.
+V6_CONVERSATION_COLUMNS = CONVERSATION_COLUMNS - {"identity"} | {"bot_id"}
+V5_CONVERSATION_COLUMNS = V6_CONVERSATION_COLUMNS - {"consecutive_reminders"}
 # Both provider adapters must be installed before any channel may receive a
 # reminder; there is no Codex-only release.
 PROVIDER_COMPONENTS = {
     "codex": ("scripts/codex-bridge.js", "scripts/discord-mcp-server.js", "scripts/conversation-reminder-adapter.js"),
-    "claude": ("scripts/claude-reminder-channel.js", "scripts/claude-reminder-hook.js",
+    "claude": ("scripts/ccdm-channel-server.js", "scripts/claude-reminder-hook.js",
                "scripts/conversation-reminder-adapter.js"),
 }
 
@@ -61,6 +68,41 @@ def reminder_gap(sent: int) -> timedelta:
 
 def store_path(state_dir: Path) -> Path:
     return state_dir / "conversations.sqlite3"
+
+
+def pool_bot_id(identity: str) -> str | None:
+    """Return the pool bot a `pool:<botId>` identity sends as, if it is one."""
+    return identity[len("pool:"):] if identity.startswith("pool:") else None
+
+
+def event_speaker(identity: str) -> str:
+    """The `bot_id` an event names for an identity: the pool bot, or the router identity itself."""
+    return pool_bot_id(identity) or identity
+
+
+def backup_store(db: sqlite3.Connection, state_dir: Path, version: int) -> None:
+    """Keep a private copy of the store as it was before its first schema change."""
+    target = state_dir / f"conversations.v{version}.backup.sqlite3"
+    if target.exists():
+        return
+    temporary = state_dir / f".{target.name}.{os.getpid()}.tmp"
+    os.close(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+    try:
+        copy = sqlite3.connect(temporary)
+        try:
+            db.backup(copy)
+            # A self-contained file: no WAL sidecars to lose beside the backup.
+            copy.execute("PRAGMA journal_mode=DELETE")
+        finally:
+            copy.close()
+        os.chmod(temporary, 0o600)
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            pass
+    finally:
+        for leftover in (temporary, Path(f"{temporary}-wal"), Path(f"{temporary}-shm")):
+            leftover.unlink(missing_ok=True)
 
 
 def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
@@ -79,7 +121,7 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
     db.execute("PRAGMA synchronous=FULL")
     db.execute("PRAGMA secure_delete=ON")
     version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version not in (0, 1, 2, 3, 4, 5, SCHEMA_VERSION) or (version == 0 and existed):
+    if version not in (0, 1, 2, 3, 4, 5, 6, SCHEMA_VERSION) or (version == 0 and existed):
         db.close()
         raise ValueError("conversation store schema is unsupported")
     if version == 0:
@@ -130,10 +172,10 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
         raise ValueError("conversation store is corrupt or unsupported")
     columns = {
         "settings": {"key", "value"},
-        # The v6 reminder streak column is validated with the full schema after migrating.
-        # Before v6 it may already exist if a concurrent open finished the migration.
-        "conversations": (CONVERSATION_COLUMNS | {"consecutive_reminders"},) + (
-            (CONVERSATION_COLUMNS,) if version < 6 else ()),
+        # Later columns are validated with the full schema after migrating. An older
+        # store may already have them if a concurrent open finished a migration.
+        "conversations": (CONVERSATION_COLUMNS,) + ((V6_CONVERSATION_COLUMNS,) if version < 7 else ()) + (
+            (V5_CONVERSATION_COLUMNS,) if version < 6 else ()),
         "applied_events": {"event_id"},
         "owner_sources": {"project", "assignment_generation", "source_message_id", "kind"},
         "qualifications": {"project", "assignment_generation", "provider_session_id",
@@ -146,6 +188,8 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
            for table, expected in columns.items()):
         db.close()
         raise ValueError("conversation store schema is unsupported")
+    if existed and version < SCHEMA_VERSION:
+        backup_store(db, state_dir, version)
     if version == 1:
         db.executescript("""
             CREATE TABLE delivery_intents (
@@ -204,11 +248,26 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
                 WHERE reminder_message_id IS NOT NULL AND state='awaiting-owner'""")
             db.execute("PRAGMA user_version=6")
         db.execute("COMMIT")
+    if db.execute("PRAGMA user_version").fetchone()[0] == 6:
+        # A conversation is keyed by the identity that speaks for its project; every
+        # earlier assignment was a pool bot.
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            if db.execute("PRAGMA user_version").fetchone()[0] == 6:
+                for table in ("conversations", "retired_assignments"):
+                    db.execute(f"ALTER TABLE {table} RENAME COLUMN bot_id TO identity")
+                    db.execute(f"UPDATE {table} SET identity='pool:'||identity")
+                db.execute("PRAGMA user_version=7")
+            db.execute("COMMIT")
+        except sqlite3.Error:
+            db.execute("ROLLBACK")
+            db.close()
+            raise ValueError("conversation store migration failed")
     expected = {
-        "conversations": CONVERSATION_COLUMNS | {"consecutive_reminders"},
+        "conversations": CONVERSATION_COLUMNS,
         "delivery_intents": {"nonce", "project", "assignment_generation", "revision", "state",
                              "message_id", "claimed_at", "retry_at"},
-        "retired_assignments": {"project", "assignment_generation", "channel_id", "bot_id",
+        "retired_assignments": {"project", "assignment_generation", "channel_id", "identity",
                                 "reason", "retired_at"},
         "retired_leftovers": {"action_id", "project", "assignment_generation", "message_id", "reason"},
         "discoveries": DISCOVERY.COLUMNS,
@@ -254,14 +313,14 @@ def usable_assignment(registry: dict, name: str) -> dict | None:
     assignment = EVENTS.assignment_for(registry, name)
     same_channel = [item for item in registry["projects"].values() if isinstance(item, dict)
                     and str(item.get("channel_id")) == assignment["channel_id"]]
-    return assignment if len(same_channel) == 1 and assignment["bot"].get("token") else None
+    return assignment if len(same_channel) == 1 else None
 
 
 def retire_conversation(db: sqlite3.Connection, row: sqlite3.Row, reason: str) -> None:
     """Stop an obsolete assignment and keep only cleanup bound to its own identity."""
     project, generation = row["project"], row["assignment_generation"]
     db.execute("INSERT OR IGNORE INTO retired_assignments VALUES (?,?,?,?,?,?)",
-               (project, generation, row["channel_id"], row["bot_id"], reason, stamp(clock_now())))
+               (project, generation, row["channel_id"], row["identity"], reason, stamp(clock_now())))
     if row["reminder_message_id"]:
         db.execute("""INSERT OR IGNORE INTO pending_actions
             (action_id,project,kind,message_id,assignment_generation) VALUES (?,?,?,?,?)""",
@@ -274,12 +333,30 @@ def retire_conversation(db: sqlite3.Connection, row: sqlite3.Row, reason: str) -
     db.execute("DELETE FROM conversations WHERE project=?", (project,))
 
 
+def transport_switched(row: sqlite3.Row, assignment: dict) -> bool:
+    """Whether only the project's transport changed: pool bot to Router webhook, or back."""
+    return (row["channel_id"], row["owner_id"]) == (assignment["channel_id"], assignment["owner_id"]) and \
+        row["identity"].split(":", 1)[0] != assignment["identity"].split(":", 1)[0]
+
+
+# The open conversation a transport switch carries into its new generation.
+CARRIED_COLUMNS = ("state", "current_interaction_id", "last_ack_at", "last_ack_message_id", "response_message_id",
+                   "response_at", "due_at", "consecutive_reminders", "reconciliation_status", "checkpoint",
+                   "last_event_order")
+
+
 def current_conversation(db: sqlite3.Connection, name: str, assignment: dict) -> sqlite3.Row:
     """Return the row for the current assignment, retiring any other generation first."""
     current = db.execute("SELECT * FROM conversations WHERE project=?", (name,)).fetchone()
-    if current is not None and (current["assignment_generation"], current["channel_id"], current["bot_id"],
+    if (current is not None and current["assignment_generation"] == assignment["generation"]
+            and transport_switched(current, assignment)):
+        # A transport switch waits for assignment-changed, which carries the open
+        # conversation into a new generation. Nothing is sent meanwhile: a claim
+        # needs the row's identity to match the registry.
+        return current
+    if current is not None and (current["assignment_generation"], current["channel_id"], current["identity"],
                                 current["owner_id"]) != (assignment["generation"], assignment["channel_id"],
-                                                         assignment["bot_id"], assignment["owner_id"]):
+                                                         assignment["identity"], assignment["owner_id"]):
         retire_conversation(db, current, "reassigned")
         current = None
     if current is None:
@@ -287,10 +364,10 @@ def current_conversation(db: sqlite3.Connection, name: str, assignment: dict) ->
         reused = db.execute("SELECT 1 FROM retired_assignments WHERE project=? AND assignment_generation=?",
                             (name, assignment["generation"])).fetchone()
         db.execute("""INSERT INTO conversations
-            (project,channel_id,bot_id,assignment_generation,owner_id,state,revision,
+            (project,channel_id,identity,assignment_generation,owner_id,state,revision,
              cleanup_message_ids,reconciliation_status,checkpoint)
             VALUES (?,?,?,?,?,'open-paused',0,'[]',?,0)""",
-            (name, assignment["channel_id"], assignment["bot_id"], assignment["generation"],
+            (name, assignment["channel_id"], assignment["identity"], assignment["generation"],
              assignment["owner_id"],
              "blocked-retired-generation" if reused else "suspended-incomplete-discovery"))
         current = db.execute("SELECT * FROM conversations WHERE project=?", (name,)).fetchone()
@@ -484,24 +561,25 @@ def assignment_changed(project_root: Path, state_dir: Path, name: str) -> dict:
                 assignment = None
             if assignment and assignment["generation"] not in retired:
                 db.execute("INSERT OR IGNORE INTO retired_assignments VALUES (?,?,?,?,?,?)",
-                           (name, assignment["generation"], assignment["channel_id"], assignment["bot_id"],
+                           (name, assignment["generation"], assignment["channel_id"], assignment["identity"],
                             "assignment-changed", stamp(clock_now())))
                 retired.append(assignment["generation"])
             generation = "gen-" + uuid.uuid4().hex
             projects[name]["assignment_generation"] = generation
-            mode = stat.S_IMODE(registry_path.stat().st_mode)
-            temporary = registry_path.with_name(f".registry.json.{os.getpid()}.tmp")
-            with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode), "w") as target:
-                json.dump(registry, target, indent=2)
-                target.write("\n")
-            os.chmod(temporary, mode)
-            os.replace(temporary, registry_path)
+            # Only this field changes, under the registry lock every writer shares.
+            REGISTRY_UPDATE.set_project_fields(registry_path, name, {"assignment_generation": generation})
             try:
                 renewed = usable_assignment(registry, name)
             except (KeyError, ValueError):
                 renewed = None
             if renewed:
                 current_conversation(db, name, renewed)
+                if row is not None and transport_switched(row, renewed):
+                    # Open conversations survive the switch; only the retired
+                    # identity's reminders are cleaned up.
+                    db.execute(f"""UPDATE conversations SET {",".join(f"{c}=?" for c in CARRIED_COLUMNS)},
+                        revision=? WHERE project=?""",
+                               (*(row[c] for c in CARRIED_COLUMNS), row["revision"] + 1, name))
         db.execute("COMMIT")
         return {"status": "changed", "project": name, "retired_generations": retired,
                 "assignment_generation": generation}
@@ -572,6 +650,47 @@ def root_credentials_present() -> bool:
     return bool(token) and not any(character.isspace() for character in token)
 
 
+ROOT_PERMISSION_NAMES = {"SendMessages": "Send Messages", "ReadMessageHistory": "Read Message History",
+                         "AddReactions": "Add Reactions", "ManageMessages": "Manage Messages",
+                         "ManageWebhooks": "Manage Webhooks"}
+
+
+def router_prerequisites(projects: object) -> dict:
+    """Per router project, what root and the Router still need before delivery, each with its fix."""
+    names = sorted(name for name, project in (projects.items() if isinstance(projects, dict) else [])
+                   if isinstance(project, dict))
+    if not names:
+        return {}
+    try:
+        completed = subprocess.run([os.environ.get("CCDM_REMINDER_NODE", "node"),
+                                    str(Path(__file__).with_name("router.js")), "status", "--json"],
+                                   capture_output=True, text=True, timeout=15)
+        router = json.loads(completed.stdout) if completed.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        router = None
+    reported = {row.get("project"): row for row in (router or {}).get("projects") or [] if isinstance(row, dict)}
+    result = {}
+    for name in names:
+        blockers = []
+        row = reported.get(name)
+        if router is None:
+            blockers.append("the Router is not reachable; start the Router "
+                            "(scripts/install-router-service.sh, or scripts/router.js serve)")
+        if not projects[name].get("webhook_id") or (row is not None and not row.get("webhook")):
+            blockers.append(f"the project's webhook is missing; run scripts/router.js ensure-webhook {name}")
+        if router is not None and row is not None:
+            missing = row.get("missing_permissions")
+            if missing is None:
+                blockers.append("the Router is not connected to Discord yet; retry once "
+                                "scripts/router.js status shows the gateway ready")
+            for flag in missing or []:
+                label = ROOT_PERMISSION_NAMES.get(flag, flag)
+                blockers.append(f"root lacks {label} in the project channel; grant root permission {label} in "
+                                f"{projects[name].get('channel_id')}")
+        result[name] = {"ready": not blockers, "blockers": blockers}
+    return result
+
+
 def enablement_checks(project_root: Path, state_dir: Path, prepare: bool = True) -> dict:
     """Foreground opt-in checks. Discord permissions are verified per channel by the worker.
 
@@ -615,6 +734,11 @@ def preflight(project_root: Path, state_dir: Path) -> dict:
     """Read-only supervisor checks: configuration, adapters, credentials, and an intact store."""
     checks = enablement_checks(project_root, state_dir, prepare=False)
     blockers = list(checks["blockers"])
+    try:
+        routed = router_prerequisites(EVENTS.load_registry(project_root).get("projects"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        routed = {}
+    blockers += [f"{name}: {blocker}" for name, row in routed.items() for blocker in row["blockers"]]
     current = None
     if not blockers:
         try:
@@ -635,6 +759,7 @@ def readiness_report(project_root: Path, state_dir: Path, db: sqlite3.Connection
     except (OSError, ValueError, json.JSONDecodeError):
         projects = None
     report = {}
+    routed = router_prerequisites(projects)
     for name in sorted(projects if isinstance(projects, dict) else {}):
         adapter = READINESS.build_readiness(name, project_root, state_dir)
         conversation = conversations.get(name)
@@ -668,6 +793,10 @@ def readiness_report(project_root: Path, state_dir: Path, db: sqlite3.Connection
             blockers.append("history: " + history + (f" ({reason})" if reason else ""))
         if uncertain:
             blockers.append("uncertain delivery: run recover")
+        speaker = (adapter["assignment"] or {}).get("bot_id")
+        if conversation and speaker and conversation["identity"] != speaker:
+            blockers.append("assignment: the project's transport changed; run assignment-changed --project " + name)
+        blockers += [f"router: {blocker}" for blocker in routed.get(name, {}).get("blockers", [])]
         report[name] = {
             "provider": adapter["provider"], "adapter": adapter["status"], "observation": observation,
             "history": history, "assignment": adapter["assignment_mismatches"] or "ok",
@@ -675,6 +804,7 @@ def readiness_report(project_root: Path, state_dir: Path, db: sqlite3.Connection
             "pending_cleanup": conversation["cleanup_message_ids"] if conversation else [],
             "catch_up_queued": bool(conversation and conversation["catch_up_queued"]),
             "delivery_ready": not blockers, "blockers": blockers,
+            **({"router": routed[name]} if name in routed else {}),
         }
     return {"provider_prerequisites": prerequisites, "projects": report}
 
@@ -727,7 +857,7 @@ def status(state_dir: Path, project_root: Path | None = None) -> dict:
             if row["state"] not in STATES:
                 raise ValueError("conversation store state is invalid")
             conversations[row["project"]] = {
-                "channel_id": row["channel_id"], "assignment_generation": row["assignment_generation"],
+                "channel_id": row["channel_id"], "identity": row["identity"], "assignment_generation": row["assignment_generation"],
                 "state": row["state"], "revision": row["revision"],
                 "last_ack_at": row["last_ack_at"], "last_ack_message_id": row["last_ack_message_id"],
                 "current_interaction_id": row["current_interaction_id"],
@@ -755,7 +885,7 @@ def status(state_dir: Path, project_root: Path | None = None) -> dict:
                 WHERE project=? AND assignment_generation=? AND kind='delete' ORDER BY rowid""", key).fetchall()
             retired.append({
                 "project": row["project"], "assignment_generation": row["assignment_generation"],
-                "channel_id": row["channel_id"], "bot_id": row["bot_id"],
+                "channel_id": row["channel_id"], "identity": row["identity"],
                 "reason": row["reason"], "retired_at": row["retired_at"],
                 "cleanup": {
                     "pending": [a["message_id"] for a in actions if a["completed"] == 0],
@@ -783,7 +913,7 @@ def status(state_dir: Path, project_root: Path | None = None) -> dict:
                                         "the registration, run scripts/conversation-reminder-service.py "
                                         "assignment-changed --project " + ", ".join(sorted(blocked)) + "."
                                         if blocked else None),
-                "recovery_guidance": ("Run recover after restoring assigned bot access. Recovery identifies a lost "
+                "recovery_guidance": ("Run recover after restoring root's channel access. Recovery identifies a lost "
                                       "reminder only by replaying its nonce inside Discord's duplicate-check window; "
                                       "it never adopts or deletes a bot emoji found in history. If recover lists "
                                       "unbound candidates, delete a stray reminder in Discord and run recover again, "
@@ -939,7 +1069,8 @@ def reconcile_restart(db: sqlite3.Connection, registry: dict, rows: list[sqlite3
     applied = 0
     for ref, kind in sorted(missed.values(), key=lambda item: (iso(item[0]["at"]), len(item[0]["id"]), item[0]["id"])):
         event = {"schema_version": 1, "event_id": f"history:{generation}:{ref['id']}", "project": project,
-                 "channel_id": row["channel_id"], "bot_id": row["bot_id"], "assignment_generation": generation,
+                 "channel_id": row["channel_id"], "bot_id": event_speaker(row["identity"]),
+                 "assignment_generation": generation,
                  "provider": "ccdm-root", "event_time": ref["at"], "event_order": f"{ref['at']}:history:{ref['id']}",
                  "adapter_instance_id": "restart-reconciliation", "actor_id": row["owner_id"],
                  "source_message_id": ref["id"]}
@@ -974,7 +1105,8 @@ def reconcile_restart(db: sqlite3.Connection, registry: dict, rows: list[sqlite3
             apply_payload(db, registry, EVENTS.validate_event({
                 "schema_version": 1, "event_id": f"history-reaction:{generation}:{uuid.uuid4().hex}",
                 "event_type": "owner_activity", "project": project, "channel_id": row["channel_id"],
-                "bot_id": row["bot_id"], "assignment_generation": generation, "provider": "ccdm-root",
+                "bot_id": event_speaker(row["identity"]), "assignment_generation": generation,
+                "provider": "ccdm-root",
                 "event_time": stamp(now), "event_order": f"{stamp(now)}:history-reaction",
                 "adapter_instance_id": "restart-reconciliation", "actor_id": row["owner_id"],
                 "source_message_id": source, "activity_kind": "reaction"}), None)
@@ -1008,14 +1140,15 @@ def pending_actions(state_dir: Path) -> dict:
         return {"actions": []}
     try:
         rows = db.execute("""SELECT a.action_id,a.project,a.kind,a.message_id,a.assignment_generation,
-                COALESCE(c.channel_id,r.channel_id) AS channel_id, COALESCE(c.bot_id,r.bot_id) AS bot_id,
+                COALESCE(c.channel_id,r.channel_id) AS channel_id, COALESCE(c.identity,r.identity) AS identity,
                 r.project IS NOT NULL AS retired
             FROM pending_actions a
             LEFT JOIN conversations c ON c.project=a.project AND c.assignment_generation=a.assignment_generation
             LEFT JOIN retired_assignments r ON r.project=a.project AND r.assignment_generation=a.assignment_generation
             WHERE a.completed=0 AND (c.project IS NOT NULL OR r.project IS NOT NULL)
             ORDER BY a.rowid LIMIT 100""").fetchall()
-        return {"actions": [{**dict(row), "retired": bool(row["retired"])} for row in rows]}
+        return {"actions": [{**dict(row), "bot_id": pool_bot_id(row["identity"]), "retired": bool(row["retired"])}
+                            for row in rows]}
     finally:
         db.close()
 
@@ -1026,7 +1159,7 @@ def uncertain_intents(state_dir: Path) -> dict:
         return {"intents": []}
     try:
         rows = db.execute("""SELECT i.nonce,i.project,i.assignment_generation,i.claimed_at,
-            c.channel_id,c.bot_id FROM delivery_intents i JOIN conversations c
+            c.channel_id,c.identity FROM delivery_intents i JOIN conversations c
               ON c.project=i.project AND c.assignment_generation=i.assignment_generation
             WHERE i.state='uncertain' ORDER BY i.claimed_at LIMIT 100""").fetchall()
         intents = []
@@ -1034,7 +1167,7 @@ def uncertain_intents(state_dir: Path) -> dict:
             # Already recorded reminders can never be the lost send's identity.
             recorded = [r[0] for r in db.execute("""SELECT message_id FROM delivery_intents
                 WHERE project=? AND state='sent' AND message_id IS NOT NULL""", (row["project"],))]
-            intents.append({**dict(row), "recorded_message_ids": recorded})
+            intents.append({**dict(row), "bot_id": pool_bot_id(row["identity"]), "recorded_message_ids": recorded})
         return {"intents": intents}
     finally:
         db.close()
@@ -1155,8 +1288,7 @@ def claim_due(project_root: Path, state_dir: Path) -> dict:
             except (KeyError, ValueError):
                 continue
             if (assignment["generation"] != row["assignment_generation"] or
-                    assignment["channel_id"] != row["channel_id"] or assignment["bot_id"] != row["bot_id"] or
-                    not assignment["bot"].get("token")):
+                    assignment["channel_id"] != row["channel_id"] or assignment["identity"] != row["identity"]):
                 continue
             if db.execute("SELECT 1 FROM catch_ups WHERE project=? AND assignment_generation=?",
                           (row["project"], row["assignment_generation"])).fetchone():
@@ -1201,7 +1333,7 @@ def validate_claim(project_root: Path, state_dir: Path, nonce: str) -> dict:
                 assignment = EVENTS.assignment_for(registry, intent["project"])
                 valid = (assignment["generation"] == intent["assignment_generation"] and
                          assignment["channel_id"] == row["channel_id"] and
-                         assignment["bot_id"] == row["bot_id"] and bool(assignment["bot"].get("token")))
+                         assignment["identity"] == row["identity"])
             except (KeyError, ValueError):
                 valid = False
         if not valid and intent and intent["state"] == "sending":
@@ -1228,7 +1360,7 @@ def record_result(project_root: Path, state_dir: Path, nonce: str, outcome: str,
         row = db.execute("SELECT * FROM conversations WHERE project=?", (intent["project"],)).fetchone()
         if outcome == "absent":
             # History covering the whole claim window shows no reminder from the
-            # assigned bot: nothing was created, so reconcile and allow a new send.
+            # root: nothing was created, so reconcile and allow a new send.
             db.execute("UPDATE delivery_intents SET state='failed', retry_at=NULL WHERE nonce=?", (nonce,))
             if (row and row["assignment_generation"] == intent["assignment_generation"] and
                     row["reconciliation_status"] == "suspended-uncertain-send"):

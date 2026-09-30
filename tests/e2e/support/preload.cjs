@@ -146,6 +146,39 @@ function takeRestFailure(method, url, init = {}) {
   });
 }
 
+// Scripted rate limits: a rule `{ method, path, count, retryAfter, bucket, global }`
+// answers matching requests with Discord's 429 shape until `count` runs out
+// (`count: null` never does). Unlike `restFailures`, any rule may match, so one
+// limited route leaves the others alone. Each 429 is recorded in `rateLimitHits`.
+function takeRateLimit(method, url) {
+  const rules = readState().fixtures?.discord?.rateLimits;
+  if (!Array.isArray(rules) || rules.length === 0) return null;
+  const matches = rule => (!rule.method || rule.method === method) && rule.path === url.pathname
+    && (rule.count === null || rule.count > 0);
+  let rule = null;
+  updateState((state) => {
+    rule = (state.fixtures.discord.rateLimits ?? []).find(matches) ?? null;
+    if (!rule) return;
+    if (rule.count !== null) rule.count -= 1;
+    state.fixtures.discord.rateLimitHits ||= [];
+    state.fixtures.discord.rateLimitHits.push({ method, path: url.pathname });
+  });
+  if (!rule) return null;
+  const retryAfter = rule.retryAfter ?? 1;
+  const headers = {
+    "content-type": "application/json",
+    "retry-after": String(Math.ceil(retryAfter)),
+    "x-ratelimit-limit": "5",
+    "x-ratelimit-remaining": "0",
+    "x-ratelimit-reset-after": String(retryAfter),
+    "x-ratelimit-scope": rule.global ? "global" : "user",
+    ...(rule.bucket ? { "x-ratelimit-bucket": rule.bucket } : {}),
+    ...(rule.global ? { "x-ratelimit-global": "true" } : {}),
+  };
+  return response(JSON.stringify({ message: "You are being rate limited.", retry_after: retryAfter,
+    global: Boolean(rule.global) }), { headers, status: 429 });
+}
+
 // Discord knows a created message's author from the token that created it.
 function authorForToken(authorization) {
   try {
@@ -154,6 +187,8 @@ function authorForToken(authorization) {
     const bot = (registry.pool ?? []).find(entry => `Bot ${entry.token}` === authorization);
     if (bot?.app_id) return String(bot.app_id);
   } catch { /* Fall back to the single-bot fixture identity. */ }
+  // The Router's token is the fake gateway's bot user.
+  if (process.env.CCDM_ROUTER_STATE_DIR) return "fixture-bot-user-id";
   return "app";
 }
 
@@ -232,9 +267,156 @@ function routeChannelHistory(url, method, init) {
   return json(page);
 }
 
+// A message the fake created, seeded in channel history, or injected, shaped
+// as Discord's GET returns it.
+function channelMessage(state, messageId) {
+  const discord = state.fixtures?.discord ?? {};
+  const sent = (discord.messages ?? []).find(message => message.id === messageId && !message.deleted);
+  if (sent) {
+    return { id: sent.id, channel_id: sent.channelId, content: sent.content,
+      ...(sent.webhookId ? { webhook_id: sent.webhookId } : {}),
+      author: sent.webhookId ? { id: sent.webhookId, username: sent.username, bot: true }
+        : { id: authorForToken(sent.authorization), bot: true } };
+  }
+  for (const [channelId, history] of Object.entries(discord.history ?? {})) {
+    const seeded = Array.isArray(history) && history.find(message => message.id === messageId);
+    if (seeded) return { ...seeded, channel_id: channelId };
+  }
+  const injected = (discord.injectedMessages ?? []).find(message => message.id === messageId);
+  if (!injected) return null;
+  // Discord re-signs attachment URLs on every fetch: `refreshedUrl` stands in for that.
+  return { id: injected.id, channel_id: injected.channelId, content: injected.content,
+    ...(injected.webhookId ? { webhook_id: injected.webhookId } : {}),
+    author: { id: injected.author.id, username: injected.author.username, bot: Boolean(injected.author.bot) },
+    attachments: (injected.attachments ?? []).map(attachment => ({ id: attachment.id, filename: attachment.name,
+      content_type: attachment.contentType, size: attachment.size, url: attachment.refreshedUrl ?? attachment.url })) };
+}
+
+// Discord refuses webhook names and username overrides that contain these
+// words or run past 80 characters.
+function webhookNameProblem(name) {
+  if (typeof name !== "string" || name.length === 0) return "Must be between 1 and 80 in length.";
+  if ([...name].length > 80) return "Must be between 1 and 80 in length.";
+  if (/discord|clyde/i.test(name)) return `Username cannot contain "${/clyde/i.test(name) ? "clyde" : "discord"}"`;
+  return null;
+}
+
+// Channel webhooks: create and list with the bot token, execute with the
+// webhook's own token. Executed messages are stored with their webhook_id.
+function routeWebhooks(url, method, init) {
+  if (url.hostname !== "discord.com") return null;
+  const json = (body, status = 200) => response(JSON.stringify(body), {
+    headers: { "content-type": "application/json" }, status,
+  });
+  const channelMatch = /^\/api\/v10\/channels\/([^/]+)\/webhooks$/.exec(url.pathname);
+  if (channelMatch && method === "GET") {
+    const webhooks = (readState().fixtures?.discord?.webhooks ?? []).filter(webhook => webhook.channel_id === channelMatch[1]);
+    return json(webhooks);
+  }
+  if (channelMatch && method === "POST") {
+    const parsedBody = init.body ? JSON.parse(String(init.body)) : {};
+    const problem = webhookNameProblem(parsedBody.name);
+    if (problem) return json({ code: 50035, message: "Invalid Form Body", errors: { name: problem } }, 400);
+    let created;
+    updateState((state) => {
+      state.fixtures.discord.webhooks ||= [];
+      state.fixtures.discord.webhookCreates ||= [];
+      // Numbered by creation, so a recreated webhook never reuses a deleted id.
+      const number = state.fixtures.discord.webhookCreates.length + 1;
+      created = { id: `fake-webhook-${number}`, token: `fake-webhook-token-${number}`, type: 1,
+        channel_id: channelMatch[1], name: parsedBody.name };
+      state.fixtures.discord.webhooks.push(created);
+      state.fixtures.discord.webhookCreates.push({ authorization: headerValue(init.headers, "Authorization"),
+        channelId: channelMatch[1], name: parsedBody.name });
+    });
+    return json(created);
+  }
+  // One webhook by id with the bot token: GET returns it with its token (the
+  // bot's application created it); DELETE removes it.
+  const webhookMatch = /^\/api\/v10\/webhooks\/([^/]+)$/.exec(url.pathname);
+  if (webhookMatch && (method === "GET" || method === "DELETE")) {
+    if (!headerValue(init.headers, "Authorization")) return json({ code: 0, message: "401: Unauthorized" }, 401);
+    const webhook = (readState().fixtures?.discord?.webhooks ?? []).find(entry => entry.id === webhookMatch[1]);
+    if (!webhook) return json({ code: 10015, message: "Unknown Webhook" }, 404);
+    if (method === "GET") return json(webhook);
+    updateState((state) => {
+      state.fixtures.discord.webhooks = state.fixtures.discord.webhooks.filter(entry => entry.id !== webhook.id);
+      state.fixtures.discord.webhookDeletes ||= [];
+      state.fixtures.discord.webhookDeletes.push({ authorization: headerValue(init.headers, "Authorization"),
+        webhookId: webhook.id });
+    });
+    return response("", { status: 204 });
+  }
+  // Webhook message edit: only messages this webhook sent. Discord does not
+  // let an edit change the username.
+  const webhookEditMatch = /^\/api\/v10\/webhooks\/([^/]+)\/([^/]+)\/messages\/([^/]+)$/.exec(url.pathname);
+  if (webhookEditMatch && method === "PATCH") {
+    const parsedBody = init.body ? JSON.parse(String(init.body)) : {};
+    const [, webhookId, webhookToken, messageId] = webhookEditMatch;
+    const webhook = (readState().fixtures?.discord?.webhooks ?? []).find(entry => entry.id === webhookId);
+    if (!webhook || webhook.token !== webhookToken) return json({ code: 10015, message: "Unknown Webhook" }, 404);
+    let edited = null;
+    updateState((state) => {
+      const message = (state.fixtures.discord.messages ?? []).find(entry =>
+        entry.id === messageId && entry.webhookId === webhookId && !entry.deleted);
+      if (!message) return;
+      message.content = parsedBody.content ?? message.content;
+      state.fixtures.discord.webhookEdits ||= [];
+      state.fixtures.discord.webhookEdits.push({ webhookId, messageId, content: parsedBody.content });
+      edited = message;
+    });
+    if (!edited) return json({ code: 10008, message: "Unknown Message" }, 404);
+    return json({ id: edited.id, channel_id: edited.channelId, content: edited.content, webhook_id: webhookId,
+      author: { id: webhookId, username: edited.username, bot: true } });
+  }
+  const executeMatch = /^\/api\/v10\/webhooks\/([^/]+)\/([^/]+)$/.exec(url.pathname);
+  if (executeMatch && method === "POST") {
+    // Multipart executes carry the JSON body as payload_json beside files[n].
+    const form = formBodyFields(init.body);
+    const parsedBody = form ? JSON.parse(form.payload_json ?? "{}") : init.body ? JSON.parse(String(init.body)) : {};
+    const uploads = form ? Object.keys(form).filter(key => /^files\[\d+\]$/.test(key))
+      .map(key => ({ name: form[key].name, size: form[key].size })) : [];
+    const webhook = (readState().fixtures?.discord?.webhooks ?? []).find(entry => entry.id === executeMatch[1]);
+    if (!webhook || webhook.token !== executeMatch[2]) return json({ code: 10015, message: "Unknown Webhook" }, 404);
+    const problem = parsedBody.username === undefined ? null : webhookNameProblem(parsedBody.username);
+    const empty = !parsedBody.content && uploads.length === 0 ? "Cannot send an empty message"
+      : [...(parsedBody.content ?? "")].length > 2000 ? "Must be 2000 or fewer in length." : null;
+    if (problem || empty) {
+      updateState((state) => {
+        state.fixtures.discord.webhookRejections ||= [];
+        state.fixtures.discord.webhookRejections.push({ webhookId: webhook.id, username: parsedBody.username,
+          reason: problem || empty });
+      });
+      return json({ code: 50035, message: "Invalid Form Body", errors: { username: problem, content: empty } }, 400);
+    }
+    let created;
+    updateState((state) => {
+      state.fixtures.discord.messages ||= [];
+      created = {
+        avatarUrl: parsedBody.avatar_url,
+        channelId: webhook.channel_id,
+        content: parsedBody.content,
+        id: `fake-message-${state.fixtures.discord.messages.length + 1}`,
+        username: parsedBody.username ?? webhook.name,
+        webhookId: webhook.id,
+        ...(uploads.length ? { uploads } : {}),
+      };
+      state.fixtures.discord.messages.push(created);
+    });
+    if (url.searchParams.get("wait") !== "true") return response("", { status: 204 });
+    // A test can make Discord attribute the returned message to another webhook.
+    const returnedWebhookId = readState().fixtures?.discord?.webhookExecuteReturnsWebhookId ?? webhook.id;
+    return json({ id: created.id, channel_id: created.channelId, content: created.content, webhook_id: returnedWebhookId,
+      author: { id: returnedWebhookId, username: created.username, bot: true } });
+  }
+  return null;
+}
+
 function routeDiscordApi(url, init = {}) {
   const method = (init.method || "GET").toUpperCase();
   if (url.hostname === "discord.com") {
+    const limited = takeRateLimit(method, url);
+    if (limited) return limited;
     const failure = takeRestFailure(method, url, init);
     if (failure) return failure;
   }
@@ -401,6 +583,16 @@ function routeDiscordApi(url, init = {}) {
     });
   }
 
+  // The bot's own user, as the root token's holder sees it.
+  if (url.hostname === "discord.com" && url.pathname === "/api/v10/users/@me" && method === "GET") {
+    return response(JSON.stringify({ id: "fixture-bot-user-id", username: "fixture-bot", bot: true }), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const webhookRoute = routeWebhooks(url, method, init);
+  if (webhookRoute) return webhookRoute;
+
   const historyRoute = routeChannelHistory(url, method, init);
   if (historyRoute) return historyRoute;
 
@@ -530,7 +722,6 @@ function routeDiscordApi(url, init = {}) {
   }
   if (url.hostname === "discord.com" && getMessageMatch && method === "GET") {
     const state = readState();
-    const message = (state.fixtures?.discord?.restMessages ?? []).find((entry) => entry.id === getMessageMatch[2]);
     updateState((nextState) => {
       nextState.fixtures.discord.messageFetches ||= [];
       nextState.fixtures.discord.messageFetches.push({
@@ -539,6 +730,15 @@ function routeDiscordApi(url, init = {}) {
         messageId: getMessageMatch[2],
       });
     });
+    // Messages the fake knows the channel of: sent through it, seeded, or injected.
+    const known = channelMessage(state, getMessageMatch[2]);
+    if (known) {
+      return response(JSON.stringify(known.channel_id === getMessageMatch[1] ? known : { code: 10008, message: "Unknown Message" }), {
+        headers: { "content-type": "application/json" },
+        status: known.channel_id === getMessageMatch[1] ? 200 : 404,
+      });
+    }
+    const message = (state.fixtures?.discord?.restMessages ?? []).find((entry) => entry.id === getMessageMatch[2]);
     if (!message) {
       return response(JSON.stringify({ message: "Unknown Message" }), {
         headers: { "content-type": "application/json" },
@@ -577,6 +777,64 @@ function routeDiscordApi(url, init = {}) {
         emoji: reactionMatch[3],
         messageId: reactionMatch[2],
       });
+    });
+    return response("", { status: 204 });
+  }
+  if (url.hostname === "discord.com" && reactionMatch && method === "DELETE") {
+    updateState((state) => {
+      state.fixtures.discord.reactionDeletes ||= [];
+      state.fixtures.discord.reactionDeletes.push({
+        authorization: headerValue(init.headers, "Authorization"),
+        channelId: reactionMatch[1],
+        emoji: reactionMatch[3],
+        messageId: reactionMatch[2],
+      });
+    });
+    return response("", { status: 204 });
+  }
+
+  const typingMatch = /^\/api\/v10\/channels\/([^/]+)\/typing$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && typingMatch && method === "POST") {
+    updateState((state) => {
+      state.fixtures.discord.typing ||= [];
+      state.fixtures.discord.typing.push({ authorization: headerValue(init.headers, "Authorization"), channelId: typingMatch[1] });
+    });
+    return response("", { status: 204 });
+  }
+
+  // Pool retirement: kicking a member, deleting a role, and (never expected)
+  // deleting an application are recorded for tests to assert on.
+  const guildMemberMatch = /^\/api\/v10\/guilds\/([^/]+)\/members\/([^/]+)$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && guildMemberMatch && method === "DELETE") {
+    updateState((state) => {
+      state.fixtures.discord.memberRemovals ||= [];
+      state.fixtures.discord.memberRemovals.push({
+        authorization: headerValue(init.headers, "Authorization"),
+        guildId: guildMemberMatch[1],
+        userId: guildMemberMatch[2],
+      });
+    });
+    return response("", { status: 204 });
+  }
+
+  const guildRoleMatch = /^\/api\/v10\/guilds\/([^/]+)\/roles\/([^/]+)$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && guildRoleMatch && method === "DELETE") {
+    updateState((state) => {
+      state.fixtures.discord.roleDeletes ||= [];
+      state.fixtures.discord.roleDeletes.push({
+        authorization: headerValue(init.headers, "Authorization"),
+        guildId: guildRoleMatch[1],
+        roleId: guildRoleMatch[2],
+      });
+    });
+    return response("", { status: 204 });
+  }
+
+  const applicationMatch = /^\/api\/v10\/applications\/([^/]+)$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && applicationMatch && method === "DELETE") {
+    updateState((state) => {
+      state.fixtures.discord.applicationDeletes ||= [];
+      state.fixtures.discord.applicationDeletes.push({ applicationId: applicationMatch[1] });
     });
     return response("", { status: 204 });
   }
@@ -662,6 +920,12 @@ async function guardedFetch(input, init = {}) {
       await new Promise(resolve => setTimeout(resolve, delay));
       updateState(state => { state.fixtures.discord.responsePending = false; });
     }
+    // Real Discord's round trip for one page of channel history.
+    const pageDelay = readState().fixtures?.discord?.historyPageDelayMs || 0;
+    if (pageDelay && (init.method || "GET").toUpperCase() === "GET" &&
+        /^\/api\/v10\/channels\/[^/]+\/messages$/.test(url.pathname)) {
+      await new Promise(resolve => setTimeout(resolve, pageDelay));
+    }
     return routed;
   }
   recordBlocked("fetch", url.href);
@@ -718,10 +982,31 @@ function hostFromNetArgs(args) {
   return { host: "localhost", port: "" };
 }
 
+// Unix-socket path of a net.connect call, or null for TCP.
+function unixPathFromNetArgs(args) {
+  const first = args[0];
+  if (typeof first === "string" && !/^\d+$/.test(first)) return first;
+  if (typeof first === "object" && first !== null && typeof first.path === "string") return first.path;
+  return null;
+}
+
+// Local sockets such as the Router's are allowed only inside the Test Workspace.
+function isWorkspaceSocket(socketPath) {
+  if (!socketPath || !stateDir) return false;
+  const workspaceRoot = path.dirname(path.resolve(stateDir));
+  return path.resolve(socketPath).startsWith(`${workspaceRoot}${path.sep}`);
+}
+
 function installNetGuard() {
   const originalConnect = net.connect.bind(net);
   const originalCreateConnection = net.createConnection.bind(net);
   function guardedConnect(...args) {
+    const socketPath = unixPathFromNetArgs(args);
+    if (socketPath !== null) {
+      if (isWorkspaceSocket(socketPath)) return originalConnect(...args);
+      recordBlocked("net", `unix:${socketPath}`);
+      throw new Error(`Blocked unexpected net egress: unix:${socketPath}`);
+    }
     const { host, port } = hostFromNetArgs(args);
     const allowedPort = String(process.env.WS_PORT || "");
     const isLocal = ["127.0.0.1", "localhost", "::1", ""].includes(String(host));
@@ -734,6 +1019,8 @@ function installNetGuard() {
   }
   net.connect = guardedConnect;
   net.createConnection = function guardedCreateConnection(...args) {
+    const socketPath = unixPathFromNetArgs(args);
+    if (socketPath !== null && isWorkspaceSocket(socketPath)) return originalCreateConnection(...args);
     const { host, port } = hostFromNetArgs(args);
     const allowedPort = String(process.env.WS_PORT || "");
     const isLocal = ["127.0.0.1", "localhost", "::1", ""].includes(String(host));

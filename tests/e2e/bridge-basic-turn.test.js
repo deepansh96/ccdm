@@ -10,16 +10,49 @@ import {
   injectDiscordMessage,
   injectDiscordReaction,
   runPreloadProbe,
-  startBridge,
   startFakeCodexServer,
   waitForState,
 } from "./support/bridge.js";
-import { readState, writeState } from "./support/state.js";
+import { runRouterCli, startBridge } from "./support/router.js";
+import { readState, seedRegistry, updateState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => {
   await cleanup();
 });
+
+// The fake gateway's bot user, which the Router logs in as: the root bot.
+const ROOT_BOT_USER_ID = "fixture-bot-user-id";
+// The first webhook the fake Discord creates, `alpha`'s Project Identity.
+const ALPHA_WEBHOOK_ID = "fake-webhook-1";
+// The fake webhook token is spelled in parts because router.test.js
+// scans every Test Workspace file, including this copied source, for that token.
+const ALPHA_WEBHOOK_PATH = `/api/v10/webhooks/fake-webhook-1/${"fake-webhook-"}token-1`;
+
+// Messages the Router posted through alpha's webhook.
+function webhookReplies(state) {
+  return state.fixtures.discord.messages.filter((message) => message.webhookId === ALPHA_WEBHOOK_ID);
+}
+
+function replyContents(state) {
+  return webhookReplies(state).map((message) => message.content);
+}
+
+// Reactions the Router added as the root bot, emoji decoded from the REST path.
+function botReactions(state) {
+  return state.fixtures.discord.reactions.map(({ messageId, emoji }) => [messageId, decodeURIComponent(emoji)]);
+}
+
+function readReadyFile(file) {
+  return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : null;
+}
+
+// Whether the Router holds a connected session for `project`.
+async function routerHasSession(workspace, project) {
+  const status = await runRouterCli(workspace, ["status"]);
+  assert.equal(status.exitCode, 0, status.stderr);
+  return new RegExp(`\\n  project ${project} scope=`).test(status.stdout);
+}
 
 test("child-scoped bridge preload blocks unexpected fetch egress", async () => {
   const workspace = createBridgeWorkspace();
@@ -84,7 +117,7 @@ test("discord.js overlay exports the bridge surface and emits injected gateway m
 test("bridge passes Codex config overrides to app-server", async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace);
-  const bridge = startBridge(workspace, {
+  const bridge = await startBridge(workspace, {
     port: codex.port,
     env: {
       CODEX_MODEL: "gpt-5.6-sol",
@@ -221,13 +254,13 @@ test("bridge resumes the requested thread but clear starts a fresh conversation"
   const workspace = createBridgeWorkspace();
   const readyFile = path.join(workspace.tmpDir, "ready");
   const codex = await startFakeCodexServer(workspace);
-  const bridge = startBridge(workspace, {
+  const bridge = await startBridge(workspace, {
     port: codex.port,
-    env: { CODEX_RESUME_THREAD_ID: "saved-thread", CODEX_STARTUP_READY_FILE: readyFile },
+    env: { CODEX_RESUME_THREAD_ID: "saved-thread", CCDM_CHANNEL_READY_FILE: readyFile },
   });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
   await waitForState(workspace, () => fs.existsSync(readyFile));
-  assert.equal(fs.readFileSync(readyFile, "utf8"), "ready\n");
+  assert.deepEqual(readReadyFile(readyFile), { ok: true, scope: { channel_id: "channel-id" } });
   const resume = codex.clientMessages.find((m) => m.method === "thread/resume");
   assert.equal(resume.params.threadId, "saved-thread");
   assert.equal(resume.params.cwd, workspace.repoDir);
@@ -243,12 +276,16 @@ test("failed resume never silently starts a fresh conversation", async () => {
   const workspace = createBridgeWorkspace();
   const readyFile = path.join(workspace.tmpDir, "ready");
   const codex = await startFakeCodexServer(workspace, { resumeError: "Saved thread unavailable" });
-  const bridge = startBridge(workspace, {
+  const bridge = await startBridge(workspace, {
     port: codex.port,
-    env: { CODEX_RESUME_THREAD_ID: "missing-thread", CODEX_STARTUP_READY_FILE: readyFile },
+    env: { CODEX_RESUME_THREAD_ID: "missing-thread", CCDM_CHANNEL_READY_FILE: readyFile },
   });
   await bridge.waitForOutput(/Saved thread unavailable/, 7000);
-  assert.equal(fs.existsSync(readyFile), false);
+  await waitForState(workspace, () => fs.existsSync(readyFile));
+  // The launcher hears a failed startup, never a ready listener.
+  assert.equal(readReadyFile(readyFile).ok, false);
+  assert.match(readReadyFile(readyFile).error, /Saved thread unavailable/);
+  assert.doesNotMatch(bridge.stdout, /Discord bot logged in/);
   assert.ok(!codex.clientMessages.some((m) => m.method === "thread/start" || m.method === "turn/start"));
   await bridge.stop();
 });
@@ -257,9 +294,9 @@ test("resumed startup fails when the fresh Discord instructions are rejected", a
   const workspace = createBridgeWorkspace();
   const readyFile = path.join(workspace.tmpDir, "ready");
   const codex = await startFakeCodexServer(workspace, { bootstrapError: "Bootstrap rejected" });
-  const bridge = startBridge(workspace, {
+  const bridge = await startBridge(workspace, {
     port: codex.port,
-    env: { CODEX_RESUME_THREAD_ID: "saved-thread", CODEX_STARTUP_READY_FILE: readyFile },
+    env: { CODEX_RESUME_THREAD_ID: "saved-thread", CCDM_CHANNEL_READY_FILE: readyFile },
   });
   await bridge.waitForOutput(/Fatal:/, 5000);
   assert.equal((await bridge.closed).exitCode, 1);
@@ -267,8 +304,11 @@ test("resumed startup fails when the fresh Discord instructions are rejected", a
   assert.ok(codex.clientMessages.some((m) => m.method === "turn/start"));
   assert.ok(!codex.clientMessages.some((m) => m.method === "thread/start"));
   assert.match(bridge.stderr, /Bootstrap rejected/);
-  assert.equal(fs.existsSync(readyFile), false);
-  assert.equal(readState(workspace.stateDir).fixtures.discord.logins.length, 0);
+  assert.equal(readReadyFile(readyFile).ok, false);
+  assert.match(readReadyFile(readyFile).error, /Bootstrap rejected/);
+  // The bridge never said hello to the Router.
+  assert.doesNotMatch(bridge.stdout, /Discord bot logged in/);
+  assert.equal(await routerHasSession(workspace, "alpha"), false);
 });
 
 test("bridge boots, registers Discord MCP, removes stale MCP, and completes one allowed text turn with opt-in text fallback", async () => {
@@ -278,27 +318,33 @@ test("bridge boots, registers Discord MCP, removes stale MCP, and completes one 
     staleMcpName: "discord-stale",
     turns: [{ delta: "Codex response" }],
   });
-  const bridge = startBridge(workspace, {
+  const bridge = await startBridge(workspace, {
     port: codex.port,
     env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
   });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
   const state = await injectMessageUntil(
     workspace,
     { content: "hello codex", id: "hello-codex" },
-    (nextState) => nextState.fixtures.discord.sends.length === 1,
+    (nextState) => nextState.fixtures.discord.messages.length === 1,
     5000,
   );
 
-  assert.equal(state.fixtures.discord.sends[0].content, "Codex response");
-  assert.equal(state.fixtures.discord.logins[0].token, "bot-token");
+  // The text fallback posts through the Router as alpha's webhook, with no
+  // context percentage known yet.
+  assert.deepEqual(state.fixtures.discord.messages.map(({ channelId, content, username, webhookId }) => ({ channelId, content, username, webhookId })), [
+    { channelId: "channel-id", content: "Codex response", username: "alpha-codex", webhookId: "fake-webhook-1" },
+  ]);
+  // Only the Router logs in to Discord, with the root bot token.
+  assert.deepEqual(state.fixtures.discord.logins, [{ token: "root-bot-token" }]);
   assert.equal(state.fixtures.discord.ready.length, 1);
-  assert.equal(state.fixtures.discord.channelCacheGets[0].id, "channel-id");
+  const status = await runRouterCli(workspace, ["status"]);
+  assert.match(status.stdout, /\n  project alpha scope=channel-id connected=/);
   assert.ok(state.fixtures.discord.typing.length >= 1);
-  const methods = state.fixtures.codex.protocolEvents
-    .filter((event) => event.event === "client-message")
-    .map((event) => event.message.method);
+  assert.deepEqual([...new Set(state.fixtures.discord.typing.map(({ authorization, channelId }) => `${authorization} ${channelId}`))],
+    ["Bot root-bot-token channel-id"]);
+  const methods = codex.clientMessages.map((message) => message.method);
   assert.deepEqual(
     methods.filter(Boolean),
     [
@@ -314,15 +360,11 @@ test("bridge boots, registers Discord MCP, removes stale MCP, and completes one 
       "turn/start",
     ],
   );
-  const threadStart = state.fixtures.codex.protocolEvents
-    .filter((event) => event.event === "client-message")
-    .map((event) => event.message)
+  const threadStart = codex.clientMessages
     .find((message) => message.method === "thread/start");
   assert.match(threadStart.params.developerInstructions, /Subagents and delegated tasks must return results to their parent agent/);
   assert.doesNotMatch(threadStart.params.developerInstructions, /scope_token/);
-  const bootstrapTurn = state.fixtures.codex.protocolEvents
-    .filter((event) => event.event === "client-message")
-    .map((event) => event.message)
+  const bootstrapTurn = codex.clientMessages
     .find((message) =>
       message.method === "turn/start" &&
       message.params?.input?.[0]?.text?.includes("Use ONLY the MCP server named \"discord-channel-id\""),
@@ -338,9 +380,9 @@ test("bridge keeps regular agent deltas private by default", async () => {
     channelId: "channel-id",
     turns: [{ delta: "sub-agent progress should stay private" }],
   });
-  const bridge = startBridge(workspace, { port: codex.port });
+  const bridge = await startBridge(workspace, { port: codex.port });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
   await injectMessageUntil(
     workspace,
     { content: "use a sub agent", id: "private-sub-agent" },
@@ -349,7 +391,7 @@ test("bridge keeps regular agent deltas private by default", async () => {
   );
   await new Promise((resolve) => setTimeout(resolve, 150));
 
-  assert.equal(readState(workspace.stateDir).fixtures.discord.sends.length, 0);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.messages, []);
   await bridge.stop();
 });
 
@@ -359,13 +401,13 @@ test("bridge accepts project guests from a comma-separated allowlist", async () 
     channelId: "channel-id",
     turns: [{ delta: "Guest response" }],
   });
-  const bridge = startBridge(workspace, {
+  const bridge = await startBridge(workspace, {
     allowedUserIds: ["allowed-user-id", "222222222222222222"],
     env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
     port: codex.port,
   });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
   await injectMessageUntil(
     workspace,
     { author: { id: "333333333333333333" }, content: "ignore outsider", id: "outsider" },
@@ -375,24 +417,21 @@ test("bridge accepts project guests from a comma-separated allowlist", async () 
   const state = await injectMessageUntil(
     workspace,
     { author: { id: "222222222222222222" }, content: "guest hello", id: "guest" },
-    (nextState) => nextState.fixtures.discord.sends.length === 1,
+    (nextState) => nextState.fixtures.discord.messages.length === 1,
     5000,
   );
 
-  assert.equal(state.fixtures.discord.sends[0].content, "Guest response");
+  assert.deepEqual(replyContents(state), ["Guest response"]);
   assert.equal(
-    state.fixtures.codex.protocolEvents.filter((event) => event.event === "client-message" && event.message.method === "turn/start").length,
+    codex.clientMessages.filter((message) => message.method === "turn/start").length,
     2,
   );
   await bridge.stop();
 });
 
-test("bridge covers channel fetch, filtering, fallback splitting, MCP reply suppression, and token-usage nickname PATCH", async () => {
+test("bridge covers filtering, fallback splitting, MCP reply suppression, and the token-usage percentage on the webhook username", async () => {
   const workspace = createBridgeWorkspace();
   const longText = "x".repeat(2001);
-  const seed = readState(workspace.stateDir);
-  seed.fixtures.discord.channelCacheMiss = true;
-  writeState(seed, workspace.stateDir);
   const codex = await startFakeCodexServer(workspace, {
     channelId: "channel-id",
     turns: [
@@ -402,12 +441,15 @@ test("bridge covers channel fetch, filtering, fallback splitting, MCP reply supp
       { delta: "usage done", tokenUsage: { last: { inputTokens: 42 }, modelContextWindow: 100 } },
     ],
   });
-  const bridge = startBridge(workspace, {
+  const bridge = await startBridge(workspace, {
     port: codex.port,
     env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
   });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
+  // Each reply lands before its turn ends; the next message must wait for the
+  // bridge to go idle, or it is steered into the finished turn.
+  await waitForFinishedTurns(bridge, 1); // the transport bootstrap
   await injectMessageUntil(
     workspace,
     { author: { id: "other-user" }, content: "ignore me", id: "ignore-user" },
@@ -429,35 +471,43 @@ test("bridge covers channel fetch, filtering, fallback splitting, MCP reply supp
   await injectMessageUntil(
     workspace,
     { content: "split this", id: "split-message" },
-    (nextState) => nextState.fixtures.discord.sends.length === 2,
+    (nextState) => nextState.fixtures.discord.messages.length === 2,
     5000,
   );
+  // The fake records the reply before the Router acknowledges it to the
+  // bridge, which ends the turn only then.
+  await waitForFinishedTurns(bridge, 2);
   await injectMessageUntil(
     workspace,
     { content: "mcp will reply", id: "mcp-message" },
     (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === "mcp-message"),
     5000,
   );
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  await waitForFinishedTurns(bridge, 3);
   await injectMessageUntil(
     workspace,
     { content: "mcp will react", id: "react-message" },
     (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === "react-message"),
     5000,
   );
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  await waitForFinishedTurns(bridge, 4);
   const state = await injectMessageUntil(
     workspace,
     { content: "usage", id: "usage-message" },
-    (nextState) => nextState.fixtures.discord.sends.length === 3 && nextState.fixtures.discord.nicknamePatches.length === 1,
+    (nextState) => nextState.fixtures.discord.messages.length === 3,
     5000,
   );
 
-  assert.equal(state.fixtures.discord.channelFetches[0].id, "channel-id");
-  assert.equal(state.fixtures.discord.sends[0].content.length, 2000);
-  assert.equal(state.fixtures.discord.sends[1].content.length, 1);
-  assert.equal(state.fixtures.discord.sends[2].content, "usage done");
-  assert.match(state.fixtures.discord.nicknamePatches[0].nick, /42%/);
+  // Ignored messages, suppressed turns, and replies all stayed in alpha's channel and webhook.
+  assert.deepEqual(state.fixtures.discord.messages.map(({ channelId, content, username, webhookId }) =>
+    ({ channelId, length: content.length, username, webhookId })), [
+    { channelId: "channel-id", length: 2000, username: "alpha-codex", webhookId: "fake-webhook-1" },
+    { channelId: "channel-id", length: 1, username: "alpha-codex", webhookId: "fake-webhook-1" },
+    { channelId: "channel-id", length: 10, username: "alpha-codex · 42%", webhookId: "fake-webhook-1" },
+  ]);
+  assert.equal(state.fixtures.discord.messages[2].content, "usage done");
+  // 42 of a 100-token window is 42%, carried on the reply's username, not a nickname.
+  assert.deepEqual(state.fixtures.discord.nicknamePatches, []);
   await bridge.stop();
 });
 
@@ -484,36 +534,43 @@ test("bridge text fallback is opt-in for completed assistant items without MCP r
       },
     ],
   });
-  const flaggedBridge = startBridge(flagged, {
+  const flaggedBridge = await startBridge(flagged, {
     port: flaggedCodex.port,
     env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
   });
 
-  await flaggedBridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await flaggedBridge.waitForOutput(/Listening in #alpha/, 7000);
+  // Each fallback reply posts before its turn ends; wait for the bridge to go
+  // idle so the next message starts its own turn instead of steering.
+  await waitForFinishedTurns(flaggedBridge, 1); // the transport bootstrap
   await injectMessageUntil(
     flagged,
     { content: "no deltas", id: "no-deltas" },
-    (nextState) => nextState.fixtures.discord.sends.length === 1,
+    (nextState) => nextState.fixtures.discord.messages.length === 1,
     5000,
   );
+  await waitForFinishedTurns(flaggedBridge, 2);
   await injectMessageUntil(
     flagged,
     { content: "completed before turn", id: "completed-before-turn" },
-    (nextState) => nextState.fixtures.discord.sends.length === 2,
+    (nextState) => nextState.fixtures.discord.messages.length === 2,
     5000,
   );
+  await waitForFinishedTurns(flaggedBridge, 3);
   await injectMessageUntil(
     flagged,
     { content: "message field", id: "message-field" },
-    (nextState) => nextState.fixtures.discord.sends.length === 3,
+    (nextState) => nextState.fixtures.discord.messages.length === 3,
     5000,
   );
   await flaggedBridge.waitForOutput(/\[text-reply-fallback\] completed item.type=agentMessage/, 5000);
 
   const flaggedState = readState(flagged.stateDir);
-  assert.equal(flaggedState.fixtures.discord.sends[0].content, "completed GLM response");
-  assert.equal(flaggedState.fixtures.discord.sends[1].content, "streamed GLM response");
-  assert.equal(flaggedState.fixtures.discord.sends[2].content, "message field GLM response");
+  assert.deepEqual(replyContents(flaggedState), [
+    "completed GLM response",
+    "streamed GLM response",
+    "message field GLM response",
+  ]);
   await flaggedBridge.stop();
 
   const unflagged = createBridgeWorkspace();
@@ -526,9 +583,9 @@ test("bridge text fallback is opt-in for completed assistant items without MCP r
       },
     ],
   });
-  const unflaggedBridge = startBridge(unflagged, { port: unflaggedCodex.port });
+  const unflaggedBridge = await startBridge(unflagged, { port: unflaggedCodex.port });
 
-  await unflaggedBridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await unflaggedBridge.waitForOutput(/Listening in #alpha/, 7000);
   await injectMessageUntil(
     unflagged,
     { content: "old path", id: "old-path" },
@@ -537,72 +594,81 @@ test("bridge text fallback is opt-in for completed assistant items without MCP r
   );
   await new Promise((resolve) => setTimeout(resolve, 150));
 
-  assert.equal(readState(unflagged.stateDir).fixtures.discord.sends.length, 0);
+  assert.deepEqual(readState(unflagged.stateDir).fixtures.discord.messages, []);
   await unflaggedBridge.stop();
 });
 
-test("bridge ignores project-channel messages that mention the root bot", async () => {
+// Turns a Discord message started, without the bridge's bootstrap instruction turns.
+function userTurnStarts(codex) {
+  return codex.clientMessages.filter((message) =>
+    message.method === "turn/start" &&
+    !message.params?.input?.[0]?.text?.startsWith("You are communicating with the user via Discord"));
+}
+
+test("project-channel messages that mention the root bot reach root, not the project session", async () => {
   const workspace = createBridgeWorkspace();
+  seedRegistry(workspace, { discord_user_id: "allowed-user-id", guild_id: "guild-id", root_channels: ["root-channel"], projects: {} });
   const codex = await startFakeCodexServer(workspace, {
     channelId: "channel-id",
     turns: [{ delta: "should not respond" }],
   });
-  const bridge = startBridge(workspace, {
+  const rootCodex = await startFakeCodexServer(workspace, { channelId: "root-channel", turns: [{ complete: true }] });
+  const bridge = await startBridge(workspace, {
     port: codex.port,
-    rootBotAppId: "root-bot-app-id",
+    rootBotAppId: ROOT_BOT_USER_ID,
+  });
+  const root = await startBridge(workspace, {
+    root: true,
+    botAppId: ROOT_BOT_USER_ID,
+    channelId: "root-channel",
+    port: rootCodex.port,
+    rootBotAppId: ROOT_BOT_USER_ID,
   });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
+  await root.waitForOutput(/Listening in #root-channel/, 7000);
   await injectMessageUntil(
     workspace,
-    { content: "<@root-bot-app-id> list sessions", id: "root-mention" },
-    (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === "root-mention"),
+    { content: "<@fixture-bot-user-id> list sessions", id: "root-mention" },
+    () => userTurnStarts(rootCodex).length === 1,
     5000,
   );
   await new Promise((resolve) => setTimeout(resolve, 150));
 
-  const state = readState(workspace.stateDir);
-  const userTurns = state.fixtures.codex.protocolEvents
-    .filter((event) => event.event === "client-message")
-    .map((event) => event.message)
-    .filter((message) =>
-      message.method === "turn/start" &&
-      !message.params?.input?.[0]?.text?.startsWith("You are communicating with the user via Discord")
-    );
-  assert.equal(userTurns.length, 0);
-  assert.equal(state.fixtures.discord.sends.length, 0);
+  assert.equal(userTurnStarts(codex).length, 0);
+  const [rootTurn] = userTurnStarts(rootCodex).map((message) => message.params.input[0].text);
+  assert.match(rootTurn, /^channel_id: channel-id$/m);
+  assert.match(rootTurn, /^message_id: root-mention$/m);
+  assert.match(rootTurn, /list sessions$/);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.messages, []);
   await bridge.stop();
+  await root.stop();
 });
 
-test("root bridge accepts root channels and mentioned project channels with routing metadata", async () => {
+test("root bridge accepts registry root channels and mentioned project channels with routing metadata", async () => {
   const workspace = createBridgeWorkspace();
-  const accessFile = path.join(workspace.tmpDir, "root-access.json");
-  fs.writeFileSync(
-    accessFile,
-    `${JSON.stringify({
-      allowFrom: ["allowed-user-id"],
-      groups: {
-        "root-channel": { requireMention: false, allowFrom: ["allowed-user-id"] },
-        "project-channel": { requireMention: true, allowFrom: ["allowed-user-id"] },
-      },
-    }, null, 2)}\n`,
-  );
-  const codex = await startFakeCodexServer(workspace, {
-    channelId: "root-channel",
-    turns: [{ complete: true }, { complete: true }],
-  });
-  const bridge = startBridge(workspace, {
-    botAppId: "root-bot-id",
-    channelId: "root-channel",
-    port: codex.port,
-    rootBotAppId: "root-bot-id",
-    env: {
-      ROOT_ACCESS_FILE: accessFile,
-      ROOT_MULTI_CHANNEL: "1",
+  const registryFile = path.join(workspace.repoDir, "registry.json");
+  seedRegistry(workspace, {
+    discord_user_id: "allowed-user-id",
+    guild_id: "guild-id",
+    root_channels: ["root-channel"],
+    projects: {
+      beta: { type: "codex", channel_id: "project-channel", path: workspace.repoDir, screen_name: "beta_codex" },
     },
   });
+  const codex = await startFakeCodexServer(workspace, {
+    channelId: "root-channel",
+    turns: [{ complete: true }, { complete: true }, { complete: true }],
+  });
+  const bridge = await startBridge(workspace, {
+    root: true,
+    botAppId: ROOT_BOT_USER_ID,
+    channelId: "root-channel",
+    port: codex.port,
+    rootBotAppId: ROOT_BOT_USER_ID,
+  });
 
-  await bridge.waitForOutput(/Root routing active for 2 configured channel\(s\)/, 7000);
+  await bridge.waitForOutput(/Root routing active for 1 configured channel\(s\)/, 7000);
   await injectMessageUntil(
     workspace,
     { channelId: "root-channel", content: "status", id: "root-status" },
@@ -617,44 +683,24 @@ test("root bridge accepts root channels and mentioned project channels with rout
   );
   await injectMessageUntil(
     workspace,
-    { channelId: "project-channel", content: "<@root-bot-id> codex restart this session with codex", id: "project-mentioned" },
-    (nextState) => {
-      const userTurns = nextState.fixtures.codex.protocolEvents
-        .filter((event) => event.event === "client-message")
-        .map((event) => event.message)
-        .filter((message) =>
-          message.method === "turn/start" &&
-          !message.params?.input?.[0]?.text?.startsWith("You are communicating with the user via Discord")
-        );
-      return userTurns.length === 2;
-    },
+    { channelId: "project-channel", content: "<@fixture-bot-user-id> codex restart this session with codex", id: "project-mentioned" },
+    () => userTurnStarts(codex).length === 2,
     5000,
   );
 
-  const state = readState(workspace.stateDir);
-  const writes = state.fixtures.codex.protocolEvents
-    .filter((event) => event.message?.method === "config/value/write")
-    .map((event) => event.message);
-  assert.ok(writes.some((message) => message.params.keyPath === "mcp_servers.discord-root"));
-  assert.equal(
-    writes.find((message) => message.params.keyPath === "mcp_servers.discord-root").params.value.env.DISCORD_CHANNEL_OVERRIDE,
-    "1",
-  );
-  assert.equal(
-    writes.find((message) => message.params.keyPath === "mcp_servers.discord-root").params.value.env.DISCORD_ACCESS_FILE,
-    accessFile,
-  );
-  const rootMcpEnv = writes.find((message) => message.params.keyPath === "mcp_servers.discord-root").params.value.env;
+  const writes = codex.clientMessages.filter((message) => message.method === "config/value/write");
+  const rootMcp = writes.find((message) => message.params.keyPath === "mcp_servers.discord-root");
+  assert.ok(rootMcp);
+  const rootMcpEnv = rootMcp.params.value.env;
+  assert.equal(rootMcpEnv.DISCORD_CHANNEL_OVERRIDE, "1");
+  // Root's MCP server reaches the Router with root's key; there is no access file.
+  assert.equal(rootMcpEnv.CCDM_ROUTER_ROLE, "root");
+  assert.equal(rootMcpEnv.CCDM_ROUTER_KEY_FILE, path.join(workspace.routerStateDir, "keys", ".root.key"));
+  assert.equal(rootMcpEnv.DISCORD_ACCESS_FILE, undefined);
   assert.match(rootMcpEnv.DISCORD_CHANNEL_SCOPE_SECRET, /^[a-f0-9]{64}$/);
   assert.match(rootMcpEnv.DISCORD_CHANNEL_SCOPE_FILE, /codex-discord-scope-/);
 
-  const userTurns = state.fixtures.codex.protocolEvents
-    .filter((event) => event.event === "client-message")
-    .map((event) => event.message)
-    .filter((message) =>
-      message.method === "turn/start" &&
-      !message.params?.input?.[0]?.text?.startsWith("You are communicating with the user via Discord")
-    );
+  const userTurns = userTurnStarts(codex);
   assert.equal(userTurns.length, 2);
   assert.match(userTurns[0].params.input[0].text, /channel_id: root-channel/);
   assert.match(userTurns[0].params.input[0].text, /channel_scope_token: [A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/);
@@ -662,52 +708,41 @@ test("root bridge accepts root channels and mentioned project channels with rout
   assert.doesNotMatch(userTurns[0].params.input[0].text, /reply_channel_id/);
   assert.match(userTurns[1].params.input[0].text, /channel_id: project-channel/);
   assert.match(userTurns[1].params.input[0].text, /codex restart this session with codex/);
-  assert.doesNotMatch(userTurns[1].params.input[0].text, /<@root-bot-id>/);
+  assert.doesNotMatch(userTurns[1].params.input[0].text, /<@fixture-bot-user-id>/);
 
-  const updatedAccess = JSON.parse(fs.readFileSync(accessFile, "utf8"));
-  updatedAccess.groups["new-project-channel"] = {
-    requireMention: true,
-    allowFrom: ["allowed-user-id"],
-  };
-  fs.writeFileSync(accessFile, `${JSON.stringify(updatedAccess, null, 2)}\n`);
+  // A newly registered project channel reaches root once the Router reloads the registry.
+  const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+  registry.projects.gamma = { type: "codex", channel_id: "new-project-channel", path: workspace.repoDir, screen_name: "gamma_codex" };
+  fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
+  await new Promise((resolve) => setTimeout(resolve, 1000));
   await injectMessageUntil(
     workspace,
-    { channelId: "new-project-channel", content: "<@root-bot-id> new channel", id: "new-project-mentioned" },
-    (nextState) => nextState.fixtures.codex.protocolEvents
-      .filter((event) => event.event === "client-message")
-      .map((event) => event.message)
-      .filter((message) =>
-        message.method === "turn/start" &&
-        !message.params?.input?.[0]?.text?.startsWith("You are communicating with the user via Discord")
-      ).length === 3,
+    { channelId: "new-project-channel", content: "<@fixture-bot-user-id> new channel", id: "new-project-mentioned" },
+    () => userTurnStarts(codex).length === 3,
     5000,
   );
 
-  delete updatedAccess.groups["project-channel"];
-  fs.writeFileSync(accessFile, `${JSON.stringify(updatedAccess, null, 2)}\n`);
+  // A deregistered project channel no longer does.
+  delete registry.projects.beta;
+  fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
+  await new Promise((resolve) => setTimeout(resolve, 1000));
   await injectMessageUntil(
     workspace,
-    { channelId: "project-channel", content: "<@root-bot-id> removed channel", id: "removed-project-mentioned" },
+    { channelId: "project-channel", content: "<@fixture-bot-user-id> removed channel", id: "removed-project-mentioned" },
     (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === "removed-project-mentioned"),
     5000,
   );
-  await new Promise((resolve) => setTimeout(resolve, 150));
-  const finalUserTurns = readState(workspace.stateDir).fixtures.codex.protocolEvents
-    .filter((event) => event.event === "client-message")
-    .map((event) => event.message)
-    .filter((message) =>
-      message.method === "turn/start" &&
-      !message.params?.input?.[0]?.text?.startsWith("You are communicating with the user via Discord")
-    );
-  assert.equal(finalUserTurns.length, 3);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.equal(userTurnStarts(codex).length, 3);
   await bridge.stop();
 });
 
-test("bridge logs failed nickname PATCH responses", async () => {
+test("bridge never PATCHes a nickname and carries the context percentage on the reply username", async () => {
   const workspace = createBridgeWorkspace();
+  // The pool-mode nickname endpoint would fail, as a guild without the permission does.
   const seed = readState(workspace.stateDir);
   seed.fixtures.discord.restFailures = [
-    { status: 403, body: { message: "missing permissions" } },
+    { method: "PATCH", path: "/api/v10/guilds/guild-id/members/@me", status: 403, body: { message: "missing permissions" } },
   ];
   writeState(seed, workspace.stateDir);
   const codex = await startFakeCodexServer(workspace, {
@@ -715,18 +750,23 @@ test("bridge logs failed nickname PATCH responses", async () => {
       { delta: "usage done", tokenUsage: { last: { inputTokens: 42 }, modelContextWindow: 100 } },
     ],
   });
-  const bridge = startBridge(workspace, { port: codex.port });
+  const bridge = await startBridge(workspace, { port: codex.port, env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" } });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
-  await injectMessageUntil(
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
+  const state = await injectMessageUntil(
     workspace,
     { content: "usage", id: "failed-nickname-usage-message" },
-    (nextState) => nextState.fixtures.discord.restFailureUses.length === 1,
+    (nextState) => nextState.fixtures.discord.messages.length === 1,
     5000,
   );
-  await bridge.waitForOutput(/Nickname update failed: Discord API 403.*missing permissions/, 5000);
-  const state = readState(workspace.stateDir);
-  assert.equal(state.fixtures.discord.restFailureUses[0].path, "/api/v10/guilds/guild-id/members/@me");
+
+  // 42 of a 100-token window.
+  assert.deepEqual(state.fixtures.discord.messages.map(({ content, username, webhookId }) => ({ content, username, webhookId })), [
+    { content: "usage done", username: "alpha-codex · 42%", webhookId: "fake-webhook-1" },
+  ]);
+  assert.deepEqual(state.fixtures.discord.nicknamePatches, []);
+  assert.deepEqual(state.fixtures.discord.restFailureUses ?? [], []);
+  assert.doesNotMatch(bridge.stdout + bridge.stderr, /Nickname/i);
   await bridge.stop();
 });
 
@@ -739,7 +779,7 @@ test("bridge handles approvals, active-turn steer, and stale-turn queue fallback
       { delta: "queued done" },
     ],
   });
-  const bridge = startBridge(workspace, {
+  const bridge = await startBridge(workspace, {
     port: codex.port,
     env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
   });
@@ -757,13 +797,11 @@ test("bridge handles approvals, active-turn steer, and stale-turn queue fallback
     throw lastError;
   };
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
   await injectMessageUntil(
     workspace,
     { content: "first", id: "first" },
-    (nextState) => nextState.fixtures.codex.protocolEvents.some(
-      (event) => event.message?.method === "turn/start" && event.message.params.input?.[0]?.text === "first",
-    ),
+    (nextState) => codex.clientMessages.some((message) => message.method === "turn/start" && message.params.input?.[0]?.text === "first"),
   );
   await new Promise((resolve) => setTimeout(resolve, 250));
   await injectAndWait({ content: "steer succeeds", id: "steer-succeeds" }, /\[steer\] Injected into active turn turn-active/);
@@ -772,11 +810,9 @@ test("bridge handles approvals, active-turn steer, and stale-turn queue fallback
   const state = await waitForState(
     workspace,
     (nextState) => {
-      const clientMessages = nextState.fixtures.codex.protocolEvents
-        .filter((event) => event.event === "client-message")
-        .map((event) => event.message);
+      const clientMessages = codex.clientMessages;
       return (
-        nextState.fixtures.discord.sends.map((send) => send.content).includes("queued done") &&
+        replyContents(nextState).includes("queued done") &&
         clientMessages.filter((message) => message.result?.approved === true).length >= 2
       );
     },
@@ -786,15 +822,17 @@ test("bridge handles approvals, active-turn steer, and stale-turn queue fallback
   await new Promise((resolve) => setTimeout(resolve, 150));
   const afterDelay = readState(workspace.stateDir);
 
-  assert.ok(state.fixtures.discord.sends.map((send) => send.content).includes("first done"));
-  assert.ok(state.fixtures.discord.sends.map((send) => send.content).includes("queued done"));
-  assert.ok(state.fixtures.discord.reactions.map((reaction) => reaction.emoji).includes("\u23f3"));
-  assert.ok(state.fixtures.discord.reactionRemovals.length >= 1);
+  assert.ok(replyContents(state).includes("first done"));
+  assert.ok(replyContents(state).includes("queued done"));
+  // The queued message's ⏳ is added as the root bot through the Router. (The
+  // Router has no reaction-removal op, so the bridge no longer removes it.)
+  const hourglass = state.fixtures.discord.reactions.filter((reaction) => decodeURIComponent(reaction.emoji) === "\u23f3");
+  assert.ok(hourglass.length >= 1);
+  assert.ok(hourglass.every((reaction) => reaction.authorization === "Bot root-bot-token" &&
+    reaction.channelId === "channel-id" && reaction.messageId.startsWith("steer-queues-")));
   assert.ok(state.fixtures.discord.typing.length >= 2);
   assert.equal(afterDelay.fixtures.discord.typing.length, typingCountAfterCompletion);
-  const clientMessages = state.fixtures.codex.protocolEvents
-    .filter((event) => event.event === "client-message")
-    .map((event) => event.message);
+  const clientMessages = codex.clientMessages;
   assert.match(bridge.stdout, /\[steer\] Injected into active turn turn-active/);
   assert.match(bridge.stdout, /\[steer\] Failed \(stale turn\), queuing instead/);
   assert.ok(
@@ -820,18 +858,16 @@ test("bridge drains queued messages after Codex reports a different active turn 
       { delta: "queued done" },
     ],
   });
-  const bridge = startBridge(workspace, {
+  const bridge = await startBridge(workspace, {
     port: codex.port,
     env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
   });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
   await injectMessageUntil(
     workspace,
     { content: "first", id: "first-mismatch" },
-    (nextState) => nextState.fixtures.codex.protocolEvents.some(
-      (event) => event.message?.method === "turn/start" && event.message.params.input?.[0]?.text === "first",
-    ),
+    (nextState) => codex.clientMessages.some((message) => message.method === "turn/start" && message.params.input?.[0]?.text === "first"),
   );
   await injectMessageUntil(
     workspace,
@@ -845,13 +881,13 @@ test("bridge drains queued messages after Codex reports a different active turn 
 
   const state = await waitForState(
     workspace,
-    (nextState) => nextState.fixtures.discord.sends.map((send) => send.content).includes("queued done"),
+    (nextState) => replyContents(nextState).includes("queued done"),
     10000,
   );
-  const sends = state.fixtures.discord.sends.map((send) => send.content);
+  const replies = replyContents(state);
 
-  assert.ok(sends.includes("first done"));
-  assert.ok(sends.includes("queued done"));
+  assert.ok(replies.includes("first done"));
+  assert.ok(replies.includes("queued done"));
   assert.match(bridge.stdout, /\[turn\] accepting active turn id actual-turn/);
   await bridge.stop();
 });
@@ -869,30 +905,29 @@ test("bridge finishes a mismatched turn that only completes an assistant item", 
       { delta: "queued reply" },
     ],
   });
-  const bridge = startBridge(workspace, {
+  const bridge = await startBridge(workspace, {
     port: codex.port,
     env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
   });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
+  await waitForFinishedTurns(bridge, 1); // the transport bootstrap
   await injectMessageUntil(
     workspace,
     { content: "first", id: "completed-only-mismatch" },
-    (nextState) => nextState.fixtures.discord.sends.some(
-      (send) => send.content === "completed-only reply",
-    ),
+    (nextState) => replyContents(nextState).includes("completed-only reply"),
     5000,
   );
+  // The reply posts before the turn ends; the second message must start its own turn.
+  await waitForFinishedTurns(bridge, 2);
   const state = await injectMessageUntil(
     workspace,
     { content: "second", id: "after-completed-only" },
-    (nextState) => nextState.fixtures.discord.sends.some(
-      (send) => send.content === "queued reply",
-    ),
+    (nextState) => replyContents(nextState).includes("queued reply"),
     5000,
   );
   assert.deepEqual(
-    state.fixtures.discord.sends.map((send) => send.content),
+    replyContents(state),
     ["completed-only reply", "queued reply"],
   );
   assert.match(bridge.stdout, /accepting active turn id actual-turn for item\/completed/);
@@ -918,22 +953,25 @@ test("bridge ignores stale turn notifications before and after the current turn 
       },
     ],
   });
-  const bridge = startBridge(workspace, {
+  const bridge = await startBridge(workspace, {
     port: codex.port,
     env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
   });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
+  await waitForFinishedTurns(bridge, 1); // the transport bootstrap
   await injectMessageUntil(
     workspace,
     { content: "first", id: "first-turn" },
-    (state) => state.fixtures.discord.sends.some((send) => send.content === "first done"),
+    (state) => replyContents(state).includes("first done"),
     5000,
   );
+  // The reply posts before the turn ends; the second message must start its own turn.
+  await waitForFinishedTurns(bridge, 2);
   await injectMessageUntil(
     workspace,
     { content: "second", id: "second-turn" },
-    (state) => state.fixtures.discord.sends.some((send) => send.content === "second done"),
+    (state) => replyContents(state).includes("second done"),
     5000,
   );
 
@@ -947,52 +985,40 @@ test("bridge queues compact during an active turn and runs it after completion",
     compactComplete: true,
     turns: [{ delta: "busy done", startDelayMs: 10, turnId: "busy-turn", waitForRelease: true }],
   });
-  const bridge = startBridge(workspace, {
+  const bridge = await startBridge(workspace, {
     port: codex.port,
     env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
   });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
   await injectMessageUntil(
     workspace,
     { content: "busy", id: "busy-0" },
-    (nextState) => nextState.fixtures.codex.protocolEvents.some(
-      (event) => event.message?.method === "turn/start" && event.message.params.input?.[0]?.text === "busy",
-    ),
+    (nextState) => codex.clientMessages.some((message) => message.method === "turn/start" && message.params.input?.[0]?.text === "busy"),
   );
   await new Promise((resolve) => setTimeout(resolve, 80));
   await injectMessageUntil(
     workspace,
     { content: "/compact", id: "compact-message" },
-    (nextState) => nextState.fixtures.discord.sends.some(
-      (send) => send.content === "Compaction queued.",
-    ),
+    (nextState) => replyContents(nextState).includes("Compaction queued."),
     5000,
   );
   codex.releaseTurn("busy-turn");
-  const compactState = await waitForState(
+  await waitForState(
     workspace,
-    (nextState) => nextState.fixtures.discord.sends.some(
-      (send) => send.content === "Compaction complete.",
-    ),
+    (nextState) => replyContents(nextState).includes("Compaction complete."),
     20000,
   );
   await new Promise((resolve) => setTimeout(resolve, 150));
   const state = readState(workspace.stateDir);
 
-  assert.deepEqual(state.fixtures.discord.reactions.map((reaction) => reaction.emoji), ["\ud83d\udd04"]);
-  const clientMessageMap = new Map();
-  for (const sourceState of [compactState, state]) {
-    for (const event of sourceState.fixtures.codex.protocolEvents) {
-      if (event.event === "client-message") {
-        clientMessageMap.set(JSON.stringify(event.message), event.message);
-      }
-    }
-  }
-  const clientMessages = [...clientMessageMap.values()];
+  assert.deepEqual(botReactions(state), [["compact-message", "\ud83d\udd04"]]);
+  const clientMessages = codex.clientMessages;
   assert.ok(clientMessages.some((message) => message.method === "thread/compact/start"));
   const mcpWrite = clientMessages.find((message) => message.method === "config/value/write");
   assert.equal(mcpWrite.params.keyPath, "mcp_servers.discord-channel-id");
+  // Codex waits out the Router's longest per-op deadline (a 10-minute export).
+  assert.equal(mcpWrite.params.value.tool_timeout_sec, 630);
   assert.equal(mcpWrite.params.value.env.CHANNEL_ID, "channel-id");
   assert.match(mcpWrite.params.value.env.DISCORD_REPLY_TOKEN, /^[a-f0-9]{32}$/);
   const bootstrapTurns = clientMessages.filter((message) =>
@@ -1013,27 +1039,21 @@ test("bridge pauses new turns and sends queued messages in order after unpause",
       { delta: "second queued done", turnId: "second-queued-turn" },
     ],
   });
-  const bridge = startBridge(workspace, {
+  const bridge = await startBridge(workspace, {
     port: codex.port,
     env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
   });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
   await injectMessageUntil(
     workspace,
     { content: "active", id: "active-message" },
-    (state) => state.fixtures.codex.protocolEvents.some(
-      (event) =>
-        event.message?.method === "turn/start" &&
-        event.message.params.input?.[0]?.text === "active",
-    ),
+    (state) => codex.clientMessages.some((message) => message.method === "turn/start" && message.params.input?.[0]?.text === "active"),
   );
   await injectMessageUntil(
     workspace,
     { content: "/pause", id: "pause-message" },
-    (state) => state.fixtures.discord.sends.some(
-      (send) => send.content === "Bridge paused. New messages will be queued.",
-    ),
+    (state) => replyContents(state).includes("Bridge paused. New messages will be queued."),
   );
   for (const [id, content] of [
     ["first-queued-message", "first queued"],
@@ -1042,35 +1062,35 @@ test("bridge pauses new turns and sends queued messages in order after unpause",
     await injectMessageUntil(
       workspace,
       { content, id },
-      (state) => state.fixtures.discord.reactions.some(
-        (reaction) => reaction.messageId === id && reaction.emoji === "⏳",
-      ),
+      (state) => botReactions(state).some(([messageId, emoji]) => messageId === id && emoji === "⏳"),
     );
   }
 
   const pausedState = await waitForState(
     workspace,
-    (state) => state.fixtures.discord.sends.some((send) => send.content === "active done"),
+    (state) => replyContents(state).includes("active done"),
     5000,
   );
-  const pausedUserTurns = pausedState.fixtures.codex.protocolEvents
-    .filter((event) => event.message?.method === "turn/start")
-    .map((event) => event.message.params.input?.[0]?.text)
+  const pausedUserTurns = codex.clientMessages
+    .filter((message) => message.method === "turn/start")
+    .map((message) => message.params.input?.[0]?.text)
     .filter((text) => text && !text.startsWith("You are communicating with the user via Discord"));
   assert.deepEqual(pausedUserTurns, ["active"]);
 
   const unpausedState = await injectMessageUntil(
     workspace,
     { content: "/unpause", id: "unpause-message" },
-    (state) => state.fixtures.discord.sends.some((send) => send.content === "second queued done"),
+    (state) => replyContents(state).includes("second queued done"),
     5000,
   );
   assert.deepEqual(
-    unpausedState.fixtures.discord.sends
-      .map((send) => send.content)
+    replyContents(unpausedState)
       .filter((content) => ["active done", "first queued done", "second queued done"].includes(content)),
     ["active done", "first queued done", "second queued done"],
   );
+  assert.deepEqual(botReactions(unpausedState), [
+    ["pause-message", "⏸️"], ["first-queued-message", "⏳"], ["second-queued-message", "⏳"], ["unpause-message", "▶️"],
+  ]);
   await bridge.stop();
 });
 
@@ -1082,22 +1102,27 @@ test("bridge forwards thumbs-up and thumbs-down reactions on its own messages", 
       { delta: "down received", turnId: "thumbs-down-turn" },
     ],
   });
-  const bridge = startBridge(workspace, {
+  const bridge = await startBridge(workspace, {
     port: codex.port,
     env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
   });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
+  // The bridge's own messages are those alpha's webhook posted.
+  const ownMessage = { author: { bot: true, id: ALPHA_WEBHOOK_ID, username: "alpha-codex" }, webhookId: ALPHA_WEBHOOK_ID };
   for (const reaction of [
-    { emoji: "🎉", id: "ignored-emoji" },
+    { emoji: "🎉", id: "ignored-emoji", message: ownMessage },
     {
       emoji: "👍",
       id: "ignored-user-message",
       message: { author: { bot: false, id: "allowed-user-id" } },
     },
+    // A message the root bot itself sent is not this session's.
+    { emoji: "👍", id: "ignored-root-bot-message", message: { author: { bot: true, id: ROOT_BOT_USER_ID } } },
     {
       emoji: "👍",
       id: "ignored-user",
+      message: ownMessage,
       user: { id: "other-user" },
     },
   ]) {
@@ -1107,10 +1132,10 @@ test("bridge forwards thumbs-up and thumbs-down reactions on its own messages", 
       (state) => state.fixtures.discord.deliveredReactions.some(
         (delivered) => delivered.id === reaction.id,
       ),
-      1000,
+      5000,
     );
   }
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  await new Promise((resolve) => setTimeout(resolve, 300));
 
   await injectReactionUntil(
     workspace,
@@ -1119,11 +1144,11 @@ test("bridge forwards thumbs-up and thumbs-down reactions on its own messages", 
       id: "thumbs-up",
       messageId: "bot-message-up",
       partial: true,
-      message: { content: "The PR is ready.", partial: true },
+      message: { ...ownMessage, content: "The PR is ready.", partial: true },
       user: { partial: true },
     },
-    (state) => state.fixtures.discord.sends.some((send) => send.content === "up received"),
-    1000,
+    (state) => replyContents(state).includes("up received"),
+    5000,
   );
   await new Promise((resolve) => setTimeout(resolve, 50));
 
@@ -1133,15 +1158,14 @@ test("bridge forwards thumbs-up and thumbs-down reactions on its own messages", 
       emoji: "👎",
       id: "thumbs-down",
       messageId: "bot-message-down",
+      message: ownMessage,
     },
-    (nextState) => nextState.fixtures.discord.sends.some(
-      (send) => send.content === "down received",
-    ),
-    1000,
+    (nextState) => replyContents(nextState).includes("down received"),
+    5000,
   );
-  const reactionTurns = state.fixtures.codex.protocolEvents
-    .filter((event) => event.message?.method === "turn/start")
-    .map((event) => event.message.params.input?.[0]?.text)
+  const reactionTurns = codex.clientMessages
+    .filter((message) => message.method === "turn/start")
+    .map((message) => message.params.input?.[0]?.text)
     .filter((text) => text && !text.startsWith("You are communicating with the user via Discord"));
 
   assert.deepEqual(reactionTurns, [
@@ -1157,12 +1181,12 @@ test("bridge clears during an active turn", async () => {
     threadIds: ["thread-before-clear", "thread-after-clear"],
     turns: [{ delta: "busy done", startDelayMs: 10, turnId: "busy-turn", waitForRelease: true }],
   });
-  const bridge = startBridge(workspace, {
+  const bridge = await startBridge(workspace, {
     port: codex.port,
     env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
   });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
   await injectMessageUntil(
     workspace,
     { content: "busy", id: "busy-before-clear" },
@@ -1174,7 +1198,7 @@ test("bridge clears during an active turn", async () => {
     workspace,
     { content: "/clear", id: "clear-message" },
     (nextState) =>
-      nextState.fixtures.discord.sends.some((send) => send.content.startsWith("Conversation cleared")) &&
+      replyContents(nextState).some((content) => content.startsWith("Conversation cleared")) &&
       codex.clientMessages.filter((message) => message.method === "thread/start").length === 2,
     15000,
   );
@@ -1194,21 +1218,19 @@ test("bridge sends the bootstrap instruction turn after idle compact completion"
     compactComplete: true,
     compactTurnId: "compact-turn",
   });
-  const bridge = startBridge(workspace, { port: codex.port });
+  const bridge = await startBridge(workspace, { port: codex.port });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
   await injectMessageUntil(
     workspace,
     { content: "/compact", id: "idle-compact-message" },
-    (nextState) => nextState.fixtures.discord.sends.some((send) => send.content === "Compaction complete."),
+    (nextState) => replyContents(nextState).includes("Compaction complete."),
     15000,
   );
   // Compaction can announce completion before its queued instruction refresh finishes.
   await bridge.waitForOutput(/Bootstrap instruction sent \(compact\)/, 5000);
   const state = readState(workspace.stateDir);
-  const bootstrapTurns = state.fixtures.codex.protocolEvents
-    .filter((event) => event.event === "client-message")
-    .map((event) => event.message)
+  const bootstrapTurns = codex.clientMessages
     .filter((message) =>
       message.method === "turn/start" &&
       message.params?.input?.[0]?.text?.includes("Use ONLY the MCP server named \"discord-channel-id\"") &&
@@ -1221,41 +1243,33 @@ test("bridge sends the bootstrap instruction turn after idle compact completion"
 
 test("bridge restarts its own Codex session from slash command", async () => {
   const workspace = createBridgeWorkspace();
-  fs.writeFileSync(
-    path.join(workspace.repoDir, "registry.json"),
-    `${JSON.stringify({
-      root_bot_app_id: "root-bot-app-id",
-      discord_user_id: "allowed-user-id",
-      guild_id: "guild-id",
-      pool: [
-        { id: "bot1", app_id: "root-bot-app-id", token: "root-token", state_dir: "~/.claude/channels/discord", assigned_to: null },
-        { id: "bot2", app_id: "bot-app-id", token: "bot-token", state_dir: "~/.claude/channels/discord2", assigned_to: "alpha" },
-      ],
-      projects: {
-        alpha: {
-          path: workspace.repoDir,
-          bot_id: "bot2",
-          screen_name: "alpha",
-          channel_id: "channel-id",
-          type: "codex",
-          ws_port: 18342,
-          pid: process.pid,
-          session_id: null,
-        },
-      },
-    }, null, 2)}\n`,
-  );
-  fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
   const codex = await startFakeCodexServer(workspace);
-  const bridge = startBridge(workspace, { port: codex.port });
+  seedRegistry(workspace, {
+    root_bot_app_id: ROOT_BOT_USER_ID,
+    discord_user_id: "allowed-user-id",
+    guild_id: "guild-id",
+    projects: {
+      alpha: {
+        path: workspace.repoDir,
+        screen_name: "alpha",
+        channel_id: "channel-id",
+        type: "codex",
+        ws_port: codex.port,
+        pid: process.pid,
+        session_id: null,
+      },
+    },
+  });
+  fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
+  const bridge = await startBridge(workspace, { port: codex.port });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
   await injectMessageUntil(
     workspace,
     { content: "/restart", id: "restart-message" },
     (nextState) =>
-      nextState.fixtures.discord.sends.some((send) => send.content.startsWith("Restarting session")) &&
-      nextState.fixtures.discord.reactions.some((reaction) => reaction.emoji === "🔄"),
+      replyContents(nextState).some((content) => content.startsWith("Restarting session")) &&
+      botReactions(nextState).some(([messageId, emoji]) => messageId === "restart-message" && emoji === "🔄"),
     5000,
   );
   const result = await bridge.closed;
@@ -1263,60 +1277,15 @@ test("bridge restarts its own Codex session from slash command", async () => {
   const state = await waitForState(
     workspace,
     (nextState) => Boolean(nextState.fixtures.tmux.sessions.alpha),
-    5000,
+    30000,
   );
 
+  assert.deepEqual(replyContents(state), ["Restarting session — fresh thread coming up."]);
   assert.equal(state.fixtures.tmux.sessions.alpha.bridgeCommand, "node scripts/codex-bridge.js");
   assert.equal(state.fixtures.tmux.sessions.alpha.env.CHANNEL_ID, "channel-id");
-});
-
-test("root bridge restarts through the root Codex restart script", async () => {
-  const workspace = createBridgeWorkspace();
-  fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
-  const rootStateDir = path.join(workspace.homeDir, ".claude", "channels", "discord");
-  fs.mkdirSync(rootStateDir, { recursive: true });
-  fs.writeFileSync(path.join(rootStateDir, ".env"), "DISCORD_BOT_TOKEN=cm9vdC1hcHA.fixture.token\n");
-  fs.writeFileSync(path.join(rootStateDir, "access.json"), `${JSON.stringify({
-    allowFrom: ["allowed-user-id"],
-    groups: { "root-channel": { requireMention: false, allowFrom: ["allowed-user-id"] } },
-  })}\n`);
-  fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), `${JSON.stringify({
-    discord_user_id: "allowed-user-id",
-    guild_id: "guild-id",
-    pool: [
-      { id: "bot1", app_id: "root-app", token: "root-token", state_dir: rootStateDir, assigned_to: null },
-    ],
-    projects: {},
-  })}\n`);
-  const codex = await startFakeCodexServer(workspace, { channelId: "root-channel" });
-  const bridge = startBridge(workspace, {
-    botAppId: "root-app",
-    botToken: "cm9vdC1hcHA.fixture.token",
-    channelId: "root-channel",
-    port: codex.port,
-    rootBotAppId: "root-app",
-    env: {
-      ROOT_ACCESS_FILE: path.join(rootStateDir, "access.json"),
-      ROOT_MULTI_CHANNEL: "1",
-    },
-  });
-
-  await bridge.waitForOutput(/Listening in #channel-root-channel/, 7000);
-  await injectMessageUntil(
-    workspace,
-    { channelId: "root-channel", content: "/restart", id: "root-restart-message" },
-    (state) => state.fixtures.discord.sends.some((send) => send.content.startsWith("Restarting root session")),
-    5000,
-  );
-  const result = await bridge.closed;
-  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  const state = await waitForState(
-    workspace,
-    (nextState) => Boolean(nextState.fixtures.tmux.sessions.root_agent),
-    5000,
-  );
-  assert.equal(state.fixtures.tmux.sessions.root_agent.env.CHANNEL_ID, "root-channel");
-  assert.equal(state.fixtures.tmux.sessions.root_agent.bridgeCommand, "node scripts/codex-bridge.js");
+  // The relaunched bridge is a Router client for alpha, with a fresh key file.
+  assert.equal(state.fixtures.tmux.sessions.alpha.env.CCDM_CODEX_PROJECT, "alpha");
+  assert.equal(state.fixtures.tmux.sessions.alpha.env.CCDM_ROUTER_KEY_FILE, path.join(workspace.routerStateDir, "keys", "alpha.key"));
 });
 
 test("bridge stops typing after a non-retryable Codex error", async () => {
@@ -1324,9 +1293,9 @@ test("bridge stops typing after a non-retryable Codex error", async () => {
   const codex = await startFakeCodexServer(workspace, {
     turns: [{ error: "model unavailable" }],
   });
-  const bridge = startBridge(workspace, { port: codex.port });
+  const bridge = await startBridge(workspace, { port: codex.port });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
   let failed;
   let lastError;
   for (let attempt = 0; attempt < 3 && !failed; attempt++) {
@@ -1334,7 +1303,7 @@ test("bridge stops typing after a non-retryable Codex error", async () => {
     try {
       failed = await waitForState(
         workspace,
-        (nextState) => nextState.fixtures.discord.sends.some((send) => send.content === "**Error:** model unavailable"),
+        (nextState) => replyContents(nextState).includes("**Error:** model unavailable"),
         5000,
       );
     } catch (error) {
@@ -1359,16 +1328,16 @@ test("bridge retries a terminal response.failed once before reporting it", async
       { delta: "Recovered response" },
     ],
   });
-  const bridge = startBridge(workspace, {
+  const bridge = await startBridge(workspace, {
     port: codex.port,
     env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
   });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
   await injectMessageUntil(
     workspace,
     { content: "recover this turn", id: "recover-this-turn" },
-    (nextState) => nextState.fixtures.discord.sends.some((send) => send.content === "Recovered response"),
+    (nextState) => replyContents(nextState).includes("Recovered response"),
     5000,
   );
   const recoveryTurn = codex.clientMessages.find(
@@ -1381,7 +1350,7 @@ test("bridge retries a terminal response.failed once before reporting it", async
   const state = readState(workspace.stateDir);
 
   assert.equal(
-    state.fixtures.discord.sends.some((send) => send.content.startsWith("**Error:**")),
+    replyContents(state).some((content) => content.startsWith("**Error:**")),
     false,
   );
   await bridge.stop();
@@ -1397,15 +1366,13 @@ test("bridge reports response.failed after its single recovery attempt", async (
       { delta: "unexpected third attempt" },
     ],
   });
-  const bridge = startBridge(workspace, { port: codex.port });
+  const bridge = await startBridge(workspace, { port: codex.port });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
   const state = await injectMessageUntil(
     workspace,
     { content: "fail twice", id: "fail-twice" },
-    (nextState) => nextState.fixtures.discord.sends.some(
-      (send) => send.content === `**Error:** ${error}`,
-    ),
+    (nextState) => replyContents(nextState).includes(`**Error:** ${error}`),
     5000,
   );
 
@@ -1415,7 +1382,7 @@ test("bridge reports response.failed after its single recovery attempt", async (
     1,
   );
   assert.equal(
-    state.fixtures.discord.sends.some((send) => send.content === "unexpected third attempt"),
+    replyContents(state).includes("unexpected third attempt"),
     false,
   );
   await bridge.stop();
@@ -1430,15 +1397,13 @@ test("bridge does not retry response.failed after agent work starts", async () =
       { delta: "unexpected retry" },
     ],
   });
-  const bridge = startBridge(workspace, { port: codex.port });
+  const bridge = await startBridge(workspace, { port: codex.port });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
   await injectMessageUntil(
     workspace,
     { content: "start work then fail", id: "start-work-then-fail" },
-    (nextState) => nextState.fixtures.discord.sends.some(
-      (send) => send.content === `**Error:** ${error}`,
-    ),
+    (nextState) => replyContents(nextState).includes(`**Error:** ${error}`),
     5000,
   );
 
@@ -1453,19 +1418,18 @@ test("bridge warns on stale MCP removal failure and records diagnostics for MCP 
     failStaleMcpRemoval: "delete failed",
     staleMcpName: "discord-stale",
   });
-  const staleBridge = startBridge(staleWorkspace, { port: staleCodex.port });
+  const staleBridge = await startBridge(staleWorkspace, { port: staleCodex.port });
 
   await staleBridge.waitForOutput(/Warning: could not clean stale MCP servers: delete failed/, 7000);
   await staleBridge.waitForOutput(/Codex-Discord bridge running/, 7000);
-  const staleState = readState(staleWorkspace.stateDir);
   assert.ok(
-    staleState.fixtures.codex.protocolEvents.some(
-      (event) => event.message?.method === "config/value/delete" && event.message.params?.keyPath === "mcp_servers.discord-stale",
+    staleCodex.clientMessages.some(
+      (message) => message.method === "config/value/delete" && message.params?.keyPath === "mcp_servers.discord-stale",
     ),
   );
   assert.ok(
-    staleState.fixtures.codex.protocolEvents.some(
-      (event) => event.message?.method === "config/value/write" && event.message.params?.keyPath === "mcp_servers.discord-channel-id",
+    staleCodex.clientMessages.some(
+      (message) => message.method === "config/value/write" && message.params?.keyPath === "mcp_servers.discord-channel-id",
     ),
   );
   await staleBridge.stop();
@@ -1474,7 +1438,7 @@ test("bridge warns on stale MCP removal failure and records diagnostics for MCP 
   const registrationCodex = await startFakeCodexServer(registrationWorkspace, {
     failMcpRegistration: "write failed",
   });
-  const registrationBridge = startBridge(registrationWorkspace, { port: registrationCodex.port });
+  const registrationBridge = await startBridge(registrationWorkspace, { port: registrationCodex.port });
   const registrationResult = await registrationBridge.closed;
 
   assert.notEqual(registrationResult.exitCode, 0);
@@ -1487,18 +1451,21 @@ test("bridge warns on stale MCP removal failure and records diagnostics for MCP 
 
 test("bridge records diagnostics when Discord send fails", async () => {
   const workspace = createBridgeWorkspace();
-  const seed = readState(workspace.stateDir);
-  seed.fixtures.discord.failures.send = "send failed";
-  writeState(seed, workspace.stateDir);
   const codex = await startFakeCodexServer(workspace, {
     turns: [{ delta: "cannot send" }],
   });
-  const bridge = startBridge(workspace, {
+  const bridge = await startBridge(workspace, {
     port: codex.port,
     env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
   });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
+  // Discord refuses the Router's post through alpha's webhook.
+  updateState(workspace.stateDir, (seed) => {
+    seed.fixtures.discord.restFailures = [
+      { method: "POST", path: ALPHA_WEBHOOK_PATH, status: 403, body: { message: "send failed" } },
+    ];
+  });
   await injectMessageUntil(
     workspace,
     { content: "trigger send failure", id: "trigger-send-failure" },
@@ -1510,8 +1477,8 @@ test("bridge records diagnostics when Discord send fails", async () => {
   assert.notEqual(result.exitCode, 0);
   assert.match(result.stderr, /send failed/);
   const state = readState(workspace.stateDir);
-  assert.equal(state.fixtures.discord.sendFailures[0].channelId, "channel-id");
-  assert.equal(state.fixtures.discord.sendFailures[0].content, "cannot send");
+  assert.deepEqual(state.fixtures.discord.restFailureUses, [{ method: "POST", path: ALPHA_WEBHOOK_PATH, status: 403 }]);
+  assert.deepEqual(state.fixtures.discord.messages, []);
   assert.match(state.commands.at(-1).stderr, /send failed/);
 });
 
@@ -1534,12 +1501,12 @@ test("bridge builds Codex input for empty messages and image, text, binary, and 
   const codex = await startFakeCodexServer(workspace, {
     turns: [{ delta: "attachments done" }],
   });
-  const bridge = startBridge(workspace, {
+  const bridge = await startBridge(workspace, {
     port: codex.port,
     env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
   });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
   await injectMessageUntil(
     workspace,
     { content: "   ", id: "empty-message" },
@@ -1552,24 +1519,28 @@ test("bridge builds Codex input for empty messages and image, text, binary, and 
     content: "",
     attachments: [
       {
+        id: "att-1",
         contentType: "image/png",
         name: "diagram.png",
         size: 123,
         url: "https://cdn.discordapp.com/attachments/channel/message/diagram.png",
       },
       {
+        id: "att-2",
         contentType: "text/plain",
         name: "notes.txt",
         size: 17,
         url: "https://cdn.discordapp.com/attachments/channel/message/notes.txt",
       },
       {
+        id: "att-3",
         contentType: "application/octet-stream",
         name: "archive.bin",
         size: 11,
         url: "https://cdn.discordapp.com/attachments/channel/message/archive.bin",
       },
       {
+        id: "att-4",
         contentType: "text/plain",
         name: "missing.txt",
         size: 7,
@@ -1581,18 +1552,13 @@ test("bridge builds Codex input for empty messages and image, text, binary, and 
     workspace,
     attachmentMessage,
     (nextState) =>
-      nextState.fixtures.discord.sends.some((send) => send.content === "attachments done") &&
-      nextState.fixtures.codex.protocolEvents.some((event) =>
-        event.event === "client-message" &&
-        event.message.method === "turn/start" &&
-        event.message.params?.input?.[0]?.type === "image",
-      ),
+      replyContents(nextState).includes("attachments done") &&
+      codex.clientMessages.some((message) =>
+        message.method === "turn/start" && message.params?.input?.[0]?.type === "image"),
     15000,
   );
 
-  const userTurns = state.fixtures.codex.protocolEvents
-    .filter((event) => event.event === "client-message" && event.message.method === "turn/start")
-    .map((event) => event.message.params.input)
+  const userTurns = codex.clientMessages.filter((message) => message.method === "turn/start").map((message) => message.params.input)
     .filter((input) => !input[0]?.text?.startsWith("You are communicating with the user via Discord"));
   assert.equal(userTurns.length, 1);
   assert.equal(userTurns[0][0].type, "image");
@@ -1632,12 +1598,12 @@ test("bridge transcribes audio attachments by default", async () => {
   const codex = await startFakeCodexServer(workspace, {
     turns: [{ delta: "transcription done" }],
   });
-  const bridge = startBridge(workspace, {
+  const bridge = await startBridge(workspace, {
     port: codex.port,
     env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
   });
 
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
   const state = await injectMessageUntil(
     workspace,
     {
@@ -1645,12 +1611,14 @@ test("bridge transcribes audio attachments by default", async () => {
       content: "some context",
       attachments: [
         {
+          id: "voice-att",
           contentType: "audio/ogg",
           name: "voice-message.ogg",
           size: 399925,
           url: "https://cdn.discordapp.com/attachments/channel/message/voice-message.ogg",
         },
         {
+          id: "notes-att",
           contentType: "text/plain",
           name: "notes.txt",
           size: 15,
@@ -1659,14 +1627,12 @@ test("bridge transcribes audio attachments by default", async () => {
       ],
     },
     (nextState) =>
-      nextState.fixtures.discord.sends.some((send) => send.content === "transcription done") &&
+      replyContents(nextState).includes("transcription done") &&
       nextState.fixtures.whisper.invocations.length === 1,
     15000,
   );
 
-  const userTurns = state.fixtures.codex.protocolEvents
-    .filter((event) => event.event === "client-message" && event.message.method === "turn/start")
-    .map((event) => event.message.params.input)
+  const userTurns = codex.clientMessages.filter((message) => message.method === "turn/start").map((message) => message.params.input)
     .filter((input) => !input[0]?.text?.startsWith("You are communicating with the user via Discord"));
   assert.equal(userTurns.length, 1);
   assert.equal(userTurns[0][0].text, "some context");
@@ -1684,36 +1650,43 @@ test("bridge transcribes audio attachments by default", async () => {
   await bridge.stop();
 });
 
-test("bridge exits on login failure, app-server exit, websocket close, and startup without a thread id", async () => {
-  const loginWorkspace = createBridgeWorkspace();
-  let state = readState(loginWorkspace.stateDir);
-  state.fixtures.discord.failures.login = "login failed";
-  writeState(state, loginWorkspace.stateDir);
-  const loginCodex = await startFakeCodexServer(loginWorkspace);
-  const loginBridge = startBridge(loginWorkspace, { port: loginCodex.port });
-  const loginResult = await loginBridge.closed;
-  assert.notEqual(loginResult.exitCode, 0);
-  assert.match(loginResult.stderr, /login failed/);
+test("bridge exits on a failed Router hello, app-server exit, websocket close, and startup without a thread id", async () => {
+  const helloWorkspace = createBridgeWorkspace();
+  // A key the Router never issued: the hello is refused.
+  const wrongKeyFile = path.join(helloWorkspace.tmpDir, "wrong.key");
+  fs.writeFileSync(wrongKeyFile, "not-the-launch-key\n", { mode: 0o600 });
+  const helloReadyFile = path.join(helloWorkspace.tmpDir, "hello-ready");
+  const helloCodex = await startFakeCodexServer(helloWorkspace);
+  const helloBridge = await startBridge(helloWorkspace, {
+    port: helloCodex.port,
+    env: { CCDM_ROUTER_KEY_FILE: wrongKeyFile, CCDM_CHANNEL_READY_FILE: helloReadyFile },
+  });
+  const helloResult = await helloBridge.closed;
+  assert.notEqual(helloResult.exitCode, 0);
+  assert.match(helloResult.stderr, /Discord startup failed/);
+  assert.equal(readReadyFile(helloReadyFile).ok, false);
+  assert.match(readReadyFile(helloReadyFile).error, /^Router hello failed: /);
+  assert.equal(await routerHasSession(helloWorkspace, "alpha"), false);
 
   const appExitWorkspace = createBridgeWorkspace();
-  state = readState(appExitWorkspace.stateDir);
-  state.fixtures.codex.servers["65530"] = { ready: true, exitImmediately: true, exitCode: 7 };
-  writeState(state, appExitWorkspace.stateDir);
-  const appExitBridge = startBridge(appExitWorkspace, { port: 65530 });
+  updateState(appExitWorkspace.stateDir, (state) => {
+    state.fixtures.codex.servers["65530"] = { ready: true, exitImmediately: true, exitCode: 7 };
+  });
+  const appExitBridge = await startBridge(appExitWorkspace, { port: 65530 });
   const appExitResult = await appExitBridge.closed;
   assert.notEqual(appExitResult.exitCode, 0);
   assert.match(appExitResult.stderr, /Codex app-server exited with code 7/);
 
   const closeWorkspace = createBridgeWorkspace();
   const closeCodex = await startFakeCodexServer(closeWorkspace, { closeAfterInitialize: true });
-  const closeBridge = startBridge(closeWorkspace, { port: closeCodex.port });
+  const closeBridge = await startBridge(closeWorkspace, { port: closeCodex.port });
   const closeResult = await closeBridge.closed;
   assert.notEqual(closeResult.exitCode, 0);
   assert.match(closeResult.stderr, /WebSocket closed/);
 
   const noThreadWorkspace = createBridgeWorkspace();
   const noThreadCodex = await startFakeCodexServer(noThreadWorkspace, { omitThreadStarted: true });
-  const noThreadBridge = startBridge(noThreadWorkspace, { port: noThreadCodex.port });
+  const noThreadBridge = await startBridge(noThreadWorkspace, { port: noThreadCodex.port });
   const noThreadResult = await noThreadBridge.closed;
   assert.notEqual(noThreadResult.exitCode, 0);
   assert.match(noThreadResult.stderr, /Failed to get thread ID from server/);
@@ -1736,6 +1709,15 @@ async function waitFor(predicate, timeoutMs = 1000) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error("Timed out waiting for condition");
+}
+
+// The bridge logs each turn's end once it is idle and will start, not steer, a turn.
+async function waitForFinishedTurns(bridge, count, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while ((bridge.stdout.match(/\[turn\] Finished /g) ?? []).length < count) {
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${count} finished turn(s); stdout:\n${bridge.stdout}`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
 }
 
 async function injectMessageUntil(workspace, message, predicate, timeoutMs = 5000) {
@@ -1780,12 +1762,14 @@ async function injectReactionUntil(workspace, reaction, predicate, timeoutMs = 5
 
 test("root steers only the active channel and author, retaining the active grant and safe queue fallback", async () => {
   const workspace = createBridgeWorkspace();
-  const accessFile = path.join(workspace.tmpDir, "root-steer-access.json");
   const users = ["allowed-user-id", "second-user-id"];
-  fs.writeFileSync(accessFile, JSON.stringify({ allowFrom: users, groups: {
-    "root-channel": { requireMention: false, allowFrom: users },
-    "other-channel": { requireMention: false, allowFrom: users },
-  } }));
+  seedRegistry(workspace, {
+    discord_user_id: "allowed-user-id",
+    guild_id: "guild-id",
+    root_channels: ["root-channel", "other-channel"],
+    root_allowed_user_ids: ["second-user-id"],
+    projects: {},
+  });
   const codex = await startFakeCodexServer(workspace, {
     steer: ["success", "failure"],
     turns: [
@@ -1793,12 +1777,13 @@ test("root steers only the active channel and author, retaining the active grant
       { delta: "other channel done" }, { delta: "other author done" }, { delta: "fallback done" },
     ],
   });
-  const bridge = startBridge(workspace, {
-    botAppId: "root-bot-id", rootBotAppId: "root-bot-id", channelId: "root-channel", port: codex.port,
-    env: { ROOT_MULTI_CHANNEL: "1", ROOT_ACCESS_FILE: accessFile, CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  const bridge = await startBridge(workspace, {
+    root: true, allowedUserIds: users, botAppId: ROOT_BOT_USER_ID, rootBotAppId: ROOT_BOT_USER_ID,
+    channelId: "root-channel", port: codex.port, env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
   });
-  const messages = (state) => state.fixtures.codex.protocolEvents
-    .filter((e) => e.event === "client-message").map((e) => e.message);
+  // The fake app-server's own record; the state file can drop protocol events
+  // written while the Router and bridge also write it.
+  const messages = () => codex.clientMessages;
   const turns = (state) => messages(state).filter((m) => m.method === "turn/start" &&
     m.params.input?.[0]?.text?.startsWith("Discord routing metadata:"));
   const grant = (input) => input[0].text.match(/channel_scope_token: (\S+)/)[1];
@@ -1821,7 +1806,7 @@ test("root steers only the active channel and author, retaining the active grant
     { channelId: "root-channel", content: "other author", id: "other-author-message", author: { id: "second-user-id" } },
   ]) {
     await injectMessageUntil(workspace, message,
-      (next) => next.fixtures.discord.reactions.some((r) => r.messageId === message.id && r.emoji === "⏳"));
+      (next) => botReactions(next).some(([messageId, emoji]) => messageId === message.id && emoji === "⏳"));
   }
   state = readState(workspace.stateDir);
   assert.equal(messages(state).filter((m) => m.method === "turn/steer").length, 1);
@@ -1831,8 +1816,9 @@ test("root steers only the active channel and author, retaining the active grant
     (next) => messages(next).filter((m) => m.method === "turn/steer").length === 2);
   await bridge.waitForOutput(/Failed \(stale turn\), queuing instead/, 5000);
   codex.releaseTurn("root-active");
+  // Root replies post as the root bot, not a webhook.
   state = await waitForState(workspace,
-    (next) => next.fixtures.discord.sends.some((send) => send.content === "fallback done"), 15000);
+    (next) => next.fixtures.discord.messages.some((m) => m.content === "fallback done" && !m.webhookId), 15000);
   const queued = turns(state).slice(1);
   assert.equal(queued.length, 3);
   assert.match(queued[0].params.input[0].text, /channel_id: other-channel/);
@@ -1845,8 +1831,8 @@ test("root steers only the active channel and author, retaining the active grant
 test("Discord MCP readiness follows data pages and waits for the reply tool before starting a thread", async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, { staleMcpName: "discord-stale", mcpReadyAfter: 5, paginatedMcp: true });
-  const bridge = startBridge(workspace, { port: codex.port });
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  const bridge = await startBridge(workspace, { port: codex.port });
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
   const messages = codex.clientMessages;
   assert.ok(messages.some((m) => m.method === "config/value/delete" && m.params.keyPath === "mcp_servers.discord-stale"));
   const start = messages.findIndex((m) => m.method === "thread/start");
@@ -1862,12 +1848,12 @@ test("Discord MCP readiness follows data pages and waits for the reply tool befo
 test("Discord MCP missing reply fails startup without advertising a listener", async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, { missingReply: true });
-  const bridge = startBridge(workspace, { port: codex.port, env: { CODEX_MCP_READY_TIMEOUT_MS: "250" } });
+  const bridge = await startBridge(workspace, { port: codex.port, env: { CODEX_MCP_READY_TIMEOUT_MS: "250" } });
   const result = await bridge.closed;
   assert.equal(result.exitCode, 1);
   assert.match(result.stderr, /did not expose the reply tool/);
   assert.ok(!codex.clientMessages.some((m) => m.method === "thread/start"));
-  assert.equal(readState(workspace.stateDir).fixtures.discord.logins.length, 0);
+  assert.doesNotMatch(result.stdout, /Discord bot logged in|Listening in/);
 });
 
 test("slow bootstrap remains tracked beyond the old fifteen-second cutoff", async () => {
@@ -1875,14 +1861,15 @@ test("slow bootstrap remains tracked beyond the old fifteen-second cutoff", asyn
   const codex = await startFakeCodexServer(workspace, {
     bootstrapPlan: { turnId: "slow-bootstrap", waitForRelease: true },
   });
-  const bridge = startBridge(workspace, { port: codex.port });
-  await waitForState(workspace, (state) => state.fixtures.codex.protocolEvents.some(
-    (e) => e.message?.method === "turn/start"), 7000);
+  const bridge = await startBridge(workspace, { port: codex.port });
+  await waitForState(workspace, () => codex.clientMessages.some((m) => m.method === "turn/start"), 7000);
   await new Promise((resolve) => setTimeout(resolve, 15500));
-  assert.doesNotMatch(bridge.stdout, /Bootstrap instruction sent|Listening in/);
-  assert.equal(readState(workspace.stateDir).fixtures.discord.logins.length, 0);
+  assert.doesNotMatch(bridge.stdout, /Bootstrap instruction sent|Discord bot logged in|Listening in/);
+  // No Router hello until the bootstrap turn finishes.
+  assert.equal(await routerHasSession(workspace, "alpha"), false);
   codex.releaseTurn("slow-bootstrap");
-  await bridge.waitForOutput(/Listening in #channel-channel-id/, 7000);
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
+  assert.equal(await routerHasSession(workspace, "alpha"), true);
   assert.doesNotMatch(bridge.stdout, /no turn is active/);
   await bridge.stop();
 });
@@ -1892,12 +1879,12 @@ test("bootstrap deadline explicitly interrupts and fails closed instead of forge
   const codex = await startFakeCodexServer(workspace, {
     bootstrapPlan: { turnId: "blocked-bootstrap", waitForRelease: true },
   });
-  const bridge = startBridge(workspace, { port: codex.port, env: { CODEX_BOOTSTRAP_TIMEOUT_MS: "250" } });
+  const bridge = await startBridge(workspace, { port: codex.port, env: { CODEX_BOOTSTRAP_TIMEOUT_MS: "250" } });
   const result = await bridge.closed;
   assert.equal(result.exitCode, 1);
   assert.match(result.stderr, /Bootstrap timed out/);
   assert.ok(codex.clientMessages.some((m) => m.method === "turn/interrupt" && m.params.turnId === "blocked-bootstrap"));
-  assert.equal(readState(workspace.stateDir).fixtures.discord.logins.length, 0);
+  assert.doesNotMatch(result.stdout, /Discord bot logged in|Listening in/);
 });
 
 test("failed bootstrap completion without a separate error event fails startup", async () => {
@@ -1905,9 +1892,9 @@ test("failed bootstrap completion without a separate error event fails startup",
   const codex = await startFakeCodexServer(workspace, {
     bootstrapPlan: { status: "failed", terminalError: { message: "provider bootstrap failure" } },
   });
-  const bridge = startBridge(workspace, { port: codex.port });
+  const bridge = await startBridge(workspace, { port: codex.port });
   const result = await bridge.closed;
   assert.equal(result.exitCode, 1);
   assert.match(result.stderr, /provider bootstrap failure/);
-  assert.equal(readState(workspace.stateDir).fixtures.discord.logins.length, 0);
+  assert.doesNotMatch(result.stdout, /Discord bot logged in|Listening in/);
 });

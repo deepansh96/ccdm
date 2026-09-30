@@ -76,6 +76,23 @@ function attachmentMap(entries = []) {
   return map;
 }
 
+// Like Discord's `referenced_message.author`: who wrote the message a native
+// reply points at. A webhook message's author is the webhook; a message the
+// fake created without one was sent by this gateway's bot.
+function repliedUser(client, raw) {
+  if (!raw.replyTo) return null;
+  const discord = readState().fixtures?.discord ?? {};
+  const injected = (discord.injectedMessages ?? []).find(message => message.id === raw.replyTo);
+  if (injected) return { id: injected.webhookId ?? injected.author?.id, bot: Boolean(injected.webhookId || injected.author?.bot) };
+  const sent = (discord.messages ?? []).find(message => message.id === raw.replyTo);
+  if (sent) return { id: sent.webhookId ?? client.user.id, bot: true };
+  for (const history of Object.values(discord.history ?? {})) {
+    const seeded = Array.isArray(history) && history.find(message => message.id === raw.replyTo);
+    if (seeded) return { id: seeded.webhook_id ?? seeded.author?.id, bot: Boolean(seeded.author?.bot) };
+  }
+  return null;
+}
+
 function fixtureMessage(client, raw) {
   return {
     attachments: attachmentMap(raw.attachments),
@@ -85,9 +102,14 @@ function fixtureMessage(client, raw) {
       username: raw.author?.username ?? "Allowed User",
     },
     channel: { id: raw.channelId },
+    channelId: raw.channelId,
     client,
     content: raw.content ?? "",
+    createdTimestamp: raw.createdTimestamp ?? Date.now(),
     id: raw.id,
+    reference: raw.replyTo ? { channelId: raw.channelId, messageId: raw.replyTo } : null,
+    mentions: { repliedUser: repliedUser(client, raw) },
+    webhookId: raw.webhookId ?? null,
     reactions: {
       cache: new Map([
         [
@@ -126,8 +148,11 @@ function fixtureReaction(client, raw) {
     content: raw.message?.content ?? "",
     id: raw.messageId,
     partial: raw.message?.partial ?? false,
+    // A partial message knows nothing of its webhook until fetched.
+    webhookId: raw.message?.partial ? null : raw.message?.webhookId ?? null,
     async fetch() {
       this.partial = false;
+      this.webhookId = raw.message?.webhookId ?? null;
       return this;
     },
   };
@@ -204,7 +229,15 @@ class Client extends EventEmitter {
     return Promise.resolve(token);
   }
 
+  // A logged-in client going away is recorded with when it happened, so tests
+  // can order it against other events (root's Router hello, say).
   destroy() {
+    if (this._poller) {
+      updateState((state) => {
+        state.fixtures.discord.destroys ||= [];
+        state.fixtures.discord.destroys.push({ pid: process.pid, at: new Date().toISOString() });
+      });
+    }
     if (this._poller) clearInterval(this._poller);
     this._poller = null;
   }

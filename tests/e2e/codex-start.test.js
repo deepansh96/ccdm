@@ -4,6 +4,8 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { startFakeCodexServer } from "./support/bridge.js";
+import { createRouterWorkspace, routerEnv, routerWithWebhooks, runRouterCli } from "./support/router.js";
 import { createWorkspace, runScript } from "./support/runner.js";
 import { readState, seedFixtureProcess, seedRegistry, seedTmuxSession, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
@@ -12,42 +14,34 @@ test.afterEach(async () => {
   await cleanup();
 });
 
+// Every Codex launch goes through the Router, so each scenario runs in a
+// Router Test Workspace (its private state under `routerStateDir`, root's
+// token in root's Discord state for the Router alone).
+function createCodexWorkspace() {
+  return createRouterWorkspace({});
+}
+
+// The router default: `alpha` is a Codex project with no pool bot and no
+// `transport` field (`options.transport` sets one); the pool is empty.
 function buildCodexRegistry(workspace, options = {}) {
   const projectPath = options.projectPath ?? path.join(workspace.tmpDir, 'project with spaces and "quotes"');
-  const stateDir = options.stateDir ?? path.join(workspace.homeDir, ".claude", "channels", "discord2");
+  fs.mkdirSync(projectPath, { recursive: true });
   const registry = {
-    root_bot_app_id: "root-app-id",
     discord_user_id: "allowed-user-id",
     guild_id: "guild-id",
     max_pool_size: 50,
     project_bot_role_id: null,
     category_ids: [],
     ...(options.globalCodexHome ? { codex_home: options.globalCodexHome } : {}),
-    pool: [
-      {
-        id: "bot1",
-        app_id: "root-app-id",
-        token: "root-token",
-        state_dir: path.join(workspace.homeDir, ".claude", "channels", "discord"),
-        assigned_to: null,
-      },
-      {
-        id: "bot2",
-        app_id: "bot-app-id",
-        token: "bot-token",
-        state_dir: stateDir,
-        assigned_to: "alpha",
-      },
-      ...(options.extraPool ?? []),
-    ],
+    pool: [],
     projects: {
       alpha: {
         path: projectPath,
-        bot_id: "bot2",
         screen_name: "alpha_codex",
         channel_id: "channel-id",
         type: "codex",
         ws_port: 18342,
+        ...(options.transport ? { transport: options.transport } : {}),
         ...(options.guestUserIds ? { guest_user_ids: options.guestUserIds } : {}),
         ...(options.codexHome ? { codex_home: options.codexHome } : {}),
         ...(options.textReplyFallback ? { text_reply_fallback: true } : {}),
@@ -71,6 +65,46 @@ function buildCodexRegistry(workspace, options = {}) {
   }
 
   return registry;
+}
+
+// Puts alpha (and any `samePort` projects) on a fake Codex app-server, seeds
+// the registry, gives alpha its webhook, and starts the Router, so a launch
+// can say hello.
+async function serveAlpha(workspace, registrySeed, { codex: codexOptions = {}, samePort = [] } = {}) {
+  const codex = await startFakeCodexServer(workspace, { channelId: "channel-id", ...codexOptions });
+  for (const name of ["alpha", ...samePort]) registrySeed.projects[name].ws_port = codex.port;
+  seedRegistry(workspace, registrySeed);
+  const router = await routerWithWebhooks(workspace, ["alpha"]);
+  return { codex, router };
+}
+
+function startCodex(workspace, { args = ["alpha"], env = {}, timeoutMs = 30000 } = {}) {
+  return runScript(workspace, "scripts/start-codex-session.sh", { args, env: routerEnv(workspace, env), timeoutMs });
+}
+
+function alphaKeyFile(workspace) {
+  return path.join(workspace.routerStateDir, "keys", "alpha.key");
+}
+
+// A refused launch creates no tmux session, records no PID, and writes no launch key.
+function assertNoLaunch(workspace, label) {
+  assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {}, label);
+  assert.equal(readRegistry(workspace).projects.alpha.pid, null, label);
+  assert.equal(fs.existsSync(alphaKeyFile(workspace)), false, label);
+}
+
+async function waitForExit(pid, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if (error.code === "ESRCH") return;
+      throw error;
+    }
+    assert.ok(Date.now() < deadline, `process ${pid} is still running`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
 }
 
 function readRegistry(workspace) {
@@ -144,17 +178,11 @@ test("npm fixture fails closed when a scenario tries to run package installation
   assert.deepEqual(readState(workspace.stateDir).fixtures.npm.invocations[0].args, ["ci"]);
 });
 
-test("start-codex-session constructs a bridge tmux launch, removes stale MCP config, and records PID", async () => {
-  const workspace = createWorkspace();
+test("start-codex-session constructs a Router bridge tmux launch, removes stale MCP config, and records PID", async () => {
+  const workspace = createCodexWorkspace();
   const codexHome = path.join(workspace.homeDir, ".codex-ccdm");
   const defaultCodexHome = path.join(workspace.homeDir, ".codex");
   const registrySeed = buildCodexRegistry(workspace, { globalCodexHome: codexHome });
-  seedRegistry(workspace, registrySeed);
-  fs.mkdirSync(path.join(workspace.homeDir, ".claude", "channels", "discord"), { recursive: true });
-  fs.writeFileSync(
-    path.join(workspace.homeDir, ".claude", "channels", "discord", ".env"),
-    "DISCORD_BOT_TOKEN=cm9vdC1saXN0ZW5lci1pZA.fixture.token\n",
-  );
   fs.mkdirSync(codexHome, { recursive: true });
   fs.writeFileSync(
     path.join(codexHome, "config.toml"),
@@ -179,15 +207,15 @@ test("start-codex-session constructs a bridge tmux launch, removes stale MCP con
       "",
     ].join("\n"),
   );
+  const { codex } = await serveAlpha(workspace, registrySeed);
 
   const beforeInventory = listRelativeFiles(workspace.repoDir);
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
   const afterInventory = listRelativeFiles(workspace.repoDir);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  assert.match(result.stdout, /Started Codex bridge in tmux session 'alpha_codex'/);
+  assert.match(result.stdout, /Started Codex Router bridge in tmux session 'alpha_codex'/);
+  assert.match(result.stdout, /Bridge connected to the Router \(scope channel-id\)/);
   assert.match(result.stdout, /Recorded PID \d+/);
   assert.deepEqual(afterInventory, beforeInventory);
 
@@ -203,80 +231,95 @@ test("start-codex-session constructs a bridge tmux launch, removes stale MCP con
   const state = readState(workspace.stateDir);
   const session = state.fixtures.tmux.sessions.alpha_codex;
   assert.equal(session.cwd, workspace.repoDir);
+  assert.equal(registry.projects.alpha.pid, session.pid);
   assert.deepEqual(session.env, {
-    ALLOWED_USER_IDS: registrySeed.discord_user_id,
-    BOT_APP_ID: registrySeed.pool[1].app_id,
-    BOT_DISPLAY_NAME: "bot2-alpha-codex",
-    BOT_TOKEN: registrySeed.pool[1].token,
-    CHANNEL_ID: registrySeed.projects.alpha.channel_id,
+    ALLOWED_USER_IDS: "allowed-user-id",
+    CCDM_CHANNEL_READY_FILE: path.join(workspace.routerStateDir, "launches", "alpha", "ready.json"),
+    CCDM_CODEX_PROJECT: "alpha",
+    CCDM_ROUTER_KEY_FILE: alphaKeyFile(workspace),
+    CCDM_ROUTER_STATE_DIR: workspace.routerStateDir,
+    CHANNEL_ID: "channel-id",
     CODEX_HOME: codexHome,
     CODEX_SERVICE_TIER: "default",
     CODEX_RESUME_THREAD_ID: "",
-    CODEX_STARTUP_READY_FILE: "",
-    GUILD_ID: registrySeed.guild_id,
-    PROJECT_DIR: registrySeed.projects.alpha.path,
-    ROOT_BOT_APP_ID: "root-listener-id",
-    WS_PORT: String(registrySeed.projects.alpha.ws_port),
+    PROJECT_DIR: path.join(workspace.tmpDir, 'project with spaces and "quotes"'),
+    WS_PORT: String(codex.port),
   });
+  for (const forbidden of ["BOT_TOKEN", "DISCORD_STATE_DIR"]) {
+    assert.equal(session.shellCommand.includes(forbidden), false, forbidden);
+  }
   assert.equal(session.bridgeCommand, "node scripts/codex-bridge.js");
+  assert.equal(fs.statSync(alphaKeyFile(workspace)).mode & 0o777, 0o600);
   assert.equal(state.fixtures.codex.bridgeInvocations.length, 1);
-  assert.equal(state.fixtures.codex.appServerInvocations.length, 0);
+  // The bridge's Codex app-server is the fake one on alpha's port.
+  assert.equal(codex.clientMessages.filter((message) => message.method === "initialize").length, 1);
   assert.equal(state.fixtures.npm.invocations.length, 0);
+  const status = await runRouterCli(workspace, ["status"]);
+  assert.match(status.stdout, /sessions: 1\n  project alpha scope=channel-id connected=/);
 });
 
 test("start-codex-session forwards an explicit resume ID and ignores an inherited one", async () => {
   for (const resume of [true, false]) {
-    const workspace = createWorkspace();
-    seedRegistry(workspace, buildCodexRegistry(workspace));
+    const workspace = createCodexWorkspace();
+    const { codex } = await serveAlpha(workspace, buildCodexRegistry(workspace));
     const id = "00000000-0000-4000-8000-000000000001";
-    const result = await runScript(workspace, "scripts/start-codex-session.sh", {
+    const result = await startCodex(workspace, {
       args: resume ? ["alpha", "--resume", id] : ["alpha"],
-      env: { CODEX_RESUME_THREAD_ID: "inherited-other-thread", CODEX_STARTUP_READY_FILE: "/unwanted/inherited/file" },
+      env: {
+        CODEX_RESUME_THREAD_ID: "inherited-other-thread",
+        CODEX_STARTUP_READY_FILE: "/unwanted/inherited/file",
+        CCDM_CHANNEL_READY_FILE: "/unwanted/inherited/ready.json",
+      },
     });
     assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-    assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex.env.CODEX_RESUME_THREAD_ID,
-      resume ? id : "");
     const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex;
+    assert.equal(session.env.CODEX_RESUME_THREAD_ID, resume ? id : "");
     assert.equal(readRegistry(workspace).projects.alpha.pid, session.pid);
-    if (resume) {
-      assert.ok(session.env.CODEX_STARTUP_READY_FILE);
-      assert.equal(fs.existsSync(path.dirname(session.env.CODEX_STARTUP_READY_FILE)), false);
-    } else {
-      assert.equal(session.env.CODEX_STARTUP_READY_FILE, "");
-    }
+    assert.equal(session.env.CCDM_CHANNEL_READY_FILE, path.join(workspace.routerStateDir, "launches", "alpha", "ready.json"));
+    assert.equal(session.env.CODEX_STARTUP_READY_FILE, undefined);
+    const threadRequests = codex.clientMessages
+      .filter((message) => message.method === "thread/resume" || message.method === "thread/start")
+      .map((message) => [message.method, message.params?.threadId]);
+    assert.deepEqual(threadRequests, resume ? [["thread/resume", id]] : [["thread/start", undefined]]);
   }
 });
 
-test("resume startup failures clean the listener, runtime state, and readiness directory", async () => {
+test("resume startup failures clean the listener, runtime state, launch key, and launch directory", async () => {
   for (const startupMode of ["exit", "timeout"]) {
-    const workspace = createWorkspace();
+    const workspace = createCodexWorkspace();
     const registry = buildCodexRegistry(workspace);
     registry.projects.alpha.pid = 99999999;
     registry.projects.alpha.session_id = "old-session";
-    seedRegistry(workspace, registry);
-    const state = readState(workspace.stateDir);
-    state.fixtures.tmux.startupMode = startupMode;
-    writeState(state, workspace.stateDir);
-    const result = await runScript(workspace, "scripts/start-codex-session.sh", {
+    // `exit`: Codex refuses the thread and the bridge exits; `timeout`: the
+    // bootstrap turn never completes, so the bridge never says hello.
+    await serveAlpha(workspace, registry, {
+      codex: startupMode === "exit" ? { resumeError: "no rollout found for thread" } : { bootstrapPlan: { complete: false } },
+    });
+    const result = await startCodex(workspace, {
       args: ["alpha", "--resume", "00000000-0000-4000-8000-000000000001"],
-      timeoutMs: 75000,
+      env: { CCDM_CODEX_LAUNCH_TIMEOUT_S: "5" },
     });
     assert.equal(result.exitCode, 1, result.stderr || result.stdout);
-    assert.match(result.stderr, startupMode === "exit" ? /bridge exited/ : /timed out/);
-    assert.doesNotMatch(result.stdout, /Started Codex bridge|Recorded PID/);
-    assert.equal(readRegistry(workspace).projects.alpha.pid, null);
-    assert.equal(readRegistry(workspace).projects.alpha.session_id, null);
+    assert.match(result.stderr, startupMode === "exit"
+      ? /Codex Router launch failed: .*no rollout found for thread/
+      : /Codex Router launch failed: the bridge never said hello to the Router/);
+    assert.match(result.stderr, /Launch of 'alpha' failed; cleaning up/);
+    assert.doesNotMatch(result.stdout, /Recorded PID/);
     const after = readState(workspace.stateDir);
     assert.deepEqual(after.fixtures.tmux.sessions, {});
+    assert.equal(fs.existsSync(alphaKeyFile(workspace)), false);
+    assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "launches", "alpha")), false);
     const launch = after.fixtures.codex.bridgeInvocations[0];
-    assert.ok(launch.env.CODEX_STARTUP_READY_FILE);
-    assert.equal(fs.existsSync(path.dirname(launch.env.CODEX_STARTUP_READY_FILE)), false);
-    assert.throws(() => process.kill(launch.pid, 0), { code: "ESRCH" });
+    assert.equal(launch.env.CODEX_RESUME_THREAD_ID, "00000000-0000-4000-8000-000000000001");
+    await waitForExit(launch.pid);
+    assert.equal(readRegistry(workspace).projects.alpha.pid, null);
+    assert.equal(readRegistry(workspace).projects.alpha.session_id, null);
+    await cleanup();
   }
 });
 
 test("start-codex-session rejects malformed resume arguments before changing state", async () => {
-  const workspace = createWorkspace();
+  const workspace = createCodexWorkspace();
   const seed = buildCodexRegistry(workspace);
   seedRegistry(workspace, seed);
   for (const args of [
@@ -287,7 +330,7 @@ test("start-codex-session rejects malformed resume arguments before changing sta
     ["alpha", "--resume", "00000000-0000-4000-8000-000000000001", "extra"],
     ["alpha", "--unknown", "00000000-0000-4000-8000-000000000001"],
   ]) {
-    const result = await runScript(workspace, "scripts/start-codex-session.sh", { args });
+    const result = await startCodex(workspace, { args });
     assert.notEqual(result.exitCode, 0);
     assert.deepEqual(readRegistry(workspace), seed);
     assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {});
@@ -295,17 +338,15 @@ test("start-codex-session rejects malformed resume arguments before changing sta
 });
 
 test("start-codex-session launches a project under its Codex Account Alias home", async () => {
-  const workspace = createWorkspace();
+  const workspace = createCodexWorkspace();
   const projectAccountHome = path.join(workspace.homeDir, ".codex-project-account");
   fs.mkdirSync(projectAccountHome, { recursive: true });
   const registrySeed = buildCodexRegistry(workspace);
   registrySeed.codex_accounts = { "codex-project": projectAccountHome };
   registrySeed.projects.alpha.codex_account = "codex-project";
-  seedRegistry(workspace, registrySeed);
+  await serveAlpha(workspace, registrySeed);
 
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.equal(
@@ -315,17 +356,15 @@ test("start-codex-session launches a project under its Codex Account Alias home"
 });
 
 test("start-codex-session inherits the Default Codex Account when a project has no selector", async () => {
-  const workspace = createWorkspace();
+  const workspace = createCodexWorkspace();
   const defaultAccountHome = path.join(workspace.homeDir, ".codex-default-account");
   fs.mkdirSync(defaultAccountHome, { recursive: true });
   const registrySeed = buildCodexRegistry(workspace);
   registrySeed.codex_accounts = { "codex-default": defaultAccountHome };
   registrySeed.default_codex_account = "codex-default";
-  seedRegistry(workspace, registrySeed);
+  await serveAlpha(workspace, registrySeed);
 
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.equal(
@@ -335,7 +374,7 @@ test("start-codex-session inherits the Default Codex Account when a project has 
 });
 
 test("start-codex-session rejects a project Codex Account Alias and Legacy Codex Home conflict", async () => {
-  const workspace = createWorkspace();
+  const workspace = createCodexWorkspace();
   const accountHome = path.join(workspace.homeDir, ".codex-account");
   const legacyHome = path.join(workspace.homeDir, ".codex-legacy");
   fs.mkdirSync(accountHome, { recursive: true });
@@ -346,9 +385,7 @@ test("start-codex-session rejects a project Codex Account Alias and Legacy Codex
   registrySeed.projects.alpha.codex_home = legacyHome;
   seedRegistry(workspace, registrySeed);
 
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
 
   assert.notEqual(result.exitCode, 0);
   assert.match(`${result.stdout}\n${result.stderr}`, /project 'alpha'.*(codex_account.*codex_home|codex_home.*codex_account)/);
@@ -358,7 +395,7 @@ test("start-codex-session rejects a project Codex Account Alias and Legacy Codex
 });
 
 test("start-codex-session rejects an unknown project Codex Account Alias without falling back", async () => {
-  const workspace = createWorkspace();
+  const workspace = createCodexWorkspace();
   const configuredHome = path.join(workspace.homeDir, ".codex-configured");
   fs.mkdirSync(configuredHome, { recursive: true });
   const registrySeed = buildCodexRegistry(workspace);
@@ -366,18 +403,15 @@ test("start-codex-session rejects an unknown project Codex Account Alias without
   registrySeed.projects.alpha.codex_account = "missing-account";
   seedRegistry(workspace, registrySeed);
 
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
 
   assert.notEqual(result.exitCode, 0);
   assert.match(`${result.stdout}\n${result.stderr}`, /unknown Codex Account Alias 'missing-account'/);
-  assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {});
-  assert.equal(readRegistry(workspace).projects.alpha.pid, null);
+  assertNoLaunch(workspace);
 });
 
 test("start-codex-session rejects an unknown Default Codex Account even when the project has a legacy override", async () => {
-  const workspace = createWorkspace();
+  const workspace = createCodexWorkspace();
   const legacyHome = path.join(workspace.homeDir, ".codex-legacy");
   fs.mkdirSync(legacyHome, { recursive: true });
   const registrySeed = buildCodexRegistry(workspace, { codexHome: legacyHome });
@@ -387,14 +421,11 @@ test("start-codex-session rejects an unknown Default Codex Account even when the
   fs.mkdirSync(registrySeed.projects.alpha.codex_home, { recursive: true });
   seedRegistry(workspace, registrySeed);
 
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
 
   assert.notEqual(result.exitCode, 0);
   assert.match(`${result.stdout}\n${result.stderr}`, /default_codex_account.*unknown Codex Account Alias 'missing-account'/);
-  assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {});
-  assert.equal(readRegistry(workspace).projects.alpha.pid, null);
+  assertNoLaunch(workspace);
 });
 
 test("start-codex-session rejects malformed named-account maps and project selectors", async () => {
@@ -432,35 +463,30 @@ test("start-codex-session rejects malformed named-account maps and project selec
   ];
 
   for (const invalidCase of cases) {
-    const workspace = createWorkspace();
+    const workspace = createCodexWorkspace();
     const registrySeed = buildCodexRegistry(workspace);
     invalidCase.setup(registrySeed, workspace);
     seedRegistry(workspace, registrySeed);
 
-    const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-      args: ["alpha"],
-    });
+    const result = await startCodex(workspace);
 
     assert.notEqual(result.exitCode, 0, invalidCase.name);
     assert.match(`${result.stdout}\n${result.stderr}`, invalidCase.message, invalidCase.name);
-    assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {}, invalidCase.name);
-    assert.equal(readRegistry(workspace).projects.alpha.pid, null, invalidCase.name);
+    assertNoLaunch(workspace, invalidCase.name);
   }
 });
 
 test("start-codex-session treats a null project Codex Account Alias as unset", async () => {
-  const workspace = createWorkspace();
+  const workspace = createCodexWorkspace();
   const defaultAccountHome = path.join(workspace.homeDir, ".codex-default-account");
   fs.mkdirSync(defaultAccountHome, { recursive: true });
   const registrySeed = buildCodexRegistry(workspace);
   registrySeed.codex_accounts = { "codex-default": defaultAccountHome };
   registrySeed.default_codex_account = "codex-default";
   registrySeed.projects.alpha.codex_account = null;
-  seedRegistry(workspace, registrySeed);
+  await serveAlpha(workspace, registrySeed);
 
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.equal(
@@ -509,7 +535,7 @@ test("start-codex-session applies Codex Home validation to an aliased home", asy
   ];
 
   for (const invalidCase of cases) {
-    const workspace = createWorkspace();
+    const workspace = createCodexWorkspace();
     const selectedHome = invalidCase.setup(workspace);
     const registrySeed = buildCodexRegistry(workspace);
     registrySeed.codex_accounts = { selected: selectedHome };
@@ -520,14 +546,11 @@ test("start-codex-session applies Codex Home validation to an aliased home", asy
       fs.writeFileSync(markerPath, "stale\n");
     }
 
-    const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-      args: ["alpha"],
-    });
+    const result = await startCodex(workspace);
 
     assert.notEqual(result.exitCode, 0, invalidCase.name);
     assert.match(`${result.stdout}\n${result.stderr}`, invalidCase.message, invalidCase.name);
-    assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {}, invalidCase.name);
-    assert.equal(readRegistry(workspace).projects.alpha.pid, null, invalidCase.name);
+    assertNoLaunch(workspace, invalidCase.name);
     if (invalidCase.name === "unusable config") {
       assert.equal(fs.readFileSync(markerPath, "utf8"), "stale\n", invalidCase.name);
     }
@@ -535,14 +558,13 @@ test("start-codex-session applies Codex Home validation to an aliased home", asy
 });
 
 test("start-codex-session ignores a broken Codex Account Alias on an unrelated project", async () => {
-  const workspace = createWorkspace();
+  const workspace = createCodexWorkspace();
   const selectedHome = path.join(workspace.homeDir, ".codex-selected");
   fs.mkdirSync(selectedHome, { recursive: true });
   const registrySeed = buildCodexRegistry(workspace, {
     extraProjects: {
       beta: {
         path: path.join(workspace.tmpDir, "beta project"),
-        bot_id: "bot3",
         screen_name: "beta_codex",
         channel_id: "beta-channel-id",
         type: "codex",
@@ -555,25 +577,38 @@ test("start-codex-session ignores a broken Codex Account Alias on an unrelated p
   });
   registrySeed.codex_accounts = { selected: selectedHome };
   registrySeed.projects.alpha.codex_account = "selected";
-  seedRegistry(workspace, registrySeed);
+  await serveAlpha(workspace, registrySeed);
 
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex.env.CODEX_HOME, selectedHome);
   assert.equal(readRegistry(workspace).projects.beta.pid, null);
 });
 
+test("a Codex project without a webhook_id is refused before MCP cleanup, a key, a tmux session, or a PID", async () => {
+  const workspace = createCodexWorkspace();
+  seedRegistry(workspace, buildCodexRegistry(workspace));
+  const config = path.join(workspace.homeDir, ".codex", "config.toml");
+  const staleConfig = '[mcp_servers.discord-old]\ncommand = "node"\n';
+  fs.writeFileSync(config, staleConfig);
+
+  const result = await startCodex(workspace);
+
+  assert.equal(result.exitCode, 1, result.stderr || result.stdout);
+  assert.match(result.stderr, /Refusing to start 'alpha': it has no webhook_id, so its replies could not be posted\. Run scripts\/migrate-to-router\.sh alpha/);
+  assertNoLaunch(workspace, "no webhook_id");
+  assert.equal(readState(workspace.stateDir).fixtures.codex.bridgeInvocations.length, 0);
+  assert.equal(fs.readFileSync(config, "utf8"), staleConfig);
+  assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "launches", "alpha")), false);
+});
+
 test("start-codex-session rejects a missing Codex home before lifecycle mutation", async () => {
-  const workspace = createWorkspace();
+  const workspace = createCodexWorkspace();
   const missingHome = path.join(workspace.homeDir, ".codex-missing");
   seedRegistry(workspace, buildCodexRegistry(workspace, { createCodexHomes: false, globalCodexHome: missingHome }));
 
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
 
   assert.notEqual(result.exitCode, 0);
   assert.match(`${result.stdout}\n${result.stderr}`, /codex_home/);
@@ -586,7 +621,7 @@ test("start-codex-session rejects a missing Codex home before lifecycle mutation
 
 test("start-codex-session rejects a wrong-typed project Codex home selector", async () => {
   for (const selector of ["project", "top-level"]) {
-    const workspace = createWorkspace();
+    const workspace = createCodexWorkspace();
     const registrySeed = buildCodexRegistry(workspace);
     if (selector === "project") {
       registrySeed.projects.alpha.codex_home = 42;
@@ -595,28 +630,23 @@ test("start-codex-session rejects a wrong-typed project Codex home selector", as
     }
     seedRegistry(workspace, registrySeed);
 
-    const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-      args: ["alpha"],
-    });
+    const result = await startCodex(workspace);
 
     assert.notEqual(result.exitCode, 0);
     assert.match(`${result.stdout}\n${result.stderr}`, /codex_home/);
     assert.match(`${result.stdout}\n${result.stderr}`, /non-empty string/);
-    assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {});
-    assert.equal(readRegistry(workspace).projects.alpha.pid, null);
+    assertNoLaunch(workspace);
   }
 });
 
 test("start-codex-session treats null Codex home selectors as unset", async () => {
-  const workspace = createWorkspace();
+  const workspace = createCodexWorkspace();
   const registrySeed = buildCodexRegistry(workspace);
   registrySeed.codex_home = null;
   registrySeed.projects.alpha.codex_home = null;
-  seedRegistry(workspace, registrySeed);
+  await serveAlpha(workspace, registrySeed);
 
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.equal(
@@ -627,7 +657,7 @@ test("start-codex-session treats null Codex home selectors as unset", async () =
 
 test("start-codex-session rejects empty or whitespace Codex home selectors", async () => {
   for (const selector of ["project", "top-level"]) {
-    const workspace = createWorkspace();
+    const workspace = createCodexWorkspace();
     const registrySeed = buildCodexRegistry(workspace);
     if (selector === "project") {
       registrySeed.projects.alpha.codex_home = " \t";
@@ -636,38 +666,32 @@ test("start-codex-session rejects empty or whitespace Codex home selectors", asy
     }
     seedRegistry(workspace, registrySeed);
 
-    const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-      args: ["alpha"],
-    });
+    const result = await startCodex(workspace);
 
     assert.notEqual(result.exitCode, 0);
     assert.match(`${result.stdout}\n${result.stderr}`, /codex_home.*empty or whitespace-only/);
-    assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {});
-    assert.equal(readRegistry(workspace).projects.alpha.pid, null);
+    assertNoLaunch(workspace);
   }
 });
 
 test("start-codex-session rejects a non-regular config.toml before MCP cleanup", async () => {
-  const workspace = createWorkspace();
+  const workspace = createCodexWorkspace();
   const codexHome = path.join(workspace.homeDir, ".codex-config-directory");
   seedRegistry(workspace, buildCodexRegistry(workspace, { globalCodexHome: codexHome }));
   fs.mkdirSync(path.join(codexHome, "config.toml"), { recursive: true });
   fs.writeFileSync(path.join(codexHome, "stale-mcp-marker"), "[mcp_servers.discord-stale]\n");
 
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
 
   assert.notEqual(result.exitCode, 0);
   assert.match(`${result.stdout}\n${result.stderr}`, /config\.toml.*not a regular file/);
   assert.equal(fs.statSync(path.join(codexHome, "config.toml")).isDirectory(), true);
   assert.equal(fs.readFileSync(path.join(codexHome, "stale-mcp-marker"), "utf8"), "[mcp_servers.discord-stale]\n");
-  assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {});
-  assert.equal(readRegistry(workspace).projects.alpha.pid, null);
+  assertNoLaunch(workspace);
 });
 
 test("start-codex-session accepts normalized paths with spaces and valid symlinks", async () => {
-  const workspace = createWorkspace();
+  const workspace = createCodexWorkspace();
   const targetHome = path.join(workspace.tmpDir, "codex home with spaces");
   const symlinkHome = path.join(workspace.homeDir, "codex home link");
   fs.mkdirSync(targetHome, { recursive: true });
@@ -675,11 +699,9 @@ test("start-codex-session accepts normalized paths with spaces and valid symlink
   const registrySeed = buildCodexRegistry(workspace, {
     globalCodexHome: `${workspace.homeDir}/./codex home link`,
   });
-  seedRegistry(workspace, registrySeed);
+  await serveAlpha(workspace, registrySeed);
 
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.equal(
@@ -689,7 +711,7 @@ test("start-codex-session accepts normalized paths with spaces and valid symlink
 });
 
 test("start-codex-session rejects a broken Codex Home symlink before lifecycle mutation", async () => {
-  const workspace = createWorkspace();
+  const workspace = createCodexWorkspace();
   const brokenHome = path.join(workspace.homeDir, "broken codex home");
   fs.symlinkSync(path.join(workspace.tmpDir, "missing codex target"), brokenHome, "dir");
   const registrySeed = buildCodexRegistry(workspace, {
@@ -698,18 +720,15 @@ test("start-codex-session rejects a broken Codex Home symlink before lifecycle m
   });
   seedRegistry(workspace, registrySeed);
 
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
 
   assert.notEqual(result.exitCode, 0);
   assert.match(`${result.stdout}\n${result.stderr}`, /broken symlink/);
-  assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {});
-  assert.equal(readRegistry(workspace).projects.alpha.pid, null);
+  assertNoLaunch(workspace);
 });
 
 test("start-codex-session rejects non-directory and non-writable Codex Homes", async () => {
-  const nonDirectoryWorkspace = createWorkspace();
+  const nonDirectoryWorkspace = createCodexWorkspace();
   const nonDirectoryHome = path.join(nonDirectoryWorkspace.homeDir, "codex file");
   fs.writeFileSync(nonDirectoryHome, "not a directory\n");
   seedRegistry(
@@ -719,27 +738,23 @@ test("start-codex-session rejects non-directory and non-writable Codex Homes", a
       globalCodexHome: nonDirectoryHome,
     }),
   );
-  const nonDirectoryResult = await runScript(nonDirectoryWorkspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const nonDirectoryResult = await startCodex(nonDirectoryWorkspace);
   assert.notEqual(nonDirectoryResult.exitCode, 0);
   assert.match(`${nonDirectoryResult.stdout}\n${nonDirectoryResult.stderr}`, /not a directory/);
   assert.deepEqual(readState(nonDirectoryWorkspace.stateDir).fixtures.tmux.sessions, {});
 
-  const permissionWorkspace = createWorkspace();
+  const permissionWorkspace = createCodexWorkspace();
   const permissionHome = path.join(permissionWorkspace.homeDir, "codex read-only");
   seedRegistry(permissionWorkspace, buildCodexRegistry(permissionWorkspace, { globalCodexHome: permissionHome }));
   fs.chmodSync(permissionHome, 0o555);
-  const permissionResult = await runScript(permissionWorkspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const permissionResult = await startCodex(permissionWorkspace);
   assert.notEqual(permissionResult.exitCode, 0);
   assert.match(`${permissionResult.stdout}\n${permissionResult.stderr}`, /not writable/);
   assert.deepEqual(readState(permissionWorkspace.stateDir).fixtures.tmux.sessions, {});
 });
 
 test("start-codex-session rejects a non-writable config.toml before cleanup", async () => {
-  const workspace = createWorkspace();
+  const workspace = createCodexWorkspace();
   const codexHome = path.join(workspace.homeDir, ".codex-read-only-config");
   seedRegistry(workspace, buildCodexRegistry(workspace, { globalCodexHome: codexHome }));
   const configPath = path.join(codexHome, "config.toml");
@@ -747,9 +762,7 @@ test("start-codex-session rejects a non-writable config.toml before cleanup", as
   fs.writeFileSync(configPath, originalConfig);
   fs.chmodSync(configPath, 0o444);
 
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
 
   assert.notEqual(result.exitCode, 0);
   assert.match(`${result.stdout}\n${result.stderr}`, /config\.toml.*not writable/);
@@ -758,12 +771,11 @@ test("start-codex-session rejects a non-writable config.toml before cleanup", as
 });
 
 test("start-codex-session ignores a broken Codex home on an unrelated project", async () => {
-  const workspace = createWorkspace();
+  const workspace = createCodexWorkspace();
   const registrySeed = buildCodexRegistry(workspace, {
     extraProjects: {
       beta: {
         path: path.join(workspace.tmpDir, "beta project"),
-        bot_id: "bot3",
         screen_name: "beta_codex",
         channel_id: "beta-channel-id",
         type: "codex",
@@ -774,11 +786,9 @@ test("start-codex-session ignores a broken Codex home on an unrelated project", 
       },
     },
   });
-  seedRegistry(workspace, registrySeed);
+  await serveAlpha(workspace, registrySeed);
 
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.equal(
@@ -789,15 +799,13 @@ test("start-codex-session ignores a broken Codex home on an unrelated project", 
 });
 
 test("start-codex-session expands home-relative selectors and rejects unresolved paths", async () => {
-  const successWorkspace = createWorkspace();
+  const successWorkspace = createCodexWorkspace();
   const tildeHome = path.join(successWorkspace.homeDir, ".codex tilde home");
   fs.mkdirSync(tildeHome, { recursive: true });
   const successRegistry = buildCodexRegistry(successWorkspace);
   successRegistry.codex_home = "~/.codex tilde home";
-  seedRegistry(successWorkspace, successRegistry);
-  const successResult = await runScript(successWorkspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  await serveAlpha(successWorkspace, successRegistry);
+  const successResult = await startCodex(successWorkspace);
   assert.equal(successResult.exitCode, 0, successResult.stderr || successResult.stdout);
   assert.equal(
     readState(successWorkspace.stateDir).fixtures.tmux.sessions.alpha_codex.env.CODEX_HOME,
@@ -805,13 +813,11 @@ test("start-codex-session expands home-relative selectors and rejects unresolved
   );
 
   for (const unresolvedPath of ["relative/codex-home", "${HOME}/codex-home"]) {
-    const workspace = createWorkspace();
+    const workspace = createCodexWorkspace();
     const registrySeed = buildCodexRegistry(workspace);
     registrySeed.codex_home = unresolvedPath;
     seedRegistry(workspace, registrySeed);
-    const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-      args: ["alpha"],
-    });
+    const result = await startCodex(workspace);
     assert.notEqual(result.exitCode, 0);
     assert.match(`${result.stdout}\n${result.stderr}`, /top-level codex_home.*must be absolute or use '~'/);
     assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {});
@@ -819,29 +825,25 @@ test("start-codex-session expands home-relative selectors and rejects unresolved
 });
 
 test("start-codex-session keeps project Codex homes above the shared home", async () => {
-  const workspace = createWorkspace();
+  const workspace = createCodexWorkspace();
   const sharedHome = path.join(workspace.homeDir, ".codex-ccdm");
   const projectHome = path.join(workspace.homeDir, ".codex-api");
-  seedRegistry(workspace, buildCodexRegistry(workspace, {
+  await serveAlpha(workspace, buildCodexRegistry(workspace, {
     codexHome: projectHome,
     globalCodexHome: sharedHome,
   }));
 
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex.env.CODEX_HOME, projectHome);
 });
 
 test("start-codex-session passes text reply fallback only for flagged Codex projects", async () => {
-  const workspace = createWorkspace();
-  seedRegistry(workspace, buildCodexRegistry(workspace, { textReplyFallback: true }));
+  const workspace = createCodexWorkspace();
+  await serveAlpha(workspace, buildCodexRegistry(workspace, { textReplyFallback: true }));
 
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex;
@@ -849,8 +851,8 @@ test("start-codex-session passes text reply fallback only for flagged Codex proj
 });
 
 test("start-codex-session passes per-project Codex config overrides to the bridge", async () => {
-  const workspace = createWorkspace();
-  seedRegistry(
+  const workspace = createCodexWorkspace();
+  await serveAlpha(
     workspace,
     buildCodexRegistry(workspace, {
       codexModel: "gpt-5.6-sol",
@@ -859,9 +861,7 @@ test("start-codex-session passes per-project Codex config overrides to the bridg
     }),
   );
 
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex;
@@ -871,12 +871,10 @@ test("start-codex-session passes per-project Codex config overrides to the bridg
 });
 
 test("start-codex-session allows owner plus project guests", async () => {
-  const workspace = createWorkspace();
-  seedRegistry(workspace, buildCodexRegistry(workspace, { guestUserIds: ["222222222222222222"] }));
+  const workspace = createCodexWorkspace();
+  await serveAlpha(workspace, buildCodexRegistry(workspace, { guestUserIds: ["222222222222222222"], transport: "router" }));
 
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex;
@@ -884,39 +882,38 @@ test("start-codex-session allows owner plus project guests", async () => {
 });
 
 test("start-codex-session exits successfully when the target tmux session is already running", async () => {
-  const workspace = createWorkspace();
+  const workspace = createCodexWorkspace();
   seedRegistry(workspace, buildCodexRegistry(workspace));
   seedTmuxSession("alpha_codex", { paneOutput: "already running\n" }, { stateDir: workspace.stateDir });
 
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.match(result.stdout, /Session 'alpha_codex' is already running\./);
   assert.equal(readState(workspace.stateDir).fixtures.codex.bridgeInvocations.length, 0);
   assert.equal(readRegistry(workspace).projects.alpha.pid, null);
+  // The running launch keeps its key: no new key revokes it.
+  assert.equal(fs.existsSync(alphaKeyFile(workspace)), false);
 });
 
 test("start-codex-session refuses duplicate bridge and app-server processes from fixture ps state", async () => {
-  const bridgeWorkspace = createWorkspace();
+  const bridgeWorkspace = createCodexWorkspace();
   const bridgeRegistry = buildCodexRegistry(bridgeWorkspace);
   seedRegistry(bridgeWorkspace, bridgeRegistry);
   const bridgePid = seedOwnedProcess(
     bridgeWorkspace,
-    "node scripts/codex-bridge.js CHANNEL_ID='channel-id' BOT_APP_ID='bot-app-id'",
+    `node scripts/codex-bridge.js CHANNEL_ID='channel-id' WS_PORT='18399' CCDM_ROUTER_KEY_FILE='${alphaKeyFile(bridgeWorkspace)}'`,
   );
 
-  const bridgeResult = await runScript(bridgeWorkspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const bridgeResult = await startCodex(bridgeWorkspace);
 
   assert.equal(bridgeResult.exitCode, 1);
   assert.match(bridgeResult.stdout, /existing Codex Discord bridge process\(es\)/);
   assert.match(bridgeResult.stdout, new RegExp(String(bridgePid)));
   assert.equal(readState(bridgeWorkspace.stateDir).fixtures.tmux.sessions.alpha_codex, undefined);
+  assert.equal(fs.existsSync(alphaKeyFile(bridgeWorkspace)), false);
 
-  const appServerWorkspace = createWorkspace();
+  const appServerWorkspace = createCodexWorkspace();
   const appServerRegistry = buildCodexRegistry(appServerWorkspace);
   seedRegistry(appServerWorkspace, appServerRegistry);
   const appServerPid = seedOwnedProcess(
@@ -924,71 +921,54 @@ test("start-codex-session refuses duplicate bridge and app-server processes from
     "codex app-server --listen ws://127.0.0.1:18342",
   );
 
-  const appServerResult = await runScript(appServerWorkspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const appServerResult = await startCodex(appServerWorkspace);
 
   assert.equal(appServerResult.exitCode, 1);
   assert.match(appServerResult.stdout, /channel channel-id or port 18342/);
   assert.match(appServerResult.stdout, new RegExp(String(appServerPid)));
   assert.equal(readState(appServerWorkspace.stateDir).fixtures.tmux.sessions.alpha_codex, undefined);
+  assert.equal(fs.existsSync(alphaKeyFile(appServerWorkspace)), false);
 });
 
 test("start-codex-session reports current executable failures for registry lookup errors", async () => {
-  const missingProject = createWorkspace();
+  const missingProject = createCodexWorkspace();
   seedRegistry(missingProject, buildCodexRegistry(missingProject));
-  const missingProjectResult = await runScript(missingProject, "scripts/start-codex-session.sh", {
-    args: ["missing"],
-  });
+  const missingProjectResult = await startCodex(missingProject, { args: ["missing"] });
   assert.notEqual(missingProjectResult.exitCode, 0);
   assert.match(missingProjectResult.stderr, /KeyError: 'missing'/);
 
-  const malformed = createWorkspace();
+  const malformed = createCodexWorkspace();
   fs.writeFileSync(path.join(malformed.repoDir, "registry.json"), "{ not json\n");
-  const malformedResult = await runScript(malformed, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const malformedResult = await startCodex(malformed);
   assert.notEqual(malformedResult.exitCode, 0);
   assert.match(malformedResult.stderr, /JSONDecodeError/);
 
-  const missingBot = createWorkspace();
-  const missingBotRegistry = buildCodexRegistry(missingBot);
-  missingBotRegistry.pool = missingBotRegistry.pool.filter((bot) => bot.id !== "bot2");
-  seedRegistry(missingBot, missingBotRegistry);
-  const missingBotResult = await runScript(missingBot, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
-  assert.notEqual(missingBotResult.exitCode, 0);
-  assert.match(missingBotResult.stderr, /StopIteration/);
-
-  const missingRootBot = createWorkspace();
-  const missingRootBotRegistry = buildCodexRegistry(missingRootBot);
-  missingRootBotRegistry.pool = missingRootBotRegistry.pool.filter((bot) => bot.id !== "bot1");
-  seedRegistry(missingRootBot, missingRootBotRegistry);
-  const missingRootBotResult = await runScript(missingRootBot, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
-  assert.equal(missingRootBotResult.exitCode, 0, missingRootBotResult.stderr);
+  // A stale `bot_id` naming no pool bot is not looked up: the lookup passes
+  // and the launch reaches the Router bridge (which, with no Router or
+  // app-server here, never says hello).
+  const staleBot = createCodexWorkspace();
+  const staleBotRegistry = buildCodexRegistry(staleBot);
+  staleBotRegistry.projects.alpha.bot_id = "bot2";
+  staleBotRegistry.projects.alpha.webhook_id = "webhook-alpha";
+  seedRegistry(staleBot, staleBotRegistry);
+  const staleBotResult = await startCodex(staleBot, { env: { CCDM_CODEX_LAUNCH_TIMEOUT_S: "2" } });
+  assert.notEqual(staleBotResult.exitCode, 0);
+  assert.doesNotMatch(staleBotResult.stderr, /StopIteration|KeyError|Traceback/);
+  assert.match(staleBotResult.stdout, /Started Codex Router bridge in tmux session 'alpha_codex'/);
+  assert.match(staleBotResult.stderr, /Codex Router launch failed/);
+  assertNoLaunch(staleBot);
 });
 
-test("start-codex-session preserves current duplicate channel and port registry behavior", async () => {
-  const workspace = createWorkspace();
+// The Router rejects a registry that gives two projects one channel, so beta
+// has its own channel; the shared ws_port is what this test preserves.
+test("start-codex-session preserves current duplicate port registry behavior", async () => {
+  const workspace = createCodexWorkspace();
   const registrySeed = buildCodexRegistry(workspace, {
-    extraPool: [
-      {
-        id: "bot3",
-        app_id: "bot-app-id-3",
-        token: "bot-token-3",
-        state_dir: path.join(workspace.homeDir, ".claude", "channels", "discord3"),
-        assigned_to: "beta",
-      },
-    ],
     extraProjects: {
       beta: {
         path: path.join(workspace.tmpDir, "beta project"),
-        bot_id: "bot3",
         screen_name: "beta_codex",
-        channel_id: "channel-id",
+        channel_id: "beta-channel-id",
         type: "codex",
         ws_port: 18342,
         session_id: null,
@@ -996,14 +976,13 @@ test("start-codex-session preserves current duplicate channel and port registry 
       },
     },
   });
-  seedRegistry(workspace, registrySeed);
+  await serveAlpha(workspace, registrySeed, { samePort: ["beta"] });
 
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["alpha"],
-  });
+  const result = await startCodex(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const registry = readRegistry(workspace);
+  assert.equal(registry.projects.alpha.ws_port, registry.projects.beta.ws_port);
   assert.equal(typeof registry.projects.alpha.pid, "number");
   assert.equal(registry.projects.beta.pid, null);
   const state = readState(workspace.stateDir);
@@ -1011,14 +990,27 @@ test("start-codex-session preserves current duplicate channel and port registry 
   assert.equal(state.fixtures.tmux.sessions.beta_codex, undefined);
 });
 
-test("project launch refuses to infer root identity from a project pool entry", async () => {
-  const workspace = createWorkspace();
+test("project launch never reads a pool token or root .env and carries no bot identity", async () => {
+  const workspace = createCodexWorkspace();
+  // Leftover pool-era fields: a pool entry for alpha's old bot and no root
+  // identity. Root's Discord state holds root-bot-token for the Router alone.
   const registry = buildCodexRegistry(workspace);
+  registry.pool = [{ id: "bot2", app_id: "pool-app-id", token: "pool-bot-token", state_dir: path.join(workspace.homeDir, ".claude", "channels", "discord2"), assigned_to: "alpha" }];
+  registry.projects.alpha.bot_id = "bot2";
   delete registry.root_bot_app_id;
-  seedRegistry(workspace, registry);
-  const result = await runScript(workspace, "scripts/start-codex-session.sh", { args: ["alpha"] });
-  assert.notEqual(result.exitCode, 0);
-  assert.match(result.stderr, /Root bot identity missing/);
-  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex, undefined);
-  assert.doesNotMatch(result.stderr, /root-token/);
+  await serveAlpha(workspace, registry);
+
+  const result = await startCodex(workspace);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.doesNotMatch(result.stderr, /Root bot identity missing/);
+  const state = readState(workspace.stateDir);
+  const session = state.fixtures.tmux.sessions.alpha_codex;
+  assert.equal(session.env.CCDM_ROUTER_KEY_FILE, alphaKeyFile(workspace));
+  const surfaces = [session.shellCommand, JSON.stringify(session.env), JSON.stringify(state.fixtures.codex.bridgeInvocations), result.stdout, result.stderr];
+  for (const text of surfaces) {
+    for (const forbidden of ["pool-bot-token", "root-bot-token", "pool-app-id", "BOT_TOKEN", "BOT_APP_ID", "ROOT_BOT_APP_ID", "BOT_DISPLAY_NAME", "GUILD_ID", "DISCORD_STATE_DIR"]) {
+      assert.equal(text.includes(forbidden), false, `${forbidden} in ${text.slice(0, 300)}`);
+    }
+  }
 });

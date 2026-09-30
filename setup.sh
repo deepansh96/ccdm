@@ -81,12 +81,11 @@ fi
 REGISTRY_CONTENT="{
   \"discord_user_id\": \"$discord_id\",
   \"guild_id\": \"$guild_id\",
-  \"max_pool_size\": 50,
+  \"root_channels\": [],
+  \"root_allowed_user_ids\": [],
   \"codex_accounts\": {},
   \"default_codex_account\": null,
-  \"project_bot_role_id\": null,
   \"category_ids\": [],
-  \"pool\": [],
   \"projects\": {}
 }"
 
@@ -107,11 +106,12 @@ fi
 
 # ── Get bot token ──
 echo ""
-echo "You need a Discord bot token for the root agent."
-echo "If you don't have one yet, create a bot at https://discord.com/developers/applications"
+echo "CCDM uses one Discord bot, root. The Router holds its token and serves"
+echo "root and every project channel through it."
+echo "If you don't have the bot yet, create it at https://discord.com/developers/applications"
 echo "(See README.md for detailed instructions)"
 echo ""
-read "bot_token?Enter the root agent's Discord bot token: "
+read "bot_token?Enter the root bot's Discord bot token: "
 
 if [ -z "$bot_token" ]; then
     echo "Error: Bot token is required."
@@ -142,20 +142,10 @@ fi
 # ── Create state directory ──
 mkdir -p "$STATE_DIR"
 
-# Write .env
+# Write .env: the only place the root bot token lives. The Router and root's
+# admin scripts read it from here.
 echo "DISCORD_BOT_TOKEN=$bot_token" > "$STATE_DIR/.env"
 echo "Created $STATE_DIR/.env"
-
-# Write access.json
-cat > "$STATE_DIR/access.json" << EOF
-{
-  "dmPolicy": "allowlist",
-  "allowFrom": ["$discord_id"],
-  "groups": {},
-  "pending": {}
-}
-EOF
-echo "Created $STATE_DIR/access.json (you are pre-approved)"
 
 # ── Make scripts executable ──
 chmod +x "$SCRIPT_DIR/restart-root-agent.sh"
@@ -166,11 +156,19 @@ echo "════════════════════════�
 echo "  Setup complete!"
 echo "════════════════════════════════════════════════"
 echo ""
-echo "To start the root agent:"
+echo "Next steps:"
 echo ""
-echo "  tmux new-session -d -s root_agent -- zsh -ic 'cd $SCRIPT_DIR && DISCORD_STATE_DIR=$STATE_DIR claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'"
+echo "  1. Create a root channel in your server and add its ID to \"root_channels\""
+echo "     in $SCRIPT_DIR/registry.json. Add anyone else who may talk to root"
+echo "     to \"root_allowed_user_ids\"."
+echo "  2. Install and start the Router (it holds the root bot token):"
+echo "       $SCRIPT_DIR/scripts/install-router-service.sh"
+echo "       node $SCRIPT_DIR/scripts/router.js status"
+echo "  3. Start the root agent as a Router client:"
+echo "       $SCRIPT_DIR/restart-root-agent.sh"
 echo ""
-echo "Then message your bot on Discord to manage project sessions."
+echo "Then message root in your root channel to register and manage projects."
+echo "Each project gets its own channel and webhook; no extra bots are needed."
 echo ""
 echo "Useful commands:"
 echo "  tmux attach -t root_agent   # Attach to the session"

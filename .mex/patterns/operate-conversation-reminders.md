@@ -11,13 +11,13 @@ edges:
     condition: when the reminder service's relationship to adapters or sessions is unclear
   - target: context/session-management.md
     condition: when a registration or deregistration also changes reminder assignments
-last_updated: 2026-09-25
+last_updated: 2026-09-29
 ---
 
 # Operate Conversation Reminders
 
 ## Context
-Read `docs/conversation-reminders.md`. The service runs independently of coding sessions and uses the root bot to observe. It sends through each project's assigned bot. The LaunchAgent supervises the same `run` worker, so foreground and supervised launches share one worker lock.
+Read `docs/conversation-reminders.md`. The service runs independently of coding sessions and uses the root bot to observe. It observes as the Router's read-only `observer` client and sends every reminder as the root bot. The LaunchAgent supervises the same `run` worker, so foreground and supervised launches share one worker lock.
 
 ## Steps
 1. Install supervision only when the operator asks: `scripts/install-conversation-reminder-service.sh`. It runs the read-only `preflight` and exits with status 2, with nothing changed, if a check fails.
@@ -26,15 +26,14 @@ Read `docs/conversation-reminders.md`. The service runs independently of coding 
 4. To stop, run `disable`. The supervised worker exits successfully and launchd does not relaunch it.
 5. To re-enable, run `enable`, then rerun the installer to start the supervised worker. Channels reconcile before sending.
 6. The running worker resolves uncertain sends by itself: it replays the intent's nonce inside Discord's duplicate-check window, and afterwards releases the channel only when history proves nothing was sent. If one stays unresolved, or cleanup is stuck, run `disable`, wait for `worker_running: false`, then `enable` and `recover`. Then rerun the installer. If `recover` lists unbound `candidates`, delete a stray reminder in Discord and recover again, or run `assignment-changed --project <project>`.
-7. After registration or deregistration, run `assignment-changed --project <project>`. It deletes retired reminders at once with the retired bot; check `retired_cleanup` in its output and delete any `inaccessible` message manually.
+7. After registration or deregistration, run `assignment-changed --project <project>`. It deletes retired reminders at once as root; check `retired_cleanup` in its output and delete any `inaccessible` message manually.
 
 ## Gotchas
 - Never edit or delete the private databases to clear state; a new owner message reopens a closed conversation.
 - Recovery never adopts or deletes a bot `👀` found in history; only a nonce replay or a recorded message ID identifies a reminder.
 - A reaction, including one on a reminder, can pause a conversation indefinitely until the next qualifying agent response; this is expected.
-- A Claude channel is ready only while its adapter launch runs. A plain `scripts/start-session.sh <project>` restart without `CCDM_CLAUDE_REMINDER_ADAPTER=1` leaves it blocked.
-- An adapter launch requires Claude Code 2.x from `2.1.281`, so auto-updates within 2.x keep working. After an update, confirm one adapter launch reaches `ready-observe-only`; if the plugin contract changed, the MCP proxy blocks it.
-- `--dangerously-load-development-channels server:discord` asks for first-use consent in the tmux pane ("I am using this for local development"). Send Enter to confirm; the session sits at the prompt until then. The startup notice "server:discord · no MCP server configured with that name" is stale — the capability marker written after the official plugin handshake is the real proof.
+- A Claude channel is ready only while its launch's CCDM channel server runs; `scripts/start-session.sh <project>` relaunches it. The retired reminder proxy and `CCDM_CLAUDE_REMINDER_ADAPTER=1` no longer exist.
+- `start-session.sh` accepts the `--dangerously-load-development-channels server:ccdm` first-use consent in the tmux pane itself; the capability marker written after the channel server's Router hello is the real proof.
 - Sleep or a clock jump is handled like a restart: channels reconcile before any send, and overdue channels get spaced catch-ups.
 - Do not run live Discord or launchd checks as part of default tests; the Live Smoke Suite is separately gated.
 - The installer never touches the Usage Stats Poster LaunchAgent or its storage.

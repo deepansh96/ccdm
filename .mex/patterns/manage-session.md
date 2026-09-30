@@ -8,13 +8,13 @@ triggers:
 edges:
   - target: context/session-management.md
     condition: always before changing session state
-last_updated: 2026-09-22
+last_updated: 2026-09-29
 ---
 
 # Manage A Session
 
 ## Steps
-1. Read the project and assigned bot from `registry.json`; treat a missing `type` as `claude`.
+1. Read the project from `registry.json`; treat a missing `type` as `claude`.
 2. For start, run `scripts/start-session.sh <project>` or `scripts/start-codex-session.sh <project>` based on type.
 3. For stop, run `scripts/stop-session.sh <project>`. For restart, stop fully before starting.
 4. Capture the exact tmux pane and confirm the expected listener banner.
@@ -28,7 +28,7 @@ last_updated: 2026-09-22
 
 ## Verify
 - [ ] Exactly one assigned listener exists.
-- [ ] The bot is listening in the registered channel.
+- [ ] `node scripts/router.js status` shows the session connected in the registered channel.
 - [ ] Registry PID/session fields match the resulting state.
 
 ## Debug

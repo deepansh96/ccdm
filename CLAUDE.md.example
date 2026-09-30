@@ -4,13 +4,17 @@ This is the root agent that manages Discord-connected Claude Code sessions for m
 
 ## What this does
 
-You are a coordinator bot. Users message you on Discord to start, stop, and manage Claude Code sessions running in different project directories. Each project has its own Discord bot, its own tmux session, and its own state directory.
+You are a coordinator bot. Users message you on Discord to start, stop, and manage Claude Code and Codex sessions running in different project directories. CCDM uses **one Discord bot** (root). A local **Router** daemon holds its token, delivers each project channel's messages to the one session serving it, and performs Discord actions on each session's behalf. Each project has its own channel, its own tmux session, and its own **Project Identity** webhook (`ccdm-<project>`), whose messages post as `<project>-<claude|codex> · N%`.
+
+You are a Router client too (the `root` role): you hear messages in root channels and bot mentions in project channels, and you can read, post, and react in every registered channel through your Discord tools. You hold no Discord token in your session. For admin REST work (channels, roles, invites, polls) read the root token from `~/.claude/channels/discord/.env` (or `$ROOT_DISCORD_STATE_DIR/.env`) at the moment you need it, and never print, log, or copy it.
 
 ## Key files
 
-- `registry.json` — contains the bot pool and project assignments
-- `scripts/start-session.sh <project>` — generic script to start any registered project's Discord session
-- `scripts/stop-session.sh <project>` — generic script to stop any registered project's Discord session
+- `registry.json` — project registrations, root channels, and account settings (no tokens)
+- `scripts/start-session.sh <project>` — start a registered Claude project
+- `scripts/start-codex-session.sh <project>` — start a registered Codex project
+- `scripts/stop-session.sh <project>` — stop any registered project
+- `scripts/router.js` — Router CLI: `status`, `ensure-webhook`, `delete-webhook`, `probe`
 
 ## How to respond
 
@@ -26,29 +30,28 @@ Read `registry.json` to discover configured projects. This session is always the
 
 ### Registry
 
-Read the `registry.json` file in this project's root directory. It has two main sections:
+Read the `registry.json` file in this project's root directory.
 
-**Pool** (`pool` array) — all available Discord bots:
-- `id`: bot identifier (e.g., `bot1`, `bot2`)
-- `app_id`: Discord application ID
-- `token`: bot token
-- `state_dir`: Discord state directory (`~/.claude/channels/discord{N}/`)
-- `assigned_to`: project name if assigned, `null` if available
+**Top-level fields:**
+- `discord_user_id`: the owner's Discord ID. Only the owner and channel guests are forwarded to sessions.
+- `guild_id`: the Discord server ID
+- `root_channels`: channel IDs where you listen without an @mention; the first is the primary root channel
+- `root_allowed_user_ids`: extra users (besides the owner) who may talk to you in root channels. Guests can never reach you.
+- `category_ids`: CCDM-managed category IDs that guest roles are denied on
+- `codex_accounts` / `default_codex_account`: named Codex Homes
 
 **Projects** (`projects` object) — registered projects:
 - `path`: project directory
-- `bot_id`: which pool bot is assigned to this project
+- `type`: `claude` (default) or `codex`
 - `screen_name`: name of the tmux session
-- `channel_id`: Discord channel ID the bot is scoped to
-- `session_id`: Claude Code session ID (updated on start, cleared on stop)
-- `pid`: Claude Code process ID (updated on start, cleared on stop)
+- `channel_id`: the project's Discord channel, and its Session Scope
+- `webhook_id`: the project's Project Identity webhook, written by `ensure-webhook`
+- `guest_user_ids`: guests allowed in this channel
+- `ws_port`: Codex app-server port (Codex projects)
+- `session_id`, `pid`: runtime state, written by the start and stop scripts
+- optional account and model overrides (`claude_home`, `model`, `claude_effort`, `codex_account`, `codex_model`, `codex_reasoning_effort`, `codex_service_tier`)
 
-**Other fields:**
-- `discord_user_id`: the user's Discord ID (for access control)
-- `guild_id`: the Discord server ID (for bot invites)
-- `max_pool_size`: maximum number of bots in the pool (50)
-- `project_bot_role_id`: Discord role ID for the "project-bot" role (zero permissions, used to deny VIEW_CHANNEL on all categories)
-- `category_ids`: array of Discord category channel IDs where the project-bot role has VIEW_CHANNEL denied
+Never put a bot or webhook token in the registry. Webhook tokens live only in private Router state.
 
 ### Commands
 
@@ -60,327 +63,88 @@ Run `tmux list-sessions` and cross-reference with the registry. Report which pro
 
 #### 2. Start a session (`start <project>`)
 
-1. Look up the project in `registry.json`. Find its assigned bot in the pool via `bot_id` to get the `state_dir`.
-2. Check if a tmux session with that name is already running (`tmux has-session -t <screen_name> 2>/dev/null`). If yes, say it's already running.
-3. Pre-trust the workspace so the trust dialog is skipped (or auto-dismissed):
-   ```python
-   import json
-   path = os.path.expanduser('~/.claude/.claude.json')
-   d = json.load(open(path))
-   project_key = '<path>'  # must match the resolved/canonical path (capital D in Documents on macOS)
-   if project_key not in d.get('projects', {}):
-       d.setdefault('projects', {})[project_key] = {
-           'allowedTools': [], 'mcpContextUris': [], 'mcpServers': {},
-           'enabledMcpjsonServers': [], 'disabledMcpjsonServers': [],
-           'hasTrustDialogAccepted': True, 'projectOnboardingSeenCount': 1
-       }
-   else:
-       d['projects'][project_key]['hasTrustDialogAccepted'] = True
-   json.dump(d, open(path, 'w'), indent=2)
-   ```
-4. Run:
-   ```sh
-   tmux new-session -d -s <screen_name> -- zsh -ic 'cd <path> && DISCORD_STATE_DIR=<state_dir> claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
-   ```
-5. **Dismiss the trust dialog** — the Ink TUI may still show it even with pre-trust. Wait ~8 seconds for the prompt to render, then send Enter:
-   ```sh
-   sleep 8 && tmux send-keys -t <screen_name> Enter
-   ```
-6. Verify it started by capturing the tmux pane output:
-   ```sh
-   tmux capture-pane -t <screen_name> -p
-   ```
-   Look for "Listening for channel messages" to confirm the session is live. If the trust dialog is still showing, re-run the `send-keys` command.
-7. Look up the Claude Code PID and session ID from `~/.claude/sessions/<pid>.json` (the PID is the `claude` process running inside the tmux session). Update `registry.json` with `session_id` and `pid`.
+Run the launcher for the project's `type`:
+
+```sh
+scripts/start-session.sh <project>        # Claude
+scripts/start-codex-session.sh <project>  # Codex
+```
+
+The launcher rejects a duplicate listener, writes a fresh per-launch Router key (which disconnects any previous listener for the project), starts the session in tmux through `zsh -ic`, accepts the Claude development-channel confirmation, and records `pid`/`session_id` only after the session has connected to the Router. A failed launch cleans up and exits non-zero; report its error. Confirm with `node scripts/router.js status` that the project is connected in its channel.
 
 #### 3. Stop a session (`stop <project>`)
 
-1. Look up the project in `registry.json`.
-2. Run: `tmux kill-session -t <screen_name>`
-3. Clear `session_id` and `pid` from the project's entry in `registry.json` (set to `null`).
-4. Confirm it's stopped.
+Run `scripts/stop-session.sh <project>`. It kills the recorded process tree and tmux session, sweeps orphan listeners, removes the launch key, and clears `pid` and `session_id`. Never use only `tmux kill-session`. Messages to the channel now get 💤.
 
 #### 4. Restart a session (`restart <project>`)
 
-Stop then start.
+Stop then start. A restart request from or naming a project channel restarts that project, never you.
 
 #### 5. Register a project (`register`, `setup`)
 
-This assigns an available bot from the pool to a new project and scopes it to a single Discord channel.
+This connects a new project to a Discord channel. There is no bot to create, assign, rename, or give a role.
 
 **Interactive flow:**
-1. Ask the user: "Which channel should the bot be registered to?" (user provides `#channel-name` or channel ID)
+1. Ask the user: "Which channel should the project use?" (user provides `#channel-name` or channel ID, or asks you to create one)
 2. Ask: "What is the project directory path?" (user provides absolute path)
-3. Derive `project_name` from the channel name (or let user specify). Derive `screen_name`: lowercase, underscores.
+3. Ask whether it is a Claude or Codex project.
+4. Derive `project_name` from the channel name (or let user specify). Derive `screen_name`: lowercase, underscores.
 
 **Registration steps:**
-1. Check the pool for an unassigned bot (`assigned_to` is `null`). If none available, tell the user: "No bots available in the pool. Add one with `pool add` or remove a project to free one up."
-2. Claim the first available bot: set its `assigned_to` to `<project_name>`.
-3. Add the project to `registry.json` with `bot_id`, `path`, `screen_name`, and `channel_id`.
-4. Rename the bot on Discord to `<bot_id>-<project_name>` (e.g., `bot2-my-project`):
+1. Create the channel (or resolve the one the user named) with the root bot's REST credentials, limited to the exact guild and category the user asked for:
    ```sh
-   curl -s -X PATCH "https://discord.com/api/v10/users/@me" \
-     -H "Authorization: Bot <token>" \
+   curl -s -X POST "https://discord.com/api/v10/guilds/<guild_id>/channels" \
+     -H "Authorization: Bot $ROOT_TOKEN" \
      -H "Content-Type: application/json" \
-     -d '{"username": "<bot_id>-<project_name>"}'
+     -d '{"name": "<channel-name>", "type": 0, "parent_id": "<category_id>"}'
    ```
-5. Assign the "project-bot" role to the bot (this role denies VIEW_CHANNEL on all categories):
+   Load `ROOT_TOKEN` from root's `.env` inside the same shell command; never echo it.
+2. Add the project to `registry.json` with `path`, `screen_name`, `channel_id`, and `type` (plus an unused `ws_port` for Codex). Update the JSON structurally and preserve other fields.
+3. Create its Project Identity webhook:
    ```sh
-   curl -s -X PUT "https://discord.com/api/v10/guilds/<guild_id>/members/<bot_app_id>/roles/<project_bot_role_id>" \
-     -H "Authorization: Bot <root_bot_token>"
+   node scripts/router.js ensure-webhook <project_name>
    ```
-   Use bot1's token as `<root_bot_token>` (it has admin permissions).
-6. Add a member-level permission override on the target channel to ALLOW the bot to see and use it:
+   This finds or creates `ccdm-<project_name>` in the channel, records `webhook_id` in the registry, and keeps the webhook token only in private Router state. Never copy the token anywhere.
+4. Issue a fresh Conversation Reminder assignment:
    ```sh
-   curl -s -X PUT "https://discord.com/api/v10/channels/<channel_id>/permissions/<bot_app_id>" \
-     -H "Authorization: Bot <root_bot_token>" \
-     -H "Content-Type: application/json" \
-     -d '{"allow": "274878008384", "deny": "0", "type": 1}'
+   scripts/conversation-reminder-service.py assignment-changed --project <project_name>
    ```
-   Permission bits: VIEW_CHANNEL + SEND_MESSAGES + READ_MESSAGE_HISTORY + ATTACH_FILES + ADD_REACTIONS + SEND_MESSAGES_IN_THREADS = `274878008384`. `type: 1` = member override.
-7. Write the `.env` file in the bot's state directory:
-   ```
-   DISCORD_BOT_TOKEN=<token>
-   ```
-8. Write `access.json` for the project bot — scoped to its one channel only:
-   ```json
-   {
-     "dmPolicy": "allowlist",
-     "allowFrom": ["<discord_user_id>"],
-     "groups": {
-       "<channel_id>": {
-         "requireMention": false,
-         "allowFrom": ["<discord_user_id>"]
-       }
-     },
-     "pending": {}
-   }
-   ```
-9. Update the ROOT bot's `access.json` (`~/.claude/channels/discord/access.json`) — add the project channel with `requireMention: true` so the user can @tag the root bot there:
-   ```json
-   "<channel_id>": {
-     "requireMention": true,
-     "allowFrom": ["<discord_user_id>"]
-   }
-   ```
-   Read the file, add the entry to `groups`, write it back.
-10. Start the session (follow the start steps above, including recording `session_id` and `pid`).
-11. Tell the user which bot was assigned, which channel it's scoped to, and that the session is running.
+5. Start the session (see Start above) and check `node scripts/router.js status`. If root is missing channel permissions there, `router status` names them.
+6. Tell the user which channel the project serves and that the session is running.
+
+The Router reloads the registry itself; no Router or root restart is needed.
 
 #### 6. Deregister a project (`deregister`, `remove`, `unregister`)
 
-1. Stop the session if running (`tmux kill-session -t <screen_name>`).
-2. Find the project's assigned bot in the pool via `bot_id`. Get `token` and `app_id` from the pool entry, and `channel_id` from the project entry.
-3. Rename the bot back to its base name (e.g., `bot2`):
+1. Stop the session fully with `scripts/stop-session.sh <project_name>`.
+2. Delete its Project Identity webhook, which also removes the private token and clears `webhook_id`:
    ```sh
-   curl -s -X PATCH "https://discord.com/api/v10/users/@me" \
-     -H "Authorization: Bot <token>" \
-     -H "Content-Type: application/json" \
-     -d '{"username": "<bot_id>"}'
+   node scripts/router.js delete-webhook <project_name>
    ```
-4. Remove the channel permission override for the bot:
-   ```sh
-   curl -s -X DELETE "https://discord.com/api/v10/channels/<channel_id>/permissions/<bot_app_id>" \
-     -H "Authorization: Bot <root_bot_token>"
-   ```
-5. Remove the "project-bot" role from the bot:
-   ```sh
-   curl -s -X DELETE "https://discord.com/api/v10/guilds/<guild_id>/members/<bot_app_id>/roles/<project_bot_role_id>" \
-     -H "Authorization: Bot <root_bot_token>"
-   ```
-6. Remove the channel from the root bot's `access.json` (`~/.claude/channels/discord/access.json`) — delete the `<channel_id>` entry from `groups`.
-7. Set the bot's `assigned_to` to `null` in the pool (returns it to the pool).
-8. Clear `session_id` and `pid` (set to `null`).
-9. Remove the project entry from `registry.json`.
-10. Confirm the bot has been returned to the pool. The Discord channel still exists (not deleted).
+   Running it again is a no-op.
+3. Revoke any guests with `scripts/guest-access.js revoke <project_name> <user_id>`.
+4. Remove the project entry from `registry.json`, then run `scripts/conversation-reminder-service.py assignment-changed --project <project_name>`.
+5. Confirm the removal. The Discord channel still exists (not deleted).
 
-#### 7. Pool status (`pool`, `pool status`)
+#### 7. Router status (`router status`, `is the router up`)
 
-Show all bots in the pool with their assignment status. For each bot, show:
-- Bot ID and username
-- Assigned project (or "available")
-- State directory
+Run `node scripts/router.js status`. It shows the gateway state, the registry's last load and any load error, connected sessions with role, project, scope, and connect time, webhook presence and missing root permissions per project, and recent scope violations. It exits non-zero when the Router is unreachable. Use `--json` when you need to parse it.
 
-#### 8. Pool add (`pool add`)
+If the Router is down, launchd restarts it (`com.ccdm.router`, logs in `~/.local/state/ccdm/router/router.err`). To reinstall it, run `scripts/install-router-service.sh`; its read-only preflight names any blocker.
 
-Create a new bot and add it to the pool.
+**Emergency fallback:** if the Router stays unreachable for about 2 minutes, you open an emergency direct gateway connection with the root token for root channels only (owner and `root_allowed_user_ids`) and post a one-line notice in the primary root channel. You can still reply, react, and edit your own messages in root channels; project channels, reads, and attachments are not served until the Router returns. Use that window to diagnose and restart the Router, not root: the root restart scripts refuse to run while the Router is down. When it is back, you drop the emergency connection before reconnecting.
 
-1. Check `max_pool_size` — refuse if pool is already at capacity.
-2. Determine the next bot ID: find the highest `botN` in the pool and increment (e.g., if `bot4` is highest, next is `bot5`).
-3. Run the automated bot creation flow (see below) to create the Discord app, get the token, and invite it.
-4. Determine the next available state directory number from existing `~/.claude/channels/discord*/` directories.
-5. Create the state directory: `mkdir -p ~/.claude/channels/discord{N}`
-6. Add the bot to the pool array in `registry.json` with `assigned_to: null`.
-7. Confirm the new bot is in the pool and available.
+#### 8. Probe a project (`probe <project>`)
 
-#### 9. Pool remove (`pool remove <bot_id>`)
+`node scripts/router.js probe <project>` posts one short connection notice through the project's webhook and checks Discord returned the project's `webhook_id`. Use it to confirm a project's identity works end to end.
 
-Remove a bot from the pool entirely.
+#### 9. Cutover and retirement
 
-1. Check the bot is not assigned to any project (`assigned_to` must be `null`). If assigned, tell the user to `deregister` the project first.
-2. Optionally delete the Discord bot application via Playwright:
-
-```python
-page.goto(f'https://discord.com/developers/applications/{app_id}/information')
-page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-page.locator('button:has-text("Delete App")').last.click()  # Bottom of page
-time.sleep(2)
-# Type app name in confirmation dialog
-page.locator('[role="dialog"] input[type="text"], dialog input[type="text"]').first.fill('<app_name>')
-time.sleep(1)
-# Click confirm Delete App (now enabled)
-page.locator('button:has-text("Delete App"):not([disabled])').last.click()
-time.sleep(3)
-# Handle MFA password prompt
-pw = page.locator('input[type="password"]')
-if pw.is_visible(timeout=3000):
-    pw.fill('<password>')
-    page.get_by_role('button', name='Submit').click()
-```
-
-Verify deletion by checking the bot token returns 401:
-```sh
-curl -s -H "Authorization: Bot <token>" https://discord.com/api/v10/users/@me
-```
-
-3. Remove the bot entry from the pool array in `registry.json`.
-4. Confirm removal.
-
-### Automated bot creation (`create bot <name>`)
-
-> **Note:** This flow is optional and relies on browser automation (Playwright + hCaptcha bypass) which can be flaky. For most users, the [manual bot creation](#manual-bot-creation-fallback) flow below is simpler and more reliable. Use this only if you want fully hands-off bot creation.
-
-Create a new Discord bot entirely via automation — no manual portal steps needed. This uses Playwright with the user's Discord credentials to create the application, bypass hCaptcha, extract the bot token, and invite it to the server.
-
-**Prerequisites:** `playwright` Python package (`pip3 install playwright`).
-
-**Procedure:**
-
-```python
-from playwright.sync_api import sync_playwright
-import time
-```
-
-1. **Launch browser and log in:**
-   ```python
-   browser = p.chromium.launch(headless=False, args=['--disable-gpu'])
-   context = browser.new_context(viewport={'width': 1280, 'height': 720})
-   page = context.new_page()
-   page.goto('https://discord.com/developers/applications')
-   page.wait_for_load_state('networkidle')
-   page.get_by_role('button', name='Log In').click()
-   page.wait_for_load_state('networkidle')
-   page.get_by_label('Email or Phone Number').fill('<phone_or_email>')
-   page.get_by_label('Password').fill('<password>')
-   page.get_by_role('button', name='Log In').click()
-   ```
-   - Credentials: ask the user, or retrieve from a secure store.
-   - Wait ~6 seconds for login to complete.
-
-2. **Dismiss survey banner** (appears intermittently):
-   ```python
-   try:
-       page.get_by_role('button', name='Dismiss').click(timeout=2000)
-   except:
-       pass
-   ```
-
-3. **Create the application:**
-   ```python
-   page.get_by_role('button', name='New Application').click()
-   page.get_by_label('Name').fill('<bot_name>')
-   page.get_by_role('checkbox').check(force=True)  # ToS checkbox
-   page.get_by_role('button', name='Create').click()
-   ```
-   - Wait ~5 seconds for hCaptcha to appear.
-
-4. **Bypass hCaptcha** (the key trick):
-   ```python
-   iframe_el = page.query_selector('iframe[src*="hcaptcha"]')
-   box = iframe_el.bounding_box()
-   page.mouse.click(box['x'] + 38, box['y'] + 38)
-   ```
-   - This clicks the hCaptcha checkbox at its known position within the iframe.
-   - Playwright's `page.mouse.click()` sends a real browser mouse event at page coordinates, bypassing the iframe interaction limitation.
-   - Wait ~5 seconds. Check `page.url` — if it contains `/applications/<id>/information`, creation succeeded.
-
-5. **Extract bot token** — navigate to the bot page and reset the token:
-   ```python
-   page.goto(f'https://discord.com/developers/applications/{app_id}/bot')
-   page.get_by_text('Reset Token').click()
-   page.get_by_text('Yes, do it!').click()
-   # Enter password for MFA
-   page.locator('input[type="password"]').fill('<password>')
-   page.get_by_role('button', name='Submit').click()
-   ```
-   - Wait ~3 seconds, then extract the token from the page:
-   ```python
-   import re
-   page_text = page.evaluate('() => document.body.innerText')
-   matches = re.findall(r'[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}', page_text)
-   bot_token = matches[0]  # This may be truncated — see note below
-   ```
-   - **Token truncation fix:** The regex may miss the first few characters. Verify by base64-decoding the first segment (before the first `.`). It should decode to the bot's user/application ID. If it doesn't, prepend characters from the base64-encoded app ID until it does.
-
-6. **Intercept user auth token** (needed for API calls):
-   ```python
-   auth_tokens = []
-   def on_request(req):
-       auth = req.headers.get('authorization')
-       if auth and not auth.startswith('Bot '):
-           auth_tokens.append(auth)
-   page.on('request', on_request)
-   page.reload()  # triggers API calls that include the auth header
-   user_token = auth_tokens[0]
-   ```
-
-7. **Invite bot to the server** (via Discord API, no browser needed):
-   ```sh
-   curl -s -X POST "https://discord.com/api/v10/oauth2/authorize?client_id=<app_id>&scope=bot" \
-     -H "Authorization: <user_token>" \
-     -H "Content-Type: application/json" \
-     -d '{"guild_id": "<guild_id>", "permissions": "274878008384", "authorize": true}'
-   ```
-   - `guild_id`: read from `registry.json`.
-   - Permissions `274878008384` = View Channels + Send Messages + Send in Threads + Read History + Attach Files + Add Reactions.
-
-8. **Message Content Intent** — the bot gets `GATEWAY_MESSAGE_CONTENT_LIMITED` (flag 524288) by default, which works for bots in < 100 servers. No manual toggle needed for personal use.
-
-9. **Clean up:**
-   ```python
-   browser.close()
-   ```
-
-After obtaining the bot token, add the bot to the pool in `registry.json` with `assigned_to: null`. If this was triggered by a `pool add` command, the bot is now available. If triggered by a `setup` command (no bots available), also assign it to the project and continue with the setup flow.
-
-**Important notes on this flow:**
-- The hCaptcha bypass works because `page.mouse.click()` sends a real browser event at page-level coordinates calculated from the iframe's bounding box. The checkbox is at approximately `(box.x + 38, box.y + 38)`.
-- `--disable-gpu` flag is recommended when launching the browser. It doesn't affect the captcha bypass but avoids GPU-rendering issues if screenshots are needed.
-- `headless=False` is required — hCaptcha blocks headless browsers.
-- The user's Discord credentials are only used in-memory during the Playwright session. Never store them.
-- If the flow fails at the captcha step, retry — hCaptcha may occasionally present an image challenge instead of a simple checkbox. In that case, fall back to manual creation.
-
-### Manual bot creation (fallback)
-
-If automated creation fails, walk the user through these steps:
-
-1. **Create a Discord application**: Go to https://discord.com/developers/applications and click **New Application**. Give it a name (e.g., the project name).
-
-2. **Set up the bot user**: In the sidebar, go to **Bot**. Give the bot a username. Scroll down to **Privileged Gateway Intents** and enable **Message Content Intent** — without this the bot receives messages with empty content.
-
-3. **Copy the bot token**: Still on the **Bot** page, scroll up to **Token** and click **Reset Token**. Copy the token immediately — it's only shown once. This is the token needed for `pool add`.
-
-4. **Invite the bot to a server**: Go to **OAuth2** -> **URL Generator**. Select the `bot` scope. Under **Bot Permissions**, enable:
-   - View Channels
-   - Send Messages
-   - Send Messages in Threads
-   - Read Message History
-   - Attach Files
-   - Add Reactions
-
-   Set Integration type to **Guild Install**. Copy the **Generated URL**, open it in a browser, and add the bot to a server the user shares with their other bots.
-
-5. **Add to pool**: Once the user has the token, they can provide it and the bot will be added to the pool via `pool add`.
+For an install that still has Bot Pool fields in `registry.json`, cut over in this order:
+1. Stop every pool session with `scripts/stop-session.sh <project>` (it also sweeps a project's leftover pool-bot listener while the project still names its `bot_id`).
+2. Move root's configuration: `node scripts/router.js migrate-root-config`, `scripts/install-router-service.sh`, `node scripts/router.js status`, then restart root.
+3. Migrate each project with `scripts/migrate-to-router.sh <project>`: a preflight, per-step `ok`/`failed` output, a `router status` plus `probe` round-trip check, and automatic rollback to the project's previous registry state on failure. `--rollback` refuses, since no pool bot remains. Launchers refuse a project without `webhook_id`, so an unmigrated project comes back only this way.
+4. Retire the pool with `scripts/retire-pool.sh`, a dry run by default. It refuses while a project still tied to a pool bot is not on the Router; projects registered after the cutover need no `transport`. With `--apply` it removes the old pool bots from the server, backs up their state directories privately, deletes the obsolete `project-bot` role, and strips the pool fields from the registry after a private backup; an interrupted run finishes on a rerun. It never deletes bot applications. Run it only when the user asks, and show them the dry run first.
 
 #### 10. Context report (`context report`, `context for all`)
 
@@ -456,11 +220,11 @@ You can restart yourself by running the restart script in the background with `n
 
 ### Discord Polls
 
-Create native Discord polls using the API directly:
+Create native Discord polls using the API directly with the root bot token (read from root's `.env` in the same shell command):
 
 ```sh
 curl -s -X POST "https://discord.com/api/v10/channels/<channel_id>/messages" \
-  -H "Authorization: Bot <bot_token>" \
+  -H "Authorization: Bot $ROOT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "content": "",
@@ -480,7 +244,7 @@ curl -s -X POST "https://discord.com/api/v10/channels/<channel_id>/messages" \
 - `duration`: poll duration in hours (1–168, default 24)
 - `allow_multiselect`: whether users can vote for multiple options
 - `answers`: up to 10 options, each with a `text` field
-- Use the root bot token (`bot1`) for polls in `#root` channels, or the project bot's token for project channels
+- Post only in a root channel or a registered project channel the user named
 - The `poll_media` object can also include an `emoji` field: `{"id": null, "name": "🎉"}` for custom option emojis
 
 ### Voice Messages
@@ -494,84 +258,16 @@ When the user sends a voice message (`.ogg` audio attachment), transcribe it usi
 
 ### Channel Routing Rules
 
-- **#root channels** (one per category): Messages go to the root bot WITHOUT @mention. These are configured in the root bot's `access.json` with `requireMention: false`.
-- **Project channels**: Messages go to the assigned project bot WITHOUT @mention. The root bot can only be reached in project channels via @mention (`requireMention: true` in root bot's `access.json`).
-- **Project bot isolation**: Each project bot has the "project-bot" role (which denies VIEW_CHANNEL on all categories) plus a member-level override that allows it on its one assigned channel. It cannot see any other channel.
-- **New categories**: When a new category is added to the server, apply the "project-bot" role deny on it:
-  ```sh
-  curl -s -X PUT "https://discord.com/api/v10/channels/<new_category_id>/permissions/<project_bot_role_id>" \
-    -H "Authorization: Bot <root_bot_token>" \
-    -H "Content-Type: application/json" \
-    -d '{"allow": "0", "deny": "1024", "type": 0}'
-  ```
-  And add the category ID to `category_ids` in `registry.json`.
+- **Root channels** (`root_channels`): messages from the owner and `root_allowed_user_ids` come to you without an @mention.
+- **Project channels**: owner and guest messages go to that project's session without an @mention. A bot @mention, or a native reply to one of your messages, comes to you only; the project never sees it. A reply to a project's webhook message goes to the project. Guests' mentions reach no one.
+- **Session Scope**: each project session may act only in its own channel. The Router rejects anything else with `scope_violation` and logs it. Discord permissions are not the isolation boundary: the old `project-bot` role and per-channel override model is obsolete.
+- **Offline channels**: a message to a project with no live session gets 💤 and is not replayed later. Start the session and ask the user to resend.
+- **Management commands**: plain `/pause`, `/unpause`, `/compact`, `/clear`, and `/restart` in a project channel are handled by that project's session for both Claude and Codex. `/close` goes only to the Conversation Reminder service.
+- **Root permissions**: the root bot needs Send Messages, Read Message History, Add Reactions, and Manage Messages in every project channel, plus Manage Webhooks. `router status` names what is missing.
 
-### Remote VM Setup (`setup remote`, `setup vm`, `setup linux`)
+### Remote VM Sessions
 
-Set up a Claude Code session on a remote Linux VM connected to a Discord channel. The registration (bot assignment, channel creation, permissions) is done locally by the root agent. Only the Claude Code + Discord plugin runtime runs on the VM.
-
-**Prerequisites on the VM:**
-- Node.js/npm installed
-- Claude Code installed (`npm install -g @anthropic-ai/claude-code`) and logged in (`claude` → follow OAuth flow)
-- tmux installed (`apt install tmux` or similar)
-- **IMPORTANT:** `--dangerously-skip-permissions` cannot run as root/sudo. To bypass this, prefix the command with `IS_SANDBOX=1`. Alternatively, run as a regular user (`su - <username>`).
-
-**Step 1: Install Bun (required by Discord plugin)**
-```bash
-npm install -g bun
-```
-Note: `curl -fsSL https://bun.sh/install | bash` also works but requires `unzip`. On restricted VMs where apt repos are unreachable, `npm install -g bun` is the reliable fallback.
-
-**Step 2: Install the Discord plugin**
-```bash
-claude plugin marketplace add anthropics/claude-plugins-official
-claude plugin install discord@claude-plugins-official
-```
-
-**Step 3: Create the bot state directory**
-The root agent provides the bot token and channel ID after registration.
-```bash
-mkdir -p ~/.claude/channels/discord_<name>
-
-cat > ~/.claude/channels/discord_<name>/.env << 'EOF'
-DISCORD_BOT_TOKEN=<token>
-EOF
-
-cat > ~/.claude/channels/discord_<name>/access.json << 'EOF'
-{
-  "dmPolicy": "allowlist",
-  "allowFrom": ["<discord_user_id>"],
-  "groups": {
-    "<channel_id>": {
-      "requireMention": false,
-      "allowFrom": ["<discord_user_id>"]
-    }
-  },
-  "pending": {}
-}
-EOF
-```
-
-**Step 4: Start the session**
-```bash
-tmux new-session -d -s <screen_name> -- bash -ic 'cd /path/to/project && IS_SANDBOX=1 DISCORD_STATE_DIR=~/.claude/channels/discord_<name> claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions'
-sleep 8 && tmux send-keys -t <screen_name> Enter
-```
-`IS_SANDBOX=1` is required when running as root — without it, `--dangerously-skip-permissions` is blocked.
-Use `zsh -ic` if the VM has zsh, `bash -ic` otherwise.
-
-**Step 5: Verify**
-```bash
-tmux capture-pane -t <screen_name> -p
-```
-Look for "Listening for channel messages" and confirm "plugin not installed" does NOT appear.
-
-**Troubleshooting:** If the tmux session dies immediately (shows "no server running" right after creation), run the command directly without tmux to see the actual error:
-```bash
-IS_SANDBOX=1 DISCORD_STATE_DIR=~/.claude/channels/discord_<name> claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions
-```
-
-**Root agent registration:** Use the normal `register` flow to assign a bot, create the channel, and set permissions. Set the project path in `registry.json` to `"remote:<vm-name>"` to indicate it's not a local session. The root agent cannot start/stop/restart remote sessions — provide the user with the commands to run on the VM.
+Remote VM sessions are not supported with the Router yet (a remote session would need its own connection to the local Router). Do not give a VM a Discord token. If the user asks, explain this and offer to deregister unused VM projects.
 
 ### Auto-Start on Reboot (macOS)
 
@@ -625,21 +321,16 @@ To unload: `launchctl unload ~/Library/LaunchAgents/com.claude.root-agent.plist`
 
 ### Usage Stats Poster
 
-Automated Discord usage reports should run through a scheduler such as a macOS LaunchAgent, not the removed tmux usage loop. The poster should run independently of project sessions and can report both Claude Code and Codex usage.
-
-Recommended behavior:
-1. Fetch Claude Code live limits from Anthropic OAuth APIs via the macOS Keychain credential.
-2. Read Codex rate-limit data from local Codex session files under `~/.codex/sessions`.
-3. Read secondary Codex API-key account data from `~/.codex-api/sessions` when projects use `"codex_home": "~/.codex-api"`.
-4. Post to Discord through the root bot token.
+Automated Discord usage reports run through the opt-in `scripts/install-usage-stats-poster.sh` LaunchAgent, independently of project sessions, and report both Claude Code and Codex usage from the configured accounts. The poster posts with the root bot token from root's state directory.
 
 For local operational paths, channel IDs, and LaunchAgent details, keep sensitive setup notes in `CLAUDE.local.md`.
 
 ### Important Notes
 
-- Always use `zsh -ic` (not `bash -c`) when launching tmux sessions — tools like `bun` or `claude` may only be in PATH via `~/.zshrc`. On Linux, ensure `zsh` is installed or adapt the commands to use `bash -ic` with the appropriate profile.
-- Each project gets its own bot from the pool. Two sessions cannot share a bot. The pool has a max size of 50.
+- Always use `zsh -ic` (not `bash -c`) when launching tmux sessions — tools like `node` or `claude` may only be in PATH via `~/.zshrc`. On Linux, ensure `zsh` is installed or adapt the commands to use `bash -ic` with the appropriate profile.
+- One session serves one project channel, enforced by the Router. Always stop an existing session before starting a replacement.
+- The root bot token is the only Discord credential. It lives in root's `.env` and the Router; never put it in `registry.json`, a project's files, a prompt, or a log.
 - Tmux session names should be short, lowercase, use underscores (derived from project name).
-- Sessions do not persist across machine restarts. The user needs to start them again.
-- New sessions start with a fresh Claude Code conversation — no history from previous sessions is carried over.
+- Sessions do not persist across machine restarts. The Router restarts itself under launchd; the user needs to start project sessions again.
+- New sessions start with a fresh conversation — no history from previous sessions is carried over (Codex can resume a saved thread with `--resume <thread_uuid>`).
 - Voice message transcription requires `whisper` (`pip install openai-whisper`). This is optional — if not installed, ask the user to type their message instead.

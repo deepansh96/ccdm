@@ -10,16 +10,16 @@ edges:
     condition: when permissions, scope tokens, or routing may be wrong
   - target: context/session-management.md
     condition: when process or tmux state may be wrong
-last_updated: 2026-09-28
+last_updated: 2026-09-29
 ---
 
 # Debug A Discord Session
 
 ## Steps
-1. Confirm the registry assignment, session type, channel ID, bot app ID, state directory, and WebSocket port.
-2. Check the exact tmux session and capture its pane.
-3. Inspect processes using the same identity rules as the lifecycle scripts; look for orphan or duplicate listeners.
-4. Check Discord channel overrides and the relevant `access.json` allowlist.
+1. Run `node scripts/router.js status`: the Router must be reachable with its gateway ready, the registry loaded without error, and the project's session connected with its channel as scope. Check its webhook presence, root's missing permissions, and recent scope violations. Router logs are in `~/.local/state/ccdm/router/router.log` and `router.err`.
+2. Confirm the registry entry: session type, channel ID, `webhook_id`, guests, and WebSocket port.
+3. Check the exact tmux session and capture its pane.
+4. Inspect processes using the same identity rules as the lifecycle scripts; look for orphan or duplicate listeners.
 5. For Codex, confirm the bridge registered the channel MCP server and the top-level turn used its current scope token.
 6. Stop through `scripts/stop-session.sh`, then start cleanly if process state is inconsistent.
 
@@ -27,20 +27,20 @@ last_updated: 2026-09-28
 - MCP status in current Codex uses paginated `data`, not just legacy `servers`/`items`. Verify the scoped reply tool is present before starting a thread.
 - Bootstrap is not a user request: instruct the model to acknowledge without tools. Never drop active-turn tracking merely because startup is slow; interrupt on timeout and fail closed.
 - Tool listing alone does not prove the model invokes tools correctly. Use dummy credentials and a local recording MCP stub with the real tool schema to verify direct replies and steering; never let a test agent access live Discord credentials or use shell transport workarounds.
-- When unrelated bots appear in a channel's member list, inspect Administrator grants on every assigned role before changing channel overrides. Administrator bypasses even member-level View Channel denies. Back up channel overwrites first; do not change server roles when authorization covers only one channel.
-- For an authorized single-bot Administrator repair, back up roles and channel overwrites privately, confirm the granting role belongs exclusively to that bot, and calculate its required assigned-channel permissions without Administrator before applying the change. Remove only the Administrator bit, verify assigned-channel history access and an unrelated-channel denial using that bot's identity, and restore the role if verification fails. Compare overwrite collections by ID rather than API response order; Discord can reorder them without changing permissions.
-- Before expanding a repair, resolve the actual root identity separately from legacy pool management credentials and protect both until dependencies are accounted for. A role PATCH can return HTTP 403 for one management identity while succeeding through the authorized root identity; check role hierarchy without changing root's roles. Audit non-Administrator bots too: an unassigned monitoring role can independently grant broad visibility.
-- If an unassigned bot lacks the shared restricted bot role, calculate the effect of adding it before editing any channel overrides; existing member allows may already preserve its intended monitoring channels. HTTP 401 from its saved token is an authentication failure, not a successful access-denial test. Report effective-permission verification separately from any unavailable bot-identity read test.
-- Do not print tokens or scope tokens while debugging.
-- Root mentions and project messages intentionally follow different routing paths.
-- Claude commands are tmux relay; Codex commands are handled in the bridge.
+- A 💤 reaction means the Router found no live session for the channel; offline messages are never replayed.
+- `router_unavailable` from a session means the Router is down; launchd restarts it and sessions reconnect. If it stays down about 2 minutes, root's emergency gateway serves root channels only.
+- A reply that fails with `scope_violation` targeted another channel or a message outside the session's channel; the Router logs project, operation, and target.
+- `webhook_deleted` means the webhook was deleted twice in a row; run `node scripts/router.js ensure-webhook <project>`.
+- Do not print tokens, launch keys, or scope tokens while debugging.
+- Root mentions and project messages intentionally follow different routing paths: a bot mention in a project channel reaches root only.
+- Plain management commands are handled by the session's own adapter for both providers (Claude through the channel server's tmux relay, Codex in the bridge).
 - `stream disconnected before completion: response.failed event received` is a terminal upstream Responses event after Codex has exhausted its internal retries, not a Discord disconnect. The bridge retries it once only when no agent work has started, which avoids repeating possible side effects.
 - A Claude session whose pane stops repainting and ignores Esc, Ctrl+C, SIGINT, and a resize is stuck at the OS level, not busy. Check for a hung credential read with `pgrep -lf "security find-generic-password"`, which looks for `Claude Code-credentials` (projects without `claude_home`) or `Claude Code-credentials-<first 8 hex of sha256(Claude config dir path, e.g. ~/.claude-af)>`; the Usage Stats Poster also runs short `security` reads, so confirm the match is a long-lived child of the frozen session. A locked login keychain (typical after the Mac sleeps) blocks that read, and the CLI cannot repaint or answer queued Discord messages until the keychain is unlocked on the machine (log in, or `security unlock-keychain`). Confirm the hang and try unlocking before restarting: a restart keeps committed work but loses uncommitted work and the session's live context.
 
 ## Verify
-- [ ] One user message produces at most one response from the assigned bot.
-- [ ] No other channel can reach the project bot.
-- [ ] Relevant bridge/plugin E2E tests pass.
+- [ ] One user message produces at most one response, under the project's webhook identity.
+- [ ] `router status` shows exactly one session for the project, scoped to its channel.
+- [ ] Relevant Router, channel server, and bridge E2E tests pass.
 
 ## Update Scaffold
 - [ ] Record a recurring failure mode in this pattern.

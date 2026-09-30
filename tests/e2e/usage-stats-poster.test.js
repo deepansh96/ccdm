@@ -8,7 +8,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { createWorkspace, runScript } from "./support/runner.js";
-import { readState, writeState } from "./support/state.js";
+import { readState, updateState, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 
 test.afterEach(async () => {
@@ -164,20 +164,19 @@ function seedPosterWorkspace(workspace, baseUrl, extraConfig = {}) {
   fs.writeFileSync(
     path.join(workspace.repoDir, "registry.json"),
     `${JSON.stringify({
-      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
-  const state = readState(workspace.stateDir);
-  state.fixtures.security = {
-    credentials: {
-      "Claude Code-credentials": {
-        claudeAiOauth: { accessToken: "fixture-oauth-token" },
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.security = {
+      credentials: {
+        "Claude Code-credentials": {
+          claudeAiOauth: { accessToken: "fixture-oauth-token" },
+        },
       },
-    },
-    invocations: [],
-  };
-  writeState(state, workspace.stateDir);
+      invocations: [],
+    };
+  });
 }
 
 test("poster posts a Claude usage embed through the configured Discord endpoint", async () => {
@@ -623,9 +622,9 @@ async function runPosterWithDefaultHomeCredentials(credentialsFor) {
   const api = await startPosterApi();
   seedPosterWorkspace(workspace, api.baseUrl);
   const hashedService = serviceFor(path.join(workspace.homeDir, ".claude"));
-  const state = readState(workspace.stateDir);
-  state.fixtures.security.credentials = credentialsFor(hashedService);
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.security.credentials = credentialsFor(hashedService);
+  });
 
   const result = await runScript(workspace, "scripts/usage-stats-poster.py");
 
@@ -767,7 +766,6 @@ test("poster falls back when Codex JSON-RPC returns a non-object response", asyn
     `${JSON.stringify({
       codex_accounts: { "codex-non-object": codexHome },
       default_codex_account: "codex-non-object",
-      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -799,7 +797,6 @@ test("poster reads Codex JSON-RPC lines already buffered above the descriptor", 
     `${JSON.stringify({
       codex_accounts: { "codex-buffered": codexHome },
       default_codex_account: "codex-buffered",
-      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -842,7 +839,6 @@ test("poster reports named Codex Accounts in default-first alphabetical order", 
         "codex-default": defaultHome,
       },
       default_codex_account: "codex-default",
-      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -949,7 +945,6 @@ test("poster deduplicates named aliases that share a Codex Home", async () => {
         "codex-alpha": otherHome,
       },
       default_codex_account: "codex-default",
-      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -989,7 +984,6 @@ test("poster falls back to raw Codex Homes in a legacy registry", async () => {
     path.join(workspace.repoDir, "registry.json"),
     `${JSON.stringify({
       codex_home: sharedHome,
-      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: { project: { codex_home: projectHome, type: "codex" } },
     }, null, 2)}\n`,
   );
@@ -1027,7 +1021,6 @@ test("poster reports a missing configured Codex Home as unavailable", async () =
     `${JSON.stringify({
       codex_accounts: { available: availableHome, missing: missingHome },
       default_codex_account: "missing",
-      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -1079,7 +1072,6 @@ test("poster falls back to recent Codex session tokens after a live rate-limit f
     `${JSON.stringify({
       codex_accounts: { "codex-fallback": codexHome },
       default_codex_account: "codex-fallback",
-      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -1135,7 +1127,6 @@ test("poster preserves stale rate-limit fallback age and ignores a newer malform
     `${JSON.stringify({
       codex_accounts: { "codex-stale-rate-limits": codexHome },
       default_codex_account: "codex-stale-rate-limits",
-      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -1182,7 +1173,6 @@ test("poster preserves stale token-count fallback age markers", async () => {
     `${JSON.stringify({
       codex_accounts: { "codex-stale-token-count": codexHome },
       default_codex_account: "codex-stale-token-count",
-      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -1216,7 +1206,6 @@ test("poster discovers only registry Codex Homes, not ROOT_CODEX_HOME", async ()
     `${JSON.stringify({
       codex_accounts: { configured: configuredHome },
       default_codex_account: "configured",
-      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -1288,7 +1277,6 @@ test("poster reports malformed named Codex registry fields instead of degrading 
       path.join(workspace.repoDir, "registry.json"),
       `${JSON.stringify({
         ...registry,
-        pool: [{ id: "bot1", token: "fixture-project-token" }],
         projects: registry.projects ?? {},
       }, null, 2)}\n`,
     );
@@ -1319,7 +1307,6 @@ test("poster merges named accounts with project legacy homes and deduplicates sh
         "named-default": defaultHome,
       },
       default_codex_account: "named-default",
-      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {
         "project-raw": { codex_home: projectHome },
         "project-shared": { codex_home: namedOtherHome },
@@ -1366,7 +1353,6 @@ test("poster merges top-level legacy homes with named accounts when no top-level
       codex_accounts: { "named-zulu": zuluHome, "named-alpha": alphaHome },
       default_codex_account: null,
       codex_home: topLegacyHome,
-      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: { "project-legacy": { codex_home: projectLegacyHome } },
     }, null, 2)}\n`,
   );
@@ -1412,7 +1398,6 @@ test("poster labels a shared home with the alphabetically first alias without a 
         "codex-alpha": uniqueHome,
         "codex-beta": sharedHome,
       },
-      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -1606,7 +1591,6 @@ test("scheduled poster posts the original text report once per 30-minute slot wi
     `${JSON.stringify({
       codex_accounts: { "codex-scheduled": codexHome },
       default_codex_account: "codex-scheduled",
-      pool: [{ id: "bot1", token: "fixture-project-token" }],
       projects: {},
     }, null, 2)}\n`,
   );
@@ -1797,6 +1781,11 @@ test("poster never falls back to a project pool token when root credentials are 
   const workspace = createWorkspace();
   const api = await startPosterApi();
   seedPosterWorkspace(workspace, api.baseUrl);
+  // A leftover pool-era registry: its bot token must never be used.
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    JSON.stringify({ pool: [{ id: "bot1", token: "fixture-project-token" }], projects: {} }),
+  );
   fs.unlinkSync(path.join(workspace.homeDir, ".claude/channels/discord/.env"));
   const result = await runScript(workspace, "scripts/usage-stats-poster.py");
   assert.notEqual(result.exitCode, 0);
@@ -1805,11 +1794,11 @@ test("poster never falls back to a project pool token when root credentials are 
   assert.doesNotMatch(result.stderr, /fixture-project-token/);
 });
 
-test("poster can use a custom root state directory without a root pool entry", async () => {
+test("poster can use a custom root state directory with a router-only registry", async () => {
   const workspace = createWorkspace();
   const api = await startPosterApi();
   seedPosterWorkspace(workspace, api.baseUrl);
-  fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), JSON.stringify({ pool: [], projects: {} }));
+  fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), JSON.stringify({ projects: {} }));
   const custom = path.join(workspace.homeDir, "custom root");
   fs.renameSync(path.join(workspace.homeDir, ".claude/channels/discord"), custom);
   const result = await runScript(workspace, "scripts/usage-stats-poster.py", { env: { ROOT_DISCORD_STATE_DIR: custom } });
@@ -1991,7 +1980,7 @@ test("poster reports a DeepSeek balance and local-session coverage without quota
   });
   fs.writeFileSync(
     path.join(workspace.repoDir, "registry.json"),
-    `${JSON.stringify({ pool: [], projects: {}, codex_accounts: { "deepseek-flash": home } }, null, 2)}\n`,
+    `${JSON.stringify({ projects: {}, codex_accounts: { "deepseek-flash": home } }, null, 2)}\n`,
   );
 
   const result = await runScript(workspace, "scripts/usage-stats-poster.py");
@@ -2049,7 +2038,7 @@ test("DeepSeek coverage reports unavailable without hiding the real balance", as
   seedPosterWorkspace(workspace, api.baseUrl, { deepseek_base_url: balance.baseUrl });
   fs.writeFileSync(
     path.join(workspace.repoDir, "registry.json"),
-    `${JSON.stringify({ pool: [], projects: {}, codex_accounts: { "deepseek-flash": home } }, null, 2)}\n`,
+    `${JSON.stringify({ projects: {}, codex_accounts: { "deepseek-flash": home } }, null, 2)}\n`,
   );
 
   const result = await runScript(workspace, "scripts/usage-stats-poster.py");
@@ -2093,7 +2082,6 @@ test("DeepSeek key grouping issues one balance request per distinct key", async 
   fs.writeFileSync(
     path.join(workspace.repoDir, "registry.json"),
     `${JSON.stringify({
-      pool: [],
       projects: {},
       codex_accounts: {
         "deepseek-mirror": sharedB,
@@ -2163,7 +2151,7 @@ test("malformed or redirecting DeepSeek balance responses stay unavailable and u
     seedPosterWorkspace(workspace, api.baseUrl, { deepseek_base_url: balance.baseUrl });
     fs.writeFileSync(
       path.join(workspace.repoDir, "registry.json"),
-      `${JSON.stringify({ pool: [], projects: {}, codex_accounts: { "deepseek-flash": home } }, null, 2)}\n`,
+      `${JSON.stringify({ projects: {}, codex_accounts: { "deepseek-flash": home } }, null, 2)}\n`,
     );
 
     const result = await runScript(workspace, "scripts/usage-stats-poster.py");
@@ -2528,7 +2516,7 @@ test("scheduled poster posts a referenced DeepSeek block with the inline used-ba
   });
   fs.writeFileSync(
     path.join(workspace.repoDir, "registry.json"),
-    `${JSON.stringify({ pool: [], projects: {}, codex_accounts: { "deepseek-flash": home } }, null, 2)}\n`,
+    `${JSON.stringify({ projects: {}, codex_accounts: { "deepseek-flash": home } }, null, 2)}\n`,
   );
 
   const result = await runScript(workspace, "scripts/usage-stats-poster.py", {

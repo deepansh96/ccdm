@@ -597,8 +597,8 @@ def load_registry_data(path):
         raise PosterError("registry.json not found next to the repository") from None
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         raise PosterError("unable to read valid registry.json") from None
-    if not isinstance(registry, dict) or not isinstance(registry.get("pool"), list):
-        raise PosterError("registry.json has no valid bot pool")
+    if not isinstance(registry, dict):
+        raise PosterError("unable to read valid registry.json")
     state_dir = Path(os.environ.get("ROOT_DISCORD_STATE_DIR") or "~/.claude/channels/discord").expanduser()
     try:
         lines = (state_dir / ".env").read_text().splitlines()

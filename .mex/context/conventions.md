@@ -15,7 +15,7 @@ edges:
     condition: when code changes permissions, credentials, or message routing
   - target: context/session-management.md
     condition: when changing lifecycle scripts or registry runtime state
-last_updated: 2026-07-19
+last_updated: 2026-09-30
 ---
 
 # Conventions
@@ -24,7 +24,7 @@ last_updated: 2026-07-19
 - Scripts and tests use kebab-case filenames (`guest-access.js`, `codex-start.test.js`).
 - JavaScript functions and variables use camelCase; environment variables use uppercase snake case.
 - Registry project keys are human-readable names; `screen_name` is short lowercase snake case.
-- Bot names follow `<bot_id>-<project>-<type>` while assigned and revert to `<bot_id>` when released.
+- Project replies post as `<project>-<type> · N%` through the `ccdm-<project>` webhook; no bot is renamed.
 
 ## Structure
 - Executable lifecycle and integration code lives in `scripts/`; reusable agent instructions live in `skills/`.
@@ -35,7 +35,8 @@ last_updated: 2026-07-19
 
 ## Patterns
 - Parse and rewrite JSON structurally with `JSON.parse`/`JSON.stringify` or Python's `json` module; never edit registry/access JSON with regex.
-- Before launching, check both the exact tmux session and listener processes tied to the bot state directory, channel, app ID, or WebSocket port.
+- Rewrite `registry.json` only through the shared registry lock: `updateRegistry` (`scripts/router/registry.js`) from Node, `scripts/registry-update.py` from shell and Python. Change only the fields you own inside the updater; never write back a copy read before the lock.
+- Before launching, check both the exact tmux session and listener processes tied to the project's Router launch key, channel, or WebSocket port.
 - Stop descendants before parents, terminate tmux, sweep remaining listeners, then clear registry PID/session state.
 - Discord writes from Codex require the bridge-issued scope token; delegated agents never receive it.
 
@@ -43,6 +44,6 @@ last_updated: 2026-07-19
 - [ ] `npm test` passes with local fakes and no live external services.
 - [ ] No token, credential, `registry.json` value, or local channel ID was added to tracked output unintentionally.
 - [ ] Start/stop changes preserve duplicate-listener detection and cleanup.
-- [ ] Discord permission changes keep every project bot isolated to one channel.
-- [ ] Registry and access files are handled with structured JSON parsing.
+- [ ] Every project session stays within its Session Scope (one channel), enforced by the Router.
+- [ ] Registry and access files are handled with structured JSON parsing, and registry writes hold the registry lock.
 - [ ] Relevant mex context or patterns were updated when behavior changed.

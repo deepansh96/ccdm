@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { createWorkspace, runScript } from "./support/runner.js";
-import { readState, seedRegistry, writeState } from "./support/state.js";
+import { readState, seedRegistry, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 const contextTempFiles = new Set();
@@ -31,6 +31,9 @@ function rememberContextFile(stateDir) {
   return file;
 }
 
+// Pool-era state directories still hold bot tokens on disk, and a stale
+// registry still names pool bots; the nickname tools must PATCH no member
+// for any of them.
 function seedNicknameRegistry(workspace, options = {}) {
   const projectStateName = options.projectStateName ?? uniqueStateName("discord-project");
   const rootSessionStateName = options.rootSessionStateName ?? uniqueStateName("discord-root-session");
@@ -49,17 +52,8 @@ function seedNicknameRegistry(workspace, options = {}) {
   seedRegistry(workspace, {
     discord_user_id: "allowed-user-id",
     guild_id: "guild-id",
-    max_pool_size: 50,
-    project_bot_role_id: null,
     category_ids: [],
     pool: [
-      {
-        id: "bot1",
-        app_id: "root-app-id",
-        token: "registry-root-token",
-        state_dir: rootStateDir,
-        assigned_to: null,
-      },
       {
         id: "bot2",
         app_id: "bot-app-id",
@@ -72,10 +66,9 @@ function seedNicknameRegistry(workspace, options = {}) {
       alpha: {
         path: path.join(workspace.tmpDir, "alpha"),
         bot_id: "bot2",
-        screen_name: "alpha_codex",
+        screen_name: "alpha_session",
         channel_id: "channel-id",
-        type: "codex",
-        ws_port: 18342,
+        type: "claude",
         session_id: null,
         pid: null,
       },
@@ -85,27 +78,23 @@ function seedNicknameRegistry(workspace, options = {}) {
 }
 
 function seedDiscordPatchRoute(workspace, member = "bot-app-id", exitCode = 0) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.curl.routes.push({
-    method: "PATCH",
-    hostname: "discord.com",
-    path: `/api/v10/guilds/guild-id/members/${member}`,
-    exitCode,
-    body: "{}",
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.curl.routes.push({
+      method: "PATCH",
+      hostname: "discord.com",
+      path: `/api/v10/guilds/guild-id/members/${member}`,
+      exitCode,
+      body: "{}",
+    });
   });
-  writeState(state, workspace.stateDir);
 }
 
-async function waitForNicknamePatch(workspace) {
-  const deadline = Date.now() + 3000;
-  while (Date.now() < deadline) {
-    const patches = readState(workspace.stateDir).fixtures.discord.nicknamePatches;
-    if (patches.length > 0) {
-      return patches[0];
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  assert.fail("timed out waiting for nickname PATCH fixture state");
+// A background PATCH would land well within this window.
+async function assertNoNicknamePatch(workspace) {
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const state = readState(workspace.stateDir);
+  assert.deepEqual(state.fixtures.discord.nicknamePatches, []);
+  assert.deepEqual(state.fixtures.curl.requests, []);
 }
 
 function runFixture(workspace, tool, args, options = {}) {
@@ -117,7 +106,7 @@ function runFixture(workspace, tool, args, options = {}) {
   });
 }
 
-test("statusline wrapper updates the project nickname and returns deterministic statusline output", async () => {
+test("statusline wrapper makes no nickname PATCH for a project state dir and returns deterministic statusline output", async () => {
   const workspace = createWorkspace();
   const { projectStateDir } = seedNicknameRegistry(workspace);
   seedDiscordPatchRoute(workspace);
@@ -132,19 +121,14 @@ test("statusline wrapper updates the project nickname and returns deterministic 
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.match(result.stdout, /ccstatusline fixture output/);
-
-  const patch = await waitForNicknamePatch(workspace);
-  assert.equal(patch.method, "PATCH");
-  assert.equal(patch.url, "https://discord.com/api/v10/guilds/guild-id/members/bot-app-id");
-  assert.equal(patch.headers.Authorization, "Bot root-token");
-  assert.deepEqual(JSON.parse(patch.body), { nick: "bot2-alpha-codex · 42%" });
+  await assertNoNicknamePatch(workspace);
 
   const state = readState(workspace.stateDir);
   assert.deepEqual(state.fixtures.npx.invocations[0].args, ["-y", "ccstatusline@latest"]);
   assert.deepEqual(state.fixtures.network.blocked, []);
 });
 
-test("nickname wrapper skips disabled, missing state, and missing context percentage inputs", async () => {
+test("nickname wrapper passes input through for disabled, missing state, and missing context percentage inputs", async () => {
   const workspace = createWorkspace();
   const { projectStateDir } = seedNicknameRegistry(workspace);
   seedDiscordPatchRoute(workspace);
@@ -163,6 +147,7 @@ test("nickname wrapper skips disabled, missing state, and missing context percen
     input: `${JSON.stringify({ context_window: { used_percentage: 8 } })}\n`,
   });
   assert.equal(missingState.exitCode, 0, missingState.stderr || missingState.stdout);
+  assert.match(missingState.stdout, /"used_percentage":8/);
 
   const missingContext = await runScript(workspace, "scripts/cc-discord-nicknames.sh", {
     env: {
@@ -171,17 +156,15 @@ test("nickname wrapper skips disabled, missing state, and missing context percen
     input: `${JSON.stringify({ other: true })}\n`,
   });
   assert.equal(missingContext.exitCode, 0, missingContext.stderr || missingContext.stdout);
+  assert.match(missingContext.stdout, /"other":true/);
 
-  await new Promise((resolve) => setTimeout(resolve, 300));
-  const state = readState(workspace.stateDir);
-  assert.deepEqual(state.fixtures.discord.nicknamePatches, []);
-  assert.deepEqual(state.fixtures.curl.requests, []);
+  await assertNoNicknamePatch(workspace);
 });
 
-test("nickname wrapper uses root @me PATCH for state dirs without a registry app id and tolerates curl failure", async () => {
+test("nickname wrapper makes no root @me PATCH for a root state dir", async () => {
   const workspace = createWorkspace();
   const { rootSessionStateDir } = seedNicknameRegistry(workspace);
-  seedDiscordPatchRoute(workspace, "@me", 55);
+  seedDiscordPatchRoute(workspace, "@me");
 
   const result = await runScript(workspace, "scripts/cc-discord-nicknames.sh", {
     env: {
@@ -193,44 +176,28 @@ test("nickname wrapper uses root @me PATCH for state dirs without a registry app
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.match(result.stdout, /"used_percentage":55/);
-
-  const patch = await waitForNicknamePatch(workspace);
-  assert.equal(patch.url, "https://discord.com/api/v10/guilds/guild-id/members/@me");
-  assert.equal(patch.headers.Authorization, "Bot session-root-token");
-  assert.deepEqual(JSON.parse(patch.body), { nick: "root · 55%" });
-  assert.equal(patch.exitCode, 55);
+  await assertNoNicknamePatch(workspace);
 });
 
-test("nickname wrapper rate limits repeated sends with unique hardcoded tmp files", async () => {
+test("repeated nickname wrapper runs make no PATCH and leave no rate-limit tmp files", async () => {
   const workspace = createWorkspace();
   const { projectStateDir } = seedNicknameRegistry(workspace);
   seedDiscordPatchRoute(workspace);
   const contextFile = rememberContextFile(projectStateDir);
 
-  const first = await runScript(workspace, "scripts/cc-discord-nicknames.sh", {
-    env: {
-      CONTEXT_DISCORD_INTERVAL: "60",
-      DISCORD_STATE_DIR: projectStateDir,
-    },
-    input: `${JSON.stringify({ context_window: { used_percentage: 11 } })}\n`,
-  });
-  assert.equal(first.exitCode, 0, first.stderr || first.stdout);
-  await waitForNicknamePatch(workspace);
+  for (const pct of [11, 12]) {
+    const result = await runScript(workspace, "scripts/cc-discord-nicknames.sh", {
+      env: {
+        CONTEXT_DISCORD_INTERVAL: "60",
+        DISCORD_STATE_DIR: projectStateDir,
+      },
+      input: `${JSON.stringify({ context_window: { used_percentage: pct } })}\n`,
+    });
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  }
 
-  const second = await runScript(workspace, "scripts/cc-discord-nicknames.sh", {
-    env: {
-      CONTEXT_DISCORD_INTERVAL: "60",
-      DISCORD_STATE_DIR: projectStateDir,
-    },
-    input: `${JSON.stringify({ context_window: { used_percentage: 12 } })}\n`,
-  });
-  assert.equal(second.exitCode, 0, second.stderr || second.stdout);
-  await new Promise((resolve) => setTimeout(resolve, 300));
-
-  const state = readState(workspace.stateDir);
-  assert.equal(state.fixtures.discord.nicknamePatches.length, 1);
-  assert.ok(fs.existsSync(contextFile), `${contextFile} should be written by the production script`);
-  assert.equal(path.basename(contextFile).startsWith("cc-context-discord-project-"), true);
+  await assertNoNicknamePatch(workspace);
+  assert.equal(fs.existsSync(contextFile), false);
 });
 
 test("npx fixture returns ccstatusline output and blocks unapproved package execution", () => {

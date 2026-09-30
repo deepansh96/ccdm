@@ -3,14 +3,16 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { createWorkspace, runScript } from "./support/runner.js";
+import { createBridgeWorkspace, startFakeCodexServer } from "./support/bridge.js";
+import { routerEnv, routerWithWebhooks, writeRootToken } from "./support/router.js";
+import { runScript } from "./support/runner.js";
 import { readState, seedRegistry } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(cleanup);
 
 function setupFixture(options = {}) {
-  const workspace = createWorkspace();
+  const workspace = createBridgeWorkspace();
   const home = path.join(workspace.homeDir, options.homeName ?? ".codex-mimo");
   const catalog = path.join(workspace.tmpDir, "catalog.json");
   fs.writeFileSync(catalog, JSON.stringify({ models: [{
@@ -45,19 +47,22 @@ test("MiMo setup creates private standalone provider state and launches through 
 
   const project = path.join(workspace.tmpDir, "project");
   fs.mkdirSync(project);
+  // Codex launches through the Router, which serves alpha with root's token.
+  const codex = await startFakeCodexServer(workspace);
   seedRegistry(workspace, {
-    root_bot_app_id: "root-app-id", discord_user_id: "user-id", guild_id: "guild-id",
+    discord_user_id: "user-id", guild_id: "guild-id",
     codex_accounts: { mimo: home },
-    pool: [{ id: "bot2", app_id: "bot-app-id", token: "fixture-token",
-      state_dir: path.join(workspace.homeDir, "bot-state"), assigned_to: "alpha" }],
-    projects: { alpha: { path: project, bot_id: "bot2", screen_name: "alpha_mimo",
-      channel_id: "channel-id", type: "codex", ws_port: 18342, codex_account: "mimo" } },
+    projects: { alpha: { path: project, screen_name: "alpha_mimo",
+      channel_id: "channel-id", type: "codex", ws_port: codex.port, codex_account: "mimo" } },
   });
+  writeRootToken(workspace);
+  await routerWithWebhooks(workspace, ["alpha"]);
   fs.appendFileSync(configPath, '\n[mcp_servers.discord-old]\ncommand = "old"\n');
-  const launch = await runScript(workspace, "scripts/start-codex-session.sh", { args: ["alpha"] });
+  const launch = await runScript(workspace, "scripts/start-codex-session.sh", { args: ["alpha"], env: routerEnv(workspace), timeoutMs: 30000 });
   assert.equal(launch.exitCode, 0, launch.stderr || launch.stdout);
   const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_mimo;
   assert.equal(session.env.CODEX_HOME, home);
+  assert.equal(session.env.CCDM_ROUTER_KEY_FILE, path.join(workspace.routerStateDir, "keys", "alpha.key"));
   assert.equal(session.env.MIMO_API_KEY, undefined);
   assert.doesNotMatch(session.shellCommand, /sk-fixture-testing-only/);
   const cleaned = fs.readFileSync(configPath, "utf8");
