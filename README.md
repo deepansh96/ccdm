@@ -35,7 +35,7 @@ The root agent is a Claude Code or Codex session that is itself a Router client.
 
 Each project has its own channel, its own session, and its own **Project Identity**: a per-channel webhook `ccdm-<project>` whose messages post as `<project>-<claude|codex> · N%`, with live context usage in the name. You chat with each project in its own channel, no `@mention` needed. The root agent listens in `#root` without `@mention`, and `@mentioning` the bot in a project channel reaches root only, never the project.
 
-Each session has a **Session Scope**: the one channel it may read and act in. The Router rejects anything outside it with `scope_violation` and logs the attempt. A new launch writes a new key, which disconnects the previous listener, so two sessions never answer the same channel. Messages to a channel with no live session get 💤 and are not replayed later.
+Each session has a **Session Scope**: the one channel it may read and act in. The Router rejects anything outside it with `scope_violation` and logs the attempt. A new launch writes a new key, which disconnects the previous listener, so two sessions never answer the same channel. Messages to a channel with no live session get 💤 and are not replayed later (a project not yet migrated, with no `webhook_id`, gets no 💤).
 
 ## Prerequisites
 

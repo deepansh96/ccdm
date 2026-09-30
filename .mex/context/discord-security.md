@@ -17,7 +17,7 @@ edges:
     condition: when granting, syncing, listing, or revoking guest access
   - target: patterns/debug-discord-session.md
     condition: when a session cannot read or reply in its channel
-last_updated: 2026-09-29
+last_updated: 2026-10-01
 ---
 
 # Discord Security
@@ -46,4 +46,4 @@ Project-specific user and channel access exceptions live in ignored `CLAUDE.loca
 
 ## Routing Rules
 
-Only owner and channel-guest messages and reactions are forwarded; bot and webhook messages never reach sessions. Root channels (`root_channels`) go to root for the owner and `root_allowed_user_ids`. In a project channel, a bot mention or a native reply to a root-bot message goes to root only, preventing duplicate responses; a reply to the project's webhook message goes to the project. Plain management commands go to the project session, and `/close` goes only to the reminder observer. A channel with no live session gets 💤, with no replay.
+Only owner and channel-guest messages and reactions are forwarded; bot and webhook messages never reach sessions. Root channels (`root_channels`) go to root for the owner and `root_allowed_user_ids`. In a project channel, a bot mention or a native reply to a root-bot message goes to root only, preventing duplicate responses; a reply to the project's webhook message goes to the project. Plain management commands go to the project session, and `/close` goes only to the reminder observer. A channel with no live session gets 💤, with no replay; a project without `webhook_id` (not yet migrated) is dropped without 💤, since its old pool bot may still serve it.

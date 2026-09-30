@@ -88,6 +88,9 @@ async function serve() {
       if (!routed) return;
       attachments.remember(routed.event);
       if (routed.root ? server.deliverRoot(routed.event) : server.deliver(routed.route.project, routed.event)) return;
+      // A project without `webhook_id` is not migrated yet and may still be
+      // served by its old pool bot, so its message is dropped without a mark.
+      if (!routed.root && !routed.route.webhook_id) return;
       // No live session: mark the message and drop it. Nothing is replayed later.
       await discordRequest("PUT",
         `/channels/${routed.route.channel_id}/messages/${message.id}/reactions/${encodeURIComponent(OFFLINE_EMOJI)}/@me`,
