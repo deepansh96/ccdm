@@ -45,8 +45,10 @@ export function createRouterWorkspace(registry = routerRegistry()) {
   return workspace;
 }
 
+// Launchers find node through CCDM_ROUTER_NODE, since the fixture PATH has none.
 export function routerEnv(workspace, extraEnv = {}) {
-  return bridgeChildEnv(workspace, { CCDM_ROUTER_STATE_DIR: workspace.routerStateDir, ...extraEnv });
+  return bridgeChildEnv(workspace, { CCDM_ROUTER_STATE_DIR: workspace.routerStateDir, CCDM_ROUTER_NODE: process.execPath,
+    ...extraEnv });
 }
 
 // A launcher writes the per-project key before starting a session.
@@ -163,6 +165,36 @@ export async function connectRoot(workspace, key) {
   const scope = await client.connect();
   registerTeardownCallback(() => client.close());
   return { client, events, scope };
+}
+
+// A stand-in Router that answers `router status` but refuses every other
+// hello, so a root launch passes its health check and then fails its hello.
+export async function startRefusingRouter(workspace) {
+  fs.mkdirSync(workspace.routerStateDir, { recursive: true, mode: 0o700 });
+  const server = net.createServer((socket) => {
+    let buffer = "";
+    const reply = (frame) => socket.write(`${JSON.stringify(frame)}\n`);
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      let newline;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const frame = JSON.parse(buffer.slice(0, newline));
+        buffer = buffer.slice(newline + 1);
+        if (frame.type === "hello" && frame.role === "status") reply({ type: "hello_ok", v: 1, scope: null });
+        else if (frame.type === "hello") {
+          reply({ type: "hello_error", v: 1, error: { code: "unauthorized", message: "refused" } });
+          socket.end();
+        } else if (frame.type === "request") {
+          reply({ type: "response", id: frame.id, ok: true, result: {
+            gateway: "ready", registry_loaded_at: null, sessions: [], projects: [], scope_violations: [] } });
+        }
+      }
+    });
+  });
+  await new Promise((resolve) => server.listen(workspace.socketPath, resolve));
+  registerTeardownCallback(() => new Promise((resolve) => server.close(resolve)));
+  return server;
 }
 
 const bridgeRouters = new WeakMap();

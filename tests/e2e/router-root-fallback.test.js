@@ -62,8 +62,9 @@ async function rootSessionAfterRestart(workspace, timeoutMs = 15000) {
 
 const MODES = {
   claude: {
+    restart: (workspace) => runScript(workspace, "restart-root-agent.sh", { env: routerEnv(workspace, FALLBACK_ENV), timeoutMs: 20000 }),
     async launch(workspace) {
-      const restarted = await runScript(workspace, "restart-root-agent.sh", { env: routerEnv(workspace, FALLBACK_ENV) });
+      const restarted = await runScript(workspace, "restart-root-agent.sh", { env: routerEnv(workspace, FALLBACK_ENV), timeoutMs: 20000 });
       assert.equal(restarted.exitCode, 0, restarted.stderr || restarted.stdout);
       return {
         delivered: () => (readState(workspace.stateDir).fixtures.claude.channelNotifications ?? [])
@@ -72,6 +73,9 @@ const MODES = {
     },
   },
   codex: {
+    restart: (workspace) => runScript(workspace, "restart-root-codex-agent.sh", {
+      args: ["root-channel"], env: routerEnv(workspace, FALLBACK_ENV), timeoutMs: 30000,
+    }),
     async launch(workspace) {
       const codex = await startFakeCodexServer(workspace);
       const restarted = await runScript(workspace, "restart-root-codex-agent.sh", {
@@ -91,7 +95,7 @@ const MODES = {
   },
 };
 
-for (const [mode, { launch }] of Object.entries(MODES)) {
+for (const [mode, { launch, restart }] of Object.entries(MODES)) {
   test(`root ${mode} falls back to a direct gateway for root channels while the Router is down, and hands back before rejoining`, async () => {
     const workspace = rootWorkspace();
     const router = await routerWithWebhooks(workspace, ["demo"]);
@@ -138,6 +142,32 @@ for (const [mode, { launch }] of Object.entries(MODES)) {
       `direct client destroyed at ${destroys[0].at}, root hello_ok at ${rejoined.connected_at}`);
     // The notice is posted once, by the fallback alone.
     assert.equal(readState(workspace.stateDir).fixtures.discord.messages.filter((m) => m.content === NOTICE).length, 1);
+  });
+}
+
+for (const [mode, { launch, restart }] of Object.entries(MODES)) {
+  test(`restarting root ${mode} while the Router is down fails and leaves the emergency root running with its key`, async () => {
+    const workspace = rootWorkspace();
+    const router = await routerWithWebhooks(workspace, ["demo"]);
+    const root = await launch(workspace);
+    process.kill(-router.child.pid, "SIGKILL");
+    await router.closed;
+    await waitForState(workspace, (next) => next.fixtures.discord.messages.some((m) => m.content === NOTICE), 15000);
+    const keyFile = path.join(workspace.routerStateDir, "keys", ".root.key");
+    const key = fs.readFileSync(keyFile, "utf8");
+    const session = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
+
+    const restarted = await restart(workspace);
+
+    assert.notEqual(restarted.exitCode, 0, restarted.stdout);
+    assert.match(restarted.stderr, /Router is not answering/);
+    const after = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
+    assert.equal(after?.pid, session.pid);
+    assert.equal(after.killAttempts, session.killAttempts);
+    process.kill(session.pid, 0);
+    assert.equal(fs.readFileSync(keyFile, "utf8"), key);
+    owner(workspace, { id: "after-restart", channelId: "root-channel", content: "still there?" });
+    await waitFor(() => root.delivered().includes("after-restart"), () => "the message after the refused restart", 15000);
   });
 }
 

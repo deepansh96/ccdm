@@ -10,6 +10,28 @@ ROUTER_STATE_DIR="${CCDM_ROUTER_STATE_DIR:-$HOME/.local/state/ccdm/router}"
 ROOT_KEY_FILE="$ROUTER_STATE_DIR/keys/.root.key"
 ROOT_LAUNCH_DIR="$ROUTER_STATE_DIR/launches/.root"
 ROOT_READY_FILE="$ROOT_LAUNCH_DIR/ready.json"
+# A restart rotates root's key and stops the running root, and the new root
+# can only say hello to a live Router. While the Router is down the running
+# root (perhaps on its emergency direct gateway) is the only way to reach
+# root, so leave it and its key alone. The check is read-only and bounded.
+if ! python3 - "$SCRIPT_DIR/scripts/router.js" <<'PY'
+import os
+import subprocess
+import sys
+
+node = os.environ.get("CCDM_ROUTER_NODE") or "node"
+try:
+    status = subprocess.run([node, sys.argv[1], "status"], stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE, text=True, timeout=15)
+except (OSError, subprocess.TimeoutExpired) as error:
+    sys.exit(f"Router status check failed: {error}")
+if status.returncode:
+    sys.exit(status.stderr.strip() or "Router status check failed")
+PY
+then
+    echo "The Router is not answering, so root was not restarted: the running root and its key are unchanged. Start the Router (scripts/install-router-service.sh, or node scripts/router.js serve) and retry." >&2
+    exit 1
+fi
 python3 - "$SCRIPT_DIR" "$ROUTER_STATE_DIR" "$ROOT_LAUNCH_DIR" <<'PY'
 import json
 import os

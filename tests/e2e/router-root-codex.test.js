@@ -14,6 +14,7 @@ import {
   routerRegistry,
   routerWithWebhooks,
   runRouterCli,
+  startRefusingRouter,
   waitFor,
 } from "./support/router.js";
 import { readState } from "./support/state.js";
@@ -221,15 +222,28 @@ test("no Discord token reaches the root Codex session environment, launch files,
   assert.equal(fs.statSync(path.join(workspace.routerStateDir, "keys", ".root.key")).mode & 0o777, 0o600);
 });
 
-test("a root Codex launch whose Router hello fails exits non-zero and removes root's key", async () => {
+test("a root Codex launch with no Router answering exits non-zero before launching or writing root's key", async () => {
   const workspace = rootWorkspace();
   const codex = await startFakeCodexServer(workspace);
-  // No Router is running, so the bridge's hello cannot succeed.
 
   const restarted = await restartRootCodex(workspace, codex.port, { CCDM_CODEX_LAUNCH_TIMEOUT_S: "20" });
 
   assert.notEqual(restarted.exitCode, 0, restarted.stdout);
-  assert.match(restarted.stderr, /Router hello failed: router_unavailable/);
+  assert.match(restarted.stderr, /The Router is not answering, so root was not restarted/);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent, undefined);
+  assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", ".root.key")), false);
+});
+
+test("a root Codex launch whose Router hello fails exits non-zero and removes root's key", async () => {
+  const workspace = rootWorkspace();
+  const codex = await startFakeCodexServer(workspace);
+  // The Router answers its health check but refuses root's hello.
+  await startRefusingRouter(workspace);
+
+  const restarted = await restartRootCodex(workspace, codex.port, { CCDM_CODEX_LAUNCH_TIMEOUT_S: "20" });
+
+  assert.notEqual(restarted.exitCode, 0, restarted.stdout);
+  assert.match(restarted.stderr, /Router hello failed: unauthorized/);
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent, undefined);
   assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", ".root.key")), false);
 });

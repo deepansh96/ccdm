@@ -14,6 +14,7 @@ import {
   routerRegistry,
   routerWithWebhooks,
   runRouterCli,
+  startRefusingRouter,
   waitFor,
 } from "./support/router.js";
 import { readState, updateState } from "./support/state.js";
@@ -35,7 +36,7 @@ function rootWorkspace() {
 }
 
 function restartRoot(workspace, extraEnv = {}) {
-  return runScript(workspace, "restart-root-agent.sh", { env: routerEnv(workspace, extraEnv) });
+  return runScript(workspace, "restart-root-agent.sh", { env: routerEnv(workspace, extraEnv), timeoutMs: 20000 });
 }
 
 test("restart-root-agent launches root Claude whose channel server says hello to the Router as root", async () => {
@@ -132,14 +133,27 @@ test("no Discord token reaches the root Claude session environment, launch files
   assert.equal(fs.statSync(path.join(workspace.routerStateDir, "keys", ".root.key")).mode & 0o777, 0o600);
 });
 
-test("a root launch whose Router hello fails exits non-zero and removes root's key", async () => {
+test("a root launch with no Router answering exits non-zero before launching or writing root's key", async () => {
   const workspace = rootWorkspace();
-  // No Router is running, so the channel server's hello cannot succeed.
 
   const restarted = await restartRoot(workspace, { CCDM_CLAUDE_LAUNCH_TIMEOUT_S: "10" });
 
   assert.notEqual(restarted.exitCode, 0, restarted.stdout);
-  assert.match(restarted.stderr, /Router hello failed: router_unavailable/);
+  assert.match(restarted.stderr, /The Router is not answering, so root was not restarted/);
+  assert.equal(readState(workspace.stateDir).fixtures.claude.invocations?.length ?? 0, 0);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent, undefined);
+  assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", ".root.key")), false);
+});
+
+test("a root launch whose Router hello fails exits non-zero and removes root's key", async () => {
+  const workspace = rootWorkspace();
+  // The Router answers its health check but refuses root's hello.
+  await startRefusingRouter(workspace);
+
+  const restarted = await restartRoot(workspace, { CCDM_CLAUDE_LAUNCH_TIMEOUT_S: "10" });
+
+  assert.notEqual(restarted.exitCode, 0, restarted.stdout);
+  assert.match(restarted.stderr, /Router hello failed: unauthorized/, JSON.stringify(restarted));
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent, undefined);
   assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", ".root.key")), false);
 });

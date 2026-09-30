@@ -487,7 +487,7 @@ test("project stop and root restart keep the independent service and closed stat
   const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"] });
   assert.equal(stopped.exitCode, 0, stopped.stderr || stopped.stdout);
   // Root Claude launches as a client of the Router the worker already observes through.
-  const restarted = await runScript(workspace, "restart-root-agent.sh", { env: routerEnv(context.router) });
+  const restarted = await runScript(workspace, "restart-root-agent.sh", { env: routerEnv(context.router), timeoutMs: 20000 });
   assert.equal(restarted.exitCode, 0, restarted.stderr || restarted.stdout);
 
   const current = await command(workspace, context.stateDir, "status");
