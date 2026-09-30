@@ -16,7 +16,7 @@ edges:
     condition: when performing a start, stop, or restart
   - target: patterns/register-project.md
     condition: when registering or deregistering a project (channel, webhook, registry entry)
-last_updated: 2026-09-30
+last_updated: 2026-10-01
 ---
 
 # Session Management
@@ -25,7 +25,7 @@ last_updated: 2026-09-30
 
 `registry.json` contains `discord_user_id` (the owner), `guild_id`, `root_channels` (the first is the primary root channel), `root_allowed_user_ids`, `category_ids` (guest-managed categories), the Codex account fields, and `projects`. Project records contain path, channel ID, `webhook_id`, tmux `screen_name`, session `type`, PID/session state, `guest_user_ids`, `ws_port` for Codex, and optional account/model overrides. The registry holds no bot or webhook token; the root token stays in root's state `.env` and webhook tokens in private Router state. The Router watches the registry and applies changes to the next message.
 
-Every registry read-modify-write holds one cross-process lock, the `registry.json.lock` directory beside the registry (its `owner` file names the holder's pid; a dead holder's lock is reclaimed, and a live holder is waited for up to `CCDM_REGISTRY_LOCK_TIMEOUT_MS`, default 30 s), rereads the registry, and commits through a unique adjacent temporary file renamed over it with its mode kept. Node writers use `updateRegistry` in `scripts/router/registry.js`; shell and Python writers use `scripts/registry-update.py` (`set-project-fields <registry> <project> '<json>'`, or `update_registry`/`set_project_fields` loaded with `importlib`). Never rewrite the registry in place or outside that lock: an unlocked whole-file rewrite drops a concurrent writer's change (for example a webhook recreation), and truncating in place lets the Router's reload read a partial file.
+Every registry read-modify-write holds one cross-process lock, the `registry.json.lock` directory beside the registry (built under a staging name and renamed into place with an `owner` file naming the holder's pid and a per-acquisition `nonce`; a dead holder's lock is removed only by the one waiter holding its `registry.json.lock.reclaim-<key>` claim after rechecking it is still that dead instance, so a late waiter never displaces a live lock; a live holder is waited for up to `CCDM_REGISTRY_LOCK_TIMEOUT_MS`, default 30 s), rereads the registry, and commits through a unique adjacent temporary file renamed over it with its mode kept. Node writers use `updateRegistry` in `scripts/router/registry.js`; shell and Python writers use `scripts/registry-update.py` (`set-project-fields <registry> <project> '<json>'`, or `update_registry`/`set_project_fields` loaded with `importlib`). Never rewrite the registry in place or outside that lock: an unlocked whole-file rewrite drops a concurrent writer's change (for example a webhook recreation), and truncating in place lets the Router's reload read a partial file.
 
 Never print tokens. Treat missing project `type` as `claude`. Use exact tmux targets (`=<screen_name>`) and expand home paths before comparing them.
 

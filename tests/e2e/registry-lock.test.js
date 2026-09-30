@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 
 import {
   connectSession,
@@ -19,6 +22,7 @@ import { cleanup } from "./support/teardown.js";
 // Longer than the Router's reload debounce below, so a reload lands mid-transaction.
 const DEBOUNCE_MS = 20;
 const HOLD_MS = 400;
+const execFileAsync = promisify(execFile);
 
 test.afterEach(async () => {
   await cleanup();
@@ -141,4 +145,94 @@ test("a registry lock left by a dead writer is reclaimed, and a live holder's lo
   assert.notEqual(refused.exitCode, 0);
   assert.match(refused.stderr, new RegExp(`registry\\.json is locked \\(held by pid ${process.pid}\\)`));
   assert.equal(fs.readFileSync(path.join(lock, "owner"), "utf8"), `${process.pid}\n`);
+});
+
+// The workspace copy of the lock implementation, driven in this process.
+function registryModule(workspace) {
+  return createRequire(import.meta.url)(path.join(workspace.repoDir, "scripts/router/registry.js"));
+}
+
+// Runs a Python snippet with the workspace's registry-update.py loaded as `ru`.
+function runPython(workspace, code, args = []) {
+  const prelude = "import importlib.util,sys\n"
+    + "spec=importlib.util.spec_from_file_location('ru',sys.argv[1]);ru=importlib.util.module_from_spec(spec);spec.loader.exec_module(ru)\n";
+  return execFileAsync("python3", ["-c", prelude + code, path.join(workspace.repoDir, "scripts/registry-update.py"), ...args],
+    { encoding: "utf8" });
+}
+
+function deadLock(lock) {
+  fs.mkdirSync(lock);
+  fs.writeFileSync(path.join(lock, "owner"), "999999\n");
+}
+
+const lockLitter = workspace => fs.readdirSync(workspace.repoDir).filter(name => /registry\.json\.(lock|.*\.tmp)/.test(name));
+
+test("a waiter that saw a dead owner too late leaves the live lock taken since in place, in both implementations", async () => {
+  const workspace = createRouterWorkspace(routerRegistry({
+    other: { channel_id: "other-channel", type: "claude", screen_name: "other_session" },
+  }));
+  const file = registryFile(workspace);
+  const lock = `${file}.lock`;
+  const hold = path.join(workspace.tmpDir, "registry-hold");
+  const { _lockInternals: { deadKey, reclaim }, updateRegistry } = registryModule(workspace);
+  deadLock(lock);
+  // Two late waiters, one per implementation, both observe the dead owner.
+  const jsKey = await deadKey(lock);
+  const pyKey = (await runPython(workspace, "print(ru._dead_key(ru.Path(sys.argv[2])))", [lock])).stdout.trim();
+  assert.equal(pyKey, jsKey);
+
+  // A Python writer reclaims the dead lock and pauses holding it.
+  fs.writeFileSync(`${hold}.armed`, "");
+  const first = execFileAsync("python3", [path.join(workspace.repoDir, "scripts/registry-update.py"),
+    "set-project-fields", file, "other", '{"first": true}'], { env: { ...process.env, CCDM_TEST_REGISTRY_HOLD: hold } });
+  first.catch(() => {});
+  await waitFor(() => exists(`${hold}.waiting`), () => "the first writer to pause holding the lock");
+  const held = fs.readFileSync(path.join(lock, "nonce"), "utf8");
+
+  // The late waiters act on what they saw: each holds the claim, and neither
+  // moves or deletes the live lock.
+  assert.equal(await reclaim(lock, jsKey), true);
+  assert.equal((await runPython(workspace, "print(ru._reclaim(ru.Path(sys.argv[2]), sys.argv[3]))", [lock, pyKey])).stdout.trim(), "True");
+  assert.equal(fs.readFileSync(path.join(lock, "nonce"), "utf8"), held);
+
+  // A third writer still waits for the first.
+  const previous = process.env.CCDM_TEST_REGISTRY_HOLD;
+  process.env.CCDM_TEST_REGISTRY_HOLD = hold;
+  let third;
+  try {
+    third = updateRegistry(file, registry => { registry.projects.other.third = true; });
+    await waitFor(() => exists(`${hold}.blocked`), () => "the third writer to wait for the lock");
+  } finally {
+    if (previous === undefined) delete process.env.CCDM_TEST_REGISTRY_HOLD;
+    else process.env.CCDM_TEST_REGISTRY_HOLD = previous;
+  }
+  fs.writeFileSync(`${hold}.release`, "");
+  await Promise.all([first, third]);
+
+  const { other } = JSON.parse(fs.readFileSync(file, "utf8")).projects;
+  assert.deepEqual({ first: other.first, third: other.third }, { first: true, third: true });
+  assert.deepEqual(lockLitter(workspace), []);
+});
+
+test("concurrent Node and Python writers racing to reclaim one dead lock all commit", async () => {
+  const workspace = createRouterWorkspace(routerRegistry({
+    other: { channel_id: "other-channel", type: "claude", screen_name: "other_session" },
+  }));
+  const file = registryFile(workspace);
+  const { updateRegistry } = registryModule(workspace);
+  for (let round = 0; round < 3; round++) {
+    deadLock(`${file}.lock`);
+    const writers = [];
+    for (let index = 0; index < 5; index++) {
+      writers.push(runPython(workspace, "ru.set_project_fields(sys.argv[2], 'other', {sys.argv[3]: True})",
+        [file, `py_${round}_${index}`]));
+      writers.push(updateRegistry(file, registry => { registry.projects.other[`js_${round}_${index}`] = true; }));
+    }
+    await Promise.all(writers);
+  }
+
+  const { other } = JSON.parse(fs.readFileSync(file, "utf8")).projects;
+  const written = Object.keys(other).filter(key => /^(py|js)_\d_\d$/.test(key));
+  assert.equal(written.length, 30, `lost writes: ${written.sort().join(", ")}`);
+  assert.deepEqual(lockLitter(workspace), []);
 });

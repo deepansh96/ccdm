@@ -112,14 +112,28 @@ function watchRegistry(file, { debounceMs = DEFAULT_RELOAD_DEBOUNCE_MS, onLoad, 
 
 // Every registry read-modify-write, here and in scripts/registry-update.py
 // (the shell and Python writers), holds one cross-process lock: a
-// `registry.json.lock` directory beside the registry, created atomically and
-// naming its holder's pid. A lock whose holder died is reclaimed; a live
-// holder is waited for up to CCDM_REGISTRY_LOCK_TIMEOUT_MS (default 30 s).
+// `registry.json.lock` directory beside the registry naming its holder's pid
+// (`owner`) and a nonce unique to that acquisition (`nonce`). A lock whose
+// holder died is reclaimed; a live holder is waited for up to
+// CCDM_REGISTRY_LOCK_TIMEOUT_MS (default 30 s).
 //
-// A lock directory still without an owner file after this long was left by a
-// holder that died between creating it and recording its pid.
-const UNOWNED_STALE_MS = 10000;
+// Both implementations follow the same protocol, so they exclude each other:
+// - A lock directory is built complete under a unique staging name and
+//   renamed into place, so the lock never exists without its owner. The
+//   rename fails while a (non-empty) lock exists.
+// - A holder releases by renaming its own lock aside, then deleting it.
+// - A dead holder's lock is removed only by the one waiter that owns the
+//   reclaim claim for that lock instance: `<lock>.reclaim-<key>`, itself a
+//   lock built the same way, keyed by the dead lock's nonce (or, for a lock
+//   written before nonces, its pid and inode). The claimant rechecks that the
+//   lock is still that dead instance before moving it aside. A dead instance
+//   is never released by its holder and only its claimant removes it, so the
+//   check cannot go stale, and a waiter that saw the dead owner too late finds
+//   a different instance and leaves it alone. A claim whose claimant died is
+//   reclaimed the same way.
 const LOCK_POLL_MS = 10;
+// Claims of claims, if claimants keep dying, before a waiter just waits.
+const MAX_RECLAIM_DEPTH = 4;
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -139,61 +153,93 @@ function alive(pid) {
   }
 }
 
-// The stale holder's owner text, or null while the holder may be alive.
-async function staleOwner(lock) {
-  let owner;
-  try {
-    owner = await readFile(path.join(lock, "owner"), "utf8");
-  } catch {
-    try {
-      return Date.now() - (await stat(lock)).mtimeMs > UNOWNED_STALE_MS ? "" : null;
-    } catch {
-      return null;
-    }
-  }
-  return alive(Number.parseInt(owner, 10)) ? null : owner;
+const uniqueSuffix = () => `${process.pid}-${randomBytes(8).toString("hex")}`;
+const readTrimmed = file => readFile(file, "utf8").then(text => text.trim(), () => null);
+
+// The lock instance at `dir`: its holder's pid and a key naming that instance
+// alone. Null when there is none, or it changed while being read.
+async function lockInstance(dir) {
+  const before = await stat(dir, { bigint: true }).catch(() => null);
+  if (!before) return null;
+  const nonce = await readTrimmed(path.join(dir, "nonce"));
+  const owner = await readTrimmed(path.join(dir, "owner"));
+  const after = await stat(dir, { bigint: true }).catch(() => null);
+  if (owner === null || !after || after.ino !== before.ino || await readTrimmed(path.join(dir, "nonce")) !== nonce) return null;
+  const pid = /^\d+$/.test(owner) ? Number(owner) : 0;
+  return { pid, key: nonce ? `n${nonce}` : `p${pid}-i${after.ino}` };
 }
 
-async function reclaim(lock, owner) {
-  const aside = `${lock}.stale-${process.pid}-${randomBytes(4).toString("hex")}`;
+// The key of the instance at `dir` if its holder is dead, else null.
+async function deadKey(dir) {
+  const instance = await lockInstance(dir);
+  return instance && !alive(instance.pid) ? instance.key : null;
+}
+
+// Creates `target` owned by this process; its nonce, or null while held.
+async function createOwned(target) {
+  const nonce = randomBytes(16).toString("hex");
+  const staging = `${target}.new-${uniqueSuffix()}`;
+  await mkdir(staging, { mode: 0o700 });
   try {
-    await rename(lock, aside);
+    await writeFile(path.join(staging, "owner"), `${process.pid}\n`);
+    await writeFile(path.join(staging, "nonce"), `${nonce}\n`);
+    await rename(staging, target);
+    return nonce;
+  } catch (error) {
+    await rm(staging, { recursive: true, force: true });
+    if (error.code === "ENOTEMPTY" || error.code === "EEXIST") return null;
+    throw error;
+  }
+}
+
+// Moves `dir` aside and deletes it.
+async function discard(dir) {
+  const aside = `${dir}.gone-${uniqueSuffix()}`;
+  try {
+    await rename(dir, aside);
   } catch {
     return;
   }
-  const moved = await readFile(path.join(aside, "owner"), "utf8").catch(() => "");
-  // Another waiter reclaimed it first and a live writer took the lock since:
-  // hand it back.
-  if (moved !== owner && await rename(aside, lock).then(() => true, () => false)) return;
   await rm(aside, { recursive: true, force: true });
+}
+
+// Removes `target` only while it is still this process's instance `nonce`.
+async function removeOwned(target, nonce) {
+  if (await readTrimmed(path.join(target, "nonce")) === nonce) await discard(target);
+}
+
+// Removes the dead instance `key` at `target`, holding its reclaim claim.
+// True when this waiter held the claim (the instance is gone either way).
+async function reclaim(target, key, depth = 0) {
+  const claim = `${target}.reclaim-${key}`;
+  const nonce = await createOwned(claim);
+  if (!nonce) {
+    // Another waiter holds the claim; if it died, clear its claim.
+    const claimKey = depth < MAX_RECLAIM_DEPTH ? await deadKey(claim) : null;
+    return claimKey !== null && await reclaim(claim, claimKey, depth + 1);
+  }
+  try {
+    if (await deadKey(target) === key) await discard(target);
+  } finally {
+    await removeOwned(claim, nonce);
+  }
+  return true;
 }
 
 async function acquireRegistryLock(file) {
   const lock = `${file}.lock`;
   const deadline = Date.now() + lockTimeoutMs();
   for (;;) {
-    try {
-      await mkdir(lock, { mode: 0o700 });
-    } catch (error) {
-      if (error.code !== "EEXIST") throw error;
-      const owner = await staleOwner(lock);
-      if (owner !== null) {
-        await reclaim(lock, owner);
-        continue;
-      }
-      await testNoteBlocked();
-      if (Date.now() >= deadline) {
-        const holder = await readFile(path.join(lock, "owner"), "utf8").then(text => ` (held by pid ${text.trim()})`, () => "");
-        throw new Error(`${file} is locked${holder}; retry once the other writer finishes`);
-      }
-      await sleep(LOCK_POLL_MS);
-      continue;
+    const nonce = await createOwned(lock);
+    if (nonce) return () => removeOwned(lock, nonce);
+    const key = await deadKey(lock);
+    if (key !== null && await reclaim(lock, key)) continue;
+    await testNoteBlocked();
+    if (Date.now() >= deadline) {
+      const holder = await readFile(path.join(lock, "owner"), "utf8").then(text => ` (held by pid ${text.trim()})`, () => "");
+      throw new Error(`${file} is locked${holder}; retry once the other writer finishes`);
     }
-    await writeFile(path.join(lock, "owner"), `${process.pid}\n`);
-    return async () => {
-      const owner = await readFile(path.join(lock, "owner"), "utf8").catch(() => "");
-      if (Number.parseInt(owner, 10) === process.pid) await rm(lock, { recursive: true, force: true });
-    };
+    await sleep(LOCK_POLL_MS);
   }
 }
 
@@ -275,4 +321,6 @@ async function updateRegistry(file, updater) {
 module.exports = {
   DEFAULT_RELOAD_DEBOUNCE_MS, buildRoutingTable, loadRoutingTable, readRegistry, updateRegistry, validateRegistry, watchRegistry,
   withRegistryLock,
+  // For the E2E suite's stale-lock race checks.
+  _lockInternals: { deadKey, reclaim },
 };
