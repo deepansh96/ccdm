@@ -184,6 +184,20 @@ test("a Claude project with no transport field starts through the Router and rec
   assert.equal(fs.existsSync(path.join(workspace.homeDir, ".claude", ".claude.json")), false);
 });
 
+test("a Claude project without a webhook_id is refused before any key, launch file, tmux session, or PID", async () => {
+  const workspace = seededWorkspace();
+  assert.equal("webhook_id" in readRegistry(workspace).projects.alpha, false);
+
+  const result = await startSession(workspace);
+
+  assert.equal(result.exitCode, 1, result.stderr || result.stdout);
+  assert.match(result.stderr, /Refusing to start 'alpha': it has no webhook_id, so its replies could not be posted\. Run scripts\/migrate-to-router\.sh alpha/);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {});
+  assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", "alpha.key")), false);
+  assert.equal(fs.existsSync(launchDir(workspace)), false);
+  assert.deepEqual(readRegistry(workspace).projects.alpha, buildClaudeRegistry(workspace).projects.alpha);
+});
+
 test("no Claude launch passes a Discord token, DISCORD_STATE_DIR, the official plugin channel, or the reminder proxy", async () => {
   // The retired reminder-adapter opt-in and a stale pool bot entry change nothing.
   const { workspace } = await claudeRouterWorkspace({

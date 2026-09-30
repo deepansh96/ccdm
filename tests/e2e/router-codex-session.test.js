@@ -84,10 +84,10 @@ test("a Codex project with no transport field launches through the Router and re
   ]);
 });
 
-function setPort(workspace, port) {
+function setPort(workspace, port, fields = {}) {
   const registryFile = path.join(workspace.repoDir, "registry.json");
   const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
-  registry.projects.demo.ws_port = port;
+  Object.assign(registry.projects.demo, { ws_port: port, ...fields });
   fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
 }
 
@@ -162,8 +162,9 @@ test("no Discord bot or webhook token reaches the Codex session environment, lau
 test("a router Codex launch whose Router hello fails exits non-zero and cleans up", async () => {
   const workspace = codexRouterWorkspace(0);
   const codex = await startFakeCodexServer(workspace, { channelId: "demo-channel" });
-  setPort(workspace, codex.port);
-  // No Router is running, so the bridge's hello cannot succeed.
+  setPort(workspace, codex.port, { webhook_id: "webhook-demo" });
+  // demo has its webhook, but no Router is running, so the bridge's hello
+  // cannot succeed.
 
   const started = await startCodexSession(workspace, { CCDM_CODEX_LAUNCH_TIMEOUT_S: "20" });
 

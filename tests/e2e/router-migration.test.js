@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -6,8 +7,8 @@ import test from "node:test";
 import { startFakeCodexServer } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import { OWNER_ID, createRouterWorkspace, routerEnv, runRouterCli, startRouter } from "./support/router.js";
-import { readState, seedTmuxSession, updateState, writeState } from "./support/state.js";
-import { cleanup } from "./support/teardown.js";
+import { readState, seedFixtureProcess, seedTmuxSession, updateState, writeState } from "./support/state.js";
+import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 
 test.afterEach(async () => {
   await cleanup();
@@ -86,11 +87,47 @@ const webhookMessages = (workspace) => (readState(workspace.stateDir).fixtures.d
   .filter((message) => message.webhookId)
   .map(({ channelId, webhookId }) => ({ channelId, webhookId }));
 
-test("migrating an unmigrated Claude project records it on the Router, verifies a probe round trip, and exits 0", async () => {
-  const { workspace } = poolClaudeWorkspace();
+// Refused before any runtime change: no key, tmux session, or PID.
+function assertRefusedWithoutWebhook(workspace, result, project, screen) {
+  assert.equal(result.exitCode, 1, result.stderr || result.stdout);
+  assert.match(result.stderr, new RegExp(`Refusing to start '${project}': it has no webhook_id.*Run scripts/migrate-to-router\\.sh ${project}`));
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions[screen], undefined);
+  assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", `${project}.key`)), false);
+  assert.equal(readRegistry(workspace).projects[project].pid, null);
+}
+
+// The official Discord plugin listener a pool-era launch left running with the
+// pool bot's state directory.
+function spawnLegacyPoolListener(workspace, poolStateDir) {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    detached: true, env: { CCDM_TEST_STATE: workspace.stateDir }, stdio: "ignore",
+  });
+  child.unref();
+  registerTeardownCallback(() => {
+    try { process.kill(child.pid, "SIGKILL"); } catch { /* already gone */ }
+  });
+  seedFixtureProcess({
+    command: `claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions DISCORD_STATE_DIR='${poolStateDir}'`,
+    owned: true, ownerStateDir: workspace.stateDir, pid: child.pid, ppid: process.pid,
+  }, { stateDir: workspace.stateDir });
+  return child.pid;
+}
+
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+test("migrating an unmigrated Claude project stops its legacy pool listener, records it on the Router, verifies a probe round trip, and exits 0", async () => {
+  const { workspace, poolStateDir } = poolClaudeWorkspace();
   await startRouter(workspace);
-  const pooled = await startClaude(workspace);
-  assert.equal(pooled.exitCode, 0, pooled.stderr || pooled.stdout);
+  // Without a webhook the project cannot launch; its pool-era listener still runs.
+  assertRefusedWithoutWebhook(workspace, await startClaude(workspace), "demo", "demo_claude");
+  const legacyPid = spawnLegacyPoolListener(workspace, poolStateDir);
 
   const result = await migrate(workspace, ["demo"]);
 
@@ -107,6 +144,7 @@ test("migrating an unmigrated Claude project records it on the Router, verifies 
   // The router launch holds the tmux session.
   const session = readState(workspace.stateDir).fixtures.tmux.sessions.demo_claude;
   assert.equal(session.env?.DISCORD_STATE_DIR, undefined);
+  assert.equal(isAlive(legacyPid), false);
 });
 
 test("migrating a Codex project with no transport field or webhook records it on the Router, verifies a probe round trip, and exits 0", async () => {
@@ -114,8 +152,9 @@ test("migrating a Codex project with no transport field or webhook records it on
   assert.equal(readRegistry(workspace).projects.beta.transport, undefined);
   assert.equal(readRegistry(workspace).projects.beta.webhook_id, undefined);
   await startRouter(workspace);
-  const running = await runScript(workspace, "scripts/start-codex-session.sh", { args: ["beta"], env: routerEnv(workspace) });
-  assert.equal(running.exitCode, 0, running.stderr || running.stdout);
+  // Without a webhook the project cannot launch.
+  const refused = await runScript(workspace, "scripts/start-codex-session.sh", { args: ["beta"], env: routerEnv(workspace) });
+  assertRefusedWithoutWebhook(workspace, refused, "beta", "beta_codex");
 
   const result = await migrate(workspace, ["beta"]);
 
@@ -162,8 +201,6 @@ test("a preflight failure names root's missing permissions in the project channe
 test("a verify failure after the stop rolls back to the previous registry state, restarts the session, and names the failed step", async () => {
   const { workspace } = poolClaudeWorkspace();
   await startRouter(workspace);
-  const running = await startClaude(workspace);
-  assert.equal(running.exitCode, 0, running.stderr || running.stdout);
   // The probe comes back under another webhook, so verification fails.
   const state = updateState(workspace.stateDir, (state) => {
     state.fixtures.discord.webhookExecuteReturnsWebhookId = "someone-elses-webhook";

@@ -49,6 +49,107 @@ terminate_pids() {
   done
 }
 
+# A Claude listener left from before the Router cutover: the official Discord
+# plugin (or the retired reminder proxy) started with its pool bot's
+# DISCORD_STATE_DIR. The pool fields locate it until retire-pool.sh strips them.
+find_legacy_pool_claude_pids() {
+  local state_dir="$1"
+  python3 - "$state_dir" <<'PY'
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+target = os.path.normpath(os.path.expanduser(sys.argv[1]))
+try:
+    ps = subprocess.check_output(
+        ["ps", "axeww", "-o", "pid=,command="],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+except Exception:
+    sys.exit(0)
+
+env_re = re.compile(r"""DISCORD_STATE_DIR=(?:"([^"]+)"|'([^']+)'|([^\s]+))""")
+
+def has_target_state(command: str) -> bool:
+    for match in env_re.finditer(command):
+        value = next(group for group in match.groups() if group is not None)
+        if os.path.normpath(os.path.expanduser(value)) == target:
+            return True
+    return False
+
+def command_argv(command: str) -> list[str]:
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return []
+
+def is_discord_plugin_path(value: str) -> bool:
+    path = os.path.normpath(os.path.expanduser(value))
+    plugin_roots = (
+        "claude-plugins-official/discord",
+        "claude-plugins-official/external_plugins/discord",
+    )
+    return any(path.endswith(f"/{root}") or f"/{root}/" in path for root in plugin_roots)
+
+def has_claude_discord_plugin_root(command: str) -> bool:
+    root_re = re.compile(r"""CLAUDE_PLUGIN_ROOT=(?:"([^"]+)"|'([^']+)'|([^\s]+))""")
+    for match in root_re.finditer(command):
+        value = next(group for group in match.groups() if group is not None)
+        if is_discord_plugin_path(value):
+            return True
+    return False
+
+def has_claude_discord_cwd(argv: list[str]) -> bool:
+    for index, arg in enumerate(argv[:-1]):
+        if arg == "--cwd" and is_discord_plugin_path(argv[index + 1]):
+            return True
+    return False
+
+def is_listener(command: str) -> bool:
+    argv = command_argv(command)
+    if not argv:
+        return False
+
+    exe = os.path.basename(argv[0])
+    if exe in {"tmux", "zsh", "bash", "sh", "fish", "login"}:
+        return False
+
+    if exe == "claude" and (
+        ("--channels" in argv and any(arg.startswith("plugin:discord") for arg in argv))
+        or ("--dangerously-load-development-channels" in argv and "server:discord" in argv)
+    ):
+        return True
+    if exe == "node" and any(os.path.basename(arg) == "claude-reminder-channel.js" for arg in argv[1:]):
+        return True
+    if exe == "claude-channel-discord":
+        return True
+    if exe == "bun" and "run" in argv and has_claude_discord_cwd(argv):
+        return True
+    if exe == "bun" and any(
+        os.path.basename(arg) == "server.ts" and
+        (is_discord_plugin_path(arg) or has_claude_discord_plugin_root(command))
+        for arg in argv[1:]
+    ):
+        return True
+    return False
+
+for line in ps.splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    pid_text, _, command = line.partition(" ")
+    if not pid_text.isdigit():
+        continue
+    if "ps axeww" in command or "python3 -" in command:
+        continue
+    if has_target_state(command) and is_listener(command):
+        print(pid_text)
+PY
+}
+
 # Claude listeners carry their launch key file path (never the key) in their
 # environment: the claude process and its channel server.
 find_router_claude_pids() {
@@ -162,7 +263,9 @@ PY
 }
 
 # Neither Claude nor Codex has a pool mode, so `transport` is ignored.
-IFS=$'\t' read -r SCREEN_NAME SESSION_TYPE REGISTRY_PID CHANNEL_ID WS_PORT <<< "$(python3 -c "
+# A Claude project that still names its former pool bot also has that bot's
+# state directory swept for a legacy listener.
+IFS=$'\t' read -r SCREEN_NAME SESSION_TYPE REGISTRY_PID CHANNEL_ID WS_PORT LEGACY_STATE_DIR <<< "$(python3 -c "
 import json, os
 r = json.load(open('$REGISTRY'))
 p = r['projects']['$PROJECT']
@@ -170,18 +273,23 @@ session_type = p.get('type', 'claude')
 def field(value):
     return '__NONE__' if value in (None, '') else str(value)
 ws_port = p.get('ws_port', 18300) if session_type == 'codex' else p.get('ws_port')
+pool = r.get('pool') if isinstance(r.get('pool'), list) else []
+bot = next((b for b in pool if isinstance(b, dict) and p.get('bot_id') and b.get('id') == p.get('bot_id')), {})
+legacy_state_dir = os.path.expanduser(bot['state_dir']) if session_type != 'codex' and bot.get('state_dir') else None
 print('\t'.join([
     field(p['screen_name']),
     field(session_type),
     field(p.get('pid')),
     field(p.get('channel_id')),
     field(ws_port),
+    field(legacy_state_dir),
 ]))
 ")"
 
 [[ "$REGISTRY_PID" == "__NONE__" ]] && REGISTRY_PID=""
 [[ "$CHANNEL_ID" == "__NONE__" ]] && CHANNEL_ID=""
 [[ "$WS_PORT" == "__NONE__" ]] && WS_PORT=""
+[[ "$LEGACY_STATE_DIR" == "__NONE__" ]] && LEGACY_STATE_DIR=""
 
 ROUTER_STATE_DIR="${CCDM_ROUTER_STATE_DIR:-$HOME/.local/state/ccdm/router}"
 ROUTER_KEY_FILE="$ROUTER_STATE_DIR/keys/$PROJECT.key"
@@ -195,6 +303,9 @@ find_owned_listener_pids() {
     find_codex_listener_pids "$CHANNEL_ID" "$WS_PORT"
   else
     find_router_claude_pids "$ROUTER_KEY_FILE"
+    if [[ -n "$LEGACY_STATE_DIR" ]]; then
+      find_legacy_pool_claude_pids "$LEGACY_STATE_DIR"
+    fi
   fi
 }
 

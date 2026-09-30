@@ -185,7 +185,6 @@ registry_update = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(registry_update)
 registry_update.set_project_fields(registry_path, project, {"pid": pid, "session_id": None})
 
-
 print(f"Recorded PID {pid}")
 PY
 }
@@ -289,7 +288,7 @@ PY
   record_codex_pid "$CHANNEL_ID"
 }
 
-IFS=$'\t' read -r PATH_DIR SCREEN_NAME CHANNEL_ID WS_PORT DISCORD_USER_IDS TEXT_REPLY_FALLBACK_FLAG CODEX_MODEL_VALUE CODEX_REASONING_EFFORT_VALUE CODEX_SERVICE_TIER_VALUE <<< "$(python3 -c "
+IFS=$'\t' read -r PATH_DIR SCREEN_NAME CHANNEL_ID WS_PORT DISCORD_USER_IDS TEXT_REPLY_FALLBACK_FLAG CODEX_MODEL_VALUE CODEX_REASONING_EFFORT_VALUE CODEX_SERVICE_TIER_VALUE WEBHOOK_ID <<< "$(python3 -c "
 import json, os
 r = json.load(open('$REGISTRY'))
 p = r['projects']['$PROJECT']
@@ -304,6 +303,7 @@ print('\t'.join([
     (p.get('codex_model') or p.get('model') or '__NONE__'),
     (p.get('codex_reasoning_effort') or p.get('model_reasoning_effort') or '__NONE__'),
     (p.get('codex_service_tier') or p.get('service_tier') or '__NONE__'),
+    (str(p.get('webhook_id') or '') or '__NONE__'),
 ]))
 ")"
 
@@ -324,6 +324,14 @@ if [[ -n "$EXISTING_PIDS" ]]; then
   echo "Refusing to start '$PROJECT': existing Codex Discord bridge process(es) already use channel $CHANNEL_ID or port $WS_PORT:"
   echo "$EXISTING_PIDS" | sed 's/^/  /'
   echo "Run scripts/stop-session.sh '$PROJECT' first, then retry."
+  exit 1
+fi
+
+# The Router posts replies only through the project's webhook: a project
+# without one is refused before any runtime change (MCP cleanup, key, tmux,
+# PID).
+if [[ "$WEBHOOK_ID" == "__NONE__" ]]; then
+  echo "Refusing to start '$PROJECT': it has no webhook_id, so its replies could not be posted. Run scripts/migrate-to-router.sh $PROJECT (or node scripts/router.js ensure-webhook $PROJECT), then retry." >&2
   exit 1
 fi
 
