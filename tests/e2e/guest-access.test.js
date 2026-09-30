@@ -326,3 +326,50 @@ test("guest access reads an explicitly selected root state directory", async () 
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(readState(workspace.stateDir).fixtures.discord.roleCreates[0].authorization, "Bot custom-root-token");
 });
+
+// Two guest changes overlap: `first` pauses holding the registry lock with its
+// write not yet in place, and `second` (which read the registry before that
+// write landed) waits for the lock. Both changes must survive.
+async function overlappingGuestChanges(first, second) {
+  const workspace = createWorkspace();
+  const registry = buildRegistry(workspace);
+  registry.projects.alpha.guest_role_id = "existing-role";
+  registry.projects.alpha.guest_user_ids = [GUEST_ID];
+  registry.projects.alpha.guest_invites = { [GUEST_ID]: ["fake-invite-1"] };
+  seedRegistry(workspace, registry);
+  const hold = path.join(workspace.tmpDir, "registry-hold");
+  const env = { ...preloadEnv(workspace), CCDM_TEST_REGISTRY_HOLD: hold };
+  const run = args => runNodeEntrypoint(workspace, "scripts/guest-access.js", { args, env, timeoutMs: 20000 });
+  const waitForFile = async (file) => {
+    const deadline = Date.now() + 10000;
+    while (!fs.existsSync(file)) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${file}`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+
+  fs.writeFileSync(`${hold}.armed`, "");
+  const firstRun = run(first);
+  await waitForFile(`${hold}.waiting`);
+  const secondRun = run(second);
+  await waitForFile(`${hold}.blocked`);
+  fs.writeFileSync(`${hold}.release`, "");
+  for (const result of await Promise.all([firstRun, secondRun])) {
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  }
+  return readRegistry(workspace).projects.alpha;
+}
+
+test("concurrent guest grants both survive", async () => {
+  const alpha = await overlappingGuestChanges(["grant", "alpha", "333333333333333333"], ["grant", "alpha", "444444444444444444"]);
+
+  assert.deepEqual([...alpha.guest_user_ids].sort(), [GUEST_ID, "333333333333333333", "444444444444444444"]);
+  assert.equal(alpha.guest_role_id, "existing-role");
+});
+
+test("an invite overlapping a revoke does not restore the revoked guest or their invites", async () => {
+  const alpha = await overlappingGuestChanges(["revoke", "alpha", GUEST_ID], ["invite", "alpha", "333333333333333333"]);
+
+  assert.deepEqual(alpha.guest_user_ids, ["333333333333333333"]);
+  assert.deepEqual(Object.keys(alpha.guest_invites), ["333333333333333333"]);
+});
