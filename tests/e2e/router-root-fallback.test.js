@@ -81,6 +81,7 @@ const MODES = {
       });
       assert.equal(restarted.exitCode, 0, restarted.stderr || restarted.stdout);
       return {
+        codex,
         delivered: () => codex.clientMessages
           .filter((message) => message.method === "turn/start")
           .map((message) => message.params.input?.[0]?.text?.match(/^message_id: (\S+)$/m)?.[1])
@@ -117,7 +118,9 @@ for (const [mode, { launch }] of Object.entries(MODES)) {
     owner(workspace, { id: "in-fallback", channelId: "root-channel", content: "status?" });
     injectDiscordMessage(workspace, { id: "helper-fallback", channelId: "other-root-channel", content: "and here?",
       author: { id: "helper-id", username: "Helper" } });
-    await waitFor(() => root.delivered().length >= 2, () => "the fallback deliveries", 15000);
+    await waitFor(() => root.delivered().length >= 2, () => `the fallback deliveries; delivered ${JSON.stringify(root.delivered())}` +
+      (root.codex ? `; Codex requests ${JSON.stringify(root.codex.clientMessages.map((message) => message.method ?? `response:${message.id}`))}` : "") +
+      `; discord ${JSON.stringify(readState(workspace.stateDir).fixtures.discord.injectedMessages.map(({ id, delivered }) => [id, delivered]))}`, 15000);
     assert.deepEqual(root.delivered(), ["in-fallback", "helper-fallback"]);
 
     // A message sent while the Router comes back is delivered once, and the

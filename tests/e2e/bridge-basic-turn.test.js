@@ -540,18 +540,23 @@ test("bridge text fallback is opt-in for completed assistant items without MCP r
   });
 
   await flaggedBridge.waitForOutput(/Listening in #alpha/, 7000);
+  // Each fallback reply posts before its turn ends; wait for the bridge to go
+  // idle so the next message starts its own turn instead of steering.
+  await waitForFinishedTurns(flaggedBridge, 1); // the transport bootstrap
   await injectMessageUntil(
     flagged,
     { content: "no deltas", id: "no-deltas" },
     (nextState) => nextState.fixtures.discord.messages.length === 1,
     5000,
   );
+  await waitForFinishedTurns(flaggedBridge, 2);
   await injectMessageUntil(
     flagged,
     { content: "completed before turn", id: "completed-before-turn" },
     (nextState) => nextState.fixtures.discord.messages.length === 2,
     5000,
   );
+  await waitForFinishedTurns(flaggedBridge, 3);
   await injectMessageUntil(
     flagged,
     { content: "message field", id: "message-field" },
@@ -906,12 +911,15 @@ test("bridge finishes a mismatched turn that only completes an assistant item", 
   });
 
   await bridge.waitForOutput(/Listening in #alpha/, 7000);
+  await waitForFinishedTurns(bridge, 1); // the transport bootstrap
   await injectMessageUntil(
     workspace,
     { content: "first", id: "completed-only-mismatch" },
     (nextState) => replyContents(nextState).includes("completed-only reply"),
     5000,
   );
+  // The reply posts before the turn ends; the second message must start its own turn.
+  await waitForFinishedTurns(bridge, 2);
   const state = await injectMessageUntil(
     workspace,
     { content: "second", id: "after-completed-only" },
@@ -951,12 +959,15 @@ test("bridge ignores stale turn notifications before and after the current turn 
   });
 
   await bridge.waitForOutput(/Listening in #alpha/, 7000);
+  await waitForFinishedTurns(bridge, 1); // the transport bootstrap
   await injectMessageUntil(
     workspace,
     { content: "first", id: "first-turn" },
     (state) => replyContents(state).includes("first done"),
     5000,
   );
+  // The reply posts before the turn ends; the second message must start its own turn.
+  await waitForFinishedTurns(bridge, 2);
   await injectMessageUntil(
     workspace,
     { content: "second", id: "second-turn" },
