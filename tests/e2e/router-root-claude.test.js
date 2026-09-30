@@ -153,7 +153,7 @@ test("a root launch whose Router hello fails exits non-zero and removes root's k
   const restarted = await restartRoot(workspace, { CCDM_CLAUDE_LAUNCH_TIMEOUT_S: "10" });
 
   assert.notEqual(restarted.exitCode, 0, restarted.stdout);
-  assert.match(restarted.stderr, /Router hello failed: unauthorized/, JSON.stringify(restarted));
+  assert.match(restarted.stderr, /Router hello failed: unauthorized/);
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent, undefined);
   assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", ".root.key")), false);
 });
