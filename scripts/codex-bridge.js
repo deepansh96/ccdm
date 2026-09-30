@@ -25,6 +25,8 @@ const routerPaths = require("./router/paths.js");
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const PROJECT_DIR = process.env.PROJECT_DIR;
 const WS_PORT = parseInt(process.env.WS_PORT || "18300", 10);
+// Root mode only: a project bridge trusts the Router, which authorizes the
+// owner and current guests from the hot-reloaded registry.
 const ALLOWED_USER_IDS = new Set(
   (process.env.ALLOWED_USER_IDS || process.env.ALLOWED_USER_ID || "")
     .split(",")
@@ -347,7 +349,9 @@ async function shouldHandleDiscordMessage(msg) {
   // from allowed users and the owner's mentions in project channels.
   if (ROOT_MULTI_CHANNEL) return true;
   if (msg.channel.id !== CHANNEL_ID) return false;
-  if (ALLOWED_USER_IDS.size > 0 && !ALLOWED_USER_IDS.has(msg.author.id)) return false;
+  // The Router authorizes authors from the registry it hot-reloads, so it
+  // forwards only the owner and the channel's current guests; a launch-time
+  // allowlist here would drop guests granted after launch.
   if (mentionsRootBot(msg)) return false;
   return true;
 }
@@ -355,10 +359,8 @@ async function shouldHandleDiscordMessage(msg) {
 async function shouldHandleDiscordReaction(channelId, user) {
   if (user.bot) return false;
   if (!channelId) return false;
-  if (!ROOT_MULTI_CHANNEL) {
-    return channelId === CHANNEL_ID &&
-      (ALLOWED_USER_IDS.size === 0 || ALLOWED_USER_IDS.has(user.id));
-  }
+  // A project's reactors are authorized by the Router, like its messages.
+  if (!ROOT_MULTI_CHANNEL) return channelId === CHANNEL_ID;
 
   try {
     await loadRootAccess(false);
