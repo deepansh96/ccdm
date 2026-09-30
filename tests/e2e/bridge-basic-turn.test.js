@@ -447,6 +447,9 @@ test("bridge covers filtering, fallback splitting, MCP reply suppression, and th
   });
 
   await bridge.waitForOutput(/Listening in #alpha/, 7000);
+  // Each reply lands before its turn ends; the next message must wait for the
+  // bridge to go idle, or it is steered into the finished turn.
+  await waitForFinishedTurns(bridge, 1); // the transport bootstrap
   await injectMessageUntil(
     workspace,
     { author: { id: "other-user" }, content: "ignore me", id: "ignore-user" },
@@ -472,22 +475,22 @@ test("bridge covers filtering, fallback splitting, MCP reply suppression, and th
     5000,
   );
   // The fake records the reply before the Router acknowledges it to the
-  // bridge, which ends the turn only then; let it settle before the next turn.
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  // bridge, which ends the turn only then.
+  await waitForFinishedTurns(bridge, 2);
   await injectMessageUntil(
     workspace,
     { content: "mcp will reply", id: "mcp-message" },
     (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === "mcp-message"),
     5000,
   );
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  await waitForFinishedTurns(bridge, 3);
   await injectMessageUntil(
     workspace,
     { content: "mcp will react", id: "react-message" },
     (nextState) => nextState.fixtures.discord.deliveredMessages.some((message) => message.id === "react-message"),
     5000,
   );
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  await waitForFinishedTurns(bridge, 4);
   const state = await injectMessageUntil(
     workspace,
     { content: "usage", id: "usage-message" },
@@ -1693,6 +1696,15 @@ async function waitFor(predicate, timeoutMs = 1000) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error("Timed out waiting for condition");
+}
+
+// The bridge logs each turn's end once it is idle and will start, not steer, a turn.
+async function waitForFinishedTurns(bridge, count, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while ((bridge.stdout.match(/\[turn\] Finished /g) ?? []).length < count) {
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${count} finished turn(s); stdout:\n${bridge.stdout}`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
 }
 
 async function injectMessageUntil(workspace, message, predicate, timeoutMs = 5000) {

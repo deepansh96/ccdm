@@ -803,6 +803,8 @@ async function onTurnCompleted(turn = {}) {
   activeOutputChannelId = null;
   await clearDiscordChannelScope();
   turnActive = false;
+  // From here a new Discord message starts a turn instead of steering this one.
+  console.log(`[turn] Finished (${turn.status ?? "no status"}); bridge idle`);
   if (outputSuppressed && bootstrapCompletion) {
     const complete = bootstrapCompletion;
     bootstrapCompletion = null;

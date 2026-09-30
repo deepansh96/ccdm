@@ -393,6 +393,16 @@ async function serveClaude(workspace) {
   const result = await runRouterCli(workspace, ["ensure-webhook", "claude-demo"]);
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   writeProjectKey(workspace, "claude-demo", "claude-demo-key");
+  // The running Router picks up the new webhook on its debounced registry
+  // reload; the installer's preflight reads it from `router status`.
+  const deadline = Date.now() + 10000;
+  for (;;) {
+    const status = await runRouterCli(workspace, ["status", "--json"]);
+    const row = status.exitCode === 0 && JSON.parse(status.stdout).projects.find((next) => next.project === "claude-demo");
+    if (row?.webhook) return;
+    if (Date.now() > deadline) throw new Error(`Router never reported claude-demo's webhook: ${status.stdout}${status.stderr}`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
 }
 
 // One Claude turn through the real CCDM channel server behind the Router: the

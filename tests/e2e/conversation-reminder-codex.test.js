@@ -319,6 +319,8 @@ test("an input-needed reply during active work pauses when the owner resumes", a
   assert.equal(JSON.parse(reply.stdout).result.content[0].text, "sent (id: fake-message-1)");
   injectDiscordMessage(workspace, { id: "resume-message", content: "Option A" });
   await waitForState(workspace, (state) => state.fixtures.discord.deliveredMessages.some((message) => message.id === "resume-message"));
+  // The resume is recorded after the steer; wait for it, then settle for any stray event.
+  await waitForEvents(workspace, (rows) => rows.some((event) => event.event_type === "work_resumed"));
   await new Promise((resolve) => setTimeout(resolve, 150));
   const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
   const events = JSON.parse(result.stdout).events;
@@ -405,6 +407,8 @@ test("a bridge management command records owner activity without a response comp
   await bridge.waitForOutput(/Listening in #demo/, 7000);
   injectDiscordMessage(workspace, { id: "pause-command", content: "/pause" });
   await waitForState(workspace, (state) => state.fixtures.discord.deliveredMessages.some((message) => message.id === "pause-command"));
+  await waitForEvents(workspace, (rows) => rows.length >= 1);
+  // Settle so a wrongly recorded completion or turn would show up.
   await new Promise((resolve) => setTimeout(resolve, 100));
   const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
   const events = JSON.parse(result.stdout).events;
@@ -516,8 +520,9 @@ test("attachment replies and successful optional text fallback produce confirmed
   await new Promise((resolve) => setTimeout(resolve, 100));
   injectDiscordMessage(workspace, { id: "fallback-owner", content: "plain answer" });
   await waitForState(workspace, (state) => state.fixtures.discord.messages.some((row) => row.content === "fallback answer" && row.webhookId === "fake-webhook-1"));
-  const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  const receipts = JSON.parse(result.stdout).events.filter((event) => event.event_type === "response_delivered");
+  // The fallback's receipt is recorded after its Discord post lands.
+  const receipts = (await waitForEvents(workspace, (rows) => rows.filter((event) => event.event_type === "response_delivered").length >= 2))
+    .filter((event) => event.event_type === "response_delivered");
   assert.equal(receipts.length, 2);
   assert.equal(receipts[0].message_id, "fake-message-1");
   assert.equal(receipts[1].message_id, "fake-message-2");
@@ -541,7 +546,9 @@ test("exact mention forms of /close are consumed, including a guest command", as
   await waitForState(workspace, (state) => state.fixtures.discord.deliveredMessages.length === 3);
   const events = await waitForEvents(workspace, (rows) => rows.length >= 2);
   await new Promise((resolve) => setTimeout(resolve, 150));
-  assert.deepEqual(events.map((event) => event.source_message_id), ["root-mention-close", "root-bang-mention-close"]);
+  // The bridge handles Discord messages concurrently, so two closes may commit
+  // in either order; each exact mention form is recorded once.
+  assert.deepEqual(events.map((event) => event.source_message_id).sort(), ["root-bang-mention-close", "root-mention-close"]);
   assert.deepEqual(events.map((event) => event.event_type), ["close_requested", "close_requested"]);
   assert.equal(codex.clientMessages.filter((message) => message.method === "turn/start").length, 1);
   await worker.stop();
