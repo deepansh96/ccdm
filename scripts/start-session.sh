@@ -309,11 +309,11 @@ prompt = re.compile(r"development channels?", re.IGNORECASE)
 
 accepted = False
 while time.monotonic() < deadline:
-    pane = subprocess.run(["tmux", "capture-pane", "-t", f"={screen}", "-p"], capture_output=True, text=True)
+    pane = subprocess.run(["tmux", "capture-pane", "-t", f"={screen}:", "-p"], capture_output=True, text=True)
     if pane.returncode != 0:
         sys.exit("Claude exited before the development-channel confirmation")
     if prompt.search(pane.stdout):
-        subprocess.run(["tmux", "send-keys", "-t", f"={screen}", "Enter"], check=True)
+        subprocess.run(["tmux", "send-keys", "-t", f"={screen}:", "Enter"], check=True)
         accepted = True
         break
     time.sleep(0.2)

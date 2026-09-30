@@ -319,7 +319,7 @@ function updateState(updater) {
 }
 
 function normalizeSessionTarget(value) {
-  return String(value || "").replace(/^=/, "");
+  return String(value || "").replace(/^=/, "").replace(/:.*$/, "");
 }
 
 function isAlive(pid) {
