@@ -8,7 +8,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { createWorkspace, runScript } from "./support/runner.js";
-import { readState, writeState } from "./support/state.js";
+import { readState, updateState, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 
 test.afterEach(async () => {
@@ -167,16 +167,16 @@ function seedPosterWorkspace(workspace, baseUrl, extraConfig = {}) {
       projects: {},
     }, null, 2)}\n`,
   );
-  const state = readState(workspace.stateDir);
-  state.fixtures.security = {
-    credentials: {
-      "Claude Code-credentials": {
-        claudeAiOauth: { accessToken: "fixture-oauth-token" },
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.security = {
+      credentials: {
+        "Claude Code-credentials": {
+          claudeAiOauth: { accessToken: "fixture-oauth-token" },
+        },
       },
-    },
-    invocations: [],
-  };
-  writeState(state, workspace.stateDir);
+      invocations: [],
+    };
+  });
 }
 
 test("poster posts a Claude usage embed through the configured Discord endpoint", async () => {
@@ -622,9 +622,9 @@ async function runPosterWithDefaultHomeCredentials(credentialsFor) {
   const api = await startPosterApi();
   seedPosterWorkspace(workspace, api.baseUrl);
   const hashedService = serviceFor(path.join(workspace.homeDir, ".claude"));
-  const state = readState(workspace.stateDir);
-  state.fixtures.security.credentials = credentialsFor(hashedService);
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.security.credentials = credentialsFor(hashedService);
+  });
 
   const result = await runScript(workspace, "scripts/usage-stats-poster.py");
 

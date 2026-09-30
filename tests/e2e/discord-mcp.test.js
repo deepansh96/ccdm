@@ -15,7 +15,7 @@ import {
   writeRootKey,
 } from "./support/router.js";
 import { runNodeEntrypoint } from "./support/runner.js";
-import { readState, writeState } from "./support/state.js";
+import { readState, updateState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 
 test.afterEach(async () => {
@@ -126,16 +126,16 @@ function responseById(result) {
 
 // Channel history as Discord returns it: newest first.
 function seedHistory(workspace, channelId, messages) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.history ||= {};
-  state.fixtures.discord.history[channelId] = messages;
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.history ||= {};
+    state.fixtures.discord.history[channelId] = messages;
+  });
 }
 
 function seedDiscord(workspace, update) {
-  const state = readState(workspace.stateDir);
-  update(state.fixtures.discord);
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    update(state.fixtures.discord);
+  });
 }
 
 function webhookMessages(workspace) {

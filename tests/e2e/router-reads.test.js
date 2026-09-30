@@ -13,7 +13,7 @@ import {
   routerWithWebhooks,
   waitFor,
 } from "./support/router.js";
-import { readState, writeState } from "./support/state.js";
+import { readState, updateState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => {
@@ -22,10 +22,10 @@ test.afterEach(async () => {
 
 // Channel history as Discord returns it: newest first.
 function seedHistory(workspace, channelId, messages) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.history ||= {};
-  state.fixtures.discord.history[channelId] = messages;
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.history ||= {};
+    state.fixtures.discord.history[channelId] = messages;
+  });
 }
 
 const DEMO_HISTORY = [
@@ -144,9 +144,9 @@ const FRESH_URL = "https://cdn.discordapp.com/attachments/demo-channel/a7/plan.t
 const STALE_URL = "https://cdn.discordapp.com/attachments/demo-channel/a7/plan.txt?ex=00000002&is=00000001&hm=stale";
 
 function seedCdn(workspace, url, body) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.attachments[url] = { body };
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.attachments[url] = { body };
+  });
 }
 
 test("download_attachment returns the event's signed CDN URL while it is fresh, and the fake CDN serves it", async () => {

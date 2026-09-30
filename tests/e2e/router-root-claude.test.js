@@ -16,7 +16,7 @@ import {
   runRouterCli,
   waitFor,
 } from "./support/router.js";
-import { readState, writeState } from "./support/state.js";
+import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => {
@@ -81,11 +81,11 @@ test("owner messages in a root channel and owner bot mentions in a project chann
 test("root Claude's reply into a project channel posts as the root bot, not a webhook", async () => {
   const workspace = rootWorkspace();
   await routerWithWebhooks(workspace, ["demo"]);
-  const state = readState(workspace.stateDir);
-  state.fixtures.claude.toolScript = [
-    { name: "reply", arguments: { chat_id: "demo-channel", text: "restarting demo now" } },
-  ];
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.claude.toolScript = [
+      { name: "reply", arguments: { chat_id: "demo-channel", text: "restarting demo now" } },
+    ];
+  });
   const restarted = await restartRoot(workspace);
   assert.equal(restarted.exitCode, 0, restarted.stderr || restarted.stdout);
 

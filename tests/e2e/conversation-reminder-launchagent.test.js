@@ -10,7 +10,7 @@ import { routerEnv, runRouterCli, startBridge, startRouter, waitFor, writeProjec
 import {
   bridgeChildEnv, createBridgeWorkspace, injectDiscordMessage, startFakeCodexServer, waitForState,
 } from "./support/bridge.js";
-import { readState, writeState } from "./support/state.js";
+import { readState, updateState, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 
 test.afterEach(async () => cleanup());
@@ -193,9 +193,9 @@ test("a failed replacement load restores the previous plist and loaded service",
   const otherNode = path.join(workspace.tmpDir, "node-bin", "node");
   fs.mkdirSync(path.dirname(otherNode));
   fs.symlinkSync(process.execPath, otherNode);
-  const state = readState(workspace.stateDir);
-  state.fixtures.launchctl.loadFailuresRemaining = 1;
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.launchctl.loadFailuresRemaining = 1;
+  });
 
   const result = await install(workspace, { ...context, env: { ...context.env, CCDM_REMINDER_NODE: otherNode } });
 
@@ -592,16 +592,16 @@ test("Claude and Codex complete reply, reminder, and reply or close through the 
   await warmup.stop();
   const claude = await claudeTurn(workspace, context, { messageId: "claude-question" });
   const codex = await codexTurn(workspace, codexBridge, "codex-question");
-  const history = readState(workspace.stateDir);
-  history.fixtures.discord.history["claude-channel"].unshift(
-    webhookMessage(claude.answerId, at(0), CLAUDE_WEBHOOK), historyMessage("claude-question", at(-1000), "owner-id"),
-    webhookMessage(warmup.answerId, at(-5 * 60000), CLAUDE_WEBHOOK),
-    historyMessage("claude-warmup", at(-6 * 60000), "owner-id"));
-  history.fixtures.discord.history["codex-channel"].unshift(
-    // The Codex answer is the project's own webhook message.
-    webhookMessage(codex.answerId, at(0), "fake-webhook-1"),
-    historyMessage("codex-question", at(-1000), "owner-id"));
-  writeState(history, workspace.stateDir);
+  const history = updateState(workspace.stateDir, (history) => {
+    history.fixtures.discord.history["claude-channel"].unshift(
+      webhookMessage(claude.answerId, at(0), CLAUDE_WEBHOOK), historyMessage("claude-question", at(-1000), "owner-id"),
+      webhookMessage(warmup.answerId, at(-5 * 60000), CLAUDE_WEBHOOK),
+      historyMessage("claude-warmup", at(-6 * 60000), "owner-id"));
+    history.fixtures.discord.history["codex-channel"].unshift(
+      // The Codex answer is the project's own webhook message.
+      webhookMessage(codex.answerId, at(0), "fake-webhook-1"),
+      historyMessage("codex-question", at(-1000), "owner-id"));
+  });
 
   // Re-enable reconciles before any send; at +30 minutes nothing is due yet.
   await service(workspace, context, "enable");
@@ -645,12 +645,12 @@ test("Claude and Codex complete reply, reminder, and reply or close through the 
   // A supervised restart preserves the closure and the paused conversation.
   await service(workspace, context, "disable");
   assert.equal((await supervised).exitCode, 0);
-  const restartHistory = readState(workspace.stateDir);
-  restartHistory.fixtures.discord.history["claude-channel"].unshift(
-    historyMessage("claude-reply", at(62 * 60000), "owner-id", "Option A"));
-  restartHistory.fixtures.discord.history["codex-channel"].unshift(
-    historyMessage("codex-close", at(62 * 60000), "owner-id", "/close"));
-  writeState(restartHistory, workspace.stateDir);
+  updateState(workspace.stateDir, (restartHistory) => {
+    restartHistory.fixtures.discord.history["claude-channel"].unshift(
+      historyMessage("claude-reply", at(62 * 60000), "owner-id", "Option A"));
+    restartHistory.fixtures.discord.history["codex-channel"].unshift(
+      historyMessage("codex-close", at(62 * 60000), "owner-id", "/close"));
+  });
   await service(workspace, context, "enable");
   context.setClock(at(5 * 3600000));
   supervised = launchAsSupervisor(workspace, context);

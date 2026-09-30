@@ -6,7 +6,7 @@ import test from "node:test";
 
 import { runScript } from "./support/runner.js";
 import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerEnv, runRouterCli, startRouter } from "./support/router.js";
-import { readState, writeState } from "./support/state.js";
+import { readState, updateState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => cleanup());
@@ -84,10 +84,10 @@ async function pooledHistory(context) {
   sql(context, `UPDATE conversations SET reconciliation_status='ready', identity='pool:bot',
     reminder_message_id='pool-reminder', due_at='2026-09-24T13:00:00Z', consecutive_reminders=1,
     revision=revision+1`);
-  const state = readState(context.workspace.stateDir);
-  state.fixtures.discord.messages = [...(state.fixtures.discord.messages ?? []), { id: "pool-reminder",
-    channelId: "demo-channel", authorization: "Bot pool-bot-token", content: "👀" }];
-  writeState(state, context.workspace.stateDir);
+  updateState(context.workspace.stateDir, (state) => {
+    state.fixtures.discord.messages = [...(state.fixtures.discord.messages ?? []), { id: "pool-reminder",
+      channelId: "demo-channel", authorization: "Bot pool-bot-token", content: "👀" }];
+  });
 }
 
 async function waitForStatus(context, predicate) {
@@ -214,9 +214,9 @@ test("status and preflight name each missing router prerequisite with its fix, a
     { ready: false, blockers: permissions.map((line) => line.slice("demo: ".length)) });
   assert.deepEqual((await preflight()).blockers, permissions);
 
-  const granted = readState(context.workspace.stateDir);
-  delete granted.fixtures.discord.permissionDenials;
-  writeState(granted, context.workspace.stateDir);
+  updateState(context.workspace.stateDir, (granted) => {
+    delete granted.fixtures.discord.permissionDenials;
+  });
   assert.deepEqual(routerBlockers(await service(context, "status")), { ready: true, blockers: [] });
   const ready = await preflight();
   assert.deepEqual([ready.exitCode, ready.status, ready.blockers], [0, "ok", []]);

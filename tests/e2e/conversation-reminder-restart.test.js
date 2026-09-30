@@ -6,7 +6,7 @@ import test from "node:test";
 import { runScript } from "./support/runner.js";
 import { injectDiscordMessage, waitForState } from "./support/bridge.js";
 import { ROOT_TOKEN, createRouterWorkspace, routerEnv, runRouterCli, startRouter } from "./support/router.js";
-import { readState, writeState } from "./support/state.js";
+import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => cleanup());
@@ -61,17 +61,17 @@ function answered(name, prefix = name) {
 }
 
 function seedHistory(workspace, history, extra = {}) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.history = history;
-  Object.assign(state.fixtures.discord, extra);
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.history = history;
+    Object.assign(state.fixtures.discord, extra);
+  });
 }
 
 // A message sent while nothing observed the Router exists only in history.
 function missed(workspace, channelId, raw) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.history[channelId].unshift(raw);
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.history[channelId].unshift(raw);
+  });
 }
 
 async function command(workspace, context, name, extra = []) {
@@ -239,13 +239,13 @@ test("missed owner activity and provider replay are applied before any catch-up 
 
   // Downtime, 10:00-15:20. Nothing observes the Router.
   missed(workspace, "closed-channel", message("closed-3", "2026-09-20T10:00:00Z", "owner", "/close"));
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.history["reacted-channel"][0].reactions = [{ emoji: { name: "party", id: "77" }, count: 1 }];
-  state.fixtures.discord.history["ambiguous-channel"][1].reactions = [{ emoji: { name: "👍" }, count: 1 }];
-  state.fixtures.discord.reactionUsers = { "reacted-2|party:77": ["owner"], "ambiguous-p|👍": ["owner"] };
-  state.fixtures.discord.restFailures = [{ method: "GET", path: "/api/v10/channels/denied-channel/messages",
-    status: 403 }];
-  writeState(state, workspace.stateDir);
+  const state = updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.history["reacted-channel"][0].reactions = [{ emoji: { name: "party", id: "77" }, count: 1 }];
+    state.fixtures.discord.history["ambiguous-channel"][1].reactions = [{ emoji: { name: "👍" }, count: 1 }];
+    state.fixtures.discord.reactionUsers = { "reacted-2|party:77": ["owner"], "ambiguous-p|👍": ["owner"] };
+    state.fixtures.discord.restFailures = [{ method: "GET", path: "/api/v10/channels/denied-channel/messages",
+      status: 403 }];
+  });
   // A still-running Codex bridge answered a new owner message and durably recorded it.
   missed(workspace, "replayed-channel", message("replayed-3", "2026-09-20T12:00:00Z", "owner", "One more"));
   missed(workspace, "replayed-channel", message("replayed-4", "2026-09-20T12:05:00Z", hook("replayed"), "Answered"));
@@ -300,10 +300,10 @@ test("a rate limit outranks catch-up spacing, and a restart during catch-up cann
   const { workspace, context } = await setup(Object.fromEntries(names.map(name => [name, `${name}-channel`])));
   seedHistory(workspace, Object.fromEntries(names.map(name => [`${name}-channel`, answered(name)])));
   await discoveredThenStopped(workspace, context, names);
-  const seed = readState(workspace.stateDir);
-  seed.fixtures.discord.restFailures = [{ method: "POST", path: "/api/v10/channels/alpha-channel/messages",
-    status: 429, body: { retry_after: 60, global: true } }];
-  writeState(seed, workspace.stateDir);
+  updateState(workspace.stateDir, (seed) => {
+    seed.fixtures.discord.restFailures = [{ method: "POST", path: "/api/v10/channels/alpha-channel/messages",
+      status: 429, body: { retry_after: 60, global: true } }];
+  });
 
   await command(workspace, context, "enable");
   context.setClock("2026-09-20T15:20:00Z");
@@ -395,10 +395,10 @@ test("a queued catch-up honors an owner reply and a deregistration before its tu
   const queued = await waitForStatus(workspace, context, current => current.conversations.alpha.reminder_message_id);
   assert.deepEqual(names.map(name => queued.conversations[name].catch_up_queued), [false, true, true]);
 
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.history["beta-channel"].unshift(
-    message("beta-3", "2026-09-20T15:20:02Z", "owner", "Seen it, thanks"));
-  writeState(state, workspace.stateDir);
+  const state = updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.history["beta-channel"].unshift(
+      message("beta-3", "2026-09-20T15:20:02Z", "owner", "Seen it, thanks"));
+  });
   injectDiscordMessage(workspace, { id: "beta-3", channelId: "beta-channel", content: "Seen it, thanks",
     author: { id: "owner" } });
   const registryPath = path.join(workspace.repoDir, "registry.json");
@@ -471,10 +471,10 @@ test("a catch-up waits for the cleanup backlog left before downtime", async () =
   context.setClock("2026-09-20T09:05:00Z");
   await waitForState(workspace, state => reminders(state).length === 1, 20000);
   await waitForStatus(workspace, context, current => current.conversations.alpha.due_at === "2026-09-20T11:05:00Z");
-  const seed = readState(workspace.stateDir);
-  const failure = { method: "DELETE", path: "/api/v10/channels/alpha-channel/messages/fake-message-1", status: 500 };
-  seed.fixtures.discord.restFailures = [failure, failure];
-  writeState(seed, workspace.stateDir);
+  updateState(workspace.stateDir, (seed) => {
+    const failure = { method: "DELETE", path: "/api/v10/channels/alpha-channel/messages/fake-message-1", status: 500 };
+    seed.fixtures.discord.restFailures = [failure, failure];
+  });
   context.setClock("2026-09-20T11:05:00Z");
   await waitForState(workspace, state => state.fixtures.discord.restFailureUses?.length === 1, 20000);
   await stopWorker(workspace, context, first);
@@ -508,20 +508,20 @@ test("an uncertain delivery stays gated through restart until its nonce replay r
   const first = startWorker(workspace, context);
   await waitForStatus(workspace, context, current => ["alpha", "beta"].every(name =>
     current.conversations[name]?.reconciliation_status === "ready"));
-  const seed = readState(workspace.stateDir);
-  seed.fixtures.discord.crashAfterReminderAccept = true;
-  // History briefly lags the accepted reminder.
-  seed.fixtures.discord.includeSentInHistory = false;
-  writeState(seed, workspace.stateDir);
+  updateState(workspace.stateDir, (seed) => {
+    seed.fixtures.discord.crashAfterReminderAccept = true;
+    // History briefly lags the accepted reminder.
+    seed.fixtures.discord.includeSentInHistory = false;
+  });
   context.setClock("2026-09-20T09:05:00Z");
   assert.equal((await first).exitCode, 2);
   assert.equal(reminders(readState(workspace.stateDir)).length, 1);
 
   // Until a nonce replay returns the accepted reminder, alpha stays gated while
   // beta reconciles normally. History never shows the reminder here.
-  const losing = readState(workspace.stateDir);
-  losing.fixtures.discord.restLoseResponse = 30;
-  writeState(losing, workspace.stateDir);
+  updateState(workspace.stateDir, (losing) => {
+    losing.fixtures.discord.restLoseResponse = 30;
+  });
   await command(workspace, context, "enable");
   context.setClock("2026-09-20T09:06:00Z");
   const second = startWorker(workspace, context);
@@ -535,9 +535,9 @@ test("an uncertain delivery stays gated through restart until its nonce replay r
 
   // Once a replay inside Discord's duplicate-check window is answered, it
   // returns the 09:05 reminder itself; the worker records it and reconciles.
-  const answering = readState(workspace.stateDir);
-  answering.fixtures.discord.restLoseResponse = false;
-  writeState(answering, workspace.stateDir);
+  updateState(workspace.stateDir, (answering) => {
+    answering.fixtures.discord.restLoseResponse = false;
+  });
   const adopted = await waitForStatus(workspace, context, current =>
     current.conversations.alpha.reminder_message_id === "fake-message-1" &&
     current.conversations.alpha.reconciliation_status === "ready", 800);
@@ -563,9 +563,9 @@ test("an interrupted restart scan resumes from its checkpoint before releasing t
   }).reverse() });
   await discoveredThenStopped(workspace, context, ["alpha"]);
   const before = readState(workspace.stateDir).fixtures.discord.historyFetches.length;
-  const seed = readState(workspace.stateDir);
-  seed.fixtures.discord.crashAfterHistoryPages = 2;
-  writeState(seed, workspace.stateDir);
+  updateState(workspace.stateDir, (seed) => {
+    seed.fixtures.discord.crashAfterHistoryPages = 2;
+  });
 
   await command(workspace, context, "enable");
   context.setClock("2026-09-20T15:20:00Z");

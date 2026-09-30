@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 import test from "node:test";
 
 import { connectSession, createRouterWorkspace, routerWithWebhooks } from "./support/router.js";
-import { readState, writeState } from "./support/state.js";
+import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => {
@@ -19,9 +19,9 @@ function demoExecutePath(workspace) {
 
 // Scripts the fake to answer matching requests with 429s; `count: null` never stops.
 function scriptRateLimit(workspace, rule) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.rateLimits = [...(state.fixtures.discord.rateLimits ?? []), rule];
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.rateLimits = [...(state.fixtures.discord.rateLimits ?? []), rule];
+  });
 }
 
 function webhookMessages(workspace) {

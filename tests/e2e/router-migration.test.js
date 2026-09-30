@@ -6,7 +6,7 @@ import test from "node:test";
 import { startFakeCodexServer } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import { OWNER_ID, createRouterWorkspace, routerEnv, runRouterCli, startRouter } from "./support/router.js";
-import { readState, seedTmuxSession, writeState } from "./support/state.js";
+import { readState, seedTmuxSession, updateState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => {
@@ -165,9 +165,9 @@ test("a verify failure after the stop rolls back to the previous registry state,
   const running = await startClaude(workspace);
   assert.equal(running.exitCode, 0, running.stderr || running.stdout);
   // The probe comes back under another webhook, so verification fails.
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.webhookExecuteReturnsWebhookId = "someone-elses-webhook";
-  writeState(state, workspace.stateDir);
+  const state = updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.webhookExecuteReturnsWebhookId = "someone-elses-webhook";
+  });
 
   const result = await migrate(workspace, ["demo"]);
 

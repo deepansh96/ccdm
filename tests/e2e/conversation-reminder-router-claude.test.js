@@ -12,7 +12,7 @@ import {
   routerEnv,
   routerWithWebhooks,
 } from "./support/router.js";
-import { readState, writeState } from "./support/state.js";
+import { readState, updateState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => {
@@ -128,9 +128,9 @@ test("a router Claude reply and Stop hook get a 👀 from root with a nonce, an 
   assert.equal(typeof reminder.requestBody.nonce, "string");
 
   // The owner's reply clears the reminder; Claude keeps working without answering.
-  const quiet = readState(workspace.stateDir);
-  delete quiet.fixtures.claude.toolScript;
-  writeState(quiet, workspace.stateDir);
+  updateState(workspace.stateDir, (quiet) => {
+    delete quiet.fixtures.claude.toolScript;
+  });
   injectDiscordMessage(workspace, { id: "reply-1", channelId: "demo-channel", author: owner, content: "thanks, go on" });
   const cleared = await waitForStatus(context, (current) => current.conversations.demo.state === "open-paused" &&
     current.conversations.demo.cleanup_message_ids.length === 0 && !current.conversations.demo.reminder_message_id);

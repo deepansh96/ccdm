@@ -15,7 +15,7 @@ import {
   routerWithWebhooks,
   waitFor,
 } from "./support/router.js";
-import { readState, writeState } from "./support/state.js";
+import { readState, updateState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 
 test.afterEach(async () => {
@@ -165,22 +165,22 @@ test("history detects a router agent reply only by the project's own webhook_id"
   const context = reminderRouterWorkspace();
   const { workspace } = context;
   await routerWithWebhooks(workspace, ["demo", "beta"]);
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.history = {
-    // Another project's webhook message and a bot message without a webhook are not answers.
-    "demo-channel": [
-      historyMessage("d3", "2026-09-20T08:05:00Z", { id: "fake-webhook-2", bot: true }, "beta answer",
-        { webhook_id: "fake-webhook-2" }),
-      historyMessage("d2", "2026-09-20T08:04:00Z", { id: "stray-bot", bot: true }, "some bot"),
-      historyMessage("d1", "2026-09-20T08:00:00Z", { id: OWNER_ID }, "Question?"),
-    ],
-    "beta-channel": [
-      historyMessage("b2", "2026-09-20T08:05:00Z", { id: "fake-webhook-2", bot: true }, "Answer",
-        { webhook_id: "fake-webhook-2" }),
-      historyMessage("b1", "2026-09-20T08:00:00Z", { id: OWNER_ID }, "Question?"),
-    ],
-  };
-  writeState(state, workspace.stateDir);
+  const state = updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.history = {
+      // Another project's webhook message and a bot message without a webhook are not answers.
+      "demo-channel": [
+        historyMessage("d3", "2026-09-20T08:05:00Z", { id: "fake-webhook-2", bot: true }, "beta answer",
+          { webhook_id: "fake-webhook-2" }),
+        historyMessage("d2", "2026-09-20T08:04:00Z", { id: "stray-bot", bot: true }, "some bot"),
+        historyMessage("d1", "2026-09-20T08:00:00Z", { id: OWNER_ID }, "Question?"),
+      ],
+      "beta-channel": [
+        historyMessage("b2", "2026-09-20T08:05:00Z", { id: "fake-webhook-2", bot: true }, "Answer",
+          { webhook_id: "fake-webhook-2" }),
+        historyMessage("b1", "2026-09-20T08:00:00Z", { id: OWNER_ID }, "Question?"),
+      ],
+    };
+  });
   await service(context, "enable");
   context.setClock("2026-09-20T08:30:00Z");
   const running = startWorker(context);
@@ -217,9 +217,9 @@ test("a router Codex reply is reminded as root with a nonce, deduped, cleared by
   const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
   registry.projects.demo.ws_port = codex.port;
   fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
-  const seed = readState(workspace.stateDir);
-  seed.fixtures.discord.history = { "demo-channel": [], "beta-channel": [] };
-  writeState(seed, workspace.stateDir);
+  updateState(workspace.stateDir, (seed) => {
+    seed.fixtures.discord.history = { "demo-channel": [], "beta-channel": [] };
+  });
   await routerWithWebhooks(workspace, ["demo", "beta"]);
   const started = await runScript(workspace, "scripts/start-codex-session.sh", {
     args: ["demo"], env: routerEnv(workspace), timeoutMs: 30000,
@@ -252,9 +252,9 @@ test("a router Codex reply is reminded as root with a nonce, deduped, cleared by
   assert.equal(typeof reminder.requestBody.nonce, "string");
 
   // A lost response is retried with the same nonce; Discord returns the created reminder.
-  const lose = readState(workspace.stateDir);
-  lose.fixtures.discord.restLoseResponse = true;
-  writeState(lose, workspace.stateDir);
+  updateState(workspace.stateDir, (lose) => {
+    lose.fixtures.discord.restLoseResponse = true;
+  });
   context.setClock(at(3 * 3600000 + 61 * 60000));
   const replaced = await waitForStatus(context, (current) => current.conversations.demo.reminder_message_id &&
     current.conversations.demo.reminder_message_id !== reminder.id && current.conversations.demo.cleanup_message_ids.length === 0);

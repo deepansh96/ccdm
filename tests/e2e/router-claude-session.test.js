@@ -13,7 +13,7 @@ import {
   routerWithWebhooks,
   runRouterCli,
 } from "./support/router.js";
-import { readState, seedTmuxSession, writeState } from "./support/state.js";
+import { readState, seedTmuxSession, updateState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => {
@@ -58,9 +58,9 @@ test("start-session launches a router Claude project whose channel server says h
 test("an owner message reaches the session as a channel notification and its reply posts as demo-claude", async () => {
   const workspace = claudeRouterWorkspace();
   const router = await routerWithWebhooks(workspace, ["demo"]);
-  const state = readState(workspace.stateDir);
-  state.fixtures.claude.replyText = "on it";
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.claude.replyText = "on it";
+  });
   const started = await startSession(workspace);
   assert.equal(started.exitCode, 0, started.stderr || started.stdout);
 
@@ -134,9 +134,9 @@ function assertLaunchCleanedUp(workspace) {
 test("a launch whose development-channel confirmation never appears exits non-zero and cleans up", async () => {
   const workspace = claudeRouterWorkspace();
   await routerWithWebhooks(workspace, ["demo"]);
-  const state = readState(workspace.stateDir);
-  state.fixtures.tmux.devChannelPrompt = "never";
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.tmux.devChannelPrompt = "never";
+  });
 
   const started = await startSession(workspace, { CCDM_CLAUDE_LAUNCH_TIMEOUT_S: "1" });
 
@@ -211,9 +211,9 @@ async function ownerMessageReply(workspace, id, count) {
 test("the statusline's context percentage rides on the next reply's Project Identity without a nickname PATCH", async () => {
   const workspace = claudeRouterWorkspace();
   await routerWithWebhooks(workspace, ["demo"]);
-  const state = readState(workspace.stateDir);
-  state.fixtures.claude.replyText = "working";
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.claude.replyText = "working";
+  });
   const started = await startSession(workspace);
   assert.equal(started.exitCode, 0, started.stderr || started.stdout);
 
@@ -240,9 +240,9 @@ test("the statusline's context percentage rides on the next reply's Project Iden
 test("an unreadable context file drops the percentage rather than posting a wrong one", async () => {
   const workspace = claudeRouterWorkspace();
   await routerWithWebhooks(workspace, ["demo"]);
-  const state = readState(workspace.stateDir);
-  state.fixtures.claude.replyText = "working";
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.claude.replyText = "working";
+  });
   const started = await startSession(workspace);
   assert.equal(started.exitCode, 0, started.stderr || started.stdout);
   fs.writeFileSync(path.join(workspace.routerStateDir, "launches", "demo", "context.json"), "{not json", { mode: 0o600 });
@@ -254,10 +254,10 @@ test("an unreadable context file drops the percentage rather than posting a wron
 // channel notification.
 async function scriptedSession(workspace, toolScript, seed = () => {}) {
   const router = await routerWithWebhooks(workspace, ["demo"]);
-  const state = readState(workspace.stateDir);
-  state.fixtures.claude.toolScript = toolScript;
-  seed(state);
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.claude.toolScript = toolScript;
+    seed(state);
+  });
   const started = await startSession(workspace);
   assert.equal(started.exitCode, 0, started.stderr || started.stdout);
   return router;

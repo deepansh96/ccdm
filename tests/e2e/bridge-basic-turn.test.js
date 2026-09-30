@@ -14,7 +14,7 @@ import {
   waitForState,
 } from "./support/bridge.js";
 import { runRouterCli, startBridge } from "./support/router.js";
-import { readState, seedRegistry, writeState } from "./support/state.js";
+import { readState, seedRegistry, updateState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => {
@@ -1459,11 +1459,11 @@ test("bridge records diagnostics when Discord send fails", async () => {
 
   await bridge.waitForOutput(/Listening in #alpha/, 7000);
   // Discord refuses the Router's post through alpha's webhook.
-  const seed = readState(workspace.stateDir);
-  seed.fixtures.discord.restFailures = [
-    { method: "POST", path: ALPHA_WEBHOOK_PATH, status: 403, body: { message: "send failed" } },
-  ];
-  writeState(seed, workspace.stateDir);
+  updateState(workspace.stateDir, (seed) => {
+    seed.fixtures.discord.restFailures = [
+      { method: "POST", path: ALPHA_WEBHOOK_PATH, status: 403, body: { message: "send failed" } },
+    ];
+  });
   await injectMessageUntil(
     workspace,
     { content: "trigger send failure", id: "trigger-send-failure" },
@@ -1667,9 +1667,9 @@ test("bridge exits on a failed Router hello, app-server exit, websocket close, a
   assert.equal(await routerHasSession(helloWorkspace, "alpha"), false);
 
   const appExitWorkspace = createBridgeWorkspace();
-  let state = readState(appExitWorkspace.stateDir);
-  state.fixtures.codex.servers["65530"] = { ready: true, exitImmediately: true, exitCode: 7 };
-  writeState(state, appExitWorkspace.stateDir);
+  updateState(appExitWorkspace.stateDir, (state) => {
+    state.fixtures.codex.servers["65530"] = { ready: true, exitImmediately: true, exitCode: 7 };
+  });
   const appExitBridge = await startBridge(appExitWorkspace, { port: 65530 });
   const appExitResult = await appExitBridge.closed;
   assert.notEqual(appExitResult.exitCode, 0);

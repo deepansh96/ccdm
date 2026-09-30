@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { createWorkspace, runScript } from "./support/runner.js";
-import { readState, updateState, writeState } from "./support/state.js";
+import { readState, updateState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 import { bridgeChildEnv, createBridgeWorkspace, injectDiscordMessage, injectDiscordReaction, startFakeCodexServer, waitForState } from "./support/bridge.js";
 import { routerEnv, runRouterCli, startBridge } from "./support/router.js";
@@ -78,9 +78,9 @@ function reminderWorker(workspace) {
   let running = null;
   return {
     async start(projects) {
-      const seed = readState(workspace.stateDir);
-      seed.fixtures.discord.history = Object.fromEntries(projects.map(([, channelId]) => [channelId, []]));
-      writeState(seed, workspace.stateDir);
+      updateState(workspace.stateDir, (seed) => {
+        seed.fixtures.discord.history = Object.fromEntries(projects.map(([, channelId]) => [channelId, []]));
+      });
       await service("enable");
       running = runScript(workspace, "scripts/conversation-reminder-service.py", {
         args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir], env, timeoutMs: 60000,

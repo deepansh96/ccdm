@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { createWorkspace, runScript } from "./support/runner.js";
-import { readState, writeState } from "./support/state.js";
+import { readState, updateState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => {
@@ -76,75 +76,75 @@ function seedMinimalStats(workspace, stats = {}) {
 }
 
 function seedAnthropicRoutes(workspace, overrides = {}) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.security = {
-    credentials: {
-      "Claude Code-credentials": {
-        claudeAiOauth: { accessToken: "fixture-oauth-token" },
-      },
-    },
-    invocations: [],
-  };
-  state.fixtures.curl = {
-    requests: [],
-    routes: [
-      {
-        method: "GET",
-        path: "/api/oauth/profile",
-        json: {
-          account: {
-            created_at: "2025-01-01T00:00:00Z",
-            display_name: "Fixture User",
-            email: "fixture@example.test",
-            full_name: "Fixture Example",
-          },
-          organization: {
-            billing_type: "subscription",
-            has_extra_usage_enabled: true,
-            organization_type: "pro",
-            rate_limit_tier: "tier_1",
-            subscription_created_at: "2025-01-02T00:00:00Z",
-            subscription_status: "active",
-          },
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.security = {
+      credentials: {
+        "Claude Code-credentials": {
+          claudeAiOauth: { accessToken: "fixture-oauth-token" },
         },
       },
-      {
-        method: "GET",
-        path: "/api/oauth/usage",
-        json: {
-          extra_usage: {
-            is_enabled: true,
-            monthly_limit: 5000,
-            used_credits: 1250,
-            utilization: 25,
-          },
-          five_hour: {
-            resets_at: "2026-05-28T16:00:00+00:00",
-            utilization: 40,
-          },
-          seven_day: {
-            resets_at: "2026-05-29T16:00:00+00:00",
-            utilization: 70,
+      invocations: [],
+    };
+    state.fixtures.curl = {
+      requests: [],
+      routes: [
+        {
+          method: "GET",
+          path: "/api/oauth/profile",
+          json: {
+            account: {
+              created_at: "2025-01-01T00:00:00Z",
+              display_name: "Fixture User",
+              email: "fixture@example.test",
+              full_name: "Fixture Example",
+            },
+            organization: {
+              billing_type: "subscription",
+              has_extra_usage_enabled: true,
+              organization_type: "pro",
+              rate_limit_tier: "tier_1",
+              subscription_created_at: "2025-01-02T00:00:00Z",
+              subscription_status: "active",
+            },
           },
         },
-      },
-    ],
-    ...overrides,
-  };
-  writeState(state, workspace.stateDir);
+        {
+          method: "GET",
+          path: "/api/oauth/usage",
+          json: {
+            extra_usage: {
+              is_enabled: true,
+              monthly_limit: 5000,
+              used_credits: 1250,
+              utilization: 25,
+            },
+            five_hour: {
+              resets_at: "2026-05-28T16:00:00+00:00",
+              utilization: 40,
+            },
+            seven_day: {
+              resets_at: "2026-05-29T16:00:00+00:00",
+              utilization: 70,
+            },
+          },
+        },
+      ],
+      ...overrides,
+    };
+  });
 }
 
 function seedSecurityCredential(workspace) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.security = {
-    credentials: {
-      "Claude Code-credentials": {
-        claudeAiOauth: { accessToken: "fixture-oauth-token" },
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.security = {
+      credentials: {
+        "Claude Code-credentials": {
+          claudeAiOauth: { accessToken: "fixture-oauth-token" },
+        },
       },
-    },
-    invocations: [],
-  };
-  writeState(state, workspace.stateDir);
+      invocations: [],
+    };
+  });
 }
 
 test("claude usage report reads live OAuth data and local history from fixtures", async () => {

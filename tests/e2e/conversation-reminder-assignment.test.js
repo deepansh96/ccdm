@@ -7,7 +7,7 @@ import test from "node:test";
 import { createWorkspace, runScript } from "./support/runner.js";
 import { waitForState } from "./support/bridge.js";
 import { routerEnv, startRouter } from "./support/router.js";
-import { readState, writeState } from "./support/state.js";
+import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => cleanup());
@@ -158,9 +158,9 @@ test("deregistration during an in-flight send removes the late reminder and neve
   const context = await setup(workspace);
   await awaitingExchange(workspace, context.stateDir);
   markReconciled(context.stateDir);
-  const seed = readState(workspace.stateDir);
-  seed.fixtures.discord.restResponseDelayMs = 800;
-  writeState(seed, workspace.stateDir);
+  updateState(workspace.stateDir, (seed) => {
+    seed.fixtures.discord.restResponseDelayMs = 800;
+  });
   const running = startWorker(workspace, context);
   await waitForState(workspace, state => state.fixtures.discord.responsePending === true);
 
@@ -225,13 +225,13 @@ async function reassignAfterReminder(workspace, context, mutate) {
 test("rejected root credentials report the leftover reminder instead of retrying", async () => {
   const workspace = createWorkspace();
   const context = await setup(workspace);
-  const seed = readState(workspace.stateDir);
-  seed.fixtures.discord.restFailures = [];
-  writeState(seed, workspace.stateDir);
+  updateState(workspace.stateDir, (seed) => {
+    seed.fixtures.discord.restFailures = [];
+  });
   const { running } = await reassignAfterReminder(workspace, context, () => {
-    const failing = readState(workspace.stateDir);
-    failing.fixtures.discord.restFailures = [{ method: "DELETE", status: 401 }];
-    writeState(failing, workspace.stateDir);
+    updateState(workspace.stateDir, (failing) => {
+      failing.fixtures.discord.restFailures = [{ method: "DELETE", status: 401 }];
+    });
   });
   await waitForState(workspace, state => state.fixtures.discord.restFailureUses?.length === 1);
   const reported = await waitForStatus(workspace, context.stateDir, current =>
@@ -253,9 +253,9 @@ test("root without access to the retired channel reports the leftover reminder i
   const context = await setup(workspace);
   const { running } = await reassignAfterReminder(workspace, context, registry => {
     registry.projects.demo.channel_id = "new-channel";
-    const failing = readState(workspace.stateDir);
-    failing.fixtures.discord.restFailures = [{ method: "DELETE", status: 403 }];
-    writeState(failing, workspace.stateDir);
+    updateState(workspace.stateDir, (failing) => {
+      failing.fixtures.discord.restFailures = [{ method: "DELETE", status: 403 }];
+    });
   });
   const reported = await waitForStatus(workspace, context.stateDir, current =>
     current.retired_assignments?.[0]?.cleanup.inaccessible.length === 1);
@@ -315,9 +315,9 @@ test("assignment-changed reports a retired reminder it cannot delete as inaccess
     const registry = readRegistry(workspace);
     registry.projects.demo.webhook_id = "webhook2";
     writeRegistry(workspace, registry);
-    const failing = readState(workspace.stateDir);
-    failing.fixtures.discord.restFailures = [{ method: "DELETE", status: scenario.status }];
-    writeState(failing, workspace.stateDir);
+    updateState(workspace.stateDir, (failing) => {
+      failing.fixtures.discord.restFailures = [{ method: "DELETE", status: scenario.status }];
+    });
 
     const changed = await command(workspace, context.stateDir, "assignment-changed",
       { args: ["--project", "demo"], env: context.env });

@@ -10,7 +10,7 @@ import {
   routerWithWebhooks,
   runRouterCli,
 } from "./support/router.js";
-import { readState, writeState } from "./support/state.js";
+import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => {
@@ -19,9 +19,9 @@ test.afterEach(async () => {
 
 // Someone deletes the webhook in Discord, outside CCDM.
 function deleteWebhookInDiscord(workspace, webhookId) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.webhooks = state.fixtures.discord.webhooks.filter(webhook => webhook.id !== webhookId);
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.webhooks = state.fixtures.discord.webhooks.filter(webhook => webhook.id !== webhookId);
+  });
 }
 
 function registry(workspace) {

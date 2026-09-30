@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { createWorkspace, runScript } from "./support/runner.js";
-import { readState, seedRegistry, writeState } from "./support/state.js";
+import { readState, seedRegistry, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 const contextTempFiles = new Set();
@@ -78,15 +78,15 @@ function seedNicknameRegistry(workspace, options = {}) {
 }
 
 function seedDiscordPatchRoute(workspace, member = "bot-app-id", exitCode = 0) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.curl.routes.push({
-    method: "PATCH",
-    hostname: "discord.com",
-    path: `/api/v10/guilds/guild-id/members/${member}`,
-    exitCode,
-    body: "{}",
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.curl.routes.push({
+      method: "PATCH",
+      hostname: "discord.com",
+      path: `/api/v10/guilds/guild-id/members/${member}`,
+      exitCode,
+      body: "{}",
+    });
   });
-  writeState(state, workspace.stateDir);
 }
 
 // A background PATCH would land well within this window.

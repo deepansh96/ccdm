@@ -7,7 +7,7 @@ import test from "node:test";
 import { runScript } from "./support/runner.js";
 import { createBridgeWorkspace, injectDiscordMessage, injectDiscordReaction, waitForState } from "./support/bridge.js";
 import { routerEnv, startRouter } from "./support/router.js";
-import { readState, writeState } from "./support/state.js";
+import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => cleanup());
@@ -44,19 +44,19 @@ function message(id, timestamp, author, content = "text", extra = {}) {
 
 // A live arrival is visible both to the Router's observer and to later history reads.
 function arrive(workspace, channelId, raw) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.history[channelId].unshift(raw);
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.history[channelId].unshift(raw);
+  });
   if (!raw.author.bot) {
     injectDiscordMessage(workspace, { channelId, id: raw.id, author: { id: raw.author.id }, content: raw.content });
   }
 }
 
 function seedHistory(workspace, history, extra = {}) {
-  const state = readState(workspace.stateDir);
-  state.fixtures.discord.history = history;
-  Object.assign(state.fixtures.discord, extra);
-  writeState(state, workspace.stateDir);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.history = history;
+    Object.assign(state.fixtures.discord, extra);
+  });
 }
 
 async function command(workspace, stateDir, name, extra = {}) {
@@ -431,9 +431,9 @@ test("denied history suspends the channel with resumable progress instead of ski
   const workspace = createBridgeWorkspace();
   const stateDir = await setup(workspace);
   const worker = await scanFirstPass(workspace, stateDir, "2026-09-24T12:00:00Z");
-  const seed = readState(workspace.stateDir);
-  seed.fixtures.discord.restFailures = [{ method: "GET", path: "/api/v10/channels/channel/messages", status: 403 }];
-  writeState(seed, workspace.stateDir);
+  updateState(workspace.stateDir, (seed) => {
+    seed.fixtures.discord.restFailures = [{ method: "GET", path: "/api/v10/channels/channel/messages", status: 403 }];
+  });
   worker.setClock("2026-09-24T12:00:30Z");
   await waitForFixture(workspace, state => state.fixtures.discord.restFailureUses?.length === 1);
   await new Promise(resolve => setTimeout(resolve, 400));
