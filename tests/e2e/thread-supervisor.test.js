@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
@@ -206,6 +207,14 @@ test(".supervisor.key is rewritten on each start, and the state is private", asy
   }
 });
 
+// A process's environment: /proc/<pid>/environ on Linux, `ps -E` on macOS.
+function processEnvironment(pid) {
+  if (process.platform === "linux") {
+    return fs.readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").join("\n");
+  }
+  return execFileSync("ps", ["-E", "-ww", "-o", "command=", "-p", String(pid)], { encoding: "utf8" });
+}
+
 test("the supervisor holds no Discord token and sends nothing to Discord but Router ops", async () => {
   const { workspace } = await supervisedWorkspace();
   const supervisor = await startThreadSupervisor(workspace);
@@ -214,8 +223,8 @@ test("the supervisor holds no Discord token and sends nothing to Discord but Rou
   await waitFor(() => patches(workspace).length === 1, () => "the auto-archive PATCH");
   for (const pid of [supervisor.workerPid, supervisor.linkPid]) {
     assert.ok(Number.isInteger(pid), `pid ${pid}`);
-    const environment = execFileSync("ps", ["-E", "-ww", "-o", "command=", "-p", String(pid)], { encoding: "utf8" });
-    // `ps -E` shows the environment: the Router state override proves it is there.
+    const environment = processEnvironment(pid);
+    // The Router state override proves the environment was read.
     assert.match(environment, /CCDM_ROUTER_STATE_DIR=/);
     assert.ok(!environment.includes(ROOT_TOKEN), `process ${pid} environment holds the token`);
     assert.ok(!environment.includes("pool-bot-token"), `process ${pid} environment holds a pool token`);
@@ -255,4 +264,40 @@ test("the store reports user_version 1, and an unexpected column is refused", as
   const run = await supervisorCli(workspace, "run", { timeoutMs: 15000 });
   assert.equal(run.exitCode, 2, run.stdout);
   assert.match(run.json.reason, /thread store schema is unsupported/);
+});
+
+test("a status racing the store's creation never sees a half-made store", () => {
+  const scripts = path.join(process.cwd(), "scripts");
+  const base = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "ccdm-e2e-store-race-"));
+  // Each round, one process creates the store while this one reads it as `status` does.
+  const race = `
+import json, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from thread_supervisor import store
+create = ("import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
+          "from thread_supervisor import store; store.connect(Path(sys.argv[2]), create=True).close()")
+errors, reads = [], 0
+for round in range(30):
+    state = Path(sys.argv[2]) / f"state-{round}"
+    state.mkdir(mode=0o700)
+    creator = subprocess.Popen([sys.executable, "-c", create, sys.argv[1], str(state)])
+    while creator.poll() is None:
+        try:
+            if store.inspect(state) is not None:
+                reads += 1
+        except Exception as error:
+            errors.append(str(error))
+    assert creator.returncode == 0
+    assert store.inspect(state)["user_version"] == 1
+    leftovers = sorted(p.name for p in state.iterdir() if p.name.startswith(".threads."))
+    assert not leftovers, leftovers
+print(json.dumps({"errors": errors, "reads": reads}))
+`;
+  try {
+    const result = JSON.parse(execFileSync("python3", ["-c", race, scripts, base], { encoding: "utf8" }));
+    assert.deepEqual(result.errors, []);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
 });

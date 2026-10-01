@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import time
+import uuid
 
 from .paths import private_directory
 
@@ -84,31 +86,50 @@ def _check_private(path: Path) -> None:
         raise ValueError("thread store permissions are not private")
 
 
+def _publish(state_dir: Path, path: Path) -> None:
+    """Build a complete schema-v1 store in a private temporary file beside
+    ``path`` and link it into place, so no reader ever sees a half-made store.
+    A store some other process published first wins."""
+    temporary = state_dir / f".threads.{os.getpid()}.{uuid.uuid4().hex}.sqlite3"
+    os.close(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    try:
+        db = sqlite3.connect(temporary, isolation_level=None)
+        try:
+            # Rollback journaling until the first `connect` turns on WAL: a
+            # read-only reader cannot open a WAL store that has no -shm yet.
+            db.execute("BEGIN IMMEDIATE")
+            for table, definition in TABLES.items():
+                db.execute(f"CREATE TABLE {table} ({definition})")
+            db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            db.execute("COMMIT")
+        finally:
+            db.close()
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            pass
+    finally:
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            Path(f"{temporary}{suffix}").unlink(missing_ok=True)
+
+
 def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
     """Open the store, creating it only when ``create`` is set."""
     path = store_path(state_dir)
-    existed = path.exists()
-    if not existed and not create:
-        return None
-    if existed:
-        _check_private(path)
-        if path.stat().st_size == 0:
-            raise ValueError("thread store schema is unsupported")
-    private_directory(state_dir)
-    if not existed:
-        os.close(os.open(path, os.O_WRONLY | os.O_CREAT, 0o600))
+    if not path.exists():
+        if not create:
+            return None
+        private_directory(state_dir)
+        _publish(state_dir, path)
+    _check_private(path)
+    if path.stat().st_size == 0:
+        raise ValueError("thread store schema is unsupported")
     db = sqlite3.connect(path, timeout=2, isolation_level=None)
     db.row_factory = sqlite3.Row
     try:
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA synchronous=FULL")
         db.execute("PRAGMA secure_delete=ON")
-        if db.execute("PRAGMA user_version").fetchone()[0] == 0 and not existed:
-            db.execute("BEGIN IMMEDIATE")
-            for table, definition in TABLES.items():
-                db.execute(f"CREATE TABLE {table} ({definition})")
-            db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-            db.execute("COMMIT")
         verify(db)
     except (sqlite3.Error, ValueError):
         db.close()
@@ -120,12 +141,28 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
     return db
 
 
+# A read-only reader cannot open a WAL store while it has no -shm, as for a
+# moment when its last writer closes; such an open is retried this long.
+INSPECT_RETRY_SECONDS = 2
+
+
 def inspect(state_dir: Path) -> dict | None:
     """Read-only check of an existing store; never creates anything."""
     path = store_path(state_dir)
     if not path.exists():
         return None
     _check_private(path)
+    deadline = time.monotonic() + INSPECT_RETRY_SECONDS
+    while True:
+        try:
+            return _inspect(path)
+        except sqlite3.OperationalError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
+
+
+def _inspect(path: Path) -> dict:
     db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     db.row_factory = sqlite3.Row
     try:
