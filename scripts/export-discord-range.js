@@ -6,12 +6,13 @@ const { homedir, tmpdir } = require("node:os");
 const path = require("node:path");
 const { Readable } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
+const { ResolveError, resolveConversation } = require("./conversation-resolver.js");
 
 const API_BASE = "https://discord.com/api/v10";
 const MAX_MESSAGES = 10_000;
 
 function usage() {
-  throw new Error("Usage: export-discord-range.js <channel-id> <start-message-id> [end-message-id]");
+  throw new Error("Usage: export-discord-range.js <channel-id|thread-id|link|thread-name> <start-message-id> [end-message-id]");
 }
 
 function validateIds(channelId, startId, endId) {
@@ -141,8 +142,23 @@ async function exportRange({ token, channelId, startId, endId, get }) {
   return output;
 }
 
+// A channel or thread id is exported as given; a link or a thread name is
+// exported as the channel or thread the conversation resolver names.
+function channelFor(target) {
+  if (/^\d+$/.test(target || "") || !target) return target;
+  return resolveConversation(target).channel_id;
+}
+
 async function main() {
-  const [channelId, startId, endId] = process.argv.slice(2);
+  const [target, startId, endId] = process.argv.slice(2);
+  let channelId;
+  try {
+    channelId = channelFor(target);
+  } catch (error) {
+    if (!(error instanceof ResolveError)) throw error;
+    process.stderr.write(`conversation-resolver: ${error.message}\n`);
+    process.exit(2);
+  }
   validateIds(channelId, startId, endId);
   const output = await exportRange({ token: await rootToken(), channelId, startId, endId });
   process.stdout.write(`${output}\n`);

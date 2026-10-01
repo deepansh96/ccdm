@@ -3,6 +3,7 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const { ResolveError, resolveConversation } = require("./conversation-resolver.js");
 const { updateRegistry } = require("./router/registry.js");
 
 const ROOT_DIR = path.resolve(__dirname, "..");
@@ -20,11 +21,11 @@ const GUEST_ALLOW =
 
 function usage() {
   console.error(`Usage:
-  scripts/guest-access.js invite <project|channel_id> <user_id>
-  scripts/guest-access.js grant <project|channel_id> <user_id>
-  scripts/guest-access.js revoke <project|channel_id> <user_id>
-  scripts/guest-access.js sync [project|channel_id]
-  scripts/guest-access.js list [project|channel_id]`);
+  scripts/guest-access.js invite <project|channel_id|thread_id|link> <user_id>
+  scripts/guest-access.js grant <project|channel_id|thread_id|link> <user_id>
+  scripts/guest-access.js revoke <project|channel_id|thread_id|link> <user_id>
+  scripts/guest-access.js sync [project|channel_id|thread_id|link]
+  scripts/guest-access.js list [project|channel_id|thread_id|link]`);
   process.exit(2);
 }
 
@@ -90,14 +91,17 @@ function rootToken() {
   return token;
 }
 
+// A thread, a link or a thread name names its parent project, through the
+// conversation resolver.
 function resolveProjects(registry, target) {
   const projects = Object.entries(registry.projects || {});
   if (!target) return projects;
   const match = projects.filter(
     ([name, project]) => name === target || String(project.channel_id || "") === target
   );
-  if (match.length === 0) throw new Error(`No project registered for ${target}`);
-  return match;
+  if (match.length > 0) return match;
+  const { project } = resolveConversation(target, { registryFile: REGISTRY_PATH });
+  return projects.filter(([name]) => name === project);
 }
 
 function safeName(value) {
@@ -312,6 +316,13 @@ async function main() {
   if (["sync", "list"].includes(action) && userId) usage();
 
   const registry = loadRegistry();
+  try {
+    resolveProjects(registry, target);
+  } catch (error) {
+    if (!(error instanceof ResolveError)) throw error;
+    console.error(`conversation-resolver: ${error.message}`);
+    process.exit(2);
+  }
   if (action === "invite") await invite(registry, target, userId);
   if (action === "grant") await grant(registry, target, userId);
   if (action === "revoke") await revoke(registry, target, userId);

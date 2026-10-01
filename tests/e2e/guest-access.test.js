@@ -373,3 +373,19 @@ test("an invite overlapping a revoke does not restore the revoked guest or their
   assert.deepEqual(alpha.guest_user_ids, ["333333333333333333"]);
   assert.deepEqual(Object.keys(alpha.guest_invites), ["333333333333333333"]);
 });
+
+test("guest access exits 2 with the conversation resolver's reason for a target it cannot name", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, buildRegistry(workspace));
+  const before = fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8");
+
+  for (const args of [["grant", "no-such-thread", GUEST_ID], ["revoke", "1799999999999999999", GUEST_ID],
+    ["list", "https://discord.com/channels/guild-id/1799999999999999999"]]) {
+    const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", { args, env: preloadEnv(workspace) });
+    assert.equal(result.exitCode, 2, `${args.join(" ")}: ${result.stdout}`);
+    assert.match(result.stderr, /^conversation-resolver: '.+' (links to no registered channel|is no registered channel)/);
+  }
+  assert.equal(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"), before);
+  const discord = readState(workspace.stateDir).fixtures.discord;
+  assert.deepEqual([discord.roleCreates ?? [], discord.permissionOverwrites ?? []], [[], []]);
+});

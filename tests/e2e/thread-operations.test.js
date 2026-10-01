@@ -278,3 +278,89 @@ test("every threads.sh subcommand fails clearly when the supervisor is down", as
   }
   assert.deepEqual(launches(workspace, THREAD_ID), []);
 });
+
+const relay = (workspace, ...args) => runScript(workspace, "scripts/send-claude-command.sh", { args,
+  env: supervisorEnv(workspace) });
+
+test("send-claude-command.sh given a thread id or link sends the command only to that thread's tmux pane", async () => {
+  const workspace = operationsWorkspace();
+  await supervised(workspace);
+  await liveThread(workspace, THREAD_ID, "fix-login");
+  await liveThread(workspace, SIBLING_ID, "write-docs");
+  const sentBefore = name => (tmuxSessions(workspace)[name]?.sendKeys ?? []).length;
+  const [threadBefore, siblingBefore] = [sentBefore(THREAD_TMUX), sentBefore(SIBLING_TMUX)];
+
+  const byId = await relay(workspace, THREAD_ID, "/compact");
+  assert.equal(byId.exitCode, 0, byId.stderr || byId.stdout);
+  assert.match(byId.stdout, new RegExp(`Sent /compact to Claude thread ${THREAD_ID} in project 'demo' \\(tmux session '${THREAD_TMUX}'\\)`));
+  const byLink = await relay(workspace, "--channel", link(THREAD_ID), "clear");
+  assert.equal(byLink.exitCode, 0, byLink.stderr || byLink.stdout);
+
+  assert.deepEqual(tmuxSessions(workspace)[THREAD_TMUX].sendKeys.slice(threadBefore),
+    [["-l", "/compact"], ["Enter"], ["-l", "/clear"], ["Enter"]]);
+  assert.equal(sentBefore(SIBLING_TMUX), siblingBefore);
+  assert.equal(tmuxSessions(workspace).demo_claude, undefined);
+
+  for (const args of [["no-such-thread", "/compact"], ["--channel", link("1799999999999999999"), "/compact"]]) {
+    const refused = await relay(workspace, ...args);
+    assert.equal(refused.exitCode, 2, `${args.join(" ")}: ${refused.stdout}`);
+    assert.match(refused.stderr, /conversation-resolver: .+/);
+  }
+});
+
+const guests = (workspace, project) => JSON.parse(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"))
+  .projects[project].guest_user_ids;
+
+test("guest-access.js given a thread id or link grants and revokes the parent project's guest", async () => {
+  const workspace = operationsWorkspace();
+  await supervised(workspace);
+  await boundThread(workspace, THREAD_ID, "fix-login");
+  const guestAccess = (...args) => runNodeEntrypoint(workspace, "scripts/guest-access.js", { args,
+    env: supervisorEnv(workspace) });
+
+  const granted = await guestAccess("grant", THREAD_ID, "new-guest-id");
+  assert.equal(granted.exitCode, 0, granted.stderr || granted.stdout);
+  assert.match(granted.stdout, /Granted new-guest-id guest access to demo\./);
+  assert.deepEqual(guests(workspace, "demo"), ["new-guest-id"]);
+  assert.equal(guests(workspace, "beta"), undefined);
+  const overwritten = new Set((discord(workspace).permissionOverwrites ?? []).map(({ channelId }) => channelId));
+  assert.ok(overwritten.has("demo-channel"), [...overwritten].join(", "));
+  assert.ok(!overwritten.has(THREAD_ID), [...overwritten].join(", "));
+
+  const revoked = await guestAccess("revoke", link(THREAD_ID), "new-guest-id");
+  assert.equal(revoked.exitCode, 0, revoked.stderr || revoked.stdout);
+  assert.match(revoked.stdout, /Revoked new-guest-id guest access from demo\./);
+  assert.deepEqual(guests(workspace, "demo"), []);
+
+  const refused = await guestAccess("grant", "no-such-thread", "new-guest-id");
+  assert.equal(refused.exitCode, 2, refused.stdout);
+  assert.match(refused.stderr, /conversation-resolver: .+/);
+});
+
+test("export-discord-range.js given a thread id or link exports that thread's messages", async () => {
+  const workspace = operationsWorkspace();
+  await supervised(workspace);
+  await boundThread(workspace, THREAD_ID, "fix-login");
+  updateState(workspace.stateDir, state => {
+    state.fixtures.discord.restMessages = [
+      { id: "903", channel_id: THREAD_ID, timestamp: "2026-07-13T10:02:00.000Z", content: "thread end", author: OWNER, attachments: [] },
+      { id: "902", channel_id: "demo-channel", timestamp: "2026-07-13T10:01:30.000Z", content: "channel chatter", author: OWNER, attachments: [] },
+      { id: "901", channel_id: THREAD_ID, timestamp: "2026-07-13T10:01:00.000Z", content: "thread start", author: OWNER, attachments: [] },
+    ];
+  });
+  const exportRange = (...args) => runNodeEntrypoint(workspace, "scripts/export-discord-range.js", { args,
+    env: supervisorEnv(workspace) });
+
+  for (const channel of [THREAD_ID, link(THREAD_ID)]) {
+    const result = await exportRange(channel, "901", "903");
+    assert.equal(result.exitCode, 0, result.stderr);
+    const text = fs.readFileSync(result.stdout.trim(), "utf8");
+    assert.match(text, /thread start[\s\S]*thread end/);
+    assert.doesNotMatch(text, /channel chatter/);
+  }
+  assert.ok(discord(workspace).messageFetches.every(({ channelId }) => channelId === THREAD_ID));
+
+  const refused = await exportRange(link("1799999999999999999"), "901");
+  assert.equal(refused.exitCode, 2, refused.stdout);
+  assert.match(refused.stderr, /conversation-resolver: .+/);
+});
