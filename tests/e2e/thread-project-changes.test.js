@@ -175,6 +175,12 @@ async function assertThreadRuns(workspace, threadId, pid) {
   assert.ok(await threadConnected(workspace, threadId), `thread ${threadId} is still connected to the Router`);
   assert.equal(threadLaunches(workspace, threadId).length, 1);
   assert.equal((await threadRow(workspace, threadId)).state, "live");
+  // The thread's launch files (the activity file idle eviction reads among
+  // them) are its own, not the channel launch's.
+  const launchDir = path.join(workspace.routerStateDir, "launches", "demo", "threads", threadId);
+  for (const file of ["mcp.json", "settings.json", "ready.json", "activity.json"]) {
+    assert.ok(fs.existsSync(path.join(launchDir, file)), `thread ${threadId}'s ${file} survives channel maintenance`);
+  }
 }
 
 test("stopping, restarting or rotating the key of the channel session leaves thread sessions running and connected", async () => {

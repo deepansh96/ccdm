@@ -273,7 +273,21 @@ sys.dont_write_bytecode = True  # no __pycache__ beside the scripts
 
 key_file, launch_dir, registry_path, project, helper = sys.argv[1:6]
 Path(key_file).unlink(missing_ok=True)
-shutil.rmtree(launch_dir, ignore_errors=True)
+# Only the channel launch's files go: threads/ holds the project's running
+# Thread Conversations' launch files, which outlive the channel session.
+launch = Path(launch_dir)
+if launch.is_dir() and not launch.is_symlink():
+    for entry in launch.iterdir():
+        if entry.name == "threads":
+            continue
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink(missing_ok=True)
+    try:
+        launch.rmdir()  # only once no thread launch is left
+    except OSError:
+        pass
 # No listener survives a failed launch, so none is recorded (under the
 # registry lock every writer shares).
 spec = importlib.util.spec_from_file_location("ccdm_registry_update", helper)

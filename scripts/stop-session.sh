@@ -350,7 +350,7 @@ if [[ -n "$ORPHAN_PIDS" ]]; then
 fi
 
 if [[ "$SESSION_TYPE" != "codex" ]]; then
-  # The stopped launch's key and launch files go with it; the next launch writes fresh ones.
+  # The stopped launch's key and launch files go with it (its threads' launch files stay); the next launch writes fresh ones.
   python3 - "$ROUTER_KEY_FILE" "$ROUTER_STATE_DIR/launches/$PROJECT" <<'PY'
 import shutil
 import sys
@@ -359,7 +359,21 @@ from pathlib import Path
 key_file, launch_dir = sys.argv[1:3]
 if "/" not in Path(key_file).name:
     Path(key_file).unlink(missing_ok=True)
-shutil.rmtree(launch_dir, ignore_errors=True)
+# Only the channel launch's files go: threads/ holds the project's running
+# Thread Conversations' launch files, which outlive the channel session.
+launch = Path(launch_dir)
+if launch.is_dir() and not launch.is_symlink():
+    for entry in launch.iterdir():
+        if entry.name == "threads":
+            continue
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink(missing_ok=True)
+    try:
+        launch.rmdir()  # only once no thread launch is left
+    except OSError:
+        pass
 PY
 fi
 

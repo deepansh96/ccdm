@@ -154,11 +154,19 @@ test("a launch whose Router hello fails exits non-zero and cleans up", async () 
   const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
   registry.projects.demo.webhook_id = "webhook-demo";
   fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
+  // A running Thread Conversation's launch files live under the channel's
+  // launch directory and must outlive the failed channel launch.
+  const threadActivity = path.join(workspace.routerStateDir, "launches", "demo", "threads", "1700000000000990001", "activity.json");
+  fs.mkdirSync(path.dirname(threadActivity), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(threadActivity, "{\"turn_running\":false}\n", { mode: 0o600 });
 
   const started = await startSession(workspace, { CCDM_CLAUDE_LAUNCH_TIMEOUT_S: "10" });
 
   assert.notEqual(started.exitCode, 0, started.stdout);
   assert.match(started.stderr, /Router hello failed: router_unavailable/);
+  assert.deepEqual(fs.readdirSync(path.join(workspace.routerStateDir, "launches", "demo")), ["threads"]);
+  assert.equal(fs.readFileSync(threadActivity, "utf8"), "{\"turn_running\":false}\n");
+  fs.rmSync(path.join(workspace.routerStateDir, "launches", "demo"), { recursive: true });
   assertLaunchCleanedUp(workspace);
 });
 
