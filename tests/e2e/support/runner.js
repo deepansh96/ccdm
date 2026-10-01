@@ -633,6 +633,15 @@ function runTmux() {
       console.error("fixture tmux new-session failure");
       process.exit(1);
     }
+    // \`earlyExits[name]\` launches start and exit at once: the session is gone
+    // before anything can look at its pane.
+    if (tmuxState.earlyExits?.[name]) {
+      updateState((state) => {
+        state.fixtures.tmux.earlyExits[name] -= 1;
+        return state;
+      });
+      process.exit(0);
+    }
     if (preexistingSession?.newSessionStatus) {
       console.error("fixture tmux new-session failure");
       process.exit(preexistingSession.newSessionStatus);

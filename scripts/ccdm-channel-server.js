@@ -13,6 +13,16 @@
 //   CCDM_CLAUDE_PROJECT       the project this session serves
 //   CCDM_CHANNEL_READY_FILE   where the Router hello outcome is written for the launcher
 //   CCDM_ROUTER_ROLE          `root` for root Claude (restart-root-agent.sh); otherwise a project
+//   CCDM_THREAD_ID            set by start-thread-session.sh: this session serves that thread
+//   CCDM_THREAD_PROVIDER      the thread's provider (`claude`)
+//   CCDM_THREAD_BOOTSTRAP_FILE  the Thread Supervisor's bootstrap for this launch
+//
+// In thread mode the server says hello as the `thread` role, so its Session
+// Scope is the thread alone. It holds live events until the supervisor's
+// bootstrap file exists (CCDM_THREAD_BOOT_TIMEOUT_S, 120 s by default),
+// delivers the bootstrap as the first channel notification, and drops held
+// messages the bootstrap already includes. It records no Conversation
+// Reminder events and ignores `scope_changed`.
 //
 // In the root role the server speaks for root: it receives root-channel
 // messages and the owner's bot mentions in project channels, may act in any
@@ -68,6 +78,10 @@ const ROOT_INSTRUCTIONS = [
 ].join("\n");
 
 const ROOT = process.env.CCDM_ROUTER_ROLE === "root";
+const THREAD_ID = ROOT ? "" : process.env.CCDM_THREAD_ID || "";
+const THREAD = Boolean(THREAD_ID);
+// The project's channel, or this thread's, records no reminder events.
+const REMINDERS = !ROOT && !THREAD;
 
 const REMINDER_PROJECT_ROOT = process.env.CCDM_REMINDER_PROJECT_ROOT || path.dirname(__dirname);
 const REMINDER_STATE_DIR = process.env.CCDM_REMINDER_STATE_DIR || path.join(os.homedir(), ".local", "state", "ccdm", "conversation-reminders");
@@ -182,7 +196,9 @@ async function recordDeliveredReply(input, result) {
 }
 
 function contextPct() {
-  const file = path.join(process.env.CCDM_ROUTER_STATE_DIR || "", "launches", process.env.CCDM_CLAUDE_PROJECT || "", "context.json");
+  const launch = path.join(process.env.CCDM_ROUTER_STATE_DIR || "", "launches", process.env.CCDM_CLAUDE_PROJECT || "",
+    ...(THREAD ? ["threads", THREAD_ID] : []));
+  const file = path.join(launch, "context.json");
   try {
     const pct = JSON.parse(readFileSync(file, "utf8")).context_pct;
     return Number.isFinite(pct) ? pct : undefined;
@@ -373,6 +389,47 @@ function notification(kind, event) {
   };
 }
 
+// The supervisor writes the bootstrap once the Router has this session's
+// hello; until it exists (or the boot timeout passes) live events wait.
+async function awaitBootstrap() {
+  const file = process.env.CCDM_THREAD_BOOTSTRAP_FILE;
+  const timeoutS = Number(process.env.CCDM_THREAD_BOOT_TIMEOUT_S);
+  const deadline = Date.now() + (Number.isFinite(timeoutS) && timeoutS > 0 ? timeoutS : 120) * 1000;
+  while (file && Date.now() < deadline) {
+    try {
+      return JSON.parse(await readFile(file, "utf8"));
+    } catch { /* Not written yet. */ }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  process.stderr.write("ccdm channel: no thread bootstrap arrived; delivering live events without it\n");
+  return null;
+}
+
+// The bootstrap as one channel notification: the preamble, the starter, and
+// every message sent while the session booted, in Discord order. Its meta
+// names the last of them, the message a reply answers.
+function bootstrapNotification(bootstrap) {
+  const messages = Array.isArray(bootstrap.messages) ? bootstrap.messages : [];
+  const parts = [String(bootstrap.preamble || "")];
+  if (bootstrap.starter) parts.push(`The thread was started from this message:\n${bootstrap.starter}`);
+  if (messages.length) {
+    parts.push(["Messages sent in the thread so far:", ...messages.map(message => {
+      const attachments = message.attachments?.length
+        ? ` [${message.attachments.length} attachment(s): ${message.attachments.map(safeName).join(", ")}; download_attachment with message_id ${message.message_id}]`
+        : "";
+      return `[${message.ts}] ${message.author?.name ?? message.author?.id}: ${message.content}${attachments}`;
+    })].join("\n"));
+  }
+  const last = messages.at(-1);
+  return {
+    content: parts.filter(Boolean).join("\n\n"),
+    meta: {
+      chat_id: THREAD_ID, message_id: last?.message_id ?? THREAD_ID,
+      user: last?.author?.name ?? "ccdm", user_id: last?.author?.id ?? "", ts: last?.ts ?? new Date().toISOString(),
+    },
+  };
+}
+
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
@@ -401,8 +458,8 @@ function scheduleRestart(project) {
 }
 
 // Reminder events are recorded in arrival order, after any stranded outbox.
-let reminderEvents = ROOT ? Promise.resolve() : reminder.drainOutbox();
-if (!ROOT) process.on("exit", removeCapabilityMarker);
+let reminderEvents = REMINDERS ? reminder.drainOutbox() : Promise.resolve();
+if (REMINDERS) process.on("exit", removeCapabilityMarker);
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(signal, () => process.exit(0));
 
 function main() {
@@ -420,7 +477,8 @@ function main() {
     onMessage: event => deliver("message")(event),
     log: line => process.stderr.write(`ccdm channel: ${line}\n`),
   }) : null;
-  const router = new RouterClient({ project, key, role: ROOT ? "root" : "project",
+  const router = new RouterClient({ project, key, role: ROOT ? "root" : THREAD ? "thread" : "project",
+    ...(THREAD ? { threadId: THREAD_ID, provider: process.env.CCDM_THREAD_PROVIDER || "claude" } : {}),
     ...(fallback ? { beforeHello: () => fallback.release() } : {}) });
   fallback?.watch(router);
   const request = fallback ? fallback.request(router) : (op, args) => router.request(op, args);
@@ -428,22 +486,36 @@ function main() {
   // Channel notifications wait until Claude has finished initializing.
   let initialized = false;
   const queued = [];
+  const channelNotify = params => {
+    if (initialized) send({ method: "notifications/claude/channel", params });
+    else queued.push(params);
+  };
   const notify = (kind, event) => {
     // Like the plugin, show the bot typing while Claude takes the message in.
     if (kind === "message") request("typing", { channel_id: event.channel_id }).catch(() => {});
-    const params = notification(kind, event);
-    if (initialized) send({ method: "notifications/claude/channel", params });
-    else queued.push(params);
+    channelNotify(notification(kind, event));
   };
   // While paused, inbound events wait here and are delivered in order on /unpause.
   let paused = false;
   const pausedEvents = [];
+  // A thread session holds live events until its bootstrap is delivered.
+  let held = THREAD ? [] : null;
   const deliver = kind => event => {
-    if (paused) pausedEvents.push([kind, event]);
+    if (held) held.push([kind, event]);
+    else if (paused) pausedEvents.push([kind, event]);
     else notify(kind, event);
   };
+  if (THREAD) {
+    awaitBootstrap().then(bootstrap => {
+      const included = new Set(bootstrap?.included_message_ids ?? []);
+      if (bootstrap) channelNotify(bootstrapNotification(bootstrap));
+      const pending = held.filter(([kind, event]) => !(kind === "message" && included.has(event.message_id)));
+      held = null;
+      for (const [kind, event] of pending) deliver(kind)(event);
+    });
+  }
   router.on("message", event => {
-    if (ROOT) return deliver("message")(event);
+    if (!REMINDERS) return deliver("message")(event);
     reminderEvents = reminderEvents.then(() => recordOwnerMessage(event)).catch(error => {
       process.stderr.write(`ccdm channel: reminder activity recording failed: ${error.message}\n`);
     });
@@ -498,6 +570,7 @@ function main() {
   // client validates it (this project, a channel) first. The implicit read
   // tools and the reminder capability marker follow the new channel.
   router.on("scope_changed", next => {
+    if (THREAD) return;
     scope = next;
     process.stderr.write(`ccdm channel: Router moved this session to channel ${next.channel_id}\n`);
     if (!ROOT) writeCapabilityMarker(next).catch(error => {
@@ -507,14 +580,14 @@ function main() {
   router.on("disconnect", () => process.stderr.write("ccdm channel: Router connection lost; reconnecting\n"));
   router.on("reconnect", () => process.stderr.write("ccdm channel: Router connection restored\n"));
   router.on("end", error => {
-    if (!ROOT) removeCapabilityMarker();
+    if (REMINDERS) removeCapabilityMarker();
     process.stderr.write(`ccdm channel: Router session ended${error ? `: ${error.code || error.message}` : ""}\n`);
   });
 
   router.connect().then(
     async granted => {
       scope = granted;
-      if (!ROOT) await writeCapabilityMarker(granted).catch(error => {
+      if (REMINDERS) await writeCapabilityMarker(granted).catch(error => {
         process.stderr.write(`ccdm channel: capability marker failed: ${error.message}\n`);
       });
       reportReady({ ok: true, scope: granted });

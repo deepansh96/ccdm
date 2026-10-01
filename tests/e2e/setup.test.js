@@ -23,6 +23,14 @@ test("registry example exposes generic named Codex account fields", () => {
   assert.equal("codex_home" in registryExample, false);
 });
 
+test("registry example documents Claude account aliases for thread overrides", () => {
+  const registryExample = JSON.parse(fs.readFileSync("registry.example.json", "utf8"));
+
+  assert.deepEqual(registryExample.claude_accounts, {
+    "example-claude-account": "~/.claude-example",
+  });
+});
+
 test("registry example shows the one-bot Router fields and no pool or bot tokens", () => {
   const source = fs.readFileSync("registry.example.json", "utf8");
   const registryExample = JSON.parse(source);

@@ -168,3 +168,45 @@ def bind(db: sqlite3.Connection, thread_id: str, project: str, name: str, creato
     except sqlite3.Error:
         db.execute("ROLLBACK")
         raise
+
+
+def update(db: sqlite3.Connection, thread_id: str, **fields) -> None:
+    columns = ", ".join(f"{column}=?" for column in fields)
+    db.execute(f"UPDATE threads SET {columns} WHERE thread_id=?", (*fields.values(), thread_id))
+
+
+def begin_boot(db: sqlite3.Connection, thread_id: str, resolved: dict) -> None:
+    """Mark a thread `booting` with what its session runs with, and empty its
+    boot buffer of any earlier attempt."""
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        update(db, thread_id, state="booting", stop_reason=None, close_reason=None,
+               **{f"resolved_{field}": resolved.get(field) for field in OVERRIDES})
+        db.execute("DELETE FROM boot_buffers WHERE thread_id=?", (thread_id,))
+        db.execute("COMMIT")
+    except sqlite3.Error:
+        db.execute("ROLLBACK")
+        raise
+
+
+def buffer_message(db: sqlite3.Connection, thread_id: str, message_id: str, payload: str, received_at: str) -> None:
+    """Keep a message sent while the thread boots; a repeat of one is ignored."""
+    db.execute("INSERT OR IGNORE INTO boot_buffers (thread_id, message_id, payload, received_at) VALUES (?,?,?,?)",
+               (thread_id, message_id, payload, received_at))
+
+
+def buffered(db: sqlite3.Connection, thread_id: str) -> list[sqlite3.Row]:
+    """A booting thread's buffered messages, in the order the Router sent them."""
+    return db.execute("SELECT * FROM boot_buffers WHERE thread_id=? ORDER BY rowid", (thread_id,)).fetchall()
+
+
+def finish_boot(db: sqlite3.Connection, thread_id: str, state: str, stop_reason: str | None = None) -> None:
+    """End a boot as `live`, or `stopped` with ``stop_reason``; the buffer goes either way."""
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        update(db, thread_id, state=state, stop_reason=stop_reason)
+        db.execute("DELETE FROM boot_buffers WHERE thread_id=?", (thread_id,))
+        db.execute("COMMIT")
+    except sqlite3.Error:
+        db.execute("ROLLBACK")
+        raise

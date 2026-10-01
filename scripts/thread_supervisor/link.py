@@ -59,6 +59,11 @@ class Link:
         with self.answered:
             self.answered.notify_all()
 
+    def post(self, frame: dict) -> None:
+        """Queue a worker-internal frame (a launch's exit, say) behind the
+        Router frames already received, so handlers see one ordered stream."""
+        self.frames.put(frame)
+
     def next_frame(self, timeout: float) -> dict | None:
         try:
             return self.frames.get(timeout=timeout)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import fcntl
 import json
 import os
@@ -33,6 +33,8 @@ class Context:
     db: sqlite3.Connection
     link: Link
     bot_user_id: str | None = None
+    # Launches in progress, by thread id (boot.Boot).
+    boots: dict = field(default_factory=dict)
 
 
 def lock_path(state_dir: Path) -> Path:
@@ -80,7 +82,7 @@ def run(project_root: Path, state_dir: Path) -> None:
                     write_health(state_dir, link, "connected")
                 elif kind == "disconnected":
                     write_health(state_dir, link, "disconnected")
-                elif kind == "event":
+                elif kind in ("event", "internal"):
                     dispatch(context, frame)
                 elif kind == "link_exit" and not stopping:
                     raise LinkStopped("the Router link stopped")

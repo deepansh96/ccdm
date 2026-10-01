@@ -1,19 +1,26 @@
-"""The Router event table: one handler per supervisor event; others are ignored."""
+"""The event table: one handler per Router event or worker-internal frame; others are ignored."""
 
 from __future__ import annotations
 
 import sys
 
-from . import binding
+from . import binding, boot
 
 
 HANDLERS = {
     "thread_create": binding.on_thread_create,
+    "thread_message": boot.on_thread_message,
+    "thread_session_live": boot.on_session_live,
+}
+# Frames the worker posts itself, never the Router.
+INTERNAL_HANDLERS = {
+    "launch_exit": boot.on_launch_exit,
 }
 
 
 def dispatch(context, event: dict) -> None:
-    handler = HANDLERS.get(event.get("event"))
+    table = INTERNAL_HANDLERS if event.get("type") == "internal" else HANDLERS
+    handler = table.get(event.get("event"))
     if handler is None:
         return
     try:
