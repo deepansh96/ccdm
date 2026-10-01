@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import sys
 
-from . import boot, creation, lifecycle, registry, store
+from . import boot, creation, lifecycle, registry, reminders, store
 from .clock import now
 from .link import LinkError
 
@@ -155,6 +155,8 @@ def _apply(context, row, changes: dict, saved: str, fresh: bool = False) -> None
         context.archive_polls.pop(thread_id, None)
         lifecycle.stop_session(context, row)
     store.update(context.db, thread_id, **changes, **({"provider_conversation_id": None} if fresh else {}))
+    if fresh:
+        reminders.emit(context, "conversation_reset", row)
     if not running:
         return _notice(context, thread_id, f"{saved} The next session uses them.")
     _notice(context, thread_id, f"{saved} {FRESH_START if fresh else RESTARTING}")

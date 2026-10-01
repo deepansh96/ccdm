@@ -6,9 +6,12 @@ const { readWebhookSecret } = require("../webhooks.js");
 // What root needs in a project channel to send, read, react, clean up, and
 // create or heal the project's webhook.
 const ROOT_PERMISSIONS = ["SendMessages", "ReadMessageHistory", "AddReactions", "ManageMessages", "ManageWebhooks"];
+// What root also needs while Thread Conversations are enabled: the three
+// channel thread bits, and the guild's View Audit Log to classify archives.
+const THREAD_PERMISSIONS = ["CreatePublicThreads", "SendMessagesInThreads", "ManageThreads", "ViewAuditLog"];
 
 // Root's missing permissions in a channel, or null before the gateway is ready.
-async function missingPermissions(ctx, channelId) {
+async function missingPermissions(ctx, channelId, flags = ROOT_PERMISSIONS) {
   const client = ctx.discord?.client;
   if (!client?.user) return null;
   const channel = await client.channels.fetch(channelId).catch(() => null);
@@ -18,7 +21,7 @@ async function missingPermissions(ctx, channelId) {
   } catch {
     // A partially cached guild cannot resolve permissions: report them all missing.
   }
-  return ROOT_PERMISSIONS.filter(flag => !permissions?.has(flag));
+  return flags.filter(flag => !permissions?.has(flag));
 }
 
 // Root's standing in one registered channel, for `args.project`.
@@ -36,6 +39,7 @@ async function status(ctx, args = {}) {
       channel_id: route.channel_id,
       webhook: Boolean(route.webhook_id && secret?.webhook_id === route.webhook_id),
       missing_permissions: await missingPermissions(ctx, route.channel_id),
+      missing_thread_permissions: await missingPermissions(ctx, route.channel_id, THREAD_PERMISSIONS),
     });
   }
   const supervisor = ctx.supervisor?.();

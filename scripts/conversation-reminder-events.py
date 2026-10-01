@@ -25,7 +25,12 @@ EVENT_TYPES = {
     "work_resumed",
     "session_terminated",
     "close_requested",
+    # The Thread Supervisor's lifecycle of one Thread Conversation.
+    "conversation_reset",
+    "conversation_closed",
+    "conversation_deleted",
 }
+THREAD_LIFECYCLE_EVENTS = {"conversation_reset", "conversation_closed", "conversation_deleted"}
 ALLOWED_FIELDS = {
     "schema_version",
     "event_id",
@@ -243,6 +248,10 @@ def validate_event(event: object) -> dict:
         raise ValueError("provider lifecycle events require a project adapter")
     if event_type in {"owner_activity", "close_requested"} and normalized["provider"] not in {"codex", "claude", "ccdm-root"}:
         raise ValueError("owner events require a registered CCDM adapter")
+    if event_type in THREAD_LIFECYCLE_EVENTS and (
+            normalized["provider"] != "ccdm-root"
+            or normalized.get("conversation_id", normalized["channel_id"]) == normalized["channel_id"]):
+        raise ValueError(f"{event_type} names a Thread Conversation, from root's Thread Supervisor")
     if event_type in {"response_delivered", "input_needed", "turn_completed", "work_resumed"}:
         for field in ("provider_session_id", "provider_turn_id", "message_id", "interaction_id"):
             if field == "message_id" and event_type in {"turn_completed", "work_resumed"}:

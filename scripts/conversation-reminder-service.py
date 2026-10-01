@@ -490,6 +490,20 @@ def thread_conversation(db: sqlite3.Connection, channel: sqlite3.Row, thread_id:
     return row
 
 
+def forget_conversation(db: sqlite3.Connection, project: str, conversation: str) -> None:
+    """Drop a deleted thread's reminder state. Its messages went with it, so its
+    cleanup is abandoned and an unresolved send can never be confirmed."""
+    for table in ("conversations", "owner_sources", "qualifications", "discoveries", "catch_ups"):
+        db.execute(f"DELETE FROM {table} WHERE project=? AND conversation_id=?", (project, conversation))
+    db.execute("UPDATE pending_actions SET completed=2 WHERE project=? AND conversation_id=? AND completed=0",
+               (project, conversation))
+    if db.execute("""UPDATE delivery_intents SET state='canceled' WHERE project=? AND conversation_id=?
+            AND state='uncertain'""", (project, conversation)).rowcount and not db.execute(
+            "SELECT 1 FROM delivery_intents WHERE project=? AND state='uncertain'", (project,)).fetchone():
+        db.execute("""UPDATE conversations SET reconciliation_status='suspended-restart-reconciliation'
+            WHERE project=? AND reconciliation_status='suspended-uncertain-send'""", (project,))
+
+
 def apply_event(db: sqlite3.Connection, registry: dict, row: sqlite3.Row) -> str:
     return apply_payload(db, registry, EVENTS.validate_event(json.loads(row["payload_json"])), row["commit_order"])
 
@@ -514,13 +528,23 @@ def apply_payload(db: sqlite3.Connection, registry: dict, event: dict, commit_or
     # An event without a conversation belongs to its project's Channel
     # Conversation; one naming a thread, to that Thread Conversation alone.
     conversation = event.get("conversation_id", event["channel_id"])
+    kind = event["event_type"]
+    if kind in EVENTS.THREAD_LIFECYCLE_EVENTS and not db.execute(
+            "SELECT 1 FROM conversations WHERE project=? AND conversation_id=?",
+            (event["project"], conversation)).fetchone():
+        # A thread with no reminder state has nothing to reset, close or drop.
+        db.execute("INSERT INTO applied_events VALUES (?)", (event["event_id"],))
+        return "applied"
+    if kind == "conversation_deleted":
+        forget_conversation(db, event["project"], conversation)
+        db.execute("INSERT INTO applied_events VALUES (?)", (event["event_id"],))
+        return "applied"
     if conversation != current["conversation_id"]:
         current = thread_conversation(db, current, conversation)
     key = (event["project"], current["conversation_id"], event["assignment_generation"])
     scoped = "project=? AND conversation_id=? AND assignment_generation=?"
     changes = {"checkpoint": current["checkpoint"] if commit_order is None else commit_order,
                "last_event_order": event["event_order"]}
-    kind = event["event_type"]
     occurred = event["event_time"]
     duplicate_source = False
     if kind == "close_requested" or (kind == "owner_activity" and event["activity_kind"] != "reaction"):
@@ -595,6 +619,14 @@ def apply_payload(db: sqlite3.Connection, registry: dict, event: dict, commit_or
                 db.execute("""INSERT INTO qualifications (project,conversation_id,assignment_generation,
                     provider_session_id,provider_turn_id,kind,response_message_id) VALUES (?,?,?,?,?,?,?)""",
                            qualification)
+    elif kind == "conversation_reset":
+        # A provider or account switch starts a fresh provider conversation:
+        # nothing the old one answered can arm a reminder any more.
+        changes.update(state="open-paused", current_interaction_id=None, response_message_id=None,
+                       response_at=None, due_at=None)
+    elif kind == "conversation_closed":
+        # An owner archive or the thread's /close: only this thread closes.
+        changes.update(state="closed", due_at=None, current_interaction_id=None)
     elif kind == "work_resumed" and current["state"] == "awaiting-owner":
         if event.get("interaction_id") == current["current_interaction_id"]:
             changes.update(state="open-paused", due_at=None)
@@ -779,10 +811,23 @@ def root_credentials_present() -> bool:
 ROOT_PERMISSION_NAMES = {"SendMessages": "Send Messages", "ReadMessageHistory": "Read Message History",
                          "AddReactions": "Add Reactions", "ManageMessages": "Manage Messages",
                          "ManageWebhooks": "Manage Webhooks"}
+THREAD_PERMISSION_NAMES = {"CreatePublicThreads": "Create Public Threads",
+                           "SendMessagesInThreads": "Send Messages in Threads",
+                           "ManageThreads": "Manage Threads", "ViewAuditLog": "View Audit Log"}
+# Granted at the guild, not in a channel.
+GUILD_PERMISSIONS = {"ViewAuditLog"}
+THREAD_SUPERVISOR_PLIST = Path("Library") / "LaunchAgents" / "com.ccdm.thread-supervisor.plist"
 
 
-def router_prerequisites(projects: object) -> dict:
+def threads_enabled(registry: dict, router: dict | None) -> bool:
+    """Thread Conversations are enabled once the supervisor is installed, configured, or connected."""
+    return ((Path.home() / THREAD_SUPERVISOR_PLIST).exists() or "thread_session_caps" in registry or
+            bool(((router or {}).get("supervisor") or {}).get("connected")))
+
+
+def router_prerequisites(registry: dict) -> dict:
     """Per router project, what root and the Router still need before delivery, each with its fix."""
+    projects = registry.get("projects")
     names = sorted(name for name, project in (projects.items() if isinstance(projects, dict) else [])
                    if isinstance(project, dict))
     if not names:
@@ -795,6 +840,7 @@ def router_prerequisites(projects: object) -> dict:
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         router = None
     reported = {row.get("project"): row for row in (router or {}).get("projects") or [] if isinstance(row, dict)}
+    threads = threads_enabled(registry, router)
     result = {}
     for name in names:
         blockers = []
@@ -812,6 +858,12 @@ def router_prerequisites(projects: object) -> dict:
             for flag in missing or []:
                 label = ROOT_PERMISSION_NAMES.get(flag, flag)
                 blockers.append(f"root lacks {label} in the project channel; grant root permission {label} in "
+                                f"{projects[name].get('channel_id')}")
+            for flag in (row.get("missing_thread_permissions") or []) if threads and missing is not None else []:
+                label = THREAD_PERMISSION_NAMES.get(flag, flag)
+                blockers.append(f"root lacks {label} in the guild; grant root permission {label} in guild "
+                                f"{registry.get('guild_id')}" if flag in GUILD_PERMISSIONS else
+                                f"root lacks {label} in the project channel; grant root permission {label} in "
                                 f"{projects[name].get('channel_id')}")
         result[name] = {"ready": not blockers, "blockers": blockers}
     return result
@@ -861,7 +913,7 @@ def preflight(project_root: Path, state_dir: Path) -> dict:
     checks = enablement_checks(project_root, state_dir, prepare=False)
     blockers = list(checks["blockers"])
     try:
-        routed = router_prerequisites(EVENTS.load_registry(project_root).get("projects"))
+        routed = router_prerequisites(EVENTS.load_registry(project_root))
     except (OSError, ValueError, json.JSONDecodeError):
         routed = {}
     blockers += [f"{name}: {blocker}" for name, row in routed.items() for blocker in row["blockers"]]
@@ -881,11 +933,12 @@ def readiness_report(project_root: Path, state_dir: Path, db: sqlite3.Connection
     """Per-project delivery readiness across adapters, observation, history, assignments, and intents."""
     prerequisites = provider_prerequisites(project_root)
     try:
-        projects = EVENTS.load_registry(project_root).get("projects")
+        registry = EVENTS.load_registry(project_root)
     except (OSError, ValueError, json.JSONDecodeError):
-        projects = None
+        registry = {}
+    projects = registry.get("projects")
     report = {}
-    routed = router_prerequisites(projects)
+    routed = router_prerequisites(registry)
     for name in sorted(projects if isinstance(projects, dict) else {}):
         adapter = READINESS.build_readiness(name, project_root, state_dir)
         conversation = conversations.get(name)
@@ -978,11 +1031,11 @@ def status(state_dir: Path, project_root: Path | None = None) -> dict:
         disabled = db.execute("SELECT value FROM settings WHERE key='disabled'").fetchone()
         if disabled is None:
             raise ValueError("conversation store settings are incomplete")
-        conversations = {}
-        for row in db.execute("SELECT * FROM conversations WHERE conversation_id=channel_id"):
+        def described(row: sqlite3.Row) -> dict:
             if row["state"] not in STATES:
                 raise ValueError("conversation store state is invalid")
-            conversations[row["project"]] = {
+            key = (row["project"], row["conversation_id"], row["assignment_generation"])
+            return {
                 "channel_id": row["channel_id"], "identity": row["identity"], "assignment_generation": row["assignment_generation"],
                 "state": row["state"], "revision": row["revision"],
                 "last_ack_at": row["last_ack_at"], "last_ack_message_id": row["last_ack_message_id"],
@@ -993,11 +1046,18 @@ def status(state_dir: Path, project_root: Path | None = None) -> dict:
                 "reminder_message_id": row["reminder_message_id"],
                 "cleanup_message_ids": json.loads(row["cleanup_message_ids"]),
                 "reconciliation_status": row["reconciliation_status"], "checkpoint": row["checkpoint"],
-                "discovery": DISCOVERY.status_for(db, row["project"], row["assignment_generation"]),
-                "catch_up_queued": db.execute("""SELECT 1 FROM catch_ups WHERE project=?
-                    AND assignment_generation=?""", (row["project"], row["assignment_generation"])).fetchone()
-                is not None,
+                "discovery": DISCOVERY.status_for(db, *key),
+                "catch_up_queued": db.execute("""SELECT 1 FROM catch_ups WHERE project=? AND conversation_id=?
+                    AND assignment_generation=?""", key).fetchone() is not None,
             }
+
+        conversations = {}
+        for row in db.execute("SELECT * FROM conversations WHERE conversation_id=channel_id"):
+            conversations[row["project"]] = {**described(row), "threads": {}}
+        # Each Thread Conversation nests under its project, keyed by thread id.
+        for row in db.execute("SELECT * FROM conversations WHERE conversation_id!=channel_id ORDER BY conversation_id"):
+            if row["project"] in conversations:
+                conversations[row["project"]]["threads"][row["conversation_id"]] = described(row)
         blocked = [name for name, row in conversations.items()
                    if row["reconciliation_status"] == "blocked-retired-generation"]
         unresolved = [dict(row) for row in db.execute("""SELECT nonce,project,state,claimed_at
@@ -1123,7 +1183,8 @@ def discovery_next(project_root: Path, state_dir: Path) -> dict:
     db = connect(state_dir, create=True)
     try:
         db.execute("BEGIN IMMEDIATE")
-        request = DISCOVERY.next_request(db, usable, clock_now())
+        guild = registry.get("guild_id")
+        request = DISCOVERY.next_request(db, usable, clock_now(), str(guild) if guild else None)
         db.execute("COMMIT")
         return {"request": request}
     except Exception:
@@ -1132,6 +1193,26 @@ def discovery_next(project_root: Path, state_dir: Path) -> dict:
         raise
     finally:
         db.close()
+
+
+def supervisor_closed_threads(project: str) -> set[str]:
+    """The project's threads the Thread Supervisor has closed, read from its private store.
+
+    Without a readable store nothing is known closed."""
+    override = os.environ.get("CCDM_THREAD_SUPERVISOR_STATE_DIR")
+    state_dir = Path(override).expanduser() if override else Path.home() / ".local" / "state" / "ccdm" / "thread-supervisor"
+    path = state_dir / "threads.sqlite3"
+    if not path.is_file():
+        return set()
+    try:
+        source = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+        try:
+            return {row[0] for row in source.execute(
+                "SELECT thread_id FROM threads WHERE project=? AND state='closed'", (project,))}
+        finally:
+            source.close()
+    except sqlite3.Error:
+        return set()
 
 
 def discovery_result(project_root: Path, state_dir: Path, payload: dict) -> dict:
@@ -1154,7 +1235,9 @@ def discovery_result(project_root: Path, state_dir: Path, payload: dict) -> dict
         recorded = {r[0] for r in db.execute(
             "SELECT message_id FROM delivery_intents WHERE state='sent' AND message_id IS NOT NULL")}
         now = clock_now()
-        outcome = DISCOVERY.record_result(db, payload, now, recorded, adapter_interactions, reaction_times)
+        closed = {r[0] for r in db.execute("""SELECT conversation_id FROM conversations WHERE project=?
+            AND conversation_id!=channel_id AND state='closed'""", (project,))} | supervisor_closed_threads(project)
+        outcome = DISCOVERY.record_result(db, payload, now, recorded, adapter_interactions, reaction_times, closed)
         if outcome == "committed":
             # Reconcile forward: newer durable events win over the historical baseline.
             for row in rows:

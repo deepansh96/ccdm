@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import sys
 
-from . import boot, config, lifecycle, store
+from . import boot, config, lifecycle, reminders, store
 from .clock import now
 from .link import LinkError
 
@@ -93,3 +93,4 @@ def _close(context, row, owner: bool, event: dict) -> None:
     lifecycle.stop_session(context, store.thread(context.db, thread_id))
     store.update(context.db, thread_id, state="closed", stop_reason=None, close_reason="close-command",
                  pending_close=None)
+    reminders.emit(context, "conversation_closed", row)

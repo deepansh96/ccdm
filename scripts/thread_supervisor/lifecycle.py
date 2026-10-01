@@ -27,7 +27,7 @@ import sys
 import threading
 import time
 
-from . import registry, store
+from . import registry, reminders, store
 from .link import LinkError
 from .paths import router_state_dir
 
@@ -155,7 +155,7 @@ def stop_archived(context, row, since_ms: int) -> None:
     if row["pending_close"]:  # The archive a `/close` made: the root bot's, so closed.
         store.update(context.db, thread_id, state="closed", stop_reason=None, close_reason="close-command",
                      pending_close=None)
-        return
+        return reminders.emit(context, "conversation_closed", row)
     store.finish_boot(context.db, thread_id, "stopped", "auto-archive")
     poll = ArchivePoll(next(_poll_ids), since_ms,
                        time.monotonic() + _seconds("CCDM_THREAD_ARCHIVE_POLL_WINDOW_S", ARCHIVE_POLL_WINDOW_SECONDS))
@@ -213,6 +213,7 @@ def _classify(context, row, poll: ArchivePoll, actor: str | None) -> None:
     owner = registry.owner_id(registry.load(context.project_root))
     if actor and actor == owner:
         store.update(context.db, thread_id, state="closed", stop_reason=None, close_reason="owner-archive")
+        reminders.emit(context, "conversation_closed", row)
     elif actor and context.bot_user_id and actor == context.bot_user_id:
         store.update(context.db, thread_id, state="closed", stop_reason=None, close_reason="root-archive")
     elif not actor and not poll.succeeded:
@@ -229,3 +230,4 @@ def on_thread_delete(context, event: dict) -> None:
     context.archive_polls.pop(thread_id, None)
     stop_session(context, row)
     store.forget(context.db, thread_id)
+    reminders.emit(context, "conversation_deleted", row)
