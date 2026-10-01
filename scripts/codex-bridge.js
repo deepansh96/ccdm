@@ -21,6 +21,7 @@ process.env.CCDM_REMINDER_RECEIPTS_DIR = REMINDER_RECEIPTS_DIR;
 const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { createRouterTransport } = require("./codex-bridge-transport.js");
 const routerPaths = require("./router/paths.js");
+const { withRegistryLock } = require("./router/registry.js");
 const { MAX_TIMEOUT_MS: ROUTER_MAX_TIMEOUT_MS } = require("./router/deadlines.js");
 
 // The launch channel: root's primary channel, and the name of a project's
@@ -128,6 +129,9 @@ const STREAM_FAILURE_MESSAGE =
 const STREAM_RECOVERY_PROMPT =
   "Retry the previous user request. The prior model response failed before any work began.";
 const DISCORD_MCP_NAME = ROOT_MULTI_CHANNEL ? "discord-root" : `discord-${CHANNEL_ID}`;
+// Every bridge on a Codex Home shares its config.toml.
+const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+const CODEX_CONFIG_FILE = path.join(CODEX_HOME, "config.toml");
 const THREAD_INSTRUCTION = ROOT_MULTI_CHANNEL
   ? `This root thread is connected to Discord through the ${DISCORD_MCP_NAME} MCP server. Incoming messages include Discord routing metadata. Do not call Discord MCP tools unless the current task includes an explicit Discord reply scope token. Subagents and delegated tasks must return results to their parent agent, not to Discord.`
   : `This thread is connected to Discord through the ${DISCORD_MCP_NAME} MCP server. Do not call Discord MCP tools unless the current task includes an explicit Discord reply scope token. Subagents and delegated tasks must return results to their parent agent, not to Discord.`;
@@ -1335,23 +1339,66 @@ async function listMcpServers() {
   return servers;
 }
 
+// The discord-* servers the Codex Home config names, which this app-server
+// may not have loaded yet.
+async function configuredDiscordMcpNames() {
+  const config = await readFile(CODEX_CONFIG_FILE, "utf8").catch(() => "");
+  return [...config.matchAll(/^\[mcp_servers\.(discord-[^.\]\s]+)\]/gm)].map((match) => match[1]);
+}
+
+const isForeignDiscordMcp = (name) => Boolean(name) && name.startsWith("discord-") && name !== DISCORD_MCP_NAME;
+
 async function registerDiscordMcp() {
   const mcpName = DISCORD_MCP_NAME;
 
-  // Remove any other discord MCP servers to prevent cross-session replies
-  try {
-    const servers = await listMcpServers();
-    for (const s of servers) {
-      const name = s.name || s.id;
-      if (name && name.startsWith("discord-") && name !== mcpName) {
+  // Many bridges share a Codex Home, so the delete-write-reload sequence runs
+  // under a lock on its config (the registry lock protocol, which
+  // start-codex-session.sh's stripping also takes): an app-server reloading
+  // between a sibling's write and the sibling's own reload would load the
+  // sibling's server and act with its key.
+  await mkdir(CODEX_HOME, { recursive: true });
+  await withRegistryLock(CODEX_CONFIG_FILE, async () => {
+    // Remove any other discord MCP servers to prevent cross-session replies
+    try {
+      const loaded = (await listMcpServers()).map((s) => s.name || s.id);
+      const stale = new Set([...loaded, ...await configuredDiscordMcpNames()].filter(isForeignDiscordMcp));
+      for (const name of stale) {
         await sendRequest("config/value/delete", { keyPath: `mcp_servers.${name}` });
         console.log(`Removed stale MCP server: ${name}`);
       }
+    } catch (err) {
+      console.log(`Warning: could not clean stale MCP servers: ${err.message || err}`);
     }
-  } catch (err) {
-    console.log(`Warning: could not clean stale MCP servers: ${err.message || err}`);
-  }
 
+    await writeDiscordMcpConfig(mcpName);
+    await sendRequest("config/mcpServer/reload", null);
+    console.log("MCP servers reloaded");
+  });
+
+  const deadline = Date.now() + Number(process.env.CODEX_MCP_READY_TIMEOUT_MS || 30000);
+  do {
+    const servers = await listMcpServers();
+    // A foreign server still loaded would let this thread act in another
+    // session's scope: refuse to start.
+    const foreign = servers.map((s) => s.name || s.id).filter(isForeignDiscordMcp);
+    if (foreign.length > 0) {
+      throw new Error(`Discord MCP ${mcpName} refused: foreign MCP server ${foreign.join(", ")} still loaded after reload`);
+    }
+    const found = servers.find((s) => (s.name || s.id) === mcpName);
+    const tools = found?.tools;
+    const hasReply = Array.isArray(tools)
+      ? tools.some((tool) => tool.name === "reply")
+      : tools && Object.values(tools).some((tool) => tool.name === "reply");
+    if (hasReply) {
+      console.log(`MCP server ready: ${mcpName} (reply tool available)`);
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  } while (Date.now() < deadline);
+  throw new Error(`Discord MCP ${mcpName} did not expose the reply tool before startup deadline`);
+}
+
+async function writeDiscordMcpConfig(mcpName) {
   await sendRequest("config/value/write", {
     keyPath: `mcp_servers.${mcpName}`,
     mergeStrategy: "replace",
@@ -1383,25 +1430,6 @@ async function registerDiscordMcp() {
     },
   });
   console.log(`MCP server config written: ${mcpName}`);
-
-  await sendRequest("config/mcpServer/reload", null);
-  console.log("MCP servers reloaded");
-
-  const deadline = Date.now() + Number(process.env.CODEX_MCP_READY_TIMEOUT_MS || 30000);
-  do {
-    const servers = await listMcpServers();
-    const found = servers.find((s) => (s.name || s.id) === mcpName);
-    const tools = found?.tools;
-    const hasReply = Array.isArray(tools)
-      ? tools.some((tool) => tool.name === "reply")
-      : tools && Object.values(tools).some((tool) => tool.name === "reply");
-    if (hasReply) {
-      console.log(`MCP server ready: ${mcpName} (reply tool available)`);
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  } while (Date.now() < deadline);
-  throw new Error(`Discord MCP ${mcpName} did not expose the reply tool before startup deadline`);
 }
 
 async function startCodexThread(resumeThreadId = "") {

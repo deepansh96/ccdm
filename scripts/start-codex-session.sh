@@ -336,36 +336,57 @@ if [[ "$WEBHOOK_ID" == "__NONE__" ]]; then
 fi
 
 # Remove stale discord MCP entries from the selected Codex home config
-# (they get re-registered per session)
-python3 - "$CODEX_HOME_DIR" <<'PY' 2>/dev/null || true
+# (they get re-registered per session), under the Codex Home lock a
+# registering bridge holds (scripts/codex-bridge.js), so no bridge's
+# delete-write-reload is interleaved.
+if ! python3 - "$CODEX_HOME_DIR" "$SCRIPT_DIR" <<'PY'
+import importlib.util
 import os
 import sys
 codex_home = os.path.expanduser(sys.argv[1])
 config_path = os.path.join(codex_home, 'config.toml')
 if os.path.exists(config_path):
-    with open(config_path) as f:
-        lines = f.readlines()
-    filtered, skip = [], False
-    for line in lines:
-        if line.startswith('[mcp_servers.discord-'):
-            skip = True
-            continue
-        if skip and line.startswith('['):
-            skip = False
-        if skip:
-            continue
-        filtered.append(line)
-    # Remove consecutive blank lines
-    result, prev_blank = [], False
-    for line in filtered:
-        blank = line.strip() == ''
-        if blank and prev_blank:
-            continue
-        result.append(line)
-        prev_blank = blank
-    with open(config_path, 'w') as f:
-        f.writelines(result)
+    sys.dont_write_bytecode = True  # no __pycache__ beside the scripts
+    spec = importlib.util.spec_from_file_location(
+        "ccdm_registry_update", os.path.join(sys.argv[2], "registry-update.py"))
+    registry_update = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(registry_update)
+    # The registry lock protocol, on the Codex Home config.
+    try:
+        lock = registry_update.acquire(config_path)
+    except TimeoutError as error:
+        print(error, file=sys.stderr)
+        sys.exit(1)
+    try:
+        with open(config_path) as f:
+            lines = f.readlines()
+        filtered, skip = [], False
+        for line in lines:
+            if line.startswith('[mcp_servers.discord-'):
+                skip = True
+                continue
+            if skip and line.startswith('['):
+                skip = False
+            if skip:
+                continue
+            filtered.append(line)
+        # Remove consecutive blank lines
+        result, prev_blank = [], False
+        for line in filtered:
+            blank = line.strip() == ''
+            if blank and prev_blank:
+                continue
+            result.append(line)
+            prev_blank = blank
+        with open(config_path, 'w') as f:
+            f.writelines(result)
+    finally:
+        registry_update.release(lock)
 PY
+then
+  echo "Refusing to start '$PROJECT': could not clean Discord MCP servers from $CODEX_HOME_DIR/config.toml." >&2
+  exit 1
+fi
 
 [[ "$TEXT_REPLY_FALLBACK_FLAG" == "__NONE__" ]] && TEXT_REPLY_FALLBACK_FLAG=""
 [[ "$CODEX_MODEL_VALUE" == "__NONE__" ]] && CODEX_MODEL_VALUE=""

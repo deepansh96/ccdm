@@ -1412,7 +1412,7 @@ test("bridge does not retry response.failed after agent work starts", async () =
   await bridge.stop();
 });
 
-test("bridge warns on stale MCP removal failure and records diagnostics for MCP registration failure", async () => {
+test("bridge refuses to start when a stale MCP server it could not remove stays loaded, and records diagnostics for MCP registration failure", async () => {
   const staleWorkspace = createBridgeWorkspace();
   const staleCodex = await startFakeCodexServer(staleWorkspace, {
     failStaleMcpRemoval: "delete failed",
@@ -1420,8 +1420,12 @@ test("bridge warns on stale MCP removal failure and records diagnostics for MCP 
   });
   const staleBridge = await startBridge(staleWorkspace, { port: staleCodex.port });
 
-  await staleBridge.waitForOutput(/Warning: could not clean stale MCP servers: delete failed/, 7000);
-  await staleBridge.waitForOutput(/Codex-Discord bridge running/, 7000);
+  const staleResult = await staleBridge.closed;
+  assert.equal(staleResult.exitCode, 1);
+  assert.match(staleResult.stdout, /Warning: could not clean stale MCP servers: delete failed/);
+  assert.match(staleResult.stderr, /foreign MCP server discord-stale still loaded after reload/);
+  assert.doesNotMatch(staleResult.stdout, /Discord bot logged in|Listening in/);
+  assert.ok(!staleCodex.clientMessages.some((message) => message.method === "thread/start"));
   assert.ok(
     staleCodex.clientMessages.some(
       (message) => message.method === "config/value/delete" && message.params?.keyPath === "mcp_servers.discord-stale",

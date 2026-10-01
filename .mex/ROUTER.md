@@ -29,6 +29,7 @@ Then read this file fully before doing anything else in this session.
 
 ## Current Project State
 **Working:**
+- Codex Discord MCP registration runs under a per-Codex-Home `config.toml.lock` shared by bridges and `start-codex-session.sh`; a bridge whose app-server still loads a foreign `discord-*` server after reload fails startup before its Router hello.
 - Router message ingress accepts only Discord default (0) and reply (19) messages before any session or observer routing; system notices, including thread-created (18), thread-starter (21), and pins (6), are dropped. The E2E harness supports thread channels, Gateway lifecycle events, thread REST operations, audit logs, and thread-scoped webhook messages for subsequent Thread Conversation slices. Thread sessions are not yet routed.
 - The Router is the only transport: registry readers ignore `transport`, and no script outside root admin reads a pool bot token. Guest management, operator exports, and usage reporting read only the root token from root Discord state; guest grants and revokes write no per-bot access file and make no `project-bot` calls. The Conversation Reminder observer has no Gateway login of its own and sends only as root.
 - Root bot serves every registered project channel through the Router, each with its own webhook identity.
