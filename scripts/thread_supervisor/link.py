@@ -14,6 +14,8 @@ import threading
 LINK_SCRIPT = Path(__file__).resolve().parent.parent / "thread-supervisor-link.js"
 # Longer than the RouterClient's own 10-second op deadline, which answers first.
 CALL_TIMEOUT_SECONDS = 15
+# The Router's own deadline for each op (scripts/router/deadlines.js), plus slack.
+OP_TIMEOUT_SECONDS = {"thread_list": 5 * 60 + 15}
 
 
 class LinkError(Exception):
@@ -80,7 +82,8 @@ class Link:
             raise LinkError("router_unavailable", "the Router link stopped") from error
         with self.answered:
             answered = self.answered.wait_for(
-                lambda: request_id in self.responses or self.process.poll() is not None, CALL_TIMEOUT_SECONDS)
+                lambda: request_id in self.responses or self.process.poll() is not None,
+                OP_TIMEOUT_SECONDS.get(op, CALL_TIMEOUT_SECONDS))
             frame = self.responses.pop(request_id, None)
         if frame is None:
             raise LinkError("timeout" if not answered else "router_unavailable", f"{op} got no answer")

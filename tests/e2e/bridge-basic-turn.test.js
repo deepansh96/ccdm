@@ -173,13 +173,17 @@ test("fake Codex app-server speaks the startup, MCP, thread, turn, delta, MCP-re
   await request(1, "initialize", {});
   ws.send(JSON.stringify({ jsonrpc: "2.0", method: "initialized" }));
   await request(2, "mcpServerStatus/list", {});
-  await request(3, "config/value/delete", { keyPath: "mcp_servers.discord-stale" });
+  await request(3, "config/value/write", { keyPath: "mcp_servers.discord-stale", mergeStrategy: "replace", value: null });
   await request(4, "config/value/write", { keyPath: "mcp_servers.discord-channel-id" });
   await request(5, "config/mcpServer/reload", null);
   await request(6, "thread/start", { cwd: workspace.repoDir });
   await waitFor(() => received.find((message) => message.method === "thread/started"));
   await request(7, "turn/start", { input: [{ type: "text", text: "user" }] });
   await waitFor(() => received.find((message) => message.method === "turn/completed"));
+  // As the real app-server, it has no delete method.
+  await request(8, "config/value/delete", { keyPath: "mcp_servers.discord-channel-id" });
+  assert.deepEqual(received.find((message) => message.id === 8).error,
+    { code: -32600, message: "Invalid request: unknown variant `config/value/delete`" });
 
   ws.close();
   const notifications = received.filter((message) => message.method).map((message) => message.method);
@@ -194,7 +198,7 @@ test("fake Codex app-server speaks the startup, MCP, thread, turn, delta, MCP-re
     "initialize",
     "initialized",
     "mcpServerStatus/list",
-    "config/value/delete",
+    "config/value/write",
     "config/value/write",
     "config/mcpServer/reload",
     "thread/start",
@@ -351,7 +355,7 @@ test("bridge boots, registers Discord MCP, removes stale MCP, and completes one 
       "initialize",
       "initialized",
       "mcpServerStatus/list",
-      "config/value/delete",
+      "config/value/write",
       "config/value/write",
       "config/mcpServer/reload",
       "mcpServerStatus/list",
@@ -1412,6 +1416,46 @@ test("bridge does not retry response.failed after agent work starts", async () =
   await bridge.stop();
 });
 
+test("bridge in a Codex Home whose config.toml holds a sibling's discord-* server removes it with a null replace write and starts", async () => {
+  const workspace = createBridgeWorkspace();
+  const codexHome = path.join(workspace.homeDir, ".codex");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, "config.toml"), [
+    'model = "gpt-5"',
+    "",
+    "[mcp_servers.exa]",
+    'url = "https://mcp.exa.ai/mcp"',
+    "",
+    "[mcp_servers.discord-sibling-channel]",
+    'command = "node"',
+    "",
+    "[mcp_servers.discord-sibling-channel.env]",
+    'CHANNEL_ID = "sibling-channel"',
+    "",
+  ].join("\n"));
+  const codex = await startFakeCodexServer(workspace, { channelId: "channel-id", codexHome });
+  const bridge = await startBridge(workspace, { port: codex.port, env: { CODEX_HOME: codexHome } });
+
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
+  assert.match(bridge.stdout, /Removed stale MCP server: discord-sibling-channel/);
+  assert.doesNotMatch(bridge.stdout, /could not clean stale MCP servers/);
+  const methods = codex.clientMessages.map((message) => message.method).filter(Boolean);
+  assert.ok(!methods.includes("config/value/delete"));
+  assert.ok(codex.clientMessages.some((message) => message.method === "config/value/write"
+    && message.params?.keyPath === "mcp_servers.discord-sibling-channel"
+    && message.params.mergeStrategy === "replace" && message.params.value === null));
+  // The foreign-server check passed: only the bridge's own discord-* server
+  // was loaded at the reload, beside the non-Discord one.
+  assert.deepEqual(readState(workspace.stateDir).fixtures.codex.servers[String(codex.port)].mcpReloads,
+    [["exa", "discord-channel-id"]]);
+  assert.ok(methods.includes("thread/start"));
+  const config = fs.readFileSync(path.join(codexHome, "config.toml"), "utf8");
+  assert.doesNotMatch(config, /discord-sibling-channel|sibling-channel/);
+  assert.match(config, /\[mcp_servers\.exa\]/);
+  assert.match(config, /\[mcp_servers\.discord-channel-id\]/);
+  await bridge.stop();
+});
+
 test("bridge refuses to start when a stale MCP server it could not remove stays loaded, and records diagnostics for MCP registration failure", async () => {
   const staleWorkspace = createBridgeWorkspace();
   const staleCodex = await startFakeCodexServer(staleWorkspace, {
@@ -1428,7 +1472,7 @@ test("bridge refuses to start when a stale MCP server it could not remove stays 
   assert.ok(!staleCodex.clientMessages.some((message) => message.method === "thread/start"));
   assert.ok(
     staleCodex.clientMessages.some(
-      (message) => message.method === "config/value/delete" && message.params?.keyPath === "mcp_servers.discord-stale",
+      (message) => message.method === "config/value/write" && message.params?.keyPath === "mcp_servers.discord-stale" && message.params?.value === null,
     ),
   );
   assert.ok(
@@ -1838,7 +1882,7 @@ test("Discord MCP readiness follows data pages and waits for the reply tool befo
   const bridge = await startBridge(workspace, { port: codex.port });
   await bridge.waitForOutput(/Listening in #alpha/, 7000);
   const messages = codex.clientMessages;
-  assert.ok(messages.some((m) => m.method === "config/value/delete" && m.params.keyPath === "mcp_servers.discord-stale"));
+  assert.ok(messages.some((m) => m.method === "config/value/write" && m.params.keyPath === "mcp_servers.discord-stale" && m.params.value === null && m.params.mergeStrategy === "replace"));
   const start = messages.findIndex((m) => m.method === "thread/start");
   assert.ok(messages.slice(0, start).filter((m) => m.method === "mcpServerStatus/list").length >= 4);
   assert.match(bridge.stdout, /reply tool available/);

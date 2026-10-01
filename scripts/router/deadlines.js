@@ -16,6 +16,9 @@ const MAX_READ = 10_000;
 // An export's size is unknown until it is paged (up to 10,000 messages), and
 // it also downloads every attachment in the range.
 const EXPORT_TIMEOUT_MS = 10 * 60_000;
+// `thread_list` reads the active threads, then up to ten archived pages for
+// every registered project channel, one rate-limited call at a time.
+const THREAD_LIST_TIMEOUT_MS = 5 * 60_000;
 // The longest budget any operation gets; MCP hosts must wait at least this long.
 const MAX_TIMEOUT_MS = EXPORT_TIMEOUT_MS;
 
@@ -26,7 +29,8 @@ function requestTimeoutMs(op, args = {}, fallback = DEFAULT_TIMEOUT_MS) {
     return Math.max(fallback, DEFAULT_TIMEOUT_MS + Math.ceil(count / PAGE_SIZE) * PAGE_BUDGET_MS);
   }
   if (op === "export_message_range") return Math.max(fallback, EXPORT_TIMEOUT_MS);
+  if (op === "thread_list") return Math.max(fallback, THREAD_LIST_TIMEOUT_MS);
   return fallback;
 }
 
-module.exports = { DEFAULT_TIMEOUT_MS, EXPORT_TIMEOUT_MS, MAX_TIMEOUT_MS, PAGE_BUDGET_MS, requestTimeoutMs };
+module.exports = { DEFAULT_TIMEOUT_MS, EXPORT_TIMEOUT_MS, THREAD_LIST_TIMEOUT_MS, MAX_TIMEOUT_MS, PAGE_BUDGET_MS, requestTimeoutMs };

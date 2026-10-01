@@ -231,7 +231,8 @@ test("no Discord token reaches the root Codex session environment, launch files,
 
   const state = readState(workspace.stateDir);
   const launchDir = path.join(workspace.routerStateDir, "launches", ".root");
-  const mcpWrites = clientMessages(codex, "config/value/write");
+  // Removals are null replace writes; only the registration carries a config.
+  const mcpWrites = clientMessages(codex, "config/value/write").filter((message) => message.params.value !== null);
   assert.equal(mcpWrites.length, 1);
   const surfaces = [
     JSON.stringify(state.fixtures.tmux.sessions.root_agent),
