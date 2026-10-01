@@ -13,6 +13,22 @@
 //   CCDM_CLAUDE_PROJECT       the project this session serves
 //   CCDM_CHANNEL_READY_FILE   where the Router hello outcome is written for the launcher
 //   CCDM_ROUTER_ROLE          `root` for root Claude (restart-root-agent.sh); otherwise a project
+//   CCDM_THREAD_ID            set by start-thread-session.sh: this session serves that thread
+//   CCDM_THREAD_PROVIDER      the thread's provider (`claude`)
+//   CCDM_THREAD_BOOTSTRAP_FILE  the Thread Supervisor's bootstrap for this launch
+//   CCDM_THREAD_TMUX          this thread session's own tmux session
+//   CCDM_THREAD_ACTIVITY_FILE   this launch's activity.json, marked turn_running on each notification
+//
+// In thread mode the server says hello as the `thread` role, so its Session
+// Scope is the thread alone. It holds live events until the supervisor's
+// bootstrap file exists (CCDM_THREAD_BOOT_TIMEOUT_S, 120 s by default),
+// delivers the bootstrap as the first channel notification, and drops held
+// messages the bootstrap already includes. It records the thread's own
+// Conversation Reminder events, with the thread as their conversation and
+// the bootstrap's owner messages as interactions, writes no capability
+// marker, and ignores `scope_changed`. Its commands are /compact,
+// typed into its own tmux pane, and /pause and /unpause; the supervisor owns
+// a thread's /restart and /clear.
 //
 // In the root role the server speaks for root: it receives root-channel
 // messages and the owner's bot mentions in project channels, may act in any
@@ -46,6 +62,7 @@ const path = require("node:path");
 const { createInterface } = require("node:readline");
 const reminder = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
+const { markTurn } = require("./thread-activity.js");
 const { createEmergencyGateway } = require("./router/emergency.js");
 
 const ROOT_DIR = path.dirname(__dirname);
@@ -68,6 +85,12 @@ const ROOT_INSTRUCTIONS = [
 ].join("\n");
 
 const ROOT = process.env.CCDM_ROUTER_ROLE === "root";
+const THREAD_ID = ROOT ? "" : process.env.CCDM_THREAD_ID || "";
+const THREAD = Boolean(THREAD_ID);
+// A project's channel session and a thread session record reminder events;
+// only the channel session proves the project's capability.
+const REMINDERS = !ROOT;
+const CAPABILITY = REMINDERS && !THREAD;
 
 const REMINDER_PROJECT_ROOT = process.env.CCDM_REMINDER_PROJECT_ROOT || path.dirname(__dirname);
 const REMINDER_STATE_DIR = process.env.CCDM_REMINDER_STATE_DIR || path.join(os.homedir(), ".local", "state", "ccdm", "conversation-reminders");
@@ -104,7 +127,12 @@ async function hasCommandHooks() {
 
 // This project's Claude assignment, or null when the registry no
 // longer assigns the channel to it.
+// A thread's is its parent project's, whatever that project's provider.
 async function reminderAssignment(channelId) {
+  if (THREAD) {
+    return channelId === THREAD_ID ? reminder.resolveThreadAssignment(process.env.CCDM_CLAUDE_PROJECT, THREAD_ID,
+      { registryPath: REGISTRY_PATH }).catch(() => null) : null;
+  }
   const assignment = await reminder.resolveAssignmentForChannel(channelId, { registryPath: REGISTRY_PATH }).catch(() => null);
   return assignment?.project === process.env.CCDM_CLAUDE_PROJECT && assignment.project_type === "claude"
     ? assignment : null;
@@ -135,12 +163,13 @@ async function writeCapabilityMarker(granted) {
   renameSync(tmp, capabilityPath);
 }
 
-// An owner message opens an interaction the reply tool can name; answering
-// after an input-needed reply records that the work resumed.
-async function recordOwnerMessage(event) {
+// An owner message opens an interaction the reply tool can name (by
+// `answeredAs`, its own id unless a bootstrap names it); answering after an
+// input-needed reply records that the work resumed.
+async function recordOwnerMessage(event, answeredAs = event.message_id) {
   const assignment = await reminderAssignment(event.channel_id);
   if (!assignment || event.author?.id !== assignment.owner_id) return;
-  interactions.set(event.message_id, {
+  interactions.set(answeredAs, {
     ...assignment,
     provider: "claude",
     provider_session_id: LAUNCH_ID,
@@ -172,7 +201,7 @@ async function recordOwnerMessage(event) {
 // the question.
 async function recordDeliveredReply(input, result) {
   const context = interactions.get(input.conversation_interaction_id);
-  if (!context || input.chat_id !== context.channel_id) return;
+  if (!context || input.chat_id !== (context.conversation_id || context.channel_id)) return;
   const ids = result.message_ids?.length ? result.message_ids : [result.message_id];
   for (const id of ids) {
     const disposition = input.conversation_disposition === "input-needed" && id === ids.at(-1) ? "input-needed" : "progress";
@@ -182,7 +211,9 @@ async function recordDeliveredReply(input, result) {
 }
 
 function contextPct() {
-  const file = path.join(process.env.CCDM_ROUTER_STATE_DIR || "", "launches", process.env.CCDM_CLAUDE_PROJECT || "", "context.json");
+  const launch = path.join(process.env.CCDM_ROUTER_STATE_DIR || "", "launches", process.env.CCDM_CLAUDE_PROJECT || "",
+    ...(THREAD ? ["threads", THREAD_ID] : []));
+  const file = path.join(launch, "context.json");
   try {
     const pct = JSON.parse(readFileSync(file, "utf8")).context_pct;
     return Number.isFinite(pct) ? pct : undefined;
@@ -322,6 +353,35 @@ const TOOLS = {
   },
 };
 
+// A Channel Conversation hands a side task off to a Thread Conversation in its
+// own channel; the Thread Supervisor validates and creates it, which can take
+// a while, so the op gets the supervisor's own budget.
+const CREATE_THREAD_TIMEOUT_MS = 60000;
+
+async function createThread(router, { chat_id, name, provider, account, model, effort, first_message }) {
+  const result = await router.request("create_thread", {
+    channel_id: chat_id || scope.channel_id, name, provider, account, model, effort, first_message,
+  }, { timeoutMs: CREATE_THREAD_TIMEOUT_MS });
+  return `created thread (id: ${result.thread_id})`;
+}
+
+if (!ROOT && !THREAD) {
+  TOOLS.create_thread = {
+    description: "Hand a side task off to a new Thread Conversation under this channel, with its own agent session. Optionally override the provider, account, model, or effort, and pass first_message to start the thread's session with it at once. Returns the new thread's id.",
+    properties: {
+      name: { type: "string", description: "Thread name (1-100 characters)." },
+      provider: { type: "string", enum: ["claude", "codex"], description: "Thread provider. Defaults to the project's." },
+      account: { type: "string", description: "An account alias from the provider's claude_accounts or codex_accounts." },
+      model: { type: "string", description: "Model name for the thread's session." },
+      effort: { type: "string", description: "Reasoning effort for the thread's session." },
+      first_message: { type: "string", description: "The task: the thread's first message, which starts its session at once." },
+      chat_id: { type: "string", description: "This session's channel. Omit it; no other channel is allowed." },
+    },
+    required: ["name"],
+    run: createThread,
+  };
+}
+
 // Root reads any of its channels, so its read tools take the channel; reply
 // correlation is a project Conversation Reminder concern.
 if (ROOT) {
@@ -373,11 +433,63 @@ function notification(kind, event) {
   };
 }
 
+// The supervisor writes the bootstrap once the Router has this session's
+// hello; until it exists (or the boot timeout passes) live events wait.
+async function awaitBootstrap() {
+  const file = process.env.CCDM_THREAD_BOOTSTRAP_FILE;
+  const timeoutS = Number(process.env.CCDM_THREAD_BOOT_TIMEOUT_S);
+  const deadline = Date.now() + (Number.isFinite(timeoutS) && timeoutS > 0 ? timeoutS : 120) * 1000;
+  while (file && Date.now() < deadline) {
+    try {
+      return JSON.parse(await readFile(file, "utf8"));
+    } catch { /* Not written yet. */ }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  process.stderr.write("ccdm channel: no thread bootstrap arrived; delivering live events without it\n");
+  return null;
+}
+
+// The bootstrap as one channel notification: the preamble, the starter, and
+// every message sent while the session booted, in Discord order. Its meta
+// names the last of them, the message a reply answers.
+function bootstrapNotification(bootstrap) {
+  const messages = Array.isArray(bootstrap.messages) ? bootstrap.messages : [];
+  const parts = [String(bootstrap.preamble || "")];
+  if (bootstrap.starter) parts.push(`The thread was started from this message:\n${bootstrap.starter}`);
+  if (messages.length) {
+    parts.push(["Messages sent in the thread so far:", ...messages.map(message => {
+      const attachments = message.attachments?.length
+        ? ` [${message.attachments.length} attachment(s): ${message.attachments.map(safeName).join(", ")}; download_attachment with message_id ${message.message_id}]`
+        : "";
+      return `[${message.ts}] ${message.author?.name ?? message.author?.id}: ${message.content}${attachments}`;
+    })].join("\n"));
+  }
+  const last = messages.at(-1);
+  return {
+    content: parts.filter(Boolean).join("\n\n"),
+    meta: {
+      chat_id: THREAD_ID, message_id: last?.message_id ?? THREAD_ID,
+      user: last?.author?.name ?? "ccdm", user_id: last?.author?.id ?? "", ts: last?.ts ?? new Date().toISOString(),
+    },
+  };
+}
+
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
+// A thread session types the command into its own pane, never the project's.
+function typeIntoOwnPane(command) {
+  const target = `=${process.env.CCDM_THREAD_TMUX}:`;
+  const tmux = args => new Promise((resolve, reject) => {
+    execFile("tmux", args, (error, stdout, stderr) => error ? reject(new Error(stderr.trim() || error.message)) : resolve(stdout));
+  });
+  if (!process.env.CCDM_THREAD_TMUX) return Promise.reject(new Error("this thread session has no tmux session"));
+  return tmux(["send-keys", "-t", target, "-l", `/${command}`]).then(() => tmux(["send-keys", "-t", target, "Enter"]));
+}
+
 function relayClaudeCommand(project, command) {
+  if (THREAD) return typeIntoOwnPane(command);
   return new Promise((resolve, reject) => {
     execFile(path.join(ROOT_DIR, "scripts", "send-claude-command.sh"), ["--project", project, command], (error, stdout, stderr) => {
       if (error) reject(new Error(stderr.trim() || error.message));
@@ -401,8 +513,8 @@ function scheduleRestart(project) {
 }
 
 // Reminder events are recorded in arrival order, after any stranded outbox.
-let reminderEvents = ROOT ? Promise.resolve() : reminder.drainOutbox();
-if (!ROOT) process.on("exit", removeCapabilityMarker);
+let reminderEvents = REMINDERS ? reminder.drainOutbox() : Promise.resolve();
+if (CAPABILITY) process.on("exit", removeCapabilityMarker);
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(signal, () => process.exit(0));
 
 function main() {
@@ -420,7 +532,8 @@ function main() {
     onMessage: event => deliver("message")(event),
     log: line => process.stderr.write(`ccdm channel: ${line}\n`),
   }) : null;
-  const router = new RouterClient({ project, key, role: ROOT ? "root" : "project",
+  const router = new RouterClient({ project, key, role: ROOT ? "root" : THREAD ? "thread" : "project",
+    ...(THREAD ? { threadId: THREAD_ID, provider: process.env.CCDM_THREAD_PROVIDER || "claude" } : {}),
     ...(fallback ? { beforeHello: () => fallback.release() } : {}) });
   fallback?.watch(router);
   const request = fallback ? fallback.request(router) : (op, args) => router.request(op, args);
@@ -428,22 +541,55 @@ function main() {
   // Channel notifications wait until Claude has finished initializing.
   let initialized = false;
   const queued = [];
+  // Each delivered notification starts a Claude turn; the Stop and StopFailure hooks end it.
+  const deliverNotification = params => {
+    if (THREAD) markTurn(process.env.CCDM_THREAD_ACTIVITY_FILE, true);
+    send({ method: "notifications/claude/channel", params });
+  };
+  const channelNotify = params => {
+    if (initialized) deliverNotification(params);
+    else queued.push(params);
+  };
   const notify = (kind, event) => {
     // Like the plugin, show the bot typing while Claude takes the message in.
     if (kind === "message") request("typing", { channel_id: event.channel_id }).catch(() => {});
-    const params = notification(kind, event);
-    if (initialized) send({ method: "notifications/claude/channel", params });
-    else queued.push(params);
+    channelNotify(notification(kind, event));
   };
   // While paused, inbound events wait here and are delivered in order on /unpause.
   let paused = false;
   const pausedEvents = [];
+  // A thread session holds live events until its bootstrap is delivered.
+  let held = THREAD ? [] : null;
   const deliver = kind => event => {
-    if (paused) pausedEvents.push([kind, event]);
+    if (held) held.push([kind, event]);
+    else if (paused) pausedEvents.push([kind, event]);
     else notify(kind, event);
   };
+  if (THREAD) {
+    awaitBootstrap().then(async bootstrap => {
+      const included = new Set(bootstrap?.included_message_ids ?? []);
+      if (bootstrap) {
+        // The bootstrap answers the owner's latest message in it, whoever wrote the last.
+        const notification = bootstrapNotification(bootstrap);
+        const asked = (Array.isArray(bootstrap.messages) ? bootstrap.messages : [])
+          .map(message => ({ ...message, channel_id: THREAD_ID }));
+        const latest = new Map(asked.map(message => [message.author?.id, message]));
+        for (const message of asked) {
+          const answeredAs = latest.get(message.author?.id) === message ? notification.meta.message_id : message.message_id;
+          reminderEvents = reminderEvents.then(() => recordOwnerMessage(message, answeredAs)).catch(error => {
+            process.stderr.write(`ccdm channel: reminder activity recording failed: ${error.message}\n`);
+          });
+        }
+        await reminderEvents;
+        channelNotify(notification);
+      }
+      const pending = held.filter(([kind, event]) => !(kind === "message" && included.has(event.message_id)));
+      held = null;
+      for (const [kind, event] of pending) deliver(kind)(event);
+    });
+  }
   router.on("message", event => {
-    if (ROOT) return deliver("message")(event);
+    if (!REMINDERS) return deliver("message")(event);
     reminderEvents = reminderEvents.then(() => recordOwnerMessage(event)).catch(error => {
       process.stderr.write(`ccdm channel: reminder activity recording failed: ${error.message}\n`);
     });
@@ -485,6 +631,10 @@ function main() {
     }
     await say(event, `Sent /${name} to Claude.`);
   }
+  if (THREAD) {
+    delete COMMANDS.clear;
+    delete COMMANDS.restart;
+  }
   let commands = Promise.resolve();
   router.on("command", event => {
     if (ROOT) return;
@@ -498,6 +648,7 @@ function main() {
   // client validates it (this project, a channel) first. The implicit read
   // tools and the reminder capability marker follow the new channel.
   router.on("scope_changed", next => {
+    if (THREAD) return;
     scope = next;
     process.stderr.write(`ccdm channel: Router moved this session to channel ${next.channel_id}\n`);
     if (!ROOT) writeCapabilityMarker(next).catch(error => {
@@ -507,14 +658,14 @@ function main() {
   router.on("disconnect", () => process.stderr.write("ccdm channel: Router connection lost; reconnecting\n"));
   router.on("reconnect", () => process.stderr.write("ccdm channel: Router connection restored\n"));
   router.on("end", error => {
-    if (!ROOT) removeCapabilityMarker();
+    if (CAPABILITY) removeCapabilityMarker();
     process.stderr.write(`ccdm channel: Router session ended${error ? `: ${error.code || error.message}` : ""}\n`);
   });
 
   router.connect().then(
     async granted => {
       scope = granted;
-      if (!ROOT) await writeCapabilityMarker(granted).catch(error => {
+      if (CAPABILITY) await writeCapabilityMarker(granted).catch(error => {
         process.stderr.write(`ccdm channel: capability marker failed: ${error.message}\n`);
       });
       reportReady({ ok: true, scope: granted });
@@ -568,7 +719,7 @@ function main() {
     }
     if (method === "notifications/initialized") {
       initialized = true;
-      for (const params of queued.splice(0)) send({ method: "notifications/claude/channel", params });
+      for (const params of queued.splice(0)) deliverNotification(params);
       return;
     }
     if (method === "tools/list") {

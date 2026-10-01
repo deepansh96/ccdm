@@ -9,11 +9,13 @@ npm test
 npm run test:e2e
 ```
 
-Both commands execute:
+Both run `tests/run-e2e.mjs`, which runs test files in parallel (`CCDM_E2E_JOBS`, default CPU count minus 2), longest first by the previous run's timings. A file that fails under parallel load is rerun alone; if it then passes it is reported as `FLAKY` and the run still succeeds. Pass test files to run only those. `npm run test:serial` runs one file at a time:
 
 ```sh
 node --test --test-concurrency=1 tests/e2e/**/*.test.js
 ```
+
+Harness deadlines (`waitFor`, `waitForState`, the `runProcess` kill timer) are multiplied by `CCDM_E2E_TIMEOUT_SCALE` (default 4) so parallel load does not kill healthy runs; a passing test never waits them out. Fixture binaries are built once per content in a shared temp directory and linked into each workspace, and the repo's executable scripts are hard-linked rather than copied: macOS XProtect scans every newly written executable on first run, one at a time, which otherwise serializes parallel files.
 
 ## Harness Architecture
 
@@ -195,6 +197,8 @@ The Conversation Reminder scenarios drive `scripts/conversation-reminder-service
 - The fake Gateway hands each injected message to only one client. Scenarios that need both a coding adapter and the root observer run the adapter while the worker is stopped. The durable event ledger carries its events into the worker's restart reconciliation.
 - `conversation-reminder-launchagent.test.js` installs through the `launchctl` fixture, then launches the rendered plist's `ProgramArguments` with its rendered environment. It keeps the harness fixture `PATH` so the worker cannot fall through to host tools. It proves the single-worker lock across supervised and foreground launches, disable and re-enable, private state, and the both-provider reply, reminder, and reply-or-close workflow with stopped coding agents. No scenario loads a real LaunchAgent or contacts Discord.
 
+`thread-supervisor-launchagent.test.js` installs `scripts/install-thread-supervisor.sh` through the `launchctl` fixture and launches the rendered `ProgramArguments` against the harness Router. It covers `enable`, `disable`, `status`, `preflight`, the foreground `run` after `disable`, and `router status` thread permission lines, with root's permissions denied by literal name through the fake's `permissionDenials`.
+
 ## One-Bot Router Surfaces
 
 The one-bot model's executables are covered against the real Router and the Contract-Checking Fake Discord (webhooks, `webhook_id` provenance, scripted 429s):
@@ -208,6 +212,26 @@ The one-bot model's executables are covered against the real Router and the Cont
 - **Retirement**: `scripts/retire-pool.sh` dry run, refusal while a project is off the Router, and `--apply` side effects in the fake.
 
 The documentation audit (`documentation-audit.test.js`) keeps the README, `CLAUDE.md.example`, `AGENTS.md`, `registry.example.json`, `setup.sh`, and `.mex` on the one-bot model and free of pool bot management instructions.
+
+## Thread Conversations
+
+Thread Conversation scenarios run on the Router harness. They use:
+
+- the real `scripts/router.js` with the discord.js shim (thread channels with `type` and `parentId`, message types 0/18/19/21, `injectedThreads` for `threadCreate`/`threadUpdate`/`threadDelete`, and `shardResume`);
+- the preload REST fake (webhook execute and edit honouring `thread_id`, thread create/PATCH/list/history, and audit logs with `auditLogEntries`, `auditLogForbidden` and fetch counters);
+- the real Thread Supervisor (`scripts/thread-supervisor.py run` plus its Node link, started by `startThreadSupervisor()` in `support/thread-supervisor.js`), the real `scripts/start-thread-session.sh`, the CCDM channel server and `codex-bridge.js`;
+- the fixture `claude`, `codex` and `tmux` binaries.
+
+Tests drive only Discord inputs and executable surfaces, and assert recorded Discord side effects, Router frames, CLI output and fixture-recorded turns. No test imports supervisor or Router internals. Expected values are literals from the decisions: usernames such as `demo-claude · 42%`, notice texts, caps 6 and 8, and the 10080-minute archive duration.
+
+- `router-threads.test.js` and `router-thread-scope.test.js`: classification, the `thread_session_live` exactly-once ordering, the type-18 drop, and thread `scope_violation`s.
+- `thread-supervisor.test.js`, `thread-claude-session.test.js` and `thread-codex-session.test.js`: binding, the boot handoff with 👀, replies with `thread_id`, start failures, and no token in any launch file.
+- `thread-commands.test.js`, `thread-lifecycle.test.js`, `thread-capacity.test.js`, `thread-reconcile.test.js` and `thread-project-changes.test.js`: commands, archive and resume, caps, reconcile and registry changes.
+- `thread-operations.test.js` and `thread-supervisor-launchagent.test.js`: `threads.sh`, the resolver, thread ids in operator tools, `router status`, and the installer.
+- `conversation-reminder-threads.test.js`: the v8 reminder store and per-thread reminders.
+- `thread-conversation-journey.test.js` is the one cross-component test. With the Router, the Thread Supervisor, a Claude thread session and the Conversation Reminder worker all running, the owner creates a thread and gets a reply, the reminder fires in the thread after the turn, the owner's reply acknowledges it, `/close` archives the thread, closes its reminders and stops the session, and the next owner message reopens it with the same Claude conversation.
+
+The live thread → Claude reply, thread → Codex reply and `/close` checks belong to the Live Smoke Suite's post-merge operator checklist in `docs/thread-supervisor.md`. They are not part of the Default CI Suite.
 
 ## Diagnostics
 

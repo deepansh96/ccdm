@@ -5,9 +5,10 @@ const path = require("node:path");
 // same state.json. Without a cross-process lock, a concurrent writer can drop
 // another process's recorded side effect (for example a fake Discord DELETE).
 const pause = new Int32Array(new SharedArrayBuffer(4));
-// Critical sections take milliseconds; a lock this old belongs to a process
-// that exited while holding it.
-const STALE_LOCK_MS = 1000;
+// Critical sections take milliseconds, but a loaded machine can stall a
+// holder for seconds; a lock this old belongs to a process that exited while
+// holding it.
+const STALE_LOCK_MS = 10000;
 
 function withStateLock(stateDir, action) {
   if (!stateDir) return action();

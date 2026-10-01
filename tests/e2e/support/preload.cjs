@@ -358,11 +358,13 @@ function routeWebhooks(url, method, init) {
     let edited = null;
     updateState((state) => {
       const message = (state.fixtures.discord.messages ?? []).find(entry =>
-        entry.id === messageId && entry.webhookId === webhookId && !entry.deleted);
+        entry.id === messageId && entry.webhookId === webhookId && !entry.deleted &&
+        entry.channelId === (url.searchParams.get("thread_id") ?? webhook.channel_id));
       if (!message) return;
       message.content = parsedBody.content ?? message.content;
       state.fixtures.discord.webhookEdits ||= [];
-      state.fixtures.discord.webhookEdits.push({ webhookId, messageId, content: parsedBody.content });
+      state.fixtures.discord.webhookEdits.push({ webhookId, messageId, content: parsedBody.content,
+        ...(url.searchParams.has("thread_id") ? { channelId: message.channelId } : {}) });
       edited = message;
     });
     if (!edited) return json({ code: 10008, message: "Unknown Message" }, 404);
@@ -394,7 +396,7 @@ function routeWebhooks(url, method, init) {
       state.fixtures.discord.messages ||= [];
       created = {
         avatarUrl: parsedBody.avatar_url,
-        channelId: webhook.channel_id,
+        channelId: url.searchParams.get("thread_id") ?? webhook.channel_id,
         content: parsedBody.content,
         id: `fake-message-${state.fixtures.discord.messages.length + 1}`,
         username: parsedBody.username ?? webhook.name,
@@ -412,6 +414,16 @@ function routeWebhooks(url, method, init) {
   return null;
 }
 
+// Discord REST channel shape, shared by thread creation, modification and lists.
+function threadChannel(thread) {
+  return { id: thread.id, type: thread.type, parent_id: thread.parentId, name: thread.name,
+    owner_id: thread.ownerId, guild_id: thread.guildId ?? "guild-id",
+    ...([15, 16].includes(thread.parentType) ? { applied_tags: [] } : {}),
+    thread_metadata: { archived: Boolean(thread.archived), locked: Boolean(thread.locked),
+      auto_archive_duration: thread.autoArchiveDuration ?? 1440,
+      archive_timestamp: thread.archiveTimestamp ?? "2026-09-01T00:00:00.000000+00:00" } };
+}
+
 function routeDiscordApi(url, init = {}) {
   const method = (init.method || "GET").toUpperCase();
   if (url.hostname === "discord.com") {
@@ -419,6 +431,56 @@ function routeDiscordApi(url, init = {}) {
     if (limited) return limited;
     const failure = takeRestFailure(method, url, init);
     if (failure) return failure;
+  }
+
+  // Get Guild Audit Log from seeded `auditLogEntries` (newest first, as
+  // Discord returns them), filtered by `action_type`. `auditLogForbidden`
+  // answers 403 50013, as for a bot without View Audit Log.
+  const auditLogMatch = /^\/api\/v10\/guilds\/([^/]+)\/audit-logs$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && auditLogMatch && method === "GET") {
+    const discord = readState().fixtures?.discord ?? {};
+    const actionType = url.searchParams.get("action_type");
+    updateState((nextState) => {
+      nextState.fixtures.discord.auditLogFetches ||= [];
+      nextState.fixtures.discord.auditLogFetches.push({ authorization: headerValue(init.headers, "Authorization"),
+        guildId: auditLogMatch[1], actionType, limit: url.searchParams.get("limit") });
+    });
+    if (discord.auditLogForbidden) {
+      return response(JSON.stringify({ code: 50013, message: "Missing Permissions" }), {
+        headers: { "content-type": "application/json" }, status: 403,
+      });
+    }
+    const entries = (discord.auditLogEntries ?? [])
+      .filter(entry => actionType === null || String(entry.action_type) === actionType)
+      .slice(0, Number(url.searchParams.get("limit") || "50"));
+    return response(JSON.stringify({ audit_log_entries: entries, users: [], threads: [], integrations: [],
+      webhooks: [], application_commands: [], auto_moderation_rules: [], guild_scheduled_events: [] }), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  // List Active Guild Threads and List Public Archived Threads, from the
+  // fake's `threads`. Archived threads come newest archive first, paged by an
+  // ISO `before` archive timestamp as Discord pages them.
+  const activeThreadsMatch = /^\/api\/v10\/guilds\/([^/]+)\/threads\/active$/.exec(url.pathname);
+  const archivedThreadsMatch = /^\/api\/v10\/channels\/([^/]+)\/threads\/archived\/public$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && (activeThreadsMatch || archivedThreadsMatch) && method === "GET") {
+    const threads = Object.values(readState().fixtures?.discord?.threads ?? {});
+    const limit = Number(url.searchParams.get("limit") || "50");
+    const before = url.searchParams.get("before");
+    updateState((nextState) => {
+      nextState.fixtures.discord.threadListFetches ||= [];
+      nextState.fixtures.discord.threadListFetches.push({ authorization: headerValue(init.headers, "Authorization"),
+        route: activeThreadsMatch ? "active" : "archived-public",
+        ...(activeThreadsMatch ? { guildId: activeThreadsMatch[1] } : { channelId: archivedThreadsMatch[1], limit }),
+        ...(before ? { before } : {}) });
+    });
+    const json = body => response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
+    if (activeThreadsMatch) return json({ threads: threads.filter(thread => !thread.archived && (!thread.guildId || thread.guildId === activeThreadsMatch[1])).map(threadChannel), members: [] });
+    const archived = threads.filter(thread => thread.archived && thread.type === 11 &&
+      thread.parentId === archivedThreadsMatch[1] && (!before || Date.parse(thread.archiveTimestamp) < Date.parse(before)))
+      .sort((a, b) => Date.parse(b.archiveTimestamp) - Date.parse(a.archiveTimestamp));
+    return json({ threads: archived.slice(0, limit).map(threadChannel), members: [], has_more: archived.length > limit });
   }
 
   const guildRolesMatch = /^\/api\/v10\/guilds\/([^/]+)\/roles$/.exec(url.pathname);
@@ -619,7 +681,8 @@ function routeDiscordApi(url, init = {}) {
     // Like Discord, created reminders stay in channel history, and a history
     // read never returns the create-time nonce.
     const sent = createdReminders(state, listMessagesMatch[1]);
-    const messages = [...sent, ...(state.fixtures?.discord?.restMessages ?? [])];
+    const messages = [...sent, ...(state.fixtures?.discord?.restMessages ?? [])
+      .filter(message => !message.channel_id || message.channel_id === listMessagesMatch[1])];
     const beforeIndex = before ? messages.findIndex((message) => message.id === before) : -1;
     const page = beforeIndex >= 0 ? messages.slice(beforeIndex + 1) : messages;
     return response(JSON.stringify(page.slice(0, limit)), {
@@ -655,6 +718,7 @@ function routeDiscordApi(url, init = {}) {
         content: parsedBody.content ?? "",
         id: `fake-message-${state.fixtures.discord.messages.length + 1}`,
         messageReference: parsedBody.message_reference,
+        ...(parsedBody.allowed_mentions ? { allowedMentions: parsedBody.allowed_mentions } : {}),
         ...(parsedBody.enforce_nonce ? {
           requestBody: parsedBody,
           timestamp: process.env.CCDM_REMINDER_CLOCK_FILE
@@ -663,6 +727,15 @@ function routeDiscordApi(url, init = {}) {
         } : {}),
       };
       state.fixtures.discord.messages.push(created);
+      // Like Discord, a message posted into an archived, unlocked thread unarchives it.
+      const thread = state.fixtures.discord.threads?.[createMessageMatch[1]];
+      if (thread?.archived && !thread.locked) {
+        const { event, previous, delivered, ...current } = thread;
+        const updated = { ...current, archived: false };
+        state.fixtures.discord.threads[thread.id] = updated;
+        (state.fixtures.discord.injectedThreads ||= []).push({ ...updated, event: "update", previous: current,
+          delivered: false });
+      }
       if (parsedBody.content === "👀" && state.fixtures.discord.crashAfterReminderAccept) {
         crashAfterAccept = true;
         state.fixtures.discord.crashAfterReminderAccept = false;
@@ -738,7 +811,8 @@ function routeDiscordApi(url, init = {}) {
         status: known.channel_id === getMessageMatch[1] ? 200 : 404,
       });
     }
-    const message = (state.fixtures?.discord?.restMessages ?? []).find((entry) => entry.id === getMessageMatch[2]);
+    const message = (state.fixtures?.discord?.restMessages ?? []).find(entry => entry.id === getMessageMatch[2] &&
+      (!entry.channel_id || entry.channel_id === getMessageMatch[1]));
     if (!message) {
       return response(JSON.stringify({ message: "Unknown Message" }), {
         headers: { "content-type": "application/json" },
@@ -837,6 +911,78 @@ function routeDiscordApi(url, init = {}) {
       state.fixtures.discord.applicationDeletes.push({ applicationId: applicationMatch[1] });
     });
     return response("", { status: 204 });
+  }
+
+  // Start Thread without Message (type 11 is a public thread) or from a
+  // message, whose thread id is the message id. Like Discord, the Gateway then
+  // sends THREAD_CREATE with the creating bot as the thread owner.
+  const threadCreateMatch = /^\/api\/v10\/channels\/([^/]+)(?:\/messages\/([^/]+))?\/threads$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && threadCreateMatch && method === "POST") {
+    const authorization = headerValue(init.headers, "Authorization");
+    const body = init.body ? JSON.parse(String(init.body)) : {};
+    const [, channelId, messageId = null] = threadCreateMatch;
+    const validDuration = body.auto_archive_duration === undefined ||
+      [60, 1440, 4320, 10080].includes(body.auto_archive_duration);
+    if (typeof body.name !== "string" || !body.name || body.name.length > 100 || !validDuration ||
+        (!messageId && body.type !== undefined && ![10, 11, 12].includes(body.type))) {
+      updateState((state) => {
+        state.fixtures.discord.malformedRequests ||= [];
+        state.fixtures.discord.malformedRequests.push({ method, url: url.href, body });
+      });
+      return response(JSON.stringify({ code: 50035, message: "Invalid Form Body" }), {
+        headers: { "content-type": "application/json" }, status: 400,
+      });
+    }
+    let thread;
+    updateState((state) => {
+      state.fixtures.discord.threadCreates ||= [];
+      const threadId = messageId ?? String(1600000000000000000n + BigInt(state.fixtures.discord.threadCreates.length + 1));
+      thread = { id: threadId, type: messageId ? 11 : (body.type ?? 11), parentId: channelId, parentType: 0,
+        name: body.name, ownerId: authorForToken(authorization), archived: false,
+        autoArchiveDuration: body.auto_archive_duration ?? 4320 };
+      state.fixtures.discord.threadCreates.push({ authorization, body, channelId, messageId, threadId });
+      (state.fixtures.discord.threads ||= {})[threadId] = thread;
+      (state.fixtures.discord.injectedThreads ||= []).push({ delivered: false, newlyCreated: true, ...thread });
+    });
+    return response(JSON.stringify(threadChannel(thread)), {
+      headers: { "content-type": "application/json" }, status: 201,
+    });
+  }
+
+  // Modify a thread channel and emit the matching Gateway update.
+  const threadMatch = /^\/api\/v10\/channels\/([^/]+)$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && threadMatch && method === "PATCH") {
+    const authorization = headerValue(init.headers, "Authorization");
+    const body = init.body ? JSON.parse(String(init.body)) : {};
+    const discord = readState().fixtures?.discord ?? {};
+    const previous = discord.threads?.[threadMatch[1]];
+    const denied = (discord.manageThreadsDenied ?? []).includes(authorization);
+    const status = denied ? 403 : previous ? 200 : 404;
+    let updated;
+    updateState(state => {
+      (state.fixtures.discord.threadPatches ||= []).push({ authorization, body, status, threadId: threadMatch[1] });
+      if (status !== 200) return;
+      updated = { ...previous,
+        ...(body.name !== undefined ? { name: body.name } : {}),
+        ...(body.archived !== undefined ? { archived: body.archived } : {}),
+        ...(body.locked !== undefined ? { locked: body.locked } : {}),
+        ...(body.auto_archive_duration !== undefined ? { autoArchiveDuration: body.auto_archive_duration } : {}) };
+      if (body.archived !== undefined && body.archived !== previous.archived) {
+        const now = Date.now();
+        updated.archiveTimestamp = new Date(now).toISOString();
+        (state.fixtures.discord.auditLogEntries ||= []).unshift({
+          id: String((BigInt(now) - 1420070400000n) << 22n), user_id: authorForToken(authorization),
+          target_id: previous.id, action_type: 111,
+          changes: [{ key: "archived", old_value: Boolean(previous.archived), new_value: body.archived }],
+        });
+      }
+      state.fixtures.discord.threads[previous.id] = updated;
+      (state.fixtures.discord.injectedThreads ||= []).push({ ...updated, event: "update", previous, delivered: false });
+    });
+    return response(JSON.stringify(status === 200 ? threadChannel(updated) :
+      { code: denied ? 50013 : 10003, message: denied ? "Missing Permissions" : "Unknown Channel" }), {
+      headers: { "content-type": "application/json" }, status,
+    });
   }
 
   const nicknameMatch = /^\/api\/v10\/guilds\/([^/]+)\/members\/([^/]+)$/.exec(url.pathname);

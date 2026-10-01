@@ -71,6 +71,17 @@ async function resolveAssignmentForChannel(channelId, options = {}) {
   return matches[0];
 }
 
+// A Thread Conversation's assignment: its parent project's, naming the thread
+// as the conversation. The thread's provider may differ from the project's.
+async function resolveThreadAssignment(projectName, threadId, options = {}) {
+  const registryPath = options.registryPath || path.join(PROJECT_ROOT, "registry.json");
+  const registry = JSON.parse(await fs.readFile(registryPath, "utf8"));
+  const channelId = registry.projects?.[projectName]?.channel_id;
+  if (!channelId || !threadId) return null;
+  const assignment = await resolveAssignmentForChannel(String(channelId), { registryPath });
+  return assignment?.project === projectName ? { ...assignment, conversation_id: String(threadId) } : null;
+}
+
 function createEvent(eventType, context, fields = {}) {
   const now = Date.now();
   eventSequence += 1;
@@ -80,6 +91,7 @@ function createEvent(eventType, context, fields = {}) {
     event_type: eventType,
     project: context.project,
     channel_id: context.channel_id,
+    ...(context.conversation_id ? { conversation_id: context.conversation_id } : {}),
     bot_id: context.bot_id,
     assignment_generation: context.assignment_generation,
     provider: context.provider || "codex",
@@ -138,6 +150,7 @@ async function writeActiveContext(context) {
     project: context.project,
     owner_id: context.owner_id,
     channel_id: context.channel_id,
+    ...(context.conversation_id ? { conversation_id: context.conversation_id } : {}),
     bot_id: context.bot_id,
     assignment_generation: context.assignment_generation,
     provider: "codex",
@@ -157,7 +170,9 @@ async function readActiveContext(targetChannelId) {
   if (!CONTEXT_FILE) return null;
   try {
     const context = JSON.parse(await fs.readFile(CONTEXT_FILE, "utf8"));
-    if (context.schema_version !== 1 || context.provider !== "codex" || context.channel_id !== targetChannelId) return null;
+    // A thread's replies go to the thread, its conversation.
+    if (context.schema_version !== 1 || context.provider !== "codex" ||
+        (context.conversation_id || context.channel_id) !== targetChannelId) return null;
     for (const field of ["project", "owner_id", "channel_id", "bot_id", "assignment_generation", "provider_session_id", "provider_turn_id", "interaction_id"]) {
       if (typeof context[field] !== "string" || !context[field]) return null;
     }
@@ -258,5 +273,6 @@ module.exports = {
   removeTurnReceipts,
   receiptsForTurn,
   resolveAssignmentForChannel,
+  resolveThreadAssignment,
   writeActiveContext,
 };

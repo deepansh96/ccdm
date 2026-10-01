@@ -169,8 +169,13 @@ test("Discord MCP initializes, lists tools, accepts initialized notifications, a
       "read_last_x_messages_in_channel",
       "export_message_range",
       "download_attachment",
+      "create_thread",
     ],
   );
+  const createThread = output[1].result.tools.find((tool) => tool.name === "create_thread");
+  assert.deepEqual(Object.keys(createThread.inputSchema.properties).sort(),
+    ["account", "channel_id", "effort", "first_message", "model", "name", "provider"]);
+  assert.deepEqual(createThread.inputSchema.required, ["name"]);
   const replyTool = output[1].result.tools.find((tool) => tool.name === "reply");
   assert.match(replyTool.inputSchema.properties.files.description, /Max 10 files, 25MB each/);
   assert.deepEqual(output[2].result.content, [{ type: "text", text: "sent (id: fake-message-1)" }]);
@@ -186,6 +191,23 @@ test("Discord MCP initializes, lists tools, accepts initialized notifications, a
     username: "beta-codex",
     webhookId: "fake-webhook-1",
   }]);
+});
+
+test("Discord MCP lists create_thread only for a channel session, never for a thread or root", async () => {
+  const { workspace } = await betaRouter();
+  const listed = async (env) => {
+    const result = await runMcp(workspace, [rpc(1, "tools/list", {})], env);
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+    return responses(result)[0].result.tools.map((tool) => tool.name);
+  };
+
+  const thread = await listed(betaMcpEnv(workspace, { CCDM_THREAD_ID: "1700000000000654321", CHANNEL_ID: "1700000000000654321" }));
+  const root = await listed(rootMcpEnv(workspace));
+
+  assert.ok(thread.includes("reply"));
+  assert.equal(thread.includes("create_thread"), false);
+  assert.ok(root.includes("reply"));
+  assert.equal(root.includes("create_thread"), false);
 });
 
 test("Discord MCP exports a message range through the latest message", async () => {

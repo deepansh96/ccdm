@@ -103,13 +103,13 @@ function setPort(workspace, port, fields = {}) {
 // 64,600 of a 258,400-token window is 25%.
 const SEEDED_USAGE = { last: { inputTokens: 64600 }, modelContextWindow: 258400 };
 
-async function routerCodexSession(turns, codexOptions = {}, { guests, routerEnv: routerExtraEnv } = {}) {
+async function routerCodexSession(turns, codexOptions = {}, { guests, routerEnv: routerExtraEnv, sessionEnv } = {}) {
   const workspace = codexRouterWorkspace(0);
   if (guests) updateRegistry(workspace, (registry) => { registry.projects.demo.guest_user_ids = guests; });
   const codex = await startFakeCodexServer(workspace, { channelId: "demo-channel", turns, ...codexOptions });
   setPort(workspace, codex.port);
   const router = await routerWithWebhooks(workspace, ["demo"], { env: routerExtraEnv ?? {} });
-  const started = await startCodexSession(workspace);
+  const started = await startCodexSession(workspace, sessionEnv);
   assert.equal(started.exitCode, 0, started.stderr || started.stdout);
   return { workspace, codex, router };
 }
@@ -443,4 +443,148 @@ test("a guest granted after a router Codex launch reaches the thread without a r
     next.fixtures.discord.deliveredReactions.some(({ id }) => id === "revoked-thumbs-up"), 15000);
   await new Promise((resolve) => setTimeout(resolve, 500));
   assert.equal(userTurnInputs(codex).length, 2);
+});
+
+// Codex Home MCP registration. `demo` and `other` are router Codex projects
+// sharing the workspace's default Codex Home, each served by its own fake
+// app-server backed by that home's config.toml.
+function sharedCodexHomeWorkspace() {
+  const workspace = codexRouterWorkspace(0);
+  updateRegistry(workspace, (registry) => {
+    registry.projects.other = {
+      ...registry.projects.demo, channel_id: "other-channel", screen_name: "other_codex", guest_user_ids: [],
+    };
+  });
+  return { workspace, codexHome: path.join(workspace.homeDir, ".codex") };
+}
+
+function startCodexProject(workspace, project) {
+  return runScript(workspace, "scripts/start-codex-session.sh", { args: [project], env: routerEnv(workspace), timeoutMs: 30000 });
+}
+
+function codexServerRecord(workspace, port) {
+  return readState(workspace.stateDir).fixtures.codex.servers[String(port)];
+}
+
+test("two Codex bridges starting together on one Codex Home each load only their own Discord MCP server", async () => {
+  const { workspace, codexHome } = sharedCodexHomeWorkspace();
+  // Slow config writes widen the window between a write and its reload.
+  const demo = await startFakeCodexServer(workspace, { channelId: "demo-channel", codexHome, configDelayMs: 300 });
+  const other = await startFakeCodexServer(workspace, { channelId: "other-channel", codexHome, configDelayMs: 300 });
+  updateRegistry(workspace, (registry) => {
+    registry.projects.demo.ws_port = demo.port;
+    registry.projects.other.ws_port = other.port;
+  });
+  await routerWithWebhooks(workspace, ["demo", "other"]);
+
+  const [demoStarted, otherStarted] = await Promise.all([startCodexProject(workspace, "demo"), startCodexProject(workspace, "other")]);
+
+  assert.equal(demoStarted.exitCode, 0, demoStarted.stderr || demoStarted.stdout);
+  assert.equal(otherStarted.exitCode, 0, otherStarted.stderr || otherStarted.stdout);
+  assert.deepEqual(codexServerRecord(workspace, demo.port).mcpReloads, [["discord-demo-channel"]]);
+  assert.deepEqual(codexServerRecord(workspace, other.port).mcpReloads, [["discord-other-channel"]]);
+  const status = await runRouterCli(workspace, ["status"]);
+  assert.match(status.stdout, /sessions: 2\n/);
+  // The registration lock was released, and the config holds the Router key
+  // path and scope token but no Discord credential.
+  assert.equal(fs.existsSync(path.join(codexHome, "config.toml.lock")), false);
+  const config = fs.readFileSync(path.join(codexHome, "config.toml"), "utf8");
+  assert.match(config, /CCDM_ROUTER_KEY_FILE = /);
+  assert.match(config, /DISCORD_REPLY_TOKEN = /);
+  assert.doesNotMatch(config, /root-bot-token|pool-bot-token|DISCORD_BOT_TOKEN/);
+});
+
+test("a Codex bridge whose app-server still loads a foreign Discord MCP server after reload refuses to start", async () => {
+  const workspace = codexRouterWorkspace(0);
+  const codex = await startFakeCodexServer(workspace, {
+    channelId: "demo-channel", staleMcpName: "discord-other-channel", failStaleMcpRemoval: "delete failed",
+    turns: [{ mcpReplyText: "should never post" }],
+  });
+  setPort(workspace, codex.port);
+  await routerWithWebhooks(workspace, ["demo"]);
+
+  const refused = await startCodexSession(workspace);
+
+  assert.notEqual(refused.exitCode, 0);
+  assert.match(`${refused.stdout}\n${refused.stderr}`, /discord-other-channel/);
+  assert.ok(!codex.clientMessages.some((message) => message.method === "thread/start"));
+  const status = await runRouterCli(workspace, ["status"]);
+  assert.match(status.stdout, /sessions: 0/);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.messages, []);
+  const codexHome = path.join(workspace.homeDir, ".codex");
+  assert.equal(fs.existsSync(path.join(codexHome, "config.toml.lock")), false);
+
+  // The released lock lets a later bridge register.
+  const healthy = await startFakeCodexServer(workspace, { channelId: "demo-channel", codexHome });
+  setPort(workspace, healthy.port);
+  const started = await startCodexSession(workspace);
+  assert.equal(started.exitCode, 0, started.stderr || started.stdout);
+  assert.deepEqual(codexServerRecord(workspace, healthy.port).mcpReloads, [["discord-demo-channel"]]);
+});
+
+test("a Codex bridge whose app-server never answers the MCP reload refuses to start and releases the Codex Home lock", async () => {
+  const workspace = codexRouterWorkspace(0);
+  const codexHome = path.join(workspace.homeDir, ".codex");
+  const codex = await startFakeCodexServer(workspace, { channelId: "demo-channel", codexHome, hangMcpReloadAfter: 0 });
+  setPort(workspace, codex.port);
+  await routerWithWebhooks(workspace, ["demo"]);
+
+  const refused = await startCodexSession(workspace, { CCDM_CODEX_CONFIG_REQUEST_TIMEOUT_MS: "1000" });
+
+  assert.notEqual(refused.exitCode, 0);
+  assert.match(`${refused.stdout}\n${refused.stderr}`, /config\/mcpServer\/reload timed out/);
+  assert.ok(!codex.clientMessages.some((message) => message.method === "thread/start"));
+  assert.equal(fs.existsSync(path.join(codexHome, "config.toml.lock")), false);
+});
+
+test("a /clear whose MCP re-registration fails stops the bridge, as a failed startup does", async () => {
+  const { workspace, codex } = await routerCodexSession([], {
+    hangMcpReloadAfter: 1, threadIds: ["thread-before-clear", "thread-after-clear"],
+  }, { sessionEnv: { CCDM_CODEX_CONFIG_REQUEST_TIMEOUT_MS: "1000" } });
+  const bridgePid = readRegistry(workspace).projects.demo.pid;
+
+  ownerMessage(workspace, { id: "cmd-clear", content: "/clear" });
+
+  const done = await waitForState(workspace, (next) => webhookContents(next).some((content) => content.includes("Failed to clear")), 30000);
+  assert.match(webhookContents(done).find((content) => content.includes("Failed to clear")), /mcpServer\/reload timed out/);
+  await waitFor(() => {
+    try {
+      process.kill(bridgePid, 0);
+      return false;
+    } catch {
+      return true;
+    }
+  }, () => `bridge ${bridgePid} to exit`, 15000);
+  assert.equal(clientMessages(codex, "thread/start").length, 1);
+  assert.equal(fs.existsSync(path.join(workspace.homeDir, ".codex", "config.toml.lock")), false);
+});
+
+test("start-codex-session waits for a bridge's Codex Home lock before stripping Discord MCP servers", async () => {
+  const workspace = codexRouterWorkspace(0);
+  const codexHome = path.join(workspace.homeDir, ".codex");
+  const configFile = path.join(codexHome, "config.toml");
+  fs.writeFileSync(configFile, 'model = "gpt"\n\n[mcp_servers.discord-old]\ncommand = "node"\n\n[mcp_servers.discord-old.env]\nCHANNEL_ID = "old"\n');
+  // A live holder (this test process) owns the lock, as a registering bridge would.
+  const lock = `${configFile}.lock`;
+  fs.mkdirSync(lock);
+  fs.writeFileSync(path.join(lock, "owner"), `${process.pid}\n`);
+  fs.writeFileSync(path.join(lock, "nonce"), "held-by-test\n");
+  const codex = await startFakeCodexServer(workspace, { channelId: "demo-channel", codexHome });
+  setPort(workspace, codex.port);
+  await routerWithWebhooks(workspace, ["demo"]);
+
+  // A lock waiter notes `<hold>.blocked`.
+  const hold = path.join(workspace.tmpDir, "codex-home-hold");
+  const starting = startCodexSession(workspace, { CCDM_TEST_REGISTRY_HOLD: hold });
+  await waitFor(() => fs.existsSync(`${hold}.blocked`), () => "start-codex-session to wait on the Codex Home lock", 15000);
+  assert.match(fs.readFileSync(configFile, "utf8"), /\[mcp_servers\.discord-old\]/);
+  assert.ok(!codex.clientMessages.length, "the bridge launched before the lock was released");
+
+  fs.rmSync(lock, { recursive: true });
+  const started = await starting;
+  assert.equal(started.exitCode, 0, started.stderr || started.stdout);
+  const config = fs.readFileSync(configFile, "utf8");
+  assert.doesNotMatch(config, /discord-old/);
+  assert.match(config, /model = "gpt"/);
+  assert.deepEqual(codexServerRecord(workspace, codex.port).mcpReloads, [["discord-demo-channel"]]);
 });

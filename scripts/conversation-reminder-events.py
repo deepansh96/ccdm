@@ -25,13 +25,20 @@ EVENT_TYPES = {
     "work_resumed",
     "session_terminated",
     "close_requested",
+    # The Thread Supervisor's lifecycle of one Thread Conversation.
+    "conversation_reset",
+    "conversation_closed",
+    "conversation_deleted",
 }
+THREAD_LIFECYCLE_EVENTS = {"conversation_reset", "conversation_closed", "conversation_deleted"}
 ALLOWED_FIELDS = {
     "schema_version",
     "event_id",
     "event_type",
     "project",
     "channel_id",
+    # Optional: the Project Conversation, defaulting to the channel's own.
+    "conversation_id",
     "bot_id",
     "assignment_generation",
     "provider",
@@ -223,6 +230,9 @@ def validate_event(event: object) -> dict:
     for field in ("event_id", "project", "channel_id", "bot_id", "assignment_generation", "provider", "adapter_instance_id"):
         if not isinstance(event.get(field), str) or not event[field].strip():
             raise ValueError(f"{field} must be a non-empty string")
+    if "conversation_id" in event and (not isinstance(event["conversation_id"], str)
+                                       or not event["conversation_id"].strip()):
+        raise ValueError("conversation_id must be a non-empty string")
     try:
         parsed_time = datetime.fromisoformat(str(event["event_time"]).replace("Z", "+00:00"))
     except ValueError as error:
@@ -238,6 +248,10 @@ def validate_event(event: object) -> dict:
         raise ValueError("provider lifecycle events require a project adapter")
     if event_type in {"owner_activity", "close_requested"} and normalized["provider"] not in {"codex", "claude", "ccdm-root"}:
         raise ValueError("owner events require a registered CCDM adapter")
+    if event_type in THREAD_LIFECYCLE_EVENTS and (
+            normalized["provider"] != "ccdm-root"
+            or normalized.get("conversation_id", normalized["channel_id"]) == normalized["channel_id"]):
+        raise ValueError(f"{event_type} names a Thread Conversation, from root's Thread Supervisor")
     if event_type in {"response_delivered", "input_needed", "turn_completed", "work_resumed"}:
         for field in ("provider_session_id", "provider_turn_id", "message_id", "interaction_id"):
             if field == "message_id" and event_type in {"turn_completed", "work_resumed"}:
@@ -287,7 +301,10 @@ def _assignment_result(registry: dict, event: dict) -> tuple[str | None, str | N
         return "stale", "project channel or bot assignment changed"
     if assignment["generation"] != event["assignment_generation"]:
         return "stale", "project assignment generation changed"
-    if event["provider"] in {"codex", "claude"} and (assignment["project"].get("type") or "claude") != event["provider"]:
+    # A Thread Conversation runs its own provider, whatever its project's is.
+    in_thread = event.get("conversation_id", event["channel_id"]) != event["channel_id"]
+    if (event["provider"] in {"codex", "claude"} and not in_thread
+            and (assignment["project"].get("type") or "claude") != event["provider"]):
         return "rejected", "adapter event targets a different project provider"
     if event["event_type"] in {"owner_activity", "close_requested"} and event.get("actor_id") != assignment["owner_id"]:
         return "rejected", "owner event actor does not match the registered owner"

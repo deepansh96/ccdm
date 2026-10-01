@@ -5,8 +5,20 @@ CCDM manages Discord-connected coding-agent sessions through one root bot and a 
 ## Language
 
 **Project Conversation**:
-The ongoing exchange in one registered project channel, whether served by Claude or Codex. Each project channel has at most one open conversation; root channels are excluded.
+An ongoing exchange with a project's coding agent, whether served by Claude or Codex: either the project channel's **Channel Conversation** or one of its **Thread Conversations**. Root channels are excluded.
 _Avoid_: message thread, agent session when referring to the conversation
+
+**Channel Conversation**:
+The **Project Conversation** held directly in a registered project channel. Each project channel has at most one.
+_Avoid_: main thread, project session
+
+**Thread Conversation**:
+A **Project Conversation** held in one public Discord thread under a registered project channel, with its own agent conversation and optional provider, account, model, and effort overrides. It is independent of its channel's **Channel Conversation** and of sibling threads.
+_Avoid_: sub-session, child channel, Codex thread
+
+**Thread Supervisor**:
+The single CCDM service, separate from the **Router**, that turns thread events from the Router into **Thread Conversation** lifecycle: start, stop, resume, close, and the live-session cap. It holds no Discord credential.
+_Avoid_: thread hub, thread listener, thread host
 
 **Conversation Reminder**:
 A standalone emoji message that draws attention to an open **Project Conversation** awaiting the CCDM owner's reply, recurring without an @mention after one hour, then 2, 4, 6 … up to 24 hours between ignored reminders. Reading the channel does not acknowledge the reminder or reset its timing.
@@ -17,7 +29,7 @@ An acknowledgment by the CCDM owner in an open **Project Conversation**, includi
 _Avoid_: read receipt, channel view
 
 **Closed Conversation**:
-A **Project Conversation** whose reminders the CCDM owner has ended with `/close`, independently of whether its coding agent is running. Only a new normal message from the owner reopens it; bot or guest activity does not.
+A **Project Conversation** whose reminders the CCDM owner has ended with `/close`, independently of whether its coding agent is running. A **Thread Conversation** is also closed when the owner or root archives its thread, or the owner sends `/close` in it, which also stops its session; any other archive, including Discord's inactivity auto-archive, only stops the session. Only a new normal message from the owner reopens it; bot or guest activity does not.
 _Avoid_: stopped session, archived channel
 
 **End-to-End Test Suite**:
@@ -125,7 +137,7 @@ The single local service that holds CCDM's only Discord bot credential, receives
 _Avoid_: root agent, bot, gateway (when meaning the service)
 
 **Session Scope**:
-The one Discord channel a session may read from and act in through the **Router**; the Router rejects any action outside it.
+The one Discord channel or thread a session may read from and act in through the **Router**; the Router rejects any action outside it. A **Thread Conversation**'s scope is its thread only, never the parent channel or sibling threads.
 _Avoid_: bot isolation, channel permissions (when meaning router enforcement)
 
 **Project Identity**:
@@ -141,6 +153,9 @@ _Avoid_: router, project identity
 - The **Router** is the only CCDM component that holds a Discord bot credential; sessions reach Discord only through it within their **Session Scope**.
 - A project session posts under its **Project Identity**; root management messages post as the root bot.
 - A message that mentions the bot in a project channel belongs to the **Root-Agent Conversation**; every other owner or guest message there belongs to the **Project Conversation**.
+- A thread message reaches only its **Thread Conversation**, never the **Channel Conversation** or sibling threads.
+- A **Thread Conversation** posts under its project's **Project Identity**, named for the thread's own provider.
+- The **Thread Supervisor** reaches Discord only through the **Router**, like every session.
 - The **Bot Pool** exists only until every project has migrated to the **Router**.
 - The **End-to-End Test Suite** uses **Local Fakes** by default.
 - The **Live Smoke Suite** verifies a narrow subset of workflows against real external services.

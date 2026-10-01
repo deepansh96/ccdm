@@ -67,6 +67,11 @@ async function botReply(ctx, args, files) {
   return { message_id: ids[0], message_ids: ids };
 }
 
+// A thread session posts through its parent project's webhook into the thread.
+function threadQuery(route) {
+  return route.thread_id ? { thread_id: route.thread_id } : {};
+}
+
 async function reply(ctx, args) {
   const files = validReply(args);
   if (ctx.session.role === "root") return botReply(ctx, args, files);
@@ -80,7 +85,7 @@ async function reply(ctx, args) {
     for (const [index, chunk] of splitMessage(text).entries()) {
       const payload = { content: chunk, username, avatar_url: avatarUrl(route.type), allowed_mentions: { parse: [] } };
       const message = await discordRequest("POST", `/webhooks/${secret.webhook_id}/${secret.token}`, {
-        query: { wait: "true" },
+        query: { wait: "true", ...threadQuery(route) },
         body: await executeBody(payload, index === 0 ? files : []),
       });
       ids.push(message.id);
@@ -90,7 +95,8 @@ async function reply(ctx, args) {
 }
 
 module.exports = {
+  threadQuery,
   ops: {
-    reply: { roles: ["project", "root"], scoped: true, run: reply },
+    reply: { roles: ["project", "root", "thread"], scoped: true, run: reply },
   },
 };

@@ -11,6 +11,12 @@ The same traversal runs in ``restart`` mode after a worker restart, Gateway
 reconnect, or re-enable. It stops at the persisted acknowledgment instead of
 building a baseline; the service then applies missed owner activity on top of
 the persisted state.
+
+An initial scan then walks the channel's Thread Conversations: its active
+threads, plus the archived ones archived within the last week whose
+conversation is not closed. Each adopted thread is scanned the same way, into
+its own baseline, and the project is released only once every thread's scan
+has committed. The whole project shares one per-pass budget.
 """
 
 from __future__ import annotations
@@ -26,6 +32,10 @@ PASS_SECONDS = 30
 TRANSIENT_RETRY_SECONDS = 30
 DENIED_RETRY_SECONDS = 300
 MAX_TAIL = 100
+# Archived threads older than this are never adopted.
+THREAD_ARCHIVE_WINDOW = timedelta(days=7)
+# The channel's thread phases, after its own scan: listing threads, then scanning each.
+THREAD_LISTING, THREAD_SCANS = "threads", "thread-scans"
 # Channels whose live events are durably buffered until the scan commits.
 ACTIVE = {"discovering", "reconciling", "suspended-discovery-history"}
 RESTART = "suspended-restart-reconciliation"
@@ -161,7 +171,18 @@ def _valid_messages(payload: dict, recorded_reminders: set[str]) -> list[dict] |
     return clean
 
 
-def next_request(db: sqlite3.Connection, usable: dict, now: datetime) -> dict | None:
+def _discovery(db: sqlite3.Connection, project: str, conversation: str, generation: str) -> sqlite3.Row | None:
+    return db.execute("SELECT * FROM discoveries WHERE project=? AND conversation_id=? AND assignment_generation=?",
+                      (project, conversation, generation)).fetchone()
+
+
+def _next_thread_scan(db: sqlite3.Connection, project: str, channel: str, generation: str) -> sqlite3.Row | None:
+    return db.execute("""SELECT * FROM discoveries WHERE project=? AND assignment_generation=?
+        AND conversation_id!=? AND phase!='complete' ORDER BY conversation_id LIMIT 1""",
+                      (project, generation, channel)).fetchone()
+
+
+def next_request(db: sqlite3.Connection, usable: dict, now: datetime, guild_id: str | None = None) -> dict | None:
     """Pick the least-served channel this pass and reserve one bounded request."""
     settings = dict(db.execute("SELECT key,value FROM settings").fetchall())
     if settings.get("disabled") == "1":
@@ -169,15 +190,15 @@ def next_request(db: sqlite3.Connection, usable: dict, now: datetime) -> dict | 
     requested = settings.get("discovery_requested") == "1"
     pass_key = int(now.timestamp()) // PASS_SECONDS
     candidates = []
-    for row in db.execute("SELECT * FROM conversations ORDER BY project").fetchall():
+    # Discovery starts from each project's channel; its threads share its status.
+    for row in db.execute("SELECT * FROM conversations WHERE conversation_id=channel_id ORDER BY project").fetchall():
         assignment = usable.get(row["project"])
         status = row["reconciliation_status"]
         if status not in STARTABLE or assignment is None or (
                 assignment["generation"], assignment["channel_id"], assignment["identity"]) != (
                 row["assignment_generation"], row["channel_id"], row["identity"]):
             continue
-        found = db.execute("SELECT * FROM discoveries WHERE project=? AND assignment_generation=?",
-                           (row["project"], row["assignment_generation"])).fetchone()
+        found = _discovery(db, row["project"], row["channel_id"], row["assignment_generation"])
         # A channel released before a restart rescans from its persisted acknowledgment.
         fresh_restart = status == RESTART or (found is None and status == "reconciling")
         if fresh_restart:
@@ -186,47 +207,60 @@ def next_request(db: sqlite3.Connection, usable: dict, now: datetime) -> dict | 
             continue
         if found is not None and found["phase"] == "complete":
             continue
-        if found is not None and found["retry_at"] and _iso(found["retry_at"]) > now:
+        # The thread being scanned, once the channel's own scan has committed.
+        target = found
+        if found is not None and found["phase"] == THREAD_SCANS:
+            target = _next_thread_scan(db, row["project"], row["channel_id"], row["assignment_generation"])
+            if target is None:
+                continue
+        if target is not None and target["retry_at"] and _iso(target["retry_at"]) > now:
             continue
         pages, reactions = ((found["pass_pages"], found["pass_reactions"])
                             if found is not None and found["pass_key"] == pass_key else (0, 0))
-        phase = found["phase"] if found is not None else "backward"
+        phase = target["phase"] if target is not None else "backward"
         if (phase == "reactions" and reactions >= REACTIONS_PER_PASS) or (
                 phase != "reactions" and pages >= PAGES_PER_PASS):
             continue
         candidates.append((pages + reactions, found["last_seq"] if found is not None else 0,
-                           row["project"], row, found, fresh_restart))
+                           row["project"], row, found, target, fresh_restart))
     if not candidates:
         return None
-    _, _, project, row, found, fresh_restart = min(candidates, key=lambda item: item[:3])
+    _, _, project, row, found, target, fresh_restart = min(candidates, key=lambda item: item[:3])
     generation = row["assignment_generation"]
     if found is None:
         mode = "restart" if fresh_restart else "initial"
         db.execute("DELETE FROM discoveries WHERE project=? AND assignment_generation=?", (project, generation))
-        db.execute("""INSERT INTO discoveries (project,assignment_generation,phase,started_revision,summary_json)
-            VALUES (?,?,'backward',?,?)""", (project, generation, row["revision"],
+        db.execute("""INSERT INTO discoveries
+            (project,conversation_id,assignment_generation,phase,started_revision,summary_json)
+            VALUES (?,?,?,'backward',?,?)""", (project, row["conversation_id"], generation, row["revision"],
                                              json.dumps(_initial_summary(mode, row["last_ack_at"] if fresh_restart else None))))
         db.execute("UPDATE conversations SET reconciliation_status=? WHERE project=?",
                    ("reconciling" if fresh_restart else "discovering", project))
-        found = db.execute("SELECT * FROM discoveries WHERE project=? AND assignment_generation=?",
-                           (project, generation)).fetchone()
+        found = target = _discovery(db, project, row["channel_id"], generation)
     seq = db.execute("SELECT COALESCE(MAX(last_seq),0)+1 FROM discoveries").fetchone()[0]
+    # `target_id` is what is read: the channel, or one of its threads.
     request = {"request_id": f"{seq}", "project": project, "assignment_generation": generation,
-               "channel_id": row["channel_id"], "limit": PAGE_LIMIT}
-    if found["phase"] == "backward":
-        request.update(kind="history", **({"before": found["before_id"]} if found["before_id"] else {}))
-    elif found["phase"] == "forward":
-        request.update(kind="history", after=found["after_id"] or "0")
+               "channel_id": row["channel_id"], "target_id": target["conversation_id"], "limit": PAGE_LIMIT}
+    if target["phase"] == "backward":
+        request.update(kind="history", **({"before": target["before_id"]} if target["before_id"] else {}))
+    elif target["phase"] == "forward":
+        request.update(kind="history", after=target["after_id"] or "0")
+    elif target["phase"] == THREAD_LISTING:
+        before = json.loads(target["summary_json"]).get("threads_before")
+        request.update(kind="threads", guild_id=guild_id, **({"before": before} if before else {}))
     else:
-        item = json.loads(found["summary_json"])["queue"][0]
+        item = json.loads(target["summary_json"])["queue"][0]
         request.update(kind="reactions", message_id=item["id"], emoji=item["emoji"])
     same_pass = found["pass_key"] == pass_key
-    pages = (found["pass_pages"] if same_pass else 0) + (request["kind"] == "history")
+    pages = (found["pass_pages"] if same_pass else 0) + (request["kind"] != "reactions")
     reactions = (found["pass_reactions"] if same_pass else 0) + (request["kind"] == "reactions")
     # Budgets count attempts, so a crash between request and result still spends them.
-    db.execute("""UPDATE discoveries SET pending_request=?, last_seq=?, pass_key=?, passes=passes+?,
-            pass_pages=?, pass_reactions=? WHERE project=? AND assignment_generation=?""",
-        (json.dumps(request), seq, pass_key, 0 if same_pass else 1, pages, reactions, project, generation))
+    db.execute("""UPDATE discoveries SET last_seq=?, pass_key=?, passes=passes+?,
+            pass_pages=?, pass_reactions=? WHERE project=? AND conversation_id=? AND assignment_generation=?""",
+        (seq, pass_key, 0 if same_pass else 1, pages, reactions, project, row["channel_id"], generation))
+    db.execute("""UPDATE discoveries SET pending_request=?, last_seq=?
+        WHERE project=? AND conversation_id=? AND assignment_generation=?""",
+        (json.dumps(request), seq, project, target["conversation_id"], generation))
     return request
 
 
@@ -245,51 +279,127 @@ def _evaluate(summary: dict, active_turn: bool) -> tuple[str, str]:
     return "awaiting-owner", APPROXIMATION
 
 
+def _release(db: sqlite3.Connection, channel: sqlite3.Row) -> str:
+    """Commit the project's discovery once no thread scan remains."""
+    project, generation = channel["project"], channel["assignment_generation"]
+    if _next_thread_scan(db, project, channel["conversation_id"], generation) is not None:
+        return "progress"
+    db.execute("""UPDATE discoveries SET phase='complete' WHERE project=? AND conversation_id=?
+        AND assignment_generation=?""", (project, channel["conversation_id"], generation))
+    db.execute("UPDATE conversations SET reconciliation_status='ready' WHERE project=?", (project,))
+    return "committed"
+
+
+def _record_threads(db: sqlite3.Connection, channel: sqlite3.Row, found: sqlite3.Row, summary: dict,
+                    threads: list[dict], has_more: bool, now: datetime, closed_threads: set[str]) -> str:
+    """Adopt the listed active threads and recent, unclosed archived ones; page on through the window."""
+    cutoff = now - THREAD_ARCHIVE_WINDOW
+    adopted = summary.setdefault("threads", [])
+    oldest = None
+    for thread in threads:
+        archived = thread.get("archived") is True
+        try:
+            archived_at = _iso(thread["archive_timestamp"]) if archived else None
+        except (KeyError, TypeError, ValueError):
+            archived_at = None
+        if archived_at is not None and (oldest is None or archived_at < _iso(oldest)):
+            oldest = thread["archive_timestamp"]
+        if thread["id"] not in adopted and (not archived or (
+                archived_at is not None and archived_at >= cutoff and thread["id"] not in closed_threads)):
+            adopted.append(thread["id"])
+    key = (channel["project"], channel["conversation_id"], channel["assignment_generation"])
+    if has_more and oldest is not None and _iso(oldest) >= cutoff:
+        # Archived threads come newest archive first: the next page may still be recent.
+        summary["threads_before"] = oldest
+        db.execute("""UPDATE discoveries SET summary_json=?, pages_total=pages_total+1, retry_at=NULL, reason=NULL
+            WHERE project=? AND conversation_id=? AND assignment_generation=?""", (json.dumps(summary), *key))
+        return "progress"
+    for thread_id in adopted:
+        # Each adopted thread is tracked under its project's assignment, sharing its status.
+        db.execute("""INSERT OR IGNORE INTO conversations
+            (project,conversation_id,channel_id,identity,assignment_generation,owner_id,state,revision,
+             cleanup_message_ids,reconciliation_status,checkpoint)
+            VALUES (?,?,?,?,?,?,'open-paused',0,'[]',?,?)""",
+                   (channel["project"], thread_id, channel["channel_id"], channel["identity"],
+                    channel["assignment_generation"], channel["owner_id"], channel["reconciliation_status"],
+                    channel["checkpoint"]))
+        revision = db.execute("SELECT revision FROM conversations WHERE project=? AND conversation_id=?",
+                              (channel["project"], thread_id)).fetchone()[0]
+        db.execute("""INSERT OR REPLACE INTO discoveries
+            (project,conversation_id,assignment_generation,phase,started_revision,summary_json)
+            VALUES (?,?,?,'backward',?,?)""",
+                   (channel["project"], thread_id, channel["assignment_generation"], revision,
+                    json.dumps(_initial_summary())))
+    db.execute("""UPDATE discoveries SET phase=?, summary_json=?, pages_total=pages_total+1, retry_at=NULL,
+        reason=NULL WHERE project=? AND conversation_id=? AND assignment_generation=?""",
+               (THREAD_SCANS, json.dumps(summary), *key))
+    return _release(db, channel)
+
+
 def record_result(db: sqlite3.Connection, payload: dict, now: datetime, recorded_reminders: set[str],
-                  adapter_interactions: set[str], reaction_times) -> str:
-    """Apply one Discord read to the checkpointed scan; commit the baseline when resolved."""
-    found = db.execute("SELECT * FROM discoveries WHERE project=? AND assignment_generation=?",
-                       (payload.get("project"), payload.get("assignment_generation"))).fetchone()
-    if found is None or not found["pending_request"]:
+                  adapter_interactions: set[str], reaction_times, closed_threads: set[str] = frozenset()) -> str:
+    """Apply one Discord read to the checkpointed scan; commit the baseline when resolved.
+
+    ``closed_threads`` are threads whose conversation is closed; archived, they are never adopted."""
+    project, generation = payload.get("project"), payload.get("assignment_generation")
+    found = next((item for item in db.execute("""SELECT * FROM discoveries WHERE project=?
+        AND assignment_generation=? AND pending_request IS NOT NULL""", (project, generation)).fetchall()
+                  if json.loads(item["pending_request"]).get("request_id") == payload.get("request_id")), None)
+    if found is None:
         return "ignored"
     request = json.loads(found["pending_request"])
-    if request["request_id"] != payload.get("request_id"):
-        return "ignored"
     project, generation = found["project"], found["assignment_generation"]
-    row = db.execute("SELECT * FROM conversations WHERE project=?", (project,)).fetchone()
-    key = (project, generation)
-    if row is None or row["assignment_generation"] != generation or row["reconciliation_status"] not in ACTIVE:
-        db.execute("DELETE FROM discoveries WHERE project=? AND assignment_generation=?", key)
+    channel = db.execute("SELECT * FROM conversations WHERE project=? AND conversation_id=channel_id",
+                         (project,)).fetchone()
+    row = db.execute("SELECT * FROM conversations WHERE project=? AND conversation_id=?",
+                     (project, found["conversation_id"])).fetchone()
+    if (channel is None or row is None or channel["assignment_generation"] != generation or
+            channel["reconciliation_status"] not in ACTIVE):
+        db.execute("DELETE FROM discoveries WHERE project=? AND assignment_generation=?", (project, generation))
         return "ignored"
-    db.execute("UPDATE discoveries SET pending_request=NULL WHERE project=? AND assignment_generation=?", key)
+    in_thread = row["conversation_id"] != channel["conversation_id"]
+    key = (project, row["conversation_id"], generation)
+    db.execute("UPDATE discoveries SET pending_request=NULL WHERE project=? AND conversation_id=? AND assignment_generation=?", key)
     status = payload.get("status")
     reactions = request["kind"] == "reactions"
+    listing = request["kind"] == "threads"
     if status == 429:
         retry = payload.get("retry_after")
         delay = float(retry) if isinstance(retry, (int, float)) and retry >= 0 else TRANSIENT_RETRY_SECONDS
-        db.execute("UPDATE discoveries SET retry_at=?, reason=? WHERE project=? AND assignment_generation=?",
+        db.execute("UPDATE discoveries SET retry_at=?, reason=? WHERE project=? AND conversation_id=? AND assignment_generation=?",
                    (_stamp(now + timedelta(seconds=max(1.0, delay))), "rate-limited; waiting for Discord", *key))
         return "backoff"
+    if in_thread and status == 404:
+        # The thread is gone: it is not adopted.
+        db.execute("DELETE FROM discoveries WHERE project=? AND conversation_id=? AND assignment_generation=?", key)
+        db.execute("DELETE FROM conversations WHERE project=? AND conversation_id=?", key[:2])
+        return _release(db, channel)
     if status in (401, 403) or (status == 404 and not reactions):
-        db.execute("UPDATE discoveries SET retry_at=?, reason=? WHERE project=? AND assignment_generation=?",
+        db.execute("UPDATE discoveries SET retry_at=?, reason=? WHERE project=? AND conversation_id=? AND assignment_generation=?",
                    (_stamp(now + timedelta(seconds=DENIED_RETRY_SECONDS)),
                     payload.get("reason") or "history access denied or unavailable", *key))
         db.execute("UPDATE conversations SET reconciliation_status='suspended-discovery-history' WHERE project=?",
                    (project,))
         return "suspended"
     summary = {**_initial_summary(), **json.loads(found["summary_json"])}
-    messages = None if reactions else _valid_messages(payload, recorded_reminders)
+    messages = None if reactions or listing else _valid_messages(payload, recorded_reminders)
     users = payload.get("users") or []
-    malformed = (not reactions and messages is None) or (
-        reactions and status == 200 and (not isinstance(users, list) or not all(isinstance(u, str) for u in users)))
+    threads = payload.get("threads")
+    malformed = (not reactions and not listing and messages is None) or (
+        reactions and status == 200 and (not isinstance(users, list) or not all(isinstance(u, str) for u in users))
+    ) or (listing and status == 200 and (not isinstance(threads, list) or not all(
+        isinstance(thread, dict) and isinstance(thread.get("id"), str) and thread["id"] for thread in threads)))
     if (status != 200 and not (reactions and status == 404)) or malformed:
-        db.execute("UPDATE discoveries SET retry_at=?, reason=? WHERE project=? AND assignment_generation=?",
+        db.execute("UPDATE discoveries SET retry_at=?, reason=? WHERE project=? AND conversation_id=? AND assignment_generation=?",
                    (_stamp(now + timedelta(seconds=TRANSIENT_RETRY_SECONDS)),
                     "history temporarily unavailable; resuming from checkpoint", *key))
         return "backoff"
     restart = summary.get("mode") == "restart"
     db.execute("UPDATE conversations SET reconciliation_status=? WHERE project=?",
                ("reconciling" if restart else "discovering", project))
+    if listing:
+        return _record_threads(db, channel, found, summary, threads, payload.get("has_more") is True, now,
+                               set(closed_threads))
     changes: dict = {"retry_at": None, "reason": None}
     messages = messages or []
     phase = found["phase"]
@@ -346,9 +456,9 @@ def record_result(db: sqlite3.Connection, payload: dict, now: datetime, recorded
             summary["queue"] = []
     changes.update(phase=phase, summary_json=json.dumps(summary))
     if phase == "reactions" and not summary["queue"]:
-        if row["revision"] != found["started_revision"]:
+        if not in_thread and row["revision"] != found["started_revision"]:
             # Something changed the conversation outside the buffer; rescan.
-            db.execute("DELETE FROM discoveries WHERE project=? AND assignment_generation=?", key)
+            db.execute("DELETE FROM discoveries WHERE project=? AND assignment_generation=?", (project, generation))
             db.execute("UPDATE conversations SET reconciliation_status=? WHERE project=?",
                        (RESTART if restart else "suspended-incomplete-discovery", project))
             return "restarted"
@@ -356,12 +466,15 @@ def record_result(db: sqlite3.Connection, payload: dict, now: datetime, recorded
             # The service merges this summary onto the persisted state, then releases the channel.
             changes.update(phase="complete", basis="restart-reconciled")
         else:
+            # The channel's baseline commits now; the project is released after its threads'.
             basis = _commit(db, row, summary,
                             bool(summary["normal"] and summary["normal"]["id"] in adapter_interactions))
-            changes.update(phase="complete", basis=basis)
+            changes.update(phase="complete" if in_thread else THREAD_LISTING, basis=basis)
     columns = ",".join(f"{name}=?" for name in changes)
-    db.execute(f"UPDATE discoveries SET {columns} WHERE project=? AND assignment_generation=?",
+    db.execute(f"UPDATE discoveries SET {columns} WHERE project=? AND conversation_id=? AND assignment_generation=?",
                (*changes.values(), *key))
+    if in_thread and changes["phase"] == "complete":
+        return _release(db, channel)
     if changes["phase"] != "complete":
         return "progress"
     return "reconciled" if restart else "committed"
@@ -391,26 +504,28 @@ def _commit(db: sqlite3.Connection, row: sqlite3.Row, summary: dict, active_turn
             changes.update(response_message_id=anchor["id"], response_at=anchor["at"],
                            due_at=_stamp(_iso(anchor["at"]) + timedelta(hours=1)))
         columns = ",".join(f"{name}=?" for name in changes)
-        db.execute(f"UPDATE conversations SET {columns}, revision=revision+1 WHERE project=?",
-                   (*changes.values(), row["project"]))
+        db.execute(f"UPDATE conversations SET {columns}, revision=revision+1 "
+                   "WHERE project=? AND conversation_id=?", (*changes.values(), row["project"], row["conversation_id"]))
     for source in summary["owner_ids"]:
-        db.execute("INSERT OR IGNORE INTO owner_sources VALUES (?,?,?,?)",
-                   (row["project"], row["assignment_generation"], source, "history"))
-    mark_reactions_seen(db, row["project"], row["assignment_generation"], summary["reacted"])
-    db.execute("UPDATE conversations SET reconciliation_status='ready' WHERE project=?", (row["project"],))
+        db.execute("""INSERT OR IGNORE INTO owner_sources
+            (project,conversation_id,assignment_generation,source_message_id,kind) VALUES (?,?,?,?,?)""",
+                   (row["project"], row["conversation_id"], row["assignment_generation"], source, "history"))
+    mark_reactions_seen(db, row["project"], row["conversation_id"], row["assignment_generation"], summary["reacted"])
     return basis
 
 
-def mark_reactions_seen(db: sqlite3.Connection, project: str, generation: str, reacted: list[dict]) -> None:
+def mark_reactions_seen(db: sqlite3.Connection, project: str, conversation: str, generation: str,
+                        reacted: list[dict]) -> None:
     """Remember owner reactions already accounted for, so a later restart does not re-pause on them."""
     for item in reacted:
-        db.execute("INSERT OR IGNORE INTO owner_sources VALUES (?,?,?,?)",
-                   (project, generation, "reaction:" + item["id"], "history-reaction"))
+        db.execute("""INSERT OR IGNORE INTO owner_sources
+            (project,conversation_id,assignment_generation,source_message_id,kind) VALUES (?,?,?,?,?)""",
+                   (project, conversation, generation, "reaction:" + item["id"], "history-reaction"))
 
 
-def status_for(db: sqlite3.Connection, project: str, generation: str) -> dict | None:
-    found = db.execute("SELECT * FROM discoveries WHERE project=? AND assignment_generation=?",
-                       (project, generation)).fetchone()
+def status_for(db: sqlite3.Connection, project: str, conversation: str, generation: str) -> dict | None:
+    found = db.execute("SELECT * FROM discoveries WHERE project=? AND conversation_id=? AND assignment_generation=?",
+                       (project, conversation, generation)).fetchone()
     if found is None:
         return None
     return {"phase": found["phase"], "basis": found["basis"],

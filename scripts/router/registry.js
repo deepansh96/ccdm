@@ -72,6 +72,8 @@ function buildRoutingTable(registry) {
       channel_id: String(project.channel_id),
       webhook_id: project.webhook_id ? String(project.webhook_id) : null,
       guests: (project.guest_user_ids || []).map(String),
+      // A `remote:` project runs on another machine and has no thread sessions.
+      remote: String(project.path || "").startsWith("remote:"),
     };
     channels.set(route.channel_id, route);
     projects.set(name, route);

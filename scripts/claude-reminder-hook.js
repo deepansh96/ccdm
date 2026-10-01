@@ -11,6 +11,9 @@ const root = process.env.CCDM_REMINDER_PROJECT_ROOT || path.resolve(__dirname, "
 const project = process.env.CCDM_CLAUDE_PROJECT;
 const channel = process.env.CCDM_CLAUDE_CHANNEL_ID;
 const launchId = process.env.CCDM_CLAUDE_LAUNCH_ID;
+// A thread session's conversation is its thread; a channel session's is the channel.
+const threadId = process.env.CCDM_CLAUDE_CONVERSATION_ID && process.env.CCDM_CLAUDE_CONVERSATION_ID !== channel
+  ? process.env.CCDM_CLAUDE_CONVERSATION_ID : "";
 const stateDir = process.env.CCDM_REMINDER_STATE_DIR || path.join(os.homedir(), ".local", "state", "ccdm", "conversation-reminders");
 const receiptsDir = process.env.CCDM_REMINDER_RECEIPTS_DIR || path.join(stateDir, "claude-receipts");
 const bindingPath = path.join(stateDir, "claude-sessions", `${launchId}.json`);
@@ -42,10 +45,13 @@ async function main() {
   if (!project || !channel || !launchId) return;
   const input = await readInput();
   if (!input.session_id || input.agent_id) return;
-  const assignment = await reminder.resolveAssignmentForChannel(channel, {
-    registryPath: path.join(root, "registry.json"),
-  });
-  if (!assignment || assignment.project !== project || assignment.project_type !== "claude") return;
+  const registryPath = path.join(root, "registry.json");
+  // A Claude thread may run under a project of either provider.
+  const assignment = threadId
+    ? await reminder.resolveThreadAssignment(project, threadId, { registryPath })
+    : await reminder.resolveAssignmentForChannel(channel, { registryPath });
+  if (!assignment || assignment.project !== project || assignment.channel_id !== channel ||
+      (!threadId && assignment.project_type !== "claude")) return;
   const context = { ...assignment, provider: "claude", provider_session_id: launchId };
   if (input.hook_event_name === "SessionStart") {
     await fs.mkdir(path.dirname(bindingPath), { recursive: true, mode: 0o700 });

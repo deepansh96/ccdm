@@ -7,10 +7,11 @@
     "ws": "^8.18.0"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.5"
   },
   "scripts": {
-    "test": "node --test --test-concurrency=1 tests/e2e/**/*.test.js",
-    "test:e2e": "node --test --test-concurrency=1 tests/e2e/**/*.test.js"
+    "test": "node tests/run-e2e.mjs",
+    "test:e2e": "node tests/run-e2e.mjs",
+    "test:serial": "node --test --test-concurrency=1 tests/e2e/**/*.test.js"
   }
 }

@@ -119,12 +119,16 @@ def validate_home(raw_path: str, label: str) -> str:
     return resolved_path
 
 
-def resolve_codex_home(registry: dict[str, Any], project: str) -> str:
+def resolve_codex_home(registry: dict[str, Any], project: str, thread_account: str | None = None) -> str:
     projects = registry.get("projects")
     if not isinstance(projects, dict) or project not in projects:
         raise ResolverError(f"project '{project}' is not present in registry.json")
     project_config = projects[project]
     accounts = codex_accounts(registry)
+    # A Thread Conversation's account alias takes the place of the project's
+    # codex_account (and so of its codex_home).
+    if thread_account is not None:
+        return resolve_account_home(accounts, thread_account, f"project '{project}' thread account")
 
     global_home = selector_value(registry, "codex_home", "top-level codex_home")
     global_account = selector_value(registry, "default_codex_account", "default_codex_account")
@@ -181,8 +185,11 @@ def resolve_root_codex_home(registry: dict[str, Any]) -> str:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
-        print(f"Usage: {argv[0]} <registry.json> <project>|--root", file=sys.stderr)
+    thread_account = None
+    if len(argv) == 5 and argv[3] == "--account" and argv[2] != "--root":
+        thread_account = argv[4]
+    elif len(argv) != 3:
+        print(f"Usage: {argv[0]} <registry.json> <project> [--account <alias>]|--root", file=sys.stderr)
         return 2
 
     try:
@@ -193,7 +200,7 @@ def main(argv: list[str]) -> int:
         if argv[2] == "--root":
             resolved_home = resolve_root_codex_home(registry)
         else:
-            resolved_home = resolve_codex_home(registry, argv[2])
+            resolved_home = resolve_codex_home(registry, argv[2], thread_account)
     except ResolverError as error:
         print(f"Codex Home validation failed: {error}", file=sys.stderr)
         return 1

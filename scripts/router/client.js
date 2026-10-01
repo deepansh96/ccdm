@@ -4,6 +4,8 @@
 // timeouts, emit pushed events, and reconnect with capped exponential backoff.
 //
 //   const client = new RouterClient({ socketPath, project, key, role: "project" });
+//   // A thread session names its thread and provider:
+//   //   new RouterClient({ project, key, role: "thread", threadId, provider: "claude" });
 //   // `listener: false` connects for operations only: no events, and the
 //   // project's listener keeps its place.
 //   const scope = await client.connect();      // the first connect does not retry
@@ -12,6 +14,7 @@
 //   client.on("scope_changed", scope => ...);  // the Router moved this session
 //   client.on("disconnect" | "reconnect" | "end", ...);
 //   client.scope                               // the current Session Scope
+//   client.hello                               // the latest hello_ok frame
 //   const result = await client.request("reply", { channel_id, text, context_pct });
 //
 // After the Router goes away the client says hello again on its own and emits
@@ -55,9 +58,9 @@ function reconnectBackoff(env = process.env) {
 
 class RouterClient extends EventEmitter {
   constructor({ socketPath = defaultSocketPath(), project, key, role = "project", listener = true, timeoutMs = 10000,
-    reconnect = role !== "status", beforeHello = null, env = process.env } = {}) {
+    reconnect = role !== "status", beforeHello = null, threadId = null, provider = null, env = process.env } = {}) {
     super();
-    Object.assign(this, { socketPath, project, key, role, listener, timeoutMs, reconnect, beforeHello,
+    Object.assign(this, { socketPath, project, key, role, listener, timeoutMs, reconnect, beforeHello, threadId, provider,
       backoff: reconnectBackoff(env) });
     this.socket = null;
     this.ready = false;
@@ -67,6 +70,7 @@ class RouterClient extends EventEmitter {
     this.retryTimer = null;
     this.pending = new Map();
     this.scope = null;
+    this.hello = null;
   }
 
   // A project scope from the Router, for this client's own project only.
@@ -113,6 +117,7 @@ class RouterClient extends EventEmitter {
       }
       this.write({ type: "hello", v: PROTOCOL_VERSION, role: this.role,
         ...(this.project ? { project: this.project } : {}), ...(this.key ? { key: this.key } : {}),
+        ...(this.role === "thread" ? { thread_id: this.threadId, provider: this.provider } : {}),
         ...(this.listener ? {} : { listener: false }) });
     });
     socket.on("data", chunk => {
@@ -130,6 +135,7 @@ class RouterClient extends EventEmitter {
         }
         if (frame.type === "hello_ok") {
           this.ready = true;
+          this.hello = frame;
           this.attempt = 0;
           const reconnected = this.connectedOnce;
           this.connectedOnce = true;

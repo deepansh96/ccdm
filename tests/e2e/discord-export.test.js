@@ -121,3 +121,21 @@ test("exports never fall back to a pool bot token when root credentials are miss
   assert.doesNotMatch(result.stderr, /pool-/);
   assert.deepEqual(readState(workspace.stateDir).fixtures.discord.messageFetches, []);
 });
+
+test("an export of a link or thread name the conversation resolver cannot name exits 2 with its reason", async () => {
+  const workspace = createWorkspace();
+  fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), JSON.stringify({
+    projects: { alpha: { channel_id: "100", type: "claude" } },
+  }));
+  seedRootState(workspace);
+
+  for (const channel of ["https://discord.com/channels/guild-id/1799999999999999999", "no-such-thread"]) {
+    const result = await runNodeEntrypoint(workspace, "scripts/export-discord-range.js", {
+      args: [channel, "101"],
+      env: bridgeChildEnv(workspace),
+    });
+    assert.equal(result.exitCode, 2, result.stdout);
+    assert.match(result.stderr, /^conversation-resolver: '.+' (links to no registered channel|is no registered channel)/);
+  }
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.messageFetches, []);
+});

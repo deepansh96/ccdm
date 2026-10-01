@@ -1,9 +1,10 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
 import path from "node:path";
 import { WebSocketServer } from "ws";
 
-import { createWorkspace } from "./runner.js";
+import { createWorkspace, scaledTimeout } from "./runner.js";
 import { readState, recordCommandInvocation, updateState } from "./state.js";
 import { registerTeardownCallback } from "./teardown.js";
 
@@ -92,7 +93,7 @@ export function collectProcess(child, metadata, workspace) {
       return closed;
     },
     async waitForOutput(pattern, timeoutMs = 5000) {
-      const deadline = Date.now() + timeoutMs;
+      const deadline = Date.now() + scaledTimeout(timeoutMs);
       while (Date.now() < deadline) {
         if (pattern.test(stdout) || pattern.test(stderr)) return;
         await new Promise((resolve) => setTimeout(resolve, 25));
@@ -169,10 +170,59 @@ async function callRegisteredMcpTool(workspace, config, name, args) {
   return result;
 }
 
+// With `codexHome`, the fake app-server keeps its MCP config in that Codex
+// Home's `config.toml`, which several fake app-servers may share, as real ones
+// do. It loads the file's MCP servers when it starts and again on
+// `config/mcpServer/reload`, and reports only those it loaded. Each reload's
+// loaded names are recorded as the server's `mcpReloads`.
+const mcpSectionHeader = /^\[mcp_servers\.([^.\]]+)(?:\.[^\]]*)?\]\s*$/;
+
+function readCodexConfig(codexHome) {
+  try {
+    return fs.readFileSync(path.join(codexHome, "config.toml"), "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function configuredMcpNames(codexHome) {
+  const names = readCodexConfig(codexHome).split("\n").map((line) => line.match(mcpSectionHeader)?.[1]).filter(Boolean);
+  return [...new Set(names)];
+}
+
+function withoutMcpSection(text, name) {
+  let skip = false;
+  return text.split("\n").filter((line) => {
+    if (line.startsWith("[")) skip = line.match(mcpSectionHeader)?.[1] === name;
+    return !skip;
+  }).join("\n");
+}
+
+function mcpSection(name, value) {
+  const tomlValue = (v) => (Array.isArray(v) ? `[${v.map(tomlValue).join(", ")}]` : typeof v === "string" ? JSON.stringify(v) : String(v));
+  const { env, ...fields } = value ?? {};
+  const lines = [`[mcp_servers.${name}]`, ...Object.entries(fields).map(([key, v]) => `${key} = ${tomlValue(v)}`)];
+  if (env) lines.push("", `[mcp_servers.${name}.env]`, ...Object.entries(env).map(([key, v]) => `${key} = ${tomlValue(v)}`));
+  return `${lines.join("\n")}\n`;
+}
+
+function writeCodexConfig(codexHome, text) {
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, "config.toml"), text);
+}
+
+// `port` binds that port instead of a free one; with `deferListen` it is
+// registered for the fixture `codex` at once but bound only by `listen()`, so a
+// port allocator can still see it free.
 export async function startFakeCodexServer(workspace, options = {}) {
-  const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
-  await new Promise((resolve) => server.once("listening", resolve));
-  const port = server.address().port;
+  const httpServer = http.createServer();
+  const server = new WebSocketServer({ server: httpServer });
+  const listen = () => new Promise((resolve, reject) => {
+    httpServer.once("error", reject);
+    httpServer.listen(options.port ?? 0, "127.0.0.1", resolve);
+  });
+  if (!options.deferListen) await listen();
+  const port = options.port ?? httpServer.address().port;
   const turnPlans = [...(options.turns ?? [])];
   const steerPlans = [...(options.steer ?? [])];
   let serverRequestId = 10000;
@@ -180,6 +230,13 @@ export async function startFakeCodexServer(workspace, options = {}) {
   let registeredMcpName = `discord-${options.channelId ?? "channel-id"}`;
   let registeredMcpConfig = null;
   let mcpStatusCount = 0;
+  let mcpReloadCount = 0;
+  // A stale server stays loaded until it is deleted and MCP servers reload.
+  let staleLoaded = Boolean(options.staleMcpName);
+  let staleDeleted = false;
+  const codexHome = options.codexHome;
+  let loadedMcpNames = codexHome ? configuredMcpNames(codexHome) : [];
+  const configDelayMs = options.configDelayMs ?? 0;
   const interruptedTurnIds = new Set();
   const pendingTurnReleases = new Map();
   const clientMessages = [];
@@ -222,9 +279,13 @@ export async function startFakeCodexServer(workspace, options = {}) {
             reply({ data: [{ name: "unrelated", tools: {} }], nextCursor: "discord-page" });
             break;
           }
+          if (codexHome) {
+            reply({ data: loadedMcpNames.map((name) => ({ name, tools: { reply: { name: "reply" } } })) });
+            break;
+          }
           reply({
             data: [
-              ...(options.staleMcpName ? [{ name: options.staleMcpName, status: "running" }] : []),
+              ...(staleLoaded ? [{ name: options.staleMcpName, status: "running" }] : []),
               { name: registeredMcpName, tools: options.missingReply || mcpStatusCount <= (options.mcpReadyAfter ?? 0) ? {} : { reply: { name: "reply" } } },
             ],
           });
@@ -234,7 +295,11 @@ export async function startFakeCodexServer(workspace, options = {}) {
             replyError({ code: -32000, message: options.failStaleMcpRemoval });
             break;
           }
-          reply({});
+          if (options.staleMcpName && message.params?.keyPath === `mcp_servers.${options.staleMcpName}`) staleDeleted = true;
+          if (codexHome && message.params?.keyPath?.startsWith("mcp_servers.")) {
+            writeCodexConfig(codexHome, withoutMcpSection(readCodexConfig(codexHome), message.params.keyPath.slice("mcp_servers.".length)));
+          }
+          setTimeout(() => reply({}), configDelayMs);
           break;
         case "config/value/write":
           if (message.params?.keyPath?.startsWith("mcp_servers.")) {
@@ -245,9 +310,26 @@ export async function startFakeCodexServer(workspace, options = {}) {
             replyError({ code: -32000, message: options.failMcpRegistration });
             break;
           }
-          reply({});
+          if (codexHome && message.params?.keyPath?.startsWith("mcp_servers.")) {
+            const name = message.params.keyPath.slice("mcp_servers.".length);
+            const rest = withoutMcpSection(readCodexConfig(codexHome), name).replace(/\n*$/, "");
+            writeCodexConfig(codexHome, `${rest ? `${rest}\n\n` : ""}${mcpSection(name, message.params.value)}`);
+          }
+          setTimeout(() => reply({}), configDelayMs);
           break;
         case "config/mcpServer/reload":
+          // \`hangMcpReloadAfter: n\`: every reload after the first n never answers.
+          mcpReloadCount += 1;
+          if (options.hangMcpReloadAfter !== undefined && mcpReloadCount > options.hangMcpReloadAfter) break;
+          if (staleDeleted) staleLoaded = false;
+          if (codexHome) {
+            loadedMcpNames = configuredMcpNames(codexHome);
+            const loaded = [...loadedMcpNames];
+            updateState(workspace.stateDir, (state) => {
+              const record = state.fixtures.codex.servers[String(port)];
+              record.mcpReloads = [...(record.mcpReloads ?? []), loaded];
+            });
+          }
           reply({});
           break;
         case "thread/resume":
@@ -435,11 +517,13 @@ export async function startFakeCodexServer(workspace, options = {}) {
     // A bridge still connected would otherwise hold the close open.
     for (const client of server.clients) client.terminate();
     await new Promise((resolve) => server.close(resolve));
+    if (httpServer.listening) await new Promise((resolve) => httpServer.close(resolve));
   });
 
   return {
     port,
     server,
+    listen,
     clientMessages,
     releaseTurn(turnId) {
       const release = pendingTurnReleases.get(turnId);
@@ -448,6 +532,7 @@ export async function startFakeCodexServer(workspace, options = {}) {
     },
     async close() {
       await new Promise((resolve) => server.close(resolve));
+      if (httpServer.listening) await new Promise((resolve) => httpServer.close(resolve));
       markCodexServer(workspace, port, { ready: false });
     },
   };
@@ -460,6 +545,9 @@ export function injectDiscordMessage(workspace, message = {}) {
     state.fixtures.discord.injectedMessages.push({
       author: { bot: false, id: "allowed-user-id", username: "Allowed User", ...(message.author ?? {}) },
       channelId: message.channelId ?? "channel-id",
+      type: message.type ?? 0,
+      ...(message.channelType !== undefined ? { channelType: message.channelType } : {}),
+      ...(message.parentId ? { parentId: message.parentId } : {}),
       content: message.content ?? "hello",
       delivered: false,
       id: message.id ?? `message-${Date.now()}`,
@@ -498,7 +586,7 @@ export function injectDiscordReaction(workspace, reaction = {}) {
 }
 
 export async function waitForState(workspace, predicate, timeoutMs = 5000) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaledTimeout(timeoutMs);
   while (Date.now() < deadline) {
     const state = readState(workspace.stateDir);
     if (predicate(state)) return state;

@@ -7,6 +7,7 @@ const FAMILIES = [
   require("./reads.js"),
   require("./reply.js"),
   require("./status.js"),
+  require("./threads.js"),
 ];
 
 const OPERATIONS = Object.freeze(Object.assign({}, ...FAMILIES.map(family => family.ops)));

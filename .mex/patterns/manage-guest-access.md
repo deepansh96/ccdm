@@ -14,7 +14,7 @@ last_updated: 2026-09-29
 # Manage Guest Access
 
 ## Steps
-1. Run `scripts/guest-access.js invite|grant|revoke <project-or-channel-id> <user-id>`; use `list` or `sync` for inspection/repair.
+1. Run `scripts/guest-access.js invite|grant|revoke <project-or-channel-id> <user-id>` (a thread id or link acts on its parent project); use `list` or `sync` for inspection/repair.
 2. For invite, send only the generated one-use target-channel invite.
 3. Restart the project session so its running allowlist includes the change.
 4. Use `sync` if Discord role state and local allowlists disagree.

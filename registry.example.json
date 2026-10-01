@@ -7,6 +7,13 @@
     "example-account": "~/.codex-example"
   },
   "default_codex_account": "example-account",
+  "claude_accounts": {
+    "example-claude-account": "~/.claude-example"
+  },
+  "thread_session_caps": {
+    "claude": 6,
+    "codex": 8
+  },
   "category_ids": [],
   "projects": {
     "example-project": {

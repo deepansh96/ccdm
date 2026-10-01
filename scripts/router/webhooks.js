@@ -119,7 +119,9 @@ const recreated = new Set();
 // registry, reported to the reminder service as an assignment change, and the
 // operation retried.
 async function withProjectWebhook(ctx, send) {
-  const { project, channel_id: channelId } = ctx.session.route;
+  // A thread session's webhook lives in the thread's parent channel.
+  const { project, parent_channel_id: parentChannelId, channel_id: routeChannelId } = ctx.session.route;
+  const channelId = parentChannelId ?? routeChannelId;
   const options = { project, registryFile: ctx.registryFile, stateDir: ctx.stateDir, token: ctx.token };
   const deletedAgain = () => new OpError("webhook_deleted",
     `the ${webhookName(project)} webhook was deleted again right after it was recreated; run ensure-webhook ${project}`);

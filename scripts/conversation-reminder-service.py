@@ -33,7 +33,7 @@ REGISTRY_UPDATE_PATH = Path(__file__).with_name("registry-update.py")
 REGISTRY_UPDATE_SPEC = importlib.util.spec_from_file_location("ccdm_registry_update", REGISTRY_UPDATE_PATH)
 REGISTRY_UPDATE = importlib.util.module_from_spec(REGISTRY_UPDATE_SPEC)
 REGISTRY_UPDATE_SPEC.loader.exec_module(REGISTRY_UPDATE)
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 # The first reminder follows a qualifying response by an hour; each further
 # ignored reminder waits longer, up to a daily reminder.
 FIRST_REMINDER_GAP = timedelta(hours=1)
@@ -44,16 +44,55 @@ CATCH_UP_SPACING = timedelta(seconds=5)
 # inside this window are one acknowledgment; a later re-add is a new one.
 REACTION_DUPLICATE_WINDOW = timedelta(minutes=2)
 STATES = {"closed", "open-paused", "awaiting-owner"}
-CONVERSATION_COLUMNS = {"project", "channel_id", "identity", "assignment_generation", "owner_id",
+CONVERSATION_COLUMNS = {"project", "conversation_id", "channel_id", "identity", "assignment_generation", "owner_id",
                         "state", "revision", "last_ack_at", "last_ack_message_id",
                         "current_interaction_id", "response_message_id", "response_at", "due_at",
                         "reminder_message_id", "cleanup_message_ids", "last_event_order",
                         "reconciliation_status", "checkpoint", "consecutive_reminders"}
-# Before v7 a conversation was keyed by its pool bot; before v6 it had no streak.
-V6_CONVERSATION_COLUMNS = CONVERSATION_COLUMNS - {"identity"} | {"bot_id"}
+# Before v8 a conversation was keyed by project alone; before v7 by its pool bot;
+# before v6 it had no streak.
+V7_CONVERSATION_COLUMNS = CONVERSATION_COLUMNS - {"conversation_id"}
+V6_CONVERSATION_COLUMNS = V7_CONVERSATION_COLUMNS - {"identity"} | {"bot_id"}
 V5_CONVERSATION_COLUMNS = V6_CONVERSATION_COLUMNS - {"consecutive_reminders"}
 # Both provider adapters must be installed before any channel may receive a
 # reminder; there is no Codex-only release.
+# Store v8 keys every conversation-scoped table by project and conversation. A
+# Channel Conversation's id is its project's channel id. Tables whose key gains
+# the conversation are rebuilt; the others gain the column in place.
+V8_TABLES = {
+    "conversations": """project TEXT NOT NULL, conversation_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+        identity TEXT NOT NULL, assignment_generation TEXT NOT NULL, owner_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('closed','open-paused','awaiting-owner')),
+        revision INTEGER NOT NULL, last_ack_at TEXT, last_ack_message_id TEXT,
+        current_interaction_id TEXT, response_message_id TEXT, response_at TEXT,
+        due_at TEXT, reminder_message_id TEXT, cleanup_message_ids TEXT NOT NULL,
+        last_event_order TEXT, reconciliation_status TEXT NOT NULL,
+        checkpoint INTEGER NOT NULL DEFAULT 0, consecutive_reminders INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(project,conversation_id)""",
+    "owner_sources": """project TEXT NOT NULL, conversation_id TEXT NOT NULL, assignment_generation TEXT NOT NULL,
+        source_message_id TEXT NOT NULL, kind TEXT NOT NULL,
+        PRIMARY KEY(project,conversation_id,assignment_generation,source_message_id)""",
+    "qualifications": """project TEXT NOT NULL, conversation_id TEXT NOT NULL, assignment_generation TEXT NOT NULL,
+        provider_session_id TEXT NOT NULL, provider_turn_id TEXT NOT NULL,
+        kind TEXT NOT NULL, response_message_id TEXT NOT NULL,
+        PRIMARY KEY(project,conversation_id,assignment_generation,provider_session_id,
+                    provider_turn_id,kind,response_message_id)""",
+    "retired_assignments": """project TEXT NOT NULL, conversation_id TEXT NOT NULL,
+        assignment_generation TEXT NOT NULL, channel_id TEXT NOT NULL, identity TEXT NOT NULL,
+        reason TEXT NOT NULL, retired_at TEXT NOT NULL,
+        PRIMARY KEY(project,conversation_id,assignment_generation)""",
+    "discoveries": """project TEXT NOT NULL, conversation_id TEXT NOT NULL, assignment_generation TEXT NOT NULL,
+        phase TEXT NOT NULL, started_revision INTEGER NOT NULL, watermark_id TEXT, before_id TEXT,
+        after_id TEXT, summary_json TEXT NOT NULL, pages_total INTEGER NOT NULL DEFAULT 0,
+        reactions_total INTEGER NOT NULL DEFAULT 0, passes INTEGER NOT NULL DEFAULT 0,
+        pass_key INTEGER, pass_pages INTEGER NOT NULL DEFAULT 0,
+        pass_reactions INTEGER NOT NULL DEFAULT 0, last_seq INTEGER NOT NULL DEFAULT 0,
+        pending_request TEXT, retry_at TEXT, reason TEXT, basis TEXT,
+        PRIMARY KEY(project,conversation_id,assignment_generation)""",
+    "catch_ups": """project TEXT NOT NULL, conversation_id TEXT NOT NULL, assignment_generation TEXT NOT NULL,
+        marked_at TEXT NOT NULL, PRIMARY KEY(project,conversation_id,assignment_generation)""",
+}
+V8_COLUMN_TABLES = ("pending_actions", "delivery_intents")
 PROVIDER_COMPONENTS = {
     "codex": ("scripts/codex-bridge.js", "scripts/discord-mcp-server.js", "scripts/conversation-reminder-adapter.js"),
     "claude": ("scripts/ccdm-channel-server.js", "scripts/claude-reminder-hook.js",
@@ -121,7 +160,7 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
     db.execute("PRAGMA synchronous=FULL")
     db.execute("PRAGMA secure_delete=ON")
     version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version not in (0, 1, 2, 3, 4, 5, 6, SCHEMA_VERSION) or (version == 0 and existed):
+    if version not in (0, 1, 2, 3, 4, 5, 6, 7, SCHEMA_VERSION) or (version == 0 and existed):
         db.close()
         raise ValueError("conversation store schema is unsupported")
     if version == 0:
@@ -170,21 +209,22 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
     if not required.issubset(tables) or db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
         db.close()
         raise ValueError("conversation store is corrupt or unsupported")
+    # Later columns are validated with the full schema after migrating. An older
+    # store may already have them if a concurrent open finished a migration.
+    keyed = ({"conversation_id"},) + ((set(),) if version < 8 else ())
     columns = {
-        "settings": {"key", "value"},
-        # Later columns are validated with the full schema after migrating. An older
-        # store may already have them if a concurrent open finished a migration.
-        "conversations": (CONVERSATION_COLUMNS,) + ((V6_CONVERSATION_COLUMNS,) if version < 7 else ()) + (
-            (V5_CONVERSATION_COLUMNS,) if version < 6 else ()),
-        "applied_events": {"event_id"},
-        "owner_sources": {"project", "assignment_generation", "source_message_id", "kind"},
-        "qualifications": {"project", "assignment_generation", "provider_session_id",
-                           "provider_turn_id", "kind", "response_message_id"},
-        "pending_actions": {"action_id", "project", "kind", "message_id",
-                            "assignment_generation", "completed"},
+        "settings": ({"key", "value"},),
+        "conversations": (CONVERSATION_COLUMNS,) + ((V7_CONVERSATION_COLUMNS,) if version < 8 else ()) + (
+            (V6_CONVERSATION_COLUMNS,) if version < 7 else ()) + ((V5_CONVERSATION_COLUMNS,) if version < 6 else ()),
+        "applied_events": ({"event_id"},),
+        "owner_sources": tuple({"project", "assignment_generation", "source_message_id", "kind"} | key
+                               for key in keyed),
+        "qualifications": tuple({"project", "assignment_generation", "provider_session_id",
+                                 "provider_turn_id", "kind", "response_message_id"} | key for key in keyed),
+        "pending_actions": tuple({"action_id", "project", "kind", "message_id",
+                                  "assignment_generation", "completed"} | key for key in keyed),
     }
-    if any({row[1] for row in db.execute(f"PRAGMA table_info({table})")} not in
-           (expected if isinstance(expected, tuple) else (expected,))
+    if any({row[1] for row in db.execute(f"PRAGMA table_info({table})")} not in expected
            for table, expected in columns.items()):
         db.close()
         raise ValueError("conversation store schema is unsupported")
@@ -263,15 +303,31 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
             db.execute("ROLLBACK")
             db.close()
             raise ValueError("conversation store migration failed")
+    if db.execute("PRAGMA user_version").fetchone()[0] == 7:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            if db.execute("PRAGMA user_version").fetchone()[0] == 7:
+                migrate_to_v8(db)
+                db.execute("PRAGMA user_version=8")
+            db.execute("COMMIT")
+        except sqlite3.Error:
+            db.execute("ROLLBACK")
+            db.close()
+            raise ValueError("conversation store migration failed")
     expected = {
         "conversations": CONVERSATION_COLUMNS,
-        "delivery_intents": {"nonce", "project", "assignment_generation", "revision", "state",
+        "owner_sources": {"project", "conversation_id", "assignment_generation", "source_message_id", "kind"},
+        "qualifications": {"project", "conversation_id", "assignment_generation", "provider_session_id",
+                           "provider_turn_id", "kind", "response_message_id"},
+        "pending_actions": {"action_id", "project", "conversation_id", "kind", "message_id",
+                            "assignment_generation", "completed"},
+        "delivery_intents": {"nonce", "project", "conversation_id", "assignment_generation", "revision", "state",
                              "message_id", "claimed_at", "retry_at"},
-        "retired_assignments": {"project", "assignment_generation", "channel_id", "identity",
+        "retired_assignments": {"project", "conversation_id", "assignment_generation", "channel_id", "identity",
                                 "reason", "retired_at"},
         "retired_leftovers": {"action_id", "project", "assignment_generation", "message_id", "reason"},
-        "discoveries": DISCOVERY.COLUMNS,
-        "catch_ups": {"project", "assignment_generation", "marked_at"},
+        "discoveries": DISCOVERY.COLUMNS | {"conversation_id"},
+        "catch_ups": {"project", "conversation_id", "assignment_generation", "marked_at"},
     }
     tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if any(table not in tables or {row[1] for row in db.execute(f"PRAGMA table_info({table})")} != columns
@@ -280,6 +336,38 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
         raise ValueError("conversation store schema is unsupported")
     os.chmod(path, 0o600)
     return db
+
+
+def migrate_to_v8(db: sqlite3.Connection) -> None:
+    """Key every conversation-scoped table by conversation inside the caller's write lock.
+
+    Every existing row belongs to its project's Channel Conversation. A retired
+    generation keeps the channel it was retired from; any other row takes the
+    channel of its generation, falling back to the project's current channel."""
+    def channel_of(conversations: str, retired: str) -> str:
+        return f"""COALESCE(
+            (SELECT c.channel_id FROM {conversations} c
+              WHERE c.project=t.project AND c.assignment_generation=t.assignment_generation),
+            (SELECT r.channel_id FROM {retired} r
+              WHERE r.project=t.project AND r.assignment_generation=t.assignment_generation),
+            (SELECT c.channel_id FROM {conversations} c WHERE c.project=t.project), '')"""
+    for table in V8_TABLES:
+        db.execute(f"ALTER TABLE {table} RENAME TO {table}_v7")
+    for table, definition in V8_TABLES.items():
+        db.execute(f"CREATE TABLE {table} ({definition})")
+        old = [row[1] for row in db.execute(f"PRAGMA table_info({table}_v7)")]
+        conversation = ("t.channel_id" if table in {"conversations", "retired_assignments"}
+                        else channel_of("conversations_v7", "retired_assignments_v7"))
+        db.execute(f"INSERT INTO {table} ({','.join(old)},conversation_id) "
+                   f"SELECT {','.join('t.' + name for name in old)},{conversation} FROM {table}_v7 t")
+    for table in V8_TABLES:
+        db.execute(f"DROP TABLE {table}_v7")
+    db.execute("DROP INDEX active_delivery_intent")
+    for table in V8_COLUMN_TABLES:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''")
+        db.execute(f"UPDATE {table} AS t SET conversation_id={channel_of('conversations', 'retired_assignments')}")
+    db.execute("""CREATE UNIQUE INDEX active_delivery_intent
+        ON delivery_intents(project,conversation_id,assignment_generation) WHERE state IN ('sending','uncertain')""")
 
 
 def iso(value: str) -> datetime:
@@ -317,14 +405,21 @@ def usable_assignment(registry: dict, name: str) -> dict | None:
 
 
 def retire_conversation(db: sqlite3.Connection, row: sqlite3.Row, reason: str) -> None:
-    """Stop an obsolete assignment and keep only cleanup bound to its own identity."""
+    """Stop an obsolete assignment and keep only cleanup bound to its own identity.
+
+    The project's Thread Conversations share its assignment and retire with it."""
     project, generation = row["project"], row["assignment_generation"]
-    db.execute("INSERT OR IGNORE INTO retired_assignments VALUES (?,?,?,?,?,?)",
-               (project, generation, row["channel_id"], row["identity"], reason, stamp(clock_now())))
-    if row["reminder_message_id"]:
-        db.execute("""INSERT OR IGNORE INTO pending_actions
-            (action_id,project,kind,message_id,assignment_generation) VALUES (?,?,?,?,?)""",
-            ("delete:" + row["reminder_message_id"], project, "delete", row["reminder_message_id"], generation))
+    for conversation in db.execute("SELECT * FROM conversations WHERE project=?", (project,)).fetchall():
+        db.execute("""INSERT OR IGNORE INTO retired_assignments
+            (project,conversation_id,assignment_generation,channel_id,identity,reason,retired_at)
+            VALUES (?,?,?,?,?,?,?)""",
+                   (project, conversation["conversation_id"], conversation["assignment_generation"],
+                    conversation["channel_id"], conversation["identity"], reason, stamp(clock_now())))
+        if conversation["reminder_message_id"]:
+            db.execute("""INSERT OR IGNORE INTO pending_actions
+                (action_id,project,conversation_id,kind,message_id,assignment_generation) VALUES (?,?,?,?,?,?)""",
+                ("delete:" + conversation["reminder_message_id"], project, conversation["conversation_id"], "delete",
+                 conversation["reminder_message_id"], conversation["assignment_generation"]))
     # A ✅ acknowledgment is not cleanup; never act for the obsolete assignment.
     db.execute("""UPDATE pending_actions SET completed=2
         WHERE project=? AND assignment_generation=? AND kind='ack' AND completed=0""", (project, generation))
@@ -347,7 +442,8 @@ CARRIED_COLUMNS = ("state", "current_interaction_id", "last_ack_at", "last_ack_m
 
 def current_conversation(db: sqlite3.Connection, name: str, assignment: dict) -> sqlite3.Row:
     """Return the row for the current assignment, retiring any other generation first."""
-    current = db.execute("SELECT * FROM conversations WHERE project=?", (name,)).fetchone()
+    current = db.execute("SELECT * FROM conversations WHERE project=? AND conversation_id=channel_id",
+                         (name,)).fetchone()
     if (current is not None and current["assignment_generation"] == assignment["generation"]
             and transport_switched(current, assignment)):
         # A transport switch waits for assignment-changed, which carries the open
@@ -364,14 +460,48 @@ def current_conversation(db: sqlite3.Connection, name: str, assignment: dict) ->
         reused = db.execute("SELECT 1 FROM retired_assignments WHERE project=? AND assignment_generation=?",
                             (name, assignment["generation"])).fetchone()
         db.execute("""INSERT INTO conversations
-            (project,channel_id,identity,assignment_generation,owner_id,state,revision,
+            (project,conversation_id,channel_id,identity,assignment_generation,owner_id,state,revision,
              cleanup_message_ids,reconciliation_status,checkpoint)
-            VALUES (?,?,?,?,?,'open-paused',0,'[]',?,0)""",
-            (name, assignment["channel_id"], assignment["identity"], assignment["generation"],
-             assignment["owner_id"],
+            VALUES (?,?,?,?,?,?,'open-paused',0,'[]',?,0)""",
+            (name, assignment["channel_id"], assignment["channel_id"], assignment["identity"],
+             assignment["generation"], assignment["owner_id"],
              "blocked-retired-generation" if reused else "suspended-incomplete-discovery"))
-        current = db.execute("SELECT * FROM conversations WHERE project=?", (name,)).fetchone()
+        current = db.execute("SELECT * FROM conversations WHERE project=? AND conversation_id=?",
+                             (name, assignment["channel_id"])).fetchone()
     return current
+
+
+def thread_conversation(db: sqlite3.Connection, channel: sqlite3.Row, thread_id: str) -> sqlite3.Row:
+    """Return a Thread Conversation's row, tracking it under its project's assignment on first sight.
+
+    Its channel is the project's; it is reminded in the thread itself. It shares
+    the project's reconciliation status, which every status change sets project-wide."""
+    query = "SELECT * FROM conversations WHERE project=? AND conversation_id=?"
+    row = db.execute(query, (channel["project"], thread_id)).fetchone()
+    if row is None:
+        db.execute("""INSERT INTO conversations
+            (project,conversation_id,channel_id,identity,assignment_generation,owner_id,state,revision,
+             cleanup_message_ids,reconciliation_status,checkpoint)
+            VALUES (?,?,?,?,?,?,'open-paused',0,'[]',?,?)""",
+            (channel["project"], thread_id, channel["channel_id"], channel["identity"],
+             channel["assignment_generation"], channel["owner_id"], channel["reconciliation_status"],
+             channel["checkpoint"]))
+        row = db.execute(query, (channel["project"], thread_id)).fetchone()
+    return row
+
+
+def forget_conversation(db: sqlite3.Connection, project: str, conversation: str) -> None:
+    """Drop a deleted thread's reminder state. Its messages went with it, so its
+    cleanup is abandoned and an unresolved send can never be confirmed."""
+    for table in ("conversations", "owner_sources", "qualifications", "discoveries", "catch_ups"):
+        db.execute(f"DELETE FROM {table} WHERE project=? AND conversation_id=?", (project, conversation))
+    db.execute("UPDATE pending_actions SET completed=2 WHERE project=? AND conversation_id=? AND completed=0",
+               (project, conversation))
+    if db.execute("""UPDATE delivery_intents SET state='canceled' WHERE project=? AND conversation_id=?
+            AND state='uncertain'""", (project, conversation)).rowcount and not db.execute(
+            "SELECT 1 FROM delivery_intents WHERE project=? AND state='uncertain'", (project,)).fetchone():
+        db.execute("""UPDATE conversations SET reconciliation_status='suspended-restart-reconciliation'
+            WHERE project=? AND reconciliation_status='suspended-uncertain-send'""", (project,))
 
 
 def apply_event(db: sqlite3.Connection, registry: dict, row: sqlite3.Row) -> str:
@@ -395,31 +525,48 @@ def apply_payload(db: sqlite3.Connection, registry: dict, event: dict, commit_or
         # Left unapplied in the durable event ledger until the history baseline or
         # restart reconciliation commits.
         return "buffered"
+    # An event without a conversation belongs to its project's Channel
+    # Conversation; one naming a thread, to that Thread Conversation alone.
+    conversation = event.get("conversation_id", event["channel_id"])
+    kind = event["event_type"]
+    if kind in EVENTS.THREAD_LIFECYCLE_EVENTS and not db.execute(
+            "SELECT 1 FROM conversations WHERE project=? AND conversation_id=?",
+            (event["project"], conversation)).fetchone():
+        # A thread with no reminder state has nothing to reset, close or drop.
+        db.execute("INSERT INTO applied_events VALUES (?)", (event["event_id"],))
+        return "applied"
+    if kind == "conversation_deleted":
+        forget_conversation(db, event["project"], conversation)
+        db.execute("INSERT INTO applied_events VALUES (?)", (event["event_id"],))
+        return "applied"
+    if conversation != current["conversation_id"]:
+        current = thread_conversation(db, current, conversation)
+    key = (event["project"], current["conversation_id"], event["assignment_generation"])
+    scoped = "project=? AND conversation_id=? AND assignment_generation=?"
     changes = {"checkpoint": current["checkpoint"] if commit_order is None else commit_order,
                "last_event_order": event["event_order"]}
-    kind = event["event_type"]
     occurred = event["event_time"]
     duplicate_source = False
     if kind == "close_requested" or (kind == "owner_activity" and event["activity_kind"] != "reaction"):
         source = event["source_message_id"]
-        existing_source = db.execute("""SELECT kind FROM owner_sources
-            WHERE project=? AND assignment_generation=? AND source_message_id=?""",
-            (event["project"], event["assignment_generation"], source)).fetchone()
+        existing_source = db.execute(f"SELECT kind FROM owner_sources WHERE {scoped} AND source_message_id=?",
+                                     (*key, source)).fetchone()
         duplicate_source = existing_source is not None
         if not duplicate_source:
-            db.execute("INSERT INTO owner_sources VALUES (?,?,?,?)",
-                       (event["project"], event["assignment_generation"], source, kind))
+            db.execute("""INSERT INTO owner_sources
+                (project,conversation_id,assignment_generation,source_message_id,kind) VALUES (?,?,?,?,?)""",
+                       (*key, source, kind))
     elif kind == "owner_activity" and event.get("reaction_emoji"):
         # Discord gives a reaction no ID of its own: identify it by the reacted
         # message, the reacting owner, and the emoji, stamped with its time.
         prefix = f"reaction-add:{event['source_message_id']}:{event['actor_id']}:{event['reaction_emoji']}@"
-        seen = [iso(row[0][len(prefix):]) for row in db.execute("""SELECT source_message_id FROM owner_sources
-            WHERE project=? AND assignment_generation=? AND substr(source_message_id,1,?)=?""",
-            (event["project"], event["assignment_generation"], len(prefix), prefix))]
+        seen = [iso(row[0][len(prefix):]) for row in db.execute(f"""SELECT source_message_id FROM owner_sources
+            WHERE {scoped} AND substr(source_message_id,1,?)=?""", (*key, len(prefix), prefix))]
         duplicate_source = any(abs(iso(occurred) - at) <= REACTION_DUPLICATE_WINDOW for at in seen)
         if not duplicate_source:
-            db.execute("INSERT OR IGNORE INTO owner_sources VALUES (?,?,?,?)",
-                       (event["project"], event["assignment_generation"], prefix + occurred, "reaction"))
+            db.execute("""INSERT OR IGNORE INTO owner_sources
+                (project,conversation_id,assignment_generation,source_message_id,kind) VALUES (?,?,?,?,?)""",
+                       (*key, prefix + occurred, "reaction"))
     stale_owner_event = (kind in {"close_requested", "owner_activity"} and current["last_ack_at"]
                          and iso(occurred) < iso(current["last_ack_at"]))
     if stale_owner_event or duplicate_source:
@@ -428,8 +575,8 @@ def apply_payload(db: sqlite3.Connection, registry: dict, event: dict, commit_or
         changes.update(state="closed", due_at=None, current_interaction_id=None,
                        last_ack_at=occurred, last_ack_message_id=event["source_message_id"])
         db.execute("""INSERT OR IGNORE INTO pending_actions
-            (action_id,project,kind,message_id,assignment_generation) VALUES (?,?,?,?,?)""",
-            ("ack:" + event["source_message_id"], event["project"], "ack",
+            (action_id,project,conversation_id,kind,message_id,assignment_generation) VALUES (?,?,?,?,?,?)""",
+            ("ack:" + event["source_message_id"], event["project"], key[1], "ack",
              event["source_message_id"], event["assignment_generation"]))
     elif kind == "owner_activity":
         if event["activity_kind"] == "message" or event["activity_kind"] == "attachment":
@@ -441,11 +588,9 @@ def apply_payload(db: sqlite3.Connection, registry: dict, event: dict, commit_or
     elif kind in {"input_needed", "turn_completed"} and current["state"] != "closed":
         interaction = event.get("interaction_id")
         ids = [event["message_id"]] if kind == "input_needed" else event["delivered_message_ids"]
-        qualification = (event["project"], event["assignment_generation"],
-                         event["provider_session_id"], event["provider_turn_id"], kind, ids[-1])
-        already_qualified = db.execute("""SELECT 1 FROM qualifications
-            WHERE project=? AND assignment_generation=? AND provider_session_id=?
-              AND provider_turn_id=? AND kind=? AND response_message_id=?""",
+        qualification = (*key, event["provider_session_id"], event["provider_turn_id"], kind, ids[-1])
+        already_qualified = db.execute(f"""SELECT 1 FROM qualifications WHERE {scoped}
+            AND provider_session_id=? AND provider_turn_id=? AND kind=? AND response_message_id=?""",
             qualification).fetchone()
         if interaction == current["current_interaction_id"] and not already_qualified:
             receipts = []
@@ -471,15 +616,25 @@ def apply_payload(db: sqlite3.Connection, registry: dict, event: dict, commit_or
                 # A fresh response starts a new streak, even while already awaiting.
                 changes.update(state="awaiting-owner", response_message_id=ids[-1], consecutive_reminders=0,
                                response_at=stamp(signal_time), due_at=stamp(signal_time + reminder_gap(0)))
-                db.execute("INSERT INTO qualifications VALUES (?,?,?,?,?,?)", qualification)
+                db.execute("""INSERT INTO qualifications (project,conversation_id,assignment_generation,
+                    provider_session_id,provider_turn_id,kind,response_message_id) VALUES (?,?,?,?,?,?,?)""",
+                           qualification)
+    elif kind == "conversation_reset":
+        # A provider or account switch starts a fresh provider conversation:
+        # nothing the old one answered can arm a reminder any more.
+        changes.update(state="open-paused", current_interaction_id=None, response_message_id=None,
+                       response_at=None, due_at=None)
+    elif kind == "conversation_closed":
+        # An owner archive or the thread's /close: only this thread closes.
+        changes.update(state="closed", due_at=None, current_interaction_id=None)
     elif kind == "work_resumed" and current["state"] == "awaiting-owner":
         if event.get("interaction_id") == current["current_interaction_id"]:
             changes.update(state="open-paused", due_at=None)
     if ("state" in changes and changes["state"] != "awaiting-owner" and current["reminder_message_id"]):
         recorded_id = current["reminder_message_id"]
         db.execute("""INSERT OR IGNORE INTO pending_actions
-            (action_id,project,kind,message_id,assignment_generation) VALUES (?,?,?,?,?)""",
-            ("delete:" + recorded_id, event["project"], "delete", recorded_id,
+            (action_id,project,conversation_id,kind,message_id,assignment_generation) VALUES (?,?,?,?,?,?)""",
+            ("delete:" + recorded_id, event["project"], key[1], "delete", recorded_id,
              event["assignment_generation"]))
         cleanup_ids = json.loads(current["cleanup_message_ids"])
         changes.update(reminder_message_id=None, cleanup_message_ids=json.dumps([*cleanup_ids, recorded_id]))
@@ -489,10 +644,10 @@ def apply_payload(db: sqlite3.Connection, registry: dict, event: dict, commit_or
     if "state" in changes or "due_at" in changes:
         changes["revision"] = current["revision"] + 1
         # A fresh arming or acknowledgment replaces any queued catch-up.
-        db.execute("DELETE FROM catch_ups WHERE project=? AND assignment_generation=?",
-                   (event["project"], event["assignment_generation"]))
-    columns = ",".join(f"{key}=?" for key in changes)
-    db.execute(f"UPDATE conversations SET {columns} WHERE project=?", (*changes.values(), event["project"]))
+        db.execute(f"DELETE FROM catch_ups WHERE {scoped}", key)
+    columns = ",".join(f"{column}=?" for column in changes)
+    db.execute(f"UPDATE conversations SET {columns} WHERE project=? AND conversation_id=?",
+               (*changes.values(), *key[:2]))
     db.execute("INSERT INTO applied_events VALUES (?)", (event["event_id"],))
     return "applied"
 
@@ -507,7 +662,7 @@ def sync(project_root: Path, state_dir: Path) -> dict:
         projects = registry.get("projects")
         if not isinstance(projects, dict):
             raise ValueError("registry project assignments are invalid")
-        for row in db.execute("SELECT * FROM conversations").fetchall():
+        for row in db.execute("SELECT * FROM conversations WHERE conversation_id=channel_id").fetchall():
             if row["project"] not in projects:
                 retire_conversation(db, row, "deregistered")
         for name in projects:
@@ -549,7 +704,8 @@ def assignment_changed(project_root: Path, state_dir: Path, name: str) -> dict:
         if not isinstance(projects, dict):
             raise ValueError("registry project assignments are invalid")
         retired = []
-        row = db.execute("SELECT * FROM conversations WHERE project=?", (name,)).fetchone()
+        row = db.execute("SELECT * FROM conversations WHERE project=? AND conversation_id=channel_id",
+                         (name,)).fetchone()
         if row is not None:
             retire_conversation(db, row, "assignment-changed")
             retired.append(row["assignment_generation"])
@@ -560,9 +716,11 @@ def assignment_changed(project_root: Path, state_dir: Path, name: str) -> dict:
             except (KeyError, ValueError):
                 assignment = None
             if assignment and assignment["generation"] not in retired:
-                db.execute("INSERT OR IGNORE INTO retired_assignments VALUES (?,?,?,?,?,?)",
-                           (name, assignment["generation"], assignment["channel_id"], assignment["identity"],
-                            "assignment-changed", stamp(clock_now())))
+                db.execute("""INSERT OR IGNORE INTO retired_assignments
+                    (project,conversation_id,assignment_generation,channel_id,identity,reason,retired_at)
+                    VALUES (?,?,?,?,?,?,?)""",
+                           (name, assignment["channel_id"], assignment["generation"], assignment["channel_id"],
+                            assignment["identity"], "assignment-changed", stamp(clock_now())))
                 retired.append(assignment["generation"])
             generation = "gen-" + uuid.uuid4().hex
             projects[name]["assignment_generation"] = generation
@@ -578,7 +736,7 @@ def assignment_changed(project_root: Path, state_dir: Path, name: str) -> dict:
                     # Open conversations survive the switch; only the retired
                     # identity's reminders are cleaned up.
                     db.execute(f"""UPDATE conversations SET {",".join(f"{c}=?" for c in CARRIED_COLUMNS)},
-                        revision=? WHERE project=?""",
+                        revision=? WHERE project=? AND conversation_id=channel_id""",
                                (*(row[c] for c in CARRIED_COLUMNS), row["revision"] + 1, name))
         db.execute("COMMIT")
         return {"status": "changed", "project": name, "retired_generations": retired,
@@ -653,10 +811,23 @@ def root_credentials_present() -> bool:
 ROOT_PERMISSION_NAMES = {"SendMessages": "Send Messages", "ReadMessageHistory": "Read Message History",
                          "AddReactions": "Add Reactions", "ManageMessages": "Manage Messages",
                          "ManageWebhooks": "Manage Webhooks"}
+THREAD_PERMISSION_NAMES = {"CreatePublicThreads": "Create Public Threads",
+                           "SendMessagesInThreads": "Send Messages in Threads",
+                           "ManageThreads": "Manage Threads", "ViewAuditLog": "View Audit Log"}
+# Granted at the guild, not in a channel.
+GUILD_PERMISSIONS = {"ViewAuditLog"}
+THREAD_SUPERVISOR_PLIST = Path("Library") / "LaunchAgents" / "com.ccdm.thread-supervisor.plist"
 
 
-def router_prerequisites(projects: object) -> dict:
+def threads_enabled(registry: dict, router: dict | None) -> bool:
+    """Thread Conversations are enabled once the supervisor is installed, configured, or connected."""
+    return ((Path.home() / THREAD_SUPERVISOR_PLIST).exists() or "thread_session_caps" in registry or
+            bool(((router or {}).get("supervisor") or {}).get("connected")))
+
+
+def router_prerequisites(registry: dict) -> dict:
     """Per router project, what root and the Router still need before delivery, each with its fix."""
+    projects = registry.get("projects")
     names = sorted(name for name, project in (projects.items() if isinstance(projects, dict) else [])
                    if isinstance(project, dict))
     if not names:
@@ -669,6 +840,7 @@ def router_prerequisites(projects: object) -> dict:
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         router = None
     reported = {row.get("project"): row for row in (router or {}).get("projects") or [] if isinstance(row, dict)}
+    threads = threads_enabled(registry, router)
     result = {}
     for name in names:
         blockers = []
@@ -686,6 +858,12 @@ def router_prerequisites(projects: object) -> dict:
             for flag in missing or []:
                 label = ROOT_PERMISSION_NAMES.get(flag, flag)
                 blockers.append(f"root lacks {label} in the project channel; grant root permission {label} in "
+                                f"{projects[name].get('channel_id')}")
+            for flag in (row.get("missing_thread_permissions") or []) if threads and missing is not None else []:
+                label = THREAD_PERMISSION_NAMES.get(flag, flag)
+                blockers.append(f"root lacks {label} in the guild; grant root permission {label} in guild "
+                                f"{registry.get('guild_id')}" if flag in GUILD_PERMISSIONS else
+                                f"root lacks {label} in the project channel; grant root permission {label} in "
                                 f"{projects[name].get('channel_id')}")
         result[name] = {"ready": not blockers, "blockers": blockers}
     return result
@@ -735,7 +913,7 @@ def preflight(project_root: Path, state_dir: Path) -> dict:
     checks = enablement_checks(project_root, state_dir, prepare=False)
     blockers = list(checks["blockers"])
     try:
-        routed = router_prerequisites(EVENTS.load_registry(project_root).get("projects"))
+        routed = router_prerequisites(EVENTS.load_registry(project_root))
     except (OSError, ValueError, json.JSONDecodeError):
         routed = {}
     blockers += [f"{name}: {blocker}" for name, row in routed.items() for blocker in row["blockers"]]
@@ -755,11 +933,12 @@ def readiness_report(project_root: Path, state_dir: Path, db: sqlite3.Connection
     """Per-project delivery readiness across adapters, observation, history, assignments, and intents."""
     prerequisites = provider_prerequisites(project_root)
     try:
-        projects = EVENTS.load_registry(project_root).get("projects")
+        registry = EVENTS.load_registry(project_root)
     except (OSError, ValueError, json.JSONDecodeError):
-        projects = None
+        registry = {}
+    projects = registry.get("projects")
     report = {}
-    routed = router_prerequisites(projects)
+    routed = router_prerequisites(registry)
     for name in sorted(projects if isinstance(projects, dict) else {}):
         adapter = READINESS.build_readiness(name, project_root, state_dir)
         conversation = conversations.get(name)
@@ -852,11 +1031,11 @@ def status(state_dir: Path, project_root: Path | None = None) -> dict:
         disabled = db.execute("SELECT value FROM settings WHERE key='disabled'").fetchone()
         if disabled is None:
             raise ValueError("conversation store settings are incomplete")
-        conversations = {}
-        for row in db.execute("SELECT * FROM conversations"):
+        def described(row: sqlite3.Row) -> dict:
             if row["state"] not in STATES:
                 raise ValueError("conversation store state is invalid")
-            conversations[row["project"]] = {
+            key = (row["project"], row["conversation_id"], row["assignment_generation"])
+            return {
                 "channel_id": row["channel_id"], "identity": row["identity"], "assignment_generation": row["assignment_generation"],
                 "state": row["state"], "revision": row["revision"],
                 "last_ack_at": row["last_ack_at"], "last_ack_message_id": row["last_ack_message_id"],
@@ -867,11 +1046,18 @@ def status(state_dir: Path, project_root: Path | None = None) -> dict:
                 "reminder_message_id": row["reminder_message_id"],
                 "cleanup_message_ids": json.loads(row["cleanup_message_ids"]),
                 "reconciliation_status": row["reconciliation_status"], "checkpoint": row["checkpoint"],
-                "discovery": DISCOVERY.status_for(db, row["project"], row["assignment_generation"]),
-                "catch_up_queued": db.execute("""SELECT 1 FROM catch_ups WHERE project=?
-                    AND assignment_generation=?""", (row["project"], row["assignment_generation"])).fetchone()
-                is not None,
+                "discovery": DISCOVERY.status_for(db, *key),
+                "catch_up_queued": db.execute("""SELECT 1 FROM catch_ups WHERE project=? AND conversation_id=?
+                    AND assignment_generation=?""", key).fetchone() is not None,
             }
+
+        conversations = {}
+        for row in db.execute("SELECT * FROM conversations WHERE conversation_id=channel_id"):
+            conversations[row["project"]] = {**described(row), "threads": {}}
+        # Each Thread Conversation nests under its project, keyed by thread id.
+        for row in db.execute("SELECT * FROM conversations WHERE conversation_id!=channel_id ORDER BY conversation_id"):
+            if row["project"] in conversations:
+                conversations[row["project"]]["threads"][row["conversation_id"]] = described(row)
         blocked = [name for name, row in conversations.items()
                    if row["reconciliation_status"] == "blocked-retired-generation"]
         unresolved = [dict(row) for row in db.execute("""SELECT nonce,project,state,claimed_at
@@ -997,7 +1183,8 @@ def discovery_next(project_root: Path, state_dir: Path) -> dict:
     db = connect(state_dir, create=True)
     try:
         db.execute("BEGIN IMMEDIATE")
-        request = DISCOVERY.next_request(db, usable, clock_now())
+        guild = registry.get("guild_id")
+        request = DISCOVERY.next_request(db, usable, clock_now(), str(guild) if guild else None)
         db.execute("COMMIT")
         return {"request": request}
     except Exception:
@@ -1006,6 +1193,26 @@ def discovery_next(project_root: Path, state_dir: Path) -> dict:
         raise
     finally:
         db.close()
+
+
+def supervisor_closed_threads(project: str) -> set[str]:
+    """The project's threads the Thread Supervisor has closed, read from its private store.
+
+    Without a readable store nothing is known closed."""
+    override = os.environ.get("CCDM_THREAD_SUPERVISOR_STATE_DIR")
+    state_dir = Path(override).expanduser() if override else Path.home() / ".local" / "state" / "ccdm" / "thread-supervisor"
+    path = state_dir / "threads.sqlite3"
+    if not path.is_file():
+        return set()
+    try:
+        source = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+        try:
+            return {row[0] for row in source.execute(
+                "SELECT thread_id FROM threads WHERE project=? AND state='closed'", (project,))}
+        finally:
+            source.close()
+    except sqlite3.Error:
+        return set()
 
 
 def discovery_result(project_root: Path, state_dir: Path, payload: dict) -> dict:
@@ -1028,7 +1235,9 @@ def discovery_result(project_root: Path, state_dir: Path, payload: dict) -> dict
         recorded = {r[0] for r in db.execute(
             "SELECT message_id FROM delivery_intents WHERE state='sent' AND message_id IS NOT NULL")}
         now = clock_now()
-        outcome = DISCOVERY.record_result(db, payload, now, recorded, adapter_interactions, reaction_times)
+        closed = {r[0] for r in db.execute("""SELECT conversation_id FROM conversations WHERE project=?
+            AND conversation_id!=channel_id AND state='closed'""", (project,))} | supervisor_closed_threads(project)
+        outcome = DISCOVERY.record_result(db, payload, now, recorded, adapter_interactions, reaction_times, closed)
         if outcome == "committed":
             # Reconcile forward: newer durable events win over the historical baseline.
             for row in rows:
@@ -1059,7 +1268,8 @@ def reconcile_restart(db: sqlite3.Connection, registry: dict, rows: list[sqlite3
     found = db.execute("SELECT summary_json FROM discoveries WHERE project=? AND assignment_generation=?",
                        (project, generation)).fetchone()
     summary = json.loads(found["summary_json"])
-    row = db.execute("SELECT * FROM conversations WHERE project=?", (project,)).fetchone()
+    channel = "SELECT * FROM conversations WHERE project=? AND conversation_id=channel_id"
+    row = db.execute(channel, (project,)).fetchone()
     db.execute("UPDATE conversations SET reconciliation_status='ready' WHERE project=?", (project,))
     missed = {}
     for ref, kind in ((summary["normal"], "message"), (summary["close"], "close"),
@@ -1078,15 +1288,14 @@ def reconcile_restart(db: sqlite3.Connection, registry: dict, rows: list[sqlite3
             event.update(event_type="close_requested", command="/close")
         else:
             event.update(event_type="owner_activity", activity_kind=kind)
-        before = db.execute("SELECT revision FROM conversations WHERE project=?", (project,)).fetchone()[0]
+        before = db.execute(channel, (project,)).fetchone()["revision"]
         apply_payload(db, registry, EVENTS.validate_event(event), None)
-        after = db.execute("SELECT revision,last_ack_message_id FROM conversations WHERE project=?",
-                           (project,)).fetchone()
+        after = db.execute(channel, (project,)).fetchone()
         applied += after["revision"] != before or after["last_ack_message_id"] == ref["id"] != row["last_ack_message_id"]
     for event_row in rows:
         apply_event(db, registry, event_row)
     basis = "missed-owner-activity" if applied else "no-missed-activity"
-    current = db.execute("SELECT * FROM conversations WHERE project=?", (project,)).fetchone()
+    current = db.execute(channel, (project,)).fetchone()
     seen = {r[0] for r in db.execute("""SELECT source_message_id FROM owner_sources
         WHERE project=? AND assignment_generation=?""", (project, generation))}
     if current["state"] == "awaiting-owner" and current["response_at"]:
@@ -1111,17 +1320,19 @@ def reconcile_restart(db: sqlite3.Connection, registry: dict, rows: list[sqlite3
                 "adapter_instance_id": "restart-reconciliation", "actor_id": row["owner_id"],
                 "source_message_id": source, "activity_kind": "reaction"}), None)
             basis = pause
-    DISCOVERY.mark_reactions_seen(db, project, generation, summary["reacted"])
+    DISCOVERY.mark_reactions_seen(db, project, current["conversation_id"], generation, summary["reacted"])
     db.execute("UPDATE discoveries SET basis=? WHERE project=? AND assignment_generation=?",
                (basis, project, generation))
 
 
 def mark_catch_up(db: sqlite3.Connection, project: str, generation: str, now: datetime) -> None:
     """Queue one catch-up for a channel released while already overdue."""
-    row = db.execute("SELECT * FROM conversations WHERE project=?", (project,)).fetchone()
+    row = db.execute("SELECT * FROM conversations WHERE project=? AND conversation_id=channel_id",
+                     (project,)).fetchone()
     if (row and row["assignment_generation"] == generation and row["reconciliation_status"] == "ready" and
             row["state"] == "awaiting-owner" and row["due_at"] and iso(row["due_at"]) <= now):
-        db.execute("INSERT OR IGNORE INTO catch_ups VALUES (?,?,?)", (project, generation, stamp(now)))
+        db.execute("""INSERT OR IGNORE INTO catch_ups (project,conversation_id,assignment_generation,marked_at)
+            VALUES (?,?,?,?)""", (project, row["conversation_id"], generation, stamp(now)))
 
 
 def rows_matching(state_dir: Path, project: str, generation: str, condition: str) -> list[sqlite3.Row]:
@@ -1139,12 +1350,15 @@ def pending_actions(state_dir: Path) -> dict:
     if db is None:
         return {"actions": []}
     try:
+        # `target_id` is where the message lives: the conversation's thread, or its channel.
         rows = db.execute("""SELECT a.action_id,a.project,a.kind,a.message_id,a.assignment_generation,
-                COALESCE(c.channel_id,r.channel_id) AS channel_id, COALESCE(c.identity,r.identity) AS identity,
-                r.project IS NOT NULL AS retired
+                COALESCE(c.channel_id,r.channel_id) AS channel_id, a.conversation_id AS target_id,
+                COALESCE(c.identity,r.identity) AS identity, r.project IS NOT NULL AS retired
             FROM pending_actions a
             LEFT JOIN conversations c ON c.project=a.project AND c.assignment_generation=a.assignment_generation
+              AND c.conversation_id=a.conversation_id
             LEFT JOIN retired_assignments r ON r.project=a.project AND r.assignment_generation=a.assignment_generation
+              AND r.conversation_id=a.conversation_id
             WHERE a.completed=0 AND (c.project IS NOT NULL OR r.project IS NOT NULL)
             ORDER BY a.rowid LIMIT 100""").fetchall()
         return {"actions": [{**dict(row), "bot_id": pool_bot_id(row["identity"]), "retired": bool(row["retired"])}
@@ -1159,8 +1373,9 @@ def uncertain_intents(state_dir: Path) -> dict:
         return {"intents": []}
     try:
         rows = db.execute("""SELECT i.nonce,i.project,i.assignment_generation,i.claimed_at,
-            c.channel_id,c.identity FROM delivery_intents i JOIN conversations c
+            c.channel_id,i.conversation_id AS target_id,c.identity FROM delivery_intents i JOIN conversations c
               ON c.project=i.project AND c.assignment_generation=i.assignment_generation
+              AND c.conversation_id=i.conversation_id
             WHERE i.state='uncertain' ORDER BY i.claimed_at LIMIT 100""").fetchall()
         intents = []
         for row in rows:
@@ -1184,11 +1399,13 @@ def complete_action(state_dir: Path, action_id: str) -> dict:
             raise ValueError("pending action does not exist")
         db.execute("UPDATE pending_actions SET completed=1 WHERE action_id=?", (action_id,))
         if action["kind"] == "delete":
-            current = db.execute("SELECT cleanup_message_ids FROM conversations WHERE project=?", (action["project"],)).fetchone()
+            conversation = (action["project"], action["conversation_id"])
+            current = db.execute("SELECT cleanup_message_ids FROM conversations WHERE project=? AND conversation_id=?",
+                                 conversation).fetchone()
             if current:
                 remaining = [value for value in json.loads(current["cleanup_message_ids"]) if value != action["message_id"]]
-                db.execute("UPDATE conversations SET cleanup_message_ids=? WHERE project=?",
-                           (json.dumps(remaining), action["project"]))
+                db.execute("UPDATE conversations SET cleanup_message_ids=? WHERE project=? AND conversation_id=?",
+                           (json.dumps(remaining), *conversation))
         db.execute("COMMIT")
         return {"status": "complete"}
     finally:
@@ -1274,13 +1491,13 @@ def claim_due(project_root: Path, state_dir: Path) -> dict:
                 continue
             if not row["due_at"] or iso(row["due_at"]) > now or json.loads(row["cleanup_message_ids"]):
                 continue
-            if db.execute("""SELECT 1 FROM delivery_intents WHERE project=? AND assignment_generation=?
-                    AND state IN ('sending','uncertain')""",
-                          (row["project"], row["assignment_generation"])).fetchone():
+            key = (row["project"], row["conversation_id"], row["assignment_generation"])
+            if db.execute("""SELECT 1 FROM delivery_intents WHERE project=? AND conversation_id=?
+                    AND assignment_generation=? AND state IN ('sending','uncertain')""", key).fetchone():
                 continue
-            previous = db.execute("""SELECT retry_at FROM delivery_intents WHERE project=?
+            previous = db.execute("""SELECT retry_at FROM delivery_intents WHERE project=? AND conversation_id=?
                 AND assignment_generation=? AND state='failed'
-                ORDER BY rowid DESC LIMIT 1""", (row["project"], row["assignment_generation"])).fetchone()
+                ORDER BY rowid DESC LIMIT 1""", key).fetchone()
             if previous and previous["retry_at"] and iso(previous["retry_at"]) > now:
                 continue
             try:
@@ -1290,10 +1507,12 @@ def claim_due(project_root: Path, state_dir: Path) -> dict:
             if (assignment["generation"] != row["assignment_generation"] or
                     assignment["channel_id"] != row["channel_id"] or assignment["identity"] != row["identity"]):
                 continue
-            if db.execute("SELECT 1 FROM catch_ups WHERE project=? AND assignment_generation=?",
-                          (row["project"], row["assignment_generation"])).fetchone():
+            if row["conversation_id"] != row["channel_id"] or db.execute(
+                    "SELECT 1 FROM catch_ups WHERE project=? AND conversation_id=? AND assignment_generation=?",
+                    key).fetchone():
                 # Initial and catch-up sends share one durable global spacing gate,
-                # so neither a restart nor a second channel can bypass it.
+                # so neither a restart nor a second channel can bypass it. Every
+                # thread reminder passes it too, so many threads never send at once.
                 gate = db.execute("SELECT value FROM settings WHERE key='catch_up_next_at'").fetchone()
                 if gate and iso(gate[0]) > now:
                     continue
@@ -1301,12 +1520,15 @@ def claim_due(project_root: Path, state_dir: Path) -> dict:
                            (stamp(now + CATCH_UP_SPACING),))
             nonce = uuid.uuid4().hex[:24]
             db.execute("""INSERT INTO delivery_intents
-                (nonce,project,assignment_generation,revision,state,claimed_at)
-                VALUES (?,?,?,?,'sending',?)""",
-                (nonce, row["project"], row["assignment_generation"], row["revision"], stamp(now)))
+                (nonce,project,conversation_id,assignment_generation,revision,state,claimed_at)
+                VALUES (?,?,?,?,?,'sending',?)""",
+                (nonce, row["project"], row["conversation_id"], row["assignment_generation"], row["revision"],
+                 stamp(now)))
             db.execute("COMMIT")
             return {"claim": {"nonce": nonce, "project": row["project"],
                               "channel_id": row["channel_id"],
+                              # Where it posts: the conversation's thread, or its channel.
+                              "target_id": row["conversation_id"],
                               "assignment_generation": row["assignment_generation"]}}
         db.execute("COMMIT")
         return {"claim": None}
@@ -1321,7 +1543,8 @@ def validate_claim(project_root: Path, state_dir: Path, nonce: str) -> dict:
     try:
         db.execute("BEGIN IMMEDIATE")
         intent = db.execute("SELECT * FROM delivery_intents WHERE nonce=?", (nonce,)).fetchone()
-        row = db.execute("SELECT * FROM conversations WHERE project=?", (intent["project"],)).fetchone() if intent else None
+        row = db.execute("SELECT * FROM conversations WHERE project=? AND conversation_id=?",
+                         (intent["project"], intent["conversation_id"])).fetchone() if intent else None
         disabled = db.execute("SELECT value FROM settings WHERE key='disabled'").fetchone()[0] == "1"
         valid = bool(intent and intent["state"] == "sending" and row and not disabled and
                      row["state"] == "awaiting-owner" and row["reconciliation_status"] == "ready" and
@@ -1357,7 +1580,8 @@ def record_result(project_root: Path, state_dir: Path, nonce: str, outcome: str,
             raise ValueError("uncertain delivery requires identity-verifiable confirmation")
         if outcome == "absent" and intent["state"] != "uncertain":
             raise ValueError("only an uncertain delivery can be proven absent")
-        row = db.execute("SELECT * FROM conversations WHERE project=?", (intent["project"],)).fetchone()
+        conversation = (intent["project"], intent["conversation_id"])
+        row = db.execute("SELECT * FROM conversations WHERE project=? AND conversation_id=?", conversation).fetchone()
         if outcome == "absent":
             # History covering the whole claim window shows no reminder from the
             # root: nothing was created, so reconcile and allow a new send.
@@ -1371,8 +1595,8 @@ def record_result(project_root: Path, state_dir: Path, nonce: str, outcome: str,
                 raise ValueError("successful delivery requires a message identity and timestamp")
             delivery_time = iso(sent_at)
             db.execute("UPDATE delivery_intents SET state='sent', message_id=? WHERE nonce=?", (message_id, nonce))
-            db.execute("DELETE FROM catch_ups WHERE project=? AND assignment_generation=?",
-                       (intent["project"], intent["assignment_generation"]))
+            db.execute("DELETE FROM catch_ups WHERE project=? AND conversation_id=? AND assignment_generation=?",
+                       (*conversation, intent["assignment_generation"]))
             if row and row["assignment_generation"] == intent["assignment_generation"]:
                 eligible_recovery = (intent["state"] == "uncertain" and
                                      row["reconciliation_status"] == "suspended-uncertain-send")
@@ -1383,20 +1607,22 @@ def record_result(project_root: Path, state_dir: Path, nonce: str, outcome: str,
                 cleanup = json.loads(row["cleanup_message_ids"])
                 for old in to_delete:
                     db.execute("""INSERT OR IGNORE INTO pending_actions
-                        (action_id,project,kind,message_id,assignment_generation) VALUES (?,?,?,?,?)""",
-                        ("delete:" + old, intent["project"], "delete", old, intent["assignment_generation"]))
+                        (action_id,project,conversation_id,kind,message_id,assignment_generation)
+                        VALUES (?,?,?,?,?,?)""",
+                        ("delete:" + old, intent["project"], intent["conversation_id"], "delete", old,
+                         intent["assignment_generation"]))
                     if old not in cleanup:
                         cleanup.append(old)
                 if canceled:
-                    db.execute("UPDATE conversations SET cleanup_message_ids=? WHERE project=?",
-                               (json.dumps(cleanup), intent["project"]))
+                    db.execute("UPDATE conversations SET cleanup_message_ids=? WHERE project=? AND conversation_id=?",
+                               (json.dumps(cleanup), *conversation))
                 else:
                     # The next gap starts from the actual send and grows with the streak.
                     sent = row["consecutive_reminders"] + 1
                     db.execute("""UPDATE conversations SET reminder_message_id=?, cleanup_message_ids=?,
-                        due_at=?, consecutive_reminders=?, revision=revision+1 WHERE project=?""",
+                        due_at=?, consecutive_reminders=?, revision=revision+1 WHERE project=? AND conversation_id=?""",
                         (message_id, json.dumps(cleanup), stamp(delivery_time + reminder_gap(sent)), sent,
-                         intent["project"]))
+                         *conversation))
                 if intent["state"] == "uncertain" and row["reconciliation_status"] == "suspended-uncertain-send":
                     db.execute("""UPDATE conversations SET reconciliation_status='suspended-restart-reconciliation'
                         WHERE project=?""", (intent["project"],))
@@ -1404,8 +1630,8 @@ def record_result(project_root: Path, state_dir: Path, nonce: str, outcome: str,
                 # The assignment changed while the request was in flight. Remove the
                 # late reminder only through the retired assignment's own identity.
                 db.execute("""INSERT OR IGNORE INTO pending_actions
-                    (action_id,project,kind,message_id,assignment_generation) VALUES (?,?,?,?,?)""",
-                    ("delete:" + message_id, intent["project"], "delete", message_id,
+                    (action_id,project,conversation_id,kind,message_id,assignment_generation) VALUES (?,?,?,?,?,?)""",
+                    ("delete:" + message_id, intent["project"], intent["conversation_id"], "delete", message_id,
                      intent["assignment_generation"]))
             # The exclusion list includes every delivered reminder identity, even
             # after deletion, so a late reaction never reaches a coding agent.
@@ -1421,12 +1647,12 @@ def record_result(project_root: Path, state_dir: Path, nonce: str, outcome: str,
             retry_at = None
             if outcome == "failed":
                 failures = db.execute("""SELECT COUNT(*) FROM delivery_intents
-                    WHERE project=? AND assignment_generation=? AND state='failed'""",
-                    (intent["project"], intent["assignment_generation"])).fetchone()[0]
+                    WHERE project=? AND conversation_id=? AND assignment_generation=? AND state='failed'""",
+                    (*conversation, intent["assignment_generation"])).fetchone()[0]
                 delay = max(min(300, 5 * (2 ** min(failures, 6))), retry_after or 0)
                 retry_at = stamp(clock_now() + timedelta(seconds=delay))
-                if retry_after and db.execute("SELECT 1 FROM catch_ups WHERE project=? AND assignment_generation=?",
-                                              (intent["project"], intent["assignment_generation"])).fetchone():
+                if retry_after and db.execute("""SELECT 1 FROM catch_ups WHERE project=? AND conversation_id=?
+                        AND assignment_generation=?""", (*conversation, intent["assignment_generation"])).fetchone():
                     # Discord's rate limit takes precedence over catch-up spacing.
                     gate = db.execute("SELECT value FROM settings WHERE key='catch_up_next_at'").fetchone()
                     limited = clock_now() + timedelta(seconds=retry_after)

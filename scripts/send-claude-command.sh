@@ -1,11 +1,15 @@
 #!/bin/zsh
 # Usage:
-#   scripts/send-claude-command.sh <project|channel_id> <compact|clear|/compact|/clear>
+#   scripts/send-claude-command.sh <project|channel_id|thread_id|link> <compact|clear|/compact|/clear>
 #   scripts/send-claude-command.sh --project <project> <compact|clear|/compact|/clear>
-#   scripts/send-claude-command.sh --channel <channel_id> <compact|clear|/compact|/clear>
+#   scripts/send-claude-command.sh --channel <channel_id|thread_id|link> <compact|clear|/compact|/clear>
 #
 # Sends a Claude Code slash command into a registered local Claude tmux session.
 # This is intended for root-agent relay commands from Discord project channels.
+# A target that is no project name or registered channel id goes through
+# scripts/conversation-resolver.js; a thread's command goes to the thread's
+# own tmux session, `<screen>-t-<thread id>`. Exits 2 with the
+# resolver's reason when it cannot name the target.
 
 set -euo pipefail
 
@@ -16,9 +20,9 @@ REGISTRY="$ROOT_DIR/registry.json"
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/send-claude-command.sh <project|channel_id> <compact|clear|/compact|/clear>
+  scripts/send-claude-command.sh <project|channel_id|thread_id|link> <compact|clear|/compact|/clear>
   scripts/send-claude-command.sh --project <project> <compact|clear|/compact|/clear>
-  scripts/send-claude-command.sh --channel <channel_id> <compact|clear|/compact|/clear>
+  scripts/send-claude-command.sh --channel <channel_id|thread_id|link> <compact|clear|/compact|/clear>
 EOF
 }
 
@@ -65,7 +69,11 @@ case "$REQUESTED_COMMAND" in
     ;;
 esac
 
-RESOLVED="$(python3 - "$REGISTRY" "$MODE" "$TARGET" <<'PY'
+# Prints the target's project, tmux session, type, path, channel and thread
+# (empty for a project channel). Mode `conversation` takes the resolver's JSON;
+# exit 3 means the target needs the resolver.
+lookup() {
+  python3 - "$REGISTRY" "$@" <<'PY'
 import json
 import os
 import sys
@@ -86,6 +94,18 @@ projects = registry.get("projects", {})
 
 project_name = None
 project = None
+thread_id = ""
+
+if mode == "conversation":
+    conversation = json.loads(target)
+    project_name = conversation["project"]
+    project = projects.get(project_name)
+    thread_id = conversation.get("thread_id") or ""
+    if project is None:
+        print(f"Unknown project: {project_name}", file=sys.stderr)
+        sys.exit(2)
+    if thread_id:
+        project = {**project, "type": conversation.get("provider") or project.get("type", "claude")}
 
 if mode in ("auto", "project") and target in projects:
     project_name = target
@@ -103,11 +123,8 @@ if project is None and mode in ("auto", "channel"):
 if project is None:
     if mode == "project":
         print(f"Unknown project: {target}", file=sys.stderr)
-    elif mode == "channel":
-        print(f"No project is registered for channel: {target}", file=sys.stderr)
-    else:
-        print(f"Unknown project or channel: {target}", file=sys.stderr)
-    sys.exit(2)
+        sys.exit(2)
+    sys.exit(3)
 
 screen_name = project.get("screen_name")
 if not screen_name:
@@ -116,32 +133,55 @@ if not screen_name:
 
 print("\t".join([
     project_name,
-    screen_name,
+    f"{screen_name}-t-{thread_id}" if thread_id else screen_name,
     project.get("type", "claude"),
     os.path.expanduser(project.get("path", "")),
     str(project.get("channel_id", "")),
+    thread_id,
 ]))
 PY
-)"
+}
 
-IFS=$'\t' read -r PROJECT_NAME SCREEN_NAME SESSION_TYPE PATH_DIR CHANNEL_ID <<< "$RESOLVED"
+STATUS=0
+RESOLVED="$(lookup "$MODE" "$TARGET")" || STATUS=$?
+if (( STATUS == 3 )); then
+  CONVERSATION="$(CCDM_REGISTRY_PATH="$REGISTRY" "${CCDM_ROUTER_NODE:-node}" "$SCRIPT_DIR/conversation-resolver.js" "$TARGET")" || exit 2
+  STATUS=0
+  RESOLVED="$(lookup conversation "$CONVERSATION")" || STATUS=$?
+fi
+(( STATUS == 0 )) || exit "$STATUS"
+
+IFS=$'\t' read -r PROJECT_NAME SCREEN_NAME SESSION_TYPE PATH_DIR CHANNEL_ID THREAD_ID <<< "$RESOLVED"
+if [[ -n "$THREAD_ID" ]]; then
+  SUBJECT="thread $THREAD_ID in project '$PROJECT_NAME'"
+  SUBJECT_START="Thread $THREAD_ID in project '$PROJECT_NAME'"
+  OWN_CHANNEL="thread"
+else
+  SUBJECT="project '$PROJECT_NAME'"
+  SUBJECT_START="Project '$PROJECT_NAME'"
+  OWN_CHANNEL="project channel"
+fi
 
 if [[ "$SESSION_TYPE" != "claude" ]]; then
-  echo "Project '$PROJECT_NAME' is type '$SESSION_TYPE', not 'claude'. Codex sessions handle /compact and /clear directly in their project channel." >&2
+  echo "$SUBJECT_START is type '$SESSION_TYPE', not 'claude'. Codex sessions handle /compact and /clear directly in their $OWN_CHANNEL." >&2
   exit 1
 fi
 
 if [[ "$PATH_DIR" == remote:* ]]; then
-  echo "Project '$PROJECT_NAME' is remote ($PATH_DIR). Run $CLAUDE_COMMAND on the remote tmux session instead." >&2
+  echo "$SUBJECT_START is remote ($PATH_DIR). Run $CLAUDE_COMMAND on the remote tmux session instead." >&2
   exit 1
 fi
 
 if ! tmux has-session -t "=$SCREEN_NAME" 2>/dev/null; then
-  echo "Claude tmux session '$SCREEN_NAME' for project '$PROJECT_NAME' is not running." >&2
+  echo "Claude tmux session '$SCREEN_NAME' for $SUBJECT is not running." >&2
   exit 1
 fi
 
 tmux send-keys -t "$SCREEN_NAME" -l "$CLAUDE_COMMAND"
 tmux send-keys -t "$SCREEN_NAME" Enter
 
-echo "Sent $CLAUDE_COMMAND to Claude project '$PROJECT_NAME' (tmux session '$SCREEN_NAME', channel '$CHANNEL_ID')."
+if [[ -n "$THREAD_ID" ]]; then
+  echo "Sent $CLAUDE_COMMAND to Claude $SUBJECT (tmux session '$SCREEN_NAME')."
+else
+  echo "Sent $CLAUDE_COMMAND to Claude $SUBJECT (tmux session '$SCREEN_NAME', channel '$CHANNEL_ID')."
+fi

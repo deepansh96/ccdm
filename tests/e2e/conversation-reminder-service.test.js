@@ -1683,7 +1683,24 @@ test("a canceled send and a late send after reassignment never grow the streak",
     ["generation-2", 0, null]);
 });
 
-test("a v5 store upgrades to v7, keeping a recorded reminder's pending due time", async () => {
+// Turn a live v8 store back into the v7 shape: no table is keyed by conversation.
+function downgradeToV7(database) {
+  const result = spawnSync("python3", ["-c", `import sqlite3,sys
+db=sqlite3.connect(sys.argv[1])
+db.execute("DROP INDEX active_delivery_intent")
+for table in ("conversations","owner_sources","qualifications","pending_actions","delivery_intents",
+              "discoveries","catch_ups","retired_assignments"):
+    columns=",".join(r[1] for r in db.execute(f"PRAGMA table_info({table})") if r[1]!="conversation_id")
+    db.execute(f"CREATE TABLE {table}_v7 AS SELECT {columns} FROM {table}")
+    db.execute(f"DROP TABLE {table}")
+    db.execute(f"ALTER TABLE {table}_v7 RENAME TO {table}")
+db.execute("""CREATE UNIQUE INDEX active_delivery_intent ON delivery_intents(project,assignment_generation)
+    WHERE state IN ('sending','uncertain')""")
+db.execute("PRAGMA user_version=7"); db.commit(); db.close()`, database], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+}
+
+test("a v5 store upgrades to v8, keeping a recorded reminder's pending due time", async () => {
   const downgrade = `ALTER TABLE conversations DROP COLUMN consecutive_reminders;
     ALTER TABLE conversations RENAME COLUMN identity TO bot_id; UPDATE conversations SET bot_id='bot';
     ALTER TABLE retired_assignments RENAME COLUMN identity TO bot_id; PRAGMA user_version=5;`;
@@ -1693,12 +1710,13 @@ test("a v5 store upgrades to v7, keeping a recorded reminder's pending due time"
   const clockFile = path.join(withReminder.tmpDir, "reminder-clock");
   await sendAt(withReminder, stateDir, clockFile, "2026-09-24T11:00:00Z", "r-1");
   const database = path.join(stateDir, "conversations.sqlite3");
+  downgradeToV7(database);
   sql(database, downgrade);
   const upgraded = (await cli(withReminder, stateDir, "status")).conversations.demo;
   assert.deepEqual([...streak(upgraded), upgraded.reminder_message_id],
     ["awaiting-owner", "2026-09-24T13:00:00Z", 1, "r-1"]);
   const version = spawnSync("python3", ["-c", "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('PRAGMA user_version').fetchone()[0])", database], { encoding: "utf8" });
-  assert.equal(version.stdout.trim(), "7");
+  assert.equal(version.stdout.trim(), "8");
   // Every v5 assignment was a pool bot, so the row stays readable as history,
   // but the Router's webhook now speaks for demo: nothing sends until the
   // operator records the assignment change.
@@ -1710,12 +1728,13 @@ test("a v5 store upgrades to v7, keeping a recorded reminder's pending due time"
   const withoutReminder = createBridgeWorkspace();
   const otherDir = setup(withoutReminder);
   await reconciledExchange(withoutReminder, otherDir);
+  downgradeToV7(path.join(otherDir, "conversations.sqlite3"));
   sql(path.join(otherDir, "conversations.sqlite3"), downgrade);
   assert.deepEqual(streak((await cli(withoutReminder, otherDir, "status")).conversations.demo),
     ["awaiting-owner", "2026-09-24T11:00:00Z", 0]);
 });
 
-test("a fresh store is created at v7, and a v7 store without the streak or a future version fails closed", async () => {
+test("a fresh store is created at v8, and a v8 store without the streak or a future version fails closed", async () => {
   const workspace = createBridgeWorkspace();
   const stateDir = setup(workspace);
   await cli(workspace, stateDir, "sync");
@@ -1725,9 +1744,9 @@ db=sqlite3.connect(sys.argv[1])
 print(json.dumps([db.execute('PRAGMA user_version').fetchone()[0],
   'consecutive_reminders' in [row[1] for row in db.execute('PRAGMA table_info(conversations)')]]))`, database],
   { encoding: "utf8" });
-  assert.deepEqual(JSON.parse(shape.stdout), [7, true]);
-  for (const script of ["PRAGMA user_version=8;",
-    "PRAGMA user_version=7; ALTER TABLE conversations DROP COLUMN consecutive_reminders;"]) {
+  assert.deepEqual(JSON.parse(shape.stdout), [8, true]);
+  for (const script of ["PRAGMA user_version=9;",
+    "ALTER TABLE conversations DROP COLUMN consecutive_reminders;"]) {
     const copy = createBridgeWorkspace();
     const copyDir = setup(copy);
     await cli(copy, copyDir, "sync");
@@ -1815,16 +1834,16 @@ print(json.dumps({"version": db.execute('PRAGMA user_version').fetchone()[0],
   return JSON.parse(result.stdout);
 }
 
-const V7_CONVERSATION = {
-  project: "demo", channel_id: "channel", identity: "pool:bot", assignment_generation: "generation-1",
+const V8_CONVERSATION = {
+  project: "demo", conversation_id: "channel", channel_id: "channel", identity: "pool:bot", assignment_generation: "generation-1",
   owner_id: "owner", state: "awaiting-owner", revision: 7, last_ack_at: "2026-09-24T09:00:00Z",
   last_ack_message_id: "ack-1", current_interaction_id: "question-1", response_message_id: "answer-1",
   response_at: "2026-09-24T10:00:00Z", due_at: "2026-09-24T17:00:00Z", reminder_message_id: "r-2",
   cleanup_message_ids: "[]", last_event_order: "2026-09-24T13:00:00Z:r-2", reconciliation_status: "ready",
   checkpoint: 3, consecutive_reminders: 2,
 };
-const V7_RETIRED = {
-  project: "demo", assignment_generation: "generation-0", channel_id: "old-channel", identity: "pool:old-bot",
+const V8_RETIRED = {
+  project: "demo", conversation_id: "old-channel", assignment_generation: "generation-0", channel_id: "old-channel", identity: "pool:old-bot",
   reason: "reassigned", retired_at: "2026-09-23T08:00:00Z",
 };
 
@@ -1832,7 +1851,7 @@ function backups(stateDir) {
   return fs.readdirSync(stateDir).filter(name => name.includes("backup"));
 }
 
-test("a v6 store migrates to v7, keying conversations and retired assignments by pool identity", async () => {
+test("a v6 store migrates to v8, keying conversations and retired assignments by pool identity", async () => {
   const workspace = createBridgeWorkspace();
   const { stateDir, database } = seedV6(workspace);
   const status = await cli(workspace, stateDir, "status");
@@ -1840,7 +1859,7 @@ test("a v6 store migrates to v7, keying conversations and retired assignments by
   assert.equal(status.conversations.demo.consecutive_reminders, 2);
   assert.equal(status.retired_assignments[0].identity, "pool:old-bot");
   assert.deepEqual(storeRows(database),
-    { version: 7, conversations: [V7_CONVERSATION], retired_assignments: [V7_RETIRED] });
+    { version: 8, conversations: [V8_CONVERSATION], retired_assignments: [V8_RETIRED] });
 
   // The pre-migration store is kept privately beside the migrated one.
   assert.deepEqual(backups(stateDir), ["conversations.v6.backup.sqlite3"]);
@@ -1857,10 +1876,10 @@ test("a v6 store migrates to v7, keying conversations and retired assignments by
   assert.deepEqual(actions.actions.map(a => [a.message_id, a.channel_id, a.bot_id, a.retired]),
     [["r-old", "old-channel", "old-bot", true]]);
 
-  // Re-running on the v7 store changes nothing and takes no second backup.
+  // Re-running on the v8 store changes nothing and takes no second backup.
   await cli(workspace, stateDir, "status");
   assert.deepEqual(storeRows(database),
-    { version: 7, conversations: [V7_CONVERSATION], retired_assignments: [V7_RETIRED] });
+    { version: 8, conversations: [V8_CONVERSATION], retired_assignments: [V8_RETIRED] });
   assert.deepEqual(backups(stateDir), ["conversations.v6.backup.sqlite3"]);
 });
 
@@ -1883,5 +1902,5 @@ test("a failed v7 migration leaves the v6 store usable", async () => {
   sql(database, "DROP TRIGGER fail_migration;");
   await cli(workspace, stateDir, "status");
   assert.deepEqual(storeRows(database),
-    { version: 7, conversations: [V7_CONVERSATION], retired_assignments: [V7_RETIRED] });
+    { version: 8, conversations: [V8_CONVERSATION], retired_assignments: [V8_RETIRED] });
 });

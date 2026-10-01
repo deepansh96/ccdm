@@ -8,7 +8,8 @@ const { chmod, mkdir, readFile, unlink } = require("node:fs/promises");
 const net = require("node:net");
 const path = require("node:path");
 const { withDeadline } = require("./discord-rest.js");
-const { ScopeViolation } = require("./ops/errors.js");
+const { threadRoute } = require("./inbound.js");
+const { OpError, ScopeViolation } = require("./ops/errors.js");
 const { OPERATIONS } = require("./ops/index.js");
 
 const PROTOCOL_VERSION = 1;
@@ -19,6 +20,10 @@ const RECENT_VIOLATIONS = 20;
 const ROOT_KEY_FILE = ".root.key";
 // The Conversation Reminder observer's key, named apart the same way.
 const OBSERVER_KEY_FILE = ".observer.key";
+// The Thread Supervisor's key, named apart the same way.
+const SUPERVISOR_KEY_FILE = ".supervisor.key";
+const PROVIDERS = new Set(["claude", "codex"]);
+const PUBLIC_THREAD = 11;
 
 function send(socket, frame) {
   if (!socket.destroyed) socket.write(`${JSON.stringify(frame)}\n`);
@@ -45,11 +50,14 @@ function parseFrame(line) {
   return frame;
 }
 
-// Root's route for one target channel, or null outside root's scope.
-function rootTarget(table, channelId) {
+// Root's route for one target channel, or null outside root's scope: a root
+// channel, a registered channel, or a public thread under a project channel.
+async function rootTarget(table, channelId, client) {
   if (table.rootChannels.has(channelId)) return { project: "root", channel_id: channelId };
   const project = table.registered.get(channelId);
-  return project ? { project, channel_id: channelId } : null;
+  if (project) return { project, channel_id: channelId };
+  const thread = await threadRoute(table, channelId, null, client);
+  return thread ? { project: thread.project, channel_id: channelId } : null;
 }
 
 // The Session Scope a project connection is granted: in its hello_ok, and in
@@ -77,10 +85,18 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
   // The read-only reminder observer: it receives every project-channel event
   // and may perform no operation.
   let observerSession = null;
+  // The one Thread Supervisor: it receives all thread lifecycle traffic.
+  let supervisorSession = null;
   // Op-only project connections (`listener: false`, such as a Codex bridge's
   // scoped MCP server): they act in the project's scope but receive no events
   // and never replace the project's listener.
   const opConnections = new Set();
+  // thread id -> the one thread session listening in it, and the op-only
+  // thread connections (a thread's Codex scoped MCP server).
+  const threadSessions = new Map();
+  const threadOps = new Set();
+  // request id -> a channel session's `create_thread` awaiting the supervisor.
+  const threadRequests = new Map();
   const violations = [];
   const keysDir = path.join(stateDir, "keys");
   let keysWatcher = null;
@@ -94,33 +110,96 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
   }
 
   const projectKey = project => readKey(`${path.basename(project)}.key`);
+  const threadKey = threadId => readKey(`.thread-${threadId}.key`);
   const connectionKey = connection => connection.role === "root" ? readKey(ROOT_KEY_FILE)
-    : connection.role === "observer" ? readKey(OBSERVER_KEY_FILE) : projectKey(connection.route.project);
+    : connection.role === "observer" ? readKey(OBSERVER_KEY_FILE)
+      : connection.role === "supervisor" ? readKey(SUPERVISOR_KEY_FILE)
+      : connection.role === "thread" ? threadKey(connection.route.thread_id) : projectKey(connection.route.project);
 
-  function forget(connection) {
-    if (connection.listener === false) {
+  function deliverSupervisor(event) {
+    if (!supervisorSession) return false;
+    send(supervisorSession.socket, { type: "event", ...event });
+    return true;
+  }
+
+  // A thread listener that goes, revoked or disconnected, is reported to the supervisor.
+  function forget(connection, reason = "disconnected") {
+    if (connection.role === "thread") {
+      threadOps.delete(connection);
+      const { project, thread_id: threadId } = connection.route;
+      if (threadSessions.get(threadId) === connection) {
+        threadSessions.delete(threadId);
+        deliverSupervisor({ event: "thread_session_revoked", project, thread_id: threadId, reason });
+      }
+    } else if (connection.listener === false) {
       opConnections.delete(connection);
     } else if (connection.role === "root") {
       if (rootSession === connection) rootSession = null;
     } else if (connection.role === "observer") {
       if (observerSession === connection) observerSession = null;
+    } else if (connection.role === "supervisor") {
+      if (supervisorSession === connection) {
+        supervisorSession = null;
+        // No supervisor will answer them now.
+        for (const id of [...threadRequests.keys()]) {
+          settleThreadRequest(id, null, new OpError("supervisor_unavailable", "the Thread Supervisor disconnected"));
+        }
+      }
     } else if (connection.route && sessions.get(connection.route.project) === connection) {
       sessions.delete(connection.route.project);
     }
   }
 
+  function settleThreadRequest(id, result, error) {
+    const pending = threadRequests.get(id);
+    if (!pending) return false;
+    threadRequests.delete(id);
+    clearTimeout(pending.timer);
+    if (result) pending.resolve(result);
+    else pending.reject(error);
+    return true;
+  }
+
+  // A `create_thread` waits for the supervisor's `thread_request_done` until
+  // its deadline; with no supervisor it fails at once.
+  const threadRequestsContext = {
+    open(id, deadline, event) {
+      if (!supervisorSession) {
+        return Promise.reject(new OpError("supervisor_unavailable", "no Thread Supervisor is connected"));
+      }
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => settleThreadRequest(id, null,
+          new OpError("timeout", "the Thread Supervisor did not answer in time")), Math.max(0, deadline - Date.now()));
+        threadRequests.set(id, { resolve, reject, timer });
+        deliverSupervisor(event);
+      });
+    },
+    done(id, result, error) {
+      return settleThreadRequest(id, result, new OpError(error.code, error.message));
+    },
+  };
+
+  // Every connection of one thread, listener and op-only, goes with `reason`.
+  function revokeThread(threadId, reason) {
+    const connections = [...threadSessions.values(), ...threadOps].filter(connection => connection.route.thread_id === threadId);
+    for (const connection of connections) revoke(connection, reason);
+    return connections.length;
+  }
+
   // The session loses its place: it is told why, then disconnected.
   function revoke(connection, reason) {
-    forget(connection);
+    forget(connection, reason);
     log(`revoked project=${connection.route.project} reason=${reason}`);
     send(connection.socket, { type: "event", event: "revoked", reason });
     connection.socket.end();
   }
 
-  // A launch wrote a new key: any session still holding the old one goes.
+  // A launch wrote a new key, or a thread's key was removed: any session
+  // still holding the old one goes.
   async function revokeStaleKeys() {
-    for (const connection of [...sessions.values(), ...opConnections, ...(rootSession ? [rootSession] : []),
-      ...(observerSession ? [observerSession] : [])]) {
+    for (const connection of [...sessions.values(), ...opConnections, ...threadSessions.values(), ...threadOps,
+      ...(rootSession ? [rootSession] : []), ...(observerSession ? [observerSession] : []),
+      ...(supervisorSession ? [supervisorSession] : [])]) {
       if (!keysMatch(await connectionKey(connection), connection.key)) revoke(connection, "key_rotated");
     }
   }
@@ -163,6 +242,22 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       observerSession = connection;
       return send(connection.socket, { type: "hello_ok", v: PROTOCOL_VERSION, scope: { project: "observer" } });
     }
+    if (frame.role === "supervisor") {
+      if (!keysMatch(await readKey(SUPERVISOR_KEY_FILE), frame.key)) return reject("unauthorized", "unknown supervisor key");
+      // One supervisor: a newer hello replaces the old one.
+      if (supervisorSession) revoke(supervisorSession, "replaced");
+      Object.assign(connection, {
+        role: "supervisor", route: { project: "supervisor", channel_id: null }, key: frame.key,
+        connectedAt: new Date().toISOString(),
+      });
+      supervisorSession = connection;
+      const projects = [...getTable().projects.values()]
+        .map(({ project, channel_id, webhook_id }) => ({ project, channel_id, webhook_id }));
+      return send(connection.socket, {
+        type: "hello_ok", v: PROTOCOL_VERSION, scope: { project: "supervisor" }, bot_user_id: context.bot?.id ?? null, projects,
+      });
+    }
+    if (frame.role === "thread") return threadHello(connection, frame, reject);
     if (frame.role !== "project") return reject("unsupported_role", `unsupported role: ${frame.role}`);
     const route = getTable().projects.get(String(frame.project));
     if (!route || !keysMatch(await projectKey(route.project), frame.key)) {
@@ -179,6 +274,40 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     Object.assign(connection, { role: "project", route, key: frame.key, connectedAt: new Date().toISOString() });
     sessions.set(route.project, connection);
     send(connection.socket, { type: "hello_ok", v: PROTOCOL_VERSION, scope: projectScope(route) });
+  }
+
+  // A thread session: its own key, and a public thread under its registered,
+  // non-`remote:` project's channel. The thread is checked once, here.
+  async function threadHello(connection, frame, reject) {
+    const threadId = String(frame.thread_id ?? "");
+    const route = getTable().projects.get(String(frame.project));
+    if (!/^[\w-]+$/.test(threadId) || !route || !PROVIDERS.has(frame.provider) ||
+      !keysMatch(await threadKey(threadId), frame.key)) {
+      return reject("unauthorized", "unknown project, thread or key");
+    }
+    const channel = await context.discord?.client?.channels.fetch(threadId).catch(() => null);
+    if (route.remote || channel?.type !== PUBLIC_THREAD || String(channel.parentId) !== route.channel_id) {
+      return reject("not_a_project_thread", `${threadId} is not a public thread in ${route.project}'s channel`);
+    }
+    const threadRoute = {
+      project: route.project, type: frame.provider, channel_id: threadId, parent_channel_id: route.channel_id,
+      thread_id: threadId, webhook_id: route.webhook_id,
+    };
+    Object.assign(connection, { role: "thread", route: threadRoute, key: frame.key, connectedAt: new Date().toISOString() });
+    if (frame.listener === false) {
+      connection.listener = false;
+      threadOps.add(connection);
+    } else {
+      // One listener per thread: a newer hello replaces whoever held it.
+      const previous = threadSessions.get(threadId);
+      if (previous) revoke(previous, "replaced");
+      threadSessions.set(threadId, connection);
+      // In the same turn as the registration: every thread message classified
+      // before this frame went to the supervisor, every one after to the session.
+      deliverSupervisor({ event: "thread_session_live", project: route.project, thread_id: threadId, provider: frame.provider });
+    }
+    const { webhook_id: _webhook, ...scope } = threadRoute;
+    send(connection.socket, { type: "hello_ok", v: PROTOCOL_VERSION, scope });
   }
 
   async function request(connection, frame) {
@@ -198,7 +327,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     // Root acts in its own channels and any registered channel, one target per request.
     let session = connection;
     if (operation.scoped && connection.role === "root") {
-      const route = rootTarget(getTable(), String(args.channel_id));
+      const route = await rootTarget(getTable(), String(args.channel_id), context.discord?.client);
       if (!route) return violation(args.channel_id, "channel_id is neither a root channel nor a registered channel");
       session = { ...connection, route };
     } else if (operation.scoped && String(args.channel_id) !== connection.route.channel_id) {
@@ -207,6 +336,8 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     try {
       // Discord calls stop once the client's own timeout has passed.
       const result = await withDeadline(frame.deadline_at, () => operation.run({ ...context, session, sessions: listSessions,
+        supervisor: () => supervisorSession && { connectedAt: supervisorSession.connectedAt },
+        threadRequests: threadRequestsContext, revokeThread,
         violations: () => [...violations], table: getTable(), gateway, registry }, args));
       respond({ ok: true, result });
     } catch (error) {
@@ -219,7 +350,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
 
   function listSessions() {
     return [...(rootSession ? [rootSession] : []), ...(observerSession ? [observerSession] : []),
-      ...sessions.values()].map(connection => ({
+      ...sessions.values(), ...threadSessions.values()].map(connection => ({
       role: connection.role, route: connection.route, connectedAt: connection.connectedAt,
     }));
   }
@@ -280,6 +411,15 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       send(connection.socket, { type: "event", ...event });
       return true;
     },
+    // Delivers to the thread's live session; false when none is connected.
+    deliverThread(threadId, event) {
+      const connection = threadSessions.get(threadId);
+      if (!connection) return false;
+      send(connection.socket, { type: "event", ...event });
+      return true;
+    },
+    // Delivers to the Thread Supervisor; false when it is not connected.
+    deliverSupervisor,
     // Delivers to root's live session; false when root is not connected.
     deliverRoot(event) {
       if (!rootSession) return false;
@@ -297,9 +437,18 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     // channel (or changed type) is pushed to each of the project's
     // connections, listener and op-only alike, as a `scope_changed` event, so
     // the adapter retargets its inbound filter and tool defaults. Root's own
-    // connections are not projects and keep their place.
+    // connections are not projects and keep their place. A thread connection
+    // never changes scope: a moved parent channel, or a parent now on another
+    // machine (`remote:`, which has no threads), revokes it, and a changed
+    // webhook only updates its route.
     refreshRoutes() {
       const { projects } = getTable();
+      for (const connection of [...threadSessions.values(), ...threadOps]) {
+        const route = projects.get(connection.route.project);
+        if (!route) revoke(connection, "deregistered");
+        else if (route.channel_id !== connection.route.parent_channel_id || route.remote) revoke(connection, "project_moved");
+        else connection.route = { ...connection.route, webhook_id: route.webhook_id };
+      }
       for (const connection of [...sessions.values(), ...opConnections]) {
         if (connection.role !== "project") continue;
         const route = projects.get(connection.route.project);
@@ -318,9 +467,12 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     },
     close() {
       keysWatcher?.close();
-      for (const connection of [...sessions.values(), ...opConnections]) connection.socket.destroy();
+      for (const connection of [...sessions.values(), ...opConnections, ...threadSessions.values(), ...threadOps]) {
+        connection.socket.destroy();
+      }
       rootSession?.socket.destroy();
       observerSession?.socket.destroy();
+      supervisorSession?.socket.destroy();
       server.close();
     },
   };

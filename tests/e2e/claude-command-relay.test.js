@@ -115,3 +115,24 @@ test("send-claude-command validates the command and running session", async () =
   assert.equal(stopped.exitCode, 1);
   assert.match(stopped.stderr, /is not running/);
 });
+
+test("send-claude-command exits 2 with the conversation resolver's reason for a target it cannot name", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, buildRegistry(workspace));
+  seedTmuxSession("alpha_session", { paneOutput: "Listening\n" }, { stateDir: workspace.stateDir });
+
+  for (const args of [["no-such-thread", "/compact"], ["--channel", "1799999999999999999", "/clear"]]) {
+    const result = await runScript(workspace, "scripts/send-claude-command.sh", {
+      args,
+      env: { CCDM_ROUTER_NODE: process.execPath },
+    });
+    assert.equal(result.exitCode, 2, `${args.join(" ")}: ${result.stdout}`);
+    assert.match(result.stderr, /^conversation-resolver: '.+' is no registered channel, bound thread or thread name/);
+  }
+  const unknownProject = await runScript(workspace, "scripts/send-claude-command.sh", {
+    args: ["--project", "nowhere", "/compact"],
+  });
+  assert.equal(unknownProject.exitCode, 2);
+  assert.match(unknownProject.stderr, /Unknown project: nowhere/);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session.sendKeys, undefined);
+});

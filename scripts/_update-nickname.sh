@@ -13,6 +13,12 @@ write_router_context() {
   project="$(basename "$key_file" .key)"
   router_state="$(dirname "$(dirname "$key_file")")"
   launch_dir="$router_state/launches/$project"
+  # A thread session's key is `.thread-<thread_id>.key`; its launch directory
+  # is launches/<project>/threads/<thread_id>.
+  if [[ "$project" == .thread-* ]]; then
+    local thread_dirs=("$router_state"/launches/*/threads/"${project#.thread-}")
+    launch_dir="${thread_dirs[0]}"
+  fi
   pct=$(echo "$input" | jq -r '.context_window.used_percentage // empty' 2>/dev/null)
   [[ "$pct" =~ ^[0-9]+(\.[0-9]+)?$ ]] && [ -d "$launch_dir" ] || return 0
   tmp="$launch_dir/.context.json.$$.tmp"

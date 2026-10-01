@@ -28,10 +28,17 @@ function updateState(updater) {
   });
 }
 
-function fixtureChannel(id) {
+function fixtureChannel(id, overrides = {}) {
+  const discord = readState().fixtures?.discord ?? {};
+  const raw = { ...(discord.channels ?? []).find(channel => channel.id === id),
+    ...discord.threads?.[id], ...overrides };
   return {
+    type: raw.type ?? 0,
+    parentId: raw.parentId ?? raw.parent_id ?? null,
+    isThread() { return [10, 11, 12].includes(this.type); },
+    ...([10, 11, 12].includes(raw.type) ? fixtureThread({ ...raw, id }) : {}),
     id,
-    name: `channel-${id}`,
+    name: raw.name ?? `channel-${id}`,
     permissionsFor(member) {
       const discord = readState().fixtures?.discord || {};
       if (discord.guildUnavailable) {
@@ -101,12 +108,16 @@ function fixtureMessage(client, raw) {
       id: raw.author?.id ?? "allowed-user-id",
       username: raw.author?.username ?? "Allowed User",
     },
-    channel: { id: raw.channelId },
+    channel: fixtureChannel(raw.channelId, {
+      ...(raw.channelType !== undefined ? { type: raw.channelType } : {}),
+      ...(raw.parentId ? { parentId: raw.parentId } : {}),
+    }),
     channelId: raw.channelId,
     client,
     content: raw.content ?? "",
     createdTimestamp: raw.createdTimestamp ?? Date.now(),
     id: raw.id,
+    type: raw.type ?? 0,
     reference: raw.replyTo ? { channelId: raw.channelId, messageId: raw.replyTo } : null,
     mentions: { repliedUser: repliedUser(client, raw) },
     webhookId: raw.webhookId ?? null,
@@ -143,7 +154,7 @@ function fixtureReaction(client, raw) {
       id: raw.message?.author?.id ?? client.user.id,
       username: raw.message?.author?.username ?? "Fixture Bot",
     },
-    channel: { id: raw.channelId, name: `channel-${raw.channelId}` },
+    channel: fixtureChannel(raw.channelId),
     channelId: raw.channelId,
     content: raw.message?.content ?? "",
     id: raw.messageId,
@@ -177,6 +188,24 @@ function fixtureReaction(client, raw) {
     },
   };
   return { reaction, user };
+}
+
+// A Gateway thread channel: type 11 is a public thread and 12 a private one.
+// `parent` stands in for discord.js's cached parent channel, whose type is 0
+// for a text channel and 15 for a forum.
+function fixtureThread(raw) {
+  return {
+    archived: raw.archived ?? false,
+    archiveTimestamp: raw.archiveTimestamp ? Date.parse(raw.archiveTimestamp) : null,
+    autoArchiveDuration: raw.autoArchiveDuration ?? 1440,
+    id: raw.id,
+    name: raw.name ?? `thread-${raw.id}`,
+    ownerId: raw.ownerId ?? null,
+    parent: raw.parentId ? { id: raw.parentId, type: raw.parentType ?? 0 } : null,
+    parentId: raw.parentId ?? null,
+    type: raw.type ?? 11,
+    isThread() { return [10, 11, 12].includes(this.type); },
+  };
 }
 
 class Client extends EventEmitter {
@@ -248,7 +277,17 @@ class Client extends EventEmitter {
       let delivered = null;
       let deliveredReaction = null;
       let deliveredGateway = null;
+      let deliveredThread = null;
       updateState((state) => {
+        const thread = (state.fixtures.discord.injectedThreads ?? []).find(entry => !entry.delivered);
+        if (thread) {
+          thread.delivered = true;
+          (state.fixtures.discord.deliveredThreads ||= []).push({ id: thread.id, event: thread.event ?? "create" });
+          deliveredThread = { ...thread };
+          if (thread.event === "delete") delete (state.fixtures.discord.threads ||= {})[thread.id];
+          else (state.fixtures.discord.threads ||= {})[thread.id] = { ...thread };
+          return;
+        }
         const messages = state.fixtures?.discord?.injectedMessages ?? [];
         const next = messages.find((message) => !message.delivered);
         if (next) {
@@ -273,7 +312,13 @@ class Client extends EventEmitter {
         state.fixtures.discord.deliveredReactions.push({ id: nextReaction.id });
         deliveredReaction = { ...nextReaction };
       });
-      if (delivered) {
+      if (deliveredThread?.event === "update") {
+        this.emit("threadUpdate", fixtureThread(deliveredThread.previous), fixtureThread(deliveredThread));
+      } else if (deliveredThread?.event === "delete") {
+        this.emit("threadDelete", fixtureThread(deliveredThread));
+      } else if (deliveredThread) {
+        this.emit("threadCreate", fixtureThread(deliveredThread), deliveredThread.newlyCreated ?? true);
+      } else if (delivered) {
         this.emit("messageCreate", fixtureMessage(this, delivered));
       } else if (deliveredReaction) {
         const { reaction, user } = fixtureReaction(this, deliveredReaction);

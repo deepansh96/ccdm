@@ -62,7 +62,10 @@ const { createEmergencyGateway } = require("./router/emergency.js");
 // gateway until the Router is back (router/emergency.js), which also carries
 // its sends, typing, and reactions; its notice goes to `primaryChannelId`, and
 // its engagement is recorded in the launch directory for the scoped MCP server.
-function createRouterTransport({ project, role = "project", keyFile, launchDir, registryPath, primaryChannelId }) {
+// In the `thread` role (with `threadId`) it serves one Codex Thread
+// Conversation, whose Session Scope the Router never moves.
+function createRouterTransport({ project, role = "project", keyFile, launchDir, registryPath, primaryChannelId,
+  threadId = null }) {
   let router = null;
   // Router operations, or root's direct ones while its fallback is engaged.
   let request = null;
@@ -137,6 +140,9 @@ function createRouterTransport({ project, role = "project", keyFile, launchDir, 
         router = new RouterClient({ key, role: "root", beforeHello: () => fallback.release() });
         fallback.watch(router);
         request = fallback.request(router);
+      } else if (role === "thread") {
+        router = new RouterClient({ project, key, role: "thread", threadId, provider: "codex" });
+        request = (op, args) => router.request(op, args);
       } else {
         router = new RouterClient({ project, key, role: "project" });
         request = (op, args) => router.request(op, args);
@@ -146,7 +152,7 @@ function createRouterTransport({ project, role = "project", keyFile, launchDir, 
       router.on("reaction", (event) => reactionHandler?.(toReaction(event)));
       // The client validates the change (this project, a channel) before it
       // fires; root has no project scope to move.
-      if (!root) {
+      if (!root && role !== "thread") {
         router.on("scope_changed", (next) => {
           scope = next;
           scopeHandler?.(next);

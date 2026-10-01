@@ -20,7 +20,9 @@ process.env.CCDM_REMINDER_CONTEXT_FILE = REMINDER_CONTEXT_FILE;
 process.env.CCDM_REMINDER_RECEIPTS_DIR = REMINDER_RECEIPTS_DIR;
 const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { createRouterTransport } = require("./codex-bridge-transport.js");
+const { markTurn } = require("./thread-activity.js");
 const routerPaths = require("./router/paths.js");
+const { withRegistryLock } = require("./router/registry.js");
 const { MAX_TIMEOUT_MS: ROUTER_MAX_TIMEOUT_MS } = require("./router/deadlines.js");
 
 // The launch channel: root's primary channel, and the name of a project's
@@ -73,7 +75,19 @@ const ROUTER_KEY_FILE = process.env.CCDM_ROUTER_KEY_FILE || "";
 const ROUTER_ROOT = process.env.CCDM_ROUTER_ROLE === "root";
 const ROOT_MULTI_CHANNEL = ROUTER_ROOT;
 const ROUTER_PROJECT = ROUTER_ROOT ? "" : process.env.CCDM_CODEX_PROJECT || "";
-const ROUTER_LAUNCH_DIR = path.join(routerPaths.stateDir(), "launches", ROUTER_ROOT ? ".root" : ROUTER_PROJECT);
+// Thread mode (start-thread-session.sh): the bridge serves one Thread
+// Conversation, CHANNEL_ID is that Discord thread, and it says hello as the
+// `thread` role. Its first turn is the Thread Supervisor's bootstrap
+// (CCDM_THREAD_BOOTSTRAP_FILE), in place of the READY instruction turn; live
+// events wait until the bootstrap exists (CCDM_THREAD_BOOT_TIMEOUT_S, 120 s by
+// default), and messages it already includes are dropped. Its turns are kept
+// in CCDM_THREAD_ACTIVITY_FILE from `turn/started` until the bridge is idle
+// again after `turn/completed`.
+const DISCORD_THREAD_ID = ROUTER_ROOT ? "" : process.env.CCDM_THREAD_ID || "";
+const THREAD_MODE = Boolean(DISCORD_THREAD_ID);
+const THREAD_ACTIVITY_FILE = THREAD_MODE ? process.env.CCDM_THREAD_ACTIVITY_FILE || "" : "";
+const ROUTER_LAUNCH_DIR = path.join(routerPaths.stateDir(), "launches", ROUTER_ROOT ? ".root" : ROUTER_PROJECT,
+  ...(THREAD_MODE ? ["threads", DISCORD_THREAD_ID] : []));
 // The launcher waits on this file for the bridge's startup outcome.
 const LAUNCH_READY_FILE = process.env.CCDM_CHANNEL_READY_FILE || "";
 
@@ -99,8 +113,9 @@ let pendingCompactionChannelId = null;
 let messageQueue = [];
 let bridgePaused = false;
 const discordTransport = createRouterTransport({
-  project: ROUTER_PROJECT, role: ROUTER_ROOT ? "root" : "project", keyFile: ROUTER_KEY_FILE,
+  project: ROUTER_PROJECT, role: ROUTER_ROOT ? "root" : THREAD_MODE ? "thread" : "project", keyFile: ROUTER_KEY_FILE,
   launchDir: ROUTER_LAUNCH_DIR, registryPath: REGISTRY_PATH, primaryChannelId: CHANNEL_ID,
+  threadId: DISCORD_THREAD_ID || null,
 });
 let codexProcess = null;
 let typingInterval = null;
@@ -128,6 +143,9 @@ const STREAM_FAILURE_MESSAGE =
 const STREAM_RECOVERY_PROMPT =
   "Retry the previous user request. The prior model response failed before any work began.";
 const DISCORD_MCP_NAME = ROOT_MULTI_CHANNEL ? "discord-root" : `discord-${CHANNEL_ID}`;
+// Every bridge on a Codex Home shares its config.toml.
+const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+const CODEX_CONFIG_FILE = path.join(CODEX_HOME, "config.toml");
 const THREAD_INSTRUCTION = ROOT_MULTI_CHANNEL
   ? `This root thread is connected to Discord through the ${DISCORD_MCP_NAME} MCP server. Incoming messages include Discord routing metadata. Do not call Discord MCP tools unless the current task includes an explicit Discord reply scope token. Subagents and delegated tasks must return results to their parent agent, not to Discord.`
   : `This thread is connected to Discord through the ${DISCORD_MCP_NAME} MCP server. Do not call Discord MCP tools unless the current task includes an explicit Discord reply scope token. Subagents and delegated tasks must return results to their parent agent, not to Discord.`;
@@ -195,14 +213,32 @@ function scheduleRootRestart() {
   return logPath;
 }
 
-function sendRequest(method, params) {
+// With `timeoutMs`, a request the app-server never answers rejects instead
+// of waiting forever (its late answer, if any, is then dropped).
+function sendRequest(method, params, { timeoutMs } = {}) {
   return new Promise((resolve, reject) => {
     const id = nextId();
     const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params });
-    pendingRequests.set(id, { resolve, reject });
+    let timer = null;
+    if (timeoutMs) {
+      timer = setTimeout(() => {
+        pendingRequests.delete(id);
+        reject(new Error(`${method} timed out after ${timeoutMs} ms`));
+      }, timeoutMs);
+      timer.unref?.();
+    }
+    pendingRequests.set(id, {
+      resolve: (value) => { clearTimeout(timer); resolve(value); },
+      reject: (error) => { clearTimeout(timer); reject(error); },
+    });
     ws.send(msg);
   });
 }
+
+// Every app-server request made while holding the Codex Home config lock is
+// bounded, so a hung app-server cannot hold that lock for its siblings forever.
+const CONFIG_REQUEST_TIMEOUT_MS = Number(process.env.CCDM_CODEX_CONFIG_REQUEST_TIMEOUT_MS) || 30000;
+const configRequest = (method, params) => sendRequest(method, params, { timeoutMs: CONFIG_REQUEST_TIMEOUT_MS });
 
 function notificationThreadId(msg) {
   return msg.params?.threadId || msg.params?.thread?.id || null;
@@ -322,6 +358,13 @@ function isCloseCommand(content) {
     if (appId && new RegExp(`^<@!?${escapeRegExp(appId)}>\\s+/close$`).test(trimmed)) return true;
   }
   return false;
+}
+
+// A thread bridge's conversation is its thread, under its parent project
+// whatever that project's provider; it serves no other channel.
+async function reminderAssignmentFor(channelId, options) {
+  if (!THREAD_MODE) return reminderAdapter.resolveAssignmentForChannel(channelId, options);
+  return channelId === DISCORD_THREAD_ID ? reminderAdapter.resolveThreadAssignment(ROUTER_PROJECT, DISCORD_THREAD_ID) : null;
 }
 
 function reminderEventContext(assignment) {
@@ -497,7 +540,7 @@ function recordSessionTermination() {
     const endingThreadId = threadId;
     const endingTurnId = activeTurnId;
     sessionTerminationPromise = (async () => {
-      const assignment = await reminderAdapter.resolveAssignmentForChannel(projectChannelId, {
+      const assignment = await reminderAssignmentFor(projectChannelId, {
         requireCodex: true,
         ...(BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
       }).catch(() => null);
@@ -566,6 +609,12 @@ function startCodexServer() {
     void exitAfterRuntimeLoss(`Codex app-server exited with code ${code}`);
   });
 }
+
+// Every exit (a failed hello, a lost Router, a fatal error) takes the
+// app-server with it, so none is left holding the port.
+process.on("exit", () => {
+  if (codexProcess && codexProcess.exitCode === null && codexProcess.signalCode === null) codexProcess.kill();
+});
 
 async function connectWebSocket() {
   const url = `ws://127.0.0.1:${WS_PORT}`;
@@ -677,7 +726,7 @@ function handleNotification(msg) {
       break;
 
     case "turn/started":
-      isCurrentTurnNotification(msg);
+      if (isCurrentTurnNotification(msg)) markTurn(THREAD_ACTIVITY_FILE, true);
       break;
 
     case "item/started":
@@ -827,7 +876,9 @@ async function onTurnCompleted(turn = {}) {
   activeOutputChannelId = null;
   await clearDiscordChannelScope();
   turnActive = false;
-  // From here a new Discord message starts a turn instead of steering this one.
+  // From here a new Discord message starts a turn instead of steering this
+  // one, so only now is the thread session idle.
+  markTurn(THREAD_ACTIVITY_FILE, false);
   console.log(`[turn] Finished (${turn.status ?? "no status"}); bridge idle`);
   if (outputSuppressed && bootstrapCompletion) {
     const complete = bootstrapCompletion;
@@ -1328,31 +1379,74 @@ async function listMcpServers() {
   const servers = [];
   let cursor;
   do {
-    const page = await sendRequest("mcpServerStatus/list", { detail: "full", ...(cursor ? { cursor } : {}) });
+    const page = await configRequest("mcpServerStatus/list", { detail: "full", ...(cursor ? { cursor } : {}) });
     servers.push(...(page?.data || page?.servers || page?.items || []));
     cursor = page?.nextCursor;
   } while (cursor);
   return servers;
 }
 
+// The discord-* servers the Codex Home config names, which this app-server
+// may not have loaded yet.
+async function configuredDiscordMcpNames() {
+  const config = await readFile(CODEX_CONFIG_FILE, "utf8").catch(() => "");
+  return [...config.matchAll(/^\[mcp_servers\.(discord-[^.\]\s]+)\]/gm)].map((match) => match[1]);
+}
+
+const isForeignDiscordMcp = (name) => Boolean(name) && name.startsWith("discord-") && name !== DISCORD_MCP_NAME;
+
 async function registerDiscordMcp() {
   const mcpName = DISCORD_MCP_NAME;
 
-  // Remove any other discord MCP servers to prevent cross-session replies
-  try {
-    const servers = await listMcpServers();
-    for (const s of servers) {
-      const name = s.name || s.id;
-      if (name && name.startsWith("discord-") && name !== mcpName) {
-        await sendRequest("config/value/delete", { keyPath: `mcp_servers.${name}` });
+  // Many bridges share a Codex Home, so the delete-write-reload sequence runs
+  // under a lock on its config (the registry lock protocol, which
+  // start-codex-session.sh's stripping also takes): an app-server reloading
+  // between a sibling's write and the sibling's own reload would load the
+  // sibling's server and act with its key.
+  await mkdir(CODEX_HOME, { recursive: true });
+  await withRegistryLock(CODEX_CONFIG_FILE, async () => {
+    // Remove any other discord MCP servers to prevent cross-session replies
+    try {
+      const loaded = (await listMcpServers()).map((s) => s.name || s.id);
+      const stale = new Set([...loaded, ...await configuredDiscordMcpNames()].filter(isForeignDiscordMcp));
+      for (const name of stale) {
+        await configRequest("config/value/delete", { keyPath: `mcp_servers.${name}` });
         console.log(`Removed stale MCP server: ${name}`);
       }
+    } catch (err) {
+      console.log(`Warning: could not clean stale MCP servers: ${err.message || err}`);
     }
-  } catch (err) {
-    console.log(`Warning: could not clean stale MCP servers: ${err.message || err}`);
-  }
 
-  await sendRequest("config/value/write", {
+    await writeDiscordMcpConfig(mcpName);
+    await configRequest("config/mcpServer/reload", null);
+    console.log("MCP servers reloaded");
+  });
+
+  const deadline = Date.now() + Number(process.env.CODEX_MCP_READY_TIMEOUT_MS || 30000);
+  do {
+    const servers = await listMcpServers();
+    // A foreign server still loaded would let this thread act in another
+    // session's scope: refuse to start.
+    const foreign = servers.map((s) => s.name || s.id).filter(isForeignDiscordMcp);
+    if (foreign.length > 0) {
+      throw new Error(`Discord MCP ${mcpName} refused: foreign MCP server ${foreign.join(", ")} still loaded after reload`);
+    }
+    const found = servers.find((s) => (s.name || s.id) === mcpName);
+    const tools = found?.tools;
+    const hasReply = Array.isArray(tools)
+      ? tools.some((tool) => tool.name === "reply")
+      : tools && Object.values(tools).some((tool) => tool.name === "reply");
+    if (hasReply) {
+      console.log(`MCP server ready: ${mcpName} (reply tool available)`);
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  } while (Date.now() < deadline);
+  throw new Error(`Discord MCP ${mcpName} did not expose the reply tool before startup deadline`);
+}
+
+async function writeDiscordMcpConfig(mcpName) {
+  await configRequest("config/value/write", {
     keyPath: `mcp_servers.${mcpName}`,
     mergeStrategy: "replace",
     value: {
@@ -1367,6 +1461,7 @@ async function registerDiscordMcp() {
         CCDM_ROUTER_KEY_FILE: ROUTER_KEY_FILE,
         CCDM_ROUTER_STATE_DIR: routerPaths.stateDir(),
         ...(ROUTER_ROOT ? { CCDM_ROUTER_ROLE: "root" } : { CCDM_CODEX_PROJECT: ROUTER_PROJECT }),
+        ...(THREAD_MODE ? { CCDM_THREAD_ID: DISCORD_THREAD_ID, CCDM_THREAD_PROVIDER: "codex" } : {}),
         CHANNEL_ID,
         DISCORD_REPLY_TOKEN,
         CCDM_REMINDER_PROJECT_ROOT: ROOT_DIR,
@@ -1383,25 +1478,6 @@ async function registerDiscordMcp() {
     },
   });
   console.log(`MCP server config written: ${mcpName}`);
-
-  await sendRequest("config/mcpServer/reload", null);
-  console.log("MCP servers reloaded");
-
-  const deadline = Date.now() + Number(process.env.CODEX_MCP_READY_TIMEOUT_MS || 30000);
-  do {
-    const servers = await listMcpServers();
-    const found = servers.find((s) => (s.name || s.id) === mcpName);
-    const tools = found?.tools;
-    const hasReply = Array.isArray(tools)
-      ? tools.some((tool) => tool.name === "reply")
-      : tools && Object.values(tools).some((tool) => tool.name === "reply");
-    if (hasReply) {
-      console.log(`MCP server ready: ${mcpName} (reply tool available)`);
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  } while (Date.now() < deadline);
-  throw new Error(`Discord MCP ${mcpName} did not expose the reply tool before startup deadline`);
 }
 
 async function startCodexThread(resumeThreadId = "") {
@@ -1435,13 +1511,75 @@ async function initializeCodex() {
 
   const resumeThreadId = process.env.CODEX_RESUME_THREAD_ID || "";
   await startCodexThread(resumeThreadId);
-  await sendBootstrapInstructionTurn("startup", { required: true });
+  // A thread's first turn is its bootstrap, sent once the Router has its hello.
+  if (!THREAD_MODE) await sendBootstrapInstructionTurn("startup", { required: true });
   console.log(`Codex thread started: ${threadId}`);
+}
+
+// The supervisor writes the bootstrap once the Router has this bridge's hello.
+async function awaitThreadBootstrap() {
+  const file = process.env.CCDM_THREAD_BOOTSTRAP_FILE;
+  const timeoutS = Number(process.env.CCDM_THREAD_BOOT_TIMEOUT_S);
+  const deadline = Date.now() + (Number.isFinite(timeoutS) && timeoutS > 0 ? timeoutS : 120) * 1000;
+  while (file && Date.now() < deadline) {
+    try {
+      return JSON.parse(await readFile(file, "utf8"));
+    } catch { /* Not written yet. */ }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  console.error("No thread bootstrap arrived; handling live events without it");
+  return null;
+}
+
+// The bootstrap as the first turn's text: the transport instruction, the
+// preamble, the starter, and every message sent while the session booted, in
+// Discord order.
+function threadBootstrapText(bootstrap) {
+  const messages = Array.isArray(bootstrap.messages) ? bootstrap.messages : [];
+  const parts = [SYSTEM_INSTRUCTION, String(bootstrap.preamble || "")];
+  if (bootstrap.starter) parts.push(`The thread was started from this message:\n${bootstrap.starter}`);
+  if (messages.length) {
+    parts.push(["Messages sent in the thread so far:", ...messages.map((message) => {
+      const attachments = message.attachments?.length
+        ? ` [${message.attachments.length} attachment(s): ${message.attachments.map((att) => att.name).join(", ")}; download_attachment with message_id ${message.message_id}]`
+        : "";
+      return `[${message.ts}] ${message.author?.name ?? message.author?.id}: ${message.content}${attachments}`;
+    })].join("\n"));
+  }
+  return parts.filter(Boolean).join("\n\n");
+}
+
+// Live events held until the bootstrap is sent, as [kind, handler, event].
+let heldThreadEvents = THREAD_MODE ? [] : null;
+const holdUntilBootstrap = (kind, handler) => async (event) => {
+  if (heldThreadEvents) heldThreadEvents.push([kind, handler, event]);
+  else await handler(event);
+};
+
+async function startThreadConversation() {
+  const bootstrap = await awaitThreadBootstrap();
+  if (bootstrap) {
+    // The bootstrap turn answers the owner's latest message in it.
+    const assignment = await reminderAssignmentFor(DISCORD_THREAD_ID).catch(() => null);
+    const asked = (Array.isArray(bootstrap.messages) ? bootstrap.messages : [])
+      .findLast((message) => assignment && message.author?.id === assignment.owner_id);
+    const source = asked
+      ? { id: asked.message_id, author: { id: asked.author.id }, reminderAssignment: assignment, synthetic: true }
+      : null;
+    if (source) lastOwnerInteraction = { id: source.id, assignment_generation: assignment.assignment_generation };
+    await sendTurn([{ type: "text", text: threadBootstrapText(bootstrap) }], projectChannelId, null, 0, source);
+  } else {
+    await sendBootstrapInstructionTurn("thread");
+  }
+  const included = new Set(bootstrap?.included_message_ids ?? []);
+  const pending = heldThreadEvents.filter(([kind, , event]) => !(kind === "message" && included.has(event.id)));
+  heldThreadEvents = null;
+  for (const [, handler, event] of pending) await handler(event);
 }
 
 function startDiscordBot() {
   discordTransport.onScopeChange(applyProjectScope);
-  discordTransport.onReaction(async (event) => {
+  discordTransport.onReaction(holdUntilBootstrap("reaction", async (event) => {
     if (!(await shouldHandleDiscordReaction(event.channelId, event.user))) return;
     let reaction;
     try {
@@ -1453,7 +1591,7 @@ function startDiscordBot() {
     const { user } = reaction;
     if (user.bot) return;
     const reactionChannelId = reaction.message.channel.id;
-    const assignment = await reminderAdapter.resolveAssignmentForChannel(reactionChannelId, {
+    const assignment = await reminderAssignmentFor(reactionChannelId, {
       requireCodex: true,
       ...(!ROOT_MULTI_CHANNEL && BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
     }).catch(() => null);
@@ -1482,13 +1620,13 @@ function startDiscordBot() {
       ? { id: lastOwnerInteraction.id, author: user, reminderAssignment: assignment, synthetic: true }
       : null;
     await routeInput(input, reactionSource, channelId, channelScopeToken);
-  });
+  }));
 
-  discordTransport.onMessage(async (msg) => {
+  discordTransport.onMessage(holdUntilBootstrap("message", async (msg) => {
     if (!msg.author.bot && isCloseCommand(msg.content)) {
       // Root management routing reserves /close in every registered project
       // channel, whichever provider serves it; a project bridge only its own.
-      const assignment = await reminderAdapter.resolveAssignmentForChannel(msg.channel.id, {
+      const assignment = await reminderAssignmentFor(msg.channel.id, {
         requireCodex: !ROOT_MULTI_CHANNEL,
         ...(!ROOT_MULTI_CHANNEL && BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
       }).catch(() => null);
@@ -1509,7 +1647,7 @@ function startDiscordBot() {
     const text = stripThisBotMention(msg.content.trim());
     const bridgeSlashCommand = !ROOT_MULTI_CHANNEL || channelId === CHANNEL_ID;
     if (bridgeSlashCommand && ["/pause", "/unpause", "/compact", "/clear", "/restart"].includes(text)) {
-      const assignment = await reminderAdapter.resolveAssignmentForChannel(channelId, {
+      const assignment = await reminderAssignmentFor(channelId, {
         requireCodex: true,
         ...(!ROOT_MULTI_CHANNEL && BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
       }).catch(() => null);
@@ -1585,7 +1723,14 @@ function startDiscordBot() {
         stopTyping();
         await clearDiscordChannelScope();
 
-        await registerDiscordMcp();
+        try {
+          await registerDiscordMcp();
+        } catch (err) {
+          // As at startup, a session whose Discord MCP cannot be registered
+          // (or might still load a foreign one) must not go on.
+          err.fatal = true;
+          throw err;
+        }
         await startCodexThread();
         await sendBootstrapInstructionTurn("clear");
 
@@ -1600,6 +1745,12 @@ function startDiscordBot() {
         resetActiveTurnId();
         fallbackText = "";
         await clearDiscordChannelScope();
+        if (err.fatal) {
+          await sendToDiscord(`**Error:** Failed to clear — ${err.message || err}. The session is stopping; restart it.`, channelId)
+            .catch(() => {});
+          await exitAfterRuntimeLoss(`Discord MCP re-registration after /clear failed: ${err.message || err}`);
+          return;
+        }
         await sendToDiscord(`**Error:** Failed to clear — ${err.message || err}`, channelId);
         activeOutputChannelId = null;
         processQueue();
@@ -1632,7 +1783,7 @@ function startDiscordBot() {
     const { input, channelScopeToken } = await buildInput(msg, text);
     if (input.length === 0) return;
 
-    const assignment = await reminderAdapter.resolveAssignmentForChannel(channelId, {
+    const assignment = await reminderAssignmentFor(channelId, {
       requireCodex: true,
       ...(!ROOT_MULTI_CHANNEL && BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
     }).catch(() => null);
@@ -1655,7 +1806,7 @@ function startDiscordBot() {
     console.log(`[discord] ${msg.author.username}: ${text || "(attachment)"} [${input.length} part(s)]`);
 
     await routeInput(input, msg, channelId, channelScopeToken);
-  });
+  }));
 
   void (async () => {
     try {
@@ -1666,7 +1817,9 @@ function startDiscordBot() {
       const channel = await discordTransport.fetchChannel(projectChannelId);
       if (!channel) throw new Error("Discord channel unavailable");
       console.log(`Listening in #${channel.name}`);
-      reportLaunchReady({ ok: true, scope: { channel_id: channel.id } });
+      reportLaunchReady({ ok: true, scope: { channel_id: channel.id },
+        ...(THREAD_MODE ? { provider_conversation_id: threadId } : {}) });
+      if (THREAD_MODE) startThreadConversation().catch((err) => console.error("Thread bootstrap failed:", err));
       if (ROOT_MULTI_CHANNEL) {
         console.log(`Root routing active for ${rootChannelAccess.size} configured channel(s)`);
       }

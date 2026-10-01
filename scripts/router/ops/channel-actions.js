@@ -7,6 +7,7 @@ const { MESSAGE_LIMIT } = require("../chunks.js");
 const { currentDeadline, discordRequest, withDeadline } = require("../discord-rest.js");
 const { projectWebhookSecret } = require("../webhooks.js");
 const { OpError, ScopeViolation } = require("./errors.js");
+const { threadQuery } = require("./reply.js");
 const { scopedMessage } = require("./targets.js");
 
 // webhook message -> { latest, sending, next }. While an edit to a message is
@@ -83,7 +84,7 @@ async function editMessage(ctx, args) {
   }
   return coalescedEdit(`${secret.webhook_id}/${message.id}`, arrival, args.text, async text => {
     const edited = await discordRequest("PATCH", `/webhooks/${secret.webhook_id}/${secret.token}/messages/${message.id}`, {
-      body: { content: text, allowed_mentions: { parse: [] } },
+      query: threadQuery(route), body: { content: text, allowed_mentions: { parse: [] } },
     });
     return { message_id: edited.id };
   });
@@ -120,8 +121,8 @@ async function typing(ctx) {
 
 module.exports = {
   ops: {
-    edit_message: { roles: ["project", "root"], scoped: true, run: editMessage },
-    react: { roles: ["project", "root"], scoped: true, run: react },
-    typing: { roles: ["project", "root"], scoped: true, run: typing },
+    edit_message: { roles: ["project", "root", "thread"], scoped: true, run: editMessage },
+    react: { roles: ["project", "root", "thread"], scoped: true, run: react },
+    typing: { roles: ["project", "root", "thread"], scoped: true, run: typing },
   },
 };

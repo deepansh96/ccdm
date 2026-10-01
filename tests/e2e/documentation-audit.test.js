@@ -139,6 +139,8 @@ const oneBotDocs = [
   ".mex/context/discord-security.md",
   ".mex/context/session-management.md",
   ".mex/patterns/register-project.md",
+  ".mex/patterns/operate-thread-supervisor.md",
+  "docs/thread-supervisor.md",
 ];
 
 test("operator and agent docs never instruct pool bot management or registry bot tokens", () => {
@@ -215,5 +217,55 @@ test("agent anchor and .mex describe Session Scope enforcement by the Router", (
   const router = fs.readFileSync(".mex/ROUTER.md", "utf8");
   for (const phrase of ["router status", "install-router-service.sh", "migrate-to-router.sh", "retire-pool.sh"]) {
     assert.match(router, new RegExp(escape(phrase)));
+  }
+});
+
+// The thread docs, each with the phrases that pin the shipped behaviour (ADR 0005).
+const ROOT_THREAD_PERMISSIONS = ["Create Public Threads", "Send Messages in Threads", "Manage Threads", "View Audit Log"];
+const threadDocs = {
+  "docs/thread-supervisor.md": [
+    "Thread Conversation", "Thread Supervisor", "Channel Conversation", "Session Scope", "Closed Conversation",
+    "no Discord credential", "com.ccdm.thread-supervisor", "scripts/install-thread-supervisor.sh",
+    "scripts/thread-supervisor.py run", "preflight", "scripts/start-thread-session.sh", "keys/.thread-<thread_id>.key",
+    "/thread <name>", "create_thread", "scripts/threads.sh create", "10080", "/config", "/close", "/restart",
+    "/clear", "/compact", "✅", "👀", "💤", "<project>-<provider> · N%", "archive-actor-unknown", "auto-archive",
+    "--resume", "thread_session_caps", "claude_accounts", "Claude 6", "Codex 8",
+    "Paused to free a session slot; send a message here to resume.", "Queued, N sessions busy.", "reconcile",
+    "stop-session.sh <project> --threads", "--all", "Conversation Reminder", "router status",
+    ...ROOT_THREAD_PERMISSIONS, "granted once by hand", "Operator checklist", "thread → Claude reply",
+    "thread → Codex reply", "not run in CI",
+  ],
+  "README.md": [
+    "## Thread Conversations", "docs/thread-supervisor.md", "scripts/install-thread-supervisor.sh", "/thread",
+    "scripts/threads.sh", "thread_session_caps", "claude_accounts", "--threads", ...ROOT_THREAD_PERMISSIONS,
+  ],
+  "AGENTS.md": [
+    "Thread Conversations", "channel's session only", "unless the request names its threads",
+    ...ROOT_THREAD_PERMISSIONS, "granted once by hand",
+  ],
+  ".mex/ROUTER.md": ["Thread Conversation", "scripts/threads.sh", "install-thread-supervisor.sh",
+    "thread-conversation-journey.test.js"],
+  ".mex/context/architecture.md": ["Thread Supervisor", "start-thread-session.sh", "thread role"],
+  ".mex/context/session-management.md": ["Thread Conversation", "start-thread-session.sh", "--threads", "--all",
+    "restart <project>"],
+  ".mex/context/discord-security.md": ["## Thread Conversations", "thread alone", "holds no Discord credential",
+    ...ROOT_THREAD_PERMISSIONS, "granted once by hand"],
+  ".mex/patterns/operate-thread-supervisor.md": ["scripts/install-thread-supervisor.sh", "preflight",
+    "scripts/thread-supervisor.py status", "scripts/threads.sh list", ...ROOT_THREAD_PERMISSIONS],
+  ".mex/patterns/register-project.md": ["Thread Conversations", "closed/deregistered", "stop-session.sh <project> --all"],
+  ".mex/patterns/INDEX.md": ["operate-thread-supervisor.md"],
+  "tests/e2e/README.md": ["## Thread Conversations", "thread-conversation-journey.test.js",
+    "Thread Supervisor", "Live Smoke Suite"],
+};
+
+test("thread docs describe Thread Conversations, the Thread Supervisor and root's thread permissions", () => {
+  for (const [file, phrases] of Object.entries(threadDocs)) {
+    const source = fs.readFileSync(file, "utf8");
+    for (const phrase of phrases) {
+      assert.match(source, new RegExp(escape(phrase)), `${file} is missing "${phrase}"`);
+    }
+  }
+  for (const workflow of ["Thread Conversations", "Thread Supervisor", "Thread journey"]) {
+    assert.match(matrix, new RegExp(`\\| ${workflow} \\|`), `SCENARIO_MATRIX.md is missing a ${workflow} row`);
   }
 });

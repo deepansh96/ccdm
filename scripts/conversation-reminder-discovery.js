@@ -49,17 +49,10 @@ function classify(message, found, rootUserId, isClose) {
   return { id: message.id, at: message.timestamp, kind, reactions };
 }
 
-async function read(request, found, token, rootUserId, isClose) {
-  const base = `https://discord.com/api/v10/channels/${encodeURIComponent(request.channel_id)}/messages`;
-  const params = new URLSearchParams({ limit: String(request.limit) });
-  let url;
-  if (request.kind === "reactions") {
-    url = `${base}/${encodeURIComponent(request.message_id)}/reactions/${encodeURIComponent(request.emoji)}?${params}`;
-  } else {
-    if (request.before) params.set("before", request.before);
-    if (request.after) params.set("after", request.after);
-    url = `${base}?${params}`;
-  }
+const API = "https://discord.com/api/v10";
+
+// One Discord read: `{status, body}` on success, else the status (and any retry_after).
+async function get(url, token) {
   let response;
   try {
     response = await fetch(url, { headers: { Authorization: `Bot ${token}` }, signal: AbortSignal.timeout(10000) });
@@ -73,6 +66,49 @@ async function read(request, found, token, rootUserId, isClose) {
   }
   if (!response.ok) return { status: response.status };
   const body = await response.json().catch(() => null);
+  return body === null ? { status: 0 } : { status: 200, body };
+}
+
+const listed = thread => ({ id: String(thread.id), archived: Boolean(thread.thread_metadata?.archived),
+  archive_timestamp: thread.thread_metadata?.archive_timestamp ?? null });
+
+// The channel's threads: on the first page its active ones, then one page of
+// its public archived threads, newest archive first, before `request.before`.
+async function listThreads(request, token) {
+  const threads = [];
+  if (!request.before && request.guild_id) {
+    const active = await get(`${API}/guilds/${encodeURIComponent(request.guild_id)}/threads/active`, token);
+    if (active.status !== 200) return active;
+    if (!Array.isArray(active.body?.threads)) return { status: 0 };
+    for (const thread of active.body.threads) {
+      if (thread?.id && String(thread.parent_id ?? "") === String(request.channel_id)) threads.push(listed(thread));
+    }
+  }
+  const params = new URLSearchParams({ limit: String(request.limit) });
+  if (request.before) params.set("before", request.before);
+  const archived = await get(`${API}/channels/${encodeURIComponent(request.channel_id)}/threads/archived/public?${params}`,
+    token);
+  if (archived.status !== 200) return archived;
+  if (!Array.isArray(archived.body?.threads)) return { status: 0 };
+  threads.push(...archived.body.threads.filter(thread => thread?.id).map(listed));
+  return { status: 200, threads, has_more: archived.body.has_more === true };
+}
+
+async function read(request, found, token, rootUserId, isClose) {
+  if (request.kind === "threads") return listThreads(request, token);
+  // A thread's history is read in the thread itself.
+  const base = `${API}/channels/${encodeURIComponent(request.target_id || request.channel_id)}/messages`;
+  const params = new URLSearchParams({ limit: String(request.limit) });
+  let url;
+  if (request.kind === "reactions") {
+    url = `${base}/${encodeURIComponent(request.message_id)}/reactions/${encodeURIComponent(request.emoji)}?${params}`;
+  } else {
+    if (request.before) params.set("before", request.before);
+    if (request.after) params.set("after", request.after);
+    url = `${base}?${params}`;
+  }
+  const { body, ...result } = await get(url, token);
+  if (result.status !== 200) return result;
   if (!Array.isArray(body)) return { status: 0 };
   if (request.kind === "reactions") return { status: 200, users: body.map(user => String(user?.id ?? "")) };
   if (body.some(message => typeof message?.id !== "string" || typeof message?.timestamp !== "string")) {

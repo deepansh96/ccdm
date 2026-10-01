@@ -1,6 +1,9 @@
 #!/bin/zsh
-# Usage: ./scripts/stop-session.sh <project_name>
-# Reads registry.json to get the tmux session name and stops it.
+# Usage: ./scripts/stop-session.sh <project_name> [--threads|--all]
+# Reads registry.json to get the tmux session name and stops it: the channel
+# session only, leaving thread sessions running. --threads stops only the
+# project's thread sessions, as operator stops through the Thread Supervisor
+# (or by their .thread-<id>.key paths when it is down); --all stops both.
 
 set -euo pipefail
 
@@ -9,10 +12,41 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 REGISTRY="$ROOT_DIR/registry.json"
 
 PROJECT="${1:-}"
+MODE="${2:-}"
 
-if [[ -z "$PROJECT" ]]; then
-  echo "Usage: $0 <project_name>"
+if [[ -z "$PROJECT" || $# -gt 2 || ( -n "$MODE" && "$MODE" != "--threads" && "$MODE" != "--all" ) ]]; then
+  echo "Usage: $0 <project_name> [--threads|--all]"
   exit 1
+fi
+
+stop_threads() {
+  python3 - "$ROOT_DIR" "$PROJECT" <<'PY'
+import sys
+from pathlib import Path
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(sys.argv[1]) / "scripts"))
+from thread_supervisor.operator_stop import main
+raise SystemExit(main(Path(sys.argv[1]), sys.argv[2]))
+PY
+}
+
+if [[ "$MODE" == "--threads" ]]; then
+  stop_threads
+  exit $?
+fi
+
+# --all: the thread sessions are stopped even when the channel stop fails,
+# and the run still exits non-zero for that failure.
+if [[ "$MODE" == "--all" ]]; then
+  channel_status=0
+  /bin/zsh "$SCRIPT_DIR/stop-session.sh" "$PROJECT" || channel_status=$?
+  threads_status=0
+  stop_threads || threads_status=$?
+  if (( channel_status != 0 )); then
+    echo "Stopping the channel session of '$PROJECT' failed (exit $channel_status); its thread sessions were still stopped." >&2
+    exit "$channel_status"
+  fi
+  exit "$threads_status"
 fi
 
 collect_tree() {
@@ -330,7 +364,7 @@ if [[ -n "$ORPHAN_PIDS" ]]; then
 fi
 
 if [[ "$SESSION_TYPE" != "codex" ]]; then
-  # The stopped launch's key and launch files go with it; the next launch writes fresh ones.
+  # The stopped launch's key and launch files go with it (its threads' launch files stay); the next launch writes fresh ones.
   python3 - "$ROUTER_KEY_FILE" "$ROUTER_STATE_DIR/launches/$PROJECT" <<'PY'
 import shutil
 import sys
@@ -339,7 +373,21 @@ from pathlib import Path
 key_file, launch_dir = sys.argv[1:3]
 if "/" not in Path(key_file).name:
     Path(key_file).unlink(missing_ok=True)
-shutil.rmtree(launch_dir, ignore_errors=True)
+# Only the channel launch's files go: threads/ holds the project's running
+# Thread Conversations' launch files, which outlive the channel session.
+launch = Path(launch_dir)
+if launch.is_dir() and not launch.is_symlink():
+    for entry in launch.iterdir():
+        if entry.name == "threads":
+            continue
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink(missing_ok=True)
+    try:
+        launch.rmdir()  # only once no thread launch is left
+    except OSError:
+        pass
 PY
 fi
 

@@ -295,6 +295,10 @@ test("resume startup failures clean the listener, runtime state, launch key, and
     await serveAlpha(workspace, registry, {
       codex: startupMode === "exit" ? { resumeError: "no rollout found for thread" } : { bootstrapPlan: { complete: false } },
     });
+    // A running Thread Conversation's launch files outlive the failed launch.
+    const threadActivity = path.join(workspace.routerStateDir, "launches", "alpha", "threads", "1700000000000990001", "activity.json");
+    fs.mkdirSync(path.dirname(threadActivity), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(threadActivity, "{}\n", { mode: 0o600 });
     const result = await startCodex(workspace, {
       args: ["alpha", "--resume", "00000000-0000-4000-8000-000000000001"],
       env: { CCDM_CODEX_LAUNCH_TIMEOUT_S: "5" },
@@ -308,10 +312,13 @@ test("resume startup failures clean the listener, runtime state, launch key, and
     const after = readState(workspace.stateDir);
     assert.deepEqual(after.fixtures.tmux.sessions, {});
     assert.equal(fs.existsSync(alphaKeyFile(workspace)), false);
-    assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "launches", "alpha")), false);
+    assert.deepEqual(fs.readdirSync(path.join(workspace.routerStateDir, "launches", "alpha")), ["threads"]);
+    assert.equal(fs.existsSync(threadActivity), true);
     const launch = after.fixtures.codex.bridgeInvocations[0];
     assert.equal(launch.env.CODEX_RESUME_THREAD_ID, "00000000-0000-4000-8000-000000000001");
     await waitForExit(launch.pid);
+    // The bridge's app-server goes with it rather than holding the port.
+    for (const appServer of readState(workspace.stateDir).fixtures.codex.appServerInvocations) await waitForExit(appServer.pid);
     assert.equal(readRegistry(workspace).projects.alpha.pid, null);
     assert.equal(readRegistry(workspace).projects.alpha.session_id, null);
     await cleanup();
