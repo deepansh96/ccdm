@@ -102,6 +102,13 @@ async function assignment(channelId) {
   return routerAssignment(found);
 }
 
+// A Thread Conversation's assignment: its project's, naming the thread.
+async function threadAssignment(project, threadId) {
+  const channelId = (await registry()).projects?.[project]?.channel_id;
+  const found = channelId ? await assignment(String(channelId)) : null;
+  return found?.project === project ? { ...found, conversation_id: threadId } : null;
+}
+
 async function adapterReady(found) {
   const readiness = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
     [path.join(__dirname, "conversation-reminder-readiness.py"), found.project, "--json",
@@ -158,12 +165,14 @@ function connectRouter() {
     const observer = new RouterClient({ role: "observer", key: await writeObserverKey() });
     const report = kind => error => process.stderr.write(`Conversation observer ${kind} failed: ${error.message}\n`);
     observer.on("message", event => observeOwnerMessage({
-      channelId: event.channel_id, messageId: event.message_id, authorId: event.author?.id,
+      channelId: event.channel_id, threadId: event.thread_id, project: event.project,
+      messageId: event.message_id, authorId: event.author?.id,
       bot: Boolean(event.author?.bot || event.webhook_id), content: event.content,
       attachmentCount: event.attachment_count,
     }).catch(report("message")));
     observer.on("reaction", event => observeOwnerReaction({
-      channelId: event.channel_id, messageId: event.message_id, userId: event.user?.id, bot: false,
+      channelId: event.channel_id, threadId: event.thread_id, project: event.project,
+      messageId: event.message_id, userId: event.user?.id, bot: false,
       emoji: event.emoji,
     }).catch(report("reaction")));
     observer.on("disconnect", () => suspendRouterProjects().catch(report("suspension")));
@@ -210,7 +219,7 @@ async function cleanupRetired(project) {
     const credentials = await retiredCredentials();
     let reason = credentials.reason;
     if (credentials.token) {
-      const url = `https://discord.com/api/v10/channels/${encodeURIComponent(action.channel_id)}` +
+      const url = `https://discord.com/api/v10/channels/${encodeURIComponent(action.target_id)}` +
         `/messages/${encodeURIComponent(action.message_id)}`;
       for (let attempt = 0; attempt < RETIRED_CLEANUP_ATTEMPTS; attempt++) {
         let response;
@@ -260,12 +269,17 @@ async function cleanupRetired(project) {
   return result;
 }
 
-// One message in a project channel, from the Router.
-async function observeOwnerMessage({ channelId, messageId, authorId, bot, content, attachmentCount }) {
+// In a thread these are the supervisor's or the thread session's commands.
+// They acknowledge without reopening; the supervisor reports a thread's closure.
+const THREAD_COMMAND = /^\/(?:close|restart|clear|config|compact|pause|unpause)(?:\s|$)/;
+
+// One message in a project channel or one of its threads, from the Router.
+async function observeOwnerMessage({ channelId, threadId, project, messageId, authorId, bot, content,
+  attachmentCount }) {
   if (bot) return;
-  const found = await assignment(channelId);
+  const found = threadId ? await threadAssignment(project, threadId) : await assignment(channelId);
   if (!found) return;
-  const close = closeCommand(content, found.bot_app_id, rootUserId());
+  const close = !threadId && closeCommand(content, found.bot_app_id, rootUserId());
   if (authorId !== found.owner_id) return;
   const context = { ...found, provider: "ccdm-root" };
   if (close) {
@@ -277,7 +291,8 @@ async function observeOwnerMessage({ channelId, messageId, authorId, bot, conten
   const trimmed = String(content || "").trim();
   // Root-management traffic never reopens a conversation, wherever the mention sits.
   const rootMention = [`<@${rootUserId()}>`, `<@!${rootUserId()}>`].some(value => trimmed.includes(value));
-  const managedCommand = ["/compact", "/clear", "/pause", "/unpause", "/restart"].includes(trimmed);
+  const managedCommand = threadId ? THREAD_COMMAND.test(trimmed)
+    : ["/compact", "/clear", "/pause", "/unpause", "/restart"].includes(trimmed);
   if (!trimmed && !attachmentCount) return;
   const kind = managedCommand || rootMention ? "management-command"
     : attachmentCount ? "attachment" : "message";
@@ -286,9 +301,9 @@ async function observeOwnerMessage({ channelId, messageId, authorId, bot, conten
   });
 }
 
-async function observeOwnerReaction({ channelId, messageId, userId, bot, emoji }) {
+async function observeOwnerReaction({ channelId, threadId, project, messageId, userId, bot, emoji }) {
   if (bot) return;
-  const found = await assignment(channelId);
+  const found = threadId ? await threadAssignment(project, threadId) : await assignment(channelId);
   if (!found || userId !== found.owner_id) return;
   // Any owner reaction acknowledges, including one on a recorded reminder.
   // The stable reaction identity lets the service merge this copy with the
@@ -341,7 +356,7 @@ async function recoverIntents(scheduled = false) {
       continue;
     }
     const claimed = Date.parse(intent.claimed_at);
-    const base = `https://discord.com/api/v10/channels/${encodeURIComponent(intent.channel_id)}/messages`;
+    const base = `https://discord.com/api/v10/channels/${encodeURIComponent(intent.target_id)}/messages`;
     if (await retryClockMs() <= claimed + NONCE_REPLAY_MS) {
       const replay = await sendReminder(base, found.bot_token, intent.nonce);
       if (replay.outcome === "sent") {
@@ -496,7 +511,7 @@ async function sideEffects(recoveryOnly = false) {
             found.assignment_generation !== action.assignment_generation) continue;
         token = found.bot_token;
       }
-      const messageUrl = `https://discord.com/api/v10/channels/${encodeURIComponent(action.channel_id)}` +
+      const messageUrl = `https://discord.com/api/v10/channels/${encodeURIComponent(action.target_id)}` +
         `/messages/${encodeURIComponent(action.message_id)}`;
       const url = action.kind === "ack" ?
         `${messageUrl}/reactions/${encodeURIComponent("✅")}/@me` : messageUrl;
@@ -541,7 +556,9 @@ async function sideEffects(recoveryOnly = false) {
       [script, "validate", "--project-root", projectRoot, "--state-dir", stateDir,
         "--nonce", claim.nonce]);
     if (!JSON.parse(checked.stdout).valid) return;
-    const url = `https://discord.com/api/v10/channels/${encodeURIComponent(claim.channel_id)}/messages`;
+    // A thread's reminder posts into the thread, which reopens it if it was
+    // archived; an unarchive never starts a session.
+    const url = `https://discord.com/api/v10/channels/${encodeURIComponent(claim.target_id)}/messages`;
     let outcome = "uncertain";
     let messageId;
     let sentAt;

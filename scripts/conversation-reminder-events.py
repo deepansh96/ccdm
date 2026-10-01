@@ -292,7 +292,10 @@ def _assignment_result(registry: dict, event: dict) -> tuple[str | None, str | N
         return "stale", "project channel or bot assignment changed"
     if assignment["generation"] != event["assignment_generation"]:
         return "stale", "project assignment generation changed"
-    if event["provider"] in {"codex", "claude"} and (assignment["project"].get("type") or "claude") != event["provider"]:
+    # A Thread Conversation runs its own provider, whatever its project's is.
+    in_thread = event.get("conversation_id", event["channel_id"]) != event["channel_id"]
+    if (event["provider"] in {"codex", "claude"} and not in_thread
+            and (assignment["project"].get("type") or "claude") != event["provider"]):
         return "rejected", "adapter event targets a different project provider"
     if event["event_type"] in {"owner_activity", "close_requested"} and event.get("actor_id") != assignment["owner_id"]:
         return "rejected", "owner event actor does not match the registered owner"

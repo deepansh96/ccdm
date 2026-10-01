@@ -341,6 +341,13 @@ function isCloseCommand(content) {
   return false;
 }
 
+// A thread bridge's conversation is its thread, under its parent project
+// whatever that project's provider; it serves no other channel.
+async function reminderAssignmentFor(channelId, options) {
+  if (!THREAD_MODE) return reminderAdapter.resolveAssignmentForChannel(channelId, options);
+  return channelId === DISCORD_THREAD_ID ? reminderAdapter.resolveThreadAssignment(ROUTER_PROJECT, DISCORD_THREAD_ID) : null;
+}
+
 function reminderEventContext(assignment) {
   return {
     ...assignment,
@@ -514,7 +521,7 @@ function recordSessionTermination() {
     const endingThreadId = threadId;
     const endingTurnId = activeTurnId;
     sessionTerminationPromise = (async () => {
-      const assignment = await reminderAdapter.resolveAssignmentForChannel(projectChannelId, {
+      const assignment = await reminderAssignmentFor(projectChannelId, {
         requireCodex: true,
         ...(BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
       }).catch(() => null);
@@ -1526,7 +1533,15 @@ const holdUntilBootstrap = (kind, handler) => async (event) => {
 async function startThreadConversation() {
   const bootstrap = await awaitThreadBootstrap();
   if (bootstrap) {
-    await sendTurn([{ type: "text", text: threadBootstrapText(bootstrap) }], projectChannelId);
+    // The bootstrap turn answers the owner's latest message in it.
+    const assignment = await reminderAssignmentFor(DISCORD_THREAD_ID).catch(() => null);
+    const asked = (Array.isArray(bootstrap.messages) ? bootstrap.messages : [])
+      .findLast((message) => assignment && message.author?.id === assignment.owner_id);
+    const source = asked
+      ? { id: asked.message_id, author: { id: asked.author.id }, reminderAssignment: assignment, synthetic: true }
+      : null;
+    if (source) lastOwnerInteraction = { id: source.id, assignment_generation: assignment.assignment_generation };
+    await sendTurn([{ type: "text", text: threadBootstrapText(bootstrap) }], projectChannelId, null, 0, source);
   } else {
     await sendBootstrapInstructionTurn("thread");
   }
@@ -1550,7 +1565,7 @@ function startDiscordBot() {
     const { user } = reaction;
     if (user.bot) return;
     const reactionChannelId = reaction.message.channel.id;
-    const assignment = await reminderAdapter.resolveAssignmentForChannel(reactionChannelId, {
+    const assignment = await reminderAssignmentFor(reactionChannelId, {
       requireCodex: true,
       ...(!ROOT_MULTI_CHANNEL && BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
     }).catch(() => null);
@@ -1585,7 +1600,7 @@ function startDiscordBot() {
     if (!msg.author.bot && isCloseCommand(msg.content)) {
       // Root management routing reserves /close in every registered project
       // channel, whichever provider serves it; a project bridge only its own.
-      const assignment = await reminderAdapter.resolveAssignmentForChannel(msg.channel.id, {
+      const assignment = await reminderAssignmentFor(msg.channel.id, {
         requireCodex: !ROOT_MULTI_CHANNEL,
         ...(!ROOT_MULTI_CHANNEL && BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
       }).catch(() => null);
@@ -1606,7 +1621,7 @@ function startDiscordBot() {
     const text = stripThisBotMention(msg.content.trim());
     const bridgeSlashCommand = !ROOT_MULTI_CHANNEL || channelId === CHANNEL_ID;
     if (bridgeSlashCommand && ["/pause", "/unpause", "/compact", "/clear", "/restart"].includes(text)) {
-      const assignment = await reminderAdapter.resolveAssignmentForChannel(channelId, {
+      const assignment = await reminderAssignmentFor(channelId, {
         requireCodex: true,
         ...(!ROOT_MULTI_CHANNEL && BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
       }).catch(() => null);
@@ -1729,7 +1744,7 @@ function startDiscordBot() {
     const { input, channelScopeToken } = await buildInput(msg, text);
     if (input.length === 0) return;
 
-    const assignment = await reminderAdapter.resolveAssignmentForChannel(channelId, {
+    const assignment = await reminderAssignmentFor(channelId, {
       requireCodex: true,
       ...(!ROOT_MULTI_CHANNEL && BOT_APP_ID ? { botAppId: BOT_APP_ID } : {}),
     }).catch(() => null);

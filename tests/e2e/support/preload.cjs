@@ -727,6 +727,15 @@ function routeDiscordApi(url, init = {}) {
         } : {}),
       };
       state.fixtures.discord.messages.push(created);
+      // Like Discord, a message posted into an archived, unlocked thread unarchives it.
+      const thread = state.fixtures.discord.threads?.[createMessageMatch[1]];
+      if (thread?.archived && !thread.locked) {
+        const { event, previous, delivered, ...current } = thread;
+        const updated = { ...current, archived: false };
+        state.fixtures.discord.threads[thread.id] = updated;
+        (state.fixtures.discord.injectedThreads ||= []).push({ ...updated, event: "update", previous: current,
+          delivered: false });
+      }
       if (parsedBody.content === "👀" && state.fixtures.discord.crashAfterReminderAccept) {
         crashAfterAccept = true;
         state.fixtures.discord.crashAfterReminderAccept = false;

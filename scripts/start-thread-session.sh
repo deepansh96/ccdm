@@ -256,15 +256,16 @@ fail() {
   exit 1
 }
 
-python3 - "$PROJECT" "$THREAD_ID" "$ROUTER_STATE" "$LAUNCH_DIR" "$SCRIPT_DIR/ccdm-channel-server.js" "$KEY_FILE" "$PROVIDER" "$TMUX_NAME" <<'PY' || fail "The thread launch files could not be written"
+python3 - "$PROJECT" "$THREAD_ID" "$ROUTER_STATE" "$LAUNCH_DIR" "$SCRIPT_DIR/ccdm-channel-server.js" "$KEY_FILE" "$PROVIDER" "$TMUX_NAME" "$REGISTRY" <<'PY' || fail "The thread launch files could not be written"
 import json
 import os
 import secrets
 import shutil
 import sys
 from pathlib import Path
+from uuid import uuid4
 
-project, thread_id, router_state, launch_dir, server_script, key_file, provider, tmux_name = sys.argv[1:9]
+project, thread_id, router_state, launch_dir, server_script, key_file, provider, tmux_name, registry_path = sys.argv[1:10]
 launch = Path(launch_dir)
 # A fresh launch directory: no previous launch's ready, context or bootstrap file.
 shutil.rmtree(launch, ignore_errors=True)
@@ -284,11 +285,24 @@ write_private(Path(key_file), secrets.token_urlsafe(32) + "\n")
 # A Codex bridge takes its settings from its tmux environment instead.
 if provider == "codex":
     sys.exit(0)
+# The channel server and the command hooks record this thread's Conversation
+# Reminder events, with the thread as their conversation.
+root_dir = str(Path(server_script).parent.parent)
+reminder_dir = Path(os.environ.get("CCDM_REMINDER_STATE_DIR") or Path.home() / ".local" / "state" / "ccdm" / "conversation-reminders")
+reminder_env = {
+    "CCDM_REMINDER_PROJECT_ROOT": root_dir,
+    "CCDM_REMINDER_STATE_DIR": str(reminder_dir),
+    "CCDM_REMINDER_RECEIPTS_DIR": str(reminder_dir / "claude-receipts"),
+    "CCDM_CLAUDE_PROJECT": project,
+    "CCDM_CLAUDE_CHANNEL_ID": str(json.load(open(registry_path))["projects"][project]["channel_id"]),
+    "CCDM_CLAUDE_CONVERSATION_ID": thread_id,
+    "CCDM_CLAUDE_LAUNCH_ID": str(uuid4()),
+}
 env = {
+    **reminder_env,
     "CCDM_ROUTER_STATE_DIR": router_state,
     "CCDM_ROUTER_KEY_FILE": key_file,
     "CCDM_CHANNEL_READY_FILE": str(launch / "ready.json"),
-    "CCDM_CLAUDE_PROJECT": project,
     "CCDM_THREAD_ID": thread_id,
     "CCDM_THREAD_PROVIDER": "claude",
     "CCDM_THREAD_TMUX": tmux_name,
@@ -301,12 +315,18 @@ write_private(launch / "mcp.json", json.dumps({"mcpServers": {"ccdm": {
     "command": "node", "args": [server_script], "env": env,
 }}}, indent=2) + "\n")
 # The official Discord plugin must not load beside the CCDM channel. The Stop
-# and StopFailure command hooks mark the turn ended in activity.json.
+# and StopFailure command hooks mark the turn ended in activity.json; the
+# reminder hook records the turn's completion.
 activity_hook = f"node '{Path(server_script).with_name('thread-activity.js')}' '{launch / 'activity.json'}'"
+reminder_hook = f"node '{Path(server_script).with_name('claude-reminder-hook.js')}'"
 write_private(launch / "settings.json", json.dumps({
     "enabledPlugins": {"discord@claude-plugins-official": False},
-    "hooks": {event: [{"hooks": [{"type": "command", "command": activity_hook}]}] for event in ("Stop", "StopFailure")},
+    "hooks": {event: [{"hooks": [{"type": "command", "command": command}
+                                 for command in ([activity_hook] if event in ("Stop", "StopFailure") else [])
+                                 + [reminder_hook]]}]
+              for event in ("SessionStart", "Stop", "StopFailure", "SessionEnd")},
 }, indent=2) + "\n")
+write_private(launch / "reminder-env.json", json.dumps(reminder_env) + "\n")
 PY
 
 if [[ "$PROVIDER" == "codex" ]]; then
@@ -408,7 +428,14 @@ EFFORT_FLAG=""
 [[ -n "$EFFORT" ]] && EFFORT_FLAG=" --effort '$EFFORT'"
 RESUME_FLAG=""
 [[ -n "$RESUME_ID" ]] && RESUME_FLAG=" --resume '$RESUME_ID'"
-if ! tmux new-session -d -s "$TMUX_NAME" -- zsh -ic "cd '$PATH_DIR' && CCDM_ROUTER_KEY_FILE='$KEY_FILE'$CONFIG_DIR_ENV claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions --mcp-config '$LAUNCH_DIR/mcp.json' --settings '$LAUNCH_DIR/settings.json'$MODEL_FLAG$EFFORT_FLAG$RESUME_FLAG" >&2; then
+# Claude and its command hooks share the launch's reminder context.
+REMINDER_ENV="$(python3 - "$LAUNCH_DIR/reminder-env.json" <<'PY'
+import json,sys
+e=json.load(open(sys.argv[1]))
+print(''.join(f" {k}='{v}'" for k,v in e.items()))
+PY
+)" || fail "The thread launch files could not be read"
+if ! tmux new-session -d -s "$TMUX_NAME" -- zsh -ic "cd '$PATH_DIR' && CCDM_ROUTER_KEY_FILE='$KEY_FILE'$REMINDER_ENV$CONFIG_DIR_ENV claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions --mcp-config '$LAUNCH_DIR/mcp.json' --settings '$LAUNCH_DIR/settings.json'$MODEL_FLAG$EFFORT_FLAG$RESUME_FLAG" >&2; then
   fail "tmux could not start the thread session"
 fi
 echo "Started Claude thread session in tmux session '$TMUX_NAME'" >&2

@@ -23,8 +23,10 @@
 // Scope is the thread alone. It holds live events until the supervisor's
 // bootstrap file exists (CCDM_THREAD_BOOT_TIMEOUT_S, 120 s by default),
 // delivers the bootstrap as the first channel notification, and drops held
-// messages the bootstrap already includes. It records no Conversation
-// Reminder events and ignores `scope_changed`. Its commands are /compact,
+// messages the bootstrap already includes. It records the thread's own
+// Conversation Reminder events, with the thread as their conversation and
+// the bootstrap's owner messages as interactions, writes no capability
+// marker, and ignores `scope_changed`. Its commands are /compact,
 // typed into its own tmux pane, and /pause and /unpause; the supervisor owns
 // a thread's /restart and /clear.
 //
@@ -85,8 +87,10 @@ const ROOT_INSTRUCTIONS = [
 const ROOT = process.env.CCDM_ROUTER_ROLE === "root";
 const THREAD_ID = ROOT ? "" : process.env.CCDM_THREAD_ID || "";
 const THREAD = Boolean(THREAD_ID);
-// The project's channel, or this thread's, records no reminder events.
-const REMINDERS = !ROOT && !THREAD;
+// A project's channel session and a thread session record reminder events;
+// only the channel session proves the project's capability.
+const REMINDERS = !ROOT;
+const CAPABILITY = REMINDERS && !THREAD;
 
 const REMINDER_PROJECT_ROOT = process.env.CCDM_REMINDER_PROJECT_ROOT || path.dirname(__dirname);
 const REMINDER_STATE_DIR = process.env.CCDM_REMINDER_STATE_DIR || path.join(os.homedir(), ".local", "state", "ccdm", "conversation-reminders");
@@ -123,7 +127,12 @@ async function hasCommandHooks() {
 
 // This project's Claude assignment, or null when the registry no
 // longer assigns the channel to it.
+// A thread's is its parent project's, whatever that project's provider.
 async function reminderAssignment(channelId) {
+  if (THREAD) {
+    return channelId === THREAD_ID ? reminder.resolveThreadAssignment(process.env.CCDM_CLAUDE_PROJECT, THREAD_ID,
+      { registryPath: REGISTRY_PATH }).catch(() => null) : null;
+  }
   const assignment = await reminder.resolveAssignmentForChannel(channelId, { registryPath: REGISTRY_PATH }).catch(() => null);
   return assignment?.project === process.env.CCDM_CLAUDE_PROJECT && assignment.project_type === "claude"
     ? assignment : null;
@@ -154,12 +163,13 @@ async function writeCapabilityMarker(granted) {
   renameSync(tmp, capabilityPath);
 }
 
-// An owner message opens an interaction the reply tool can name; answering
-// after an input-needed reply records that the work resumed.
-async function recordOwnerMessage(event) {
+// An owner message opens an interaction the reply tool can name (by
+// `answeredAs`, its own id unless a bootstrap names it); answering after an
+// input-needed reply records that the work resumed.
+async function recordOwnerMessage(event, answeredAs = event.message_id) {
   const assignment = await reminderAssignment(event.channel_id);
   if (!assignment || event.author?.id !== assignment.owner_id) return;
-  interactions.set(event.message_id, {
+  interactions.set(answeredAs, {
     ...assignment,
     provider: "claude",
     provider_session_id: LAUNCH_ID,
@@ -191,7 +201,7 @@ async function recordOwnerMessage(event) {
 // the question.
 async function recordDeliveredReply(input, result) {
   const context = interactions.get(input.conversation_interaction_id);
-  if (!context || input.chat_id !== context.channel_id) return;
+  if (!context || input.chat_id !== (context.conversation_id || context.channel_id)) return;
   const ids = result.message_ids?.length ? result.message_ids : [result.message_id];
   for (const id of ids) {
     const disposition = input.conversation_disposition === "input-needed" && id === ids.at(-1) ? "input-needed" : "progress";
@@ -504,7 +514,7 @@ function scheduleRestart(project) {
 
 // Reminder events are recorded in arrival order, after any stranded outbox.
 let reminderEvents = REMINDERS ? reminder.drainOutbox() : Promise.resolve();
-if (REMINDERS) process.on("exit", removeCapabilityMarker);
+if (CAPABILITY) process.on("exit", removeCapabilityMarker);
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(signal, () => process.exit(0));
 
 function main() {
@@ -556,9 +566,23 @@ function main() {
     else notify(kind, event);
   };
   if (THREAD) {
-    awaitBootstrap().then(bootstrap => {
+    awaitBootstrap().then(async bootstrap => {
       const included = new Set(bootstrap?.included_message_ids ?? []);
-      if (bootstrap) channelNotify(bootstrapNotification(bootstrap));
+      if (bootstrap) {
+        // The bootstrap answers the owner's latest message in it, whoever wrote the last.
+        const notification = bootstrapNotification(bootstrap);
+        const asked = (Array.isArray(bootstrap.messages) ? bootstrap.messages : [])
+          .map(message => ({ ...message, channel_id: THREAD_ID }));
+        const latest = new Map(asked.map(message => [message.author?.id, message]));
+        for (const message of asked) {
+          const answeredAs = latest.get(message.author?.id) === message ? notification.meta.message_id : message.message_id;
+          reminderEvents = reminderEvents.then(() => recordOwnerMessage(message, answeredAs)).catch(error => {
+            process.stderr.write(`ccdm channel: reminder activity recording failed: ${error.message}\n`);
+          });
+        }
+        await reminderEvents;
+        channelNotify(notification);
+      }
       const pending = held.filter(([kind, event]) => !(kind === "message" && included.has(event.message_id)));
       held = null;
       for (const [kind, event] of pending) deliver(kind)(event);
@@ -634,14 +658,14 @@ function main() {
   router.on("disconnect", () => process.stderr.write("ccdm channel: Router connection lost; reconnecting\n"));
   router.on("reconnect", () => process.stderr.write("ccdm channel: Router connection restored\n"));
   router.on("end", error => {
-    if (REMINDERS) removeCapabilityMarker();
+    if (CAPABILITY) removeCapabilityMarker();
     process.stderr.write(`ccdm channel: Router session ended${error ? `: ${error.code || error.message}` : ""}\n`);
   });
 
   router.connect().then(
     async granted => {
       scope = granted;
-      if (REMINDERS) await writeCapabilityMarker(granted).catch(error => {
+      if (CAPABILITY) await writeCapabilityMarker(granted).catch(error => {
         process.stderr.write(`ccdm channel: capability marker failed: ${error.message}\n`);
       });
       reportReady({ ok: true, scope: granted });

@@ -5,8 +5,11 @@ import path from "node:path";
 import test from "node:test";
 
 import { runScript } from "./support/runner.js";
-import { createBridgeWorkspace } from "./support/bridge.js";
+import { createBridgeWorkspace, injectDiscordMessage, startFakeCodexServer } from "./support/bridge.js";
+import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerEnv, routerWithWebhooks, waitFor } from "./support/router.js";
+import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
+import { startThreadSupervisor, supervisorStatus } from "./support/thread-supervisor.js";
 
 test.afterEach(async () => cleanup());
 
@@ -310,4 +313,258 @@ test("adapter and observer events may name their conversation, defaulting to the
   const paused = (await cli(workspace, stateDir, "status")).conversations.demo;
   assert.deepEqual([paused.state, paused.due_at, paused.consecutive_reminders, paused.last_ack_message_id],
     ["open-paused", null, 0, "channel-message"]);
+});
+
+// Thread Conversation reminders end to end: the real Router, Thread
+// Supervisor, thread sessions and reminder service, with the fixture claude,
+// codex and tmux. The Claude project's own channel session runs too, since
+// its adapter readiness gates every reminder for the project.
+const THREAD_A = "1700000000000111111";
+const THREAD_B = "1700000000000222222";
+const ROOT_AUTH = `Bot ${ROOT_TOKEN}`;
+const FAST_POLL = { CCDM_THREAD_ARCHIVE_POLL_WINDOW_S: "1.5", CCDM_THREAD_ARCHIVE_POLL_INTERVAL_S: "0.2" };
+const owner = { id: OWNER_ID, username: "Owner" };
+const guest = { id: "guest-id", username: "Guest" };
+
+function threadReminderWorkspace(type = "claude") {
+  const workspace = createRouterWorkspace({
+    discord_user_id: OWNER_ID, guild_id: "guild-id",
+    projects: { demo: { channel_id: "demo-channel", type, transport: "router", guest_user_ids: ["guest-id"],
+      screen_name: "demo_claude", assignment_generation: "gen-demo" } },
+  });
+  const registryFile = path.join(workspace.repoDir, "registry.json");
+  const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+  registry.projects.demo.path = workspace.tmpDir;
+  fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
+  fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
+  const clockFile = path.join(workspace.tmpDir, "reminder-clock");
+  const now = Date.now();
+  return {
+    workspace,
+    stateDir: path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders"),
+    // Minutes past the test's start, on the reminder service's clock.
+    setClock: minutes => fs.writeFileSync(clockFile,
+      new Date(now + minutes * 60000).toISOString().replace(/\.\d{3}Z$/, "Z")),
+    env: { CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile },
+  };
+}
+
+async function reminderService(context, name) {
+  const result = await runScript(context.workspace, "scripts/conversation-reminder-service.py", {
+    args: [name, "--project-root", context.workspace.repoDir, "--state-dir", context.stateDir],
+    env: routerEnv(context.workspace, context.env),
+  });
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  return JSON.parse(result.stdout);
+}
+
+// Claude answers every notification, naming the message it answers.
+const ANSWER = [{ name: "reply", arguments: { chat_id: "{{chat_id}}", text: "Here is the answer",
+  conversation_interaction_id: "{{message_id}}", conversation_disposition: "progress" } }];
+
+// The Router with demo's webhook, the supervisor, demo's channel session when
+// it is a Claude project, and the enabled reminder worker, ready for demo.
+async function threadReminders(context, { channelSession = true, supervisorEnv = {} } = {}) {
+  const { workspace } = context;
+  updateState(workspace.stateDir, state => {
+    state.fixtures.discord.history = { "demo-channel": [] };
+    state.fixtures.claude.toolScript = ANSWER;
+  });
+  await routerWithWebhooks(workspace, ["demo"]);
+  if (channelSession) {
+    const started = await runScript(workspace, "scripts/start-session.sh", {
+      args: ["demo"], env: routerEnv(workspace), timeoutMs: 30000,
+    });
+    assert.equal(started.exitCode, 0, started.stderr || started.stdout);
+  }
+  await startThreadSupervisor(workspace, { env: supervisorEnv });
+  await reminderService(context, "enable");
+  context.setClock(0);
+  const running = runScript(workspace, "scripts/conversation-reminder-service.py", {
+    args: ["run", "--project-root", workspace.repoDir, "--state-dir", context.stateDir],
+    env: routerEnv(workspace, context.env), timeoutMs: 120000,
+  });
+  const deadline = Date.now() + 20000;
+  while ((await reminderService(context, "status")).conversations.demo?.reconciliation_status !== "ready") {
+    if (Date.now() > deadline) throw new Error("demo never became ready for reminders");
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  return async () => {
+    await reminderService(context, "disable");
+    const stopped = await running;
+    assert.equal(stopped.exitCode, 0, stopped.stderr || stopped.stdout);
+  };
+}
+
+function createThread(workspace, id, fields = {}) {
+  updateState(workspace.stateDir, state => {
+    (state.fixtures.discord.injectedThreads ||= []).push({ id, type: 11, parentId: "demo-channel",
+      name: `Side task ${id.slice(-6)}`, ownerId: OWNER_ID, autoArchiveDuration: 10080, event: "create", ...fields });
+  });
+}
+
+async function supervisedThread(workspace, id, predicate = () => true, timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  let last;
+  while (Date.now() < deadline) {
+    last = await supervisorStatus(workspace);
+    const row = last.projects?.demo?.threads?.[id];
+    if (row && predicate(row)) return row;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error(`thread ${id} never matched: ${JSON.stringify(last)}`);
+}
+
+const posts = (workspace, channelId) => (readState(workspace.stateDir).fixtures.discord.messages ?? [])
+  .filter(message => message.channelId === channelId);
+const eyes = (workspace, channelId) => posts(workspace, channelId).filter(message => message.content === "👀");
+const agentReplies = (workspace, channelId) => posts(workspace, channelId)
+  .filter(message => message.webhookId === "fake-webhook-1");
+const settle = () => new Promise(resolve => setTimeout(resolve, 1500));
+
+// A thread whose session answered the owner's first message.
+async function answeredThread(context, id, messageId) {
+  const { workspace } = context;
+  createThread(workspace, id);
+  await supervisedThread(workspace, id);
+  injectDiscordMessage(workspace, { id: messageId, channelId: id, author: owner, content: "please fix the parser" });
+  await waitFor(() => agentReplies(workspace, id).length === 1, () => `the reply in ${id}`, 20000);
+  // The Stop hook that ends the turn runs after the reply.
+  await waitFor(() => (readState(workspace.stateDir).fixtures.claude.hookRuns ?? [])
+    .filter(run => run.event === "Stop").length >= 1, () => "the Stop hook", 10000);
+  await settle();
+}
+
+test("after a Claude thread turn ends, root reminds in that thread after the hour and never in the channel", async () => {
+  const context = threadReminderWorkspace();
+  const { workspace } = context;
+  const stop = await threadReminders(context);
+  await answeredThread(context, THREAD_A, "thread-question-1");
+
+  // Inside the hour nothing is sent.
+  context.setClock(59);
+  await settle();
+  assert.deepEqual(eyes(workspace, THREAD_A), []);
+
+  context.setClock(61);
+  await waitFor(() => eyes(workspace, THREAD_A).length === 1, () => "the thread's reminder", 20000);
+  const [reminder] = eyes(workspace, THREAD_A);
+  assert.deepEqual([reminder.authorization, reminder.requestBody.enforce_nonce], [ROOT_AUTH, true]);
+  assert.deepEqual(eyes(workspace, "demo-channel"), []);
+
+  // An ignored reminder backs off: the next one comes two hours after it.
+  context.setClock(61 + 119);
+  await settle();
+  assert.equal(eyes(workspace, THREAD_A).length, 1);
+  context.setClock(61 + 121);
+  await waitFor(() => eyes(workspace, THREAD_A).length === 2, () => "the second reminder", 20000);
+  assert.deepEqual(eyes(workspace, "demo-channel"), []);
+  await stop();
+});
+
+test("a supervisor notice in a thread is not an agent reply, so it never arms a reminder", async () => {
+  const context = threadReminderWorkspace();
+  const { workspace } = context;
+  const stop = await threadReminders(context);
+  await answeredThread(context, THREAD_A, "thread-question-1");
+
+  // The owner's /config acknowledges; the supervisor answers it as the root bot.
+  injectDiscordMessage(workspace, { id: "thread-config-1", channelId: THREAD_A, author: owner, content: "/config" });
+  await waitFor(() => posts(workspace, THREAD_A).some(message => !message.webhookId && message.content !== "👀"),
+    () => "the supervisor's settings notice", 15000);
+  const notice = posts(workspace, THREAD_A).find(message => !message.webhookId);
+  assert.equal(notice.authorization, ROOT_AUTH);
+  await settle();
+
+  context.setClock(24 * 60);
+  await settle();
+  await settle();
+  assert.deepEqual(eyes(workspace, THREAD_A), []);
+  await stop();
+});
+
+test("an owner reply in one thread acknowledges only that thread, and a guest reply acknowledges nothing", async () => {
+  const context = threadReminderWorkspace();
+  const { workspace } = context;
+  const stop = await threadReminders(context);
+  await answeredThread(context, THREAD_A, "thread-a-question");
+  await answeredThread(context, THREAD_B, "thread-b-question");
+  injectDiscordMessage(workspace, { id: "channel-question", channelId: "demo-channel", author: owner,
+    content: "and in the channel?" });
+  await waitFor(() => agentReplies(workspace, "demo-channel").length === 1, () => "the channel reply", 20000);
+  await settle();
+
+  // From here Claude keeps working without answering.
+  updateState(workspace.stateDir, state => {
+    delete state.fixtures.claude.toolScript;
+  });
+  injectDiscordMessage(workspace, { id: "thread-a-ack", channelId: THREAD_A, author: owner, content: "thanks" });
+  injectDiscordMessage(workspace, { id: "thread-b-guest", channelId: THREAD_B, author: guest, content: "me too" });
+  await settle();
+
+  // Thread reminders are spaced by the 5 s gate.
+  context.setClock(61);
+  await waitFor(() => eyes(workspace, "demo-channel").length === 1 &&
+    eyes(workspace, THREAD_B).length + eyes(workspace, THREAD_A).length === 1, () => "the first reminders", 20000);
+  context.setClock(62);
+  await settle();
+  assert.equal(eyes(workspace, THREAD_B).length, 1);
+  assert.deepEqual(eyes(workspace, THREAD_A), []);
+  assert.equal(eyes(workspace, "demo-channel").length, 1);
+  await stop();
+});
+
+test("a reminder posted into an auto-archived thread reopens it without starting a session", async () => {
+  const context = threadReminderWorkspace();
+  const { workspace } = context;
+  const stop = await threadReminders(context, { supervisorEnv: FAST_POLL });
+  await answeredThread(context, THREAD_A, "thread-question-1");
+  const launched = readState(workspace.stateDir).fixtures.claude.channelServers.length;
+
+  // Discord's inactivity auto-archive: no audit entry names an actor.
+  const thread = { id: THREAD_A, type: 11, parentId: "demo-channel", name: "Side task 111111", ownerId: OWNER_ID,
+    autoArchiveDuration: 10080 };
+  updateState(workspace.stateDir, state => {
+    (state.fixtures.discord.injectedThreads ||= []).push({ ...thread, archived: true, event: "update",
+      previous: { ...thread, archived: false } });
+  });
+  await supervisedThread(workspace, THREAD_A, row => row.state === "stopped" && row.stop_reason === "auto-archive");
+
+  context.setClock(61);
+  await waitFor(() => eyes(workspace, THREAD_A).length === 1, () => "the reminder in the archived thread", 20000);
+  await waitFor(() => readState(workspace.stateDir).fixtures.discord.threads[THREAD_A].archived === false,
+    () => "the thread to reopen", 10000);
+  await settle();
+  const row = await supervisedThread(workspace, THREAD_A);
+  assert.deepEqual([row.state, row.stop_reason], ["stopped", "auto-archive"]);
+  assert.equal(readState(workspace.stateDir).fixtures.claude.channelServers.length, launched);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions["demo_claude-t-111111"], undefined);
+  await stop();
+});
+
+test("after a Codex thread turn ends, root reminds in that thread after the hour and never in the channel", async () => {
+  const context = threadReminderWorkspace("codex");
+  const { workspace } = context;
+  const codex = await startFakeCodexServer(workspace, { port: 29510, deferListen: true,
+    codexHome: path.join(workspace.homeDir, ".codex"), channelId: THREAD_A,
+    threadId: "0199a5c4-7e1b-7c3d-9f2a-4b8e6d1c3a58", bootstrapPlan: { status: "completed", mcpReplyText: "on it" } });
+  const stop = await threadReminders(context, { channelSession: false,
+    supervisorEnv: { CCDM_THREAD_WS_PORT_BASE: "29510" } });
+  createThread(workspace, THREAD_A);
+  await supervisedThread(workspace, THREAD_A);
+  injectDiscordMessage(workspace, { id: "thread-question-1", channelId: THREAD_A, author: owner,
+    content: "please fix the parser" });
+  await supervisedThread(workspace, THREAD_A, row => row.ws_port === 29510);
+  await codex.listen();
+  await waitFor(() => agentReplies(workspace, THREAD_A).length === 1, () => "the Codex thread's reply", 20000);
+  await settle();
+
+  context.setClock(59);
+  await settle();
+  assert.deepEqual(eyes(workspace, THREAD_A), []);
+  context.setClock(61);
+  await waitFor(() => eyes(workspace, THREAD_A).length === 1, () => "the Codex thread's reminder", 20000);
+  assert.equal(eyes(workspace, THREAD_A)[0].authorization, ROOT_AUTH);
+  assert.deepEqual(eyes(workspace, "demo-channel"), []);
+  await stop();
 });

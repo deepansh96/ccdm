@@ -169,7 +169,8 @@ def next_request(db: sqlite3.Connection, usable: dict, now: datetime) -> dict | 
     requested = settings.get("discovery_requested") == "1"
     pass_key = int(now.timestamp()) // PASS_SECONDS
     candidates = []
-    for row in db.execute("SELECT * FROM conversations ORDER BY project").fetchall():
+    # Discovery reads each project's channel; its threads share its status.
+    for row in db.execute("SELECT * FROM conversations WHERE conversation_id=channel_id ORDER BY project").fetchall():
         assignment = usable.get(row["project"])
         status = row["reconciliation_status"]
         if status not in STARTABLE or assignment is None or (
@@ -257,7 +258,8 @@ def record_result(db: sqlite3.Connection, payload: dict, now: datetime, recorded
     if request["request_id"] != payload.get("request_id"):
         return "ignored"
     project, generation = found["project"], found["assignment_generation"]
-    row = db.execute("SELECT * FROM conversations WHERE project=?", (project,)).fetchone()
+    row = db.execute("SELECT * FROM conversations WHERE project=? AND conversation_id=channel_id",
+                     (project,)).fetchone()
     key = (project, generation)
     if row is None or row["assignment_generation"] != generation or row["reconciliation_status"] not in ACTIVE:
         db.execute("DELETE FROM discoveries WHERE project=? AND assignment_generation=?", key)
@@ -392,8 +394,8 @@ def _commit(db: sqlite3.Connection, row: sqlite3.Row, summary: dict, active_turn
             changes.update(response_message_id=anchor["id"], response_at=anchor["at"],
                            due_at=_stamp(_iso(anchor["at"]) + timedelta(hours=1)))
         columns = ",".join(f"{name}=?" for name in changes)
-        db.execute(f"UPDATE conversations SET {columns}, revision=revision+1 WHERE project=?",
-                   (*changes.values(), row["project"]))
+        db.execute(f"UPDATE conversations SET {columns}, revision=revision+1 "
+                   "WHERE project=? AND conversation_id=channel_id", (*changes.values(), row["project"]))
     for source in summary["owner_ids"]:
         db.execute("""INSERT OR IGNORE INTO owner_sources
             (project,conversation_id,assignment_generation,source_message_id,kind) VALUES (?,?,?,?,?)""",
