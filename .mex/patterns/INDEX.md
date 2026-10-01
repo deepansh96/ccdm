@@ -1,7 +1,7 @@
 ---
 name: pattern-index
 description: Task routing index for CCDM patterns.
-last_updated: 2026-09-29
+last_updated: 2026-10-01
 ---
 
 # Pattern Index
@@ -23,3 +23,4 @@ Lookup table for all pattern files in this directory. Check here before starting
 | [setup-mimo-codex.md](setup-mimo-codex.md) | Preparing or rotating an isolated MiMo home for Codex sessions |
 | [setup-deepseek-codex.md](setup-deepseek-codex.md) | Preparing or rotating an isolated DeepSeek Flash home for Codex sessions |
 | [operate-conversation-reminders.md](operate-conversation-reminders.md) | Installing, enabling, inspecting, disabling, or recovering the Conversation Reminder service and its LaunchAgent |
+| [operate-thread-supervisor.md](operate-thread-supervisor.md) | Installing, inspecting, debugging, or operating the Thread Supervisor, its LaunchAgent, and Thread Conversations |

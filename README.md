@@ -561,6 +561,33 @@ This creates a one-use invite and a per-project `ccdm-guest-<project>` role. The
 
 For users already in the server, use `grant` instead of `invite`. Use `revoke` to remove their project guest role, registry entry, and outstanding invites.
 
+## Thread Conversations
+
+Open a public thread under a registered project channel and type a task: it becomes a **Thread Conversation**, a fresh Claude Code or Codex conversation for that project, running in the project checkout. The Router scopes it to that thread alone, so the Channel Conversation and sibling threads never see its traffic. Replies post into the thread through the project's webhook as `<project>-<provider> · N%`. The owner and the channel's guests drive threads without an @mention. Full details are in [docs/thread-supervisor.md](docs/thread-supervisor.md).
+
+- **Create** by hand, with `/thread <name> [--provider claude|codex] [--account <alias>] [--model <model>] [--effort <effort>] [first message…]` in the project channel, from the channel agent's `create_thread` tool, or with `scripts/threads.sh create <project> <name> [flags] [message]`. Created threads auto-archive after a week.
+- **In a thread:**
+  - `/config` shows or changes the thread's provider, account, model and effort. A provider or account change applies only after your ✅.
+  - `/restart` resumes the conversation, and `/clear` starts a fresh one.
+  - `/compact`, `/pause` and `/unpause` work as in a channel.
+  - `/close` archives the thread, stops its session and closes its reminders.
+- **Lifecycle:** your archive, root's archive or `/close` closes the conversation. Discord's inactivity auto-archive only stops the session. Your next message resumes the same conversation, and only your message reopens a closed one.
+- **Capacity:** live thread sessions are capped per provider by the registry's `thread_session_caps` (default `{"claude": 6, "codex": 8}`). At the cap the longest-idle session is paused, or the new one is queued.
+- **Accounts:** a thread may use an alias from `codex_accounts`, or from the new `claude_accounts` map (alias → Claude home).
+- **Operate:**
+  - `scripts/threads.sh list|stop|restart|close` takes a thread name, link or id.
+  - `scripts/stop-session.sh <project> --threads` stops only the thread sessions, and `--all` stops the channel too. A plain `stop-session.sh <project>`, or a channel restart, leaves threads alone.
+  - `node scripts/router.js status` lists thread sessions and the supervisor.
+
+**Install the Thread Supervisor**, the separate service that starts, stops and resumes thread sessions. It holds no Discord credential:
+
+```bash
+scripts/install-thread-supervisor.sh      # read-only preflight, then the com.ccdm.thread-supervisor LaunchAgent
+scripts/thread-supervisor.py status        # worker, caps and bound threads
+```
+
+Root needs four extra permissions, granted once by hand: Create Public Threads, Send Messages in Threads and Manage Threads in the project channels, and View Audit Log on the guild. `router status` reports any that are missing while threads are enabled. The post-merge live smoke steps are in the [operator checklist](docs/thread-supervisor.md#operator-checklist).
+
 ## Creating the root bot
 
 CCDM needs exactly one Discord bot application, used by root and the Router.
@@ -576,6 +603,7 @@ CCDM needs exactly one Discord bot application, used by root and the Router.
    - Attach Files, Add Reactions, Manage Messages
    - Manage Webhooks (Project Identity webhooks)
    - Manage Channels, Manage Roles, Create Instant Invite (registration and guest access)
+   - Create Public Threads, Manage Threads, View Audit Log (Thread Conversations)
 
    Set Integration type to **Guild Install**. Copy the generated URL.
 
@@ -908,7 +936,11 @@ ccdm/
     send-claude-command.sh   # Types /compact or /clear into a Claude tmux session
     start-session.sh         # Start a registered Claude project
     start-codex-session.sh   # Start a registered Codex project
-    stop-session.sh          # Stop any registered project
+    stop-session.sh          # Stop any registered project (--threads, --all)
+    start-thread-session.sh  # Start one Thread Conversation (run by the Thread Supervisor)
+    thread-supervisor.py     # The Thread Supervisor worker and CLI (run, status, enable, disable, preflight)
+    install-thread-supervisor.sh # Install the com.ccdm.thread-supervisor LaunchAgent
+    threads.sh               # List, create, stop, restart, or close Thread Conversations
   skills/
     restart-self.md          # /restart-self skill — agent self-restart
     check-context.md         # /check-context skill — context window usage check

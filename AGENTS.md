@@ -1,7 +1,7 @@
 ---
 name: agents
 description: Always-loaded project anchor for CCDM.
-last_updated: 2026-09-29
+last_updated: 2026-10-01
 ---
 
 # CCDM - Claude Code Discord Manager
@@ -16,6 +16,8 @@ CCDM manages isolated Claude Code and Codex Discord sessions for multiple local 
 - Treat a channel-scoped Discord MCP restriction as the transport boundary for user-visible messages and message tools, not as a ban on explicitly requested root-management work. For authorized registration, deregistration, channel/category creation, webhook, role, permission, or invite tasks, use the documented CCDM scripts/workflow and the root bot's authenticated Discord REST API when required; never use another Discord MCP, broaden the requested targets, or expose credentials. A missing MCP administration tool is not by itself a blocker for these workflows.
 - One session serves one project channel, enforced by the Router; stop existing listeners before starting replacements.
 - When a restart request comes from or names a registered project channel, restart that project's isolated session; restart the root agent only when the user explicitly asks to restart root.
+- Thread Conversations are independent of their channel: "restart <project>" and `scripts/stop-session.sh <project>` act on the channel's session only, unless the request names its threads (`--threads` for threads only, `--all` for both, or `scripts/threads.sh restart <name|link>` for one).
+- Root's thread permissions, Create Public Threads, Send Messages in Threads, Manage Threads and guild View Audit Log, are granted once by hand; never PATCH them from a script. `router status` reports any that are missing.
 - Use `zsh -ic` for tmux launches so user-installed tools resolve correctly.
 - Project Codex conversations can resume across homes/accounts: copy the verified rollout into the target home's matching `sessions/` path, then start with `--resume <thread_uuid>`.
 - Follow `.mex/context/session-management.md` for the stop/copy/account-switch sequence; retain the source rollout, never overwrite a target rollout, and never copy credentials.

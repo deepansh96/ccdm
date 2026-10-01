@@ -26,8 +26,10 @@ Discord (one bot: root) <-> Router (scripts/router.js, holds the only token, lau
     -> Claude project: ccdm-channel-server.js -> Claude Code in project directory
     -> Codex project: codex-bridge.js -> codex app-server in project directory
     -> Conversation Reminder observer (read-only)
+    -> Thread Conversation (thread role, one per live thread): start-thread-session.sh ->
+         ccdm-channel-server.js (thread mode) -> Claude Code, or codex-bridge.js (thread mode) -> codex app-server
     -> Thread Supervisor link (supervisor role) <-> NDJSON stdio <-> Python worker
-  replies -> project webhook ccdm-<project> as "<project>-<type> · N%"
+  replies -> project webhook ccdm-<project> as "<project>-<type> · N%" (in a thread: ?thread_id=, named for the thread's provider)
 ```
 
 The root agent coordinates lifecycle and access. Each project session works only in its registered directory and, through the Router, only in its registered channel (its Session Scope).

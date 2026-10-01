@@ -213,6 +213,26 @@ The one-bot model's executables are covered against the real Router and the Cont
 
 The documentation audit (`documentation-audit.test.js`) keeps the README, `CLAUDE.md.example`, `AGENTS.md`, `registry.example.json`, `setup.sh`, and `.mex` on the one-bot model and free of pool bot management instructions.
 
+## Thread Conversations
+
+Thread Conversation scenarios run on the Router harness. They use:
+
+- the real `scripts/router.js` with the discord.js shim (thread channels with `type` and `parentId`, message types 0/18/19/21, `injectedThreads` for `threadCreate`/`threadUpdate`/`threadDelete`, and `shardResume`);
+- the preload REST fake (webhook execute and edit honouring `thread_id`, thread create/PATCH/list/history, and audit logs with `auditLogEntries`, `auditLogForbidden` and fetch counters);
+- the real Thread Supervisor (`scripts/thread-supervisor.py run` plus its Node link, started by `startThreadSupervisor()` in `support/thread-supervisor.js`), the real `scripts/start-thread-session.sh`, the CCDM channel server and `codex-bridge.js`;
+- the fixture `claude`, `codex` and `tmux` binaries.
+
+Tests drive only Discord inputs and executable surfaces, and assert recorded Discord side effects, Router frames, CLI output and fixture-recorded turns. No test imports supervisor or Router internals. Expected values are literals from the decisions: usernames such as `demo-claude · 42%`, notice texts, caps 6 and 8, and the 10080-minute archive duration.
+
+- `router-threads.test.js` and `router-thread-scope.test.js`: classification, the `thread_session_live` exactly-once ordering, the type-18 drop, and thread `scope_violation`s.
+- `thread-supervisor.test.js`, `thread-claude-session.test.js` and `thread-codex-session.test.js`: binding, the boot handoff with 👀, replies with `thread_id`, start failures, and no token in any launch file.
+- `thread-commands.test.js`, `thread-lifecycle.test.js`, `thread-capacity.test.js`, `thread-reconcile.test.js` and `thread-project-changes.test.js`: commands, archive and resume, caps, reconcile and registry changes.
+- `thread-operations.test.js` and `thread-supervisor-launchagent.test.js`: `threads.sh`, the resolver, thread ids in operator tools, `router status`, and the installer.
+- `conversation-reminder-threads.test.js`: the v8 reminder store and per-thread reminders.
+- `thread-conversation-journey.test.js` is the one cross-component test. With the Router, the Thread Supervisor, a Claude thread session and the Conversation Reminder worker all running, the owner creates a thread and gets a reply, the reminder fires in the thread after the turn, the owner's reply acknowledges it, `/close` archives the thread, closes its reminders and stops the session, and the next owner message reopens it with the same Claude conversation.
+
+The live thread → Claude reply, thread → Codex reply and `/close` checks belong to the Live Smoke Suite's post-merge operator checklist in `docs/thread-supervisor.md`. They are not part of the Default CI Suite.
+
 ## Diagnostics
 
 Command results include command metadata, cwd, redacted environment, stdout, stderr, exit code, signal, fixture state, and file snapshots. Diagnostics redact env values, headers, registry values, `.env` files, command lines, request bodies, OAuth tokens, Discord bot tokens, token-shaped strings, and `Authorization` headers before attaching failure context.
