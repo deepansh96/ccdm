@@ -158,6 +158,25 @@ test("moving a project's channel stops its thread sessions and closes them as pr
   assert.deepEqual(mutations(workspace), before);
 });
 
+test("a project whose path becomes remote: has its thread connections revoked and its threads closed as project-moved", async () => {
+  const workspace = changesWorkspace();
+  const { router } = await supervised(workspace);
+  const threadPid = await liveThread(workspace, THREAD_ID);
+  const before = mutations(workspace);
+
+  await changeRegistry(workspace, router, registry => {
+    registry.projects.demo.path = "remote:mac:/srv/demo";
+  });
+
+  await waitFor(() => /revoked project=demo reason=project_moved/.test(router.stdout),
+    () => `the thread connection's revocation:\n${router.stdout}`, 15000);
+  const row = await threadRow(workspace, THREAD_ID, current => current.state === "closed");
+  assert.deepEqual([row.state, row.stop_reason, row.close_reason], ["closed", null, "project-moved"]);
+  await gone(workspace, threadPid, THREAD_TMUX);
+  assert.equal(await threadConnected(workspace, THREAD_ID), false);
+  assert.deepEqual(mutations(workspace), before);
+});
+
 async function startChannel(workspace) {
   const started = await runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace) });
   assert.equal(started.exitCode, 0, started.stderr || started.stdout);
@@ -249,6 +268,28 @@ test("--all stops the channel session and the thread sessions", async () => {
   await waitFor(() => !alive(channelPid) && tmuxSessions(workspace)[CHANNEL_TMUX] === undefined,
     () => "the channel session to stop", 15000);
   assert.equal(readRegistry(workspace).projects.demo.pid, null);
+  await gone(workspace, threadPid, THREAD_TMUX);
+  const row = await threadRow(workspace, THREAD_ID);
+  assert.deepEqual([row.state, row.stop_reason], ["stopped", "operator"]);
+});
+
+test("--all still stops the thread sessions when the channel stop fails, and exits non-zero", async () => {
+  const workspace = changesWorkspace();
+  await supervised(workspace);
+  await startChannel(workspace);
+  const threadPid = await liveThread(workspace, THREAD_ID);
+  // A live writer holds the registry lock, so the channel stop cannot clear its pid.
+  const lock = `${registryFile(workspace)}.lock`;
+  fs.mkdirSync(lock);
+  fs.writeFileSync(path.join(lock, "owner"), `${process.pid}\n`);
+  fs.writeFileSync(path.join(lock, "nonce"), "held-by-test\n");
+
+  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo", "--all"],
+    env: routerEnv(workspace, { CCDM_REGISTRY_LOCK_TIMEOUT_MS: "500" }), timeoutMs: 30000 });
+  fs.rmSync(lock, { recursive: true, force: true });
+
+  assert.notEqual(stopped.exitCode, 0, stopped.stdout);
+  assert.match(stopped.stdout, /Stopped 1 thread session\(s\) for 'demo'/);
   await gone(workspace, threadPid, THREAD_TMUX);
   const row = await threadRow(workspace, THREAD_ID);
   assert.deepEqual([row.state, row.stop_reason], ["stopped", "operator"]);

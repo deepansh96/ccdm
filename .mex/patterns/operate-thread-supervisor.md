@@ -27,7 +27,7 @@ Read `docs/thread-supervisor.md`. The supervisor is a Router client (`supervisor
 3. Inspect with `scripts/thread-supervisor.py status` (worker, caps, `capacity.invalid`, bound threads) and `node scripts/router.js status` (`thread` lines, `supervisor:` line, `thread_permissions=` per project, `guild permissions:`).
 4. Operate threads with `scripts/threads.sh list [<project>]`, `scripts/threads.sh create <project> <name> [flags] [message]`, and `scripts/threads.sh stop|restart|close [<project>] <name|link|id>`.
 5. To stop a project's thread sessions, run `scripts/stop-session.sh <project> --threads`; `--all` also stops the channel. A plain `stop-session.sh <project>` or "restart <project>" touches the channel only.
-6. To debug in the foreground, run `scripts/thread-supervisor.py disable`, then `scripts/thread-supervisor.py run`; `enable` and the installer restore supervision.
+6. To debug in the foreground, run `scripts/thread-supervisor.py disable`, then `scripts/thread-supervisor.py run`; `enable` clears the disabled marker but starts nothing, so rerun `scripts/install-thread-supervisor.sh` after it to relaunch the LaunchAgent.
 
 ## Gotchas
 - Never edit `threads.sqlite3` by hand; use `threads.sh` or Discord actions (archive, delete, a new owner message).

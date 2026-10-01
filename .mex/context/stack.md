@@ -12,13 +12,13 @@ edges:
     condition: when the reasoning behind a tech choice is needed
   - target: context/conventions.md
     condition: when understanding how to use a technology in this codebase
-last_updated: 2026-09-07
+last_updated: 2026-10-02
 ---
 
 # Stack
 
 ## Core Technologies
-- `Node.js 22+` - bridge, Discord utilities, and E2E tests.
+- `Node.js 22.5+` - bridge, Discord utilities, conversation resolver (`node:sqlite`), and E2E tests.
 - `JavaScript (CommonJS)` - repository Node scripts and tests.
 - `zsh` - session lifecycle scripts; login/interactive mode is required for user tool paths.
 - `Python 3` - small embedded process inspection and JSON update helpers in shell scripts, plus the Usage Stats collector/history writer and renderer integration.
@@ -40,4 +40,4 @@ last_updated: 2026-09-07
 - No manual Codex Discord MCP config; `codex-bridge.js` registers it per session.
 
 ## Version Constraints
-`package.json` requires Node.js 22 or newer. Mex stable v0.6.3 requires Node.js 20 or newer and is run with `npx mex-agent`.
+`package.json` requires Node.js 22.5 or newer (`node:sqlite`, used by the conversation resolver). Mex stable v0.6.3 requires Node.js 20 or newer and is run with `npx mex-agent`.

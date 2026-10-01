@@ -82,6 +82,7 @@ Crashed, failed and operator-stopped sessions never restart automatically.
 
 - **Deregistration:** stops each thread session and closes the thread (`closed/deregistered`).
 - **Channel move:** closes the threads (`closed/project-moved`), because the moved webhook cannot post into the old channel's threads.
+- **Path set to `remote:`:** the project now runs on another machine, which has no thread sessions, so its threads close the same way (`closed/project-moved`).
 - **Guest changes:** apply on the next message.
 - **Channel maintenance:** `restart <project>`, `start-session.sh <project>`, `stop-session.sh <project>` and a project key rotation act on the Channel Conversation only. `stop-session.sh <project> --threads` stops the thread sessions only, and `--all` stops both.
 
@@ -111,7 +112,7 @@ The worker writes a fresh `keys/.supervisor.key` in the Router state on each sta
 
 - **Install** with `scripts/install-thread-supervisor.sh`. It runs the read-only `preflight` (interpreters, Router reachable, registry owner and guild, store) before touching launchd. It then renders a secret-free `com.ccdm.thread-supervisor` plist running `run --supervised`, relaunches only after an unsuccessful exit, and restores the prior plist if a load fails.
 - **Inspect** with `scripts/thread-supervisor.py status`. It shows the worker, the caps (and any invalid value) and every bound thread with its state.
-- **Disable / enable** with `scripts/thread-supervisor.py disable` and `enable`. While disabled, the supervised worker exits and launchd does not relaunch it.
+- **Disable / enable** with `scripts/thread-supervisor.py disable` and `enable`. While disabled, the supervised worker exits and launchd does not relaunch it. `enable` only clears the disabled marker; it does not start the worker. Rerun `scripts/install-thread-supervisor.sh` afterwards to relaunch the LaunchAgent.
 - **Debug in the foreground** with `scripts/thread-supervisor.py disable`, then `scripts/thread-supervisor.py run`. A second worker exits with status 2 while the lock is held.
 - **Operate threads** with `scripts/threads.sh list [<project>]` and `scripts/threads.sh stop|restart|close [<project>] <name|link|id>`. `send-claude-command.sh`, guest access (which acts on the parent project) and `export-discord-range.js` also accept a thread id.
 - **Router view:** `node scripts/router.js status` lists each `thread` connection, the supervisor line, and root's missing thread permissions while threads are enabled.

@@ -224,7 +224,7 @@ def on_control(context, frame: dict) -> None:
     thread_id = request.get("thread_id") if request.get("op") == "stop_thread" else None
     launching = context.boots.get(thread_id) if isinstance(thread_id, str) else None
     if launching and not launching.launched:
-        launching.deferred = frame
+        launching.deferred_stops.append(frame)
         return
     try:
         response = handle(context, request)

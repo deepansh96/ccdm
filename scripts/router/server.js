@@ -438,14 +438,15 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     // connections, listener and op-only alike, as a `scope_changed` event, so
     // the adapter retargets its inbound filter and tool defaults. Root's own
     // connections are not projects and keep their place. A thread connection
-    // never changes scope: a moved parent channel revokes it, and a changed
+    // never changes scope: a moved parent channel, or a parent now on another
+    // machine (`remote:`, which has no threads), revokes it, and a changed
     // webhook only updates its route.
     refreshRoutes() {
       const { projects } = getTable();
       for (const connection of [...threadSessions.values(), ...threadOps]) {
         const route = projects.get(connection.route.project);
         if (!route) revoke(connection, "deregistered");
-        else if (route.channel_id !== connection.route.parent_channel_id) revoke(connection, "project_moved");
+        else if (route.channel_id !== connection.route.parent_channel_id || route.remote) revoke(connection, "project_moved");
         else connection.route = { ...connection.route, webhook_id: route.webhook_id };
       }
       for (const connection of [...sessions.values(), ...opConnections]) {

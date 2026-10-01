@@ -19,7 +19,7 @@ messages until the queue starts it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import itertools
 import json
 import os
@@ -55,8 +55,22 @@ class Boot:
     starter: str
     live: bool = False
     launched: bool = False
-    # A `thread_command` (or an operator's `stop_thread`) that arrived while the launcher ran, replayed when it exits.
+    # The latest `thread_command` that arrived while the launcher ran, replayed when it exits.
     deferred: dict | None = None
+    # Every operator `stop_thread` that arrived meanwhile, each replayed (and
+    # so answered) after the deferred command, whatever else happens.
+    deferred_stops: list = field(default_factory=list)
+
+
+def drop(context, thread_id: str) -> Boot | None:
+    """Forget a thread's boot. Its deferred operator stops are replayed, never
+    lost, since each has a client waiting on its answer."""
+    boot = context.boots.pop(thread_id, None)
+    if boot:
+        stops, boot.deferred_stops = boot.deferred_stops, []
+        for frame in stops:
+            context.link.post(frame)
+    return boot
 
 
 def boot_timeout_seconds() -> float:
@@ -223,7 +237,7 @@ def on_session_live(context, event: dict) -> None:
     store.finish_boot(context.db, thread_id, "live")
     boot.live = True
     if boot.launched:
-        context.boots.pop(thread_id, None)
+        drop(context, thread_id)
     _react(context, thread_id, boot.trigger_message_id, remove=True)
 
 
@@ -232,11 +246,16 @@ def on_launch_exit(context, frame: dict) -> None:
     boot = context.boots.get(thread_id)
     if not boot or boot.id != frame.get("boot_id"):
         return
+    # The operator's stops go last, after the deferred in-thread command, so
+    # an explicit stop is what holds.
+    stops, boot.deferred_stops = boot.deferred_stops, []
     try:
         _launch_exited(context, thread_id, boot, frame)
     finally:
         if boot.deferred:
             context.link.post(boot.deferred)
+        for stop in stops:
+            context.link.post(stop)
 
 
 def _launch_exited(context, thread_id: str, boot: Boot, frame: dict) -> None:
@@ -256,11 +275,11 @@ def _launch_exited(context, thread_id: str, boot: Boot, frame: dict) -> None:
                  provider_home=result.get("provider_home") or (row["provider_home"] if row else None))
     boot.launched = True
     if boot.live:
-        context.boots.pop(thread_id, None)
+        drop(context, thread_id)
 
 
 def fail(context, thread_id: str, boot: Boot, reason: str) -> None:
-    context.boots.pop(thread_id, None)
+    drop(context, thread_id)
     store.finish_boot(context.db, thread_id, "stopped", "start-failed")
     _react(context, thread_id, boot.trigger_message_id, remove=True)
     line = " ".join(reason.split())

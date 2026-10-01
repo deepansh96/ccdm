@@ -108,8 +108,10 @@ def stop_session(context, row) -> None:
     """Stop a thread's session by its `.thread-<id>.key` path, never by name
     patterns a project or sibling session could match; then its own tmux
     session and key go."""
+    from . import boot  # boot imports capacity, which imports this module.
+
     thread_id = row["thread_id"]
-    context.boots.pop(thread_id, None)
+    boot.drop(context, thread_id)
     kill_listeners(key_path(thread_id))
     if row["runtime_tmux"]:
         subprocess.run(["tmux", "kill-session", "-t", f"={row['runtime_tmux']}"], capture_output=True)

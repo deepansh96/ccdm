@@ -21,7 +21,7 @@ last_updated: 2026-09-29
 # Setup
 
 ## Prerequisites
-- Node.js 22+ and npm.
+- Node.js 22.5+ and npm.
 - Claude Code CLI and/or Codex CLI, authenticated for the sessions being run.
 - `tmux`, `zsh`, Python 3, and `jq`.
 - The dashboard E2E tests require Pillow in the `python3` environment. CI provisions Python 3.11 and installs Pillow before `npm test`.

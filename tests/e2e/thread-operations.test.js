@@ -208,6 +208,34 @@ test("threads.sh stop by name and by link stops only that thread's session as st
   }
 });
 
+test("a threads.sh stop and an in-thread /restart that both arrive during a boot are each carried out once the launcher exits", async () => {
+  const workspace = operationsWorkspace();
+  await routerWithWebhooks(workspace, ["demo", "beta"]);
+  // The launch hangs until the shortened boot timeout fails it.
+  await startThreadSupervisor(workspace, { env: { CCDM_THREAD_BOOT_TIMEOUT_S: "4" } });
+  updateState(workspace.stateDir, state => {
+    state.fixtures.tmux.devChannelPrompt = "never";
+  });
+  await boundThread(workspace, THREAD_ID, "fix-login");
+  injectDiscordMessage(workspace, { id: "boot-message", channelId: THREAD_ID, content: "please fix the parser",
+    author: OWNER });
+  await threadRow(workspace, THREAD_ID, row => row.state === "booting");
+
+  const started = Date.now();
+  const stopping = runScript(workspace, "scripts/threads.sh", { args: ["stop", THREAD_ID], env: supervisorEnv(workspace),
+    timeoutMs: 90000 });
+  // The stop is waiting on the launcher before the /restart arrives.
+  await new Promise(resolve => setTimeout(resolve, 1500));
+  injectDiscordMessage(workspace, { id: "restart-command", channelId: THREAD_ID, content: "/restart", author: OWNER });
+
+  const stopped = await stopping;
+  assert.equal(stopped.exitCode, 0, stopped.stderr || stopped.stdout);
+  assert.ok(Date.now() - started < 30000, "the stop was answered after the launch, not at the client's timeout");
+  // The /restart was not dropped either: it relaunched the thread.
+  await waitFor(() => notices(workspace, THREAD_ID).some(notice => notice.content === "Restarting this thread's session."),
+    () => `the /restart notice: ${JSON.stringify(notices(workspace, THREAD_ID))}`, 15000);
+});
+
 test("threads.sh restart by name and by link relaunches the thread with --resume and the same id, as /restart does", async () => {
   const workspace = operationsWorkspace();
   await supervised(workspace);

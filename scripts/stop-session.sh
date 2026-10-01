@@ -35,6 +35,20 @@ if [[ "$MODE" == "--threads" ]]; then
   exit $?
 fi
 
+# --all: the thread sessions are stopped even when the channel stop fails,
+# and the run still exits non-zero for that failure.
+if [[ "$MODE" == "--all" ]]; then
+  channel_status=0
+  /bin/zsh "$SCRIPT_DIR/stop-session.sh" "$PROJECT" || channel_status=$?
+  threads_status=0
+  stop_threads || threads_status=$?
+  if (( channel_status != 0 )); then
+    echo "Stopping the channel session of '$PROJECT' failed (exit $channel_status); its thread sessions were still stopped." >&2
+    exit "$channel_status"
+  fi
+  exit "$threads_status"
+fi
+
 collect_tree() {
   local pid="$1"
   [[ "$pid" == <-> ]] || return 0
@@ -394,7 +408,3 @@ fi
 python3 "$SCRIPT_DIR/registry-update.py" set-project-fields "$REGISTRY" "$PROJECT" '{"session_id": null, "pid": null}'
 
 echo "Stopped Discord session '$PROJECT'"
-
-if [[ "$MODE" == "--all" ]]; then
-  stop_threads
-fi

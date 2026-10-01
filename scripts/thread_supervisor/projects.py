@@ -1,8 +1,9 @@
 """Project changes: the worker watches the registry for deregistrations and channel moves.
 
 A project that leaves the registry gets each of its threads' sessions stopped
-and the row `closed/deregistered`; a project whose `channel_id` changed gets
-`closed/project-moved` (the Router has revoked their connections with
+and the row `closed/deregistered`; a project whose `channel_id` changed, or
+whose `path` became `remote:` (another machine, with no thread sessions),
+gets `closed/project-moved` (the Router has revoked their connections with
 `project_moved`). Neither touches Discord: the channel may be gone. Channels
 are compared with the registry this worker last read, so a move while the
 worker was down goes unseen.
@@ -47,12 +48,14 @@ def on_registry(context, _frame: dict | None = None) -> None:
         return _log(f"the registry could not be read: {error}")
     projects = current.get("projects") if isinstance(current.get("projects"), dict) else {}
     channels = {name: entry.get("channel_id") for name, entry in projects.items() if isinstance(entry, dict)}
+    remote = {name for name, entry in projects.items()
+              if isinstance(entry, dict) and str(entry.get("path") or "").startswith("remote:")}
     known = context.watch.channels
     for row in context.db.execute("SELECT * FROM threads WHERE state != 'closed'").fetchall():
         project = row["project"]
         if project not in channels:
             reason = "deregistered"
-        elif project in known and known[project] != channels[project]:
+        elif project in remote or (project in known and known[project] != channels[project]):
             reason = "project-moved"
         else:
             continue

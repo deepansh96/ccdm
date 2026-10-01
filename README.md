@@ -45,7 +45,7 @@ Each session has a **Session Scope**: the one channel it may read and act in. Th
 | `tmux` | Yes | `brew install tmux` / `apt install tmux` |
 | `zsh` | Yes | Default on macOS / `apt install zsh` on Linux |
 | `python3` | Yes | `brew install python3` / `apt install python3` |
-| Node.js 22+ | Yes | `brew install node`, then `npm install` in this repo (the Router, channel server, and Codex bridge) |
+| Node.js 22.5+ | Yes | `brew install node`, then `npm install` in this repo (the Router, channel server, and Codex bridge) |
 | `jq` | Yes | `brew install jq` / `apt install jq` |
 | `whisper` | Optional | `pip install openai-whisper` (for voice messages) |
 
