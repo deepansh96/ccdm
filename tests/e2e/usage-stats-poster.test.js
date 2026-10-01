@@ -1842,6 +1842,8 @@ function installDeepseekUsageHelper(workspace) {
   return true;
 }
 
+const SEEDED_SESSION_STAMP = new Date(Date.now() - 1000).toISOString();
+
 function seedDeepseekHome(workspace, alias, options = {}) {
   const home = path.join(workspace.homeDir, alias);
   fs.mkdirSync(home, { recursive: true });
@@ -1854,7 +1856,11 @@ function seedDeepseekHome(workspace, alias, options = {}) {
     fs.chmodSync(path.join(home, "api-key"), options.keyMode ?? 0o600);
   }
   if (options.session) {
-    const sessionDir = path.join(home, "sessions", "2026", "09", "22");
+    // Monthly totals count only the reporting month, so seed the current UTC
+    // month unless the test pins its clock. One stamp per run keeps copied
+    // rollouts identical.
+    const stamp = options.stamp ?? SEEDED_SESSION_STAMP;
+    const sessionDir = path.join(home, "sessions", stamp.slice(0, 4), stamp.slice(5, 7), stamp.slice(8, 10));
     fs.mkdirSync(sessionDir, { recursive: true });
     fs.writeFileSync(
       path.join(sessionDir, "rollout-fixture-1.jsonl"),
@@ -1863,7 +1869,7 @@ function seedDeepseekHome(workspace, alias, options = {}) {
         JSON.stringify({ type: "turn_context", payload: { model: "deepseek-flash", turn_id: "turn-1" } }),
         JSON.stringify({
           type: "event_msg",
-          timestamp: "2026-09-22T10:00:00Z",
+          timestamp: stamp,
           payload: {
             type: "token_count",
             info: {
@@ -2507,6 +2513,7 @@ test("scheduled poster posts a referenced DeepSeek block with the inline used-ba
     marker: { version: 1, provider: "deepseek" },
     key: "sk-fixture-deepseek-key",
     session: true,
+    stamp: "2026-09-22T10:00:00Z",
   });
   const historyPath = path.join(workspace.homeDir, "Library", "Application Support", "CCDM", "usage-stats", "history.sqlite3");
   seedPosterWorkspace(workspace, api.baseUrl, {
