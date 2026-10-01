@@ -6,7 +6,13 @@ One JSON request line in, one JSON response line out:
 where code `invalid` means the request created nothing.
 `{"op": "stop_threads", "project"}` stops each of the project's booting, live
 and queued thread sessions as `stopped/operator`, and answers
-`{"ok": true, "result": {"stopped": [thread ids]}}`. The server thread
+`{"ok": true, "result": {"stopped": [thread ids]}}`. `{"op": "list", "project"}`
+answers `{"ok": true, "result": {"threads": [...]}}`, each with its provider
+and model, state, stop or close reason and idle seconds; `project` may be
+null for every project. `{"op": "stop_thread", "thread_id"}` stops one
+thread's session as `stopped/operator`, and `restart_thread` and
+`close_thread` run its `/restart` and `/close` as the owner, answering
+`{"ok": true, "result": {"thread_id", "project", "name", ...}}`. The server thread
 hands each request to the worker loop as an internal `control` frame, so the
 store and the Router link are only ever used from that loop.
 """
@@ -21,7 +27,7 @@ import queue
 import socket
 import threading
 
-from . import creation, lifecycle, store
+from . import capacity, commands, creation, lifecycle, registry, store
 
 
 SOCKET_NAME = "control.sock"
@@ -121,19 +127,83 @@ def stop_threads(context, project) -> dict:
     rows = context.db.execute("SELECT * FROM threads WHERE project=? AND state IN ('booting', 'live', 'queued')",
                               (project,)).fetchall()
     for row in rows:
-        context.archive_polls.pop(row["thread_id"], None)
-        context.queued.pop(row["thread_id"], None)
-        lifecycle.stop_session(context, row)
-        store.finish_boot(context.db, row["thread_id"], "stopped", "operator")
+        _operator_stop(context, row)
         stopped.append(row["thread_id"])
     return {"ok": True, "result": {"stopped": stopped}}
 
 
+def _operator_stop(context, row) -> None:
+    context.archive_polls.pop(row["thread_id"], None)
+    context.queued.pop(row["thread_id"], None)
+    lifecycle.stop_session(context, row)
+    store.finish_boot(context.db, row["thread_id"], "stopped", "operator")
+
+
+def list_threads(context, project) -> dict:
+    """Every bound thread, or ``project``'s: what it runs with (or would), its state and how long it has idled."""
+    current = registry.load(context.project_root)
+    if project is not None and not registry.project(current, project):
+        return _error("invalid", f"unknown project {project!r}")
+    threads = []
+    for row in context.db.execute("SELECT * FROM threads ORDER BY project, created_at, thread_id"):
+        if project is not None and row["project"] != project:
+            continue
+        settings = registry.resolved_settings(registry.project(current, row["project"]) or {}, row)
+        running = row["state"] in ("booting", "live", "queued")
+        last = max(stamp for stamp in (row["created_at"], row["last_owner_activity_at"], row["last_agent_reply_at"])
+                   if stamp)
+        threads.append({
+            "project": row["project"], "name": row["name"], "thread_id": row["thread_id"],
+            "provider": (row["resolved_provider"] if running else None) or settings["provider"],
+            "model": (row["resolved_model"] if running else None) or settings["model"],
+            "state": row["state"], "reason": row["stop_reason"] or row["close_reason"],
+            "idle_seconds": max(0, int(capacity.age_seconds(last))),
+        })
+    return {"ok": True, "result": {"threads": threads}}
+
+
+def _summary(context, thread_id: str, **extra) -> dict:
+    row = store.thread(context.db, thread_id)
+    return {"ok": True, "result": {"thread_id": thread_id, "project": row["project"], "name": row["name"],
+                                   "state": row["state"], **extra}}
+
+
+def stop_thread(context, row) -> dict:
+    """An operator stop of one thread's running or queued session; any other thread is left as it is."""
+    running = row["state"] in ("booting", "live", "queued")
+    if running:
+        _operator_stop(context, row)
+    return _summary(context, row["thread_id"], stopped=running)
+
+
+def _as_owner(command: str):
+    """The thread's in-thread command, as the owner sends it; a launch still
+    running defers it as it would the message."""
+    def run(context, row) -> dict:
+        commands.on_thread_command(context, {"type": "event", "event": "thread_command", "command": command,
+                                             "thread_id": row["thread_id"], "project": row["project"],
+                                             "author": {"is_owner": True}, "message_id": None})
+        return _summary(context, row["thread_id"])
+    return run
+
+
+THREAD_OPS = {"stop_thread": stop_thread, "restart_thread": _as_owner("restart"), "close_thread": _as_owner("close")}
+
+
 def handle(context, request: dict) -> dict:
-    if request.get("op") == "stop_threads":
+    op = request.get("op")
+    if op == "stop_threads":
         return stop_threads(context, request.get("project"))
-    if request.get("op") != "create":
-        return _error("invalid", f"unknown op {request.get('op')!r}")
+    if op == "list":
+        return list_threads(context, request.get("project"))
+    if op in THREAD_OPS:
+        thread_id = request.get("thread_id")
+        row = store.thread(context.db, thread_id) if isinstance(thread_id, str) else None
+        if not row:
+            return _error("invalid", f"no bound thread {thread_id!r}")
+        return THREAD_OPS[op](context, row)
+    if op != "create":
+        return _error("invalid", f"unknown op {op!r}")
     flags = request.get("flags") if isinstance(request.get("flags"), dict) else {}
     try:
         result = creation.create(context, request.get("project"), request.get("name"), flags,
@@ -146,9 +216,18 @@ def handle(context, request: dict) -> dict:
 
 
 def on_control(context, frame: dict) -> None:
-    """The worker loop's side: answer one control request, always."""
+    """The worker loop's side: answer one control request, always. A
+    `stop_thread` that arrives while the thread's launcher still runs waits
+    for it to exit, as an in-thread command does, so the stop finds the
+    session's tmux."""
+    request = frame.get("request") or {}
+    thread_id = request.get("thread_id") if request.get("op") == "stop_thread" else None
+    launching = context.boots.get(thread_id) if isinstance(thread_id, str) else None
+    if launching and not launching.launched:
+        launching.deferred = frame
+        return
     try:
-        response = handle(context, frame.get("request") or {})
+        response = handle(context, request)
     except Exception as error:  # The client must hear back, whatever failed.
         response = _error("failed", str(error))
     frame["reply"](response)

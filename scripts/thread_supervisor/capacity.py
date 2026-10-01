@@ -80,7 +80,7 @@ def _last_activity(row) -> str:
     return row["last_owner_activity_at"] or row["created_at"]
 
 
-def _age_seconds(stamp: str) -> float:
+def age_seconds(stamp: str) -> float:
     try:
         moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
     except ValueError:
@@ -107,7 +107,7 @@ def _victim(rows):
     """The idle live row whose owner activity is oldest."""
     threshold = idle_seconds()
     idle = [row for row in rows if row["state"] == "live" and not _turn_running(row)
-            and _age_seconds(_last_activity(row)) >= threshold]
+            and age_seconds(_last_activity(row)) >= threshold]
     return min(idle, key=_last_activity, default=None)
 
 

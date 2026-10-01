@@ -55,7 +55,7 @@ class Boot:
     starter: str
     live: bool = False
     launched: bool = False
-    # A `thread_command` that arrived while the launcher ran, replayed when it exits.
+    # A `thread_command` (or an operator's `stop_thread`) that arrived while the launcher ran, replayed when it exits.
     deferred: dict | None = None
 
 
