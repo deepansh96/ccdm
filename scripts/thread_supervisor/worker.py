@@ -56,7 +56,8 @@ def write_health(state_dir: Path, link: Link, router: str) -> None:
     write_private(health_path(state_dir), json.dumps({"pid": os.getpid(), "link_pid": link.pid, "router": router}))
 
 
-def run(project_root: Path, state_dir: Path) -> None:
+def run(project_root: Path, state_dir: Path, disabled=None) -> None:
+    """The worker loop; ``disabled``, when given, is polled and ends the loop once true."""
     private_directory(state_dir)
     path = lock_path(state_dir)
     with path.open("a+") as lock:
@@ -82,7 +83,7 @@ def run(project_root: Path, state_dir: Path) -> None:
             control = ControlServer(state_dir, link.post)
             write_health(state_dir, link, "connecting")
             connected = False
-            while not stopping:
+            while not stopping and not (disabled and disabled()):
                 # Registry changes are handled while connected, so the queue they free can start.
                 if connected and context.watch.changed():
                     dispatch(context, {"type": "internal", "event": "registry"})

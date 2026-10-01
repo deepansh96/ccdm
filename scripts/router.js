@@ -11,6 +11,8 @@
 //   scripts/router.js delete-webhook <project>  delete the project's webhook and its token
 //   scripts/router.js probe <project>         post a connection notice through the project's webhook
 //   scripts/router.js migrate-root-config     copy root channels and users from root access.json
+const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const { createAttachmentCache } = require("./router/attachments.js");
@@ -28,6 +30,9 @@ const { createRouterServer } = require("./router/server.js");
 const { deleteWebhook, ensureWebhook } = require("./router/webhooks.js");
 
 const OFFLINE_EMOJI = "💤";
+// Thread bits granted at the guild rather than in a project channel.
+const GUILD_THREAD_PERMISSIONS = ["ViewAuditLog"];
+const THREAD_SUPERVISOR_PLIST = path.join("Library", "LaunchAgents", "com.ccdm.thread-supervisor.plist");
 
 function log(line) {
   console.log(`[router] ${line}`);
@@ -204,6 +209,10 @@ async function status(json = false) {
   } finally {
     client.close();
   }
+  result.threads_enabled = threadsEnabled(result);
+  if (!result.threads_enabled) {
+    for (const project of result.projects) delete project.missing_thread_permissions;
+  }
   if (json) return console.log(JSON.stringify(result));
   console.log(`gateway: ${result.gateway}`);
   console.log(`registry loaded: ${result.registry_loaded_at}`);
@@ -220,12 +229,38 @@ async function status(json = false) {
   for (const project of result.projects) {
     const missing = project.missing_permissions;
     const access = missing === null ? "unknown" : missing.length ? `missing ${missing.join(",")}` : "ok";
-    console.log(`  ${project.project} channel=${project.channel_id} webhook=${project.webhook ? "present" : "missing"} root_permissions=${access}`);
+    const threads = result.threads_enabled ? ` thread_permissions=${permissionState(project.missing_thread_permissions,
+      flag => !GUILD_THREAD_PERMISSIONS.includes(flag))}` : "";
+    console.log(`  ${project.project} channel=${project.channel_id} webhook=${project.webhook ? "present" : "missing"} root_permissions=${access}${threads}`);
+  }
+  if (result.threads_enabled) {
+    // Guild permissions read the same through every channel; any channel's answer is the guild's.
+    const known = result.projects.find(project => project.missing_thread_permissions);
+    const guild = known ? permissionState(known.missing_thread_permissions, flag => GUILD_THREAD_PERMISSIONS.includes(flag))
+      : "unknown";
+    console.log(`guild permissions: ${guild}`);
   }
   console.log(`scope violations: ${result.scope_violations.length}`);
   for (const violation of result.scope_violations) {
     console.log(`  ${violation.at} project=${violation.project} op=${violation.op} target=${violation.target}`);
   }
+}
+
+// Thread Conversations are enabled once the supervisor is installed, configured, or connected.
+function threadsEnabled(result) {
+  if (result.supervisor?.connected || fs.existsSync(path.join(os.homedir(), THREAD_SUPERVISOR_PLIST))) return true;
+  try {
+    return Object.hasOwn(JSON.parse(fs.readFileSync(registryPath(), "utf8")), "thread_session_caps");
+  } catch {
+    return false;
+  }
+}
+
+// `ok`, `missing <flags>`, or `unknown` before the gateway can check, for the flags `pick` keeps.
+function permissionState(missing, pick) {
+  if (!missing) return "unknown";
+  const flags = missing.filter(pick);
+  return flags.length ? `missing ${flags.join(",")}` : "ok";
 }
 
 async function preflightCommand() {

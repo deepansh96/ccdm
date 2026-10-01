@@ -197,6 +197,8 @@ The Conversation Reminder scenarios drive `scripts/conversation-reminder-service
 - The fake Gateway hands each injected message to only one client. Scenarios that need both a coding adapter and the root observer run the adapter while the worker is stopped. The durable event ledger carries its events into the worker's restart reconciliation.
 - `conversation-reminder-launchagent.test.js` installs through the `launchctl` fixture, then launches the rendered plist's `ProgramArguments` with its rendered environment. It keeps the harness fixture `PATH` so the worker cannot fall through to host tools. It proves the single-worker lock across supervised and foreground launches, disable and re-enable, private state, and the both-provider reply, reminder, and reply-or-close workflow with stopped coding agents. No scenario loads a real LaunchAgent or contacts Discord.
 
+`thread-supervisor-launchagent.test.js` installs `scripts/install-thread-supervisor.sh` through the `launchctl` fixture and launches the rendered `ProgramArguments` against the harness Router. It covers `enable`, `disable`, `status`, `preflight`, the foreground `run` after `disable`, and `router status` thread permission lines, with root's permissions denied by literal name through the fake's `permissionDenials`.
+
 ## One-Bot Router Surfaces
 
 The one-bot model's executables are covered against the real Router and the Contract-Checking Fake Discord (webhooks, `webhook_id` provenance, scripted 429s):
