@@ -53,6 +53,8 @@ class Boot:
     starter: str
     live: bool = False
     launched: bool = False
+    # A `thread_command` that arrived while the launcher ran, replayed when it exits.
+    deferred: dict | None = None
 
 
 def boot_timeout_seconds() -> float:
@@ -207,6 +209,14 @@ def on_launch_exit(context, frame: dict) -> None:
     boot = context.boots.get(thread_id)
     if not boot or boot.id != frame.get("boot_id"):
         return
+    try:
+        _launch_exited(context, thread_id, boot, frame)
+    finally:
+        if boot.deferred:
+            context.link.post(boot.deferred)
+
+
+def _launch_exited(context, thread_id: str, boot: Boot, frame: dict) -> None:
     if frame.get("returncode") != 0:
         lines = [line.strip() for line in str(frame.get("stderr") or "").splitlines() if line.strip()]
         return fail(context, thread_id, boot, lines[-1] if lines else f"the launcher exited {frame.get('returncode')}")

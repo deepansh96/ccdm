@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { collectProcess, injectDiscordMessage } from "./support/bridge.js";
+import { collectProcess, injectDiscordMessage, startFakeCodexServer } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import { OWNER_ID, ROOT_TOKEN, connectSession, createRouterWorkspace, routerEnv, routerRegistry,
   routerWithWebhooks, waitFor } from "./support/router.js";
@@ -357,4 +357,217 @@ test("a Codex channel session's create_thread through the Discord MCP creates th
   const elsewhere = await codexMcpCall(workspace, { name: "elsewhere", channel_id: "demo-channel" });
   assert.match(elsewhere.result.content[0].text, /scope_violation/);
   assert.equal(threadCreates(workspace).length, 1);
+});
+
+// In-thread management commands: each affects only its own thread. Two
+// user-created threads under `demo`, beside its Channel Conversation.
+const THREAD_ID = "1700000000000223344";
+const THREAD_TMUX = "demo_claude-t-223344";
+const SIBLING_ID = "1700000000000556677";
+const SIBLING_TMUX = "demo_claude-t-556677";
+const CHANNEL_TMUX = "demo_claude";
+const userThread = id => ({ id, type: 11, parentId: "demo-channel", name: `thread ${id.slice(-6)}`, ownerId: OWNER_ID,
+  autoArchiveDuration: 10080 });
+
+function threadMessage(workspace, threadId, id, content, author = { id: OWNER_ID, username: "Owner" }) {
+  injectDiscordMessage(workspace, { id, channelId: threadId, content, author });
+}
+
+const GUEST = { id: "guest-id", username: "Guest" };
+const tmuxSessions = workspace => readState(workspace.stateDir).fixtures.tmux.sessions;
+// Claude launches by whose key they carry: a thread's `.thread-<id>.key`, or the channel's.
+const launches = (workspace, threadId) => claude(workspace).invocations.filter(invocation =>
+  threadId ? invocation.env.CCDM_ROUTER_KEY_FILE?.endsWith(`.thread-${threadId}.key`)
+    : !invocation.env.CCDM_ROUTER_KEY_FILE?.includes(".thread-"));
+const resumeArg = invocation => {
+  const index = invocation.args.indexOf("--resume");
+  return index < 0 ? null : invocation.args[index + 1].replace(/^'|'$/g, "");
+};
+const alive = pid => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+const replies = (workspace, threadId) => posts(workspace, threadId).filter(message => message.webhookId);
+
+// Claude keeps a conversation's transcript at
+// <home>/projects/<cwd, each non-alphanumeric character as "-">/<id>.jsonl.
+function writeClaudeTranscript(workspace, sessionId) {
+  const dir = path.join(workspace.homeDir, ".claude", "projects", workspace.tmpDir.replace(/[^A-Za-z0-9]/g, "-"));
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${sessionId}.jsonl`), "{}\n");
+}
+
+async function liveThread(workspace, threadId) {
+  updateState(workspace.stateDir, state => {
+    (state.fixtures.discord.injectedThreads ||= []).push({ ...userThread(threadId), event: "create" });
+  });
+  await threadRow(workspace, threadId);
+  threadMessage(workspace, threadId, `boot-${threadId}`, "please fix the parser");
+  await threadRow(workspace, threadId, current => current.state === "live" && current.provider_conversation_id != null);
+  await waitFor(() => replies(workspace, threadId).length === 1, () => `${threadId}'s bootstrap reply`, 15000);
+}
+
+// The channel session and two live threads, before any command.
+async function threeSessions(workspace) {
+  await supervised(workspace);
+  const started = await runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace) });
+  assert.equal(started.exitCode, 0, started.stderr || started.stdout);
+  await liveThread(workspace, THREAD_ID);
+  await liveThread(workspace, SIBLING_ID);
+  return { siblingPid: tmuxSessions(workspace)[SIBLING_TMUX].pid, channelPid: tmuxSessions(workspace)[CHANNEL_TMUX].pid };
+}
+
+function assertUntouched(workspace, { siblingPid, channelPid }) {
+  assert.equal(launches(workspace, SIBLING_ID).length, 1);
+  assert.equal(tmuxSessions(workspace)[SIBLING_TMUX].pid, siblingPid);
+  assert.ok(alive(siblingPid), "the sibling thread's listener still runs");
+  assert.equal(launches(workspace, null).length, 1);
+  assert.equal(tmuxSessions(workspace)[CHANNEL_TMUX].pid, channelPid);
+  assert.ok(alive(channelPid), "the channel session still runs");
+}
+
+const commandNotified = (workspace, command) => notifications(workspace)
+  .some(item => new RegExp(`(^|\\s)${command}(\\s|$)`).test(item.content));
+
+test("/restart relaunches only that thread with --resume and the same id, and a guest's /clear relaunches it fresh", async () => {
+  const workspace = commandWorkspace();
+  const before = await threeSessions(workspace);
+  const { provider_conversation_id: conversationId } = await threadRow(workspace, THREAD_ID);
+  writeClaudeTranscript(workspace, conversationId);
+
+  threadMessage(workspace, THREAD_ID, "restart-1", "/restart");
+  await waitFor(() => launches(workspace, THREAD_ID).length === 2, () => "the restarted launch", 15000);
+  await threadRow(workspace, THREAD_ID, row => row.state === "live");
+  assert.equal(resumeArg(launches(workspace, THREAD_ID)[1]), conversationId);
+  assert.equal((await threadRow(workspace, THREAD_ID)).provider_conversation_id, conversationId);
+
+  threadMessage(workspace, THREAD_ID, "clear-1", "/clear", GUEST);
+  await waitFor(() => launches(workspace, THREAD_ID).length === 3, () => `the cleared launch: ${JSON.stringify(posts(workspace, THREAD_ID))}`, 15000);
+  const cleared = await threadRow(workspace, THREAD_ID, row => row.state === "live" &&
+    row.provider_conversation_id != null);
+  assert.equal(resumeArg(launches(workspace, THREAD_ID)[2]), null);
+  assert.notEqual(cleared.provider_conversation_id, conversationId);
+
+  const answered = notices(workspace, THREAD_ID);
+  assert.equal(answered.length, 2, JSON.stringify(answered));
+  for (const notice of answered) assert.equal(notice.authorization, ROOT_AUTH);
+  assertUntouched(workspace, before);
+  assert.equal(commandNotified(workspace, "/restart") || commandNotified(workspace, "/clear"), false);
+});
+
+test("an owner /close posts the notice, archives the thread, stops its session and leaves closed/close-command; a guest's is refused", async () => {
+  const workspace = commandWorkspace();
+  const before = await threeSessions(workspace);
+
+  threadMessage(workspace, THREAD_ID, "guest-close", "/close", GUEST);
+  await waitFor(() => notices(workspace, THREAD_ID).length === 1, () => "the guest's refusal", 15000);
+  const [refusal] = notices(workspace, THREAD_ID);
+  assert.equal(refusal.authorization, ROOT_AUTH);
+  assert.match(refusal.content, /owner/i);
+  await settle(500);
+  assert.deepEqual((discord(workspace).threadPatches ?? []).filter(patch => "archived" in patch.body), []);
+  assert.equal((await threadRow(workspace, THREAD_ID)).state, "live");
+  assert.ok(tmuxSessions(workspace)[THREAD_TMUX], "the guest's /close left the session running");
+
+  threadMessage(workspace, THREAD_ID, "owner-close", "/close");
+  const row = await threadRow(workspace, THREAD_ID, current => current.state === "closed");
+  assert.deepEqual([row.state, row.close_reason], ["closed", "close-command"]);
+  assert.equal(notices(workspace, THREAD_ID).length, 2);
+  assert.equal(notices(workspace, THREAD_ID)[1].authorization, ROOT_AUTH);
+  assert.deepEqual((discord(workspace).threadPatches ?? []).filter(patch => "archived" in patch.body)
+    .map(({ authorization, body, threadId }) =>
+    ({ authorization, body, threadId })), [{ authorization: ROOT_AUTH, body: { archived: true }, threadId: THREAD_ID }]);
+  await waitFor(() => tmuxSessions(workspace)[THREAD_TMUX] === undefined, () => "the thread's tmux to stop", 15000);
+  // The archive the close made is not mistaken for an auto-archive.
+  await settle(1000);
+  assert.deepEqual([(await threadRow(workspace, THREAD_ID)).state, (await threadRow(workspace, THREAD_ID)).close_reason],
+    ["closed", "close-command"]);
+  assertUntouched(workspace, before);
+  assert.equal(commandNotified(workspace, "/close"), false);
+});
+
+test("/compact, /pause and /unpause reach only that thread's Claude session and pane", async () => {
+  const workspace = commandWorkspace();
+  const before = await threeSessions(workspace);
+  const keys = name => (tmuxSessions(workspace)[name].sendKeys ?? []).filter(keys => keys[0] !== "Enter");
+
+  threadMessage(workspace, THREAD_ID, "compact-1", "/compact");
+  // Typed literally, then submitted.
+  await waitFor(() => JSON.stringify(tmuxSessions(workspace)[THREAD_TMUX].sendKeys.slice(-2)) ===
+    JSON.stringify([["-l", "/compact"], ["Enter"]]), () => `/compact in the pane: ${JSON.stringify(tmuxSessions(workspace))}`,
+  15000);
+  assert.deepEqual(keys(THREAD_TMUX), [["-l", "/compact"]]);
+
+  threadMessage(workspace, THREAD_ID, "pause-1", "/pause");
+  await waitFor(() => replies(workspace, THREAD_ID).some(reply => /paused/i.test(reply.content)), () => "the pause reply",
+    15000);
+  const delivered = notifications(workspace).length;
+  threadMessage(workspace, THREAD_ID, "while-paused", "held while paused");
+  await settle(1000);
+  assert.equal(notifications(workspace).length, delivered);
+  threadMessage(workspace, THREAD_ID, "unpause-1", "/unpause");
+  await waitFor(() => notifications(workspace).some(item => item.content.includes("held while paused")),
+    () => "the held message after /unpause", 15000);
+
+  assert.deepEqual(keys(SIBLING_TMUX), []);
+  assert.deepEqual(keys(CHANNEL_TMUX), []);
+  assert.deepEqual(notices(workspace, THREAD_ID), []);
+  assertUntouched(workspace, before);
+  for (const command of ["/compact", "/pause", "/unpause"]) assert.equal(commandNotified(workspace, command), false);
+});
+
+test("/compact, /pause and /unpause with no live session get a no live session notice and start nothing", async () => {
+  const workspace = commandWorkspace();
+  await supervised(workspace);
+  updateState(workspace.stateDir, state => {
+    (state.fixtures.discord.injectedThreads ||= []).push({ ...userThread(THREAD_ID), event: "create" });
+  });
+  await threadRow(workspace, THREAD_ID);
+
+  threadMessage(workspace, THREAD_ID, "compact-1", "/compact");
+  threadMessage(workspace, THREAD_ID, "pause-1", "/pause", GUEST);
+  threadMessage(workspace, THREAD_ID, "unpause-1", "/unpause");
+  await waitFor(() => notices(workspace, THREAD_ID).length === 3, () => `three notices: ${JSON.stringify(posts(workspace,
+    THREAD_ID))}`, 15000);
+  for (const notice of notices(workspace, THREAD_ID)) {
+    assert.equal(notice.authorization, ROOT_AUTH);
+    assert.match(notice.content, /no live session/i);
+  }
+  await settle(500);
+  assert.deepEqual(claude(workspace).invocations, []);
+  assert.equal((await threadRow(workspace, THREAD_ID)).state, "registered");
+});
+
+const CODEX_THREAD_UUID = "0199a5c4-7e1b-7c3d-9f2a-4b8e6d1c3a58";
+
+test("/compact in a Codex thread reaches only that thread's bridge", async () => {
+  const workspace = commandWorkspace();
+  const codexHome = path.join(workspace.homeDir, ".codex");
+  fs.mkdirSync(codexHome, { recursive: true });
+  const codex = await startFakeCodexServer(workspace, { port: 29600, deferListen: true, codexHome,
+    channelId: CREATED_THREAD_ID, threadId: CODEX_THREAD_UUID, bootstrapPlan: { mcpReplyText: "on it" } });
+  await routerWithWebhooks(workspace, ["demo"]);
+  await startThreadSupervisor(workspace, { env: { CCDM_THREAD_WS_PORT_BASE: "29600" } });
+
+  channelMessage(workspace, "thread-command-1", "/thread codex-task --provider codex");
+  await threadRow(workspace, CREATED_THREAD_ID, row => row.provider === "codex");
+  threadMessage(workspace, CREATED_THREAD_ID, "boot-message-1", "please fix the parser");
+  await threadRow(workspace, CREATED_THREAD_ID, row => row.ws_port === 29600);
+  await codex.listen();
+  await threadRow(workspace, CREATED_THREAD_ID, row => row.state === "live" &&
+    row.provider_conversation_id === CODEX_THREAD_UUID);
+  await waitFor(() => replies(workspace, CREATED_THREAD_ID).length === 1, () => "the bootstrap reply", 20000);
+
+  threadMessage(workspace, CREATED_THREAD_ID, "compact-1", "/compact");
+  await waitFor(() => codex.clientMessages.some(message => message.method === "thread/compact/start"),
+    () => `thread/compact/start: ${JSON.stringify(codex.clientMessages.map(message => message.method))}`, 20000);
+  const [compact] = codex.clientMessages.filter(message => message.method === "thread/compact/start");
+  assert.equal(compact.params.threadId, CODEX_THREAD_UUID);
+  assert.deepEqual(notices(workspace, CREATED_THREAD_ID).filter(notice => /no live session/i.test(notice.content)), []);
+  assert.equal(codex.clientMessages.some(message => message.method === "turn/start" &&
+    JSON.stringify(message.params).includes("/compact")), false);
 });

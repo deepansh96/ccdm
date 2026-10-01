@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import sys
 
-from . import binding, boot, control, creation, lifecycle
+from . import binding, boot, commands, control, creation, lifecycle
 
 
 HANDLERS = {
     "channel_command": creation.on_channel_command,
     "thread_create": binding.on_thread_create,
+    "thread_command": commands.on_thread_command,
     "thread_create_request": creation.on_create_request,
     "thread_delete": lifecycle.on_thread_delete,
     "thread_message": boot.on_thread_message,

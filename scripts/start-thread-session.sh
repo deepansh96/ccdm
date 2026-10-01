@@ -254,7 +254,7 @@ fail() {
   exit 1
 }
 
-python3 - "$PROJECT" "$THREAD_ID" "$ROUTER_STATE" "$LAUNCH_DIR" "$SCRIPT_DIR/ccdm-channel-server.js" "$KEY_FILE" "$PROVIDER" <<'PY' || fail "The thread launch files could not be written"
+python3 - "$PROJECT" "$THREAD_ID" "$ROUTER_STATE" "$LAUNCH_DIR" "$SCRIPT_DIR/ccdm-channel-server.js" "$KEY_FILE" "$PROVIDER" "$TMUX_NAME" <<'PY' || fail "The thread launch files could not be written"
 import json
 import os
 import secrets
@@ -262,7 +262,7 @@ import shutil
 import sys
 from pathlib import Path
 
-project, thread_id, router_state, launch_dir, server_script, key_file, provider = sys.argv[1:8]
+project, thread_id, router_state, launch_dir, server_script, key_file, provider, tmux_name = sys.argv[1:9]
 launch = Path(launch_dir)
 # A fresh launch directory: no previous launch's ready, context or bootstrap file.
 shutil.rmtree(launch, ignore_errors=True)
@@ -289,6 +289,7 @@ env = {
     "CCDM_CLAUDE_PROJECT": project,
     "CCDM_THREAD_ID": thread_id,
     "CCDM_THREAD_PROVIDER": "claude",
+    "CCDM_THREAD_TMUX": tmux_name,
     "CCDM_THREAD_BOOTSTRAP_FILE": os.environ.get("CCDM_THREAD_BOOTSTRAP_FILE") or str(launch / "bootstrap.json"),
 }
 if os.environ.get("CCDM_THREAD_BOOT_TIMEOUT_S"):

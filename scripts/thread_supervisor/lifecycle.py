@@ -137,6 +137,10 @@ def on_thread_update(context, event: dict) -> None:
     if not row or row["project"] != event.get("project") or row["state"] == "closed":
         return
     stop_session(context, row)
+    if row["pending_close"]:  # The archive a `/close` made: the root bot's, so closed.
+        store.update(context.db, thread_id, state="closed", stop_reason=None, close_reason="close-command",
+                     pending_close=None)
+        return
     store.finish_boot(context.db, thread_id, "stopped", "auto-archive")
     poll = ArchivePoll(next(_poll_ids), int(time.time() * 1000) - ARCHIVE_LOOKBACK_MS,
                        time.monotonic() + _seconds("CCDM_THREAD_ARCHIVE_POLL_WINDOW_S", ARCHIVE_POLL_WINDOW_SECONDS))

@@ -16,13 +16,16 @@
 //   CCDM_THREAD_ID            set by start-thread-session.sh: this session serves that thread
 //   CCDM_THREAD_PROVIDER      the thread's provider (`claude`)
 //   CCDM_THREAD_BOOTSTRAP_FILE  the Thread Supervisor's bootstrap for this launch
+//   CCDM_THREAD_TMUX          this thread session's own tmux session
 //
 // In thread mode the server says hello as the `thread` role, so its Session
 // Scope is the thread alone. It holds live events until the supervisor's
 // bootstrap file exists (CCDM_THREAD_BOOT_TIMEOUT_S, 120 s by default),
 // delivers the bootstrap as the first channel notification, and drops held
 // messages the bootstrap already includes. It records no Conversation
-// Reminder events and ignores `scope_changed`.
+// Reminder events and ignores `scope_changed`. Its commands are /compact,
+// typed into its own tmux pane, and /pause and /unpause; the supervisor owns
+// a thread's /restart and /clear.
 //
 // In the root role the server speaks for root: it receives root-channel
 // messages and the owner's bot mentions in project channels, may act in any
@@ -463,7 +466,18 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
+// A thread session types the command into its own pane, never the project's.
+function typeIntoOwnPane(command) {
+  const target = `=${process.env.CCDM_THREAD_TMUX}:`;
+  const tmux = args => new Promise((resolve, reject) => {
+    execFile("tmux", args, (error, stdout, stderr) => error ? reject(new Error(stderr.trim() || error.message)) : resolve(stdout));
+  });
+  if (!process.env.CCDM_THREAD_TMUX) return Promise.reject(new Error("this thread session has no tmux session"));
+  return tmux(["send-keys", "-t", target, "-l", `/${command}`]).then(() => tmux(["send-keys", "-t", target, "Enter"]));
+}
+
 function relayClaudeCommand(project, command) {
+  if (THREAD) return typeIntoOwnPane(command);
   return new Promise((resolve, reject) => {
     execFile(path.join(ROOT_DIR, "scripts", "send-claude-command.sh"), ["--project", project, command], (error, stdout, stderr) => {
       if (error) reject(new Error(stderr.trim() || error.message));
@@ -585,6 +599,10 @@ function main() {
       return say(event, `**Error:** Failed to ${name} — ${error.message}`);
     }
     await say(event, `Sent /${name} to Claude.`);
+  }
+  if (THREAD) {
+    delete COMMANDS.clear;
+    delete COMMANDS.restart;
   }
   let commands = Promise.resolve();
   router.on("command", event => {
