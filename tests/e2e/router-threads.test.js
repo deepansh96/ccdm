@@ -4,25 +4,25 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { injectDiscordMessage } from "./support/bridge.js";
-import { OWNER_ID, connectRoot, connectSession, createRouterWorkspace, rawRouterSocket,
-  routerEnv, routerRegistry, routerWithWebhooks, runRouterCli, waitFor, writeRootKey } from "./support/router.js";
+import { injectDiscordMessage, injectDiscordReaction } from "./support/bridge.js";
+import { OWNER_ID, connectRoot, connectSession, connectThread, createRouterWorkspace, rawRouterSocket,
+  routerEnv, routerRegistry, routerWithWebhooks, runRouterCli, seedThreads, waitFor, writeRootKey } from "./support/router.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
 test.afterEach(cleanup);
 
-async function listeners() {
-  const workspace = createRouterWorkspace({ ...routerRegistry(), root_channels: ["root-channel"] });
+async function listeners(projects = {}) {
+  const workspace = createRouterWorkspace({ ...routerRegistry(projects), root_channels: ["root-channel"] });
   writeRootKey(workspace, "root-key");
   fs.writeFileSync(path.join(workspace.routerStateDir, "keys/.observer.key"), "observer-key\n", { mode: 0o600 });
-  await routerWithWebhooks(workspace, ["demo"]);
+  const router = await routerWithWebhooks(workspace, ["demo"]);
   const root = await connectRoot(workspace, "root-key");
   const demo = await connectSession(workspace, "demo", "demo-key");
   const observer = await rawRouterSocket(workspace);
   observer.send({ type: "hello", v: 1, role: "observer", key: "observer-key" });
   await waitFor(() => observer.frames.some(frame => frame.type === "hello_ok"), () => "observer hello");
-  return { workspace, root, demo, observer };
+  return { workspace, router, root, demo, observer };
 }
 
 function inject(workspace, id, extra = {}) {
@@ -78,8 +78,7 @@ test("a thread message never reaches the parent Channel Conversation", async () 
   inject(sessions.workspace, "thread-message", { channelId: "demo-thread", channelType: 11,
     parentId: "demo-channel" });
   await fence(sessions);
-  assert.deepEqual({ channel: ids(sessions.demo.events), root: ids(sessions.root.events),
-    observer: ids(sessions.observer.frames) }, { channel: [], root: [], observer: [] });
+  assert.deepEqual({ channel: ids(sessions.demo.events), root: ids(sessions.root.events) }, { channel: [], root: [] });
 });
 
 test("the REST fake executes and edits webhook messages in the requested thread", async () => {
@@ -244,4 +243,131 @@ test("thread message GET and history exclude parent and sibling messages", () =>
       parent: parent.status, sibling: sibling.status }));
   })()`);
   assert.deepEqual(result, { ids: ['1003'], own: '1003', parent: 404, sibling: 404 });
+});
+
+// Two public threads under demo's channel, each with its own thread listener.
+async function threadListeners(projects) {
+  const sessions = await listeners(projects);
+  seedThreads(sessions.workspace, {
+    "demo-thread": { type: 11, parentId: "demo-channel" },
+    "sibling-thread": { type: 11, parentId: "demo-channel" },
+  });
+  const thread = await connectThread(sessions.workspace, { threadId: "demo-thread" });
+  const sibling = await connectThread(sessions.workspace, { threadId: "sibling-thread" });
+  return { ...sessions, thread, sibling };
+}
+
+// Each call injects its own fences, after everything injected before it.
+let threadFences = 0;
+async function threadFence(sessions) {
+  const n = ++threadFences;
+  await fence(sessions);
+  inject(sessions.workspace, `${n}-thread-fence`, { channelId: "demo-thread" });
+  inject(sessions.workspace, `${n}-sibling-fence`, { channelId: "sibling-thread" });
+  await waitFor(() => sessions.thread.events.some(event => event.message_id === `${n}-thread-fence`) &&
+    sessions.sibling.events.some(event => event.message_id === `${n}-sibling-fence`), () => "thread listener fences");
+}
+
+test("an owner message in a project thread reaches only that thread's listener", async () => {
+  const sessions = await threadListeners();
+  inject(sessions.workspace, "thread-task", { channelId: "demo-thread", content: "Fix the flaky test" });
+  await threadFence(sessions);
+  assert.deepEqual({ thread: ids(sessions.thread.events), sibling: ids(sessions.sibling.events),
+    channel: ids(sessions.demo.events), root: ids(sessions.root.events) },
+  { thread: ["thread-task"], sibling: [], channel: [], root: [] });
+  const event = sessions.thread.events.find(event => event.message_id === "thread-task");
+  assert.deepEqual([event.event, event.channel_id, event.content, event.author.id, event.author.is_owner],
+    ["message", "demo-thread", "Fix the flaky test", OWNER_ID, true]);
+});
+
+test("private, forum, root-channel, unregistered-parent and remote: threads reach nobody", async () => {
+  const sessions = await threadListeners({ far: { channel_id: "far-channel", type: "claude", path: "remote:mac:/srv/far" } });
+  seedThreads(sessions.workspace, {
+    "private-thread": { type: 12, parentId: "demo-channel" },
+    "forum-post": { type: 11, parentId: "demo-channel", parentType: 15 },
+    "root-thread": { type: 11, parentId: "root-channel" },
+    "stray-thread": { type: 11, parentId: "stray-channel" },
+    "remote-thread": { type: 11, parentId: "far-channel" },
+  });
+  for (const thread of ["private-thread", "forum-post", "root-thread", "stray-thread", "remote-thread"]) {
+    inject(sessions.workspace, `in-${thread}`, { channelId: thread });
+    inject(sessions.workspace, `mention-${thread}`, { channelId: thread, content: "<@fixture-bot-user-id> help" });
+  }
+  await threadFence(sessions);
+  assert.deepEqual({ thread: ids(sessions.thread.events), sibling: ids(sessions.sibling.events),
+    channel: ids(sessions.demo.events), root: ids(sessions.root.events), observer: ids(sessions.observer.frames) },
+  { thread: [], sibling: [], channel: [], root: [], observer: [] });
+  assert.deepEqual(readState(sessions.workspace.stateDir).fixtures.discord.reactions ?? [], []);
+});
+
+// Rewrites demo's guests with an atomic replace and waits for the Router's reload.
+async function setGuests(workspace, router, guests) {
+  const file = path.join(workspace.repoDir, "registry.json");
+  const registry = JSON.parse(fs.readFileSync(file, "utf8"));
+  registry.projects.demo.guest_user_ids = guests;
+  const reloads = () => router.stdout.split("registry reloaded").length - 1;
+  const before = reloads();
+  fs.writeFileSync(`${file}.edit`, `${JSON.stringify(registry, null, 2)}\n`);
+  fs.renameSync(`${file}.edit`, file);
+  await waitFor(() => reloads() > before, () => `registry reload:\n${router.stdout}`);
+}
+
+test("a guest added to or removed from the parent applies on the next thread message", async () => {
+  const sessions = await threadListeners();
+  const guest = id => ({ channelId: "demo-thread", author: { id, username: id } });
+  inject(sessions.workspace, "guest-before", guest("guest-id"));
+  inject(sessions.workspace, "newcomer-before", guest("newcomer-id"));
+  await threadFence(sessions);
+  await setGuests(sessions.workspace, sessions.router, ["newcomer-id"]);
+  inject(sessions.workspace, "guest-after", guest("guest-id"));
+  inject(sessions.workspace, "newcomer-after", guest("newcomer-id"));
+  await threadFence(sessions);
+  assert.deepEqual(ids(sessions.thread.events), ["guest-before", "newcomer-after"]);
+  const event = sessions.thread.events.find(event => event.message_id === "newcomer-after");
+  assert.deepEqual([event.author.id, event.author.is_owner], ["newcomer-id", false]);
+});
+
+test("thread session commands reach the thread session and supervisor commands reach no session", async () => {
+  const sessions = await threadListeners();
+  for (const [id, content] of [["compact", "/compact"], ["pause", " /pause "], ["unpause", "/unpause"],
+    ["close", "/close"], ["config", "/config model=gpt-5.5"], ["config-bare", "/config"], ["restart", "/restart"],
+    ["clear", "/clear"]]) {
+    inject(sessions.workspace, id, { channelId: "demo-thread", content });
+  }
+  await threadFence(sessions);
+  const seen = sessions.thread.events.filter(event => !event.message_id.endsWith("-fence"))
+    .map(event => [event.event, event.command, event.message_id, event.channel_id]);
+  assert.deepEqual(seen, [
+    ["command", "compact", "compact", "demo-thread"],
+    ["command", "pause", "pause", "demo-thread"],
+    ["command", "unpause", "unpause", "demo-thread"],
+  ]);
+  assert.deepEqual(ids(sessions.demo.events), []);
+});
+
+test("a reaction in a thread reaches that thread's session as a reaction event", async () => {
+  const sessions = await threadListeners();
+  injectDiscordReaction(sessions.workspace, { channelId: "demo-thread", emoji: "👍", messageId: "thread-reply",
+    user: { id: OWNER_ID, username: "Owner" },
+    message: { author: { id: "demo-webhook", bot: true }, webhookId: "demo-webhook", content: "Done." } });
+  await waitFor(() => sessions.thread.events.some(event => event.event === "reaction"), () => "thread reaction");
+  await threadFence(sessions);
+  const reaction = sessions.thread.events.find(event => event.event === "reaction");
+  assert.deepEqual([reaction.message_id, reaction.channel_id, reaction.emoji, reaction.message_webhook_id],
+    ["thread-reply", "demo-thread", "👍", "demo-webhook"]);
+  assert.deepEqual(sessions.sibling.events.filter(event => event.event === "reaction"), []);
+  assert.deepEqual(sessions.demo.events.filter(event => event.event === "reaction"), []);
+});
+
+test("observer frames name the conversation, and the thread for thread messages", async () => {
+  const sessions = await threadListeners();
+  inject(sessions.workspace, "channel-message");
+  inject(sessions.workspace, "thread-message", { channelId: "demo-thread" });
+  await threadFence(sessions);
+  const frame = id => sessions.observer.frames.find(frame => frame.message_id === id);
+  const shape = ({ project, channel_id, conversation_id, thread_id }) => ({ project, channel_id, conversation_id, thread_id });
+  assert.deepEqual(shape(frame("channel-message")),
+    { project: "demo", channel_id: "demo-channel", conversation_id: "demo-channel", thread_id: undefined });
+  assert.deepEqual(shape(frame("thread-message")),
+    { project: "demo", channel_id: "demo-thread", conversation_id: "demo-thread", thread_id: "demo-thread" });
 });

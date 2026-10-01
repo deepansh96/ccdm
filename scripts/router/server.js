@@ -19,6 +19,8 @@ const RECENT_VIOLATIONS = 20;
 const ROOT_KEY_FILE = ".root.key";
 // The Conversation Reminder observer's key, named apart the same way.
 const OBSERVER_KEY_FILE = ".observer.key";
+const PROVIDERS = new Set(["claude", "codex"]);
+const PUBLIC_THREAD = 11;
 
 function send(socket, frame) {
   if (!socket.destroyed) socket.write(`${JSON.stringify(frame)}\n`);
@@ -81,6 +83,10 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
   // scoped MCP server): they act in the project's scope but receive no events
   // and never replace the project's listener.
   const opConnections = new Set();
+  // thread id -> the one thread session listening in it, and the op-only
+  // thread connections (a thread's Codex scoped MCP server).
+  const threadSessions = new Map();
+  const threadOps = new Set();
   const violations = [];
   const keysDir = path.join(stateDir, "keys");
   let keysWatcher = null;
@@ -98,7 +104,10 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     : connection.role === "observer" ? readKey(OBSERVER_KEY_FILE) : projectKey(connection.route.project);
 
   function forget(connection) {
-    if (connection.listener === false) {
+    if (connection.role === "thread") {
+      threadOps.delete(connection);
+      if (threadSessions.get(connection.route.thread_id) === connection) threadSessions.delete(connection.route.thread_id);
+    } else if (connection.listener === false) {
       opConnections.delete(connection);
     } else if (connection.role === "root") {
       if (rootSession === connection) rootSession = null;
@@ -163,6 +172,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       observerSession = connection;
       return send(connection.socket, { type: "hello_ok", v: PROTOCOL_VERSION, scope: { project: "observer" } });
     }
+    if (frame.role === "thread") return threadHello(connection, frame, reject);
     if (frame.role !== "project") return reject("unsupported_role", `unsupported role: ${frame.role}`);
     const route = getTable().projects.get(String(frame.project));
     if (!route || !keysMatch(await projectKey(route.project), frame.key)) {
@@ -179,6 +189,37 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     Object.assign(connection, { role: "project", route, key: frame.key, connectedAt: new Date().toISOString() });
     sessions.set(route.project, connection);
     send(connection.socket, { type: "hello_ok", v: PROTOCOL_VERSION, scope: projectScope(route) });
+  }
+
+  // A thread session: its own key, and a public thread under its registered,
+  // non-`remote:` project's channel. The thread is checked once, here.
+  async function threadHello(connection, frame, reject) {
+    const threadId = String(frame.thread_id ?? "");
+    const route = getTable().projects.get(String(frame.project));
+    if (!/^[\w-]+$/.test(threadId) || !route || !PROVIDERS.has(frame.provider) ||
+      !keysMatch(await readKey(`.thread-${threadId}.key`), frame.key)) {
+      return reject("unauthorized", "unknown project, thread or key");
+    }
+    const channel = await context.discord?.client?.channels.fetch(threadId).catch(() => null);
+    if (route.remote || channel?.type !== PUBLIC_THREAD || String(channel.parentId) !== route.channel_id) {
+      return reject("not_a_project_thread", `${threadId} is not a public thread in ${route.project}'s channel`);
+    }
+    const threadRoute = {
+      project: route.project, type: frame.provider, channel_id: threadId, parent_channel_id: route.channel_id,
+      thread_id: threadId, webhook_id: route.webhook_id,
+    };
+    Object.assign(connection, { role: "thread", route: threadRoute, key: frame.key, connectedAt: new Date().toISOString() });
+    if (frame.listener === false) {
+      connection.listener = false;
+      threadOps.add(connection);
+    } else {
+      // One listener per thread: a newer hello replaces whoever held it.
+      const previous = threadSessions.get(threadId);
+      if (previous) revoke(previous, "replaced");
+      threadSessions.set(threadId, connection);
+    }
+    const { webhook_id: _webhook, ...scope } = threadRoute;
+    send(connection.socket, { type: "hello_ok", v: PROTOCOL_VERSION, scope });
   }
 
   async function request(connection, frame) {
@@ -280,6 +321,13 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       send(connection.socket, { type: "event", ...event });
       return true;
     },
+    // Delivers to the thread's live session; false when none is connected.
+    deliverThread(threadId, event) {
+      const connection = threadSessions.get(threadId);
+      if (!connection) return false;
+      send(connection.socket, { type: "event", ...event });
+      return true;
+    },
     // Delivers to root's live session; false when root is not connected.
     deliverRoot(event) {
       if (!rootSession) return false;
@@ -318,7 +366,9 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     },
     close() {
       keysWatcher?.close();
-      for (const connection of [...sessions.values(), ...opConnections]) connection.socket.destroy();
+      for (const connection of [...sessions.values(), ...opConnections, ...threadSessions.values(), ...threadOps]) {
+        connection.socket.destroy();
+      }
       rootSession?.socket.destroy();
       observerSession?.socket.destroy();
       server.close();

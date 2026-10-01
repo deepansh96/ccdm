@@ -7,7 +7,7 @@ import path from "node:path";
 
 import { bridgeChildEnv, collectProcess, createBridgeWorkspace } from "./bridge.js";
 import { runNodeEntrypoint } from "./runner.js";
-import { seedRegistry } from "./state.js";
+import { seedRegistry, updateState } from "./state.js";
 import { registerTeardownCallback } from "./teardown.js";
 
 export const OWNER_ID = "owner-id";
@@ -154,6 +154,48 @@ export function writeRootKey(workspace, key) {
   const keysDir = path.join(workspace.routerStateDir, "keys");
   fs.mkdirSync(keysDir, { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(keysDir, ".root.key"), `${key}\n`, { mode: 0o600 });
+}
+
+// The Gateway's view of thread channels: `{ id: { type, parentId, parentType? } }`.
+export function seedThreads(workspace, threads) {
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.threads ||= {};
+    for (const [id, thread] of Object.entries(threads)) state.fixtures.discord.threads[id] = { id, ...thread };
+  });
+}
+
+// A thread session's key, `keys/.thread-<thread_id>.key`.
+export function writeThreadKey(workspace, threadId, key) {
+  const keysDir = path.join(workspace.routerStateDir, "keys");
+  fs.mkdirSync(keysDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(keysDir, `.thread-${threadId}.key`), `${key}\n`, { mode: 0o600 });
+}
+
+// A raw `thread` hello, writing its key first unless `key` is given. Resolves
+// once the Router answers; `hello` is that answer, `events` the pushed events,
+// and `request(op, args)` sends a request and resolves with its response.
+export async function connectThread(workspace, { project = "demo", threadId, provider = "claude", key, listener } = {}) {
+  if (key === undefined) {
+    key = `${threadId}-key`;
+    writeThreadKey(workspace, threadId, key);
+  }
+  const socket = await rawRouterSocket(workspace);
+  socket.send({ type: "hello", v: 1, role: "thread", project, thread_id: threadId, provider, key,
+    ...(listener === undefined ? {} : { listener }) });
+  const hello = await waitFor(() => socket.frames.find((frame) => frame.type === "hello_ok" || frame.type === "hello_error"),
+    () => `thread ${threadId} hello: ${JSON.stringify(socket.frames)}`);
+  let requests = 0;
+  return {
+    ...socket,
+    hello,
+    get events() { return socket.frames.filter((frame) => frame.type === "event"); },
+    async request(op, args) {
+      const id = `request-${++requests}`;
+      socket.send({ type: "request", id, op, args });
+      return waitFor(() => socket.frames.find((frame) => frame.type === "response" && frame.id === id),
+        () => `${op} response: ${JSON.stringify(socket.frames)}`);
+    },
+  };
 }
 
 // A scripted root session: the shared client library in `role: "root"`.

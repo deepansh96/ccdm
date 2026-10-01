@@ -17,7 +17,7 @@ const { createAttachmentCache } = require("./router/attachments.js");
 const { RouterClient } = require("./router/client.js");
 const { discordRequest } = require("./router/discord-rest.js");
 const { acquireRouterLock } = require("./router/lock.js");
-const { classifyMessage, classifyReaction, observedMessage } = require("./router/inbound.js");
+const { classifyMessage, classifyReaction, observedMessage, threadRoute } = require("./router/inbound.js");
 const { preflight } = require("./router/preflight.js");
 const { probe } = require("./router/probe.js");
 const { registryPath, rootStateDir, rootToken, socketPath, stateDir } = require("./router/paths.js");
@@ -84,11 +84,14 @@ async function serve() {
     // System notices are not conversation activity, including for observers.
     if (message.type !== 0 && message.type !== 19) return;
     try {
-      const observed = observedMessage(table, message);
+      const thread = await threadRoute(table, String(message.channelId ?? message.channel?.id), message.channel, client);
+      const observed = observedMessage(table, message, thread);
       if (observed) server.deliverObserver(observed);
-      const routed = classifyMessage(table, message);
+      const routed = classifyMessage(table, message, thread);
       if (!routed) return;
       attachments.remember(routed.event);
+      // A thread message with no live thread session reaches no one.
+      if (routed.thread) return void server.deliverThread(routed.route.thread_id, routed.event);
       if (routed.root ? server.deliverRoot(routed.event) : server.deliver(routed.route.project, routed.event)) return;
       // A project without `webhook_id` is not migrated yet and may still be
       // served by its old pool bot, so its message is dropped without a mark.
@@ -103,8 +106,11 @@ async function serve() {
   });
   client.on("messageReactionAdd", async (reaction, user) => {
     try {
-      const routed = await classifyReaction(table, reaction, user, client.user?.id);
+      const channelId = String(reaction.message.channelId ?? reaction.message.channel?.id);
+      const thread = await threadRoute(table, channelId, reaction.message.channel, client);
+      const routed = await classifyReaction(table, reaction, user, client.user?.id, thread);
       if (!routed) return;
+      if (routed.thread) return void server.deliverThread(routed.route.thread_id, routed.event);
       // Root-channel reactions are root's alone: no project or observer sees them.
       if (routed.root) return void server.deliverRoot(routed.event);
       server.deliver(routed.route.project, routed.event);
