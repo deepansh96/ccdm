@@ -203,7 +203,9 @@ test("a bot unarchive, and the repeated THREAD_CREATE after it, start no session
 
   unarchive(workspace);
   threadEvent(workspace, "create", { ownerId: BOT_USER_ID, newlyCreated: false });
-  await waitFor(() => (discord(workspace).deliveredThreads ?? []).length === 4, () => "the unarchive events");
+  // Every injected event, including the update the bind's auto-archive PATCH echoes.
+  await waitFor(() => (discord(workspace).injectedThreads ?? []).every(entry => entry.delivered),
+    () => "the unarchive events");
   await new Promise(resolve => setTimeout(resolve, 2000));
 
   assert.equal(claude(workspace).invocations.length, 1);
