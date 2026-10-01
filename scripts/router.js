@@ -81,6 +81,8 @@ async function serve() {
   discord.client = client;
 
   client.on("messageCreate", async message => {
+    // System notices are not conversation activity, including for observers.
+    if (message.type !== 0 && message.type !== 19) return;
     try {
       const observed = observedMessage(table, message);
       if (observed) server.deliverObserver(observed);
