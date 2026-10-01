@@ -6,11 +6,12 @@ from __future__ import annotations
 
 import sys
 
-from . import binding, boot, capacity, commands, config, control, creation, lifecycle
+from . import binding, boot, capacity, commands, config, control, creation, lifecycle, reconcile
 
 
 HANDLERS = {
     "channel_command": creation.on_channel_command,
+    "gateway_resumed": reconcile.reconcile,
     "thread_create": binding.on_thread_create,
     "thread_command": commands.on_thread_command,
     "thread_create_request": creation.on_create_request,
@@ -25,6 +26,7 @@ INTERNAL_HANDLERS = {
     "archive_poll": lifecycle.on_archive_poll,
     "control": control.on_control,
     "launch_exit": boot.on_launch_exit,
+    "reconcile": reconcile.reconcile,
 }
 
 

@@ -100,6 +100,10 @@ def _listener_pids(key_file: Path) -> list[int]:
     return pids
 
 
+def session_running(thread_id: str) -> bool:
+    return bool(_listener_pids(key_path(thread_id)))
+
+
 def stop_session(context, row) -> None:
     """Stop a thread's session by its `.thread-<id>.key` path, never by name
     patterns a project or sibling session could match; then its own tmux
@@ -136,13 +140,20 @@ def on_thread_update(context, event: dict) -> None:
     row = store.thread(context.db, thread_id)
     if not row or row["project"] != event.get("project") or row["state"] == "closed":
         return
+    stop_archived(context, row, int(time.time() * 1000) - ARCHIVE_LOOKBACK_MS)
+
+
+def stop_archived(context, row, since_ms: int) -> None:
+    """Stop an archived thread's session and look up who archived it, in
+    audit entries since ``since_ms``."""
+    thread_id = row["thread_id"]
     stop_session(context, row)
     if row["pending_close"]:  # The archive a `/close` made: the root bot's, so closed.
         store.update(context.db, thread_id, state="closed", stop_reason=None, close_reason="close-command",
                      pending_close=None)
         return
     store.finish_boot(context.db, thread_id, "stopped", "auto-archive")
-    poll = ArchivePoll(next(_poll_ids), int(time.time() * 1000) - ARCHIVE_LOOKBACK_MS,
+    poll = ArchivePoll(next(_poll_ids), since_ms,
                        time.monotonic() + _seconds("CCDM_THREAD_ARCHIVE_POLL_WINDOW_S", ARCHIVE_POLL_WINDOW_SECONDS))
     context.archive_polls[thread_id] = poll
     _poll(context, thread_id, poll)

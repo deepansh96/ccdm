@@ -143,9 +143,11 @@ def on_thread_message(context, event: dict) -> None:
         start(context, row, event)
 
 
-def start(context, row, trigger: dict | None, starter: str | None = None) -> None:
+def start(context, row, trigger: dict | None, starter: str | None = None, backlog: list[dict] = ()) -> None:
     """Launch a thread's session for its ``trigger`` message, or with no
-    trigger when a creation request's first message is the ``starter``."""
+    trigger when a creation request's first message is the ``starter``.
+    ``backlog`` holds messages the session gets in its bootstrap ahead of the
+    trigger, oldest first (the trigger may be among them)."""
     thread_id, project = row["thread_id"], row["project"]
     current = registry.load(context.project_root)
     entry = registry.project(current, project)
@@ -153,14 +155,15 @@ def start(context, row, trigger: dict | None, starter: str | None = None) -> Non
         return
     resolved = registry.resolved_settings(entry, row)
     codex = resolved["provider"] == "codex"
+    pending = [*backlog, *([trigger] if trigger else [])]
     if not capacity.admit(context, row, resolved, trigger, starter):
-        if trigger:
-            store.buffer_message(context.db, thread_id, trigger["message_id"], _payload(trigger), now())
+        for message in pending:
+            store.buffer_message(context.db, thread_id, message["message_id"], _payload(message), now())
         return
     store.begin_boot(context.db, thread_id, resolved)
     trigger_id = trigger["message_id"] if trigger else None
-    if trigger:
-        store.buffer_message(context.db, thread_id, trigger_id, _payload(trigger), now())
+    for message in pending:
+        store.buffer_message(context.db, thread_id, message["message_id"], _payload(message), now())
     _react(context, thread_id, trigger_id)
     if starter is None:
         starter = _starter(context, row, trigger.get("parent_channel_id") if trigger else None)

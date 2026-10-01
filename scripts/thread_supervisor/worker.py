@@ -87,6 +87,8 @@ def run(project_root: Path, state_dir: Path) -> None:
                 if kind == "connected":
                     context.bot_user_id = frame.get("bot_user_id")
                     write_health(state_dir, link, "connected")
+                    # Whatever happened while this worker or the Router was away.
+                    dispatch(context, {"type": "internal", "event": "reconcile"})
                 elif kind == "disconnected":
                     write_health(state_dir, link, "disconnected")
                 elif kind in ("event", "internal"):
