@@ -17,7 +17,7 @@ const { createAttachmentCache } = require("./router/attachments.js");
 const { RouterClient } = require("./router/client.js");
 const { discordRequest } = require("./router/discord-rest.js");
 const { acquireRouterLock } = require("./router/lock.js");
-const { classifyMessage, classifyReaction, observedMessage, threadRoute } = require("./router/inbound.js");
+const { classifyMessage, classifyReaction, observedMessage, supervisedMessage, threadRoute } = require("./router/inbound.js");
 const { preflight } = require("./router/preflight.js");
 const { probe } = require("./router/probe.js");
 const { registryPath, rootStateDir, rootToken, socketPath, stateDir } = require("./router/paths.js");
@@ -80,6 +80,27 @@ async function serve() {
   const ready = new Promise(resolve => client.once("ready", resolve));
   discord.client = client;
 
+  const markOffline = (channelId, messageId) => discordRequest("PUT",
+    `/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(OFFLINE_EMOJI)}/@me`, { token });
+
+  // A thread message: owner and guest messages reach the live thread session,
+  // or else the supervisor, or else get 💤. The supervisor also gets a copy of
+  // every message, in the same turn as the session delivery.
+  async function routeThreadMessage(message, thread) {
+    const routed = classifyMessage(table, message, thread);
+    if (routed) attachments.remember(routed.event);
+    const delivered = Boolean(routed?.thread) && server.deliverThread(thread.thread_id, routed.event);
+    const supervised = server.deliverSupervisor(supervisedMessage(table, message, thread, delivered));
+    if (!routed || delivered) return;
+    if (routed.root) {
+      if (!server.deliverRoot(routed.event)) await markOffline(thread.thread_id, message.id);
+      return;
+    }
+    const command = routed.supervisor ? routed.event : routed.fallback;
+    if (command) server.deliverSupervisor(command);
+    if (!supervised) await markOffline(thread.thread_id, message.id);
+  }
+
   client.on("messageCreate", async message => {
     // System notices are not conversation activity, including for observers.
     if (message.type !== 0 && message.type !== 19) return;
@@ -87,19 +108,20 @@ async function serve() {
       const thread = await threadRoute(table, String(message.channelId ?? message.channel?.id), message.channel, client);
       const observed = observedMessage(table, message, thread);
       if (observed) server.deliverObserver(observed);
+      if (thread) return await routeThreadMessage(message, thread);
       const routed = classifyMessage(table, message, thread);
       if (!routed) return;
       attachments.remember(routed.event);
-      // A thread message with no live thread session reaches no one.
-      if (routed.thread) return void server.deliverThread(routed.route.thread_id, routed.event);
+      if (routed.supervisor) {
+        if (!server.deliverSupervisor(routed.event)) await markOffline(routed.route.channel_id, message.id);
+        return;
+      }
       if (routed.root ? server.deliverRoot(routed.event) : server.deliver(routed.route.project, routed.event)) return;
       // A project without `webhook_id` is not migrated yet and may still be
       // served by its old pool bot, so its message is dropped without a mark.
       if (!routed.root && !routed.route.webhook_id) return;
       // No live session: mark the message and drop it. Nothing is replayed later.
-      await discordRequest("PUT",
-        `/channels/${routed.route.channel_id}/messages/${message.id}/reactions/${encodeURIComponent(OFFLINE_EMOJI)}/@me`,
-        { token });
+      await markOffline(routed.route.channel_id, message.id);
     } catch (error) {
       log(`message_failed id=${message.id} error=${error.message}`);
     }
@@ -110,7 +132,13 @@ async function serve() {
       const thread = await threadRoute(table, channelId, reaction.message.channel, client);
       const routed = await classifyReaction(table, reaction, user, client.user?.id, thread);
       if (!routed) return;
-      if (routed.thread) return void server.deliverThread(routed.route.thread_id, routed.event);
+      if (routed.thread) {
+        // Thread reactions also reach the supervisor (the `/config` ✅) and the observer.
+        const { project, thread_id: threadId } = routed.route;
+        server.deliverThread(threadId, routed.event);
+        server.deliverSupervisor({ ...routed.event, event: "thread_reaction", project, thread_id: threadId });
+        return void server.deliverObserver({ ...routed.event, project, conversation_id: threadId, thread_id: threadId });
+      }
       // Root-channel reactions are root's alone: no project or observer sees them.
       if (routed.root) return void server.deliverRoot(routed.event);
       server.deliver(routed.route.project, routed.event);
@@ -118,6 +146,33 @@ async function serve() {
     } catch (error) {
       log(`reaction_failed error=${error.message}`);
     }
+  });
+
+  // Thread lifecycle, for eligible threads only, is the supervisor's. A
+  // repeated THREAD_CREATE (after a bot unarchive) is passed on as it comes.
+  const threadEvent = async (event, thread, fields = () => ({})) => {
+    try {
+      const route = await threadRoute(table, String(thread.id), thread, client);
+      if (!route) return;
+      server.deliverSupervisor({ event, project: route.project, thread_id: route.thread_id,
+        parent_channel_id: route.parent_channel_id, ...fields() });
+    } catch (error) {
+      log(`thread_event_failed event=${event} id=${thread.id} error=${error.message}`);
+    }
+  };
+  const archiveFields = thread => ({ archived: Boolean(thread.archived), auto_archive_duration: thread.autoArchiveDuration ?? null });
+  client.on("threadCreate", (thread, newlyCreated) => threadEvent("thread_create", thread, () => ({
+    name: thread.name, owner_id: thread.ownerId ? String(thread.ownerId) : null, newly_created: Boolean(newlyCreated),
+  })));
+  client.on("threadUpdate", (before, after) => threadEvent("thread_update", after, () => ({
+    before: archiveFields(before), after: archiveFields(after),
+  })));
+  client.on("threadDelete", thread => threadEvent("thread_delete", thread));
+  // A resumed or re-established Gateway may have missed events; the first
+  // shardReady is the initial connection, before the client is ready.
+  client.on("shardResume", () => server.deliverSupervisor({ event: "gateway_resumed" }));
+  client.on("shardReady", () => {
+    if (gateway.state === "ready") server.deliverSupervisor({ event: "gateway_resumed" });
   });
 
   const stop = () => {
@@ -159,6 +214,8 @@ async function status(json = false) {
       : `scope=${session.scope.channel_id}`;
     console.log(`  ${session.role} ${session.project} ${where} connected=${session.connected_at}`);
   }
+  console.log(result.supervisor?.connected ? `supervisor: connected connected=${result.supervisor.connected_at}`
+    : "supervisor: absent");
   console.log("webhooks:");
   for (const project of result.projects) {
     const missing = project.missing_permissions;

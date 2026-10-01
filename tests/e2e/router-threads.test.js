@@ -371,3 +371,265 @@ test("observer frames name the conversation, and the thread for thread messages"
   assert.deepEqual(shape(frame("thread-message")),
     { project: "demo", channel_id: "demo-thread", conversation_id: "demo-thread", thread_id: "demo-thread" });
 });
+
+// A raw `supervisor` hello with `keys/.supervisor.key`; `events` are the pushed events.
+async function connectSupervisor(workspace, key = "supervisor-key") {
+  fs.writeFileSync(path.join(workspace.routerStateDir, "keys/.supervisor.key"), `${key}\n`, { mode: 0o600 });
+  const socket = await rawRouterSocket(workspace);
+  socket.send({ type: "hello", v: 1, role: "supervisor", key });
+  const hello = await waitFor(() => socket.frames.find(frame => frame.type === "hello_ok" || frame.type === "hello_error"),
+    () => `supervisor hello: ${JSON.stringify(socket.frames)}`);
+  return { ...socket, hello, get events() { return socket.frames.filter(frame => frame.type === "event"); } };
+}
+
+// The bot reactions the Router PUT, emoji decoded.
+const marks = workspace => (readState(workspace.stateDir).fixtures.discord.reactions ?? [])
+  .map(({ channelId, messageId, emoji }) => ({ channelId, messageId, emoji: decodeURIComponent(emoji) }));
+
+const supervised = (supervisor, event) => supervisor.events.filter(frame => frame.event === event &&
+  !String(frame.message_id ?? "").endsWith("-fence"));
+
+test("the supervisor hello names the root bot and every registered project's channel and webhook", async () => {
+  const { workspace } = await listeners();
+  const supervisor = await connectSupervisor(workspace);
+  const registry = JSON.parse(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"));
+  assert.equal(supervisor.hello.type, "hello_ok");
+  assert.equal(supervisor.hello.bot_user_id, "fixture-bot-user-id");
+  assert.deepEqual(supervisor.hello.projects, [
+    { project: "demo", channel_id: "demo-channel", webhook_id: registry.projects.demo.webhook_id },
+    { project: "beta", channel_id: "beta-channel", webhook_id: null },
+    { project: "legacy", channel_id: "legacy-channel", webhook_id: null },
+  ]);
+  assert.match(registry.projects.demo.webhook_id, /\S/);
+});
+
+test("a thread message with no session reaches the supervisor, and with neither gets 💤", async () => {
+  const sessions = await listeners();
+  seedThreads(sessions.workspace, { "demo-thread": { type: 11, parentId: "demo-channel" } });
+  inject(sessions.workspace, "unheard", { channelId: "demo-thread" });
+  await waitFor(() => marks(sessions.workspace).length, () => "💤 on the unheard thread message");
+  const supervisor = await connectSupervisor(sessions.workspace);
+  inject(sessions.workspace, "supervised", { channelId: "demo-thread", content: "Fix the flaky test" });
+  inject(sessions.workspace, "late-fence", { channelId: "demo-thread" });
+  await waitFor(() => supervisor.events.some(frame => frame.message_id === "late-fence"), () => "supervisor fence");
+  await fence(sessions);
+  assert.deepEqual(marks(sessions.workspace), [{ channelId: "demo-thread", messageId: "unheard", emoji: "💤" }]);
+  const [frame] = supervised(supervisor, "thread_message");
+  assert.deepEqual([frame.message_id, frame.project, frame.thread_id, frame.parent_channel_id, frame.content,
+    frame.author.id, frame.author_class, frame.delivered_to_session],
+  ["supervised", "demo", "demo-thread", "demo-channel", "Fix the flaky test", OWNER_ID, "owner", false]);
+  assert.deepEqual(ids(sessions.demo.events), []);
+});
+
+test("thread messages around a thread hello split at thread_session_live, none lost or duplicated", async () => {
+  const sessions = await listeners();
+  seedThreads(sessions.workspace, { "demo-thread": { type: 11, parentId: "demo-channel" } });
+  const supervisor = await connectSupervisor(sessions.workspace);
+  for (let n = 1; n <= 6; n++) inject(sessions.workspace, `m${n}`, { channelId: "demo-thread" });
+  await waitFor(() => supervised(supervisor, "thread_message").length >= 2, () => "the first messages at the supervisor");
+  const thread = await connectThread(sessions.workspace, { threadId: "demo-thread", provider: "codex" });
+  for (let n = 7; n <= 9; n++) inject(sessions.workspace, `m${n}`, { channelId: "demo-thread" });
+  inject(sessions.workspace, "thread-fence", { channelId: "demo-thread" });
+  await waitFor(() => thread.events.some(event => event.message_id === "thread-fence"), () => "thread fence");
+  const all = ["m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "m9"];
+  const stream = supervisor.events.filter(frame => frame.event === "thread_session_live" ||
+    (frame.event === "thread_message" && frame.message_id !== "thread-fence"));
+  const live = stream.findIndex(frame => frame.event === "thread_session_live");
+  assert.deepEqual(stream[live], { type: "event", event: "thread_session_live", project: "demo",
+    thread_id: "demo-thread", provider: "codex" });
+  const before = stream.slice(0, live);
+  const after = stream.slice(live + 1);
+  assert.deepEqual([...before, ...after].map(frame => frame.message_id), all);
+  assert.ok(before.length >= 2 && after.length >= 3, `split ${before.length}/${after.length}`);
+  assert.ok(before.every(frame => frame.delivered_to_session === false));
+  assert.ok(after.every(frame => frame.delivered_to_session === true));
+  assert.deepEqual(ids(thread.events.filter(event => event.message_id !== "thread-fence")),
+    after.map(frame => frame.message_id));
+});
+
+test("a revoked or disconnected thread session is reported to the supervisor", async () => {
+  const sessions = await listeners();
+  seedThreads(sessions.workspace, { "demo-thread": { type: 11, parentId: "demo-channel" } });
+  const supervisor = await connectSupervisor(sessions.workspace);
+  await connectThread(sessions.workspace, { threadId: "demo-thread" });
+  await connectThread(sessions.workspace, { threadId: "demo-thread", key: "demo-thread-key" });
+  fs.rmSync(path.join(sessions.workspace.routerStateDir, "keys/.thread-demo-thread.key"));
+  await waitFor(() => supervised(supervisor, "thread_session_revoked").length === 2, () => "two revocations");
+  assert.deepEqual(supervisor.events.filter(frame => frame.event.startsWith("thread_session"))
+    .map(({ event, project, thread_id, reason }) => [event, project, thread_id, reason]), [
+    ["thread_session_live", "demo", "demo-thread", undefined],
+    ["thread_session_revoked", "demo", "demo-thread", "replaced"],
+    ["thread_session_live", "demo", "demo-thread", undefined],
+    ["thread_session_revoked", "demo", "demo-thread", "key_rotated"],
+  ]);
+});
+
+test("bot, webhook and stranger thread messages reach only the supervisor, with their author class", async () => {
+  const sessions = await threadListeners();
+  const supervisor = await connectSupervisor(sessions.workspace);
+  const registry = JSON.parse(fs.readFileSync(path.join(sessions.workspace.repoDir, "registry.json"), "utf8"));
+  const inThread = (id, author, extra = {}) => inject(sessions.workspace, id, { channelId: "demo-thread", author, ...extra });
+  inThread("from-owner", { id: OWNER_ID, username: "Owner" });
+  inThread("from-guest", { id: "guest-id", username: "Guest" });
+  inThread("from-root", { id: "fixture-bot-user-id", bot: true });
+  inThread("from-webhook", { id: registry.projects.demo.webhook_id, bot: true },
+    { webhookId: registry.projects.demo.webhook_id });
+  inThread("from-other-webhook", { id: "other-webhook", bot: true }, { webhookId: "other-webhook" });
+  inThread("from-other-bot", { id: "other-bot", bot: true });
+  inThread("from-stranger", { id: "stranger-id", username: "Stranger" });
+  await threadFence(sessions);
+  await waitFor(() => supervisor.events.some(frame => frame.message_id?.endsWith("-thread-fence")), () => "supervisor fence");
+  assert.deepEqual(supervised(supervisor, "thread_message")
+    .map(frame => [frame.message_id, frame.author_class, frame.delivered_to_session]), [
+    ["from-owner", "owner", true],
+    ["from-guest", "guest", true],
+    ["from-root", "root_bot", false],
+    ["from-webhook", "project_webhook", false],
+    ["from-other-webhook", "other", false],
+    ["from-other-bot", "other", false],
+    ["from-stranger", "other", false],
+  ]);
+  assert.deepEqual(ids(sessions.thread.events), ["from-owner", "from-guest"]);
+  assert.deepEqual(marks(sessions.workspace), []);
+});
+
+test("supervisor thread commands reach only the supervisor, and session commands do with no session", async () => {
+  const sessions = await threadListeners();
+  seedThreads(sessions.workspace, { "idle-thread": { type: 11, parentId: "demo-channel" } });
+  const supervisor = await connectSupervisor(sessions.workspace);
+  for (const [id, content] of [["close", "/close"], ["config", "/config model=gpt-5.5"], ["config-bare", "/config"],
+    ["restart", "/restart"], ["clear", "/clear"], ["compact", "/compact"]]) {
+    inject(sessions.workspace, id, { channelId: "demo-thread", content });
+  }
+  for (const [id, content] of [["idle-compact", "/compact"], ["idle-pause", "/pause"], ["idle-unpause", "/unpause"]]) {
+    inject(sessions.workspace, id, { channelId: "idle-thread", content, author: { id: "guest-id", username: "Guest" } });
+  }
+  inject(sessions.workspace, "idle-fence", { channelId: "idle-thread" });
+  await threadFence(sessions);
+  await waitFor(() => supervisor.events.some(frame => frame.message_id === "idle-fence"), () => "supervisor fence");
+  assert.deepEqual(supervised(supervisor, "thread_command").map(frame =>
+    [frame.message_id, frame.command, frame.args, frame.project, frame.thread_id, frame.author.id]), [
+    ["close", "close", "", "demo", "demo-thread", OWNER_ID],
+    ["config", "config", "model=gpt-5.5", "demo", "demo-thread", OWNER_ID],
+    ["config-bare", "config", "", "demo", "demo-thread", OWNER_ID],
+    ["restart", "restart", "", "demo", "demo-thread", OWNER_ID],
+    ["clear", "clear", "", "demo", "demo-thread", OWNER_ID],
+    ["idle-compact", "compact", "", "demo", "idle-thread", "guest-id"],
+    ["idle-pause", "pause", "", "demo", "idle-thread", "guest-id"],
+    ["idle-unpause", "unpause", "", "demo", "idle-thread", "guest-id"],
+  ]);
+  assert.deepEqual(sessions.thread.events.filter(event => !event.message_id.endsWith("-fence"))
+    .map(event => [event.event, event.command, event.message_id]), [["command", "compact", "compact"]]);
+  assert.deepEqual(marks(sessions.workspace), []);
+});
+
+test("channel /thread and /config reach only the supervisor, and get 💤 with no supervisor", async () => {
+  const sessions = await listeners();
+  inject(sessions.workspace, "unsupervised-thread", { content: "/thread Fix the flaky test" });
+  inject(sessions.workspace, "unsupervised-config", { content: "/config" });
+  await waitFor(() => marks(sessions.workspace).length === 2, () => "💤 on both channel commands");
+  const supervisor = await connectSupervisor(sessions.workspace);
+  inject(sessions.workspace, "owner-thread", { content: "/thread x" });
+  inject(sessions.workspace, "guest-config", { content: "/config provider=codex",
+    author: { id: "guest-id", username: "Guest" } });
+  inject(sessions.workspace, "stranger-thread", { content: "/thread y", author: { id: "stranger-id", username: "Stranger" } });
+  inject(sessions.workspace, "not-a-command", { content: "/threads are great" });
+  await fence(sessions);
+  await waitFor(() => supervisor.events.some(frame => frame.message_id === "guest-config"), () => "supervisor commands");
+  assert.deepEqual(supervised(supervisor, "channel_command").map(frame =>
+    [frame.message_id, frame.command, frame.args, frame.project, frame.channel_id, frame.author.id]), [
+    ["owner-thread", "thread", "x", "demo", "demo-channel", OWNER_ID],
+    ["guest-config", "config", "provider=codex", "demo", "demo-channel", "guest-id"],
+  ]);
+  assert.deepEqual(ids(sessions.demo.events), ["not-a-command"]);
+  assert.deepEqual(marks(sessions.workspace), [
+    { channelId: "demo-channel", messageId: "unsupervised-thread", emoji: "💤" },
+    { channelId: "demo-channel", messageId: "unsupervised-config", emoji: "💤" },
+  ]);
+});
+
+test("thread lifecycle events reach the supervisor for eligible threads only, and type 18 never does", async () => {
+  const sessions = await listeners({ far: { channel_id: "far-channel", type: "claude", path: "remote:mac:/srv/far" } });
+  const supervisor = await connectSupervisor(sessions.workspace);
+  const thread = (id, parentId, extra = {}) => ({ id, type: 11, parentId, name: `Task ${id}`, ownerId: OWNER_ID, ...extra });
+  updateState(sessions.workspace.stateDir, state => {
+    state.fixtures.discord.injectedThreads = [
+      { ...thread("private-thread", "demo-channel", { type: 12 }), event: "create" },
+      { ...thread("root-thread", "root-channel"), event: "create" },
+      { ...thread("stray-thread", "stray-channel"), event: "create" },
+      { ...thread("remote-thread", "far-channel"), event: "create" },
+      { ...thread("forum-post", "demo-channel", { parentType: 15 }), event: "create" },
+      { ...thread("demo-thread", "demo-channel"), event: "create" },
+      { ...thread("demo-thread", "demo-channel"), event: "create", newlyCreated: false },
+      { ...thread("demo-thread", "demo-channel", { archived: true, autoArchiveDuration: 10080 }), event: "update",
+        previous: thread("demo-thread", "demo-channel", { archived: false, autoArchiveDuration: 1440 }) },
+      { ...thread("stray-thread", "stray-channel", { archived: true }), event: "update",
+        previous: thread("stray-thread", "stray-channel") },
+      { ...thread("stray-thread", "stray-channel"), event: "delete" },
+      { ...thread("demo-thread", "demo-channel"), event: "delete" },
+    ];
+  });
+  inject(sessions.workspace, "thread-created-notice", { type: 18 });
+  inject(sessions.workspace, "thread-created-in-thread", { type: 18, channelId: "demo-thread" });
+  updateState(sessions.workspace.stateDir, state => {
+    state.fixtures.discord.injectedGatewayEvents = [{ event: "shardResume" }, { event: "shardReady" }];
+  });
+  await waitFor(() => supervisor.events.filter(frame => frame.event === "gateway_resumed").length === 2,
+    () => `gateway_resumed twice: ${JSON.stringify(supervisor.events)}`);
+  await fence(sessions);
+  assert.deepEqual(supervisor.events.map(({ type: _type, ...frame }) => frame), [
+    { event: "thread_create", project: "demo", thread_id: "demo-thread", parent_channel_id: "demo-channel",
+      name: "Task demo-thread", owner_id: OWNER_ID, newly_created: true },
+    { event: "thread_create", project: "demo", thread_id: "demo-thread", parent_channel_id: "demo-channel",
+      name: "Task demo-thread", owner_id: OWNER_ID, newly_created: false },
+    { event: "thread_update", project: "demo", thread_id: "demo-thread", parent_channel_id: "demo-channel",
+      before: { archived: false, auto_archive_duration: 1440 }, after: { archived: true, auto_archive_duration: 10080 } },
+    { event: "thread_delete", project: "demo", thread_id: "demo-thread", parent_channel_id: "demo-channel" },
+    { event: "gateway_resumed" },
+    { event: "gateway_resumed" },
+  ]);
+});
+
+test("a thread reaction reaches the thread session, the supervisor and the observer", async () => {
+  const sessions = await threadListeners();
+  const supervisor = await connectSupervisor(sessions.workspace);
+  injectDiscordReaction(sessions.workspace, { channelId: "demo-thread", emoji: "✅", messageId: "config-warning",
+    user: { id: OWNER_ID, username: "Owner" },
+    message: { author: { id: "fixture-bot-user-id", bot: true }, content: "Switch to codex?" } });
+  await waitFor(() => supervisor.events.some(frame => frame.event === "thread_reaction") &&
+    sessions.observer.frames.some(frame => frame.event === "reaction"), () => "thread reaction at supervisor and observer");
+  await threadFence(sessions);
+  const reaction = supervisor.events.find(frame => frame.event === "thread_reaction");
+  assert.deepEqual([reaction.project, reaction.thread_id, reaction.message_id, reaction.emoji, reaction.user.id,
+    reaction.message_from_bot], ["demo", "demo-thread", "config-warning", "✅", OWNER_ID, true]);
+  const observed = sessions.observer.frames.find(frame => frame.event === "reaction");
+  assert.deepEqual([observed.project, observed.channel_id, observed.conversation_id, observed.thread_id],
+    ["demo", "demo-thread", "demo-thread", "demo-thread"]);
+  assert.deepEqual(sessions.thread.events.filter(event => event.event === "reaction").map(event => event.emoji), ["✅"]);
+  assert.deepEqual(sessions.sibling.events.filter(event => event.event === "reaction"), []);
+});
+
+test("a second supervisor hello replaces the first", async () => {
+  const sessions = await listeners();
+  seedThreads(sessions.workspace, { "demo-thread": { type: 11, parentId: "demo-channel" } });
+  const first = await connectSupervisor(sessions.workspace);
+  const second = await connectSupervisor(sessions.workspace);
+  await first.closed;
+  assert.deepEqual(first.events.map(frame => [frame.event, frame.reason]), [["revoked", "replaced"]]);
+  inject(sessions.workspace, "after-replace", { channelId: "demo-thread" });
+  await waitFor(() => second.events.some(frame => frame.message_id === "after-replace"), () => "the new supervisor's copy");
+  assert.equal(second.hello.type, "hello_ok");
+  assert.deepEqual(marks(sessions.workspace), []);
+});
+
+test("router status shows whether the supervisor is connected", async () => {
+  const { workspace } = await listeners();
+  const absent = await runRouterCli(workspace, ["status"]);
+  assert.equal(absent.exitCode, 0, absent.stderr);
+  assert.match(absent.stdout, /^supervisor: absent$/m);
+  await connectSupervisor(workspace);
+  const connected = await runRouterCli(workspace, ["status"]);
+  assert.match(connected.stdout, /^supervisor: connected connected=\S+$/m);
+  const json = JSON.parse((await runRouterCli(workspace, ["status", "--json"])).stdout);
+  assert.equal(json.supervisor.connected, true);
+});

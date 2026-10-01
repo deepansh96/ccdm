@@ -20,6 +20,8 @@ const RECENT_VIOLATIONS = 20;
 const ROOT_KEY_FILE = ".root.key";
 // The Conversation Reminder observer's key, named apart the same way.
 const OBSERVER_KEY_FILE = ".observer.key";
+// The Thread Supervisor's key, named apart the same way.
+const SUPERVISOR_KEY_FILE = ".supervisor.key";
 const PROVIDERS = new Set(["claude", "codex"]);
 const PUBLIC_THREAD = 11;
 
@@ -83,6 +85,8 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
   // The read-only reminder observer: it receives every project-channel event
   // and may perform no operation.
   let observerSession = null;
+  // The one Thread Supervisor: it receives all thread lifecycle traffic.
+  let supervisorSession = null;
   // Op-only project connections (`listener: false`, such as a Codex bridge's
   // scoped MCP server): they act in the project's scope but receive no events
   // and never replace the project's listener.
@@ -107,18 +111,32 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
   const threadKey = threadId => readKey(`.thread-${threadId}.key`);
   const connectionKey = connection => connection.role === "root" ? readKey(ROOT_KEY_FILE)
     : connection.role === "observer" ? readKey(OBSERVER_KEY_FILE)
+      : connection.role === "supervisor" ? readKey(SUPERVISOR_KEY_FILE)
       : connection.role === "thread" ? threadKey(connection.route.thread_id) : projectKey(connection.route.project);
 
-  function forget(connection) {
+  function deliverSupervisor(event) {
+    if (!supervisorSession) return false;
+    send(supervisorSession.socket, { type: "event", ...event });
+    return true;
+  }
+
+  // A thread listener that goes, revoked or disconnected, is reported to the supervisor.
+  function forget(connection, reason = "disconnected") {
     if (connection.role === "thread") {
       threadOps.delete(connection);
-      if (threadSessions.get(connection.route.thread_id) === connection) threadSessions.delete(connection.route.thread_id);
+      const { project, thread_id: threadId } = connection.route;
+      if (threadSessions.get(threadId) === connection) {
+        threadSessions.delete(threadId);
+        deliverSupervisor({ event: "thread_session_revoked", project, thread_id: threadId, reason });
+      }
     } else if (connection.listener === false) {
       opConnections.delete(connection);
     } else if (connection.role === "root") {
       if (rootSession === connection) rootSession = null;
     } else if (connection.role === "observer") {
       if (observerSession === connection) observerSession = null;
+    } else if (connection.role === "supervisor") {
+      if (supervisorSession === connection) supervisorSession = null;
     } else if (connection.route && sessions.get(connection.route.project) === connection) {
       sessions.delete(connection.route.project);
     }
@@ -126,7 +144,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
 
   // The session loses its place: it is told why, then disconnected.
   function revoke(connection, reason) {
-    forget(connection);
+    forget(connection, reason);
     log(`revoked project=${connection.route.project} reason=${reason}`);
     send(connection.socket, { type: "event", event: "revoked", reason });
     connection.socket.end();
@@ -136,7 +154,8 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
   // still holding the old one goes.
   async function revokeStaleKeys() {
     for (const connection of [...sessions.values(), ...opConnections, ...threadSessions.values(), ...threadOps,
-      ...(rootSession ? [rootSession] : []), ...(observerSession ? [observerSession] : [])]) {
+      ...(rootSession ? [rootSession] : []), ...(observerSession ? [observerSession] : []),
+      ...(supervisorSession ? [supervisorSession] : [])]) {
       if (!keysMatch(await connectionKey(connection), connection.key)) revoke(connection, "key_rotated");
     }
   }
@@ -178,6 +197,21 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       });
       observerSession = connection;
       return send(connection.socket, { type: "hello_ok", v: PROTOCOL_VERSION, scope: { project: "observer" } });
+    }
+    if (frame.role === "supervisor") {
+      if (!keysMatch(await readKey(SUPERVISOR_KEY_FILE), frame.key)) return reject("unauthorized", "unknown supervisor key");
+      // One supervisor: a newer hello replaces the old one.
+      if (supervisorSession) revoke(supervisorSession, "replaced");
+      Object.assign(connection, {
+        role: "supervisor", route: { project: "supervisor", channel_id: null }, key: frame.key,
+        connectedAt: new Date().toISOString(),
+      });
+      supervisorSession = connection;
+      const projects = [...getTable().projects.values()]
+        .map(({ project, channel_id, webhook_id }) => ({ project, channel_id, webhook_id }));
+      return send(connection.socket, {
+        type: "hello_ok", v: PROTOCOL_VERSION, scope: { project: "supervisor" }, bot_user_id: context.bot?.id ?? null, projects,
+      });
     }
     if (frame.role === "thread") return threadHello(connection, frame, reject);
     if (frame.role !== "project") return reject("unsupported_role", `unsupported role: ${frame.role}`);
@@ -224,6 +258,9 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       const previous = threadSessions.get(threadId);
       if (previous) revoke(previous, "replaced");
       threadSessions.set(threadId, connection);
+      // In the same turn as the registration: every thread message classified
+      // before this frame went to the supervisor, every one after to the session.
+      deliverSupervisor({ event: "thread_session_live", project: route.project, thread_id: threadId, provider: frame.provider });
     }
     const { webhook_id: _webhook, ...scope } = threadRoute;
     send(connection.socket, { type: "hello_ok", v: PROTOCOL_VERSION, scope });
@@ -255,6 +292,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     try {
       // Discord calls stop once the client's own timeout has passed.
       const result = await withDeadline(frame.deadline_at, () => operation.run({ ...context, session, sessions: listSessions,
+        supervisor: () => supervisorSession && { connectedAt: supervisorSession.connectedAt },
         violations: () => [...violations], table: getTable(), gateway, registry }, args));
       respond({ ok: true, result });
     } catch (error) {
@@ -335,6 +373,8 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       send(connection.socket, { type: "event", ...event });
       return true;
     },
+    // Delivers to the Thread Supervisor; false when it is not connected.
+    deliverSupervisor,
     // Delivers to root's live session; false when root is not connected.
     deliverRoot(event) {
       if (!rootSession) return false;
@@ -386,6 +426,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       }
       rootSession?.socket.destroy();
       observerSession?.socket.destroy();
+      supervisorSession?.socket.destroy();
       server.close();
     },
   };

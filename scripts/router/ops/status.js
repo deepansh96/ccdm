@@ -38,6 +38,7 @@ async function status(ctx, args = {}) {
       missing_permissions: await missingPermissions(ctx, route.channel_id),
     });
   }
+  const supervisor = ctx.supervisor?.();
   return {
     gateway: ctx.gateway.state,
     registry_loaded_at: ctx.table.loadedAt,
@@ -49,6 +50,7 @@ async function status(ctx, args = {}) {
       ...(session.role === "thread" ? { thread_id: session.route.thread_id, provider: session.route.type } : {}),
       connected_at: session.connectedAt,
     })),
+    supervisor: { connected: Boolean(supervisor), connected_at: supervisor?.connectedAt ?? null },
     projects,
     scope_violations: ctx.violations(),
     ...(args.project === undefined ? {} : { target: await target(ctx, String(args.project)) }),

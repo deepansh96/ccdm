@@ -9,6 +9,8 @@ const CLOSE_COMMAND = "/close";
 // supervisor's commands never reach it.
 const THREAD_COMMANDS = new Set(["/pause", "/unpause", "/compact"]);
 const SUPERVISOR_COMMAND = /^\/(?:close|restart|clear|config)(?:\s|$)/;
+// In a project channel, these are the supervisor's and never reach the session.
+const CHANNEL_COMMAND = /^\/(?:thread|config)(?:\s|$)/;
 const PUBLIC_THREAD = 11;
 const FORUM_TYPES = new Set([15, 16]);
 
@@ -92,18 +94,34 @@ function classifyMessage(table, message, thread = null) {
     ts: new Date(message.createdTimestamp).toISOString(),
   };
   const content = String(message.content || "");
-  // 5. `/close` is for the reminder service alone, which sees it through the observer.
+  // 5. `/thread` and `/config` are the Thread Supervisor's (`supervisor: true`).
+  if (CHANNEL_COMMAND.test(content.trim())) {
+    return { route, supervisor: true, event: supervisorCommand("channel_command", route, author, message) };
+  }
+  // 6. `/close` is for the reminder service alone, which sees it through the observer.
   if (content.trim() === CLOSE_COMMAND) return null;
-  // 6. Plain management commands pass through to the session adapter.
+  // 7. Plain management commands pass through to the session adapter.
   if (COMMANDS.has(content.trim())) {
     return { route, event: { event: "command", command: content.trim().slice(1), ...base } };
   }
-  // 7. Everything else is a message.
+  // 8. Everything else is a message.
   return { route, event: messageEvent(route, author, message) };
 }
 
+// A command for the supervisor, `/config model=x` as `config` and its arguments.
+function supervisorCommand(event, route, author, message) {
+  const [, command, args = ""] = /^\/(\S+)\s*(.*)$/s.exec(String(message.content || "").trim());
+  return {
+    event, command, args, project: route.project, message_id: message.id, channel_id: route.channel_id,
+    ...(route.thread_id ? { thread_id: route.thread_id, parent_channel_id: route.parent_channel_id } : {}),
+    author, ts: new Date(message.createdTimestamp).toISOString(),
+  };
+}
+
+const threadCommand = (route, author, message) => supervisorCommand("thread_command", route, author, message);
+
 // In a thread, the owner and the parent's current guests reach the thread
-// session; the supervisor's commands reach no session. Addressing the bot is
+// session; the supervisor's commands (`supervisor: true`) reach no session. Addressing the bot is
 // for root, in the thread, and only from the owner.
 function classifyThreadMessage(table, message, route, user) {
   const author = allowedAuthor(new Set(route.guests), table, user);
@@ -112,12 +130,42 @@ function classifyThreadMessage(table, message, route, user) {
     return author.is_owner ? { route, root: true, event: messageEvent(route, author, message) } : null;
   }
   const content = String(message.content || "").trim();
-  if (SUPERVISOR_COMMAND.test(content)) return null;
+  if (SUPERVISOR_COMMAND.test(content)) return { route, supervisor: true, event: threadCommand(route, author, message) };
+  // With no live session, the supervisor answers these as `fallback`.
   if (THREAD_COMMANDS.has(content)) {
-    return { route, thread: true, event: { event: "command", command: content.slice(1), message_id: message.id,
-      channel_id: route.channel_id, author, ts: new Date(message.createdTimestamp).toISOString() } };
+    return { route, thread: true, fallback: threadCommand(route, author, message), event: { event: "command",
+      command: content.slice(1), message_id: message.id, channel_id: route.channel_id, author,
+      ts: new Date(message.createdTimestamp).toISOString() } };
   }
   return { route, thread: true, event: messageEvent(route, author, message) };
+}
+
+// Who wrote a thread message, for the supervisor: the owner, a current guest
+// of the parent, the root bot itself, the project's own webhook, or anyone else.
+function authorClass(table, message, route) {
+  const id = String(message.author?.id ?? "");
+  if (message.webhookId) return String(message.webhookId) === route.webhook_id ? "project_webhook" : "other";
+  if (message.author?.bot) return id === String(message.client?.user?.id) ? "root_bot" : "other";
+  if (id === table.ownerId) return "owner";
+  return route.guests.includes(id) ? "guest" : "other";
+}
+
+// The supervisor's copy of every message in an eligible thread, bots,
+// webhooks and strangers included, saying whether its thread session got it.
+function supervisedMessage(table, message, thread, deliveredToSession) {
+  const user = { ...message.author, globalName: message.member?.displayName || message.author?.globalName };
+  const author = { id: String(user.id ?? ""), name: user.globalName || user.username || String(user.id ?? ""),
+    bot: Boolean(user.bot) };
+  return {
+    ...messageEvent(thread, author, message),
+    event: "thread_message",
+    project: thread.project,
+    thread_id: thread.thread_id,
+    parent_channel_id: thread.parent_channel_id,
+    webhook_id: message.webhookId ? String(message.webhookId) : null,
+    author_class: authorClass(table, message, thread),
+    delivered_to_session: deliveredToSession,
+  };
 }
 
 // The reminder observer's copy of every message in a router project channel,
@@ -183,4 +231,4 @@ async function classifyReaction(table, reaction, user, botId = null, thread = nu
   };
 }
 
-module.exports = { classifyMessage, classifyReaction, observedMessage, threadRoute };
+module.exports = { classifyMessage, classifyReaction, observedMessage, supervisedMessage, threadRoute };
