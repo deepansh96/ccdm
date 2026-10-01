@@ -11,7 +11,7 @@ import signal
 import sqlite3
 import sys
 
-from . import store
+from . import projects, store
 from .control import ControlServer
 from .dispatch import dispatch
 from .link import Link
@@ -40,6 +40,8 @@ class Context:
     archive_polls: dict = field(default_factory=dict)
     # What each queued thread starts with, by thread id: its trigger and starter.
     queued: dict = field(default_factory=dict)
+    # The registry as last read, for deregistrations and channel moves (projects.Watch).
+    watch: object = None
 
 
 def lock_path(state_dir: Path) -> Path:
@@ -74,22 +76,28 @@ def run(project_root: Path, state_dir: Path) -> None:
         signal.signal(signal.SIGINT, stop)
         # A fresh key each start, before the link says hello with it.
         link = Link(write_supervisor_key())
-        context = Context(project_root, state_dir, db, link)
+        context = Context(project_root, state_dir, db, link, watch=projects.Watch(project_root))
         control = None
         try:
             control = ControlServer(state_dir, link.post)
             write_health(state_dir, link, "connecting")
+            connected = False
             while not stopping:
+                # Registry changes are handled while connected, so the queue they free can start.
+                if connected and context.watch.changed():
+                    dispatch(context, {"type": "internal", "event": "registry"})
                 frame = link.next_frame(0.25)
                 if frame is None:
                     continue
                 kind = frame.get("type")
                 if kind == "connected":
                     context.bot_user_id = frame.get("bot_user_id")
+                    connected = True
                     write_health(state_dir, link, "connected")
                     # Whatever happened while this worker or the Router was away.
                     dispatch(context, {"type": "internal", "event": "reconcile"})
                 elif kind == "disconnected":
+                    connected = False
                     write_health(state_dir, link, "disconnected")
                 elif kind in ("event", "internal"):
                     dispatch(context, frame)

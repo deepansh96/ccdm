@@ -1,6 +1,9 @@
 #!/bin/zsh
-# Usage: ./scripts/stop-session.sh <project_name>
-# Reads registry.json to get the tmux session name and stops it.
+# Usage: ./scripts/stop-session.sh <project_name> [--threads|--all]
+# Reads registry.json to get the tmux session name and stops it: the channel
+# session only, leaving thread sessions running. --threads stops only the
+# project's thread sessions, as operator stops through the Thread Supervisor
+# (or by their .thread-<id>.key paths when it is down); --all stops both.
 
 set -euo pipefail
 
@@ -9,10 +12,27 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 REGISTRY="$ROOT_DIR/registry.json"
 
 PROJECT="${1:-}"
+MODE="${2:-}"
 
-if [[ -z "$PROJECT" ]]; then
-  echo "Usage: $0 <project_name>"
+if [[ -z "$PROJECT" || $# -gt 2 || ( -n "$MODE" && "$MODE" != "--threads" && "$MODE" != "--all" ) ]]; then
+  echo "Usage: $0 <project_name> [--threads|--all]"
   exit 1
+fi
+
+stop_threads() {
+  python3 - "$ROOT_DIR" "$PROJECT" <<'PY'
+import sys
+from pathlib import Path
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(sys.argv[1]) / "scripts"))
+from thread_supervisor.operator_stop import main
+raise SystemExit(main(Path(sys.argv[1]), sys.argv[2]))
+PY
+}
+
+if [[ "$MODE" == "--threads" ]]; then
+  stop_threads
+  exit $?
 fi
 
 collect_tree() {
@@ -360,3 +380,7 @@ fi
 python3 "$SCRIPT_DIR/registry-update.py" set-project-fields "$REGISTRY" "$PROJECT" '{"session_id": null, "pid": null}'
 
 echo "Stopped Discord session '$PROJECT'"
+
+if [[ "$MODE" == "--all" ]]; then
+  stop_threads
+fi

@@ -55,6 +55,8 @@ While the Thread Supervisor is down, the Router marks an owner or guest message 
 
 `/config` in a thread is owner-only (a guest gets a one-line refusal). With no arguments it posts the thread's provider, account alias, model and effort, each marked `(thread)` or `(project)`. `model=<m>` and `effort=<e>` are validated by `/thread`'s rules, saved as overrides, and restart a running session with `--resume` into the same conversation. `provider=` and `account=` (aliases only) post a warning with ✅ on it and store `pending_config`; only the owner's ✅ on that exact message applies the change, clears `provider_conversation_id`, and starts a running session fresh. An invalid value posts `Settings not changed: <reason>`. In a project channel, `/config` reaches only the supervisor and lists the settings new threads inherit; it never changes channel settings.
 
+The Thread Supervisor watches the registry. A project that leaves it has each thread session stopped and its rows set `closed/deregistered`, and a changed `channel_id` sets them `closed/project-moved` (the Router revokes their connections with `project_moved`); neither makes a Discord call. Channel maintenance never touches threads: `start-session.sh <project>`, `stop-session.sh <project>`, a channel restart and a project key rotation act on the Channel Conversation only. `stop-session.sh <project> --threads` stops only the project's thread sessions, through the supervisor's control socket (`stop_threads`), as `stopped/operator`, which nothing restarts automatically; with the supervisor down it stops the listeners carrying each thread's `.thread-<id>.key` path (threads found in the store and under `launches/<project>/threads/`), removes their tmux sessions and keys, and marks the rows when no worker holds the store. `--all` stops the channel session and then the threads. Guests are read from the registry on every message, so a revoked guest can no longer drive or resume a thread.
+
 A project's Channel Conversation, Claude or Codex, can hand a side task off with its `create_thread` tool (`name`, optional `provider`, `account`, `model`, `effort`, `first_message`): the same validation and creation flow in its own channel only, returning the new thread's id, an op error (`invalid: <reason>`) that creates nothing, or `supervisor_unavailable` when no Thread Supervisor runs. Thread sessions and root have no such tool.
 
 ## Codex Lifecycle
@@ -81,7 +83,7 @@ For an explicit history-preserving restart, use `scripts/start-codex-session.sh 
 
 ## Stop Invariant
 
-`scripts/stop-session.sh <project>` is the common teardown path: kill the recorded process tree, kill the exact tmux session, sweep listener processes by assignment identity, then clear `pid` and `session_id`. Do not replace this with only `tmux kill-session`; orphan listeners have caused duplicate processing.
+`scripts/stop-session.sh <project>` is the common teardown path for the Channel Conversation (thread sessions keep running; add `--threads` or `--all` for them): kill the recorded process tree, kill the exact tmux session, sweep listener processes by assignment identity, then clear `pid` and `session_id`. Do not replace this with only `tmux kill-session`; orphan listeners have caused duplicate processing.
 
 ## Registration
 

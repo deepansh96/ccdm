@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import sys
 
-from . import binding, boot, capacity, commands, config, control, creation, lifecycle, reconcile
+from . import binding, boot, capacity, commands, config, control, creation, lifecycle, projects, reconcile
 
 
 HANDLERS = {
@@ -27,6 +27,7 @@ INTERNAL_HANDLERS = {
     "control": control.on_control,
     "launch_exit": boot.on_launch_exit,
     "reconcile": reconcile.reconcile,
+    "registry": projects.on_registry,
 }
 
 

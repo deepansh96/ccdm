@@ -110,7 +110,15 @@ def stop_session(context, row) -> None:
     session and key go."""
     thread_id = row["thread_id"]
     context.boots.pop(thread_id, None)
-    key_file = key_path(thread_id)
+    kill_listeners(key_path(thread_id))
+    if row["runtime_tmux"]:
+        subprocess.run(["tmux", "kill-session", "-t", f"={row['runtime_tmux']}"], capture_output=True)
+    key_path(thread_id).unlink(missing_ok=True)
+    store.update(context.db, thread_id, runtime_pid=None, runtime_tmux=None)
+
+
+def kill_listeners(key_file: Path) -> None:
+    """SIGTERM the listeners carrying ``key_file``, then SIGKILL any still running after the grace period."""
     pids = _listener_pids(key_file)
     for pid in pids:
         try:
@@ -126,10 +134,6 @@ def stop_session(context, row) -> None:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-    if row["runtime_tmux"]:
-        subprocess.run(["tmux", "kill-session", "-t", f"={row['runtime_tmux']}"], capture_output=True)
-    key_file.unlink(missing_ok=True)
-    store.update(context.db, thread_id, runtime_pid=None, runtime_tmux=None)
 
 
 def on_thread_update(context, event: dict) -> None:

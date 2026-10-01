@@ -3,7 +3,10 @@
 One JSON request line in, one JSON response line out:
 `{"op": "create", "project", "name", "flags": {...}, "first_message"}` gets
 `{"ok": true, "result": {...}}` or `{"ok": false, "error": {"code", "message"}}`,
-where code `invalid` means the request created nothing. The server thread
+where code `invalid` means the request created nothing.
+`{"op": "stop_threads", "project"}` stops each of the project's booting, live
+and queued thread sessions as `stopped/operator`, and answers
+`{"ok": true, "result": {"stopped": [thread ids]}}`. The server thread
 hands each request to the worker loop as an internal `control` frame, so the
 store and the Router link are only ever used from that loop.
 """
@@ -18,7 +21,7 @@ import queue
 import socket
 import threading
 
-from . import creation
+from . import creation, lifecycle, store
 
 
 SOCKET_NAME = "control.sock"
@@ -110,7 +113,25 @@ class ControlServer:
         self.path.unlink(missing_ok=True)
 
 
+def stop_threads(context, project) -> dict:
+    """Operator stops: the project's running and queued thread sessions, never restarted on their own."""
+    if not isinstance(project, str) or not project:
+        return _error("invalid", "stop_threads needs a project")
+    stopped = []
+    rows = context.db.execute("SELECT * FROM threads WHERE project=? AND state IN ('booting', 'live', 'queued')",
+                              (project,)).fetchall()
+    for row in rows:
+        context.archive_polls.pop(row["thread_id"], None)
+        context.queued.pop(row["thread_id"], None)
+        lifecycle.stop_session(context, row)
+        store.finish_boot(context.db, row["thread_id"], "stopped", "operator")
+        stopped.append(row["thread_id"])
+    return {"ok": True, "result": {"stopped": stopped}}
+
+
 def handle(context, request: dict) -> dict:
+    if request.get("op") == "stop_threads":
+        return stop_threads(context, request.get("project"))
     if request.get("op") != "create":
         return _error("invalid", f"unknown op {request.get('op')!r}")
     flags = request.get("flags") if isinstance(request.get("flags"), dict) else {}
