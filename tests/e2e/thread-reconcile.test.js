@@ -316,3 +316,37 @@ test("a session that crashes while the supervisor runs is stopped/crashed, and t
   assert.ok(notifications(workspace, raw.id).some(notification =>
     String(notification.content).includes("are you still there?")), "the resumed bootstrap carries the message");
 });
+
+test("on restart, an owner's native reply to a root-bot message is root's and starts nothing", async () => {
+  const workspace = reconcileWorkspace();
+  const { supervisor } = await supervised(workspace);
+  const raw = thread("1700000000000380001");
+  threadEvent(workspace, raw, "create");
+  await threadRow(workspace, raw.id);
+  assert.equal((await supervisor.stop()).exitCode, 0);
+
+  // Newest first, as Discord returns it: the owner replied to root's message after the agent's reply.
+  const root = { id: "fixture-bot-user-id", username: "root", bot: true };
+  const rootMessage = { id: "root-note", type: 0, channel_id: raw.id, content: "I archived the old branch",
+    attachments: [], timestamp: "2026-09-30T10:02:00.000Z", author: root };
+  updateState(workspace.stateDir, state => {
+    (state.fixtures.discord.history ||= {})[raw.id] = [
+      { id: "reply-to-root", type: 19, channel_id: raw.id, content: "thanks, which one?", attachments: [],
+        timestamp: "2026-09-30T10:03:00.000Z", author: { id: OWNER_ID, username: "Owner" },
+        message_reference: { message_id: "root-note", channel_id: raw.id }, referenced_message: rootMessage,
+        mentions: [] },
+      rootMessage,
+      { id: "agent-reply", type: 0, channel_id: raw.id, content: "on it", attachments: [],
+        timestamp: "2026-09-30T10:01:00.000Z", webhook_id: WEBHOOK_ID,
+        author: { id: WEBHOOK_ID, username: "demo-claude", bot: true } },
+      { id: "owner-ask", type: 0, channel_id: raw.id, content: "please fix the parser", attachments: [],
+        timestamp: "2026-09-30T10:00:00.000Z", author: { id: OWNER_ID, username: "Owner" } },
+    ];
+  });
+
+  await startThreadSupervisor(workspace, { env: ENV });
+  await settle(2000);
+
+  assert.equal((await threadRows(workspace))[raw.id].state, "registered");
+  assert.deepEqual(claude(workspace).invocations ?? [], []);
+});

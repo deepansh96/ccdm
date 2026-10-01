@@ -275,3 +275,53 @@ test("Codex and Claude caps are independent, and a Codex session idle after turn
   await waitFor(() => notices(workspace, THREADS.b).length === 1, () => "B's queued notice");
   assert.deepEqual(notices(workspace, THREADS.b), ["Queued, 1 sessions busy."]);
 });
+
+test("a queued thread starts ahead of a newer one: the drain evicts an idle session for the queue head, and the newer thread queues behind it", async () => {
+  const workspace = capacityWorkspace(capsRegistry({ claude: 1 }));
+  await supervised(workspace);
+  holdTurns(workspace, THREADS.a);
+  await liveClaudeThread(workspace, THREADS.a);
+  threadEvent(workspace, THREADS.c, "create");
+  await threadRow(workspace, THREADS.c);
+  message(workspace, THREADS.c, "c-1", "start C");
+  await threadRow(workspace, THREADS.c, row => row.state === "queued");
+
+  // A's turn ends, so A is idle; C's turns are held from here, so C stays busy once it runs.
+  const stops = stopHooks(workspace);
+  holdTurns(workspace, THREADS.c);
+  await waitFor(() => stopHooks(workspace) > stops, () => "A's Stop hook", 20000);
+  threadEvent(workspace, THREADS.d, "create");
+  await threadRow(workspace, THREADS.d);
+  message(workspace, THREADS.d, "d-1", "start D");
+
+  await threadRow(workspace, THREADS.c, row => row.state === "live");
+  await waitFor(() => replies(workspace, THREADS.c).length === 1, () => "C's reply", 20000);
+  assert.match(claude(workspace).channelNotifications.find(n => n.meta.chat_id === THREADS.c.id).content, /start C/);
+  const a = await threadRow(workspace, THREADS.a);
+  assert.deepEqual([a.state, a.stop_reason], ["stopped", "evicted"]);
+  assert.deepEqual(notices(workspace, THREADS.a), [PAUSED]);
+  assert.equal((await threadRow(workspace, THREADS.d, row => row.state === "queued")).state, "queued");
+  assert.equal(invocationsFor(workspace, THREADS.d).length, 0);
+});
+
+test("a queued creation request keeps its first message across a supervisor restart and starts with it", async () => {
+  const workspace = capacityWorkspace(capsRegistry({ claude: 1 }));
+  const supervisor = await supervised(workspace);
+  holdTurns(workspace, THREADS.a);
+  await liveClaudeThread(workspace, THREADS.a);
+  const created = { id: "1600000000000000001", name: "queued-task" };
+  injectDiscordMessage(workspace, { id: "thread-command", channelId: "demo-channel",
+    content: "/thread queued-task please look at the flaky parser test", author: { id: OWNER_ID, username: "Owner" } });
+  await threadRow(workspace, created, row => row.state === "queued");
+
+  assert.equal((await supervisor.stop()).exitCode, 0);
+  await startThreadSupervisor(workspace, { env: NO_IDLE_WAIT });
+  // An archive frees A's slot for the queued thread.
+  threadEvent(workspace, THREADS.a, "update", { archived: true, previous: { id: THREADS.a.id, archived: false } });
+
+  await threadRow(workspace, created, row => row.state === "live");
+  await waitFor(() => (claude(workspace).channelNotifications ?? []).some(n => n.meta.chat_id === created.id),
+    () => "the queued thread's bootstrap", 20000);
+  const bootstrap = claude(workspace).channelNotifications.find(n => n.meta.chat_id === created.id);
+  assert.match(bootstrap.content, /please look at the flaky parser test/);
+});

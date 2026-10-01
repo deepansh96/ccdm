@@ -7,10 +7,13 @@ At a provider's cap, the idle live row with the oldest owner activity is
 stopped as `stopped/evicted` with a pause notice in its thread. Idle means
 its launch dir's activity.json says no turn is running, and its last owner
 message (or its creation) is at least 30 minutes old; a missing or unreadable
-activity.json means busy, and a booting session is never evicted. With no
-idle victim the row is `queued` behind every other queued row, with a notice
-naming the provider's live count. After every event, each provider's queue
-drains in FIFO order into whatever slots are free.
+activity.json means busy, and a booting session (or one whose launcher still
+runs) is never evicted. With no idle victim, or with rows already queued for
+its provider, the row is `queued` behind every other queued row, with a
+notice naming the provider's live count; its trigger and starter are stored
+on the row, so a supervisor restart keeps them. After every event, each
+provider's queue drains in FIFO order into free slots, evicting idle sessions
+for its head as an admission would.
 """
 
 from __future__ import annotations
@@ -103,48 +106,69 @@ def _notice(context, thread_id: str, text: str) -> None:
         _log(f"thread {thread_id}: the capacity notice failed: {error.code}")
 
 
-def _victim(rows):
-    """The idle live row whose owner activity is oldest."""
+def _victim(context, rows):
+    """The idle live row whose owner activity is oldest. A row whose launcher
+    still runs is never one: its stop would race the launch."""
     threshold = idle_seconds()
-    idle = [row for row in rows if row["state"] == "live" and not _turn_running(row)
-            and age_seconds(_last_activity(row)) >= threshold]
+    idle = [row for row in rows if row["state"] == "live" and row["thread_id"] not in context.boots
+            and not _turn_running(row) and age_seconds(_last_activity(row)) >= threshold]
     return min(idle, key=_last_activity, default=None)
+
+
+def _queued_ahead(db, provider: str, row) -> list:
+    """The queued rows for ``provider`` that start before ``row``: all of them,
+    unless ``row`` is queued itself, when only those ahead of it."""
+    ahead = db.execute("SELECT * FROM threads WHERE state='queued' AND resolved_provider=? AND thread_id != ?",
+                       (provider, row["thread_id"])).fetchall()
+    if row["state"] == "queued":
+        ahead = [other for other in ahead if other["queue_position"] < row["queue_position"]]
+    return ahead
 
 
 def admit(context, row, resolved: dict, trigger: dict | None, starter: str | None) -> bool:
     """Whether ``row`` may start now, evicting an idle session for it at the
-    cap; otherwise it is queued with its ``trigger`` and ``starter`` kept for
-    when it starts."""
+    cap. Otherwise it is queued, behind every row already queued for its
+    provider, with its ``trigger`` and ``starter`` stored for when it starts."""
     provider = resolved["provider"]
     cap = caps(registry.load(context.project_root))[0].get(provider, 1)
     running = _running(context.db, provider, row["thread_id"])
-    if len(running) < cap:
-        return True
-    victim = _victim(running) if len(running) == cap else None
-    if victim is not None:
-        lifecycle.stop_session(context, victim)
-        store.finish_boot(context.db, victim["thread_id"], "stopped", "evicted")
-        _notice(context, victim["thread_id"], PAUSED)
-        return True
-    if row["state"] != "queued":  # A queued row keeps its place.
-        store.enqueue(context.db, row["thread_id"], resolved)
+    if not _queued_ahead(context.db, provider, row):
+        if len(running) < cap:
+            return True
+        victim = _victim(context, running) if len(running) == cap else None
+        if victim is not None:
+            lifecycle.stop_session(context, victim)
+            store.finish_boot(context.db, victim["thread_id"], "stopped", "evicted")
+            _notice(context, victim["thread_id"], PAUSED)
+            return True
+    if row["state"] != "queued":  # A queued row keeps its place and what it starts with.
+        store.enqueue(context.db, row["thread_id"], resolved, json.dumps({"trigger": trigger, "starter": starter}))
         _notice(context, row["thread_id"], f"Queued, {len(running)} sessions busy.")
-    context.queued[row["thread_id"]] = {"trigger": trigger, "starter": starter}
     return False
 
 
+def _queued_start(row) -> dict:
+    try:
+        kept = json.loads(row["queued_start"] or "{}")
+    except json.JSONDecodeError:
+        kept = {}
+    return kept if isinstance(kept, dict) else {}
+
+
 def drain(context) -> None:
-    """Start queued rows, oldest first per provider, while their provider has free slots."""
+    """Start queued rows, oldest first per provider, while their provider has
+    a free slot or an idle session to evict; a provider's queue stops at the
+    first row that cannot start, so no later row passes it."""
     from . import boot  # boot admits through this module.
 
     queued = context.db.execute("SELECT * FROM threads WHERE state='queued' ORDER BY queue_position").fetchall()
-    if not queued:
-        return
-    limits = caps(registry.load(context.project_root))[0]
+    blocked = set()
     for row in queued:
         provider = row["resolved_provider"]
-        if len(_running(context.db, provider)) >= limits.get(provider, 1):
+        if provider in blocked:
             continue
-        kept = context.queued.pop(row["thread_id"], None) or {"trigger": None, "starter": ""}
-        boot.start(context, row, kept["trigger"], kept["starter"])
-
+        kept = _queued_start(row)
+        boot.start(context, row, kept.get("trigger"), kept.get("starter"))
+        current = store.thread(context.db, row["thread_id"])
+        if current and current["state"] == "queued":
+            blocked.add(provider)

@@ -29,6 +29,7 @@ def _one_of(column: str, values: tuple[str, ...], nullable: bool = False) -> str
 
 # One row per bound thread. Override columns are null when the thread inherits
 # the project's setting; `resolved_*` hold what its session runs with.
+# A queued row's `queued_start` holds the trigger and starter it starts with (JSON).
 TABLES = {
     "threads": f"""thread_id TEXT PRIMARY KEY, project TEXT NOT NULL, name TEXT NOT NULL,
         creator_id TEXT NOT NULL, starter_message_id TEXT, created_at TEXT NOT NULL,
@@ -40,7 +41,7 @@ TABLES = {
         close_reason TEXT {_one_of("close_reason", CLOSE_REASONS, nullable=True)},
         runtime_tmux TEXT, runtime_pid INTEGER, ws_port INTEGER,
         last_owner_activity_at TEXT, last_agent_reply_at TEXT,
-        pending_config TEXT, pending_close TEXT, queue_position INTEGER""",
+        pending_config TEXT, pending_close TEXT, queue_position INTEGER, queued_start TEXT""",
     "creation_requests": f"""request_id TEXT PRIMARY KEY, project TEXT NOT NULL, name TEXT NOT NULL,
         provider TEXT, account TEXT, model TEXT, effort TEXT, first_message TEXT,
         requester_id TEXT NOT NULL,
@@ -56,7 +57,7 @@ COLUMNS = {
                 "resolved_provider", "resolved_account", "resolved_model", "resolved_effort",
                 "provider_conversation_id", "provider_home", "state", "stop_reason", "close_reason",
                 "runtime_tmux", "runtime_pid", "ws_port", "last_owner_activity_at", "last_agent_reply_at",
-                "pending_config", "pending_close", "queue_position"},
+                "pending_config", "pending_close", "queue_position", "queued_start"},
     "creation_requests": {"request_id", "project", "name", "provider", "account", "model", "effort",
                           "first_message", "requester_id", "requester_kind", "status", "thread_id", "created_at"},
     "boot_buffers": {"thread_id", "message_id", "payload", "received_at"},
@@ -248,13 +249,15 @@ def held_ports(db: sqlite3.Connection, except_thread_id: str) -> set[int]:
                                          (except_thread_id,))}
 
 
-def enqueue(db: sqlite3.Connection, thread_id: str, resolved: dict) -> None:
+def enqueue(db: sqlite3.Connection, thread_id: str, resolved: dict, queued_start: str | None = None) -> None:
     """Queue a thread behind every queued one, with what its session will run
-    with, and empty its boot buffer of any earlier attempt."""
+    with and ``queued_start`` (its trigger and starter, as JSON), and empty its
+    boot buffer of any earlier attempt."""
     db.execute("BEGIN IMMEDIATE")
     try:
         position = db.execute("SELECT COALESCE(MAX(queue_position), 0) + 1 FROM threads").fetchone()[0]
         update(db, thread_id, state="queued", stop_reason=None, close_reason=None, queue_position=position,
+               queued_start=queued_start,
                **{f"resolved_{field}": resolved.get(field) for field in OVERRIDES})
         db.execute("DELETE FROM boot_buffers WHERE thread_id=?", (thread_id,))
         db.execute("COMMIT")
@@ -271,6 +274,7 @@ def begin_boot(db: sqlite3.Connection, thread_id: str, resolved: dict) -> None:
     try:
         queued = (thread(db, thread_id) or {"state": None})["state"] == "queued"
         update(db, thread_id, state="booting", stop_reason=None, close_reason=None, queue_position=None,
+               queued_start=None,
                **{f"resolved_{field}": resolved.get(field) for field in OVERRIDES})
         if not queued:
             db.execute("DELETE FROM boot_buffers WHERE thread_id=?", (thread_id,))
@@ -296,7 +300,7 @@ def finish_boot(db: sqlite3.Connection, thread_id: str, state: str, stop_reason:
     ``stop_reason``; the buffer goes either way."""
     db.execute("BEGIN IMMEDIATE")
     try:
-        update(db, thread_id, state=state, stop_reason=stop_reason, queue_position=None)
+        update(db, thread_id, state=state, stop_reason=stop_reason, queue_position=None, queued_start=None)
         db.execute("DELETE FROM boot_buffers WHERE thread_id=?", (thread_id,))
         db.execute("COMMIT")
     except sqlite3.Error:

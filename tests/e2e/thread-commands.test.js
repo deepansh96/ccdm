@@ -707,6 +707,48 @@ test("/config provider=codex posts a warning with ✅ and changes nothing until 
   assert.equal(launches(workspace, THREAD_ID).length, 1);
 });
 
+test("an owner's ✅ that lands while a /restart's launcher runs is applied once that launch is live", async () => {
+  const workspace = commandWorkspace();
+  fs.mkdirSync(path.join(workspace.homeDir, ".claude-work"), { recursive: true });
+  await supervised(workspace);
+  await liveThread(workspace, THREAD_ID);
+  const { provider_conversation_id: conversationId } = await threadRow(workspace, THREAD_ID);
+  writeClaudeTranscript(workspace, conversationId);
+  const warningText = "Changing account work starts a fresh conversation in this thread. React ✅ to this " +
+    "message to apply it.";
+
+  threadMessage(workspace, THREAD_ID, "config-account", "/config account=work");
+  await waitFor(() => checks(workspace).length === 1, () => "the warning's ✅", 15000);
+  const warning = posts(workspace, THREAD_ID).find(message => message.content === warningText);
+  // The restarted launch waits before its Router hello until released.
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.holdHellosIn = [THREAD_ID];
+  });
+  threadMessage(workspace, THREAD_ID, "restart-1", "/restart");
+  await waitFor(() => launches(workspace, THREAD_ID).length === 2, () => "the restarted launch", 15000);
+  await threadRow(workspace, THREAD_ID, row => row.state === "booting");
+  react(workspace, THREAD_ID, "owner-check", warning.id, OWNER);
+  await waitFor(() => (discord(workspace).injectedReactions ?? []).every(reaction => reaction.delivered),
+    () => "the ✅", 15000);
+  await settle(1000);
+  assert.equal(launches(workspace, THREAD_ID).length, 2, "the ✅ waited for the running launcher");
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.holdHellosIn = [];
+  });
+
+  await waitFor(() => launches(workspace, THREAD_ID).length === 3, () => "the fresh launch", 20000);
+  const row = await threadRow(workspace, THREAD_ID, current => current.state === "live" &&
+    current.account === "work" && current.provider_conversation_id != null && current.provider_conversation_id !== conversationId, 20000);
+  assert.equal(row.account, "work");
+  const fresh = launches(workspace, THREAD_ID)[2];
+  assert.equal(resumeArg(fresh), null);
+  assert.equal(fresh.env.CLAUDE_CONFIG_DIR, path.join(workspace.homeDir, ".claude-work"));
+  assert.ok(tmuxSessions(workspace)[THREAD_TMUX], "the fresh session's tmux runs");
+  assert.ok(fs.existsSync(path.join(workspace.routerStateDir, "keys", `.thread-${THREAD_ID}.key`)));
+  assert.ok(!notices(workspace, THREAD_ID).some(notice => notice.content.startsWith("Thread session failed")),
+    JSON.stringify(notices(workspace, THREAD_ID)));
+});
+
 test("a later /config supersedes a pending provider change, so a ✅ on the old warning applies nothing", async () => {
   const workspace = commandWorkspace();
   fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });

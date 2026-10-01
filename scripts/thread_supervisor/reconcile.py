@@ -9,7 +9,9 @@ rules, and classifies archives the supervisor missed through the archive-actor
 lookup. A thread is started only when `thread_history` shows its newest owner
 message is newer than its newest project-webhook message; its bootstrap holds
 the owner and guest messages after that agent reply, which the session never
-received. `crashed`, `start-failed` and `operator` stops never restart here.
+received; a message that mentions root, or natively replies to a root-bot
+message, is root's and never counts. `crashed`, `start-failed` and `operator`
+stops never restart here.
 """
 
 from __future__ import annotations
@@ -119,13 +121,21 @@ def _unanswered(context, row, thread: dict) -> list[dict]:
     return _events(context, row, thread, reversed(newer))
 
 
+def _replies_to_root(context, message: dict) -> bool:
+    """A native reply to one of the root bot's messages is root's, as live routing has it."""
+    referenced = message.get("referenced_message")
+    if not context.bot_user_id or not message.get("message_reference") or not isinstance(referenced, dict):
+        return False
+    return str((referenced.get("author") or {}).get("id") or "") == context.bot_user_id
+
+
 def _events(context, row, thread: dict, messages) -> list[dict]:
     events = []
     for message in messages:
         content = str(message.get("content") or "")
         if (message.get("author_class") not in boot.DRIVERS or message.get("type", 0) not in MESSAGE_TYPES
                 or not isinstance(message.get("id"), str) or boot.COMMAND.match(content.strip())
-                or boot._addresses_root(context, content)):
+                or boot._addresses_root(context, content) or _replies_to_root(context, message)):
             continue
         author = message.get("author") or {}
         events.append({

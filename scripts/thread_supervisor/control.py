@@ -27,7 +27,7 @@ import queue
 import socket
 import threading
 
-from . import capacity, commands, creation, lifecycle, registry, store
+from . import boot, capacity, commands, creation, lifecycle, registry, store
 
 
 SOCKET_NAME = "control.sock"
@@ -120,21 +120,27 @@ class ControlServer:
 
 
 def stop_threads(context, project) -> dict:
-    """Operator stops: the project's running and queued thread sessions, never restarted on their own."""
+    """Operator stops: the project's running and queued thread sessions, never
+    restarted on their own. A thread whose launcher still runs is stopped once
+    it exits, as a single `stop_thread` is."""
     if not isinstance(project, str) or not project:
         return _error("invalid", "stop_threads needs a project")
     stopped = []
     rows = context.db.execute("SELECT * FROM threads WHERE project=? AND state IN ('booting', 'live', 'queued')",
                               (project,)).fetchall()
     for row in rows:
-        _operator_stop(context, row)
+        launching = context.boots.get(row["thread_id"])
+        if launching and not launching.launched:
+            launching.deferred_stops.append({"type": "internal", "event": "control", "reply": lambda _response: None,
+                                             "request": {"op": "stop_thread", "thread_id": row["thread_id"]}})
+        else:
+            _operator_stop(context, row)
         stopped.append(row["thread_id"])
     return {"ok": True, "result": {"stopped": stopped}}
 
 
 def _operator_stop(context, row) -> None:
     context.archive_polls.pop(row["thread_id"], None)
-    context.queued.pop(row["thread_id"], None)
     lifecycle.stop_session(context, row)
     store.finish_boot(context.db, row["thread_id"], "stopped", "operator")
 

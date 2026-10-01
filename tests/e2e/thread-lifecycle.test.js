@@ -214,6 +214,37 @@ test("a bot unarchive, and the repeated THREAD_CREATE after it, start no session
   assert.deepEqual([row.state, row.stop_reason], ["stopped", "auto-archive"]);
 });
 
+test("a delete that arrives while the thread's launcher runs waits for the launch, then stops its session and drops the row", async () => {
+  const workspace = threadWorkspace();
+  await supervised(workspace);
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.holdHellosIn = [THREAD_ID];
+  });
+  threadEvent(workspace, "create");
+  await threadRow(workspace);
+  threadMessage(workspace, "boot-message-1", "please fix the parser");
+  await threadRow(workspace, row => row.state === "booting");
+  await waitFor(() => readState(workspace.stateDir).fixtures.tmux.sessions[THREAD_TMUX]?.devChannelPrompt === "accepted",
+    () => "the held launch");
+
+  threadEvent(workspace, "delete");
+  await waitFor(() => (discord(workspace).injectedThreads ?? []).every(entry => entry.delivered), () => "the delete");
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  // The row stays until the launcher it would race has exited.
+  assert.equal((await threadRow(workspace)).state, "booting");
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.holdHellosIn = [];
+  });
+
+  await assertStopped(workspace);
+  const deadline = Date.now() + 15000;
+  while ((await supervisorStatus(workspace)).projects?.demo?.threads?.[THREAD_ID]) {
+    if (Date.now() > deadline) throw new Error("the deleted thread's row stayed");
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", `.thread-${THREAD_ID}.key`)), false);
+});
+
 test("a delete stops the session and drops the row from status", async () => {
   const workspace = threadWorkspace();
   await supervised(workspace);
@@ -273,6 +304,29 @@ test("the next owner message in a stopped Claude thread relaunches it with --res
   assert.equal(row.provider_conversation_id, conversationId);
   // The resumed session's bootstrap carries the message that resumed it.
   assert.match(claude(workspace).channelNotifications.at(-1).content, /picking this back up/);
+});
+
+test("a resume after the project switched its Claude home continues the conversation in the home it started in", async () => {
+  const workspace = threadWorkspace();
+  await supervised(workspace);
+  const conversationId = await stoppedThread(workspace);
+  writeClaudeTranscript(workspace, conversationId);
+  // The operator moves the project to another account's home.
+  fs.mkdirSync(path.join(workspace.homeDir, ".claude-other"), { recursive: true });
+  const registryFile = path.join(workspace.repoDir, "registry.json");
+  const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+  registry.projects.demo.claude_home = "~/.claude-other";
+  fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
+
+  threadMessage(workspace, "resume-message-1", "picking this back up");
+
+  await threadRow(workspace, row => row.state === "live");
+  await waitFor(() => threadPosts(workspace).length === 2, () => "the resumed session's reply", 15000);
+  const resumed = claude(workspace).invocations[1];
+  assert.equal(resumeArgs(resumed), conversationId);
+  // The default home, as the conversation's first launch had it.
+  assert.equal(resumed.env.CLAUDE_CONFIG_DIR, undefined);
+  assert.equal((await threadRow(workspace)).provider_conversation_id, conversationId);
 });
 
 // The launcher's recorded pid, which the supervisor stores once the launcher exits.
@@ -406,7 +460,7 @@ test("the next owner message in a stopped Codex thread relaunches its bridge wit
   await waitFor(() => threadPosts(workspace).length === 1, () => "the bootstrap reply", 20000);
   archive(workspace);
   await threadRow(workspace, row => row.state === "stopped");
-  await waitFor(() => readState(workspace.stateDir).fixtures.tmux.sessions["demo_claude-t-223344"] === undefined,
+  await waitFor(() => readState(workspace.stateDir).fixtures.tmux.sessions[THREAD_TMUX] === undefined,
     () => "the Codex thread's tmux session to stop", 15000);
   // Codex keeps the conversation as a rollout under the home's sessions/.
   const rollouts = path.join(workspace.homeDir, ".codex", "sessions", "2026", "10", "01");

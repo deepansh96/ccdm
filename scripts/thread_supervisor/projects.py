@@ -6,7 +6,8 @@ whose `path` became `remote:` (another machine, with no thread sessions),
 gets `closed/project-moved` (the Router has revoked their connections with
 `project_moved`). Neither touches Discord: the channel may be gone. Channels
 are compared with the registry this worker last read, so a move while the
-worker was down goes unseen.
+worker was down goes unseen. A thread whose launcher still runs is closed
+once it exits, so the close never races the launch.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from __future__ import annotations
 import os
 import sys
 
-from . import lifecycle, registry, store
+from . import boot, lifecycle, registry, store
 
 
 def _log(message: str) -> None:
@@ -59,9 +60,25 @@ def on_registry(context, _frame: dict | None = None) -> None:
             reason = "project-moved"
         else:
             continue
-        context.archive_polls.pop(row["thread_id"], None)
-        context.queued.pop(row["thread_id"], None)
-        lifecycle.stop_session(context, row)
-        store.finish_boot(context.db, row["thread_id"], "closed")
-        store.update(context.db, row["thread_id"], close_reason=reason, pending_close=None)
+        if boot.defer(context, row["thread_id"], {"type": "internal", "event": "project_close",
+                                                  "thread_id": row["thread_id"], "project": project,
+                                                  "reason": reason}):
+            continue
+        close(context, row, reason)
     context.watch.channels = channels
+
+
+def close(context, row, reason: str) -> None:
+    """Stop a thread's session and close it for a project change."""
+    context.archive_polls.pop(row["thread_id"], None)
+    lifecycle.stop_session(context, row)
+    store.finish_boot(context.db, row["thread_id"], "closed")
+    store.update(context.db, row["thread_id"], close_reason=reason, pending_close=None)
+
+
+def on_project_close(context, frame: dict) -> None:
+    """A project change's close, deferred until the thread's launcher exited."""
+    thread_id = frame.get("thread_id")
+    row = store.thread(context.db, thread_id) if isinstance(thread_id, str) else None
+    if row and row["project"] == frame.get("project") and row["state"] != "closed":
+        close(context, row, str(frame.get("reason")))

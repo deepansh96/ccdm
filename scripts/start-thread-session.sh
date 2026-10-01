@@ -1,6 +1,6 @@
 #!/bin/zsh
 # Usage: ./scripts/start-thread-session.sh <project> <thread_id> --provider claude|codex
-#          [--account <alias>] [--model <model>] [--effort <effort>] [--resume <id>]
+#          [--account <alias>] [--model <model>] [--effort <effort>] [--resume <id>] [--home <path>]
 # Starts one Thread Conversation's session, served through the Router as the
 # `thread` role. The Thread Supervisor runs it; on success the last stdout
 # line is {"pid", "provider_conversation_id", "tmux", "provider_home"}, and
@@ -10,7 +10,8 @@
 # directory, launches/<project>/threads/<thread_id>/, and runs in tmux
 # `<screen>-t-<last 6 of the thread id>`. A launch is refused while a process
 # still carries that key path; a failed launch removes its key, launch
-# directory and tmux session. CCDM_THREAD_BOOTSTRAP_FILE, from the supervisor,
+# directory and tmux session, unless a newer launch of the thread has replaced its launch token
+# (launches/.../.launch-token), when they are that launch's and stay. CCDM_THREAD_BOOTSTRAP_FILE, from the supervisor,
 # names the bootstrap file the channel server (or Codex bridge) waits for.
 # The session's adapter keeps the launch directory's activity.json
 # (`{turn_running, last_turn_end_at}`) for the supervisor's idle eviction.
@@ -22,7 +23,9 @@
 # also carries `ws_port`.
 #
 # --resume continues the thread's provider conversation (`claude --resume`,
-# or the bridge's Codex thread uuid) in the same home and cwd. A missing
+# or the bridge's Codex thread uuid) in the same home and cwd. --home names
+# that home (the one the conversation started in, which the supervisor
+# stored) when it differs from what the project resolves to now. A missing
 # transcript or rollout fails the start before any key or tmux session; it
 # never starts a fresh conversation.
 
@@ -33,7 +36,7 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 REGISTRY="${CCDM_REGISTRY_PATH:-$ROOT_DIR/registry.json}"
 
 usage() {
-  echo "Usage: $0 <project> <thread_id> --provider claude|codex [--account <alias>] [--model <model>] [--effort <effort>] [--resume <id>]" >&2
+  echo "Usage: $0 <project> <thread_id> --provider claude|codex [--account <alias>] [--model <model>] [--effort <effort>] [--resume <id>] [--home <path>]" >&2
   exit 2
 }
 
@@ -46,6 +49,7 @@ ACCOUNT=""
 MODEL=""
 EFFORT=""
 RESUME_ID=""
+HOME_OVERRIDE=""
 while (( $# > 0 )); do
   (( $# >= 2 )) || usage
   case "$1" in
@@ -54,6 +58,7 @@ while (( $# > 0 )); do
     --model) MODEL="$2" ;;
     --effort) EFFORT="$2" ;;
     --resume) RESUME_ID="$2" ;;
+    --home) HOME_OVERRIDE="$2" ;;
     *) usage ;;
   esac
   shift 2
@@ -71,15 +76,26 @@ if [[ -n "$RESUME_ID" && ! "$RESUME_ID" =~ '^[0-9A-Za-z_-]+$' ]]; then
   echo "Invalid conversation id to resume: '$RESUME_ID'" >&2
   exit 2
 fi
+# The home is quoted into the session's shell command, so it must be a plain absolute path.
+if [[ -n "$HOME_OVERRIDE" ]]; then
+  if [[ "$HOME_OVERRIDE" != /* || "$HOME_OVERRIDE" == *[\'\"\$\`\\]* || "$HOME_OVERRIDE" == *$'\n'* ]]; then
+    echo "Invalid conversation home: '$HOME_OVERRIDE'" >&2
+    exit 2
+  fi
+  if [[ ! -d "$HOME_OVERRIDE" ]]; then
+    echo "The conversation's home $HOME_OVERRIDE is missing" >&2
+    exit 1
+  fi
+fi
 
 # The project's settings, with the thread's overrides applied. An account is
 # an alias in `claude_accounts` (or `codex_accounts`), never a path; without
 # one the project's `claude_home` applies, then the default home (for Codex,
 # the project's own Codex Home).
 if [[ "$PROVIDER" == "claude" ]]; then
-LAUNCH_FIELDS="$(python3 - "$REGISTRY" "$PROJECT" "$ACCOUNT" "$MODEL" "$EFFORT" <<'PY'
+LAUNCH_FIELDS="$(python3 - "$REGISTRY" "$PROJECT" "$ACCOUNT" "$MODEL" "$EFFORT" "$HOME_OVERRIDE" <<'PY'
 import json, os, sys
-registry_path, project, account, model, effort = sys.argv[1:6]
+registry_path, project, account, model, effort, home_override = sys.argv[1:7]
 registry = json.load(open(registry_path))
 entry = (registry.get("projects") or {}).get(project)
 if not isinstance(entry, dict) or not project or "/" in project or project.startswith("."):
@@ -95,7 +111,12 @@ else:
     home = entry.get("claude_home") or ""
 # The default home leaves CLAUDE_CONFIG_DIR unset, as Claude's own default.
 config_dir = os.path.expanduser(home) if home else ""
-home = config_dir or os.path.join(os.path.expanduser("~"), ".claude")
+default_home = os.path.join(os.path.expanduser("~"), ".claude")
+home = config_dir or default_home
+# A resumed conversation stays in the home it started in.
+if home_override and os.path.normpath(home_override) != os.path.normpath(home):
+    home = home_override
+    config_dir = "" if os.path.normpath(home_override) == os.path.normpath(default_home) else home_override
 model = model or entry.get("model") or ""
 effort = effort or entry.get("claude_effort") or ""
 if effort and effort not in ("low", "medium", "high", "xhigh", "max"):
@@ -139,6 +160,8 @@ ACCOUNT_ARGS=()
 [[ -n "$ACCOUNT" ]] && ACCOUNT_ARGS=(--account "$ACCOUNT")
 # An unknown alias is a start failure; the resolver's reason is its last stderr line.
 CODEX_HOME_DIR="$(python3 "$SCRIPT_DIR/resolve-codex-home.py" "$REGISTRY" "$PROJECT" "${ACCOUNT_ARGS[@]}")" || exit 1
+# A resumed conversation stays in the home it started in.
+[[ -n "$HOME_OVERRIDE" ]] && CODEX_HOME_DIR="$HOME_OVERRIDE"
 WS_PORT="${CCDM_THREAD_WS_PORT:-}"
 if [[ ! "$WS_PORT" =~ '^[0-9]+$' ]]; then
   echo "No ws_port was allocated for Codex thread $THREAD_ID" >&2
@@ -177,6 +200,8 @@ ROUTER_STATE="${CCDM_ROUTER_STATE_DIR:-$HOME/.local/state/ccdm/router}"
 KEY_FILE="$ROUTER_STATE/keys/.thread-$THREAD_ID.key"
 LAUNCH_DIR="$ROUTER_STATE/launches/$PROJECT/threads/$THREAD_ID"
 TMUX_NAME="$SCREEN_NAME-t-${THREAD_ID[-6,-1]}"
+# This launch's token: cleanup only removes files the token still marks as this launch's.
+LAUNCH_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
 
 # Thread listeners carry this launch's key file path (never the key) in their
 # environment: the claude process and its CCDM channel server, or the Codex
@@ -233,6 +258,12 @@ if tmux has-session -t "=$TMUX_NAME" 2>/dev/null; then
 fi
 
 cleanup_launch() {
+  # A newer launch of this thread replaced the token: the key, launch dir and
+  # tmux session are that launch's now, never this one's to remove.
+  if [[ "$(cat "$LAUNCH_DIR/.launch-token" 2>/dev/null)" != "$LAUNCH_TOKEN" ]]; then
+    echo "Leaving thread $THREAD_ID's launch files to its newer launch" >&2
+    return 0
+  fi
   tmux kill-session -t "=$TMUX_NAME" 2>/dev/null || true
   local leftover
   leftover="$(find_thread_pids)"
@@ -256,7 +287,7 @@ fail() {
   exit 1
 }
 
-python3 - "$PROJECT" "$THREAD_ID" "$ROUTER_STATE" "$LAUNCH_DIR" "$SCRIPT_DIR/ccdm-channel-server.js" "$KEY_FILE" "$PROVIDER" "$TMUX_NAME" "$REGISTRY" <<'PY' || fail "The thread launch files could not be written"
+python3 - "$PROJECT" "$THREAD_ID" "$ROUTER_STATE" "$LAUNCH_DIR" "$SCRIPT_DIR/ccdm-channel-server.js" "$KEY_FILE" "$PROVIDER" "$TMUX_NAME" "$REGISTRY" "$LAUNCH_TOKEN" <<'PY' || fail "The thread launch files could not be written"
 import json
 import os
 import secrets
@@ -265,7 +296,7 @@ import sys
 from pathlib import Path
 from uuid import uuid4
 
-project, thread_id, router_state, launch_dir, server_script, key_file, provider, tmux_name, registry_path = sys.argv[1:10]
+project, thread_id, router_state, launch_dir, server_script, key_file, provider, tmux_name, registry_path, token = sys.argv[1:11]
 launch = Path(launch_dir)
 # A fresh launch directory: no previous launch's ready, context or bootstrap file.
 shutil.rmtree(launch, ignore_errors=True)
@@ -281,6 +312,8 @@ def write_private(path: Path, text: str) -> None:
         f.write(text)
     os.replace(tmp, path)
 
+# The token first: from here on this launch owns the key and the launch dir.
+write_private(launch / ".launch-token", token + "\n")
 write_private(Path(key_file), secrets.token_urlsafe(32) + "\n")
 # A Codex bridge takes its settings from its tmux environment instead.
 if provider == "codex":

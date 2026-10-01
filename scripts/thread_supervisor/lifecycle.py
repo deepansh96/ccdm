@@ -146,13 +146,22 @@ def on_thread_update(context, event: dict) -> None:
     row = store.thread(context.db, thread_id)
     if not row or row["project"] != event.get("project") or row["state"] == "closed":
         return
-    stop_archived(context, row, int(time.time() * 1000) - ARCHIVE_LOOKBACK_MS)
+    since_ms = event.get("since_ms")
+    stop_archived(context, row, since_ms if isinstance(since_ms, int)
+                  else int(time.time() * 1000) - ARCHIVE_LOOKBACK_MS)
 
 
 def stop_archived(context, row, since_ms: int) -> None:
     """Stop an archived thread's session and look up who archived it, in
-    audit entries since ``since_ms``."""
+    audit entries since ``since_ms``. While the thread's launcher still runs,
+    the archive waits for it to exit."""
+    from . import boot  # boot imports this module.
+
     thread_id = row["thread_id"]
+    if boot.defer(context, thread_id, {"type": "event", "event": "thread_update", "project": row["project"],
+                                       "thread_id": thread_id, "before": {"archived": False},
+                                       "after": {"archived": True}, "since_ms": since_ms}):
+        return
     stop_session(context, row)
     if row["pending_close"]:  # The archive a `/close` made: the root bot's, so closed.
         store.update(context.db, thread_id, state="closed", stop_reason=None, close_reason="close-command",
@@ -230,6 +239,10 @@ def on_thread_delete(context, event: dict) -> None:
         return
     row = store.thread(context.db, thread_id)
     if not row or row["project"] != event.get("project"):
+        return
+    from . import boot  # boot imports this module.
+
+    if boot.defer(context, thread_id, event):  # Once the running launcher exits.
         return
     context.archive_polls.pop(thread_id, None)
     stop_session(context, row)

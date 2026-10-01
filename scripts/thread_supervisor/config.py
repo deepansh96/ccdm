@@ -139,6 +139,8 @@ def on_thread_reaction(context, event: dict) -> None:
         pending = {}
     if not pending.get("message_id") or pending.get("message_id") != event.get("message_id"):
         return
+    if boot.defer(context, thread_id, event):  # Applied once the running launcher exits.
+        return
     changes = {field: value for field, value in (pending.get("changes") or {}).items() if field in FIELDS}
     store.update(context.db, thread_id, pending_config=None)
     current = registry.load(context.project_root)

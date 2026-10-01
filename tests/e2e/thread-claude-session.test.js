@@ -366,3 +366,35 @@ test("a second launch for the same thread is refused while the first runs", asyn
   const status = await runRouterCli(workspace, ["status"]);
   assert.match(status.stdout, new RegExp(`thread demo thread=${THREAD_ID} provider=claude connected=`));
 });
+
+test("a failed launch's cleanup leaves the key and launch dir a newer launch of the thread took over", async () => {
+  const workspace = threadWorkspace();
+  await routerWithWebhooks(workspace, ["demo"]);
+  createThread(workspace);
+  await waitFor(() => discord(workspace).threads?.[THREAD_ID], () => "the thread in Discord");
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.holdHellosIn = [THREAD_ID];
+  });
+  const launching = runScript(workspace, "scripts/start-thread-session.sh", {
+    args: ["demo", THREAD_ID, "--provider", "claude"], env: routerEnv(workspace, { CCDM_THREAD_BOOT_TIMEOUT_S: "30" }),
+  });
+  const keyFile = path.join(workspace.routerStateDir, "keys", `.thread-${THREAD_ID}.key`);
+  const launchDir = path.join(workspace.routerStateDir, "launches", "demo", "threads", THREAD_ID);
+  await waitFor(() => readState(workspace.stateDir).fixtures.tmux.sessions[THREAD_TMUX]?.devChannelPrompt === "accepted",
+    () => "the held launch");
+  // A newer launch of the thread has written its own token and key meanwhile.
+  fs.writeFileSync(path.join(launchDir, ".launch-token"), "newer-launch\n");
+  fs.writeFileSync(keyFile, "newer-key\n");
+  // The earlier launch's session goes before its hello, so that launch fails.
+  const { pid } = readState(workspace.stateDir).fixtures.tmux.sessions[THREAD_TMUX];
+  updateState(workspace.stateDir, state => {
+    delete state.fixtures.tmux.sessions[THREAD_TMUX];
+  });
+  process.kill(-pid, "SIGKILL");
+
+  const result = await launching;
+  assert.notEqual(result.exitCode, 0, result.stdout);
+  assert.match(result.stderr, /Leaving thread 1700000000000123456's launch files to its newer launch/);
+  assert.equal(fs.readFileSync(keyFile, "utf8"), "newer-key\n");
+  assert.equal(fs.readFileSync(path.join(launchDir, ".launch-token"), "utf8"), "newer-launch\n");
+});

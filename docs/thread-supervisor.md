@@ -38,6 +38,8 @@ The session starts on the first owner or guest message, or at once when a first 
 3. Every message sent during boot is delivered exactly once, in the first prompt, together with the starter.
 4. 👀 is removed when the session is live. A failed start posts a one-line reason and is not retried automatically; the next eligible message retries.
 
+A stop that arrives while the launcher still runs (an archive, a delete, `/restart`, `/clear`, `/close`, an applied `/config`, a project change, or an operator stop) waits for the launcher to exit, so it never races the launch.
+
 Accounts are aliases only. Claude aliases live in the registry's `claude_accounts` map (alias → home), and Codex aliases in `codex_accounts`. A Discord message can name an alias, never a path. An unknown alias fails the start.
 
 ## Commands in a thread
@@ -57,7 +59,7 @@ Accounts are aliases only. Claude aliases live in the registry's `claude_account
 - **Archive:** an owner or root archive, or `/close`, closes the conversation and stops its session. Any other archive, including Discord's inactivity auto-archive, only stops the session (`stopped/auto-archive`). The supervisor reads the archive actor from audit-log action 111 entries that set `archived` to true (a rename or archive-duration change is not an archive), polling for up to 60 s. A lookup that fails throughout is recorded as `stopped/archive-actor-unknown` and fails open as an auto-archive.
 - **Unarchive:** a bot unarchive starts nothing.
 - **Delete:** stops the session and drops the supervisor row and the reminder state. Provider conversation files stay on disk.
-- **Resume:** an owner or guest message resumes a stopped thread. Only an owner message reopens a Closed Conversation. Either way it resumes the same provider conversation (`claude --resume`, or Codex `--resume <uuid>`) in the same home and cwd. A missing transcript or rollout is a start failure with a one-line reason, never a silent fresh start.
+- **Resume:** an owner or guest message resumes a stopped thread. Only an owner message reopens a Closed Conversation. Either way it resumes the same provider conversation (`claude --resume`, or Codex `--resume <uuid>`) in the same cwd and the home the conversation started in, even if the project has since switched accounts. A missing transcript or rollout is a start failure with a one-line reason, never a silent fresh start.
 
 ## Capacity
 
@@ -65,7 +67,7 @@ Live thread sessions are capped per provider by the registry's `thread_session_c
 
 - **Idle:** no turn running, and no owner message for 30 minutes.
 - **At the cap:** the longest-idle session is evicted with `Paused to free a session slot; send a message here to resume.` A session mid-turn or booting is never evicted.
-- **No idle session:** the thread is queued with `Queued, N sessions busy.` and starts automatically, FIFO per provider, when a slot frees.
+- **No idle session:** the thread is queued with `Queued, N sessions busy.` and starts automatically, FIFO per provider, when a slot frees or a running session goes idle. A new thread never passes one already queued for its provider, and a queued thread keeps its first message across a supervisor restart.
 
 ## Supervisor down and reconcile
 
@@ -74,7 +76,7 @@ While the supervisor is down, a thread message with no live session gets 💤. T
 - it binds threads it missed;
 - it classifies archives it did not see;
 - it marks dead sessions `crashed`;
-- it starts only threads whose newest owner message is newer than the last agent reply, with the undelivered messages in the bootstrap.
+- it starts only threads whose newest owner message is newer than the last agent reply, with the undelivered messages in the bootstrap; a root mention or a native reply to root never counts.
 
 A live session that dies while the supervisor runs is marked `crashed` as soon as the Router reports it gone, which frees its slot. Crashed, failed and operator-stopped sessions never restart automatically; the next owner or guest message resumes them.
 

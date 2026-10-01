@@ -59,20 +59,35 @@ class Boot:
     launched: bool = False
     # The latest `thread_command` that arrived while the launcher ran, replayed when it exits.
     deferred: dict | None = None
+    # Every other stop that arrived meanwhile (an archive, a delete, a ✅
+    # /config, a project change, a bulk operator stop), replayed in order
+    # when it exits, so no stop races the launcher's own cleanup.
+    deferred_events: list = field(default_factory=list)
     # Every operator `stop_thread` that arrived meanwhile, each replayed (and
     # so answered) after the deferred command, whatever else happens.
     deferred_stops: list = field(default_factory=list)
 
 
 def drop(context, thread_id: str) -> Boot | None:
-    """Forget a thread's boot. Its deferred operator stops are replayed, never
-    lost, since each has a client waiting on its answer."""
+    """Forget a thread's boot. Its deferred events and operator stops are
+    replayed, never lost; each stop has a client waiting on its answer."""
     boot = context.boots.pop(thread_id, None)
     if boot:
+        events, boot.deferred_events = boot.deferred_events, []
         stops, boot.deferred_stops = boot.deferred_stops, []
-        for frame in stops:
+        for frame in [*events, *stops]:
             context.link.post(frame)
     return boot
+
+
+def defer(context, thread_id: str, frame: dict) -> bool:
+    """Hold ``frame`` until the thread's launcher exits, when one still runs;
+    False when there is none and the caller may act now."""
+    launching = context.boots.get(thread_id)
+    if launching is None or launching.launched:
+        return False
+    launching.deferred_events.append(frame)
+    return True
 
 
 def boot_timeout_seconds() -> float:
@@ -192,7 +207,9 @@ def start(context, row, trigger: dict | None, starter: str | None = None, backlo
         if resolved[field]:
             args += [f"--{field}", resolved[field]]
     if row["provider_conversation_id"]:
-        args += ["--resume", row["provider_conversation_id"]]
+        # The conversation lives in the home it started in, whatever the project uses now.
+        args += ["--resume", row["provider_conversation_id"],
+                 *(["--home", row["provider_home"]] if row["provider_home"] else [])]
     env = {**os.environ, "CCDM_THREAD_BOOTSTRAP_FILE": str(bootstrap_path(project, thread_id)),
            "CCDM_THREAD_BOOT_TIMEOUT_S": f"{boot_timeout_seconds():g}"}
     if codex:
@@ -265,12 +282,15 @@ def on_launch_exit(context, frame: dict) -> None:
     boot = context.boots.get(thread_id)
     if not boot or boot.id != frame.get("boot_id"):
         return
-    # The operator's stops go last, after the deferred in-thread command, so
-    # an explicit stop is what holds.
+    # The deferred events go first, in arrival order, then the in-thread
+    # command; the operator's stops go last, so an explicit stop is what holds.
+    events, boot.deferred_events = boot.deferred_events, []
     stops, boot.deferred_stops = boot.deferred_stops, []
     try:
         _launch_exited(context, thread_id, boot, frame)
     finally:
+        for event in events:
+            context.link.post(event)
         if boot.deferred:
             context.link.post(boot.deferred)
         for stop in stops:

@@ -38,8 +38,6 @@ class Context:
     boots: dict = field(default_factory=dict)
     # Archive actor lookups in progress, by thread id (lifecycle.ArchivePoll).
     archive_polls: dict = field(default_factory=dict)
-    # What each queued thread starts with, by thread id: its trigger and starter.
-    queued: dict = field(default_factory=dict)
     # The registry as last read, for deregistrations and channel moves (projects.Watch).
     watch: object = None
 
