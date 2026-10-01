@@ -1,11 +1,27 @@
+import fs from "node:fs";
 import path from "node:path";
 
-import { routerEnv, runRouterCli } from "./router.js";
+import { routerEnv, runRouterCli, waitFor } from "./router.js";
 import { runScript } from "./runner.js";
 
 // The Thread Supervisor's private state, under the Test Workspace's home.
 export function supervisorStateDir(workspace) {
   return path.join(workspace.homeDir, ".local", "state", "ccdm", "thread-supervisor");
+}
+
+// Waits until a Codex thread's bridge has finished its turn: it marks the
+// thread idle in its activity file only once a new message would start a
+// turn rather than steer the finished one.
+export async function waitForThreadIdle(workspace, project, threadId, timeoutMs = 20000) {
+  const file = path.join(workspace.routerStateDir, "launches", project, "threads", threadId, "activity.json");
+  const idle = () => {
+    try {
+      return JSON.parse(fs.readFileSync(file, "utf8")).turn_running === false;
+    } catch {
+      return false;
+    }
+  };
+  await waitFor(idle, () => `thread ${threadId}'s session to finish its turn`, timeoutMs);
 }
 
 // The worker launches its Node link through CCDM_ROUTER_NODE, as the session

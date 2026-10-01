@@ -5,7 +5,8 @@ and where each comes from, the thread's override or the project. `model=` and
 `effort=` are validated by `/thread`'s rules, saved as the thread's overrides,
 and a running session restarts into the same provider conversation.
 `provider=` and `account=` start a fresh conversation, so they only post a
-warning with ✅ on it and store `pending_config`; the owner's ✅ on that exact
+warning with ✅ on it and store `pending_config`, which any later `/config`
+with arguments drops; the owner's ✅ on that exact
 message (a `thread_reaction`) applies the whole change, clears
 `provider_conversation_id`, and starts a running session afresh. In a
 project channel it only lists the project's settings, which new threads
@@ -100,6 +101,9 @@ def on_thread_config(context, row, owner: bool, event: dict) -> None:
     args = str(event.get("args") or "").strip()
     if not args:
         return _notice(context, thread_id, "\n".join(["Thread settings:", *settings_lines(current, entry, row)]))
+    # A new change request supersedes any pending one: a ✅ on the old warning applies nothing.
+    if row["pending_config"]:
+        store.update(context.db, thread_id, pending_config=None)
     try:
         changes = parse(args)
         creation.validate(current, row["project"], row["name"], {**{field: row[field] for field in FIELDS}, **changes})

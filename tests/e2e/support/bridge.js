@@ -230,6 +230,7 @@ export async function startFakeCodexServer(workspace, options = {}) {
   let registeredMcpName = `discord-${options.channelId ?? "channel-id"}`;
   let registeredMcpConfig = null;
   let mcpStatusCount = 0;
+  let mcpReloadCount = 0;
   // A stale server stays loaded until it is deleted and MCP servers reload.
   let staleLoaded = Boolean(options.staleMcpName);
   let staleDeleted = false;
@@ -317,6 +318,9 @@ export async function startFakeCodexServer(workspace, options = {}) {
           setTimeout(() => reply({}), configDelayMs);
           break;
         case "config/mcpServer/reload":
+          // \`hangMcpReloadAfter: n\`: every reload after the first n never answers.
+          mcpReloadCount += 1;
+          if (options.hangMcpReloadAfter !== undefined && mcpReloadCount > options.hangMcpReloadAfter) break;
           if (staleDeleted) staleLoaded = false;
           if (codexHome) {
             loadedMcpNames = configuredMcpNames(codexHome);

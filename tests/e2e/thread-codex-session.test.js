@@ -11,7 +11,7 @@ import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerEnv, routerRegistry,
   runRouterCli, waitFor } from "./support/router.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
-import { startThreadSupervisor, supervisorStateDir, supervisorStatus } from "./support/thread-supervisor.js";
+import { startThreadSupervisor, supervisorStateDir, supervisorStatus, waitForThreadIdle } from "./support/thread-supervisor.js";
 
 test.afterEach(cleanup);
 
@@ -101,19 +101,7 @@ const threadPosts = workspace => (discord(workspace).messages ?? []).filter(mess
 const turnTexts = codex => codex.clientMessages.filter(message => message.method === "turn/start")
   .map(message => message.params.input.map(part => part.text ?? "").join("\n"));
 
-// The bridge marks the thread idle in its activity file only once a new
-// message would start a turn rather than steer the finished one.
-const activityFile = workspace => path.join(workspace.routerStateDir, "launches", "demo", "threads", THREAD_ID, "activity.json");
-async function bridgeIdle(workspace) {
-  const idle = () => {
-    try {
-      return JSON.parse(fs.readFileSync(activityFile(workspace), "utf8")).turn_running === false;
-    } catch {
-      return false;
-    }
-  };
-  await waitFor(idle, () => "the thread bridge to finish its turn", 20000);
-}
+const bridgeIdle = workspace => waitForThreadIdle(workspace, "demo", THREAD_ID);
 
 // The fake app-server for the thread's allocated port, bound only once the
 // supervisor has recorded that port, so the allocator saw it free.

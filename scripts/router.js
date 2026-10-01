@@ -138,9 +138,11 @@ async function serve() {
       const routed = await classifyReaction(table, reaction, user, client.user?.id, thread);
       if (!routed) return;
       if (routed.thread) {
-        // Thread reactions also reach the supervisor (the `/config` ✅) and the observer.
+        // Thread reactions also reach the supervisor (the `/config` ✅) and the
+        // observer. One on a root-bot message (a supervisor notice, the
+        // `/config` confirmation, root's reply) is never the thread session's.
         const { project, thread_id: threadId } = routed.route;
-        server.deliverThread(threadId, routed.event);
+        if (!routed.event.message_from_bot) server.deliverThread(threadId, routed.event);
         server.deliverSupervisor({ ...routed.event, event: "thread_reaction", project, thread_id: threadId });
         return void server.deliverObserver({ ...routed.event, project, conversation_id: threadId, thread_id: threadId });
       }

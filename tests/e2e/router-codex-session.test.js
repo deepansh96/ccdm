@@ -103,13 +103,13 @@ function setPort(workspace, port, fields = {}) {
 // 64,600 of a 258,400-token window is 25%.
 const SEEDED_USAGE = { last: { inputTokens: 64600 }, modelContextWindow: 258400 };
 
-async function routerCodexSession(turns, codexOptions = {}, { guests, routerEnv: routerExtraEnv } = {}) {
+async function routerCodexSession(turns, codexOptions = {}, { guests, routerEnv: routerExtraEnv, sessionEnv } = {}) {
   const workspace = codexRouterWorkspace(0);
   if (guests) updateRegistry(workspace, (registry) => { registry.projects.demo.guest_user_ids = guests; });
   const codex = await startFakeCodexServer(workspace, { channelId: "demo-channel", turns, ...codexOptions });
   setPort(workspace, codex.port);
   const router = await routerWithWebhooks(workspace, ["demo"], { env: routerExtraEnv ?? {} });
-  const started = await startCodexSession(workspace);
+  const started = await startCodexSession(workspace, sessionEnv);
   assert.equal(started.exitCode, 0, started.stderr || started.stdout);
   return { workspace, codex, router };
 }
@@ -520,6 +520,43 @@ test("a Codex bridge whose app-server still loads a foreign Discord MCP server a
   const started = await startCodexSession(workspace);
   assert.equal(started.exitCode, 0, started.stderr || started.stdout);
   assert.deepEqual(codexServerRecord(workspace, healthy.port).mcpReloads, [["discord-demo-channel"]]);
+});
+
+test("a Codex bridge whose app-server never answers the MCP reload refuses to start and releases the Codex Home lock", async () => {
+  const workspace = codexRouterWorkspace(0);
+  const codexHome = path.join(workspace.homeDir, ".codex");
+  const codex = await startFakeCodexServer(workspace, { channelId: "demo-channel", codexHome, hangMcpReloadAfter: 0 });
+  setPort(workspace, codex.port);
+  await routerWithWebhooks(workspace, ["demo"]);
+
+  const refused = await startCodexSession(workspace, { CCDM_CODEX_CONFIG_REQUEST_TIMEOUT_MS: "1000" });
+
+  assert.notEqual(refused.exitCode, 0);
+  assert.match(`${refused.stdout}\n${refused.stderr}`, /config\/mcpServer\/reload timed out/);
+  assert.ok(!codex.clientMessages.some((message) => message.method === "thread/start"));
+  assert.equal(fs.existsSync(path.join(codexHome, "config.toml.lock")), false);
+});
+
+test("a /clear whose MCP re-registration fails stops the bridge, as a failed startup does", async () => {
+  const { workspace, codex } = await routerCodexSession([], {
+    hangMcpReloadAfter: 1, threadIds: ["thread-before-clear", "thread-after-clear"],
+  }, { sessionEnv: { CCDM_CODEX_CONFIG_REQUEST_TIMEOUT_MS: "1000" } });
+  const bridgePid = readRegistry(workspace).projects.demo.pid;
+
+  ownerMessage(workspace, { id: "cmd-clear", content: "/clear" });
+
+  const done = await waitForState(workspace, (next) => webhookContents(next).some((content) => content.includes("Failed to clear")), 30000);
+  assert.match(webhookContents(done).find((content) => content.includes("Failed to clear")), /mcpServer\/reload timed out/);
+  await waitFor(() => {
+    try {
+      process.kill(bridgePid, 0);
+      return false;
+    } catch {
+      return true;
+    }
+  }, () => `bridge ${bridgePid} to exit`, 15000);
+  assert.equal(clientMessages(codex, "thread/start").length, 1);
+  assert.equal(fs.existsSync(path.join(workspace.homeDir, ".codex", "config.toml.lock")), false);
 });
 
 test("start-codex-session waits for a bridge's Codex Home lock before stripping Discord MCP servers", async () => {

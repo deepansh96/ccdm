@@ -10,7 +10,7 @@ import { OWNER_ID, ROOT_TOKEN, connectSession, createRouterWorkspace, routerEnv,
   routerWithWebhooks, waitFor } from "./support/router.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
-import { startThreadSupervisor, supervisorEnv, supervisorStateDir, supervisorStatus } from "./support/thread-supervisor.js";
+import { startThreadSupervisor, supervisorEnv, supervisorStateDir, supervisorStatus, waitForThreadIdle } from "./support/thread-supervisor.js";
 
 test.afterEach(cleanup);
 
@@ -694,6 +694,7 @@ test("/config provider=codex posts a warning with ✅ and changes nothing until 
   const codexReplies = () => replies(workspace, THREAD_ID).filter(reply => reply.username.startsWith("demo-codex"))
     .map(({ content, username }) => ({ content, username }));
   await waitFor(() => codexReplies().length === 1, () => "the Codex bootstrap reply", 20000);
+  await waitForThreadIdle(workspace, "demo", THREAD_ID);
 
   threadMessage(workspace, THREAD_ID, "after-switch", "how is it going?");
   await waitFor(() => codexReplies().length === 2, () => `the Codex reply: ${JSON.stringify(codexReplies())}`, 20000);
@@ -704,6 +705,33 @@ test("/config provider=codex posts a warning with ✅ and changes nothing until 
   assert.deepEqual(notices(workspace, THREAD_ID).map(notice => notice.content), [SWITCH_WARNING,
     "Settings saved: provider codex. Starting a fresh conversation in this thread."]);
   assert.equal(launches(workspace, THREAD_ID).length, 1);
+});
+
+test("a later /config supersedes a pending provider change, so a ✅ on the old warning applies nothing", async () => {
+  const workspace = commandWorkspace();
+  fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
+  await supervised(workspace);
+  await liveThread(workspace, THREAD_ID);
+  const { provider_conversation_id: claudeConversation } = await threadRow(workspace, THREAD_ID);
+  const claudePid = tmuxSessions(workspace)[THREAD_TMUX].pid;
+
+  threadMessage(workspace, THREAD_ID, "config-provider", "/config provider=codex");
+  await waitFor(() => checks(workspace).length === 1, () => "the warning's ✅", 15000);
+  const warning = posts(workspace, THREAD_ID).find(message => message.content === SWITCH_WARNING);
+  threadMessage(workspace, THREAD_ID, "config-show", "/config bogus=1");
+  await waitFor(() => notices(workspace, THREAD_ID).some(notice => notice.content.startsWith("Settings not changed")),
+    () => "the second /config's refusal", 15000);
+
+  react(workspace, THREAD_ID, "owner-check", warning.id, OWNER);
+  await waitFor(() => (discord(workspace).injectedReactions ?? []).every(reaction => reaction.delivered),
+    () => "the stale ✅", 15000);
+  await settle(1000);
+  const row = await threadRow(workspace, THREAD_ID);
+  assert.deepEqual([row.provider, row.state, row.provider_conversation_id], [null, "live", claudeConversation]);
+  assert.ok(alive(claudePid), "the Claude session still runs");
+  assert.equal(launches(workspace, THREAD_ID).length, 1);
+  // The thread session never saw the ✅ on the supervisor's warning.
+  assert.equal(notifications(workspace).some(notification => notification.meta?.message_id === warning.id), false);
 });
 
 test("/config in a project channel posts the settings new threads inherit and never reaches the Channel Conversation", async () => {

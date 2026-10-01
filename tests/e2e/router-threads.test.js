@@ -590,7 +590,7 @@ test("thread lifecycle events reach the supervisor for eligible threads only, an
   ]);
 });
 
-test("a thread reaction reaches the thread session, the supervisor and the observer", async () => {
+test("a thread reaction on a root-bot message (the /config ✅) reaches the supervisor and the observer, never the thread session", async () => {
   const sessions = await threadListeners();
   const supervisor = await connectSupervisor(sessions.workspace);
   injectDiscordReaction(sessions.workspace, { channelId: "demo-thread", emoji: "✅", messageId: "config-warning",
@@ -605,7 +605,7 @@ test("a thread reaction reaches the thread session, the supervisor and the obser
   const observed = sessions.observer.frames.find(frame => frame.event === "reaction");
   assert.deepEqual([observed.project, observed.channel_id, observed.conversation_id, observed.thread_id],
     ["demo", "demo-thread", "demo-thread", "demo-thread"]);
-  assert.deepEqual(sessions.thread.events.filter(event => event.event === "reaction").map(event => event.emoji), ["✅"]);
+  assert.deepEqual(sessions.thread.events.filter(event => event.event === "reaction"), []);
   assert.deepEqual(sessions.sibling.events.filter(event => event.event === "reaction"), []);
 });
 

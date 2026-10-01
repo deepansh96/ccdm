@@ -213,14 +213,32 @@ function scheduleRootRestart() {
   return logPath;
 }
 
-function sendRequest(method, params) {
+// With `timeoutMs`, a request the app-server never answers rejects instead
+// of waiting forever (its late answer, if any, is then dropped).
+function sendRequest(method, params, { timeoutMs } = {}) {
   return new Promise((resolve, reject) => {
     const id = nextId();
     const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params });
-    pendingRequests.set(id, { resolve, reject });
+    let timer = null;
+    if (timeoutMs) {
+      timer = setTimeout(() => {
+        pendingRequests.delete(id);
+        reject(new Error(`${method} timed out after ${timeoutMs} ms`));
+      }, timeoutMs);
+      timer.unref?.();
+    }
+    pendingRequests.set(id, {
+      resolve: (value) => { clearTimeout(timer); resolve(value); },
+      reject: (error) => { clearTimeout(timer); reject(error); },
+    });
     ws.send(msg);
   });
 }
+
+// Every app-server request made while holding the Codex Home config lock is
+// bounded, so a hung app-server cannot hold that lock for its siblings forever.
+const CONFIG_REQUEST_TIMEOUT_MS = Number(process.env.CCDM_CODEX_CONFIG_REQUEST_TIMEOUT_MS) || 30000;
+const configRequest = (method, params) => sendRequest(method, params, { timeoutMs: CONFIG_REQUEST_TIMEOUT_MS });
 
 function notificationThreadId(msg) {
   return msg.params?.threadId || msg.params?.thread?.id || null;
@@ -1361,7 +1379,7 @@ async function listMcpServers() {
   const servers = [];
   let cursor;
   do {
-    const page = await sendRequest("mcpServerStatus/list", { detail: "full", ...(cursor ? { cursor } : {}) });
+    const page = await configRequest("mcpServerStatus/list", { detail: "full", ...(cursor ? { cursor } : {}) });
     servers.push(...(page?.data || page?.servers || page?.items || []));
     cursor = page?.nextCursor;
   } while (cursor);
@@ -1392,7 +1410,7 @@ async function registerDiscordMcp() {
       const loaded = (await listMcpServers()).map((s) => s.name || s.id);
       const stale = new Set([...loaded, ...await configuredDiscordMcpNames()].filter(isForeignDiscordMcp));
       for (const name of stale) {
-        await sendRequest("config/value/delete", { keyPath: `mcp_servers.${name}` });
+        await configRequest("config/value/delete", { keyPath: `mcp_servers.${name}` });
         console.log(`Removed stale MCP server: ${name}`);
       }
     } catch (err) {
@@ -1400,7 +1418,7 @@ async function registerDiscordMcp() {
     }
 
     await writeDiscordMcpConfig(mcpName);
-    await sendRequest("config/mcpServer/reload", null);
+    await configRequest("config/mcpServer/reload", null);
     console.log("MCP servers reloaded");
   });
 
@@ -1428,7 +1446,7 @@ async function registerDiscordMcp() {
 }
 
 async function writeDiscordMcpConfig(mcpName) {
-  await sendRequest("config/value/write", {
+  await configRequest("config/value/write", {
     keyPath: `mcp_servers.${mcpName}`,
     mergeStrategy: "replace",
     value: {
@@ -1705,7 +1723,14 @@ function startDiscordBot() {
         stopTyping();
         await clearDiscordChannelScope();
 
-        await registerDiscordMcp();
+        try {
+          await registerDiscordMcp();
+        } catch (err) {
+          // As at startup, a session whose Discord MCP cannot be registered
+          // (or might still load a foreign one) must not go on.
+          err.fatal = true;
+          throw err;
+        }
         await startCodexThread();
         await sendBootstrapInstructionTurn("clear");
 
@@ -1720,6 +1745,12 @@ function startDiscordBot() {
         resetActiveTurnId();
         fallbackText = "";
         await clearDiscordChannelScope();
+        if (err.fatal) {
+          await sendToDiscord(`**Error:** Failed to clear — ${err.message || err}. The session is stopping; restart it.`, channelId)
+            .catch(() => {});
+          await exitAfterRuntimeLoss(`Discord MCP re-registration after /clear failed: ${err.message || err}`);
+          return;
+        }
         await sendToDiscord(`**Error:** Failed to clear — ${err.message || err}`, channelId);
         activeOutputChannelId = null;
         processQueue();
