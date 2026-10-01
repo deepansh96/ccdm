@@ -230,3 +230,15 @@ def finish_boot(db: sqlite3.Connection, thread_id: str, state: str, stop_reason:
     except sqlite3.Error:
         db.execute("ROLLBACK")
         raise
+
+
+def forget(db: sqlite3.Connection, thread_id: str) -> None:
+    """Drop a deleted thread's row and its boot buffer."""
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        db.execute("DELETE FROM boot_buffers WHERE thread_id=?", (thread_id,))
+        db.execute("DELETE FROM threads WHERE thread_id=?", (thread_id,))
+        db.execute("COMMIT")
+    except sqlite3.Error:
+        db.execute("ROLLBACK")
+        raise

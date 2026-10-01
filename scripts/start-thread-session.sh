@@ -1,6 +1,6 @@
 #!/bin/zsh
 # Usage: ./scripts/start-thread-session.sh <project> <thread_id> --provider claude|codex
-#          [--account <alias>] [--model <model>] [--effort <effort>]
+#          [--account <alias>] [--model <model>] [--effort <effort>] [--resume <id>]
 # Starts one Thread Conversation's session, served through the Router as the
 # `thread` role. The Thread Supervisor runs it; on success the last stdout
 # line is {"pid", "provider_conversation_id", "tmux", "provider_home"}, and
@@ -18,6 +18,11 @@
 # takes the place of the project's codex_account in resolve-codex-home.py, its
 # provider conversation id is the Codex thread uuid, and its last stdout line
 # also carries `ws_port`.
+#
+# --resume continues the thread's provider conversation (`claude --resume`,
+# or the bridge's Codex thread uuid) in the same home and cwd. A missing
+# transcript or rollout fails the start before any key or tmux session; it
+# never starts a fresh conversation.
 
 set -euo pipefail
 
@@ -26,7 +31,7 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 REGISTRY="${CCDM_REGISTRY_PATH:-$ROOT_DIR/registry.json}"
 
 usage() {
-  echo "Usage: $0 <project> <thread_id> --provider claude|codex [--account <alias>] [--model <model>] [--effort <effort>]" >&2
+  echo "Usage: $0 <project> <thread_id> --provider claude|codex [--account <alias>] [--model <model>] [--effort <effort>] [--resume <id>]" >&2
   exit 2
 }
 
@@ -38,6 +43,7 @@ PROVIDER=""
 ACCOUNT=""
 MODEL=""
 EFFORT=""
+RESUME_ID=""
 while (( $# > 0 )); do
   (( $# >= 2 )) || usage
   case "$1" in
@@ -45,6 +51,7 @@ while (( $# > 0 )); do
     --account) ACCOUNT="$2" ;;
     --model) MODEL="$2" ;;
     --effort) EFFORT="$2" ;;
+    --resume) RESUME_ID="$2" ;;
     *) usage ;;
   esac
   shift 2
@@ -58,6 +65,10 @@ case "$PROVIDER" in
   claude|codex) ;;
   *) usage ;;
 esac
+if [[ -n "$RESUME_ID" && ! "$RESUME_ID" =~ '^[0-9A-Za-z_-]+$' ]]; then
+  echo "Invalid conversation id to resume: '$RESUME_ID'" >&2
+  exit 2
+fi
 
 # The project's settings, with the thread's overrides applied. An account is
 # an alias in `claude_accounts` (or `codex_accounts`), never a path; without
@@ -131,6 +142,33 @@ if [[ ! "$WS_PORT" =~ '^[0-9]+$' ]]; then
   echo "No ws_port was allocated for Codex thread $THREAD_ID" >&2
   exit 1
 fi
+fi
+
+# The conversation to resume must be on disk in this launch's home: Claude's
+# transcript <home>/projects/<cwd, each non-alphanumeric character as "-">/<id>.jsonl,
+# or a Codex rollout <CODEX_HOME>/sessions/**/rollout-*-<uuid>.jsonl.
+if [[ -n "$RESUME_ID" ]]; then
+  if [[ "$PROVIDER" == "claude" ]]; then
+    RESUME_HOME="$CLAUDE_HOME"
+  else
+    RESUME_HOME="$CODEX_HOME_DIR"
+  fi
+  python3 - "$PROVIDER" "$PATH_DIR" "$RESUME_HOME" "$RESUME_ID" <<'PY' || exit 1  # The reason is the last stderr line.
+import glob
+import os
+import re
+import sys
+
+provider, project_dir, home, conversation_id = sys.argv[1:5]
+if provider == "claude":
+    for cwd in dict.fromkeys([project_dir, os.path.realpath(project_dir)]):
+        if os.path.isfile(os.path.join(home, "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd), f"{conversation_id}.jsonl")):
+            sys.exit(0)
+    sys.exit(f"The Claude transcript for conversation {conversation_id} is missing from {home}")
+if glob.glob(os.path.join(glob.escape(home), "sessions", "**", f"rollout-*-{conversation_id}.jsonl"), recursive=True):
+    sys.exit(0)
+sys.exit(f"The Codex rollout for conversation {conversation_id} is missing from {home}")
+PY
 fi
 
 ROUTER_STATE="${CCDM_ROUTER_STATE_DIR:-$HOME/.local/state/ccdm/router}"
@@ -274,6 +312,7 @@ if [[ "$PROVIDER" == "codex" ]]; then
   BOOTSTRAP_FILE="${CCDM_THREAD_BOOTSTRAP_FILE:-$LAUNCH_DIR/bootstrap.json}"
   BOOT_TIMEOUT_ENV=""
   [[ -n "${CCDM_THREAD_BOOT_TIMEOUT_S:-}" ]] && BOOT_TIMEOUT_ENV=" CCDM_THREAD_BOOT_TIMEOUT_S='$CCDM_THREAD_BOOT_TIMEOUT_S'"
+  [[ -n "$RESUME_ID" ]] && CODEX_ENV+=" CODEX_RESUME_THREAD_ID='$RESUME_ID'"
   # The bridge runs from this checkout; its app-server and turns run in the project path.
   if ! tmux new-session -d -s "$TMUX_NAME" -- zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' CCDM_CODEX_PROJECT='$PROJECT' CCDM_ROUTER_STATE_DIR='$ROUTER_STATE' CCDM_ROUTER_KEY_FILE='$KEY_FILE' CCDM_CHANNEL_READY_FILE='$LAUNCH_DIR/ready.json' CHANNEL_ID='$THREAD_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$ALLOWED_USER_IDS' CCDM_THREAD_ID='$THREAD_ID' CCDM_THREAD_PROVIDER='codex' CCDM_THREAD_BOOTSTRAP_FILE='$BOOTSTRAP_FILE'$BOOT_TIMEOUT_ENV$CODEX_ENV node scripts/codex-bridge.js" >&2; then
     fail "tmux could not start the thread session"
@@ -360,7 +399,9 @@ MODEL_FLAG=""
 [[ -n "$MODEL" ]] && MODEL_FLAG=" --model '$MODEL'"
 EFFORT_FLAG=""
 [[ -n "$EFFORT" ]] && EFFORT_FLAG=" --effort '$EFFORT'"
-if ! tmux new-session -d -s "$TMUX_NAME" -- zsh -ic "cd '$PATH_DIR' && CCDM_ROUTER_KEY_FILE='$KEY_FILE'$CONFIG_DIR_ENV claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions --mcp-config '$LAUNCH_DIR/mcp.json' --settings '$LAUNCH_DIR/settings.json'$MODEL_FLAG$EFFORT_FLAG" >&2; then
+RESUME_FLAG=""
+[[ -n "$RESUME_ID" ]] && RESUME_FLAG=" --resume '$RESUME_ID'"
+if ! tmux new-session -d -s "$TMUX_NAME" -- zsh -ic "cd '$PATH_DIR' && CCDM_ROUTER_KEY_FILE='$KEY_FILE'$CONFIG_DIR_ENV claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions --mcp-config '$LAUNCH_DIR/mcp.json' --settings '$LAUNCH_DIR/settings.json'$MODEL_FLAG$EFFORT_FLAG$RESUME_FLAG" >&2; then
   fail "tmux could not start the thread session"
 fi
 echo "Started Claude thread session in tmux session '$TMUX_NAME'" >&2

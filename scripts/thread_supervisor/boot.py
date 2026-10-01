@@ -1,7 +1,9 @@
 """Start and boot handoff: from a thread's first eligible message to a live session.
 
-An owner or guest message in a registered thread (or one whose last start
-failed) gets 👀, sets the row `booting`, and launches start-thread-session.sh.
+An owner or guest message in a registered or stopped thread, or an owner
+message in a closed one, gets 👀, sets the row `booting`, and launches
+start-thread-session.sh; a thread with a provider conversation resumes it
+with `--resume`.
 Every owner or guest message the Router hands the supervisor while the thread
 boots is buffered. On `thread_session_live` the bootstrap, holding the
 preamble, the starter and those messages, is written atomically for the
@@ -120,7 +122,8 @@ def on_thread_message(context, event: dict) -> None:
         return
     if row["state"] == "booting":
         store.buffer_message(context.db, thread_id, event["message_id"], _payload(event), now())
-    elif row["state"] == "registered" or (row["state"] == "stopped" and row["stop_reason"] == "start-failed"):
+    elif row["state"] in ("registered", "stopped") or (row["state"] == "closed" and event["author_class"] == "owner"):
+        # Only the owner reopens a closed conversation.
         start(context, row, event)
 
 
@@ -147,6 +150,8 @@ def start(context, row, trigger: dict | None, starter: str | None = None) -> Non
     for field in ("account", "model", "effort"):
         if resolved[field]:
             args += [f"--{field}", resolved[field]]
+    if row["provider_conversation_id"]:
+        args += ["--resume", row["provider_conversation_id"]]
     env = {**os.environ, "CCDM_THREAD_BOOTSTRAP_FILE": str(bootstrap_path(project, thread_id)),
            "CCDM_THREAD_BOOT_TIMEOUT_S": f"{boot_timeout_seconds():g}"}
     if codex:

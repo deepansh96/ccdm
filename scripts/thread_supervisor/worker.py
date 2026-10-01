@@ -36,6 +36,8 @@ class Context:
     bot_user_id: str | None = None
     # Launches in progress, by thread id (boot.Boot).
     boots: dict = field(default_factory=dict)
+    # Archive actor lookups in progress, by thread id (lifecycle.ArchivePoll).
+    archive_polls: dict = field(default_factory=dict)
 
 
 def lock_path(state_dir: Path) -> Path:
