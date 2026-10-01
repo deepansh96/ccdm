@@ -317,6 +317,8 @@ test("resume startup failures clean the listener, runtime state, launch key, and
     const launch = after.fixtures.codex.bridgeInvocations[0];
     assert.equal(launch.env.CODEX_RESUME_THREAD_ID, "00000000-0000-4000-8000-000000000001");
     await waitForExit(launch.pid);
+    // The bridge's app-server goes with it rather than holding the port.
+    for (const appServer of readState(workspace.stateDir).fixtures.codex.appServerInvocations) await waitForExit(appServer.pid);
     assert.equal(readRegistry(workspace).projects.alpha.pid, null);
     assert.equal(readRegistry(workspace).projects.alpha.session_id, null);
     await cleanup();

@@ -101,6 +101,20 @@ const threadPosts = workspace => (discord(workspace).messages ?? []).filter(mess
 const turnTexts = codex => codex.clientMessages.filter(message => message.method === "turn/start")
   .map(message => message.params.input.map(part => part.text ?? "").join("\n"));
 
+// The bridge marks the thread idle in its activity file only once a new
+// message would start a turn rather than steer the finished one.
+const activityFile = workspace => path.join(workspace.routerStateDir, "launches", "demo", "threads", THREAD_ID, "activity.json");
+async function bridgeIdle(workspace) {
+  const idle = () => {
+    try {
+      return JSON.parse(fs.readFileSync(activityFile(workspace), "utf8")).turn_running === false;
+    } catch {
+      return false;
+    }
+  };
+  await waitFor(idle, () => "the thread bridge to finish its turn", 20000);
+}
+
 // The fake app-server for the thread's allocated port, bound only once the
 // supervisor has recorded that port, so the allocator saw it free.
 async function threadCodex(workspace, port, options = {}) {
@@ -150,6 +164,7 @@ test("an owner message in a Codex thread of a Claude project boots a bridge whos
   assert.ok(bootstrap.indexOf("please fix the parser") < bootstrap.indexOf("and add a regression test"));
   assert.equal(turnTexts(codex).some(text => text.includes(READY_INSTRUCTION)), false);
 
+  await bridgeIdle(workspace);
   threadMessage(workspace, "live-message-1", "how is it going?");
   await waitFor(() => (discord(workspace).webhookEdits ?? []).length === 1, () => "the live reply's edit", 20000);
 
@@ -185,6 +200,8 @@ test("no Discord credential reaches the Codex thread's environment, launch files
   threadMessage(workspace, "boot-message-1", "please fix the parser");
   await listenWhenAllocated();
   await waitFor(() => threadPosts(workspace).length === 1, () => "the bootstrap reply", 20000);
+  // Its launch files are settled once the bootstrap turn is over.
+  await bridgeIdle(workspace);
 
   const state = readState(workspace.stateDir);
   const session = state.fixtures.tmux.sessions[THREAD_TMUX];

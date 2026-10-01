@@ -647,19 +647,25 @@ test("new Codex work after a completed input-needed turn emits a resumption paus
   injectDiscordMessage(workspace, { id: "question-owner", content: "ask me" });
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
-  for (let attempt = 0; attempt < 100 && !fs.existsSync(contextFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+  // The question turn's reply needs its reminder context, written as the turn starts.
+  for (const deadline = Date.now() + 10000; Date.now() < deadline && !fs.existsSync(contextFile);) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.ok(fs.existsSync(contextFile), "the question turn's reminder context");
   const reply = await runMcp(workspace, {
     env: bridgeChildEnv(workspace, config.params.value.env),
     input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "reply", arguments: { text: "What do you prefer?", conversation_disposition: "input-needed", scope_token: config.params.value.env.DISCORD_REPLY_TOKEN } } }) + "\n",
   });
   assert.equal(JSON.parse(reply.stdout).result.isError, undefined);
+  // The answer must start a new turn, not steer the question turn, so it is
+  // sent only once the bridge is idle again.
+  const idleTurns = () => bridge.stdout.split("bridge idle").length - 1;
+  const idleBefore = idleTurns();
   codex.releaseTurn("question-turn");
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  await bridge.waitForOutput(new RegExp(`(?:bridge idle[^]*){${idleBefore + 1}}`), 7000);
   injectDiscordMessage(workspace, { id: "answer-owner", content: "The first choice" });
   await waitForState(workspace, (state) => state.fixtures.discord.deliveredMessages.some((message) => message.id === "answer-owner"));
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  const events = JSON.parse(result.stdout).events;
+  const events = await waitForEvents(workspace, (current) => current.at(-1)?.event_type === "work_resumed");
   assert.equal(events.at(-1).event_type, "work_resumed");
   assert.equal(events.at(-1).resumed_from_turn_id, "question-turn");
   assert.equal(events.at(-1).source_message_id, "answer-owner");

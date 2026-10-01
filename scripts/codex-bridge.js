@@ -81,7 +81,8 @@ const ROUTER_PROJECT = ROUTER_ROOT ? "" : process.env.CCDM_CODEX_PROJECT || "";
 // (CCDM_THREAD_BOOTSTRAP_FILE), in place of the READY instruction turn; live
 // events wait until the bootstrap exists (CCDM_THREAD_BOOT_TIMEOUT_S, 120 s by
 // default), and messages it already includes are dropped. Its turns are kept
-// in CCDM_THREAD_ACTIVITY_FILE from `turn/started` and `turn/completed`.
+// in CCDM_THREAD_ACTIVITY_FILE from `turn/started` until the bridge is idle
+// again after `turn/completed`.
 const DISCORD_THREAD_ID = ROUTER_ROOT ? "" : process.env.CCDM_THREAD_ID || "";
 const THREAD_MODE = Boolean(DISCORD_THREAD_ID);
 const THREAD_ACTIVITY_FILE = THREAD_MODE ? process.env.CCDM_THREAD_ACTIVITY_FILE || "" : "";
@@ -591,6 +592,12 @@ function startCodexServer() {
   });
 }
 
+// Every exit (a failed hello, a lost Router, a fatal error) takes the
+// app-server with it, so none is left holding the port.
+process.on("exit", () => {
+  if (codexProcess && codexProcess.exitCode === null && codexProcess.signalCode === null) codexProcess.kill();
+});
+
 async function connectWebSocket() {
   const url = `ws://127.0.0.1:${WS_PORT}`;
   const maxRetries = 30;
@@ -662,7 +669,6 @@ function handleNotification(msg) {
     case "turn/completed":
       if (!turnActive || !notificationTurnId(msg)) break;
       if (!isCurrentTurnNotification(msg)) break;
-      markTurn(THREAD_ACTIVITY_FILE, false);
       onTurnCompleted(msg.params?.turn);
       break;
 
@@ -852,7 +858,9 @@ async function onTurnCompleted(turn = {}) {
   activeOutputChannelId = null;
   await clearDiscordChannelScope();
   turnActive = false;
-  // From here a new Discord message starts a turn instead of steering this one.
+  // From here a new Discord message starts a turn instead of steering this
+  // one, so only now is the thread session idle.
+  markTurn(THREAD_ACTIVITY_FILE, false);
   console.log(`[turn] Finished (${turn.status ?? "no status"}); bridge idle`);
   if (outputSuppressed && bootstrapCompletion) {
     const complete = bootstrapCompletion;

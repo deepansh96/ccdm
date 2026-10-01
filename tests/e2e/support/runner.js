@@ -1259,7 +1259,11 @@ function runCodex() {
   }
   process.on("SIGTERM", () => process.exit(0));
   process.on("SIGINT", () => process.exit(0));
-  setInterval(() => {}, 1000);
+  // Like a pane process, it goes when its bridge does, never left orphaned.
+  const parent = process.ppid;
+  setInterval(() => {
+    if (process.ppid !== parent) process.exit(0);
+  }, 500);
 }
 
 function runLaunchctl() {
