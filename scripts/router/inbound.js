@@ -151,7 +151,9 @@ function authorClass(table, message, route) {
 }
 
 // The supervisor's copy of every message in an eligible thread, bots,
-// webhooks and strangers included, saying whether its thread session got it.
+// webhooks and strangers included, saying whether its thread session got it
+// and whether it addresses root (a bot mention or a native reply to root),
+// which never boots or feeds a thread session.
 function supervisedMessage(table, message, thread, deliveredToSession) {
   const user = { ...message.author, globalName: message.member?.displayName || message.author?.globalName };
   const author = { id: String(user.id ?? ""), name: user.globalName || user.username || String(user.id ?? ""),
@@ -165,6 +167,7 @@ function supervisedMessage(table, message, thread, deliveredToSession) {
     webhook_id: message.webhookId ? String(message.webhookId) : null,
     author_class: authorClass(table, message, thread),
     delivered_to_session: deliveredToSession,
+    to_root: !message.author?.bot && !message.webhookId && addressesRoot(message),
   };
 }
 

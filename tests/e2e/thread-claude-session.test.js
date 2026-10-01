@@ -155,6 +155,35 @@ test("a message after live arrives once as a live event, and its reply posts int
   assert.deepEqual(threadReactions(workspace, "reactions").map(reaction => reaction.messageId), ["boot-message-1"]);
 });
 
+test("an owner's native reply to a root-bot message or bot mention in a sessionless thread is root's and boots nothing", async () => {
+  const workspace = threadWorkspace();
+  await supervised(workspace);
+  createThread(workspace);
+  await threadRow(workspace);
+
+  injectDiscordMessage(workspace, { id: "root-said", channelId: THREAD_ID, content: "the deploy finished",
+    author: { id: BOT_USER_ID, username: "root", bot: true } });
+  injectDiscordMessage(workspace, { id: "reply-to-root", channelId: THREAD_ID, content: "thanks root, now tail the logs",
+    replyTo: "root-said", author: { id: OWNER_ID, username: "Owner" } });
+  threadMessage(workspace, "mention-root", `<@${BOT_USER_ID}> are you there?`);
+  await new Promise(resolve => setTimeout(resolve, 1500));
+  const idle = await threadRow(workspace);
+  assert.equal(idle.state, "registered");
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions[THREAD_TMUX], undefined);
+  assert.deepEqual(notifications(workspace), []);
+
+  // The next ordinary message boots the session, whose bootstrap carries
+  // none of root's messages.
+  threadMessage(workspace, "boot-message-1", "please fix the parser");
+  await threadRow(workspace, row => row.state === "live");
+  await waitFor(() => notifications(workspace).length === 1, () => "the bootstrap notification", 15000);
+  const [bootstrap] = notifications(workspace);
+  assert.equal(bootstrap.meta.message_id, "boot-message-1");
+  for (const text of ["thanks root, now tail the logs", "are you there?"]) {
+    assert.equal(occurrences(bootstrap.content, text), 0, `${text} in ${bootstrap.content}`);
+  }
+});
+
 const launchDir = workspace => path.join(workspace.routerStateDir, "launches", "demo", "threads", THREAD_ID);
 
 async function liveThread(workspace) {

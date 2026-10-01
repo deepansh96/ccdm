@@ -130,7 +130,9 @@ def on_thread_message(context, event: dict) -> None:
     if event.get("delivered_to_session"):
         return _note_owner_activity(context, thread_id, event)
     content = str(event.get("content") or "").strip()
-    if COMMAND.match(content) or _addresses_root(context, content) or not isinstance(event.get("message_id"), str):
+    # Root's messages (a bot mention or a native reply to root) are never a thread session's.
+    if (event.get("to_root") or COMMAND.match(content) or _addresses_root(context, content)
+            or not isinstance(event.get("message_id"), str)):
         return
     row = store.thread(context.db, thread_id)
     if not row or row["project"] != event.get("project"):
