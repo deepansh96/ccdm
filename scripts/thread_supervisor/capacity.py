@@ -28,7 +28,7 @@ from .paths import router_state_dir
 DEFAULT_CAPS = {"claude": 6, "codex": 8}
 DEFAULT_IDLE_SECONDS = 30 * 60
 RUNNING = ("booting", "live")
-PAUSED = "Paused to free a session slot; reply to resume."
+PAUSED = "Paused to free a session slot; send a message here to resume."
 
 
 def _log(message: str) -> None:

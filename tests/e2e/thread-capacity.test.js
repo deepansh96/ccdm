@@ -18,7 +18,7 @@ test.afterEach(cleanup);
 // fixtures' turns: a fixture claude turn ends with its Stop hook unless the
 // test holds it, and a fake app-server turn ends with `turn/completed`.
 const BOT_USER_ID = "fixture-bot-user-id";
-const PAUSED = "Paused to free a session slot; reply to resume.";
+const PAUSED = "Paused to free a session slot; send a message here to resume.";
 // The production 30-minute idle threshold, cut to nothing for the tests.
 const NO_IDLE_WAIT = { CCDM_THREAD_IDLE_S: "0", CCDM_THREAD_ARCHIVE_POLL_WINDOW_S: "1",
   CCDM_THREAD_ARCHIVE_POLL_INTERVAL_S: "0.2" };

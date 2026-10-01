@@ -64,7 +64,7 @@ Accounts are aliases only. Claude aliases live in the registry's `claude_account
 Live thread sessions are capped per provider by the registry's `thread_session_caps`, defaulting to Claude 6 and Codex 8. Only thread sessions count; Channel Conversations never do.
 
 - **Idle:** no turn running, and no owner message for 30 minutes.
-- **At the cap:** the longest-idle session is evicted with `Paused to free a session slot; reply to resume.` A session mid-turn or booting is never evicted.
+- **At the cap:** the longest-idle session is evicted with `Paused to free a session slot; send a message here to resume.` A session mid-turn or booting is never evicted.
 - **No idle session:** the thread is queued with `Queued, N sessions busy.` and starts automatically, FIFO per provider, when a slot frees.
 
 ## Supervisor down and reconcile

@@ -195,12 +195,12 @@ test("thread_react adds and removes the bot's reaction in a project channel or i
 test("thread_notice posts as the root bot with no mentions parsed", async () => {
   const { workspace, supervisor } = await supervisedRouter();
   const notice = ok(await supervisor.request("thread_notice", { channel_id: "demo-thread",
-    text: "Paused to free a session slot; reply to resume. <@owner-id>" }));
+    text: "Paused to free a session slot; send a message here to resume. <@owner-id>" }));
   ok(await supervisor.request("thread_notice", { channel_id: "demo-channel", text: "Queued, 2 sessions busy." }));
   const messages = discord(workspace).messages.map(({ id, channelId, content, authorization, webhookId, allowedMentions }) =>
     ({ id, channelId, content, authorization, webhookId, allowedMentions }));
   assert.deepEqual(messages.map(({ id: _id, ...message }) => message), [
-    { channelId: "demo-thread", content: "Paused to free a session slot; reply to resume. <@owner-id>", authorization: ROOT_AUTH,
+    { channelId: "demo-thread", content: "Paused to free a session slot; send a message here to resume. <@owner-id>", authorization: ROOT_AUTH,
       webhookId: undefined, allowedMentions: { parse: [] } },
     { channelId: "demo-channel", content: "Queued, 2 sessions busy.", authorization: ROOT_AUTH,
       webhookId: undefined, allowedMentions: { parse: [] } },

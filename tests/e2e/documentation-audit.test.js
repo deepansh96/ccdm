@@ -230,7 +230,7 @@ const threadDocs = {
     "/thread <name>", "create_thread", "scripts/threads.sh create", "10080", "/config", "/close", "/restart",
     "/clear", "/compact", "✅", "👀", "💤", "<project>-<provider> · N%", "archive-actor-unknown", "auto-archive",
     "--resume", "thread_session_caps", "claude_accounts", "Claude 6", "Codex 8",
-    "Paused to free a session slot; reply to resume.", "Queued, N sessions busy.", "reconcile",
+    "Paused to free a session slot; send a message here to resume.", "Queued, N sessions busy.", "reconcile",
     "stop-session.sh <project> --threads", "--all", "Conversation Reminder", "router status",
     ...ROOT_THREAD_PERMISSIONS, "granted once by hand", "Operator checklist", "thread → Claude reply",
     "thread → Codex reply", "not run in CI",
