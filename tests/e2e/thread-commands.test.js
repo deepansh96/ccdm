@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { collectProcess, injectDiscordMessage, startFakeCodexServer } from "./support/bridge.js";
+import { collectProcess, injectDiscordMessage, injectDiscordReaction, startFakeCodexServer } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import { OWNER_ID, ROOT_TOKEN, connectSession, createRouterWorkspace, routerEnv, routerRegistry,
   routerWithWebhooks, waitFor } from "./support/router.js";
@@ -570,4 +570,162 @@ test("/compact in a Codex thread reaches only that thread's bridge", async () =>
   assert.deepEqual(notices(workspace, CREATED_THREAD_ID).filter(notice => /no live session/i.test(notice.content)), []);
   assert.equal(codex.clientMessages.some(message => message.method === "turn/start" &&
     JSON.stringify(message.params).includes("/compact")), false);
+});
+
+// `/config` in a thread: the owner sees and changes that thread's settings.
+// `demo` is a Claude project with no model or effort of its own.
+test("an owner's /config in a thread shows its provider, account, model and effort and where each comes from; a guest's is refused", async () => {
+  const workspace = commandWorkspace();
+  await supervised(workspace);
+  channelMessage(workspace, "thread-command-1", "/thread configured --model claude-test-model --effort high");
+  await threadRow(workspace, CREATED_THREAD_ID);
+  await waitFor(() => notices(workspace, CREATED_THREAD_ID).length === 1, () => "the settings notice", 15000);
+
+  threadMessage(workspace, CREATED_THREAD_ID, "config-1", "/config");
+  await waitFor(() => notices(workspace, CREATED_THREAD_ID).length === 2, () => "the /config notice", 15000);
+  assert.deepEqual(notices(workspace, CREATED_THREAD_ID)[1], { authorization: ROOT_AUTH, content:
+    "Thread settings:\nprovider: claude (project)\naccount: default (project)\nmodel: claude-test-model (thread)\n" +
+    "effort: high (thread)" });
+
+  threadMessage(workspace, CREATED_THREAD_ID, "config-2", "/config model=other-model", GUEST);
+  await waitFor(() => notices(workspace, CREATED_THREAD_ID).length === 3, () => "the guest's refusal", 15000);
+  assert.deepEqual(notices(workspace, CREATED_THREAD_ID)[2], { authorization: ROOT_AUTH,
+    content: "Only the owner can change this thread's settings." });
+  await settle(500);
+  assert.equal((await threadRow(workspace, CREATED_THREAD_ID)).model, "claude-test-model");
+  assert.deepEqual(claude(workspace).invocations, []);
+});
+
+test("/config model= and effort= save the override and restart the thread with --resume and the same id; an invalid value changes nothing", async () => {
+  const workspace = commandWorkspace();
+  await supervised(workspace);
+  await liveThread(workspace, THREAD_ID);
+  const { provider_conversation_id: conversationId } = await threadRow(workspace, THREAD_ID);
+  writeClaudeTranscript(workspace, conversationId);
+
+  for (const [index, content] of ["/config effort=turbo", "/config model=bad;model", "/config colour=red",
+    "/config model"].entries()) {
+    threadMessage(workspace, THREAD_ID, `bad-config-${index}`, content);
+  }
+  await waitFor(() => notices(workspace, THREAD_ID).length === 4, () => `four refusals: ${JSON.stringify(
+    notices(workspace, THREAD_ID))}`, 15000);
+  assert.deepEqual(notices(workspace, THREAD_ID).map(notice => notice.content), [
+    "Settings not changed: effort 'turbo' is not valid for claude (expected low, medium, high, xhigh, max)",
+    "Settings not changed: model 'bad;model' is not a valid model name",
+    "Settings not changed: unknown setting colour (expected provider, account, model or effort)",
+    "Settings not changed: model needs a value, as model=<value>",
+  ]);
+  await settle(500);
+  assert.equal(launches(workspace, THREAD_ID).length, 1);
+  const unchanged = await threadRow(workspace, THREAD_ID);
+  assert.deepEqual([unchanged.model, unchanged.effort], [null, null]);
+
+  threadMessage(workspace, THREAD_ID, "config-model", "/config model=claude-next effort=max");
+  await waitFor(() => launches(workspace, THREAD_ID).length === 2, () => "the relaunch", 15000);
+  const row = await threadRow(workspace, THREAD_ID, current => current.state === "live");
+  assert.deepEqual([row.model, row.effort, row.provider_conversation_id], ["claude-next", "max", conversationId]);
+  assert.equal(resumeArg(launches(workspace, THREAD_ID)[1]), conversationId);
+  assert.match(tmuxSessions(workspace)[THREAD_TMUX].shellCommand, /--model 'claude-next' --effort 'max'/);
+  assert.deepEqual(notices(workspace, THREAD_ID).at(-1), { authorization: ROOT_AUTH,
+    content: "Settings saved: model claude-next · effort max. Restarting this thread's session." });
+  assert.equal(commandNotified(workspace, "/config"), false);
+});
+
+// 64,600 of a 258,400-token window is 25%.
+const SEEDED_USAGE = { last: { inputTokens: 64600 }, modelContextWindow: 258400 };
+const SWITCH_WARNING = "Changing provider codex starts a fresh conversation in this thread. React ✅ to this " +
+  "message to apply it.";
+const OWNER = { id: OWNER_ID, username: "Owner" };
+const checks = workspace => (discord(workspace).reactions ?? [])
+  .filter(reaction => decodeURIComponent(reaction.emoji) === "✅");
+
+function react(workspace, threadId, id, messageId, user, emoji = "✅") {
+  injectDiscordReaction(workspace, { id, channelId: threadId, emoji, messageId, user,
+    message: { author: { id: BOT_USER_ID, bot: true }, content: SWITCH_WARNING } });
+}
+
+test("/config provider=codex posts a warning with ✅ and changes nothing until the owner's ✅, which starts a fresh Codex session", async () => {
+  const workspace = commandWorkspace();
+  fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
+  const codex = await startFakeCodexServer(workspace, { port: 29700, deferListen: true,
+    codexHome: path.join(workspace.homeDir, ".codex"), channelId: THREAD_ID, threadId: CODEX_THREAD_UUID,
+    bootstrapPlan: { mcpReplyText: "on it", tokenUsage: SEEDED_USAGE }, turns: [{ mcpReplyText: "done" }] });
+  await routerWithWebhooks(workspace, ["demo"]);
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.replyText = "on it";
+  });
+  await startThreadSupervisor(workspace, { env: { CCDM_THREAD_WS_PORT_BASE: "29700" } });
+  await liveThread(workspace, THREAD_ID);
+  const { provider_conversation_id: claudeConversation } = await threadRow(workspace, THREAD_ID);
+  const claudePid = tmuxSessions(workspace)[THREAD_TMUX].pid;
+
+  threadMessage(workspace, THREAD_ID, "config-provider", "/config provider=codex");
+  await waitFor(() => checks(workspace).length === 1, () => `the warning's ✅: ${JSON.stringify(posts(workspace,
+    THREAD_ID))}`, 15000);
+  const warning = posts(workspace, THREAD_ID).find(message => message.content === SWITCH_WARNING);
+  assert.equal(warning.authorization, ROOT_AUTH);
+  assert.equal(checks(workspace)[0].messageId, warning.id);
+  assert.equal(checks(workspace)[0].authorization, ROOT_AUTH);
+
+  // A guest's ✅ on the warning, the owner's ✅ on another message, and the
+  // owner's other emoji on the warning are all ignored.
+  react(workspace, THREAD_ID, "guest-check", warning.id, GUEST);
+  react(workspace, THREAD_ID, "elsewhere-check", `boot-${THREAD_ID}`, OWNER);
+  react(workspace, THREAD_ID, "owner-thumbs", warning.id, OWNER, "👍");
+  await waitFor(() => (discord(workspace).injectedReactions ?? []).every(reaction => reaction.delivered),
+    () => "the ignored reactions", 15000);
+  await settle(1000);
+  const pending = await threadRow(workspace, THREAD_ID);
+  assert.deepEqual([pending.provider, pending.state, pending.provider_conversation_id],
+    [null, "live", claudeConversation]);
+  assert.equal(launches(workspace, THREAD_ID).length, 1);
+  assert.ok(alive(claudePid), "the Claude session still runs");
+
+  react(workspace, THREAD_ID, "owner-check", warning.id, OWNER);
+  await threadRow(workspace, THREAD_ID, row => row.provider === "codex" && row.ws_port === 29700);
+  await codex.listen();
+  const switched = await threadRow(workspace, THREAD_ID, row => row.state === "live" &&
+    row.provider_conversation_id === CODEX_THREAD_UUID, 20000);
+  assert.equal(switched.provider, "codex");
+  assert.ok(!alive(claudePid), "the Claude session stopped");
+  assert.doesNotMatch(tmuxSessions(workspace)[THREAD_TMUX].shellCommand, /--resume/);
+  assert.equal(codex.clientMessages.some(message => message.method === "thread/resume"), false);
+  // The fixture Claude answered each reaction it saw, so only the Codex replies count from here.
+  const codexReplies = () => replies(workspace, THREAD_ID).filter(reply => reply.username.startsWith("demo-codex"))
+    .map(({ content, username }) => ({ content, username }));
+  await waitFor(() => codexReplies().length === 1, () => "the Codex bootstrap reply", 20000);
+
+  threadMessage(workspace, THREAD_ID, "after-switch", "how is it going?");
+  await waitFor(() => codexReplies().length === 2, () => `the Codex reply: ${JSON.stringify(codexReplies())}`, 20000);
+  assert.deepEqual(codexReplies(), [
+    { content: "on it", username: "demo-codex" },
+    { content: "done", username: "demo-codex · 25%" },
+  ]);
+  assert.deepEqual(notices(workspace, THREAD_ID).map(notice => notice.content), [SWITCH_WARNING,
+    "Settings saved: provider codex. Starting a fresh conversation in this thread."]);
+  assert.equal(launches(workspace, THREAD_ID).length, 1);
+});
+
+test("/config in a project channel posts the settings new threads inherit and never reaches the Channel Conversation", async () => {
+  const workspace = commandWorkspace();
+  const registryFile = path.join(workspace.repoDir, "registry.json");
+  const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+  Object.assign(registry.projects.demo, { model: "claude-project-model", claude_effort: "medium" });
+  fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
+  await supervised(workspace);
+  const channel = await connectSession(workspace, "demo", "demo-key");
+
+  channelMessage(workspace, "channel-config-1", "/config");
+  channelMessage(workspace, "channel-config-2", "/config model=other", GUEST);
+  await waitFor(() => notices(workspace, "demo-channel").length === 2, () => "two settings notices", 15000);
+  const settings = "provider: claude\naccount: default\nmodel: claude-project-model\neffort: medium";
+  assert.deepEqual(notices(workspace, "demo-channel"), [
+    { authorization: ROOT_AUTH, content: `Settings new threads in this channel inherit:\n${settings}` },
+    { authorization: ROOT_AUTH, content: "/config does not change channel settings.\n" +
+      `Settings new threads in this channel inherit:\n${settings}` },
+  ]);
+  await settle(500);
+  assert.deepEqual(channel.events.filter(event => String(event.message_id).startsWith("channel-config")), []);
+  assert.equal(JSON.parse(fs.readFileSync(registryFile, "utf8")).projects.demo.model, "claude-project-model");
+  assert.deepEqual(claude(workspace).invocations, []);
 });

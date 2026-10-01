@@ -15,7 +15,7 @@ import re
 import sys
 import uuid
 
-from . import registry, store
+from . import config, registry, store
 from .clock import now
 from .link import LinkError
 
@@ -128,7 +128,9 @@ def create(context, project: str | None, name: str | None, flags: dict, first_me
 
 
 def on_channel_command(context, event: dict) -> None:
-    """`/thread` from the owner or a guest in a project channel; other channel commands are not handled here."""
+    """`/thread` from the owner or a guest in a project channel; `/config` lists the project's settings."""
+    if event.get("command") == "config":
+        return config.on_channel_config(context, event)
     if event.get("command") != "thread":
         return
     author = event.get("author") or {}

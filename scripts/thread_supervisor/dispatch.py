@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 
-from . import binding, boot, commands, control, creation, lifecycle
+from . import binding, boot, commands, config, control, creation, lifecycle
 
 
 HANDLERS = {
@@ -14,6 +14,7 @@ HANDLERS = {
     "thread_create_request": creation.on_create_request,
     "thread_delete": lifecycle.on_thread_delete,
     "thread_message": boot.on_thread_message,
+    "thread_reaction": config.on_thread_reaction,
     "thread_session_live": boot.on_session_live,
     "thread_update": lifecycle.on_thread_update,
 }

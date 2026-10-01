@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import sys
 
-from . import boot, lifecycle, store
+from . import boot, config, lifecycle, store
 from .clock import now
 from .link import LinkError
 
@@ -53,10 +53,13 @@ def on_thread_command(context, event: dict) -> None:
     if command in ("compact", "pause", "unpause"):
         return _notice(context, thread_id, NO_LIVE_SESSION)
     launching = context.boots.get(thread_id)
-    if command in ("restart", "clear", "close") and launching and not launching.launched:
+    changes_config = command == "config" and str(event.get("args") or "").strip()
+    if (command in ("restart", "clear", "close") or changes_config) and launching and not launching.launched:
         launching.deferred = event  # The latest one wins.
         return
-    if command in ("restart", "clear"):
+    if command == "config":
+        config.on_thread_config(context, row, owner, event)
+    elif command in ("restart", "clear"):
         _relaunch(context, row, owner, fresh=command == "clear")
     elif command == "close":
         _close(context, row, owner, event)
