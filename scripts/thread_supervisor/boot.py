@@ -8,6 +8,7 @@ preamble, the starter and those messages, is written atomically for the
 session's channel server, 👀 comes off, and the row is `live`. A launch that
 fails, times out or exits early takes 👀 off, posts a one-line reason, and
 leaves the row `stopped/start-failed`; the next eligible message retries.
+A Codex thread is first given its own app-server port, recorded on the row.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import subprocess
 import sys
 import threading
 
-from . import registry, store
+from . import ports, registry, store
 from .clock import now
 from .link import LinkError
 from .paths import router_state_dir, write_private
@@ -120,14 +121,18 @@ def on_thread_message(context, event: dict) -> None:
 
 def start(context, row, trigger: dict) -> None:
     thread_id, project = row["thread_id"], row["project"]
-    entry = registry.project(registry.load(context.project_root), project)
+    current = registry.load(context.project_root)
+    entry = registry.project(current, project)
     if not entry:
         return
+    provider = row["provider"] or entry.get("type") or "claude"
+    codex = provider == "codex"
     resolved = {
-        "provider": row["provider"] or entry.get("type") or "claude",
+        "provider": provider,
         "account": row["account"],
-        "model": row["model"] or entry.get("model"),
-        "effort": row["effort"] or entry.get("claude_effort"),
+        "model": row["model"] or (entry.get("codex_model") if codex else None) or entry.get("model"),
+        "effort": row["effort"] or (entry.get("codex_reasoning_effort") or entry.get("model_reasoning_effort")
+                                    if codex else entry.get("claude_effort")),
     }
     store.begin_boot(context.db, thread_id, resolved)
     store.buffer_message(context.db, thread_id, trigger["message_id"], _payload(trigger), now())
@@ -140,6 +145,12 @@ def start(context, row, trigger: dict) -> None:
             args += [f"--{field}", row[field]]
     env = {**os.environ, "CCDM_THREAD_BOOTSTRAP_FILE": str(bootstrap_path(project, thread_id)),
            "CCDM_THREAD_BOOT_TIMEOUT_S": f"{boot_timeout_seconds():g}"}
+    if codex:
+        port = ports.allocate(current, store.held_ports(context.db, thread_id))
+        if port is None:
+            return fail(context, thread_id, boot, f"no free Codex app-server port from {ports.base()}")
+        store.update(context.db, thread_id, ws_port=port)
+        env["CCDM_THREAD_WS_PORT"] = str(port)
 
     def launch() -> None:
         try:

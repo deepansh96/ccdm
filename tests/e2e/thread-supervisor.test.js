@@ -73,6 +73,7 @@ test("an owner-created thread binds, shows in status, and is PATCHed to a one-we
   assert.equal(status.running, true);
   assert.deepEqual(status.projects, { demo: { threads: { "owner-thread": {
     name: "Fix flaky test", creator_id: OWNER_ID, state: "registered", stop_reason: null,
+    ws_port: null, provider_conversation_id: null,
     provider: null, account: null, model: null, effort: null,
   } } } });
   await waitFor(() => patches(workspace).length === 1, () => "the auto-archive PATCH");
@@ -136,6 +137,7 @@ db.commit()`, store]);
   await fence(workspace);
   assert.deepEqual((await supervisorStatus(workspace)).projects.demo.threads["requested-bot-thread"], {
     name: "Port the parser", creator_id: BOT_USER_ID, state: "registered", stop_reason: null,
+    ws_port: null, provider_conversation_id: null,
     provider: "codex", account: null, model: "gpt-5.5", effort: "high",
   });
   assert.equal(status.projects.demo.threads["unrequested-bot-thread"], undefined);

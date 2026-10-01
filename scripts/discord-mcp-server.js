@@ -29,6 +29,8 @@ const DISCORD_GLOBAL_USER_IDS = new Set(
 const ROUTER_KEY_FILE = process.env.CCDM_ROUTER_KEY_FILE;
 const ROUTER_ROOT = Boolean(ROUTER_KEY_FILE) && process.env.CCDM_ROUTER_ROLE === "root";
 const ROUTER_PROJECT = process.env.CCDM_CODEX_PROJECT;
+// A Codex Thread Conversation's tools act in its thread, as the `thread` role.
+const ROUTER_THREAD_ID = ROUTER_ROOT ? "" : process.env.CCDM_THREAD_ID || "";
 
 if (!ROUTER_KEY_FILE || !CHANNEL_ID || (!ROUTER_ROOT && !ROUTER_PROJECT)) {
   process.stderr.write(`Missing ${ROUTER_KEY_FILE ? "CCDM_CODEX_PROJECT or CHANNEL_ID" : "CCDM_ROUTER_KEY_FILE or CHANNEL_ID"}\n`);
@@ -278,6 +280,9 @@ function routerClient() {
       const key = (await readFile(ROUTER_KEY_FILE, "utf8")).trim();
       const client = ROUTER_ROOT
         ? new RouterClient({ key, role: "root", listener: false })
+        : ROUTER_THREAD_ID
+        ? new RouterClient({ project: ROUTER_PROJECT, key, role: "thread", threadId: ROUTER_THREAD_ID,
+          provider: process.env.CCDM_THREAD_PROVIDER || "codex", listener: false })
         : new RouterClient({ project: ROUTER_PROJECT, key, role: "project", listener: false });
       client.on("end", () => {
         routerConnection = null;
@@ -322,7 +327,8 @@ async function routerRequest(op, channelId, args) {
 // Root posts as the bot, which carries none.
 async function routerContextPct() {
   if (ROUTER_ROOT) return undefined;
-  const file = path.join(process.env.CCDM_ROUTER_STATE_DIR || "", "launches", ROUTER_PROJECT, "context.json");
+  const file = path.join(process.env.CCDM_ROUTER_STATE_DIR || "", "launches", ROUTER_PROJECT,
+    ...(ROUTER_THREAD_ID ? ["threads", ROUTER_THREAD_ID] : []), "context.json");
   try {
     const pct = JSON.parse(await readFile(file, "utf8")).context_pct;
     return Number.isFinite(pct) ? pct : undefined;

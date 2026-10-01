@@ -36,7 +36,8 @@ def status(state_dir: Path) -> dict:
     for row in (inspected or {}).get("threads", []):
         projects.setdefault(row["project"], {"threads": {}})["threads"][row["thread_id"]] = {
             "name": row["name"], "creator_id": row["creator_id"], "state": row["state"],
-            "stop_reason": row["stop_reason"],
+            "stop_reason": row["stop_reason"], "ws_port": row["ws_port"],
+            "provider_conversation_id": row["provider_conversation_id"],
             **{field: row[field] for field in store.OVERRIDES},
         }
     return {

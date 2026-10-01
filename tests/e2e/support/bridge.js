@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
 import path from "node:path";
 import { WebSocketServer } from "ws";
 
@@ -210,10 +211,18 @@ function writeCodexConfig(codexHome, text) {
   fs.writeFileSync(path.join(codexHome, "config.toml"), text);
 }
 
+// `port` binds that port instead of a free one; with `deferListen` it is
+// registered for the fixture `codex` at once but bound only by `listen()`, so a
+// port allocator can still see it free.
 export async function startFakeCodexServer(workspace, options = {}) {
-  const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
-  await new Promise((resolve) => server.once("listening", resolve));
-  const port = server.address().port;
+  const httpServer = http.createServer();
+  const server = new WebSocketServer({ server: httpServer });
+  const listen = () => new Promise((resolve, reject) => {
+    httpServer.once("error", reject);
+    httpServer.listen(options.port ?? 0, "127.0.0.1", resolve);
+  });
+  if (!options.deferListen) await listen();
+  const port = options.port ?? httpServer.address().port;
   const turnPlans = [...(options.turns ?? [])];
   const steerPlans = [...(options.steer ?? [])];
   let serverRequestId = 10000;
@@ -504,11 +513,13 @@ export async function startFakeCodexServer(workspace, options = {}) {
     // A bridge still connected would otherwise hold the close open.
     for (const client of server.clients) client.terminate();
     await new Promise((resolve) => server.close(resolve));
+    if (httpServer.listening) await new Promise((resolve) => httpServer.close(resolve));
   });
 
   return {
     port,
     server,
+    listen,
     clientMessages,
     releaseTurn(turnId) {
       const release = pendingTurnReleases.get(turnId);
@@ -517,6 +528,7 @@ export async function startFakeCodexServer(workspace, options = {}) {
     },
     async close() {
       await new Promise((resolve) => server.close(resolve));
+      if (httpServer.listening) await new Promise((resolve) => httpServer.close(resolve));
       markCodexServer(workspace, port, { ready: false });
     },
   };

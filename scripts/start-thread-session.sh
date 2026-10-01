@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Usage: ./scripts/start-thread-session.sh <project> <thread_id> --provider claude
+# Usage: ./scripts/start-thread-session.sh <project> <thread_id> --provider claude|codex
 #          [--account <alias>] [--model <model>] [--effort <effort>]
 # Starts one Thread Conversation's session, served through the Router as the
 # `thread` role. The Thread Supervisor runs it; on success the last stdout
@@ -11,7 +11,13 @@
 # `<screen>-t-<last 6 of the thread id>`. A launch is refused while a process
 # still carries that key path; a failed launch removes its key, launch
 # directory and tmux session. CCDM_THREAD_BOOTSTRAP_FILE, from the supervisor,
-# names the bootstrap file the channel server waits for.
+# names the bootstrap file the channel server (or Codex bridge) waits for.
+#
+# A Codex thread runs codex-bridge.js in thread mode, with its own app-server
+# on CCDM_THREAD_WS_PORT, the port the supervisor allocated. Its account alias
+# takes the place of the project's codex_account in resolve-codex-home.py, its
+# provider conversation id is the Codex thread uuid, and its last stdout line
+# also carries `ws_port`.
 
 set -euo pipefail
 
@@ -20,7 +26,7 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 REGISTRY="${CCDM_REGISTRY_PATH:-$ROOT_DIR/registry.json}"
 
 usage() {
-  echo "Usage: $0 <project> <thread_id> --provider claude [--account <alias>] [--model <model>] [--effort <effort>]" >&2
+  echo "Usage: $0 <project> <thread_id> --provider claude|codex [--account <alias>] [--model <model>] [--effort <effort>]" >&2
   exit 2
 }
 
@@ -49,14 +55,15 @@ if [[ ! "$THREAD_ID" =~ '^[0-9A-Za-z_-]+$' ]]; then
   exit 2
 fi
 case "$PROVIDER" in
-  claude) ;;
-  codex) echo "Codex thread sessions are not supported yet" >&2; exit 2 ;;
+  claude|codex) ;;
   *) usage ;;
 esac
 
 # The project's settings, with the thread's overrides applied. An account is
-# an alias in `claude_accounts`, never a path; without one the project's
-# `claude_home` applies, then the default home.
+# an alias in `claude_accounts` (or `codex_accounts`), never a path; without
+# one the project's `claude_home` applies, then the default home (for Codex,
+# the project's own Codex Home).
+if [[ "$PROVIDER" == "claude" ]]; then
 LAUNCH_FIELDS="$(python3 - "$REGISTRY" "$PROJECT" "$ACCOUNT" "$MODEL" "$EFFORT" <<'PY'
 import json, os, sys
 registry_path, project, account, model, effort = sys.argv[1:6]
@@ -89,6 +96,42 @@ CONFIG_DIR_ENV=""
 [[ "$CONFIG_DIR" != "__NONE__" ]] && CONFIG_DIR_ENV=" CLAUDE_CONFIG_DIR='$CONFIG_DIR'"
 [[ "$MODEL" == "__NONE__" ]] && MODEL=""
 [[ "$EFFORT" == "__NONE__" ]] && EFFORT=""
+else
+LAUNCH_FIELDS="$(python3 - "$REGISTRY" "$PROJECT" "$MODEL" "$EFFORT" <<'PY'
+import json, os, sys
+registry_path, project, model, effort = sys.argv[1:5]
+registry = json.load(open(registry_path))
+entry = (registry.get("projects") or {}).get(project)
+if not isinstance(entry, dict) or not project or "/" in project or project.startswith("."):
+    sys.exit(f"Unknown project '{project}'")
+if not entry.get("webhook_id"):
+    sys.exit(f"Project '{project}' has no webhook_id, so its thread replies could not be posted")
+allowed = [registry.get("discord_user_id")] + list(entry.get("guest_user_ids") or [])
+fields = [
+    os.path.expanduser(entry["path"]), entry["screen_name"],
+    model or entry.get("codex_model") or entry.get("model") or "",
+    effort or entry.get("codex_reasoning_effort") or entry.get("model_reasoning_effort") or "",
+    entry.get("codex_service_tier") or entry.get("service_tier") or "default",
+    "1" if entry.get("text_reply_fallback") is True else "",
+    ",".join(dict.fromkeys(str(user_id) for user_id in allowed if user_id)),
+]
+print("\t".join(field or "__NONE__" for field in fields))
+PY
+)" || exit 1  # Python's reason is the last stderr line.
+IFS=$'\t' read -r PATH_DIR SCREEN_NAME MODEL EFFORT SERVICE_TIER TEXT_REPLY_FALLBACK ALLOWED_USER_IDS <<< "$LAUNCH_FIELDS"
+[[ "$MODEL" == "__NONE__" ]] && MODEL=""
+[[ "$EFFORT" == "__NONE__" ]] && EFFORT=""
+[[ "$TEXT_REPLY_FALLBACK" == "__NONE__" ]] && TEXT_REPLY_FALLBACK=""
+ACCOUNT_ARGS=()
+[[ -n "$ACCOUNT" ]] && ACCOUNT_ARGS=(--account "$ACCOUNT")
+# An unknown alias is a start failure; the resolver's reason is its last stderr line.
+CODEX_HOME_DIR="$(python3 "$SCRIPT_DIR/resolve-codex-home.py" "$REGISTRY" "$PROJECT" "${ACCOUNT_ARGS[@]}")" || exit 1
+WS_PORT="${CCDM_THREAD_WS_PORT:-}"
+if [[ ! "$WS_PORT" =~ '^[0-9]+$' ]]; then
+  echo "No ws_port was allocated for Codex thread $THREAD_ID" >&2
+  exit 1
+fi
+fi
 
 ROUTER_STATE="${CCDM_ROUTER_STATE_DIR:-$HOME/.local/state/ccdm/router}"
 KEY_FILE="$ROUTER_STATE/keys/.thread-$THREAD_ID.key"
@@ -96,8 +139,9 @@ LAUNCH_DIR="$ROUTER_STATE/launches/$PROJECT/threads/$THREAD_ID"
 TMUX_NAME="$SCREEN_NAME-t-${THREAD_ID[-6,-1]}"
 
 # Thread listeners carry this launch's key file path (never the key) in their
-# environment: the claude process and its CCDM channel server. Only that exact
-# path matches, so project and sibling sessions never do.
+# environment: the claude process and its CCDM channel server, or the Codex
+# bridge and its app-server. Only that exact path matches, so project and
+# sibling sessions never do.
 find_thread_pids() {
   python3 - "$KEY_FILE" <<'PY'
 import os
@@ -123,7 +167,10 @@ def is_listener(command: str) -> bool:
     exe = os.path.basename(argv[0])
     if exe == "claude":
         return "--dangerously-load-development-channels" in argv and "server:ccdm" in argv
-    return exe == "node" and any(os.path.basename(arg) == "ccdm-channel-server.js" for arg in argv[1:])
+    if exe == "codex":
+        return "app-server" in argv
+    return exe == "node" and any(os.path.basename(arg) in ("ccdm-channel-server.js", "codex-bridge.js")
+                                 for arg in argv[1:])
 
 for line in ps.splitlines():
     pid_text, _, command = line.strip().partition(" ")
@@ -169,7 +216,7 @@ fail() {
   exit 1
 }
 
-python3 - "$PROJECT" "$THREAD_ID" "$ROUTER_STATE" "$LAUNCH_DIR" "$SCRIPT_DIR/ccdm-channel-server.js" "$KEY_FILE" <<'PY' || fail "The thread launch files could not be written"
+python3 - "$PROJECT" "$THREAD_ID" "$ROUTER_STATE" "$LAUNCH_DIR" "$SCRIPT_DIR/ccdm-channel-server.js" "$KEY_FILE" "$PROVIDER" <<'PY' || fail "The thread launch files could not be written"
 import json
 import os
 import secrets
@@ -177,7 +224,7 @@ import shutil
 import sys
 from pathlib import Path
 
-project, thread_id, router_state, launch_dir, server_script, key_file = sys.argv[1:7]
+project, thread_id, router_state, launch_dir, server_script, key_file, provider = sys.argv[1:8]
 launch = Path(launch_dir)
 # A fresh launch directory: no previous launch's ready, context or bootstrap file.
 shutil.rmtree(launch, ignore_errors=True)
@@ -193,6 +240,10 @@ def write_private(path: Path, text: str) -> None:
         f.write(text)
     os.replace(tmp, path)
 
+write_private(Path(key_file), secrets.token_urlsafe(32) + "\n")
+# A Codex bridge takes its settings from its tmux environment instead.
+if provider == "codex":
+    sys.exit(0)
 env = {
     "CCDM_ROUTER_STATE_DIR": router_state,
     "CCDM_ROUTER_KEY_FILE": key_file,
@@ -211,8 +262,99 @@ write_private(launch / "mcp.json", json.dumps({"mcpServers": {"ccdm": {
 write_private(launch / "settings.json", json.dumps({
     "enabledPlugins": {"discord@claude-plugins-official": False},
 }, indent=2) + "\n")
-write_private(Path(key_file), secrets.token_urlsafe(32) + "\n")
 PY
+
+if [[ "$PROVIDER" == "codex" ]]; then
+  CODEX_ENV=" CODEX_SERVICE_TIER='$SERVICE_TIER'"
+  [[ -n "$MODEL" ]] && CODEX_ENV+=" CODEX_MODEL='$MODEL'"
+  [[ -n "$EFFORT" ]] && CODEX_ENV+=" CODEX_REASONING_EFFORT='$EFFORT'"
+  [[ -n "$TEXT_REPLY_FALLBACK" ]] && CODEX_ENV+=" CODEX_BRIDGE_TEXT_REPLY_FALLBACK='1'"
+  TRANSCRIBE_AUDIO_FLAG="${CODEX_BRIDGE_TRANSCRIBE_AUDIO:-${USE_AUDIO_TRANSCRIPTION_IN_BRIDGE:-}}"
+  [[ -n "$TRANSCRIBE_AUDIO_FLAG" ]] && CODEX_ENV+=" CODEX_BRIDGE_TRANSCRIBE_AUDIO='$TRANSCRIBE_AUDIO_FLAG'"
+  BOOTSTRAP_FILE="${CCDM_THREAD_BOOTSTRAP_FILE:-$LAUNCH_DIR/bootstrap.json}"
+  BOOT_TIMEOUT_ENV=""
+  [[ -n "${CCDM_THREAD_BOOT_TIMEOUT_S:-}" ]] && BOOT_TIMEOUT_ENV=" CCDM_THREAD_BOOT_TIMEOUT_S='$CCDM_THREAD_BOOT_TIMEOUT_S'"
+  # The bridge runs from this checkout; its app-server and turns run in the project path.
+  if ! tmux new-session -d -s "$TMUX_NAME" -- zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' CCDM_CODEX_PROJECT='$PROJECT' CCDM_ROUTER_STATE_DIR='$ROUTER_STATE' CCDM_ROUTER_KEY_FILE='$KEY_FILE' CCDM_CHANNEL_READY_FILE='$LAUNCH_DIR/ready.json' CHANNEL_ID='$THREAD_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$ALLOWED_USER_IDS' CCDM_THREAD_ID='$THREAD_ID' CCDM_THREAD_PROVIDER='codex' CCDM_THREAD_BOOTSTRAP_FILE='$BOOTSTRAP_FILE'$BOOT_TIMEOUT_ENV$CODEX_ENV node scripts/codex-bridge.js" >&2; then
+    fail "tmux could not start the thread session"
+  fi
+  echo "Started Codex thread bridge in tmux session '$TMUX_NAME'" >&2
+
+  # The bridge reports its Router hello outcome, and its Codex thread uuid,
+  # once its app-server is up and its MCP server is registered.
+  RESULT="$(python3 - "$TMUX_NAME" "$LAUNCH_DIR/ready.json" "$KEY_FILE" "$CODEX_HOME_DIR" "$WS_PORT" <<'PY'
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+screen, ready_file, key_file, codex_home, ws_port = sys.argv[1:6]
+failure = Path(ready_file).with_name(".failure")
+timeout = float(os.environ.get("CCDM_THREAD_BOOT_TIMEOUT_S") or 120)
+deadline = time.monotonic() + timeout
+
+def give_up(reason: str) -> None:
+    failure.write_text(reason)
+    sys.exit(reason)
+
+outcome = None
+while time.monotonic() < deadline:
+    try:
+        with open(ready_file) as f:
+            outcome = json.load(f)
+        break
+    except (FileNotFoundError, json.JSONDecodeError):
+        if subprocess.run(["tmux", "has-session", "-t", f"={screen}"], capture_output=True).returncode != 0:
+            give_up("The Codex bridge exited before its Router hello")
+        time.sleep(0.2)
+if outcome is None:
+    give_up(f"The Codex bridge did not say hello to the Router within {timeout:g}s")
+if not outcome.get("ok"):
+    give_up(f"The Codex bridge failed to start: {outcome.get('error')}")
+
+target = os.path.normpath(key_file)
+env_re = re.compile(r"""CCDM_ROUTER_KEY_FILE=(?:"([^"]+)"|'([^']+)'|([^\s]+))""")
+
+def find_pid():
+    try:
+        ps = subprocess.check_output(["ps", "axeww", "-o", "pid=,command="], text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        return None
+    for line in ps.splitlines():
+        pid_text, _, command = line.strip().partition(" ")
+        if not pid_text.isdigit() or "ps axeww" in command or "python3 -" in command:
+            continue
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            continue
+        if len(argv) < 2 or os.path.basename(argv[0]) != "node" or not argv[1].endswith("codex-bridge.js"):
+            continue
+        keys = [next(g for g in m.groups() if g is not None) for m in env_re.finditer(command)]
+        if any(os.path.normpath(key) == target for key in keys):
+            return int(pid_text)
+    return None
+
+pid = None
+for _ in range(20):
+    pid = find_pid()
+    if pid:
+        break
+    time.sleep(0.5)
+if not pid:
+    give_up("The thread session's Codex bridge process could not be found")
+print(json.dumps({"pid": pid, "provider_conversation_id": outcome.get("provider_conversation_id"), "tmux": screen,
+                  "provider_home": codex_home, "ws_port": int(ws_port)}))
+PY
+)" || fail "$(cat "$LAUNCH_DIR/.failure" 2>/dev/null || echo "The thread session did not start")"
+  echo "Attach with: tmux attach -t $TMUX_NAME" >&2
+  echo "$RESULT"
+  exit 0
+fi
 
 MODEL_FLAG=""
 [[ -n "$MODEL" ]] && MODEL_FLAG=" --model '$MODEL'"

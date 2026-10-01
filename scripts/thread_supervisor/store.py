@@ -175,6 +175,12 @@ def update(db: sqlite3.Connection, thread_id: str, **fields) -> None:
     db.execute(f"UPDATE threads SET {columns} WHERE thread_id=?", (*fields.values(), thread_id))
 
 
+def held_ports(db: sqlite3.Connection, except_thread_id: str) -> set[int]:
+    """The ws_ports other threads' rows hold."""
+    return {row[0] for row in db.execute("SELECT ws_port FROM threads WHERE ws_port IS NOT NULL AND thread_id != ?",
+                                         (except_thread_id,))}
+
+
 def begin_boot(db: sqlite3.Connection, thread_id: str, resolved: dict) -> None:
     """Mark a thread `booting` with what its session runs with, and empty its
     boot buffer of any earlier attempt."""

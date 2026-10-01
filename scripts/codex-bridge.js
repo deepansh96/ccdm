@@ -74,7 +74,16 @@ const ROUTER_KEY_FILE = process.env.CCDM_ROUTER_KEY_FILE || "";
 const ROUTER_ROOT = process.env.CCDM_ROUTER_ROLE === "root";
 const ROOT_MULTI_CHANNEL = ROUTER_ROOT;
 const ROUTER_PROJECT = ROUTER_ROOT ? "" : process.env.CCDM_CODEX_PROJECT || "";
-const ROUTER_LAUNCH_DIR = path.join(routerPaths.stateDir(), "launches", ROUTER_ROOT ? ".root" : ROUTER_PROJECT);
+// Thread mode (start-thread-session.sh): the bridge serves one Thread
+// Conversation, CHANNEL_ID is that Discord thread, and it says hello as the
+// `thread` role. Its first turn is the Thread Supervisor's bootstrap
+// (CCDM_THREAD_BOOTSTRAP_FILE), in place of the READY instruction turn; live
+// events wait until the bootstrap exists (CCDM_THREAD_BOOT_TIMEOUT_S, 120 s by
+// default), and messages it already includes are dropped.
+const DISCORD_THREAD_ID = ROUTER_ROOT ? "" : process.env.CCDM_THREAD_ID || "";
+const THREAD_MODE = Boolean(DISCORD_THREAD_ID);
+const ROUTER_LAUNCH_DIR = path.join(routerPaths.stateDir(), "launches", ROUTER_ROOT ? ".root" : ROUTER_PROJECT,
+  ...(THREAD_MODE ? ["threads", DISCORD_THREAD_ID] : []));
 // The launcher waits on this file for the bridge's startup outcome.
 const LAUNCH_READY_FILE = process.env.CCDM_CHANNEL_READY_FILE || "";
 
@@ -100,8 +109,9 @@ let pendingCompactionChannelId = null;
 let messageQueue = [];
 let bridgePaused = false;
 const discordTransport = createRouterTransport({
-  project: ROUTER_PROJECT, role: ROUTER_ROOT ? "root" : "project", keyFile: ROUTER_KEY_FILE,
+  project: ROUTER_PROJECT, role: ROUTER_ROOT ? "root" : THREAD_MODE ? "thread" : "project", keyFile: ROUTER_KEY_FILE,
   launchDir: ROUTER_LAUNCH_DIR, registryPath: REGISTRY_PATH, primaryChannelId: CHANNEL_ID,
+  threadId: DISCORD_THREAD_ID || null,
 });
 let codexProcess = null;
 let typingInterval = null;
@@ -1414,6 +1424,7 @@ async function writeDiscordMcpConfig(mcpName) {
         CCDM_ROUTER_KEY_FILE: ROUTER_KEY_FILE,
         CCDM_ROUTER_STATE_DIR: routerPaths.stateDir(),
         ...(ROUTER_ROOT ? { CCDM_ROUTER_ROLE: "root" } : { CCDM_CODEX_PROJECT: ROUTER_PROJECT }),
+        ...(THREAD_MODE ? { CCDM_THREAD_ID: DISCORD_THREAD_ID, CCDM_THREAD_PROVIDER: "codex" } : {}),
         CHANNEL_ID,
         DISCORD_REPLY_TOKEN,
         CCDM_REMINDER_PROJECT_ROOT: ROOT_DIR,
@@ -1463,13 +1474,67 @@ async function initializeCodex() {
 
   const resumeThreadId = process.env.CODEX_RESUME_THREAD_ID || "";
   await startCodexThread(resumeThreadId);
-  await sendBootstrapInstructionTurn("startup", { required: true });
+  // A thread's first turn is its bootstrap, sent once the Router has its hello.
+  if (!THREAD_MODE) await sendBootstrapInstructionTurn("startup", { required: true });
   console.log(`Codex thread started: ${threadId}`);
+}
+
+// The supervisor writes the bootstrap once the Router has this bridge's hello.
+async function awaitThreadBootstrap() {
+  const file = process.env.CCDM_THREAD_BOOTSTRAP_FILE;
+  const timeoutS = Number(process.env.CCDM_THREAD_BOOT_TIMEOUT_S);
+  const deadline = Date.now() + (Number.isFinite(timeoutS) && timeoutS > 0 ? timeoutS : 120) * 1000;
+  while (file && Date.now() < deadline) {
+    try {
+      return JSON.parse(await readFile(file, "utf8"));
+    } catch { /* Not written yet. */ }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  console.error("No thread bootstrap arrived; handling live events without it");
+  return null;
+}
+
+// The bootstrap as the first turn's text: the transport instruction, the
+// preamble, the starter, and every message sent while the session booted, in
+// Discord order.
+function threadBootstrapText(bootstrap) {
+  const messages = Array.isArray(bootstrap.messages) ? bootstrap.messages : [];
+  const parts = [SYSTEM_INSTRUCTION, String(bootstrap.preamble || "")];
+  if (bootstrap.starter) parts.push(`The thread was started from this message:\n${bootstrap.starter}`);
+  if (messages.length) {
+    parts.push(["Messages sent in the thread so far:", ...messages.map((message) => {
+      const attachments = message.attachments?.length
+        ? ` [${message.attachments.length} attachment(s): ${message.attachments.map((att) => att.name).join(", ")}; download_attachment with message_id ${message.message_id}]`
+        : "";
+      return `[${message.ts}] ${message.author?.name ?? message.author?.id}: ${message.content}${attachments}`;
+    })].join("\n"));
+  }
+  return parts.filter(Boolean).join("\n\n");
+}
+
+// Live events held until the bootstrap is sent, as [kind, handler, event].
+let heldThreadEvents = THREAD_MODE ? [] : null;
+const holdUntilBootstrap = (kind, handler) => async (event) => {
+  if (heldThreadEvents) heldThreadEvents.push([kind, handler, event]);
+  else await handler(event);
+};
+
+async function startThreadConversation() {
+  const bootstrap = await awaitThreadBootstrap();
+  if (bootstrap) {
+    await sendTurn([{ type: "text", text: threadBootstrapText(bootstrap) }], projectChannelId);
+  } else {
+    await sendBootstrapInstructionTurn("thread");
+  }
+  const included = new Set(bootstrap?.included_message_ids ?? []);
+  const pending = heldThreadEvents.filter(([kind, , event]) => !(kind === "message" && included.has(event.id)));
+  heldThreadEvents = null;
+  for (const [, handler, event] of pending) await handler(event);
 }
 
 function startDiscordBot() {
   discordTransport.onScopeChange(applyProjectScope);
-  discordTransport.onReaction(async (event) => {
+  discordTransport.onReaction(holdUntilBootstrap("reaction", async (event) => {
     if (!(await shouldHandleDiscordReaction(event.channelId, event.user))) return;
     let reaction;
     try {
@@ -1510,9 +1575,9 @@ function startDiscordBot() {
       ? { id: lastOwnerInteraction.id, author: user, reminderAssignment: assignment, synthetic: true }
       : null;
     await routeInput(input, reactionSource, channelId, channelScopeToken);
-  });
+  }));
 
-  discordTransport.onMessage(async (msg) => {
+  discordTransport.onMessage(holdUntilBootstrap("message", async (msg) => {
     if (!msg.author.bot && isCloseCommand(msg.content)) {
       // Root management routing reserves /close in every registered project
       // channel, whichever provider serves it; a project bridge only its own.
@@ -1683,7 +1748,7 @@ function startDiscordBot() {
     console.log(`[discord] ${msg.author.username}: ${text || "(attachment)"} [${input.length} part(s)]`);
 
     await routeInput(input, msg, channelId, channelScopeToken);
-  });
+  }));
 
   void (async () => {
     try {
@@ -1694,7 +1759,9 @@ function startDiscordBot() {
       const channel = await discordTransport.fetchChannel(projectChannelId);
       if (!channel) throw new Error("Discord channel unavailable");
       console.log(`Listening in #${channel.name}`);
-      reportLaunchReady({ ok: true, scope: { channel_id: channel.id } });
+      reportLaunchReady({ ok: true, scope: { channel_id: channel.id },
+        ...(THREAD_MODE ? { provider_conversation_id: threadId } : {}) });
+      if (THREAD_MODE) startThreadConversation().catch((err) => console.error("Thread bootstrap failed:", err));
       if (ROOT_MULTI_CHANNEL) {
         console.log(`Root routing active for ${rootChannelAccess.size} configured channel(s)`);
       }
