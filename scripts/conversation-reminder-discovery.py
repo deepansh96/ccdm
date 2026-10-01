@@ -203,8 +203,9 @@ def next_request(db: sqlite3.Connection, usable: dict, now: datetime) -> dict | 
     if found is None:
         mode = "restart" if fresh_restart else "initial"
         db.execute("DELETE FROM discoveries WHERE project=? AND assignment_generation=?", (project, generation))
-        db.execute("""INSERT INTO discoveries (project,assignment_generation,phase,started_revision,summary_json)
-            VALUES (?,?,'backward',?,?)""", (project, generation, row["revision"],
+        db.execute("""INSERT INTO discoveries
+            (project,conversation_id,assignment_generation,phase,started_revision,summary_json)
+            VALUES (?,?,?,'backward',?,?)""", (project, row["conversation_id"], generation, row["revision"],
                                              json.dumps(_initial_summary(mode, row["last_ack_at"] if fresh_restart else None))))
         db.execute("UPDATE conversations SET reconciliation_status=? WHERE project=?",
                    ("reconciling" if fresh_restart else "discovering", project))
@@ -394,18 +395,21 @@ def _commit(db: sqlite3.Connection, row: sqlite3.Row, summary: dict, active_turn
         db.execute(f"UPDATE conversations SET {columns}, revision=revision+1 WHERE project=?",
                    (*changes.values(), row["project"]))
     for source in summary["owner_ids"]:
-        db.execute("INSERT OR IGNORE INTO owner_sources VALUES (?,?,?,?)",
-                   (row["project"], row["assignment_generation"], source, "history"))
-    mark_reactions_seen(db, row["project"], row["assignment_generation"], summary["reacted"])
+        db.execute("""INSERT OR IGNORE INTO owner_sources
+            (project,conversation_id,assignment_generation,source_message_id,kind) VALUES (?,?,?,?,?)""",
+                   (row["project"], row["conversation_id"], row["assignment_generation"], source, "history"))
+    mark_reactions_seen(db, row["project"], row["conversation_id"], row["assignment_generation"], summary["reacted"])
     db.execute("UPDATE conversations SET reconciliation_status='ready' WHERE project=?", (row["project"],))
     return basis
 
 
-def mark_reactions_seen(db: sqlite3.Connection, project: str, generation: str, reacted: list[dict]) -> None:
+def mark_reactions_seen(db: sqlite3.Connection, project: str, conversation: str, generation: str,
+                        reacted: list[dict]) -> None:
     """Remember owner reactions already accounted for, so a later restart does not re-pause on them."""
     for item in reacted:
-        db.execute("INSERT OR IGNORE INTO owner_sources VALUES (?,?,?,?)",
-                   (project, generation, "reaction:" + item["id"], "history-reaction"))
+        db.execute("""INSERT OR IGNORE INTO owner_sources
+            (project,conversation_id,assignment_generation,source_message_id,kind) VALUES (?,?,?,?,?)""",
+                   (project, conversation, generation, "reaction:" + item["id"], "history-reaction"))
 
 
 def status_for(db: sqlite3.Connection, project: str, generation: str) -> dict | None:

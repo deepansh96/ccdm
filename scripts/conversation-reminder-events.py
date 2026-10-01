@@ -32,6 +32,8 @@ ALLOWED_FIELDS = {
     "event_type",
     "project",
     "channel_id",
+    # Optional: the Project Conversation, defaulting to the channel's own.
+    "conversation_id",
     "bot_id",
     "assignment_generation",
     "provider",
@@ -223,6 +225,9 @@ def validate_event(event: object) -> dict:
     for field in ("event_id", "project", "channel_id", "bot_id", "assignment_generation", "provider", "adapter_instance_id"):
         if not isinstance(event.get(field), str) or not event[field].strip():
             raise ValueError(f"{field} must be a non-empty string")
+    if "conversation_id" in event and (not isinstance(event["conversation_id"], str)
+                                       or not event["conversation_id"].strip()):
+        raise ValueError("conversation_id must be a non-empty string")
     try:
         parsed_time = datetime.fromisoformat(str(event["event_time"]).replace("Z", "+00:00"))
     except ValueError as error:
