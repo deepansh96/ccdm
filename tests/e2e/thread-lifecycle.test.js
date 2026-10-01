@@ -18,8 +18,8 @@ test.afterEach(cleanup);
 // and CCDM channel server, with the fixture claude and tmux. Only Discord
 // thread events, messages and the fake audit log go in.
 const THREAD_ID = "1700000000000223344";
-// `<screen>-t-<last 6 of the thread id>`.
-const THREAD_TMUX = "demo_claude-t-223344";
+// `<screen>-t-<thread id>`.
+const THREAD_TMUX = `demo_claude-t-${THREAD_ID}`;
 const BOT_USER_ID = "fixture-bot-user-id";
 const THREAD = { id: THREAD_ID, type: 11, parentId: "demo-channel", name: "Fix flaky test", ownerId: OWNER_ID,
   autoArchiveDuration: 10080 };

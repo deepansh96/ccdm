@@ -20,8 +20,8 @@ test.afterEach(cleanup);
 // fixture claude and tmux. Only Discord inputs and threads.sh go in.
 // The fake gives the root bot's first created thread this id.
 const CREATED_THREAD_ID = "1600000000000000001";
-// `<screen>-t-<last 6 of the thread id>`.
-const CREATED_THREAD_TMUX = "demo_claude-t-000001";
+// `<screen>-t-<thread id>`.
+const CREATED_THREAD_TMUX = `demo_claude-t-${CREATED_THREAD_ID}`;
 const ROOT_AUTH = `Bot ${ROOT_TOKEN}`;
 const BOT_USER_ID = "fixture-bot-user-id";
 
@@ -362,9 +362,9 @@ test("a Codex channel session's create_thread through the Discord MCP creates th
 // In-thread management commands: each affects only its own thread. Two
 // user-created threads under `demo`, beside its Channel Conversation.
 const THREAD_ID = "1700000000000223344";
-const THREAD_TMUX = "demo_claude-t-223344";
+const THREAD_TMUX = `demo_claude-t-${THREAD_ID}`;
 const SIBLING_ID = "1700000000000556677";
-const SIBLING_TMUX = "demo_claude-t-556677";
+const SIBLING_TMUX = `demo_claude-t-${SIBLING_ID}`;
 const CHANNEL_TMUX = "demo_claude";
 const userThread = id => ({ id, type: 11, parentId: "demo-channel", name: `thread ${id.slice(-6)}`, ownerId: OWNER_ID,
   autoArchiveDuration: 10080 });

@@ -18,9 +18,9 @@ test.afterEach(cleanup);
 // start-thread-session.sh and CCDM channel server, with the fixture claude
 // and tmux. Registry edits, Discord inputs and the session scripts go in.
 const THREAD_ID = "1700000000000410001";
-const THREAD_TMUX = "demo_claude-t-410001";
+const THREAD_TMUX = `demo_claude-t-${THREAD_ID}`;
 const SIBLING_ID = "1700000000000410002";
-const SIBLING_TMUX = "demo_claude-t-410002";
+const SIBLING_TMUX = `demo_claude-t-${SIBLING_ID}`;
 const CHANNEL_TMUX = "demo_claude";
 const OWNER = { id: OWNER_ID, username: "Owner" };
 const GUEST = { id: "guest-id", username: "Guest" };
@@ -156,6 +156,30 @@ test("moving a project's channel stops its thread sessions and closes them as pr
   assert.deepEqual([row.state, row.stop_reason, row.close_reason], ["closed", null, "project-moved"]);
   await gone(workspace, threadPid, THREAD_TMUX);
   assert.deepEqual(mutations(workspace), before);
+});
+
+test("a channel move while the supervisor was down closes the project's threads as project-moved on its next start", async () => {
+  const workspace = changesWorkspace();
+  const { router, supervisor } = await supervised(workspace);
+  const threadPid = await liveThread(workspace, THREAD_ID);
+  updateState(workspace.stateDir, state => {
+    state.fixtures.discord.injectedThreads.push({ id: SIBLING_ID, type: 11, parentId: "demo-channel",
+      name: "idle sibling", ownerId: OWNER_ID, autoArchiveDuration: 10080, event: "create" });
+  });
+  await threadRow(workspace, SIBLING_ID);
+  assert.equal((await supervisor.stop()).exitCode, 0);
+
+  await changeRegistry(workspace, router, registry => {
+    registry.projects.demo.channel_id = "moved-channel";
+  });
+  await startThreadSupervisor(workspace);
+
+  for (const threadId of [THREAD_ID, SIBLING_ID]) {
+    const row = await threadRow(workspace, threadId, current => current.state === "closed");
+    assert.deepEqual([row.state, row.stop_reason, row.close_reason], ["closed", null, "project-moved"]);
+  }
+  await gone(workspace, threadPid, THREAD_TMUX);
+  assert.equal(threadLaunches(workspace, SIBLING_ID).length, 0);
 });
 
 test("a project whose path becomes remote: has its thread sessions stopped and its threads closed as project-moved", async () => {

@@ -21,8 +21,8 @@ test.afterEach(cleanup);
 // recorded Discord REST calls, the app-server's protocol messages and the
 // supervisor CLI come out.
 const THREAD_ID = "1700000000000654321";
-// `<screen>-t-<last 6 of the thread id>`.
-const THREAD_TMUX = "demo_claude-t-654321";
+// `<screen>-t-<thread id>`.
+const THREAD_TMUX = `demo_claude-t-${THREAD_ID}`;
 const CODEX_THREAD_UUID = "0199a5c4-7e1b-7c3d-9f2a-4b8e6d1c3a57";
 const ROOT_AUTH = `Bot ${ROOT_TOKEN}`;
 const BOT_USER_ID = "fixture-bot-user-id";

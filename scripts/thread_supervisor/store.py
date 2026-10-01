@@ -29,10 +29,11 @@ def _one_of(column: str, values: tuple[str, ...], nullable: bool = False) -> str
 
 # One row per bound thread. Override columns are null when the thread inherits
 # the project's setting; `resolved_*` hold what its session runs with.
-# A queued row's `queued_start` holds the trigger and starter it starts with (JSON).
+# `parent_channel_id` is the project channel it was bound under, and a queued
+# row's `queued_start` holds the trigger and starter it starts with (JSON).
 TABLES = {
     "threads": f"""thread_id TEXT PRIMARY KEY, project TEXT NOT NULL, name TEXT NOT NULL,
-        creator_id TEXT NOT NULL, starter_message_id TEXT, created_at TEXT NOT NULL,
+        creator_id TEXT NOT NULL, starter_message_id TEXT, parent_channel_id TEXT, created_at TEXT NOT NULL,
         provider TEXT, account TEXT, model TEXT, effort TEXT,
         resolved_provider TEXT, resolved_account TEXT, resolved_model TEXT, resolved_effort TEXT,
         provider_conversation_id TEXT, provider_home TEXT,
@@ -52,7 +53,7 @@ TABLES = {
         received_at TEXT NOT NULL, PRIMARY KEY(thread_id, message_id)""",
 }
 COLUMNS = {
-    "threads": {"thread_id", "project", "name", "creator_id", "starter_message_id", "created_at",
+    "threads": {"thread_id", "project", "name", "creator_id", "starter_message_id", "parent_channel_id", "created_at",
                 "provider", "account", "model", "effort",
                 "resolved_provider", "resolved_account", "resolved_model", "resolved_effort",
                 "provider_conversation_id", "provider_home", "state", "stop_reason", "close_reason",
@@ -214,7 +215,7 @@ def update_request(db: sqlite3.Connection, request_id: str, **fields) -> None:
 
 
 def bind(db: sqlite3.Connection, thread_id: str, project: str, name: str, creator_id: str, created_at: str,
-         request: sqlite3.Row | None = None) -> bool:
+         request: sqlite3.Row | None = None, parent_channel_id: str | None = None) -> bool:
     """Insert a registered thread; False when the thread is already bound. A
     thread fulfilling a creation ``request`` takes its overrides, and the
     request is marked fulfilled in the same transaction."""
@@ -224,9 +225,9 @@ def bind(db: sqlite3.Connection, thread_id: str, project: str, name: str, creato
         if thread(db, thread_id):
             db.execute("COMMIT")
             return False
-        db.execute("""INSERT INTO threads (thread_id, project, name, creator_id, created_at,
-            provider, account, model, effort, state) VALUES (?,?,?,?,?,?,?,?,?,'registered')""",
-                   (thread_id, project, name, creator_id, created_at,
+        db.execute("""INSERT INTO threads (thread_id, project, name, creator_id, parent_channel_id, created_at,
+            provider, account, model, effort, state) VALUES (?,?,?,?,?,?,?,?,?,?,'registered')""",
+                   (thread_id, project, name, creator_id, parent_channel_id, created_at,
                     *(overrides.get(field) for field in OVERRIDES)))
         if request:
             db.execute("UPDATE creation_requests SET status='fulfilled', thread_id=? WHERE request_id=?",

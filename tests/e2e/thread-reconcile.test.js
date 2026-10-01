@@ -25,8 +25,8 @@ const EYES = encodeURIComponent("👀");
 
 const thread = (id, fields = {}) => ({ id, type: 11, parentId: "demo-channel", name: `Task ${id.slice(-4)}`,
   ownerId: OWNER_ID, autoArchiveDuration: 10080, ...fields });
-// `<screen>-t-<last 6 of the thread id>`.
-const tmuxName = threadId => `demo_claude-t-${threadId.slice(-6)}`;
+// `<screen>-t-<thread id>`.
+const tmuxName = threadId => `demo_claude-t-${threadId}`;
 
 function reconcileWorkspace() {
   const workspace = createRouterWorkspace({ ...routerRegistry({

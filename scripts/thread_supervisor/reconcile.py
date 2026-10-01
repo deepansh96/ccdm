@@ -2,8 +2,9 @@
 Router reconnect, or a Gateway resume.
 
 It runs on each Router connection (worker start and every reconnect) and on
-`gateway_resumed`. A `booting` or `live` row whose process is gone is
-`stopped/crashed`. `thread_list` (active threads, and threads archived in the
+`gateway_resumed`. Project changes come first, so a thread whose project's
+channel moved meanwhile is `closed/project-moved` and never started. A
+`booting` or `live` row whose process is gone is `stopped/crashed`. `thread_list` (active threads, and threads archived in the
 last 7 days) then binds unknown active threads under the normal binding
 rules, and classifies archives the supervisor missed through the archive-actor
 lookup. A thread is started only when `thread_history` shows its newest owner
@@ -20,7 +21,7 @@ from datetime import datetime
 import sys
 import time
 
-from . import binding, boot, lifecycle, store
+from . import binding, boot, lifecycle, projects, store
 from .clock import now
 from .link import LinkError
 
@@ -40,6 +41,8 @@ def _log(message: str) -> None:
 
 
 def reconcile(context, _event: dict | None = None) -> None:
+    # Project changes first: a thread whose channel moved meanwhile is closed, never started.
+    projects.on_registry(context)
     _mark_crashed(context)
     try:
         listed = context.link.call("thread_list", {"archived_within_days": ARCHIVED_WITHIN_DAYS}) or {}
@@ -77,7 +80,8 @@ def _reconcile_thread(context, thread: dict) -> None:
         return
     if row is None:
         binding.on_thread_create(context, {"project": project, "thread_id": thread_id, "name": thread.get("name"),
-                                           "owner_id": thread.get("owner_id")})
+                                           "owner_id": thread.get("owner_id"),
+                                           "parent_channel_id": thread.get("parent_id")})
         row = store.thread(context.db, thread_id)
         if row is None:
             return

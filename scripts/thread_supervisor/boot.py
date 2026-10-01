@@ -199,7 +199,10 @@ def start(context, row, trigger: dict | None, starter: str | None = None, backlo
         store.buffer_message(context.db, thread_id, message["message_id"], _payload(message), now())
     _react(context, thread_id, trigger_id)
     if starter is None:
-        starter = _starter(context, row, trigger.get("parent_channel_id") if trigger else None)
+        # The parent's starter message goes only into a conversation's first
+        # boot; a resumed conversation already has it.
+        starter = "" if row["provider_conversation_id"] else _starter(
+            context, row, (trigger or {}).get("parent_channel_id") or row["parent_channel_id"])
     boot = Boot(next(_boot_ids), project, trigger_id, starter)
     context.boots[thread_id] = boot
     args = [str(LAUNCHER), project, thread_id, "--provider", resolved["provider"]]

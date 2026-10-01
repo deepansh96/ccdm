@@ -8,7 +8,7 @@
 # This is intended for root-agent relay commands from Discord project channels.
 # A target that is no project name or registered channel id goes through
 # scripts/conversation-resolver.js; a thread's command goes to the thread's
-# own tmux session, `<screen>-t-<last 6 of the thread id>`. Exits 2 with the
+# own tmux session, `<screen>-t-<thread id>`. Exits 2 with the
 # resolver's reason when it cannot name the target.
 
 set -euo pipefail
@@ -133,7 +133,7 @@ if not screen_name:
 
 print("\t".join([
     project_name,
-    f"{screen_name}-t-{thread_id[-6:]}" if thread_id else screen_name,
+    f"{screen_name}-t-{thread_id}" if thread_id else screen_name,
     project.get("type", "claude"),
     os.path.expanduser(project.get("path", "")),
     str(project.get("channel_id", "")),

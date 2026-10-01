@@ -22,7 +22,7 @@ const PAUSED = "Paused to free a session slot; send a message here to resume.";
 // The production 30-minute idle threshold, cut to nothing for the tests.
 const NO_IDLE_WAIT = { CCDM_THREAD_IDLE_S: "0", CCDM_THREAD_ARCHIVE_POLL_WINDOW_S: "1",
   CCDM_THREAD_ARCHIVE_POLL_INTERVAL_S: "0.2" };
-// Distinct last six digits give each thread its own tmux session.
+// Each thread runs in its own tmux session, `<screen>-t-<thread id>`.
 const THREADS = {
   a: { id: "1700000000000100001", name: "Thread A" },
   b: { id: "1700000000000100002", name: "Thread B" },
@@ -324,4 +324,21 @@ test("a queued creation request keeps its first message across a supervisor rest
     () => "the queued thread's bootstrap", 20000);
   const bootstrap = claude(workspace).channelNotifications.find(n => n.meta.chat_id === created.id);
   assert.match(bootstrap.content, /please look at the flaky parser test/);
+});
+
+test("two threads whose ids share their last six digits each run in their own tmux session", async () => {
+  const workspace = capacityWorkspace();
+  await supervised(workspace);
+  const first = { id: "1700000000000900001", name: "First" };
+  const second = { id: "1700000000001900001", name: "Second" };
+  await liveClaudeThread(workspace, first);
+  await liveClaudeThread(workspace, second);
+
+  const sessions = readState(workspace.stateDir).fixtures.tmux.sessions;
+  assert.ok(sessions[`demo_claude-t-${first.id}`], JSON.stringify(Object.keys(sessions)));
+  assert.ok(sessions[`demo_claude-t-${second.id}`], JSON.stringify(Object.keys(sessions)));
+  for (const thread of [first, second]) {
+    assert.equal((await threadRow(workspace, thread)).state, "live");
+    assert.deepEqual(notices(workspace, thread), []);
+  }
 });

@@ -18,9 +18,9 @@ test.afterEach(cleanup);
 // fixture claude and tmux. Discord inputs, the conversation resolver CLI and
 // threads.sh go in.
 const THREAD_ID = "1700000000000610001";
-const THREAD_TMUX = "demo_claude-t-610001";
+const THREAD_TMUX = `demo_claude-t-${THREAD_ID}`;
 const SIBLING_ID = "1700000000000610002";
-const SIBLING_TMUX = "demo_claude-t-610002";
+const SIBLING_TMUX = `demo_claude-t-${SIBLING_ID}`;
 const BETA_THREAD_ID = "1700000000000610003";
 const ROOT_AUTH = `Bot ${ROOT_TOKEN}`;
 const OWNER = { id: OWNER_ID, username: "Owner" };

@@ -17,8 +17,8 @@ test.afterEach(cleanup);
 // server and the fixture claude and tmux, and the Conversation Reminder
 // service. Only Discord messages, thread events and the reminder clock go in.
 const THREAD_ID = "1700000000000556677";
-// `<screen>-t-<last 6 of the thread id>`.
-const THREAD_TMUX = "demo_claude-t-556677";
+// `<screen>-t-<thread id>`.
+const THREAD_TMUX = `demo_claude-t-${THREAD_ID}`;
 const ROOT_AUTH = `Bot ${ROOT_TOKEN}`;
 const owner = { id: OWNER_ID, username: "Owner" };
 

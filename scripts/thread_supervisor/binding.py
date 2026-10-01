@@ -26,8 +26,11 @@ def on_thread_create(context, event: dict) -> None:
     if store.thread(context.db, thread_id):
         return
     current = registry.load(context.project_root)
-    if not registry.project(current, project):
+    entry = registry.project(current, project)
+    if not entry:
         return
+    # The channel the thread is bound under, to tell a later channel move.
+    parent = event.get("parent_channel_id") or entry.get("channel_id")
     request = None
     if creator != registry.owner_id(current) and creator not in registry.guests(current, project):
         if not context.bot_user_id or creator != context.bot_user_id:
@@ -35,11 +38,12 @@ def on_thread_create(context, event: dict) -> None:
         request = store.pending_request(context.db, project, name, thread_id)
         if not request:
             return
-    if not store.bind(context.db, thread_id, project, name, creator, now(), request):
+    if not store.bind(context.db, thread_id, project, name, creator, now(), request,
+                      str(parent) if parent else None):
         return
     if request is not None:
         row = store.thread(context.db, thread_id)
-        resolved = registry.resolved_settings(registry.project(current, project), row)
+        resolved = registry.resolved_settings(entry, row)
         store.update(context.db, thread_id, **{f"resolved_{field}": value for field, value in resolved.items()})
         if request["first_message"]:
             boot.start(context, store.thread(context.db, thread_id), None, starter=request["first_message"])

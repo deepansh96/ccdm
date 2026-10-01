@@ -8,9 +8,9 @@
 #
 # Each launch writes a fresh key, keys/.thread-<thread_id>.key, and a launch
 # directory, launches/<project>/threads/<thread_id>/, and runs in tmux
-# `<screen>-t-<last 6 of the thread id>`. A launch is refused while a process
-# still carries that key path; a failed launch removes its key, launch
-# directory and tmux session, unless a newer launch of the thread has replaced its launch token
+# `<screen>-t-<thread id>`. A launch is refused while a process still carries
+# that key path; a failed launch removes its key, launch directory and tmux
+# session, unless a newer launch of the thread has replaced its launch token
 # (launches/.../.launch-token), when they are that launch's and stay. CCDM_THREAD_BOOTSTRAP_FILE, from the supervisor,
 # names the bootstrap file the channel server (or Codex bridge) waits for.
 # The session's adapter keeps the launch directory's activity.json
@@ -199,7 +199,7 @@ fi
 ROUTER_STATE="${CCDM_ROUTER_STATE_DIR:-$HOME/.local/state/ccdm/router}"
 KEY_FILE="$ROUTER_STATE/keys/.thread-$THREAD_ID.key"
 LAUNCH_DIR="$ROUTER_STATE/launches/$PROJECT/threads/$THREAD_ID"
-TMUX_NAME="$SCREEN_NAME-t-${THREAD_ID[-6,-1]}"
+TMUX_NAME="$SCREEN_NAME-t-$THREAD_ID"
 # This launch's token: cleanup only removes files the token still marks as this launch's.
 LAUNCH_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
 

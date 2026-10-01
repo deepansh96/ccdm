@@ -34,8 +34,8 @@ Created threads use a one-week archive duration (`auto_archive_duration: 10080`)
 The session starts on the first owner or guest message, or at once when a first message was given:
 
 1. 👀 shows on the triggering message while the session boots.
-2. The supervisor runs `scripts/start-thread-session.sh <project> <thread_id> --provider …` with a fresh `keys/.thread-<thread_id>.key`, the launch dir `launches/<project>/threads/<thread_id>/`, and tmux `<screen>-t-<last 6 of the thread id>`.
-3. Every message sent during boot is delivered exactly once, in the first prompt, together with the starter.
+2. The supervisor runs `scripts/start-thread-session.sh <project> <thread_id> --provider …` with a fresh `keys/.thread-<thread_id>.key`, the launch dir `launches/<project>/threads/<thread_id>/`, and tmux `<screen>-t-<thread_id>`.
+3. Every message sent during boot is delivered exactly once, in the first prompt, together with the starter. The starter goes only into a conversation's first boot; a resume does not repeat it.
 4. 👀 is removed when the session is live. A failed start posts a one-line reason and is not retried automatically; the next eligible message retries.
 
 A stop that arrives while the launcher still runs (an archive, a delete, `/restart`, `/clear`, `/close`, an applied `/config`, a project change, or an operator stop) waits for the launcher to exit, so it never races the launch.
@@ -83,7 +83,7 @@ A live session that dies while the supervisor runs is marked `crashed` as soon a
 ## Project changes
 
 - **Deregistration:** stops each thread session and closes the thread (`closed/deregistered`).
-- **Channel move:** closes the threads (`closed/project-moved`), because the moved webhook cannot post into the old channel's threads.
+- **Channel move:** closes the threads (`closed/project-moved`), because the moved webhook cannot post into the old channel's threads. Each thread remembers the channel it was bound under, so a move made while the supervisor was down closes them on its next start.
 - **Path set to `remote:`:** the project now runs on another machine, which has no thread sessions, so its threads close the same way (`closed/project-moved`).
 - **Guest changes:** apply on the next message.
 - **Channel maintenance:** `restart <project>`, `start-session.sh <project>`, `stop-session.sh <project>` and a project key rotation act on the Channel Conversation only. `stop-session.sh <project> --threads` stops the thread sessions only, and `--all` stops both.

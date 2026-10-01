@@ -80,7 +80,7 @@ def sweep(project_root, state_dir, project: str) -> list[str]:
         key_file = lifecycle.key_path(thread_id)
         running = lifecycle.session_running(thread_id)
         lifecycle.kill_listeners(key_file)
-        names = {tmux.get(thread_id), f"{screen}-t-{thread_id[-6:]}" if screen else None} - {None}
+        names = {tmux.get(thread_id), f"{screen}-t-{thread_id}" if screen else None} - {None}
         for name in names:
             subprocess.run(["tmux", "kill-session", "-t", f"={name}"], capture_output=True)
         key_file.unlink(missing_ok=True)

@@ -539,7 +539,7 @@ test("a reminder posted into an auto-archived thread reopens it without starting
   const row = await supervisedThread(workspace, THREAD_A);
   assert.deepEqual([row.state, row.stop_reason], ["stopped", "auto-archive"]);
   assert.equal(readState(workspace.stateDir).fixtures.claude.channelServers.length, launched);
-  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions["demo_claude-t-111111"], undefined);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions[`demo_claude-t-${THREAD_A}`], undefined);
   await stop();
 });
 

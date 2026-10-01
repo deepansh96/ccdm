@@ -19,8 +19,8 @@ test.afterEach(cleanup);
 // fixture claude and tmux. Only Discord inputs go in; recorded Discord REST
 // calls, Claude channel notifications and the supervisor CLI come out.
 const THREAD_ID = "1700000000000123456";
-// `<screen>-t-<last 6 of the thread id>`.
-const THREAD_TMUX = "demo_claude-t-123456";
+// `<screen>-t-<thread id>`.
+const THREAD_TMUX = `demo_claude-t-${THREAD_ID}`;
 const ROOT_AUTH = `Bot ${ROOT_TOKEN}`;
 const BOT_USER_ID = "fixture-bot-user-id";
 const EYES = encodeURIComponent("👀");
@@ -397,4 +397,38 @@ test("a failed launch's cleanup leaves the key and launch dir a newer launch of 
   assert.match(result.stderr, /Leaving thread 1700000000000123456's launch files to its newer launch/);
   assert.equal(fs.readFileSync(keyFile, "utf8"), "newer-key\n");
   assert.equal(fs.readFileSync(path.join(launchDir, ".launch-token"), "utf8"), "newer-launch\n");
+});
+
+test("a resumed session's bootstrap carries the message that resumed it but not the thread's starter again", async () => {
+  const workspace = threadWorkspace();
+  updateState(workspace.stateDir, state => {
+    state.fixtures.discord.history = { "demo-channel": [{ id: THREAD_ID, content: "The parser drops trailing commas",
+      author: { id: OWNER_ID, username: "Owner" } }] };
+  });
+  await supervised(workspace);
+  createThread(workspace);
+  await threadRow(workspace);
+  threadMessage(workspace, "boot-message-1", "please fix the parser");
+  const live = await threadRow(workspace, row => row.state === "live" && row.provider_conversation_id != null);
+  await waitFor(() => notifications(workspace).length === 1 && threadPosts(workspace).length === 1,
+    () => "the bootstrap and its reply", 15000);
+  assert.equal(occurrences(notifications(workspace)[0].content, "The parser drops trailing commas"), 1);
+
+  // An inactivity archive stops the session; the next owner message resumes it.
+  updateState(workspace.stateDir, state => {
+    state.fixtures.discord.injectedThreads.push({ id: THREAD_ID, type: 11, parentId: "demo-channel",
+      name: "Fix flaky test", ownerId: OWNER_ID, autoArchiveDuration: 1440, event: "update", archived: true,
+      previous: { id: THREAD_ID, archived: false } });
+  });
+  await threadRow(workspace, row => row.state === "stopped");
+  const transcripts = path.join(workspace.homeDir, ".claude", "projects", workspace.tmpDir.replace(/[^A-Za-z0-9]/g, "-"));
+  fs.mkdirSync(transcripts, { recursive: true });
+  fs.writeFileSync(path.join(transcripts, `${live.provider_conversation_id}.jsonl`), "{}\n");
+  threadMessage(workspace, "resume-message-1", "picking this back up");
+
+  await threadRow(workspace, row => row.state === "live");
+  await waitFor(() => notifications(workspace).length === 2, () => "the resumed bootstrap", 15000);
+  const resumed = notifications(workspace)[1].content;
+  assert.equal(occurrences(resumed, "picking this back up"), 1, resumed);
+  assert.equal(occurrences(resumed, "The parser drops trailing commas"), 0, resumed);
 });
