@@ -287,3 +287,32 @@ test("a Router restart (link reconnect) runs the same reconcile", async () => {
   await waitFor(() => notifications(workspace, missed.id).length === 1, () => "the bootstrap", 15000);
   assert.equal(occurrences(notifications(workspace, missed.id)[0].content, "look at the flaky test"), 1);
 });
+
+test("a session that crashes while the supervisor runs is stopped/crashed, and the next owner message resumes it", async () => {
+  const workspace = reconcileWorkspace();
+  await supervised(workspace);
+  const raw = thread("1700000000000370001");
+  await liveThread(workspace, raw);
+  const conversationId = (await threadRows(workspace))[raw.id].provider_conversation_id;
+
+  const { pid } = readState(workspace.stateDir).fixtures.tmux.sessions[tmuxName(raw.id)];
+  process.kill(-pid, "SIGKILL");
+  await disconnected(workspace, raw.id);
+  const crashed = await threadRow(workspace, raw.id, current => current.state === "stopped");
+  assert.deepEqual([crashed.state, crashed.stop_reason], ["stopped", "crashed"]);
+  // Claude keeps the transcript at <home>/projects/<cwd, non-alphanumerics as "-">/<id>.jsonl.
+  const transcripts = path.join(workspace.homeDir, ".claude", "projects", workspace.tmpDir.replace(/[^A-Za-z0-9]/g, "-"));
+  fs.mkdirSync(transcripts, { recursive: true });
+  fs.writeFileSync(path.join(transcripts, `${conversationId}.jsonl`), "{}\n");
+
+  threadMessage(workspace, raw.id, "after-crash", "are you still there?");
+
+  const row = await threadRow(workspace, raw.id, current => current.state === "live");
+  assert.equal(row.provider_conversation_id, conversationId);
+  await waitFor(() => threadPosts(workspace, raw.id).length === 2, () => "the resumed session's reply", 15000);
+  const invocations = claude(workspace).invocations;
+  assert.equal(invocations.length, 2);
+  assert.equal(invocations[1].args[invocations[1].args.indexOf("--resume") + 1].replace(/^'|'$/g, ""), conversationId);
+  assert.ok(notifications(workspace, raw.id).some(notification =>
+    String(notification.content).includes("are you still there?")), "the resumed bootstrap carries the message");
+});

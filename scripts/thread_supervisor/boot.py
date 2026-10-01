@@ -14,7 +14,9 @@ A Codex thread is first given its own app-server port, recorded on the row.
 A thread created with a first message starts at once, with no trigger
 message (so no 👀) and that message as its starter. Every start is admitted
 through its provider's session cap first; a queued thread buffers its
-messages until the queue starts it.
+messages until the queue starts it. A live session the Router loses
+(`thread_session_revoked`, other than `replaced`) is `stopped/crashed`, so the
+next eligible message resumes it.
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ import subprocess
 import sys
 import threading
 
-from . import capacity, ports, registry, store
+from . import capacity, lifecycle, ports, registry, store
 from .clock import now
 from .link import LinkError
 from .paths import router_state_dir, write_private
@@ -239,6 +241,23 @@ def on_session_live(context, event: dict) -> None:
     if boot.launched:
         drop(context, thread_id)
     _react(context, thread_id, boot.trigger_message_id, remove=True)
+
+
+def on_session_revoked(context, event: dict) -> None:
+    """A live thread session the Router lost (it crashed, exited, or its key
+    changed) is `stopped/crashed`, freeing its slot, so the next eligible
+    message starts it again. A revocation for a session a newer hello
+    `replaced`, or while a newer launch runs, is the old session's and changes
+    nothing; neither does one for a row that is not live."""
+    thread_id = event.get("thread_id")
+    if not isinstance(thread_id, str) or event.get("reason") == "replaced" or thread_id in context.boots:
+        return
+    row = store.thread(context.db, thread_id)
+    if not row or row["project"] != event.get("project") or row["state"] != "live":
+        return
+    _log(f"thread {thread_id}: the Router lost its session ({event.get('reason')}); marking it crashed")
+    lifecycle.stop_session(context, row)
+    store.finish_boot(context.db, thread_id, "stopped", "crashed")
 
 
 def on_launch_exit(context, frame: dict) -> None:

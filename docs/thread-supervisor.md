@@ -76,7 +76,7 @@ While the supervisor is down, a thread message with no live session gets 💤. T
 - it marks dead sessions `crashed`;
 - it starts only threads whose newest owner message is newer than the last agent reply, with the undelivered messages in the bootstrap.
 
-Crashed, failed and operator-stopped sessions never restart automatically.
+A live session that dies while the supervisor runs is marked `crashed` as soon as the Router reports it gone, which frees its slot. Crashed, failed and operator-stopped sessions never restart automatically; the next owner or guest message resumes them.
 
 ## Project changes
 

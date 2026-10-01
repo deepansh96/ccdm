@@ -19,6 +19,7 @@ HANDLERS = {
     "thread_message": boot.on_thread_message,
     "thread_reaction": config.on_thread_reaction,
     "thread_session_live": boot.on_session_live,
+    "thread_session_revoked": boot.on_session_revoked,
     "thread_update": lifecycle.on_thread_update,
 }
 # Frames the worker posts itself, never the Router.
