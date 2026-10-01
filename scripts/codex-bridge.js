@@ -1398,7 +1398,7 @@ const isForeignDiscordMcp = (name) => Boolean(name) && name.startsWith("discord-
 async function registerDiscordMcp() {
   const mcpName = DISCORD_MCP_NAME;
 
-  // Many bridges share a Codex Home, so the delete-write-reload sequence runs
+  // Many bridges share a Codex Home, so the remove-write-reload sequence runs
   // under a lock on its config (the registry lock protocol, which
   // start-codex-session.sh's stripping also takes): an app-server reloading
   // between a sibling's write and the sibling's own reload would load the
@@ -1410,7 +1410,7 @@ async function registerDiscordMcp() {
       const loaded = (await listMcpServers()).map((s) => s.name || s.id);
       const stale = new Set([...loaded, ...await configuredDiscordMcpNames()].filter(isForeignDiscordMcp));
       for (const name of stale) {
-        await configRequest("config/value/delete", { keyPath: `mcp_servers.${name}` });
+        await removeMcpServerConfig(name);
         console.log(`Removed stale MCP server: ${name}`);
       }
     } catch (err) {
@@ -1443,6 +1443,13 @@ async function registerDiscordMcp() {
     await new Promise((resolve) => setTimeout(resolve, 100));
   } while (Date.now() < deadline);
   throw new Error(`Discord MCP ${mcpName} did not expose the reply tool before startup deadline`);
+}
+
+// The app-server has no delete method (`config/value/delete` is an unknown
+// variant): a `replace` write of null removes the key, here the whole
+// `[mcp_servers.<name>]` table with its `.env` subtable.
+async function removeMcpServerConfig(name) {
+  await configRequest("config/value/write", { keyPath: `mcp_servers.${name}`, mergeStrategy: "replace", value: null });
 }
 
 async function writeDiscordMcpConfig(mcpName) {

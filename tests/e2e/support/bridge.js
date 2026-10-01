@@ -290,33 +290,40 @@ export async function startFakeCodexServer(workspace, options = {}) {
             ],
           });
           break;
-        case "config/value/delete":
-          if (options.failStaleMcpRemoval && String(message.params?.keyPath ?? "").includes(options.staleMcpName ?? "discord-")) {
-            replyError({ code: -32000, message: options.failStaleMcpRemoval });
+        case "config/value/write": {
+          // As the real app-server: a `replace` write of null removes the
+          // key (an MCP server's whole table); there is no delete method.
+          const keyPath = String(message.params?.keyPath ?? "");
+          const mcpName = keyPath.startsWith("mcp_servers.") ? keyPath.slice("mcp_servers.".length) : null;
+          if (message.params?.value === null) {
+            if (message.params?.mergeStrategy !== "replace") {
+              replyError({ code: -32600, message: "null value requires mergeStrategy replace" });
+              break;
+            }
+            if (options.failStaleMcpRemoval && keyPath.includes(options.staleMcpName ?? "discord-")) {
+              replyError({ code: -32000, message: options.failStaleMcpRemoval });
+              break;
+            }
+            if (options.staleMcpName && mcpName === options.staleMcpName) staleDeleted = true;
+            if (codexHome && mcpName) writeCodexConfig(codexHome, withoutMcpSection(readCodexConfig(codexHome), mcpName));
+            setTimeout(() => reply({}), configDelayMs);
             break;
           }
-          if (options.staleMcpName && message.params?.keyPath === `mcp_servers.${options.staleMcpName}`) staleDeleted = true;
-          if (codexHome && message.params?.keyPath?.startsWith("mcp_servers.")) {
-            writeCodexConfig(codexHome, withoutMcpSection(readCodexConfig(codexHome), message.params.keyPath.slice("mcp_servers.".length)));
-          }
-          setTimeout(() => reply({}), configDelayMs);
-          break;
-        case "config/value/write":
-          if (message.params?.keyPath?.startsWith("mcp_servers.")) {
-            registeredMcpName = message.params.keyPath.slice("mcp_servers.".length);
+          if (mcpName) {
+            registeredMcpName = mcpName;
             registeredMcpConfig = message.params.value;
           }
           if (options.failMcpRegistration) {
             replyError({ code: -32000, message: options.failMcpRegistration });
             break;
           }
-          if (codexHome && message.params?.keyPath?.startsWith("mcp_servers.")) {
-            const name = message.params.keyPath.slice("mcp_servers.".length);
-            const rest = withoutMcpSection(readCodexConfig(codexHome), name).replace(/\n*$/, "");
-            writeCodexConfig(codexHome, `${rest ? `${rest}\n\n` : ""}${mcpSection(name, message.params.value)}`);
+          if (codexHome && mcpName) {
+            const rest = withoutMcpSection(readCodexConfig(codexHome), mcpName).replace(/\n*$/, "");
+            writeCodexConfig(codexHome, `${rest ? `${rest}\n\n` : ""}${mcpSection(mcpName, message.params.value)}`);
           }
           setTimeout(() => reply({}), configDelayMs);
           break;
+        }
         case "config/mcpServer/reload":
           // \`hangMcpReloadAfter: n\`: every reload after the first n never answers.
           mcpReloadCount += 1;
@@ -508,7 +515,9 @@ export async function startFakeCodexServer(workspace, options = {}) {
           reply({});
           break;
         default:
-          reply({});
+          // A Contract-Checking Fake: a method the real app-server lacks (such
+          // as `config/value/delete`) fails as it does there.
+          replyError({ code: -32600, message: `Invalid request: unknown variant \`${message.method}\`` });
       }
     });
   });
