@@ -174,7 +174,7 @@ test("project names Discord would refuse get a sanitized username that keeps the
   const discord = readState(workspace.stateDir).fixtures.discord;
   assert.deepEqual(discord.webhookRejections ?? [], []);
   assert.deepEqual(discord.messages.map(message => message.username), [
-    "d‍iscord-root-agent-claude · 42%",
+    "dc-root-agent-claude · 42%",
     `${"a".repeat(69)}-codex · 7%`,
   ]);
 });
