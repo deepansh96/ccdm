@@ -12,6 +12,7 @@
 //   client.on("scope_changed", scope => ...);  // the Router moved this session
 //   client.on("disconnect" | "reconnect" | "end", ...);
 //   client.scope                               // the current Session Scope
+//   client.hello                               // the latest hello_ok frame
 //   const result = await client.request("reply", { channel_id, text, context_pct });
 //
 // After the Router goes away the client says hello again on its own and emits
@@ -67,6 +68,7 @@ class RouterClient extends EventEmitter {
     this.retryTimer = null;
     this.pending = new Map();
     this.scope = null;
+    this.hello = null;
   }
 
   // A project scope from the Router, for this client's own project only.
@@ -130,6 +132,7 @@ class RouterClient extends EventEmitter {
         }
         if (frame.type === "hello_ok") {
           this.ready = true;
+          this.hello = frame;
           this.attempt = 0;
           const reconnected = this.connectedOnce;
           this.connectedOnce = true;

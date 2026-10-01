@@ -1,0 +1,91 @@
+"""The `run` loop: one locked worker, its store, its Router key and its link."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import sqlite3
+import sys
+
+from . import store
+from .dispatch import dispatch
+from .link import Link
+from .paths import private_directory, write_private, write_supervisor_key
+
+
+class AlreadyRunning(Exception):
+    pass
+
+
+class LinkStopped(Exception):
+    pass
+
+
+@dataclass
+class Context:
+    """What every handler gets: the store, the link, and the Router's view."""
+    project_root: Path
+    state_dir: Path
+    db: sqlite3.Connection
+    link: Link
+    bot_user_id: str | None = None
+
+
+def lock_path(state_dir: Path) -> Path:
+    return state_dir / "worker.lock"
+
+
+def health_path(state_dir: Path) -> Path:
+    return state_dir / "worker.json"
+
+
+def write_health(state_dir: Path, link: Link, router: str) -> None:
+    write_private(health_path(state_dir), json.dumps({"pid": os.getpid(), "link_pid": link.pid, "router": router}))
+
+
+def run(project_root: Path, state_dir: Path) -> None:
+    private_directory(state_dir)
+    path = lock_path(state_dir)
+    with path.open("a+") as lock:
+        os.chmod(path, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise AlreadyRunning("thread supervisor is already running") from error
+        db = store.connect(state_dir, create=True)
+        stopping = False
+
+        def stop(_signal, _frame):
+            nonlocal stopping
+            stopping = True
+
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        # A fresh key each start, before the link says hello with it.
+        link = Link(write_supervisor_key())
+        context = Context(project_root, state_dir, db, link)
+        try:
+            write_health(state_dir, link, "connecting")
+            while not stopping:
+                frame = link.next_frame(0.25)
+                if frame is None:
+                    continue
+                kind = frame.get("type")
+                if kind == "connected":
+                    context.bot_user_id = frame.get("bot_user_id")
+                    write_health(state_dir, link, "connected")
+                elif kind == "disconnected":
+                    write_health(state_dir, link, "disconnected")
+                elif kind == "event":
+                    dispatch(context, frame)
+                elif kind == "link_exit" and not stopping:
+                    raise LinkStopped("the Router link stopped")
+        finally:
+            link.close()
+            health_path(state_dir).unlink(missing_ok=True)
+            db.close()
+    print("thread-supervisor: stopped", file=sys.stderr, flush=True)
