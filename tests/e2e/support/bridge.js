@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { WebSocketServer } from "ws";
 
-import { createWorkspace } from "./runner.js";
+import { createWorkspace, scaledTimeout } from "./runner.js";
 import { readState, recordCommandInvocation, updateState } from "./state.js";
 import { registerTeardownCallback } from "./teardown.js";
 
@@ -92,7 +92,7 @@ export function collectProcess(child, metadata, workspace) {
       return closed;
     },
     async waitForOutput(pattern, timeoutMs = 5000) {
-      const deadline = Date.now() + timeoutMs;
+      const deadline = Date.now() + scaledTimeout(timeoutMs);
       while (Date.now() < deadline) {
         if (pattern.test(stdout) || pattern.test(stderr)) return;
         await new Promise((resolve) => setTimeout(resolve, 25));
@@ -570,7 +570,7 @@ export function injectDiscordReaction(workspace, reaction = {}) {
 }
 
 export async function waitForState(workspace, predicate, timeoutMs = 5000) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaledTimeout(timeoutMs);
   while (Date.now() < deadline) {
     const state = readState(workspace.stateDir);
     if (predicate(state)) return state;

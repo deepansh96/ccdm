@@ -6,7 +6,7 @@ import net from "node:net";
 import path from "node:path";
 
 import { bridgeChildEnv, collectProcess, createBridgeWorkspace } from "./bridge.js";
-import { runNodeEntrypoint } from "./runner.js";
+import { runNodeEntrypoint, scaledTimeout } from "./runner.js";
 import { seedRegistry, updateState } from "./state.js";
 import { registerTeardownCallback } from "./teardown.js";
 
@@ -133,7 +133,7 @@ export async function rawRouterSocket(workspace) {
 }
 
 export async function waitFor(predicate, describe, timeoutMs = 5000) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaledTimeout(timeoutMs);
   while (Date.now() < deadline) {
     const value = predicate();
     if (value) return value;

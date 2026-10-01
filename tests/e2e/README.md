@@ -9,11 +9,13 @@ npm test
 npm run test:e2e
 ```
 
-Both commands execute:
+Both run `tests/run-e2e.mjs`, which runs test files in parallel (`CCDM_E2E_JOBS`, default CPU count minus 2), longest first by the previous run's timings. A file that fails under parallel load is rerun alone; if it then passes it is reported as `FLAKY` and the run still succeeds. Pass test files to run only those. `npm run test:serial` runs one file at a time:
 
 ```sh
 node --test --test-concurrency=1 tests/e2e/**/*.test.js
 ```
+
+Harness deadlines (`waitFor`, `waitForState`, the `runProcess` kill timer) are multiplied by `CCDM_E2E_TIMEOUT_SCALE` (default 4) so parallel load does not kill healthy runs; a passing test never waits them out. Fixture binaries are built once per content in a shared temp directory and linked into each workspace, and the repo's executable scripts are hard-linked rather than copied: macOS XProtect scans every newly written executable on first run, one at a time, which otherwise serializes parallel files.
 
 ## Harness Architecture
 

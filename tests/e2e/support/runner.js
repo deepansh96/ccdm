@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -6,6 +7,14 @@ import path from "node:path";
 import { assertIsolatedPath, buildCommandDiagnostics } from "./diagnostics.js";
 import { readState, recordCommandInvocation, writeState } from "./state.js";
 import { registerTeardownCallback } from "./teardown.js";
+
+// Deadlines are upper bounds that a passing test never waits out, so they
+// scale with load: parallel files on a busy machine run slower than one file
+// on an idle one. CCDM_E2E_TIMEOUT_SCALE overrides the default factor.
+export const TIMEOUT_SCALE = Number(process.env.CCDM_E2E_TIMEOUT_SCALE) || 4;
+export function scaledTimeout(ms) {
+  return ms * TIMEOUT_SCALE;
+}
 
 const FORBIDDEN_WORKSPACE_ARTIFACTS = [
   "registry.json",
@@ -87,8 +96,18 @@ function copySourceFiles(root, repoDir, files) {
     if (!fs.existsSync(source)) continue;
     const destination = path.join(repoDir, file);
     fs.mkdirSync(path.dirname(destination), { recursive: true });
+    const { mode } = fs.statSync(source);
+    // A hard link shares the source's XProtect scan; a fresh copy of an
+    // executable is scanned again on its first exec, which serializes
+    // parallel test files. Workspaces only add, replace, or remove files.
+    if (mode & 0o111) {
+      try {
+        fs.linkSync(source, destination);
+        continue;
+      } catch { /* Fall back to a copy, e.g. across volumes. */ }
+    }
     fs.copyFileSync(source, destination);
-    fs.chmodSync(destination, fs.statSync(source).mode);
+    fs.chmodSync(destination, mode);
   }
 }
 
@@ -1348,10 +1367,10 @@ exec ${shellQuote(resolvedTarget)} "$@"
   );
 }
 
-function createFixtures(fixtureDir, options = {}) {
+function buildFixtures(fixtureDir, runtimeDir, exclude, hostPaths) {
   fs.mkdirSync(fixtureDir, { recursive: true });
-  const runtime = createFixtureRuntime(fixtureDir);
-  const exclude = new Set(options.excludeFixtures ?? []);
+  createFixtureRuntime(fixtureDir);
+  const runtime = path.join(runtimeDir, "fixture-runtime.cjs");
   for (const tool of FIXTURE_TOOLS) {
     if (!exclude.has(tool)) {
       if (tool === "sleep") {
@@ -1365,10 +1384,56 @@ function createFixtures(fixtureDir, options = {}) {
       }
     }
   }
-  for (const [name, target] of HOST_WRAPPERS) {
+  for (const [name, target] of hostPaths) {
     if (!exclude.has(name)) {
       createHostWrapper(fixtureDir, name, target);
     }
+  }
+}
+
+let hostPathsCache = null;
+function resolvedHostPaths() {
+  hostPathsCache ??= [...HOST_WRAPPERS].map(([name, target]) => [name, target ?? hostCommandPath(name)]);
+  return hostPathsCache;
+}
+
+// macOS XProtect scans every newly written executable on its first exec, one
+// file at a time, so fresh fixture binaries in every workspace queue parallel
+// test files behind that scan. Build each distinct fixture set once, keyed by
+// its content, and give each workspace a directory of links to it.
+const sharedFixtureDirs = new Map();
+function sharedFixtureDir(exclude) {
+  const key = [...exclude].sort().join(",");
+  if (sharedFixtureDirs.has(key)) return sharedFixtureDirs.get(key);
+  const hostPaths = resolvedHostPaths();
+  const digest = createHash("sha256")
+    .update(fs.readFileSync(new URL(import.meta.url)))
+    .update(fs.readFileSync(new URL("./state-lock.cjs", import.meta.url)))
+    .update(JSON.stringify([process.execPath, key, hostPaths]))
+    .digest("hex")
+    .slice(0, 16);
+  const dir = path.join(os.tmpdir(), `ccdm-e2e-fixtures-${digest}`);
+  if (!fs.existsSync(path.join(dir, ".complete"))) {
+    const staging = fs.mkdtempSync(`${dir}.staging-`);
+    buildFixtures(staging, dir, exclude, hostPaths);
+    fs.writeFileSync(path.join(staging, ".complete"), "");
+    try {
+      fs.renameSync(staging, dir);
+    } catch (error) {
+      // Another test file published the same set first.
+      fs.rmSync(staging, { recursive: true, force: true });
+      if (!fs.existsSync(path.join(dir, ".complete"))) throw error;
+    }
+  }
+  sharedFixtureDirs.set(key, dir);
+  return dir;
+}
+
+function createFixtures(fixtureDir, options = {}) {
+  const shared = sharedFixtureDir(new Set(options.excludeFixtures ?? []));
+  fs.mkdirSync(fixtureDir, { recursive: true });
+  for (const name of fs.readdirSync(shared)) {
+    if (name !== ".complete") fs.symlinkSync(path.join(shared, name), path.join(fixtureDir, name));
   }
 }
 
@@ -1386,7 +1451,7 @@ function processGroupExists(pid) {
 }
 
 async function waitForProcessGroupExit(pid, timeoutMs = 5000) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaledTimeout(timeoutMs);
   while (Date.now() < deadline) {
     if (!processGroupExists(pid)) {
       return true;
@@ -1527,7 +1592,7 @@ function runProcess(workspace, command, args, options = {}) {
       } catch {
         // The process may have already exited.
       }
-    }, options.timeoutMs ?? 5000);
+    }, scaledTimeout(options.timeoutMs ?? 5000));
 
     child.on("close", (exitCode, signal) => {
       clearTimeout(timeout);
