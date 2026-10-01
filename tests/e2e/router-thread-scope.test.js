@@ -214,29 +214,37 @@ async function editRegistry(workspace, router, edit) {
   await waitFor(() => reloads() > before, () => `registry reload:\n${router.stdout}`);
 }
 
-test("a registry reload revokes thread connections on deregistration and channel moves, never pushing scope_changed", async () => {
-  const workspace = createRouterWorkspace();
-  const router = await routerWithWebhooks(workspace, ["demo", "beta"]);
+test("a registry reload revokes thread connections on deregistration, channel moves and a remote: path, never pushing scope_changed", async () => {
+  const workspace = createRouterWorkspace(routerRegistry({
+    gamma: { channel_id: "gamma-channel", type: "claude", transport: "router" },
+  }));
+  const router = await routerWithWebhooks(workspace, ["demo", "beta", "gamma"]);
   seedThreads(workspace, {
     "demo-thread": { type: 11, parentId: "demo-channel" },
     "beta-thread": { type: 11, parentId: "beta-channel" },
+    "gamma-thread": { type: 11, parentId: "gamma-channel" },
   });
   const demo = await connectThread(workspace, { threadId: "demo-thread" });
   const demoOps = await connectThread(workspace, { threadId: "demo-thread", listener: false });
   const beta = await connectThread(workspace, { project: "beta", threadId: "beta-thread", provider: "codex" });
-  const all = [demo, demoOps, beta];
-  assert.deepEqual(all.map(connection => connection.hello.type), ["hello_ok", "hello_ok", "hello_ok"]);
+  const gamma = await connectThread(workspace, { project: "gamma", threadId: "gamma-thread" });
+  const all = [demo, demoOps, beta, gamma];
+  assert.deepEqual(all.map(connection => connection.hello.type), ["hello_ok", "hello_ok", "hello_ok", "hello_ok"]);
 
   await editRegistry(workspace, router, registry => { registry.projects.demo.webhook_id = "999999"; });
   await new Promise(resolve => setTimeout(resolve, 200));
-  assert.deepEqual(all.map(connection => connection.events), [[], [], []]);
+  assert.deepEqual(all.map(connection => connection.events), [[], [], [], []]);
 
   await editRegistry(workspace, router, registry => { registry.projects.demo.channel_id = "moved-channel"; });
   await waitFor(() => revocations(demo).length && revocations(demoOps).length, () => "demo thread revocations");
   await editRegistry(workspace, router, registry => { delete registry.projects.beta; });
   await waitFor(() => revocations(beta).length, () => "beta thread revocation");
+  // gamma now runs on another machine, which has no thread sessions.
+  await editRegistry(workspace, router, registry => { registry.projects.gamma.path = "remote:mac:/srv/gamma"; });
+  await waitFor(() => revocations(gamma).length, () => "gamma thread revocation");
   assert.deepEqual(all.map(connection => connection.events.map(event => [event.event, event.reason])),
-    [[["revoked", "project_moved"]], [["revoked", "project_moved"]], [["revoked", "deregistered"]]]);
+    [[["revoked", "project_moved"]], [["revoked", "project_moved"]], [["revoked", "deregistered"]],
+      [["revoked", "project_moved"]]]);
 });
 
 test("router status lists each thread connection with its project, thread, provider and connection time", async () => {

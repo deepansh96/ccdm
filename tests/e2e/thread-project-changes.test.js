@@ -158,7 +158,7 @@ test("moving a project's channel stops its thread sessions and closes them as pr
   assert.deepEqual(mutations(workspace), before);
 });
 
-test("a project whose path becomes remote: has its thread connections revoked and its threads closed as project-moved", async () => {
+test("a project whose path becomes remote: has its thread sessions stopped and its threads closed as project-moved", async () => {
   const workspace = changesWorkspace();
   const { router } = await supervised(workspace);
   const threadPid = await liveThread(workspace, THREAD_ID);
@@ -168,8 +168,8 @@ test("a project whose path becomes remote: has its thread connections revoked an
     registry.projects.demo.path = "remote:mac:/srv/demo";
   });
 
-  await waitFor(() => /revoked project=demo reason=project_moved/.test(router.stdout),
-    () => `the thread connection's revocation:\n${router.stdout}`, 15000);
+  // Router-side revocation is in router-thread-scope.test.js; here the
+  // supervisor may stop the session before the Router's reload revokes it.
   const row = await threadRow(workspace, THREAD_ID, current => current.state === "closed");
   assert.deepEqual([row.state, row.stop_reason, row.close_reason], ["closed", null, "project-moved"]);
   await gone(workspace, threadPid, THREAD_TMUX);
