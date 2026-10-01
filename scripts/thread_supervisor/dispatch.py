@@ -1,10 +1,12 @@
-"""The event table: one handler per Router event or worker-internal frame; others are ignored."""
+"""The event table: one handler per Router event or worker-internal frame; others are ignored.
+
+After each one, any slot it freed goes to the queue."""
 
 from __future__ import annotations
 
 import sys
 
-from . import binding, boot, commands, config, control, creation, lifecycle
+from . import binding, boot, capacity, commands, config, control, creation, lifecycle
 
 
 HANDLERS = {
@@ -35,3 +37,7 @@ def dispatch(context, event: dict) -> None:
         handler(context, event)
     except Exception as error:  # One bad event must not stop the worker.
         print(f"thread-supervisor: {event.get('event')} failed: {error}", file=sys.stderr, flush=True)
+    try:
+        capacity.drain(context)
+    except Exception as error:
+        print(f"thread-supervisor: draining the queue failed: {error}", file=sys.stderr, flush=True)

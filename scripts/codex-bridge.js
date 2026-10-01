@@ -20,6 +20,7 @@ process.env.CCDM_REMINDER_CONTEXT_FILE = REMINDER_CONTEXT_FILE;
 process.env.CCDM_REMINDER_RECEIPTS_DIR = REMINDER_RECEIPTS_DIR;
 const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { createRouterTransport } = require("./codex-bridge-transport.js");
+const { markTurn } = require("./thread-activity.js");
 const routerPaths = require("./router/paths.js");
 const { withRegistryLock } = require("./router/registry.js");
 const { MAX_TIMEOUT_MS: ROUTER_MAX_TIMEOUT_MS } = require("./router/deadlines.js");
@@ -79,9 +80,11 @@ const ROUTER_PROJECT = ROUTER_ROOT ? "" : process.env.CCDM_CODEX_PROJECT || "";
 // `thread` role. Its first turn is the Thread Supervisor's bootstrap
 // (CCDM_THREAD_BOOTSTRAP_FILE), in place of the READY instruction turn; live
 // events wait until the bootstrap exists (CCDM_THREAD_BOOT_TIMEOUT_S, 120 s by
-// default), and messages it already includes are dropped.
+// default), and messages it already includes are dropped. Its turns are kept
+// in CCDM_THREAD_ACTIVITY_FILE from `turn/started` and `turn/completed`.
 const DISCORD_THREAD_ID = ROUTER_ROOT ? "" : process.env.CCDM_THREAD_ID || "";
 const THREAD_MODE = Boolean(DISCORD_THREAD_ID);
+const THREAD_ACTIVITY_FILE = THREAD_MODE ? process.env.CCDM_THREAD_ACTIVITY_FILE || "" : "";
 const ROUTER_LAUNCH_DIR = path.join(routerPaths.stateDir(), "launches", ROUTER_ROOT ? ".root" : ROUTER_PROJECT,
   ...(THREAD_MODE ? ["threads", DISCORD_THREAD_ID] : []));
 // The launcher waits on this file for the bridge's startup outcome.
@@ -652,6 +655,7 @@ function handleNotification(msg) {
     case "turn/completed":
       if (!turnActive || !notificationTurnId(msg)) break;
       if (!isCurrentTurnNotification(msg)) break;
+      markTurn(THREAD_ACTIVITY_FILE, false);
       onTurnCompleted(msg.params?.turn);
       break;
 
@@ -691,7 +695,7 @@ function handleNotification(msg) {
       break;
 
     case "turn/started":
-      isCurrentTurnNotification(msg);
+      if (isCurrentTurnNotification(msg)) markTurn(THREAD_ACTIVITY_FILE, true);
       break;
 
     case "item/started":

@@ -505,7 +505,7 @@ function unquote(value) {
 // channel notification, and calls the reply tool when a test scripts
 // \`fixtures.claude.replyText\`. Like Claude, it runs the command hooks from
 // \`--settings\`: SessionStart once the server is up, and Stop after each
-// notification's tool calls finish.
+// notification's tool calls finish (or, in a held thread, once released).
 function runRouterClaudeHost() {
   const sessionName = process.env.CCDM_FIXTURE_TMUX_SESSION;
   const record = (field, value) => updateState((state) => {
@@ -612,6 +612,10 @@ function runRouterClaudeHost() {
               });
             }
             if (toolScript) await runToolScript(toolScript, meta);
+            // \`fixtures.claude.holdTurnsIn\` keeps a thread's turns running until its id leaves the list.
+            while ((readState().fixtures.claude.holdTurnsIn || []).includes(serverEnv.CCDM_THREAD_ID)) {
+              await new Promise((done) => setTimeout(done, 50));
+            }
             await runHooks("Stop", { stop_hook_active: false, background_tasks: [], session_crons: [] });
           });
         } else if (toolCalls.has(message.id)) {

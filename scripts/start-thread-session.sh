@@ -12,6 +12,8 @@
 # still carries that key path; a failed launch removes its key, launch
 # directory and tmux session. CCDM_THREAD_BOOTSTRAP_FILE, from the supervisor,
 # names the bootstrap file the channel server (or Codex bridge) waits for.
+# The session's adapter keeps the launch directory's activity.json
+# (`{turn_running, last_turn_end_at}`) for the supervisor's idle eviction.
 #
 # A Codex thread runs codex-bridge.js in thread mode, with its own app-server
 # on CCDM_THREAD_WS_PORT, the port the supervisor allocated. Its account alias
@@ -291,15 +293,19 @@ env = {
     "CCDM_THREAD_PROVIDER": "claude",
     "CCDM_THREAD_TMUX": tmux_name,
     "CCDM_THREAD_BOOTSTRAP_FILE": os.environ.get("CCDM_THREAD_BOOTSTRAP_FILE") or str(launch / "bootstrap.json"),
+    "CCDM_THREAD_ACTIVITY_FILE": str(launch / "activity.json"),
 }
 if os.environ.get("CCDM_THREAD_BOOT_TIMEOUT_S"):
     env["CCDM_THREAD_BOOT_TIMEOUT_S"] = os.environ["CCDM_THREAD_BOOT_TIMEOUT_S"]
 write_private(launch / "mcp.json", json.dumps({"mcpServers": {"ccdm": {
     "command": "node", "args": [server_script], "env": env,
 }}}, indent=2) + "\n")
-# The official Discord plugin must not load beside the CCDM channel.
+# The official Discord plugin must not load beside the CCDM channel. The Stop
+# and StopFailure command hooks mark the turn ended in activity.json.
+activity_hook = f"node '{Path(server_script).with_name('thread-activity.js')}' '{launch / 'activity.json'}'"
 write_private(launch / "settings.json", json.dumps({
     "enabledPlugins": {"discord@claude-plugins-official": False},
+    "hooks": {event: [{"hooks": [{"type": "command", "command": activity_hook}]}] for event in ("Stop", "StopFailure")},
 }, indent=2) + "\n")
 PY
 
@@ -315,7 +321,7 @@ if [[ "$PROVIDER" == "codex" ]]; then
   [[ -n "${CCDM_THREAD_BOOT_TIMEOUT_S:-}" ]] && BOOT_TIMEOUT_ENV=" CCDM_THREAD_BOOT_TIMEOUT_S='$CCDM_THREAD_BOOT_TIMEOUT_S'"
   [[ -n "$RESUME_ID" ]] && CODEX_ENV+=" CODEX_RESUME_THREAD_ID='$RESUME_ID'"
   # The bridge runs from this checkout; its app-server and turns run in the project path.
-  if ! tmux new-session -d -s "$TMUX_NAME" -- zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' CCDM_CODEX_PROJECT='$PROJECT' CCDM_ROUTER_STATE_DIR='$ROUTER_STATE' CCDM_ROUTER_KEY_FILE='$KEY_FILE' CCDM_CHANNEL_READY_FILE='$LAUNCH_DIR/ready.json' CHANNEL_ID='$THREAD_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$ALLOWED_USER_IDS' CCDM_THREAD_ID='$THREAD_ID' CCDM_THREAD_PROVIDER='codex' CCDM_THREAD_BOOTSTRAP_FILE='$BOOTSTRAP_FILE'$BOOT_TIMEOUT_ENV$CODEX_ENV node scripts/codex-bridge.js" >&2; then
+  if ! tmux new-session -d -s "$TMUX_NAME" -- zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' CCDM_CODEX_PROJECT='$PROJECT' CCDM_ROUTER_STATE_DIR='$ROUTER_STATE' CCDM_ROUTER_KEY_FILE='$KEY_FILE' CCDM_CHANNEL_READY_FILE='$LAUNCH_DIR/ready.json' CHANNEL_ID='$THREAD_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$ALLOWED_USER_IDS' CCDM_THREAD_ID='$THREAD_ID' CCDM_THREAD_PROVIDER='codex' CCDM_THREAD_BOOTSTRAP_FILE='$BOOTSTRAP_FILE' CCDM_THREAD_ACTIVITY_FILE='$LAUNCH_DIR/activity.json'$BOOT_TIMEOUT_ENV$CODEX_ENV node scripts/codex-bridge.js" >&2; then
     fail "tmux could not start the thread session"
   fi
   echo "Started Codex thread bridge in tmux session '$TMUX_NAME'" >&2

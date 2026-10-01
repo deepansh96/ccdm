@@ -195,14 +195,32 @@ def held_ports(db: sqlite3.Connection, except_thread_id: str) -> set[int]:
                                          (except_thread_id,))}
 
 
-def begin_boot(db: sqlite3.Connection, thread_id: str, resolved: dict) -> None:
-    """Mark a thread `booting` with what its session runs with, and empty its
-    boot buffer of any earlier attempt."""
+def enqueue(db: sqlite3.Connection, thread_id: str, resolved: dict) -> None:
+    """Queue a thread behind every queued one, with what its session will run
+    with, and empty its boot buffer of any earlier attempt."""
     db.execute("BEGIN IMMEDIATE")
     try:
-        update(db, thread_id, state="booting", stop_reason=None, close_reason=None,
+        position = db.execute("SELECT COALESCE(MAX(queue_position), 0) + 1 FROM threads").fetchone()[0]
+        update(db, thread_id, state="queued", stop_reason=None, close_reason=None, queue_position=position,
                **{f"resolved_{field}": resolved.get(field) for field in OVERRIDES})
         db.execute("DELETE FROM boot_buffers WHERE thread_id=?", (thread_id,))
+        db.execute("COMMIT")
+    except sqlite3.Error:
+        db.execute("ROLLBACK")
+        raise
+
+
+def begin_boot(db: sqlite3.Connection, thread_id: str, resolved: dict) -> None:
+    """Mark a thread `booting` with what its session runs with. A thread that
+    was queued keeps the messages buffered meanwhile; any other empties its
+    boot buffer of an earlier attempt."""
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        queued = (thread(db, thread_id) or {"state": None})["state"] == "queued"
+        update(db, thread_id, state="booting", stop_reason=None, close_reason=None, queue_position=None,
+               **{f"resolved_{field}": resolved.get(field) for field in OVERRIDES})
+        if not queued:
+            db.execute("DELETE FROM boot_buffers WHERE thread_id=?", (thread_id,))
         db.execute("COMMIT")
     except sqlite3.Error:
         db.execute("ROLLBACK")
@@ -221,10 +239,11 @@ def buffered(db: sqlite3.Connection, thread_id: str) -> list[sqlite3.Row]:
 
 
 def finish_boot(db: sqlite3.Connection, thread_id: str, state: str, stop_reason: str | None = None) -> None:
-    """End a boot as `live`, or `stopped` with ``stop_reason``; the buffer goes either way."""
+    """End a boot (or a wait in the queue) as `live`, or `stopped` with
+    ``stop_reason``; the buffer goes either way."""
     db.execute("BEGIN IMMEDIATE")
     try:
-        update(db, thread_id, state=state, stop_reason=stop_reason)
+        update(db, thread_id, state=state, stop_reason=stop_reason, queue_position=None)
         db.execute("DELETE FROM boot_buffers WHERE thread_id=?", (thread_id,))
         db.execute("COMMIT")
     except sqlite3.Error:

@@ -1,4 +1,4 @@
-"""`status`: whether a worker runs, its Router connection, and the bound threads."""
+"""`status`: whether a worker runs, its Router connection, the session caps, and the bound threads."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import fcntl
 import json
 from pathlib import Path
 
-from . import store
+from . import capacity, registry, store
 from .worker import health_path, lock_path
 
 
@@ -23,7 +23,16 @@ def running(state_dir: Path) -> bool:
     return False
 
 
-def status(state_dir: Path) -> dict:
+def _capacity(project_root: Path) -> dict:
+    try:
+        current = registry.load(project_root)
+    except (OSError, ValueError) as error:
+        return {"caps": dict(capacity.DEFAULT_CAPS), "invalid": [f"the registry could not be read: {error}"]}
+    caps, invalid = capacity.caps(current)
+    return {"caps": caps, "invalid": invalid}
+
+
+def status(state_dir: Path, project_root: Path) -> dict:
     alive = running(state_dir)
     health = {}
     if alive and health_path(state_dir).exists():
@@ -37,6 +46,7 @@ def status(state_dir: Path) -> dict:
         projects.setdefault(row["project"], {"threads": {}})["threads"][row["thread_id"]] = {
             "name": row["name"], "creator_id": row["creator_id"], "state": row["state"],
             "stop_reason": row["stop_reason"], "close_reason": row["close_reason"], "ws_port": row["ws_port"],
+            "queue_position": row["queue_position"],
             "provider_conversation_id": row["provider_conversation_id"],
             **{field: row[field] for field in store.OVERRIDES},
         }
@@ -46,5 +56,6 @@ def status(state_dir: Path) -> dict:
         "link_pid": health.get("link_pid") if alive else None,
         "router": health.get("router", "unknown") if alive else "not-running",
         "store": {"user_version": inspected["user_version"]} if inspected else None,
+        "capacity": _capacity(project_root),
         "projects": projects,
     }

@@ -17,6 +17,7 @@
 //   CCDM_THREAD_PROVIDER      the thread's provider (`claude`)
 //   CCDM_THREAD_BOOTSTRAP_FILE  the Thread Supervisor's bootstrap for this launch
 //   CCDM_THREAD_TMUX          this thread session's own tmux session
+//   CCDM_THREAD_ACTIVITY_FILE   this launch's activity.json, marked turn_running on each notification
 //
 // In thread mode the server says hello as the `thread` role, so its Session
 // Scope is the thread alone. It holds live events until the supervisor's
@@ -59,6 +60,7 @@ const path = require("node:path");
 const { createInterface } = require("node:readline");
 const reminder = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
+const { markTurn } = require("./thread-activity.js");
 const { createEmergencyGateway } = require("./router/emergency.js");
 
 const ROOT_DIR = path.dirname(__dirname);
@@ -529,8 +531,13 @@ function main() {
   // Channel notifications wait until Claude has finished initializing.
   let initialized = false;
   const queued = [];
+  // Each delivered notification starts a Claude turn; the Stop and StopFailure hooks end it.
+  const deliverNotification = params => {
+    if (THREAD) markTurn(process.env.CCDM_THREAD_ACTIVITY_FILE, true);
+    send({ method: "notifications/claude/channel", params });
+  };
   const channelNotify = params => {
-    if (initialized) send({ method: "notifications/claude/channel", params });
+    if (initialized) deliverNotification(params);
     else queued.push(params);
   };
   const notify = (kind, event) => {
@@ -688,7 +695,7 @@ function main() {
     }
     if (method === "notifications/initialized") {
       initialized = true;
-      for (const params of queued.splice(0)) send({ method: "notifications/claude/channel", params });
+      for (const params of queued.splice(0)) deliverNotification(params);
       return;
     }
     if (method === "tools/list") {

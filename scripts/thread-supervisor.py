@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Thread Supervisor: Thread Conversation lifecycle as a Router client.
 
-`run` is the foreground worker; `status` reports it and the bound threads.
+`run` is the foreground worker; `status` reports it, the session caps and the bound threads.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ def main() -> int:
     try:
         if args.command == "run":
             run(args.project_root, state_dir)
-        result = status(state_dir)
+        result = status(state_dir, args.project_root)
     except LinkStopped as error:
         print(json.dumps({"status": "failed", "reason": str(error)}, sort_keys=True))
         return 1

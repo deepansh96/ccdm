@@ -12,7 +12,9 @@ fails, times out or exits early takes 👀 off, posts a one-line reason, and
 leaves the row `stopped/start-failed`; the next eligible message retries.
 A Codex thread is first given its own app-server port, recorded on the row.
 A thread created with a first message starts at once, with no trigger
-message (so no 👀) and that message as its starter.
+message (so no 👀) and that message as its starter. Every start is admitted
+through its provider's session cap first; a queued thread buffers its
+messages until the queue starts it.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ import subprocess
 import sys
 import threading
 
-from . import ports, registry, store
+from . import capacity, ports, registry, store
 from .clock import now
 from .link import LinkError
 from .paths import router_state_dir, write_private
@@ -112,17 +114,29 @@ def _payload(event: dict) -> str:
     })
 
 
+def _note_owner_activity(context, thread_id: str, event: dict) -> None:
+    """Only the owner's messages keep a session from idling."""
+    if event.get("author_class") != "owner":
+        return
+    row = store.thread(context.db, thread_id)
+    if row and row["project"] == event.get("project"):
+        store.update(context.db, thread_id, last_owner_activity_at=now())
+
+
 def on_thread_message(context, event: dict) -> None:
     thread_id = event.get("thread_id")
-    if not isinstance(thread_id, str) or event.get("author_class") not in DRIVERS or event.get("delivered_to_session"):
+    if not isinstance(thread_id, str) or event.get("author_class") not in DRIVERS:
         return
+    if event.get("delivered_to_session"):
+        return _note_owner_activity(context, thread_id, event)
     content = str(event.get("content") or "").strip()
     if COMMAND.match(content) or _addresses_root(context, content) or not isinstance(event.get("message_id"), str):
         return
     row = store.thread(context.db, thread_id)
     if not row or row["project"] != event.get("project"):
         return
-    if row["state"] == "booting":
+    _note_owner_activity(context, thread_id, event)
+    if row["state"] in ("booting", "queued"):
         store.buffer_message(context.db, thread_id, event["message_id"], _payload(event), now())
     elif row["state"] in ("registered", "stopped") or (row["state"] == "closed" and event["author_class"] == "owner"):
         # Only the owner reopens a closed conversation.
@@ -139,6 +153,10 @@ def start(context, row, trigger: dict | None, starter: str | None = None) -> Non
         return
     resolved = registry.resolved_settings(entry, row)
     codex = resolved["provider"] == "codex"
+    if not capacity.admit(context, row, resolved, trigger, starter):
+        if trigger:
+            store.buffer_message(context.db, thread_id, trigger["message_id"], _payload(trigger), now())
+        return
     store.begin_boot(context.db, thread_id, resolved)
     trigger_id = trigger["message_id"] if trigger else None
     if trigger:

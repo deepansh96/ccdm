@@ -31,6 +31,12 @@ test("registry example documents Claude account aliases for thread overrides", (
   });
 });
 
+test("registry example documents the default thread session caps", () => {
+  const registryExample = JSON.parse(fs.readFileSync("registry.example.json", "utf8"));
+
+  assert.deepEqual(registryExample.thread_session_caps, { claude: 6, codex: 8 });
+});
+
 test("registry example shows the one-bot Router fields and no pool or bot tokens", () => {
   const source = fs.readFileSync("registry.example.json", "utf8");
   const registryExample = JSON.parse(source);
