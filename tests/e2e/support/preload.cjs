@@ -718,6 +718,7 @@ function routeDiscordApi(url, init = {}) {
         content: parsedBody.content ?? "",
         id: `fake-message-${state.fixtures.discord.messages.length + 1}`,
         messageReference: parsedBody.message_reference,
+        ...(parsedBody.allowed_mentions ? { allowedMentions: parsedBody.allowed_mentions } : {}),
         ...(parsedBody.enforce_nonce ? {
           requestBody: parsedBody,
           timestamp: process.env.CCDM_REMINDER_CLOCK_FILE

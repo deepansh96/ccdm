@@ -9,7 +9,7 @@ const net = require("node:net");
 const path = require("node:path");
 const { withDeadline } = require("./discord-rest.js");
 const { threadRoute } = require("./inbound.js");
-const { ScopeViolation } = require("./ops/errors.js");
+const { OpError, ScopeViolation } = require("./ops/errors.js");
 const { OPERATIONS } = require("./ops/index.js");
 
 const PROTOCOL_VERSION = 1;
@@ -95,6 +95,8 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
   // thread connections (a thread's Codex scoped MCP server).
   const threadSessions = new Map();
   const threadOps = new Set();
+  // request id -> a channel session's `create_thread` awaiting the supervisor.
+  const threadRequests = new Map();
   const violations = [];
   const keysDir = path.join(stateDir, "keys");
   let keysWatcher = null;
@@ -136,10 +138,52 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     } else if (connection.role === "observer") {
       if (observerSession === connection) observerSession = null;
     } else if (connection.role === "supervisor") {
-      if (supervisorSession === connection) supervisorSession = null;
+      if (supervisorSession === connection) {
+        supervisorSession = null;
+        // No supervisor will answer them now.
+        for (const id of [...threadRequests.keys()]) {
+          settleThreadRequest(id, null, new OpError("supervisor_unavailable", "the Thread Supervisor disconnected"));
+        }
+      }
     } else if (connection.route && sessions.get(connection.route.project) === connection) {
       sessions.delete(connection.route.project);
     }
+  }
+
+  function settleThreadRequest(id, result, error) {
+    const pending = threadRequests.get(id);
+    if (!pending) return false;
+    threadRequests.delete(id);
+    clearTimeout(pending.timer);
+    if (result) pending.resolve(result);
+    else pending.reject(error);
+    return true;
+  }
+
+  // A `create_thread` waits for the supervisor's `thread_request_done` until
+  // its deadline; with no supervisor it fails at once.
+  const threadRequestsContext = {
+    open(id, deadline, event) {
+      if (!supervisorSession) {
+        return Promise.reject(new OpError("supervisor_unavailable", "no Thread Supervisor is connected"));
+      }
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => settleThreadRequest(id, null,
+          new OpError("timeout", "the Thread Supervisor did not answer in time")), Math.max(0, deadline - Date.now()));
+        threadRequests.set(id, { resolve, reject, timer });
+        deliverSupervisor(event);
+      });
+    },
+    done(id, result, error) {
+      return settleThreadRequest(id, result, new OpError(error.code, error.message));
+    },
+  };
+
+  // Every connection of one thread, listener and op-only, goes with `reason`.
+  function revokeThread(threadId, reason) {
+    const connections = [...threadSessions.values(), ...threadOps].filter(connection => connection.route.thread_id === threadId);
+    for (const connection of connections) revoke(connection, reason);
+    return connections.length;
   }
 
   // The session loses its place: it is told why, then disconnected.
@@ -293,6 +337,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       // Discord calls stop once the client's own timeout has passed.
       const result = await withDeadline(frame.deadline_at, () => operation.run({ ...context, session, sessions: listSessions,
         supervisor: () => supervisorSession && { connectedAt: supervisorSession.connectedAt },
+        threadRequests: threadRequestsContext, revokeThread,
         violations: () => [...violations], table: getTable(), gateway, registry }, args));
       respond({ ok: true, result });
     } catch (error) {
