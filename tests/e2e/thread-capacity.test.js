@@ -227,7 +227,7 @@ function requestCodexThread(workspace, thread) {
 db = sqlite3.connect(sys.argv[1], timeout=5)
 db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
   first_message, requester_id, requester_kind, status, thread_id, created_at)
-  VALUES (?, 'demo', ?, 'codex', NULL, NULL, NULL, NULL, ?, 'owner', 'pending', NULL, '2026-10-01T00:00:00Z')""",
+  VALUES (?, 'demo', ?, 'codex', NULL, NULL, NULL, NULL, ?, 'owner', 'pending', NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))""",
   (sys.argv[2], sys.argv[3], sys.argv[4]))
 db.commit()`, path.join(supervisorStateDir(workspace), "threads.sqlite3"), `request-${thread.id}`, thread.name,
   OWNER_ID]);

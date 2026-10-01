@@ -247,9 +247,13 @@ def _launch_exited(context, thread_id: str, boot: Boot, frame: dict) -> None:
         result = json.loads(str(frame.get("stdout") or "").strip().splitlines()[-1])
     except (IndexError, json.JSONDecodeError):
         result = {}
+    # A launcher that could not read the session id (say after a --resume)
+    # reports none; the known conversation id stays rather than being lost.
+    row = store.thread(context.db, thread_id)
     store.update(context.db, thread_id, runtime_pid=result.get("pid"), runtime_tmux=result.get("tmux"),
-                 provider_conversation_id=result.get("provider_conversation_id"),
-                 provider_home=result.get("provider_home"))
+                 provider_conversation_id=result.get("provider_conversation_id")
+                 or (row["provider_conversation_id"] if row else None),
+                 provider_home=result.get("provider_home") or (row["provider_home"] if row else None))
     boot.launched = True
     if boot.live:
         context.boots.pop(thread_id, None)

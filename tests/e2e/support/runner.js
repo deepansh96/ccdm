@@ -749,7 +749,8 @@ function runTmux() {
         pid,
         sessionId,
       });
-      writeClaudeSession(pid, sessionId, launch.env.CLAUDE_CONFIG_DIR);
+      // \`fixtures.claude.omitSessionFile\`: Claude never writes its session file.
+      if (!readState().fixtures.claude.omitSessionFile) writeClaudeSession(pid, sessionId, launch.env.CLAUDE_CONFIG_DIR);
     }
     process.exit(0);
   }

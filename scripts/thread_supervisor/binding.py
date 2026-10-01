@@ -32,7 +32,7 @@ def on_thread_create(context, event: dict) -> None:
     if creator != registry.owner_id(current) and creator not in registry.guests(current, project):
         if not context.bot_user_id or creator != context.bot_user_id:
             return
-        request = store.pending_request(context.db, project, name)
+        request = store.pending_request(context.db, project, name, thread_id)
         if not request:
             return
     if not store.bind(context.db, thread_id, project, name, creator, now(), request):

@@ -54,7 +54,7 @@ Accounts are aliases only. Claude aliases live in the registry's `claude_account
 
 ## Archive, delete and resume
 
-- **Archive:** an owner or root archive, or `/close`, closes the conversation and stops its session. Any other archive, including Discord's inactivity auto-archive, only stops the session (`stopped/auto-archive`). The supervisor reads the archive actor from audit-log action 111, polling for up to 60 s. A lookup that fails throughout is recorded as `stopped/archive-actor-unknown` and fails open as an auto-archive.
+- **Archive:** an owner or root archive, or `/close`, closes the conversation and stops its session. Any other archive, including Discord's inactivity auto-archive, only stops the session (`stopped/auto-archive`). The supervisor reads the archive actor from audit-log action 111 entries that set `archived` to true (a rename or archive-duration change is not an archive), polling for up to 60 s. A lookup that fails throughout is recorded as `stopped/archive-actor-unknown` and fails open as an auto-archive.
 - **Unarchive:** a bot unarchive starts nothing.
 - **Delete:** stops the session and drops the supervisor row and the reminder state. Provider conversation files stay on disk.
 - **Resume:** an owner or guest message resumes a stopped thread. Only an owner message reopens a Closed Conversation. Either way it resumes the same provider conversation (`claude --resume`, or Codex `--resume <uuid>`) in the same home and cwd. A missing transcript or rollout is a start failure with a one-line reason, never a silent fresh start.

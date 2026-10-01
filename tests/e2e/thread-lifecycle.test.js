@@ -60,10 +60,10 @@ const unarchive = workspace => threadEvent(workspace, "update", { archived: fals
 // A Discord snowflake for now: milliseconds since the Discord epoch, shifted 22 bits.
 const snowflakeNow = () => String((BigInt(Date.now()) - 1420070400000n) << 22n);
 
-function seedArchiveEntry(workspace, userId) {
+function seedArchiveEntry(workspace, userId, changes = [{ key: "archived", old_value: false, new_value: true }]) {
   updateState(workspace.stateDir, state => {
     (state.fixtures.discord.auditLogEntries ||= []).unshift({ id: snowflakeNow(), user_id: userId,
-      target_id: THREAD_ID, action_type: 111, changes: [{ key: "archived", old_value: false, new_value: true }] });
+      target_id: THREAD_ID, action_type: 111, changes });
   });
 }
 
@@ -159,6 +159,22 @@ test("another member's archive stops the session as auto-archive", async () => {
   await assertStopped(workspace);
   const row = await threadRow(workspace);
   assert.deepEqual([row.state, row.stop_reason], ["stopped", "auto-archive"]);
+});
+
+test("an owner rename or a root-bot duration PATCH is not an archive: the auto-archive stays auto-archive", async () => {
+  const workspace = threadWorkspace();
+  await supervised(workspace);
+  await liveThread(workspace);
+
+  seedArchiveEntry(workspace, BOT_USER_ID, [{ key: "auto_archive_duration", old_value: 1440, new_value: 10080 }]);
+  seedArchiveEntry(workspace, OWNER_ID, [{ key: "name", old_value: "Fix flaky test", new_value: "Fix the flaky test" }]);
+  seedArchiveEntry(workspace, OWNER_ID, []);
+  archive(workspace);
+
+  await assertStopped(workspace);
+  await waitFor(() => (discord(workspace).auditLogFetches ?? []).length >= 3, () => "the audit-log polls", 15000);
+  const row = await threadRow(workspace, current => current.stop_reason === "auto-archive" || current.state === "closed");
+  assert.deepEqual([row.state, row.stop_reason, row.close_reason], ["stopped", "auto-archive", null]);
 });
 
 test("a forbidden audit log stops the session as archive-actor-unknown", async () => {
@@ -257,6 +273,31 @@ test("the next owner message in a stopped Claude thread relaunches it with --res
   assert.match(claude(workspace).channelNotifications.at(-1).content, /picking this back up/);
 });
 
+// The launcher's recorded pid, which the supervisor stores once the launcher exits.
+const storedRuntimePid = workspace => JSON.parse(execFileSync("python3", ["-c", `import json, sqlite3, sys
+db = sqlite3.connect(sys.argv[1], timeout=5)
+print(json.dumps(db.execute("SELECT runtime_pid FROM threads WHERE thread_id = ?", (sys.argv[2],)).fetchone()[0]))`,
+path.join(supervisorStateDir(workspace), "threads.sqlite3"), THREAD_ID], { encoding: "utf8" }));
+
+test("a resumed Claude session whose session id cannot be read keeps the known conversation id", async () => {
+  const workspace = threadWorkspace();
+  await supervised(workspace);
+  const conversationId = await stoppedThread(workspace);
+  writeClaudeTranscript(workspace, conversationId);
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.omitSessionFile = true;
+  });
+
+  threadMessage(workspace, "resume-message-1", "picking this back up");
+
+  await threadRow(workspace, row => row.state === "live");
+  // The launcher gives up on the session file after about 10 s and reports no id.
+  await waitFor(() => claude(workspace).invocations.length === 2, () => "the resumed launch", 15000);
+  const resumedPid = claude(workspace).invocations[1].pid;
+  await waitFor(() => storedRuntimePid(workspace) === resumedPid, () => "the resumed launch to be recorded", 25000);
+  assert.equal((await threadRow(workspace)).provider_conversation_id, conversationId);
+});
+
 const notices = workspace => threadPosts(workspace).filter(message => !message.webhookId).map(message => message.content);
 
 test("a resume whose Claude transcript is missing posts a one-line reason and leaves the row stopped/start-failed", async () => {
@@ -331,7 +372,7 @@ db = sqlite3.connect(sys.argv[1], timeout=5)
 db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
   first_message, requester_id, requester_kind, status, thread_id, created_at)
   VALUES ('request-1', 'demo', 'Fix flaky test', 'codex', NULL, NULL, NULL, NULL, ?, 'owner', 'pending', NULL,
-  '2026-10-01T00:00:00Z')""", (sys.argv[2],))
+  strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))""", (sys.argv[2],))
 db.commit()`, path.join(supervisorStateDir(workspace), "threads.sqlite3"), OWNER_ID]);
   threadEvent(workspace, "create", { ownerId: BOT_USER_ID });
 }

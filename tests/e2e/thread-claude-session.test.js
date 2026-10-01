@@ -240,7 +240,7 @@ db = sqlite3.connect(sys.argv[1], timeout=5)
 db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
   first_message, requester_id, requester_kind, status, thread_id, created_at)
   VALUES ('request-1', 'demo', 'Fix flaky test', NULL, ?, NULL, NULL, NULL, ?, 'owner', 'pending', NULL,
-  '2026-10-01T00:00:00Z')""", (sys.argv[2] or None, sys.argv[3]))
+  strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))""", (sys.argv[2] or None, sys.argv[3]))
 db.commit()`, store, account ?? "", OWNER_ID]);
   createThread(workspace, { ownerId: BOT_USER_ID });
 }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import sqlite3
@@ -139,10 +140,25 @@ def thread(db: sqlite3.Connection, thread_id: str) -> sqlite3.Row | None:
     return db.execute("SELECT * FROM threads WHERE thread_id=?", (thread_id,)).fetchone()
 
 
-def pending_request(db: sqlite3.Connection, project: str, name: str) -> sqlite3.Row | None:
-    """The oldest pending creation request for ``name`` in ``project``."""
+# How long a pending request that has not yet recorded its thread id may still
+# claim a bot-created thread by name: well past thread_create's deadline.
+REQUEST_MATCH_SECONDS = 300
+
+
+def pending_request(db: sqlite3.Connection, project: str, name: str, thread_id: str) -> sqlite3.Row | None:
+    """The pending creation request ``thread_id`` fulfils: the one that
+    recorded it, else (its THREAD_CREATE can beat thread_create's answer) the
+    oldest recent one for ``name`` in ``project`` that recorded no thread yet.
+    A request for another thread, or a stale one, matches nothing."""
+    recorded = db.execute("""SELECT * FROM creation_requests WHERE status='pending' AND project=? AND thread_id=?
+        ORDER BY created_at, request_id LIMIT 1""", (project, thread_id)).fetchone()
+    if recorded:
+        return recorded
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=REQUEST_MATCH_SECONDS)).isoformat(
+        timespec="milliseconds").replace("+00:00", "Z")
     return db.execute("""SELECT * FROM creation_requests WHERE status='pending' AND project=? AND name=?
-        ORDER BY created_at, request_id LIMIT 1""", (project, name)).fetchone()
+        AND thread_id IS NULL AND created_at >= ? ORDER BY created_at, request_id LIMIT 1""",
+                      (project, name, cutoff)).fetchone()
 
 
 def add_request(db: sqlite3.Connection, request_id: str, project: str, name: str, overrides: dict,

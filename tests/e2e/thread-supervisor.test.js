@@ -126,7 +126,7 @@ db = sqlite3.connect(sys.argv[1])
 db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
   first_message, requester_id, requester_kind, status, thread_id, created_at)
   VALUES ('request-1', 'demo', 'Port the parser', 'codex', NULL, 'gpt-5.5', 'high', NULL, ?, 'owner',
-  'pending', NULL, '2026-10-01T00:00:00Z')""", ("${OWNER_ID}",))
+  'pending', NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))""", ("${OWNER_ID}",))
 db.commit()`, store]);
   await startThreadSupervisor(workspace);
   injectThreads(workspace, [
@@ -143,6 +143,38 @@ db.commit()`, store]);
   assert.equal(status.projects.demo.threads["unrequested-bot-thread"], undefined);
   // A bot-created thread was made with the one-week duration already.
   assert.deepEqual(patches(workspace).map(patch => patch.threadId), ["fence-thread"]);
+});
+
+test("a request matches the thread whose id it recorded, and a stale unrecorded request matches nothing", async () => {
+  const { workspace } = await supervisedWorkspace();
+  const first = await startThreadSupervisor(workspace);
+  assert.equal((await first.stop()).exitCode, 0);
+  const store = path.join(supervisorStateDir(workspace), "threads.sqlite3");
+  // request-1 already recorded its thread; request-2's creation never got
+  // that far, an hour ago.
+  execFileSync("python3", ["-c", `import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
+  first_message, requester_id, requester_kind, status, thread_id, created_at)
+  VALUES ('request-1', 'demo', 'Port the parser', 'codex', NULL, NULL, NULL, NULL, ?, 'owner',
+  'pending', 'recorded-bot-thread', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))""", ("${OWNER_ID}",))
+db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
+  first_message, requester_id, requester_kind, status, thread_id, created_at)
+  VALUES ('request-2', 'demo', 'Old request', 'codex', NULL, NULL, NULL, NULL, ?, 'owner',
+  'pending', NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 hour'))""", ("${OWNER_ID}",))
+db.commit()`, store]);
+  await startThreadSupervisor(workspace);
+  injectThreads(workspace, [
+    { id: "same-name-bot-thread", name: "Port the parser", ownerId: BOT_USER_ID },
+    { id: "late-bot-thread", name: "Old request", ownerId: BOT_USER_ID },
+    { id: "recorded-bot-thread", name: "Port the parser", ownerId: BOT_USER_ID },
+  ]);
+  await waitForBound(workspace, "recorded-bot-thread");
+  await fence(workspace);
+  const threads = (await supervisorStatus(workspace)).projects.demo.threads;
+  assert.equal(threads["recorded-bot-thread"].provider, "codex");
+  assert.equal(threads["same-name-bot-thread"], undefined);
+  assert.equal(threads["late-bot-thread"], undefined);
 });
 
 test("a second worker exits 2 while the first holds the lock", async () => {

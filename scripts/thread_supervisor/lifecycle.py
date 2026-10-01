@@ -171,13 +171,15 @@ def on_archive_poll(context, frame: dict) -> None:
 
 
 def _archive_actor(entries: list) -> str | None:
-    """The newest entry's actor that archived the thread (entries come newest first)."""
+    """The actor of the newest entry that archived the thread (entries come
+    newest first). Only a change of ``archived`` to true counts: a rename or
+    an ``auto_archive_duration`` PATCH is a thread update too."""
     for entry in entries:
         if not isinstance(entry, dict):
             continue
         changes = entry.get("changes") or []
-        archived = [change for change in changes if isinstance(change, dict) and change.get("key") == "archived"]
-        if not archived or any(change.get("new_value") is True for change in archived):
+        if any(isinstance(change, dict) and change.get("key") == "archived" and change.get("new_value") is True
+               for change in changes):
             return str(entry.get("user_id") or "") or None
     return None
 
