@@ -104,9 +104,9 @@ async function downloadAttachment(ctx, args) {
 
 module.exports = {
   ops: {
-    fetch_messages: { roles: ["project", "root"], scoped: true, run: fetchMessages },
-    read_last_x_messages_in_channel: { roles: ["project", "root"], scoped: true, run: readLastMessages },
-    export_message_range: { roles: ["project", "root"], scoped: true, run: exportMessageRange },
-    download_attachment: { roles: ["project", "root"], scoped: true, run: downloadAttachment },
+    fetch_messages: { roles: ["project", "root", "thread"], scoped: true, run: fetchMessages },
+    read_last_x_messages_in_channel: { roles: ["project", "root", "thread"], scoped: true, run: readLastMessages },
+    export_message_range: { roles: ["project", "root", "thread"], scoped: true, run: exportMessageRange },
+    download_attachment: { roles: ["project", "root", "thread"], scoped: true, run: downloadAttachment },
   },
 };

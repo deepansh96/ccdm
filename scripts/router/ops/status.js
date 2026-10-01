@@ -46,6 +46,7 @@ async function status(ctx, args = {}) {
       role: session.role,
       project: session.route.project,
       scope: { channel_id: session.route.channel_id },
+      ...(session.role === "thread" ? { thread_id: session.route.thread_id, provider: session.route.type } : {}),
       connected_at: session.connectedAt,
     })),
     projects,

@@ -103,10 +103,14 @@ function classifyMessage(table, message, thread = null) {
 }
 
 // In a thread, the owner and the parent's current guests reach the thread
-// session; the supervisor's commands reach no session.
+// session; the supervisor's commands reach no session. Addressing the bot is
+// for root, in the thread, and only from the owner.
 function classifyThreadMessage(table, message, route, user) {
   const author = allowedAuthor(new Set(route.guests), table, user);
   if (!author) return null;
+  if (addressesRoot(message)) {
+    return author.is_owner ? { route, root: true, event: messageEvent(route, author, message) } : null;
+  }
   const content = String(message.content || "").trim();
   if (SUPERVISOR_COMMAND.test(content)) return null;
   if (THREAD_COMMANDS.has(content)) {

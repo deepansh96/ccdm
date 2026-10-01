@@ -8,6 +8,7 @@ const { chmod, mkdir, readFile, unlink } = require("node:fs/promises");
 const net = require("node:net");
 const path = require("node:path");
 const { withDeadline } = require("./discord-rest.js");
+const { threadRoute } = require("./inbound.js");
 const { ScopeViolation } = require("./ops/errors.js");
 const { OPERATIONS } = require("./ops/index.js");
 
@@ -47,11 +48,14 @@ function parseFrame(line) {
   return frame;
 }
 
-// Root's route for one target channel, or null outside root's scope.
-function rootTarget(table, channelId) {
+// Root's route for one target channel, or null outside root's scope: a root
+// channel, a registered channel, or a public thread under a project channel.
+async function rootTarget(table, channelId, client) {
   if (table.rootChannels.has(channelId)) return { project: "root", channel_id: channelId };
   const project = table.registered.get(channelId);
-  return project ? { project, channel_id: channelId } : null;
+  if (project) return { project, channel_id: channelId };
+  const thread = await threadRoute(table, channelId, null, client);
+  return thread ? { project: thread.project, channel_id: channelId } : null;
 }
 
 // The Session Scope a project connection is granted: in its hello_ok, and in
@@ -100,8 +104,10 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
   }
 
   const projectKey = project => readKey(`${path.basename(project)}.key`);
+  const threadKey = threadId => readKey(`.thread-${threadId}.key`);
   const connectionKey = connection => connection.role === "root" ? readKey(ROOT_KEY_FILE)
-    : connection.role === "observer" ? readKey(OBSERVER_KEY_FILE) : projectKey(connection.route.project);
+    : connection.role === "observer" ? readKey(OBSERVER_KEY_FILE)
+      : connection.role === "thread" ? threadKey(connection.route.thread_id) : projectKey(connection.route.project);
 
   function forget(connection) {
     if (connection.role === "thread") {
@@ -126,10 +132,11 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     connection.socket.end();
   }
 
-  // A launch wrote a new key: any session still holding the old one goes.
+  // A launch wrote a new key, or a thread's key was removed: any session
+  // still holding the old one goes.
   async function revokeStaleKeys() {
-    for (const connection of [...sessions.values(), ...opConnections, ...(rootSession ? [rootSession] : []),
-      ...(observerSession ? [observerSession] : [])]) {
+    for (const connection of [...sessions.values(), ...opConnections, ...threadSessions.values(), ...threadOps,
+      ...(rootSession ? [rootSession] : []), ...(observerSession ? [observerSession] : [])]) {
       if (!keysMatch(await connectionKey(connection), connection.key)) revoke(connection, "key_rotated");
     }
   }
@@ -197,7 +204,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     const threadId = String(frame.thread_id ?? "");
     const route = getTable().projects.get(String(frame.project));
     if (!/^[\w-]+$/.test(threadId) || !route || !PROVIDERS.has(frame.provider) ||
-      !keysMatch(await readKey(`.thread-${threadId}.key`), frame.key)) {
+      !keysMatch(await threadKey(threadId), frame.key)) {
       return reject("unauthorized", "unknown project, thread or key");
     }
     const channel = await context.discord?.client?.channels.fetch(threadId).catch(() => null);
@@ -239,7 +246,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     // Root acts in its own channels and any registered channel, one target per request.
     let session = connection;
     if (operation.scoped && connection.role === "root") {
-      const route = rootTarget(getTable(), String(args.channel_id));
+      const route = await rootTarget(getTable(), String(args.channel_id), context.discord?.client);
       if (!route) return violation(args.channel_id, "channel_id is neither a root channel nor a registered channel");
       session = { ...connection, route };
     } else if (operation.scoped && String(args.channel_id) !== connection.route.channel_id) {
@@ -260,7 +267,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
 
   function listSessions() {
     return [...(rootSession ? [rootSession] : []), ...(observerSession ? [observerSession] : []),
-      ...sessions.values()].map(connection => ({
+      ...sessions.values(), ...threadSessions.values()].map(connection => ({
       role: connection.role, route: connection.route, connectedAt: connection.connectedAt,
     }));
   }
@@ -345,9 +352,17 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     // channel (or changed type) is pushed to each of the project's
     // connections, listener and op-only alike, as a `scope_changed` event, so
     // the adapter retargets its inbound filter and tool defaults. Root's own
-    // connections are not projects and keep their place.
+    // connections are not projects and keep their place. A thread connection
+    // never changes scope: a moved parent channel revokes it, and a changed
+    // webhook only updates its route.
     refreshRoutes() {
       const { projects } = getTable();
+      for (const connection of [...threadSessions.values(), ...threadOps]) {
+        const route = projects.get(connection.route.project);
+        if (!route) revoke(connection, "deregistered");
+        else if (route.channel_id !== connection.route.parent_channel_id) revoke(connection, "project_moved");
+        else connection.route = { ...connection.route, webhook_id: route.webhook_id };
+      }
       for (const connection of [...sessions.values(), ...opConnections]) {
         if (connection.role !== "project") continue;
         const route = projects.get(connection.route.project);

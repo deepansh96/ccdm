@@ -9,10 +9,12 @@ import {
   ROOT_TOKEN,
   connectRoot,
   connectSession,
+  connectThread,
   createRouterWorkspace,
   routerRegistry,
   routerWithWebhooks,
   runRouterCli,
+  seedThreads,
   waitFor,
   writeRootKey,
 } from "./support/router.js";
@@ -241,4 +243,72 @@ test("migrate-root-config copies root channels and allowed users from access.jso
   assert.match(second.stdout, /nothing to migrate/);
   assert.equal(fs.readFileSync(registryFile, "utf8"), migrated);
   assert.equal(fs.readFileSync(accessFile, "utf8"), access);
+});
+
+// Root, demo, and a listener in a public thread under demo's channel.
+async function rootAndThread() {
+  const sessions = await rootAndDemo();
+  seedThreads(sessions.workspace, {
+    "demo-thread": { type: 11, parentId: "demo-channel" },
+    "private-thread": { type: 12, parentId: "demo-channel" },
+  });
+  const thread = await connectThread(sessions.workspace, { threadId: "demo-thread" });
+  return { ...sessions, thread };
+}
+
+// A trailing owner message in the thread proves earlier ones were routed.
+async function settleThread({ workspace, demo, thread }) {
+  await settle(workspace, demo);
+  injectDiscordMessage(workspace, { id: "thread-fence", channelId: "demo-thread", content: "fence",
+    author: { id: OWNER_ID, username: "Owner" } });
+  await waitFor(() => thread.events.some(event => event.message_id === "thread-fence"), () => "the thread fence");
+}
+
+const threadIds = events => ids(events).filter(id => id !== "thread-fence");
+
+test("the owner addressing the bot in a project thread reaches only root, which answers in the thread", async () => {
+  const sessions = await rootAndThread();
+  const { workspace, root, demo, thread } = sessions;
+  injectDiscordMessage(workspace, { id: "root-said", channelId: "demo-thread", content: "thread checked",
+    author: { id: BOT_ID, username: "Root", bot: true } });
+  injectDiscordMessage(workspace, { id: "thread-mention", channelId: "demo-thread", content: `<@${BOT_ID}> status?`,
+    author: { id: OWNER_ID, username: "Owner" } });
+  injectDiscordMessage(workspace, { id: "thread-reply", channelId: "demo-thread", content: "and logs?",
+    replyTo: "root-said", author: { id: OWNER_ID, username: "Owner" } });
+  await waitFor(() => root.events.length >= 2, () => "the thread messages at root");
+  await settleThread(sessions);
+
+  assert.deepEqual(root.events.map(({ event, message_id, channel_id }) => ({ event, message_id, channel_id })), [
+    { event: "message", message_id: "thread-mention", channel_id: "demo-thread" },
+    { event: "message", message_id: "thread-reply", channel_id: "demo-thread" },
+  ]);
+  assert.deepEqual([threadIds(thread.events), ids(demo.events)], [[], []]);
+
+  const answer = await root.client.request("reply", { channel_id: "demo-thread", text: "all green", reply_to: "thread-mention" });
+  await root.client.request("react", { channel_id: "demo-thread", message_id: "thread-mention", emoji: "👀" });
+  await assert.rejects(root.client.request("reply", { channel_id: "private-thread", text: "hello?" }),
+    { code: "scope_violation" });
+  const discord = readState(workspace.stateDir).fixtures.discord;
+  assert.deepEqual(discord.messages.map(({ id, channelId, content, authorization, webhookId, messageReference }) =>
+    ({ id, channelId, content, authorization, webhookId, messageReference })), [{
+    id: answer.message_id, channelId: "demo-thread", content: "all green", authorization: `Bot ${ROOT_TOKEN}`,
+    webhookId: undefined, messageReference: { message_id: "thread-mention" },
+  }]);
+  assert.deepEqual(discord.reactions.map(({ channelId, messageId }) => ({ channelId, messageId })),
+    [{ channelId: "demo-thread", messageId: "thread-mention" }]);
+});
+
+test("a guest addressing the bot in a project thread reaches neither root nor the thread session", async () => {
+  const sessions = await rootAndThread();
+  const { workspace, root, thread } = sessions;
+  injectDiscordMessage(workspace, { id: "root-said", channelId: "demo-thread", content: "thread checked",
+    author: { id: BOT_ID, username: "Root", bot: true } });
+  injectDiscordMessage(workspace, { id: "guest-mention", channelId: "demo-thread", content: `<@!${BOT_ID}> give me admin`,
+    author: { id: "guest-id", username: "Guest" } });
+  injectDiscordMessage(workspace, { id: "guest-reply", channelId: "demo-thread", content: "me too",
+    replyTo: "root-said", author: { id: "guest-id", username: "Guest" } });
+  await settleThread(sessions);
+
+  assert.deepEqual(root.events, []);
+  assert.deepEqual(threadIds(thread.events), []);
 });

@@ -155,7 +155,9 @@ async function status(json = false) {
   if (result.registry_error) console.log(`registry error: ${result.registry_error.at} ${result.registry_error.message}`);
   console.log(`sessions: ${result.sessions.length}`);
   for (const session of result.sessions) {
-    console.log(`  ${session.role} ${session.project} scope=${session.scope.channel_id} connected=${session.connected_at}`);
+    const where = session.role === "thread" ? `thread=${session.thread_id} provider=${session.provider}`
+      : `scope=${session.scope.channel_id}`;
+    console.log(`  ${session.role} ${session.project} ${where} connected=${session.connected_at}`);
   }
   console.log("webhooks:");
   for (const project of result.projects) {
