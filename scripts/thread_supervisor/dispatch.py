@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import sys
 
-from . import binding, boot
+from . import binding, boot, control, creation
 
 
 HANDLERS = {
+    "channel_command": creation.on_channel_command,
     "thread_create": binding.on_thread_create,
     "thread_message": boot.on_thread_message,
     "thread_session_live": boot.on_session_live,
 }
 # Frames the worker posts itself, never the Router.
 INTERNAL_HANDLERS = {
+    "control": control.on_control,
     "launch_exit": boot.on_launch_exit,
 }
 

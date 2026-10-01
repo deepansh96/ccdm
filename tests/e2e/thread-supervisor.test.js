@@ -190,7 +190,8 @@ test("the supervisor holds no Discord token and sends nothing to Discord but Rou
     assert.ok(!/DISCORD_BOT_TOKEN/.test(environment), `process ${pid} environment names DISCORD_BOT_TOKEN`);
   }
   const stateDir = supervisorStateDir(workspace);
-  for (const name of fs.readdirSync(stateDir)) {
+  // Every file, past the control socket.
+  for (const name of fs.readdirSync(stateDir).filter(name => fs.statSync(path.join(stateDir, name)).isFile())) {
     const content = fs.readFileSync(path.join(stateDir, name));
     assert.ok(!content.includes(ROOT_TOKEN), `${name} holds the token`);
   }

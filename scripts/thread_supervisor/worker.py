@@ -1,4 +1,4 @@
-"""The `run` loop: one locked worker, its store, its Router key and its link."""
+"""The `run` loop: one locked worker, its store, its Router key, its link and its control socket."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import sqlite3
 import sys
 
 from . import store
+from .control import ControlServer
 from .dispatch import dispatch
 from .link import Link
 from .paths import private_directory, write_private, write_supervisor_key
@@ -70,7 +71,9 @@ def run(project_root: Path, state_dir: Path) -> None:
         # A fresh key each start, before the link says hello with it.
         link = Link(write_supervisor_key())
         context = Context(project_root, state_dir, db, link)
+        control = None
         try:
+            control = ControlServer(state_dir, link.post)
             write_health(state_dir, link, "connecting")
             while not stopping:
                 frame = link.next_frame(0.25)
@@ -87,6 +90,8 @@ def run(project_root: Path, state_dir: Path) -> None:
                 elif kind == "link_exit" and not stopping:
                     raise LinkStopped("the Router link stopped")
         finally:
+            if control:
+                control.close()
             link.close()
             health_path(state_dir).unlink(missing_ok=True)
             db.close()

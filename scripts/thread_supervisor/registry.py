@@ -35,3 +35,22 @@ def guests(registry: dict, name: str) -> list[str]:
     entry = project(registry, name) or {}
     values = entry.get("guest_user_ids")
     return [value for value in values if isinstance(value, str)] if isinstance(values, list) else []
+
+
+def accounts(registry: dict, provider: str) -> dict:
+    """A provider's account aliases: `claude_accounts` or `codex_accounts`."""
+    values = registry.get(f"{provider}_accounts")
+    return values if isinstance(values, dict) else {}
+
+
+def resolved_settings(entry: dict, overrides) -> dict:
+    """What a thread's session runs with: each override, else the project's setting."""
+    provider = overrides["provider"] or entry.get("type") or "claude"
+    codex = provider == "codex"
+    return {
+        "provider": provider,
+        "account": overrides["account"],
+        "model": overrides["model"] or (entry.get("codex_model") if codex else None) or entry.get("model"),
+        "effort": overrides["effort"] or (entry.get("codex_reasoning_effort") or entry.get("model_reasoning_effort")
+                                          if codex else entry.get("claude_effort")),
+    }

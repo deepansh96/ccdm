@@ -145,6 +145,20 @@ def pending_request(db: sqlite3.Connection, project: str, name: str) -> sqlite3.
         ORDER BY created_at, request_id LIMIT 1""", (project, name)).fetchone()
 
 
+def add_request(db: sqlite3.Connection, request_id: str, project: str, name: str, overrides: dict,
+                first_message: str | None, requester_id: str, requester_kind: str, created_at: str) -> None:
+    """Insert a pending creation request; null overrides inherit the project's settings."""
+    db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
+        first_message, requester_id, requester_kind, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,'pending',?)""",
+               (request_id, project, name, *(overrides.get(field) for field in OVERRIDES), first_message,
+                requester_id, requester_kind, created_at))
+
+
+def update_request(db: sqlite3.Connection, request_id: str, **fields) -> None:
+    columns = ", ".join(f"{column}=?" for column in fields)
+    db.execute(f"UPDATE creation_requests SET {columns} WHERE request_id=?", (*fields.values(), request_id))
+
+
 def bind(db: sqlite3.Connection, thread_id: str, project: str, name: str, creator_id: str, created_at: str,
          request: sqlite3.Row | None = None) -> bool:
     """Insert a registered thread; False when the thread is already bound. A

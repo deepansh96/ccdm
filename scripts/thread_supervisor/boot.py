@@ -9,6 +9,8 @@ session's channel server, 👀 comes off, and the row is `live`. A launch that
 fails, times out or exits early takes 👀 off, posts a one-line reason, and
 leaves the row `stopped/start-failed`; the next eligible message retries.
 A Codex thread is first given its own app-server port, recorded on the row.
+A thread created with a first message starts at once, with no trigger
+message (so no 👀) and that message as its starter.
 """
 
 from __future__ import annotations
@@ -44,7 +46,8 @@ class Boot:
     """One launch attempt, kept in memory from start until its launcher exits."""
     id: int
     project: str
-    trigger_message_id: str
+    # None for a start a creation request's first message admitted.
+    trigger_message_id: str | None
     starter: str
     live: bool = False
     launched: bool = False
@@ -71,7 +74,9 @@ def _addresses_root(context, content: str) -> bool:
     return bool(context.bot_user_id) and re.search(rf"<@!?{re.escape(context.bot_user_id)}>", content) is not None
 
 
-def _react(context, thread_id: str, message_id: str, remove: bool = False) -> None:
+def _react(context, thread_id: str, message_id: str | None, remove: bool = False) -> None:
+    if message_id is None:
+        return
     try:
         context.link.call("thread_react", {"channel_id": thread_id, "message_id": message_id, "emoji": EYES,
                                            **({"remove": True} if remove else {})})
@@ -119,30 +124,29 @@ def on_thread_message(context, event: dict) -> None:
         start(context, row, event)
 
 
-def start(context, row, trigger: dict) -> None:
+def start(context, row, trigger: dict | None, starter: str | None = None) -> None:
+    """Launch a thread's session for its ``trigger`` message, or with no
+    trigger when a creation request's first message is the ``starter``."""
     thread_id, project = row["thread_id"], row["project"]
     current = registry.load(context.project_root)
     entry = registry.project(current, project)
     if not entry:
         return
-    provider = row["provider"] or entry.get("type") or "claude"
-    codex = provider == "codex"
-    resolved = {
-        "provider": provider,
-        "account": row["account"],
-        "model": row["model"] or (entry.get("codex_model") if codex else None) or entry.get("model"),
-        "effort": row["effort"] or (entry.get("codex_reasoning_effort") or entry.get("model_reasoning_effort")
-                                    if codex else entry.get("claude_effort")),
-    }
+    resolved = registry.resolved_settings(entry, row)
+    codex = resolved["provider"] == "codex"
     store.begin_boot(context.db, thread_id, resolved)
-    store.buffer_message(context.db, thread_id, trigger["message_id"], _payload(trigger), now())
-    _react(context, thread_id, trigger["message_id"])
-    boot = Boot(next(_boot_ids), project, trigger["message_id"], _starter(context, row, trigger.get("parent_channel_id")))
+    trigger_id = trigger["message_id"] if trigger else None
+    if trigger:
+        store.buffer_message(context.db, thread_id, trigger_id, _payload(trigger), now())
+    _react(context, thread_id, trigger_id)
+    if starter is None:
+        starter = _starter(context, row, trigger.get("parent_channel_id") if trigger else None)
+    boot = Boot(next(_boot_ids), project, trigger_id, starter)
     context.boots[thread_id] = boot
     args = [str(LAUNCHER), project, thread_id, "--provider", resolved["provider"]]
     for field in ("account", "model", "effort"):
-        if row[field]:
-            args += [f"--{field}", row[field]]
+        if resolved[field]:
+            args += [f"--{field}", resolved[field]]
     env = {**os.environ, "CCDM_THREAD_BOOTSTRAP_FILE": str(bootstrap_path(project, thread_id)),
            "CCDM_THREAD_BOOT_TIMEOUT_S": f"{boot_timeout_seconds():g}"}
     if codex:
