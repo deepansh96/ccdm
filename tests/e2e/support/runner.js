@@ -581,6 +581,7 @@ function runRouterClaudeHost() {
     }
     // One turn at a time: each notification's tool calls, then the Stop hook.
     let turns = runHooks("SessionStart", { source: "startup" });
+    let toolsListId = null;
     const initializeId = call("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "claude-fixture", version: "1" } });
     let buffer = "";
     child.stdout.setEncoding("utf8");
@@ -595,6 +596,11 @@ function runRouterClaudeHost() {
         if (message.id === initializeId) {
           record("channelServers", { serverInfo: message.result.serverInfo, capabilities: message.result.capabilities });
           write({ method: "notifications/initialized" });
+          toolsListId = call("tools/list", {});
+        } else if (message.id === toolsListId) {
+          // Each server's tools, by the thread it serves (null for a channel).
+          record("toolLists", { threadId: serverEnv.CCDM_THREAD_ID || null,
+            tools: (message.result?.tools || []).map((tool) => tool.name) });
         } else if (message.method === "notifications/claude/channel") {
           record("channelNotifications", message.params);
           const { replyText, toolScript } = readState().fixtures.claude;

@@ -338,6 +338,35 @@ const TOOLS = {
   },
 };
 
+// A Channel Conversation hands a side task off to a Thread Conversation in its
+// own channel; the Thread Supervisor validates and creates it, which can take
+// a while, so the op gets the supervisor's own budget.
+const CREATE_THREAD_TIMEOUT_MS = 60000;
+
+async function createThread(router, { chat_id, name, provider, account, model, effort, first_message }) {
+  const result = await router.request("create_thread", {
+    channel_id: chat_id || scope.channel_id, name, provider, account, model, effort, first_message,
+  }, { timeoutMs: CREATE_THREAD_TIMEOUT_MS });
+  return `created thread (id: ${result.thread_id})`;
+}
+
+if (!ROOT && !THREAD) {
+  TOOLS.create_thread = {
+    description: "Hand a side task off to a new Thread Conversation under this channel, with its own agent session. Optionally override the provider, account, model, or effort, and pass first_message to start the thread's session with it at once. Returns the new thread's id.",
+    properties: {
+      name: { type: "string", description: "Thread name (1-100 characters)." },
+      provider: { type: "string", enum: ["claude", "codex"], description: "Thread provider. Defaults to the project's." },
+      account: { type: "string", description: "An account alias from the provider's claude_accounts or codex_accounts." },
+      model: { type: "string", description: "Model name for the thread's session." },
+      effort: { type: "string", description: "Reasoning effort for the thread's session." },
+      first_message: { type: "string", description: "The task: the thread's first message, which starts its session at once." },
+      chat_id: { type: "string", description: "This session's channel. Omit it; no other channel is allowed." },
+    },
+    required: ["name"],
+    run: createThread,
+  };
+}
+
 // Root reads any of its channels, so its read tools take the channel; reply
 // correlation is a project Conversation Reminder concern.
 if (ROOT) {

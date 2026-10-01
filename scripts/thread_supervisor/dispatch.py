@@ -10,6 +10,7 @@ from . import binding, boot, control, creation
 HANDLERS = {
     "channel_command": creation.on_channel_command,
     "thread_create": binding.on_thread_create,
+    "thread_create_request": creation.on_create_request,
     "thread_message": boot.on_thread_message,
     "thread_session_live": boot.on_session_live,
 }

@@ -269,6 +269,30 @@ const ALL_TOOLS = [
   },
 ];
 
+// A Codex Channel Conversation hands a side task off to a Thread Conversation
+// in its own channel; neither a thread nor root has the tool.
+const CREATE_THREAD_TIMEOUT_MS = 60000;
+if (!ROUTER_ROOT && !ROUTER_THREAD_ID) {
+  ALL_TOOLS.push({
+    name: "create_thread",
+    description:
+      "Hand a side task off to a new Thread Conversation under this channel, with its own agent session. Optionally override the provider, account, model, or effort, and pass first_message to start the thread's session with it at once. Returns the new thread's id.",
+    inputSchema: {
+      type: "object",
+      properties: withScopeToken({
+        name: { type: "string", description: "Thread name (1-100 characters)" },
+        provider: { type: "string", enum: ["claude", "codex"], description: "Thread provider. Defaults to the project's." },
+        account: { type: "string", description: "An account alias from the provider's claude_accounts or codex_accounts" },
+        model: { type: "string", description: "Model name for the thread's session" },
+        effort: { type: "string", description: "Reasoning effort for the thread's session" },
+        first_message: { type: "string", description: "The task: the thread's first message, which starts its session at once" },
+        channel_id: { type: "string", description: "This session's channel. Omit it; no other channel is allowed." },
+      }),
+      required: requiredWithScope(["name"]),
+    },
+  });
+}
+
 // One op-only Router connection (`listener: false`), so the bridge keeps its
 // place as the project's listener. A failed or ended connection is retried on
 // the next tool call.
@@ -312,14 +336,16 @@ async function emergencyRequest(op, channelId, args) {
   }
 }
 
-async function routerRequest(op, channelId, args) {
+// `detail` adds the Router's reason to the error code.
+async function routerRequest(op, channelId, args, { detail = false, ...options } = {}) {
   try {
     const client = await routerClient();
-    return await client.request(op, { channel_id: channelId, ...args });
+    return await client.request(op, { channel_id: channelId, ...args }, options);
   } catch (error) {
     const direct = error.code === "router_unavailable" ? await emergencyRequest(op, channelId, args) : null;
     if (direct) return direct.result;
-    throw new Error(`Router ${op} failed: ${error.code || error.message}`);
+    const reason = detail && error.code && error.message && error.message !== error.code ? `: ${error.message}` : "";
+    throw new Error(`Router ${op} failed: ${error.code || error.message}${reason}`);
   }
 }
 
@@ -405,6 +431,17 @@ async function handleToolCall(name, args) {
       if (!res.ok) throw new Error(`Failed to download: ${res.status}`);
       await writeFile(filePath, Buffer.from(await res.arrayBuffer()));
       return filePath;
+    }
+
+    case "create_thread": {
+      if (ROUTER_ROOT || ROUTER_THREAD_ID) throw new Error(`Unknown tool: ${name}`);
+      const { scope_token, channel_id, name: threadName, provider, account, model, effort, first_message } = args;
+      requireScopeToken(scope_token);
+      // The Router refuses any channel but this session's own.
+      const result = await routerRequest("create_thread", channel_id || channelId, {
+        name: threadName, provider, account, model, effort, first_message,
+      }, { timeoutMs: CREATE_THREAD_TIMEOUT_MS, detail: true });
+      return `created thread (id: ${result.thread_id})`;
     }
 
     default:

@@ -1,4 +1,5 @@
-"""Creation: one flow for `/thread` in a project channel and `threads.sh create`.
+"""Creation: one flow for `/thread` in a project channel, `threads.sh create`, and a
+channel agent's `create_thread` tool (the Router's `thread_create_request`).
 
 The flags are validated against the registry first; a failure creates nothing.
 Then a pending creation request is stored, the root bot creates the thread
@@ -142,3 +143,23 @@ def on_channel_command(context, event: dict) -> None:
         except LinkError as notice_error:
             print(f"thread-supervisor: the /thread refusal notice failed: {notice_error.code}",
                   file=sys.stderr, flush=True)
+
+
+def on_create_request(context, event: dict) -> None:
+    """A channel agent's `create_thread`, in its own channel: always answered
+    with `thread_request_done`, the thread id or the op error the tool returns."""
+    project = event.get("project")
+    flags = {field: event[field] for field in FLAGS if event.get(field) is not None}
+    try:
+        result = create(context, project, event.get("name"), flags, event.get("first_message"), str(project),
+                        "channel-agent")
+        done = {"ok": True, "thread_id": result["thread_id"]}
+    except Invalid as error:
+        done = {"ok": False, "error": {"code": "invalid", "message": str(error)}}
+    except Exception as error:  # The waiting tool must hear back, whatever failed.
+        done = {"ok": False, "error": {"code": "thread_create_failed", "message": str(error)}}
+    try:
+        context.link.call("thread_request_done", {"request_id": event.get("request_id"), **done})
+    except LinkError as error:
+        print(f"thread-supervisor: create_thread {event.get('request_id')}: thread_request_done failed: {error.code}",
+              file=sys.stderr, flush=True)

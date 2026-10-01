@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { injectDiscordMessage } from "./support/bridge.js";
+import { collectProcess, injectDiscordMessage } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
-import { OWNER_ID, ROOT_TOKEN, connectSession, createRouterWorkspace, routerRegistry, routerWithWebhooks,
-  waitFor } from "./support/router.js";
+import { OWNER_ID, ROOT_TOKEN, connectSession, createRouterWorkspace, routerEnv, routerRegistry,
+  routerWithWebhooks, waitFor } from "./support/router.js";
 import { readState, updateState } from "./support/state.js";
-import { cleanup } from "./support/teardown.js";
+import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 import { startThreadSupervisor, supervisorEnv, supervisorStateDir, supervisorStatus } from "./support/thread-supervisor.js";
 
 test.afterEach(cleanup);
@@ -33,12 +34,14 @@ function commandWorkspace(extra = {}) {
   const registryFile = path.join(workspace.repoDir, "registry.json");
   const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
   registry.projects.demo.path = workspace.tmpDir;
+  registry.projects.beta.path = workspace.tmpDir;
+  registry.projects.beta.screen_name = "beta_codex";
   fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
   return workspace;
 }
 
-async function supervised(workspace) {
-  await routerWithWebhooks(workspace, ["demo"]);
+async function supervised(workspace, projects = ["demo"]) {
+  await routerWithWebhooks(workspace, projects);
   updateState(workspace.stateDir, state => {
     state.fixtures.claude.replyText = "on it";
   });
@@ -54,7 +57,7 @@ async function threadRow(workspace, threadId, predicate = () => true, timeoutMs 
   let last;
   while (Date.now() < deadline) {
     last = await supervisorStatus(workspace);
-    const row = last.projects?.demo?.threads?.[threadId];
+    const row = Object.values(last.projects ?? {}).map(project => project.threads?.[threadId]).find(Boolean);
     if (row && predicate(row)) return row;
     await new Promise(resolve => setTimeout(resolve, 50));
   }
@@ -220,4 +223,138 @@ test("a bot-created thread with no matching pending request binds nothing", asyn
   await waitFor(() => (discord(workspace).deliveredThreads ?? []).length === 1, () => "the thread_create");
   await settle(1000);
   assert.deepEqual((await supervisorStatus(workspace)).projects, {});
+});
+
+// A side task handed off from a Channel Conversation with the create_thread
+// tool. The fixture claude runs `toolScript` on every notification, the
+// Channel Conversation's and the new thread's alike.
+async function channelSession(workspace, toolScript) {
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.toolScript = toolScript;
+  });
+  const started = await runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace) });
+  assert.equal(started.exitCode, 0, started.stderr || started.stdout);
+  channelMessage(workspace, "owner-message-1", "split the parser work off");
+}
+
+const toolResults = workspace => claude(workspace).toolResults ?? [];
+const resultText = entry => entry.result?.content?.[0]?.text ?? entry.error?.message ?? "";
+const toolList = (workspace, threadId) => (claude(workspace).toolLists ?? []).find(list => list.threadId === threadId);
+
+test("a Claude channel session's create_thread with a first message creates a one-week thread with the notice and starts a thread session with that message as its starter", async () => {
+  const workspace = commandWorkspace();
+  await supervised(workspace);
+  await channelSession(workspace, [{ name: "create_thread", arguments: { name: "parser-port", effort: "high",
+    first_message: "port the parser to the new API" } }]);
+
+  await waitFor(() => toolResults(workspace).some(entry => entry.name === "create_thread"),
+    () => `the create_thread result: ${JSON.stringify(claude(workspace))}`, 15000);
+  const [created] = toolResults(workspace).filter(entry => entry.name === "create_thread");
+  assert.equal(created.result.isError, undefined, JSON.stringify(created));
+  assert.match(resultText(created), new RegExp(CREATED_THREAD_ID));
+
+  await threadRow(workspace, CREATED_THREAD_ID, row => row.state === "live");
+  await waitFor(() => notifications(workspace).some(item => item.meta.chat_id === CREATED_THREAD_ID),
+    () => `the thread bootstrap: ${JSON.stringify(notifications(workspace))}`, 15000);
+  assert.deepEqual(threadCreates(workspace), [{ authorization: ROOT_AUTH, channelId: "demo-channel",
+    body: { name: "parser-port", type: 11, auto_archive_duration: 10080 } }]);
+  const [notice] = notices(workspace, CREATED_THREAD_ID);
+  assert.equal(notice.authorization, ROOT_AUTH);
+  for (const setting of ["high", "port the parser to the new API"]) {
+    assert.ok(notice.content.includes(setting), `${setting} in ${notice.content}`);
+  }
+  const bootstrap = notifications(workspace).find(item => item.meta.chat_id === CREATED_THREAD_ID);
+  assert.match(bootstrap.content, /port the parser to the new API/);
+  const row = await threadRow(workspace, CREATED_THREAD_ID);
+  assert.deepEqual([row.name, row.effort], ["parser-port", "high"]);
+
+  // The channel session lists the tool; the thread session neither lists nor runs it.
+  assert.ok(toolList(workspace, null).tools.includes("create_thread"));
+  await waitFor(() => toolList(workspace, CREATED_THREAD_ID), () => "the thread session's tools");
+  assert.equal(toolList(workspace, CREATED_THREAD_ID).tools.includes("create_thread"), false);
+  await waitFor(() => toolResults(workspace).filter(entry => entry.name === "create_thread").length === 2,
+    () => "the thread session's create_thread attempt");
+  assert.match(resultText(toolResults(workspace).filter(entry => entry.name === "create_thread")[1]), /unknown tool/);
+  assert.equal(threadCreates(workspace).length, 1);
+});
+
+test("create_thread with invalid overrides returns an op error, refuses another channel, and creates no thread", async () => {
+  const workspace = commandWorkspace();
+  await supervised(workspace);
+  await channelSession(workspace, [
+    { name: "create_thread", arguments: { name: "a", effort: "turbo" } },
+    // `work` is a Claude alias, not a Codex one.
+    { name: "create_thread", arguments: { name: "b", provider: "codex", account: "work" } },
+    { name: "create_thread", arguments: { name: "c", chat_id: "beta-channel" } },
+  ]);
+
+  await waitFor(() => toolResults(workspace).filter(entry => entry.name === "create_thread").length === 3,
+    () => `three create_thread results: ${JSON.stringify(toolResults(workspace))}`, 15000);
+  const [effort, account, elsewhere] = toolResults(workspace).filter(entry => entry.name === "create_thread");
+  for (const entry of [effort, account, elsewhere]) assert.equal(entry.result.isError, true, JSON.stringify(entry));
+  assert.match(resultText(effort), /invalid.*turbo/);
+  assert.match(resultText(account), /invalid.*work/);
+  assert.match(resultText(elsewhere), /scope_violation/);
+  await settle(500);
+  assert.deepEqual(threadCreates(workspace), []);
+  assert.deepEqual((await supervisorStatus(workspace)).projects, {});
+});
+
+test("create_thread returns supervisor_unavailable with the supervisor stopped", async () => {
+  const workspace = commandWorkspace();
+  const supervisor = await supervised(workspace);
+  await supervisor.stop();
+  await channelSession(workspace, [{ name: "create_thread", arguments: { name: "later" } }]);
+
+  await waitFor(() => toolResults(workspace).some(entry => entry.name === "create_thread"),
+    () => `the create_thread result: ${JSON.stringify(toolResults(workspace))}`, 15000);
+  const [result] = toolResults(workspace).filter(entry => entry.name === "create_thread");
+  assert.equal(result.result.isError, true);
+  assert.match(resultText(result), /supervisor_unavailable/);
+  assert.deepEqual(threadCreates(workspace), []);
+});
+
+// `beta`'s Codex channel session reaches the Router through its scoped
+// Discord MCP server, as the bridge configures it.
+async function codexMcpCall(workspace, args) {
+  const env = routerEnv(workspace, { CCDM_ROUTER_KEY_FILE: path.join(workspace.routerStateDir, "keys", "beta.key"),
+    CCDM_CODEX_PROJECT: "beta", CHANNEL_ID: "beta-channel" });
+  const command = [process.execPath, path.join(workspace.repoDir, "scripts/discord-mcp-server.js")];
+  const child = spawn(command[0], command.slice(1), { cwd: workspace.repoDir, detached: true, env,
+    stdio: ["pipe", "pipe", "pipe"] });
+  const running = collectProcess(child, { command, cwd: workspace.repoDir, detached: true, env }, workspace);
+  registerTeardownCallback(() => running.stop());
+  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call",
+    params: { name: "create_thread", arguments: args } })}\n`);
+  await waitFor(() => running.stdout.includes("\n"), () => `the MCP response: ${running.stderr}`, 20000);
+  child.stdin.end();
+  await running.closed;
+  return JSON.parse(running.stdout.trim().split("\n")[0]);
+}
+
+test("a Codex channel session's create_thread through the Discord MCP creates the thread and starts it with the first message", async () => {
+  const workspace = commandWorkspace();
+  await supervised(workspace, ["demo", "beta"]);
+
+  const response = await codexMcpCall(workspace, { name: "codex-side-task", provider: "claude",
+    first_message: "summarise the open issues" });
+  assert.equal(response.result.isError, undefined, JSON.stringify(response));
+  assert.match(response.result.content[0].text, new RegExp(CREATED_THREAD_ID));
+
+  await threadRow(workspace, CREATED_THREAD_ID, row => row.state === "live");
+  await waitFor(() => notifications(workspace).some(item => item.meta.chat_id === CREATED_THREAD_ID),
+    () => `the thread bootstrap: ${JSON.stringify(notifications(workspace))}`, 15000);
+  assert.deepEqual(threadCreates(workspace), [{ authorization: ROOT_AUTH, channelId: "beta-channel",
+    body: { name: "codex-side-task", type: 11, auto_archive_duration: 10080 } }]);
+  const [notice] = notices(workspace, CREATED_THREAD_ID);
+  assert.ok(notice.content.includes("summarise the open issues"), notice.content);
+  assert.match(notifications(workspace).find(item => item.meta.chat_id === CREATED_THREAD_ID).content,
+    /summarise the open issues/);
+
+  const invalid = await codexMcpCall(workspace, { name: "bad", effort: "max" });
+  assert.equal(invalid.result.isError, true);
+  assert.match(invalid.result.content[0].text, /invalid.*max/);
+  const elsewhere = await codexMcpCall(workspace, { name: "elsewhere", channel_id: "demo-channel" });
+  assert.match(elsewhere.result.content[0].text, /scope_violation/);
+  assert.equal(threadCreates(workspace).length, 1);
 });
