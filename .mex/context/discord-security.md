@@ -17,7 +17,7 @@ edges:
     condition: when granting, syncing, listing, or revoking guest access
   - target: patterns/debug-discord-session.md
     condition: when a session cannot read or reply in its channel
-last_updated: 2026-10-01
+last_updated: 2026-10-02
 ---
 
 # Discord Security
@@ -59,4 +59,4 @@ Project-specific user and channel access exceptions live in ignored `CLAUDE.loca
 
 ## Routing Rules
 
-At Router message ingress, only Discord default (0) and reply (19) messages are eligible; all system notices are dropped before session or observer routing. Only owner and channel-guest messages and reactions are forwarded (in a thread, the guests of its parent channel, read on every message); bot and webhook messages never reach sessions. Root channels (`root_channels`) go to root for the owner and `root_allowed_user_ids`. In a project channel, a bot mention or a native reply to a root-bot message goes to root only, preventing duplicate responses; a reply to the project's webhook message goes to the project. Plain management commands go to the project session, and `/close` goes only to the reminder observer. A thread message reaches only its Thread Conversation; the thread's `/close`, `/config`, `/restart` and `/clear`, and a channel's `/thread` and `/config`, reach only the Thread Supervisor. A channel with no live session gets 💤, with no replay, and so does a thread message with neither a live session nor a supervisor; a project without `webhook_id` (not yet migrated) is dropped without 💤, since its old pool bot may still serve it.
+At Router message ingress, only Discord default (0) and reply (19) messages are eligible; all system notices are dropped before session or observer routing. Only owner and channel-guest messages and reactions are forwarded (in a thread, the guests of its parent channel, read on every message); bot and webhook messages never reach sessions. Root channels (`root_channels`) go to root for the owner and `root_allowed_user_ids`. In a project channel, a bot mention or a native reply to a root-bot message goes to root only, preventing duplicate responses; a reply to the project's webhook message goes to the project. Plain management commands go to the project session, and `/close` goes only to the reminder observer. A thread message reaches only its Thread Conversation; the thread's `/close`, `/config`, `/model`, `/restart` and `/clear`, and a channel's `/thread`, `/config` and `/model`, reach only the Thread Supervisor; a root channel's `/model` reaches root as a command that root answers without a model turn. A channel with no live session gets 💤, with no replay, and so does a thread message with neither a live session nor a supervisor; a project without `webhook_id` (not yet migrated) is dropped without 💤, since its old pool bot may still serve it.
