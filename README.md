@@ -870,6 +870,26 @@ Replace `/path/to/ccdm` and `/Users/YOU` with your actual paths. The Launch Agen
 
 To unload: `launchctl unload ~/Library/LaunchAgents/com.claude.root-agent.plist`
 
+If tmux Continuum or Resurrect also restores sessions at login, add this to
+`~/.tmux.conf` before the plugin loader:
+
+```tmux
+# Keep session restoration from replacing an agent already started by launchd.
+set -g @resurrect-never-overwrite 'on'
+```
+
+Apply it to an already-running tmux server with
+`tmux set-option -g @resurrect-never-overwrite on`. Resurrect otherwise treats a
+server with only one pane as a restore from scratch and can replace that pane
+with a saved shell, stopping a newly started root agent. Restoring saved pane
+contents does not restart the agent process.
+
+This LaunchAgent launches a detached tmux session once; it does not supervise
+the bridge after startup. A successful launchd exit therefore does not prove
+root is still connected. Check `node scripts/router.js status` for a live root
+listener when Discord is online but messages receive 💤.
+
+
 ## Security Note
 
 CCDM uses the `--dangerously-skip-permissions` flag when starting Claude Code sessions. This is necessary because automated bot sessions cannot interactively confirm permission prompts.
