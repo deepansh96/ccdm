@@ -50,9 +50,10 @@ Accounts are aliases only. Claude aliases live in the registry's `claude_account
 | `/restart` | owner or guest | Relaunches the session with `--resume` into the same conversation. |
 | `/clear` | owner or guest | Relaunches the session as a fresh conversation. |
 | `/config` | owner | With no arguments, shows provider, account, model and effort. `model=` and `effort=` save and restart with resume. `provider=` and `account=` warn that the next conversation starts fresh, and apply only after the owner's ✅ on that warning. |
+| `/model` | owner or guest | Shows the provider, model, thinking level and account/home the thread's session runs with, each marked `(thread)`, `(project)` or `(home config)`. It changes nothing and starts no session. |
 | `/compact`, `/pause`, `/unpause` | owner or guest | Go to the live session. With no session, the supervisor answers `No live session in this thread.` |
 
-`/thread` and `/config` never reach a model. Every in-thread command affects only its own thread.
+`/thread`, `/config` and `/model` never reach a model; in a project channel `/model` shows the channel session's settings the same way. Every in-thread command affects only its own thread.
 
 ## Archive, delete and resume
 

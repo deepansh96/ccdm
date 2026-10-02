@@ -7,7 +7,8 @@ is the owner's: the acknowledgement is posted first (a post after archiving
 would unarchive the thread), `pending_close` is set, the thread is archived
 through `thread_update`, the session stops, and the row is
 `closed/close-command`. `/compact`, `/pause` and `/unpause` reach the supervisor
-only when the thread has no live session. Every answer is a root-bot notice.
+only when the thread has no live session. `/model`, from the owner or a
+guest, lists the thread's model, thinking level and account. Every answer is a root-bot notice.
 A `/restart`, `/clear` or `/close` that arrives while the thread's launcher
 still runs waits for it to exit, so a stop never races a launch.
 """
@@ -17,7 +18,7 @@ from __future__ import annotations
 import json
 import sys
 
-from . import boot, config, lifecycle, reminders, store
+from . import boot, config, lifecycle, model_info, reminders, store
 from .clock import now
 from .link import LinkError
 
@@ -52,6 +53,8 @@ def on_thread_command(context, event: dict) -> None:
     command = event.get("command")
     if command in ("compact", "pause", "unpause"):
         return _notice(context, thread_id, NO_LIVE_SESSION)
+    if command == "model":  # Read-only, so it never waits for a launch.
+        return model_info.on_thread_model(context, row)
     launching = context.boots.get(thread_id)
     changes_config = command == "config" and str(event.get("args") or "").strip()
     if (command in ("restart", "clear", "close") or changes_config) and launching and not launching.launched:

@@ -64,6 +64,7 @@ const reminder = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
 const { markTurn } = require("./thread-activity.js");
 const { createEmergencyGateway } = require("./router/emergency.js");
+const modelInfo = require("./model-info.js");
 
 const ROOT_DIR = path.dirname(__dirname);
 const PROTOCOL_VERSION = "2025-03-26";
@@ -529,7 +530,7 @@ function main() {
   }
   // Root's emergency direct gateway delivers like the Router, until root rejoins it.
   const fallback = ROOT ? createEmergencyGateway({
-    onMessage: event => deliver("message")(event),
+    onMessage: event => (modelInfo.isModelCommand(event.content) ? answerModel(event) : deliver("message")(event)),
     log: line => process.stderr.write(`ccdm channel: ${line}\n`),
   }) : null;
   const router = new RouterClient({ project, key, role: ROOT ? "root" : THREAD ? "thread" : "project",
@@ -537,6 +538,14 @@ function main() {
     ...(fallback ? { beforeHello: () => fallback.release() } : {}) });
   fallback?.watch(router);
   const request = fallback ? fallback.request(router) : (op, args) => router.request(op, args);
+  // Root answers `/model` itself, from its own launch, without a Claude turn.
+  function answerModel(event) {
+    const text = modelInfo.describe({ provider: "claude", home: process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude"),
+      model: process.env.ANTHROPIC_MODEL, registry: modelInfo.readRegistry(REGISTRY_PATH) });
+    request("reply", { channel_id: event.channel_id, text }).catch(error => {
+      process.stderr.write(`ccdm channel: /model failed: ${error.code || error.message}\n`);
+    });
+  }
 
   // Channel notifications wait until Claude has finished initializing.
   let initialized = false;
@@ -637,7 +646,10 @@ function main() {
   }
   let commands = Promise.resolve();
   router.on("command", event => {
-    if (ROOT) return;
+    if (ROOT) {
+      if (event.command === "model") answerModel(event);
+      return;
+    }
     const run = Object.hasOwn(COMMANDS, event.command) ? COMMANDS[event.command] : null;
     if (!run) return;
     commands = commands.then(() => run(event)).catch(error => {

@@ -271,7 +271,9 @@ async function cleanupRetired(project) {
 
 // In a thread these are the supervisor's or the thread session's commands.
 // They acknowledge without reopening; the supervisor reports a thread's closure.
-const THREAD_COMMAND = /^\/(?:close|restart|clear|config|compact|pause|unpause)(?:\s|$)/;
+const THREAD_COMMAND = /^\/(?:close|restart|clear|config|model|compact|pause|unpause)(?:\s|$)/;
+// The supervisor answers `/model` in a channel too; it never needs an agent reply.
+const MODEL_COMMAND = /^\/model(?:\s|$)/;
 
 // One message in a project channel or one of its threads, from the Router.
 async function observeOwnerMessage({ channelId, threadId, project, messageId, authorId, bot, content,
@@ -292,7 +294,7 @@ async function observeOwnerMessage({ channelId, threadId, project, messageId, au
   // Root-management traffic never reopens a conversation, wherever the mention sits.
   const rootMention = [`<@${rootUserId()}>`, `<@!${rootUserId()}>`].some(value => trimmed.includes(value));
   const managedCommand = threadId ? THREAD_COMMAND.test(trimmed)
-    : ["/compact", "/clear", "/pause", "/unpause", "/restart"].includes(trimmed);
+    : ["/compact", "/clear", "/pause", "/unpause", "/restart"].includes(trimmed) || MODEL_COMMAND.test(trimmed);
   if (!trimmed && !attachmentCount) return;
   const kind = managedCommand || rootMention ? "management-command"
     : attachmentCount ? "attachment" : "message";

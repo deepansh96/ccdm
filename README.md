@@ -465,6 +465,7 @@ In a project channel, these plain commands are handled by that project's session
 | `/compact` / `/clear` | Compact or clear that project's conversation |
 | `/restart` | Restart that project's session only (never root) |
 | `/close` | End Conversation Reminders for the channel; it reaches only the reminder service |
+| `/model` | Show the model, thinking level and account/home the channel's session runs with; the Thread Supervisor answers it (in a root channel, root does), with no agent turn |
 
 ### Resuming a Codex conversation
 
@@ -568,6 +569,7 @@ Open a public thread under a registered project channel and type a task: it beco
 - **Create** by hand, with `/thread <name> [--provider claude|codex] [--account <alias>] [--model <model>] [--effort <effort>] [first message…]` in the project channel, from the channel agent's `create_thread` tool, or with `scripts/threads.sh create <project> <name> [flags] [message]`. Created threads auto-archive after a week.
 - **In a thread:**
   - `/config` shows or changes the thread's provider, account, model and effort. A provider or account change applies only after your ✅.
+  - `/model` shows the model, thinking level and account/home the thread runs with.
   - `/restart` resumes the conversation, and `/clear` starts a fresh one.
   - `/compact`, `/pause` and `/unpause` work as in a channel.
   - `/close` archives the thread, stops its session and closes its reminders.

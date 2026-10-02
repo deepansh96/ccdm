@@ -157,3 +157,26 @@ test("a root launch whose Router hello fails exits non-zero and removes root's k
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent, undefined);
   assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", ".root.key")), false);
 });
+
+test("/model in a root channel is answered by root Claude's channel server from its home, never reaching Claude", async () => {
+  const workspace = rootWorkspace();
+  fs.mkdirSync(path.join(workspace.homeDir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(workspace.homeDir, ".claude", "settings.json"), JSON.stringify({ effortLevel: "high" }));
+  await routerWithWebhooks(workspace, ["demo"]);
+  const restarted = await restartRoot(workspace);
+  assert.equal(restarted.exitCode, 0, restarted.stderr || restarted.stdout);
+
+  injectDiscordMessage(workspace, { id: "model", channelId: "root-channel", content: "/model",
+    author: { id: OWNER_ID, username: "Owner" } });
+  injectDiscordMessage(workspace, { id: "after", channelId: "root-channel", content: "fence",
+    author: { id: OWNER_ID, username: "Owner" } });
+
+  const done = await waitForState(workspace, (next) => next.fixtures.discord.messages.length > 0 &&
+    next.fixtures.claude.channelNotifications?.length >= 1, 10000);
+  assert.deepEqual(done.fixtures.discord.messages.map(({ channelId, content, authorization }) =>
+    ({ channelId, content, authorization })), [
+    { channelId: "root-channel", authorization: `Bot ${ROOT_TOKEN}`, content:
+      "Root's session:\nProvider: claude\nModel: account default\nThinking: high (home config)\nAccount: ~/.claude" },
+  ]);
+  assert.deepEqual(done.fixtures.claude.channelNotifications.map(({ meta }) => meta.message_id), ["after"]);
+});

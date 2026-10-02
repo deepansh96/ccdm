@@ -40,7 +40,7 @@ from .paths import router_state_dir, write_private
 EYES = "👀"
 DRIVERS = ("owner", "guest")
 # Thread commands are the supervisor's or the session's, never a boot trigger.
-COMMAND = re.compile(r"^/(?:close|config|restart|clear|compact|pause|unpause)(?:\s|$)")
+COMMAND = re.compile(r"^/(?:close|config|model|restart|clear|compact|pause|unpause)(?:\s|$)")
 DEFAULT_BOOT_TIMEOUT_SECONDS = 120
 LAUNCHER = Path(__file__).resolve().parent.parent / "start-thread-session.sh"
 NOTICE_LIMIT = 300

@@ -8,9 +8,11 @@ const CLOSE_COMMAND = "/close";
 // In a thread, only these reach the thread session as commands; the
 // supervisor's commands never reach it.
 const THREAD_COMMANDS = new Set(["/pause", "/unpause", "/compact"]);
-const SUPERVISOR_COMMAND = /^\/(?:close|restart|clear|config)(?:\s|$)/;
+const SUPERVISOR_COMMAND = /^\/(?:close|restart|clear|config|model)(?:\s|$)/;
 // In a project channel, these are the supervisor's and never reach the session.
-const CHANNEL_COMMAND = /^\/(?:thread|config)(?:\s|$)/;
+const CHANNEL_COMMAND = /^\/(?:thread|config|model)(?:\s|$)/;
+// In a root channel, root's own session answers `/model` from its launch settings.
+const ROOT_COMMAND = /^\/model(?:\s|$)/;
 const PUBLIC_THREAD = 11;
 const FORUM_TYPES = new Set([15, 16]);
 
@@ -76,7 +78,12 @@ function classifyMessage(table, message, thread = null) {
   if (table.rootChannels.has(channelId)) {
     const author = allowedAuthor(table.rootAllowedUserIds, table, user);
     const route = { project: "root", channel_id: channelId };
-    return author ? { route, root: true, event: messageEvent(route, author, message) } : null;
+    if (!author) return null;
+    if (ROOT_COMMAND.test(String(message.content || "").trim())) {
+      return { route, root: true, event: { event: "command", command: "model", message_id: message.id,
+        channel_id: channelId, author, ts: new Date(message.createdTimestamp).toISOString() } };
+    }
+    return { route, root: true, event: messageEvent(route, author, message) };
   }
   const route = table.channels.get(channelId);
   if (!route) return null;
@@ -94,7 +101,7 @@ function classifyMessage(table, message, thread = null) {
     ts: new Date(message.createdTimestamp).toISOString(),
   };
   const content = String(message.content || "");
-  // 5. `/thread` and `/config` are the Thread Supervisor's (`supervisor: true`).
+  // 5. `/thread`, `/config` and `/model` are the Thread Supervisor's (`supervisor: true`).
   if (CHANNEL_COMMAND.test(content.trim())) {
     return { route, supervisor: true, event: supervisorCommand("channel_command", route, author, message) };
   }

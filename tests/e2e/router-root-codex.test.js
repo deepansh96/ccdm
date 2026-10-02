@@ -276,3 +276,23 @@ test("a root Codex launch whose Router hello fails exits non-zero and removes ro
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent, undefined);
   assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", ".root.key")), false);
 });
+
+test("/model in a root channel is answered by root Codex from its home, without a turn", async () => {
+  const workspace = rootWorkspace();
+  fs.writeFileSync(path.join(workspace.homeDir, ".codex", "config.toml"),
+    'model = "gpt-root"\nmodel_reasoning_effort = "low"\n\n[profiles.other]\nmodel = "not-this"\n');
+  const codex = await startFakeCodexServer(workspace);
+  await routerWithWebhooks(workspace, ["demo"]);
+  const restarted = await restartRootCodex(workspace, codex.port);
+  assert.equal(restarted.exitCode, 0, restarted.stderr || restarted.stdout);
+
+  discordMessage(workspace, { id: "model", channelId: "root-channel", content: "/model" });
+
+  const done = await waitForState(workspace, (next) => next.fixtures.discord.messages.length > 0, 15000);
+  assert.deepEqual(done.fixtures.discord.messages.map(({ channelId, content, authorization, webhookId }) =>
+    ({ channelId, content, authorization, webhookId })), [
+    { channelId: "root-channel", authorization: `Bot ${ROOT_TOKEN}`, webhookId: undefined, content:
+      "Root's session:\nProvider: codex\nModel: gpt-root (home config)\nThinking: low (home config)\nAccount: ~/.codex" },
+  ]);
+  assert.deepEqual(routedTurns(codex), []);
+});

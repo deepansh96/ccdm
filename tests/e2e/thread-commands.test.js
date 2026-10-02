@@ -799,3 +799,55 @@ test("/config in a project channel posts the settings new threads inherit and ne
   assert.equal(JSON.parse(fs.readFileSync(registryFile, "utf8")).projects.demo.model, "claude-project-model");
   assert.deepEqual(claude(workspace).invocations, []);
 });
+
+// `/model`: what a channel's or thread's session runs with, for the owner or a
+// guest. Values the registry or thread leave unset come from the provider home.
+test("/model in a project channel lists the channel session's model, thinking level and account and never reaches it", async () => {
+  const workspace = commandWorkspace();
+  const registryFile = path.join(workspace.repoDir, "registry.json");
+  const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+  Object.assign(registry.projects.demo, { model: "claude-project-model", claude_home: "~/.claude-work" });
+  Object.assign(registry.projects.beta, { codex_account: "codex-work" });
+  fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
+  fs.mkdirSync(path.join(workspace.homeDir, ".claude-work"), { recursive: true });
+  fs.writeFileSync(path.join(workspace.homeDir, ".claude-work", "settings.json"), JSON.stringify({ effortLevel: "max" }));
+  fs.mkdirSync(path.join(workspace.homeDir, ".codex-work"), { recursive: true });
+  fs.writeFileSync(path.join(workspace.homeDir, ".codex-work", "config.toml"),
+    'model = "gpt-home"\nmodel_reasoning_effort = "xhigh"\n');
+  await supervised(workspace, ["demo", "beta"]);
+  const channel = await connectSession(workspace, "demo", "demo-key");
+
+  channelMessage(workspace, "channel-model-1", "/model");
+  channelMessage(workspace, "channel-model-2", "/model", GUEST);
+  injectDiscordMessage(workspace, { id: "channel-model-3", channelId: "beta-channel", content: "/model",
+    author: { id: OWNER_ID, username: "Owner" } });
+  await waitFor(() => notices(workspace, "demo-channel").length === 2 && notices(workspace, "beta-channel").length === 1,
+    () => `three /model notices: ${JSON.stringify(discord(workspace).messages)}`, 15000);
+  const demo = "This channel's session:\nProvider: claude\nModel: claude-project-model (project)\n" +
+    "Thinking: max (home config)\nAccount: work · ~/.claude-work";
+  assert.deepEqual(notices(workspace, "demo-channel"), [
+    { authorization: ROOT_AUTH, content: demo }, { authorization: ROOT_AUTH, content: demo }]);
+  assert.deepEqual(notices(workspace, "beta-channel"), [{ authorization: ROOT_AUTH, content:
+    "This channel's session:\nProvider: codex\nModel: gpt-home (home config)\nThinking: xhigh (home config)\n" +
+    "Account: codex-work · ~/.codex-work" }]);
+  await settle(500);
+  assert.deepEqual(channel.events.filter(event => String(event.message_id).startsWith("channel-model")), []);
+  assert.deepEqual(claude(workspace).invocations, []);
+});
+
+test("/model in a thread lists its overrides and project settings, for a guest too, without starting a session", async () => {
+  const workspace = commandWorkspace();
+  await supervised(workspace);
+  channelMessage(workspace, "thread-command-1", "/thread modelled --model claude-test-model --effort high");
+  await threadRow(workspace, CREATED_THREAD_ID);
+  await waitFor(() => notices(workspace, CREATED_THREAD_ID).length === 1, () => "the settings notice", 15000);
+
+  threadMessage(workspace, CREATED_THREAD_ID, "model-1", "/model", GUEST);
+  await waitFor(() => notices(workspace, CREATED_THREAD_ID).length === 2, () => "the /model notice", 15000);
+  assert.deepEqual(notices(workspace, CREATED_THREAD_ID)[1], { authorization: ROOT_AUTH, content:
+    "This thread's session (registered):\nProvider: claude\nModel: claude-test-model (thread)\n" +
+    "Thinking: high (thread)\nAccount: ~/.claude" });
+  await settle(500);
+  assert.equal((await threadRow(workspace, CREATED_THREAD_ID)).state, "registered");
+  assert.deepEqual(claude(workspace).invocations, []);
+});

@@ -21,6 +21,7 @@ process.env.CCDM_REMINDER_RECEIPTS_DIR = REMINDER_RECEIPTS_DIR;
 const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { createRouterTransport } = require("./codex-bridge-transport.js");
 const { markTurn } = require("./thread-activity.js");
+const modelInfo = require("./model-info.js");
 const routerPaths = require("./router/paths.js");
 const { withRegistryLock } = require("./router/registry.js");
 const { MAX_TIMEOUT_MS: ROUTER_MAX_TIMEOUT_MS } = require("./router/deadlines.js");
@@ -1653,6 +1654,12 @@ function startDiscordBot() {
     const channelId = msg.channel.id;
     const text = stripThisBotMention(msg.content.trim());
     const bridgeSlashCommand = !ROOT_MULTI_CHANNEL || channelId === CHANNEL_ID;
+    // Root answers `/model` itself; the Thread Supervisor answers it for projects.
+    if (ROOT_MULTI_CHANNEL && modelInfo.isModelCommand(text)) {
+      await sendToDiscord(modelInfo.describe({ provider: "codex", home: CODEX_HOME, model: CODEX_MODEL,
+        effort: CODEX_REASONING_EFFORT, registry: modelInfo.readRegistry(REGISTRY_PATH) }), channelId);
+      return;
+    }
     if (bridgeSlashCommand && ["/pause", "/unpause", "/compact", "/clear", "/restart"].includes(text)) {
       const assignment = await reminderAssignmentFor(channelId, {
         requireCodex: true,
