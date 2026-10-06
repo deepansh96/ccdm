@@ -413,6 +413,15 @@ test("Claude channel instructions require reply correlation without modifying in
   assert.equal(channel.notifications()[0].content, "work on this");
 });
 
+test("Claude channel instructions name the relayed commands and how to type any other into the session's own pane", async () => {
+  const { workspace } = await claudeWorkspace();
+  const channel = await startChannel(workspace);
+  await channel.stop();
+  const { instructions } = channel.initialize.result;
+  assert.match(instructions, /relays only \/pause, \/unpause, \/compact, \/clear and \/restart as commands/);
+  assert.match(instructions, /tmux send-keys -t "\$TMUX_PANE"/);
+});
+
 test("Claude reply tool exposes explicit interaction and input-needed fields", async () => {
   const { workspace } = await claudeWorkspace();
   const channel = await startChannel(workspace);
