@@ -19,7 +19,7 @@ function serviceFor(configDir) {
   return `Claude Code-credentials-${crypto.createHash("sha256").update(configDir).digest("hex").slice(0, 8)}`;
 }
 
-async function startPosterApi({ organization = { organization_type: "pro" }, unauthorizedTokens = [], acceptDashboard = false, usage = {}, accounts = {}, failedPosts = 0, droppedPosts = 0 } = {}) {
+async function startPosterApi({ organization = { organization_type: "pro" }, unauthorizedTokens = [], acceptDashboard = false, usage = {}, resetGrants = null, accounts = {}, failedPosts = 0, droppedPosts = 0 } = {}) {
   let remainingPostFailures = failedPosts;
   let remainingPostDrops = droppedPosts;
   const emails = { "fixture-oauth-token": "fixture@example.test", ...accounts };
@@ -62,7 +62,8 @@ async function startPosterApi({ organization = { organization_type: "pro" }, una
         }));
         return;
       }
-      if (request.method === "GET" && request.url === "/api/oauth/usage") {
+      const resetGrantsRequest = request.url === "/api/oauth/usage?cedar_ember=1";
+      if (request.method === "GET" && (request.url === "/api/oauth/usage" || resetGrantsRequest)) {
         if (unauthorized.has(request.headers.authorization?.replace(/^Bearer /, ""))) {
           response.statusCode = 401;
           response.end();
@@ -78,6 +79,10 @@ async function startPosterApi({ organization = { organization_type: "pro" }, una
           extra_usage: { is_enabled: true, used_credits: 1250 },
           five_hour: { utilization: request.headers.authorization === "Bearer fixture-oauth-token" ? 37 : 5 },
           seven_day: { utilization: 62 },
+          // Like Anthropic, report reset grants only to a Claude Code client.
+          ...(resetGrantsRequest && resetGrants
+            ? { cedar_ember: request.headers["user-agent"]?.startsWith("claude-cli/") ? resetGrants : { eligible: false, ineligible_reason: "surface", grants: [] } }
+            : {}),
           ...usage,
         }));
         return;
@@ -213,6 +218,70 @@ test("poster posts a Claude usage embed through the configured Discord endpoint"
     ["find-generic-password", "-s", serviceFor(path.join(workspace.homeDir, ".claude")), "-w"],
     ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
   ]);
+});
+
+function installNativeClaude(workspace, version) {
+  const versionsDir = path.join(workspace.homeDir, ".local", "share", "claude", "versions");
+  const binDir = path.join(workspace.homeDir, ".local", "bin");
+  fs.mkdirSync(versionsDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(path.join(versionsDir, version), "#!/bin/sh\n", { mode: 0o755 });
+  fs.symlinkSync(path.join(versionsDir, version), path.join(binDir, "claude"));
+}
+
+test("poster shows Claude limit resets available when Claude Code is installed", async () => {
+  const workspace = createWorkspace();
+  const future = (days) => new Date(Date.now() + days * 86_400_000 + 1_800_000).toISOString();
+  const api = await startPosterApi({
+    resetGrants: {
+      eligible: true,
+      ineligible_reason: null,
+      grants: [
+        { id: "launch", resets_total: 2, resets_left: 2, ends_at: future(14), paused: false },
+        { id: "soon", resets_total: 1, resets_left: 1, ends_at: future(3), paused: false },
+        { id: "spent", resets_total: 1, resets_left: 0, ends_at: future(1), paused: false },
+        { id: "paused", resets_total: 1, resets_left: 1, ends_at: future(2), paused: true },
+        { id: "expired", resets_total: 1, resets_left: 1, ends_at: future(-2), paused: false },
+      ],
+    },
+  });
+  seedPosterWorkspace(workspace, api.baseUrl);
+  installNativeClaude(workspace, "2.1.293");
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", { cwd: workspace.tmpDir });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const usageRequest = api.requests.find((request) => request.path.startsWith("/api/oauth/usage"));
+  assert.equal(usageRequest.path, "/api/oauth/usage?cedar_ember=1");
+  assert.equal(usageRequest.userAgent, "claude-cli/2.1.293 (external, cli)");
+  const claudeValue = JSON.parse(api.requests.find((request) => request.method === "POST").body).embeds[0].fields[0].value;
+  assert.match(claudeValue, /\nLimit resets available: \*\*3\*\*  use within 3d 0h$/);
+});
+
+test("poster omits Claude limit resets for an ineligible account or without Claude Code", async () => {
+  const ineligible = createWorkspace();
+  const ineligibleApi = await startPosterApi({
+    resetGrants: { eligible: false, ineligible_reason: "tier", grants: [] },
+  });
+  seedPosterWorkspace(ineligible, ineligibleApi.baseUrl);
+  installNativeClaude(ineligible, "2.1.293");
+  const missing = createWorkspace();
+  const missingApi = await startPosterApi({
+    resetGrants: { eligible: true, grants: [{ id: "launch", resets_left: 1, paused: false }] },
+  });
+  seedPosterWorkspace(missing, missingApi.baseUrl);
+
+  for (const [workspace, api, usagePath] of [
+    [ineligible, ineligibleApi, "/api/oauth/usage?cedar_ember=1"],
+    [missing, missingApi, "/api/oauth/usage"],
+  ]) {
+    const result = await runScript(workspace, "scripts/usage-stats-poster.py", { cwd: workspace.tmpDir });
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+    assert.ok(api.requests.some((request) => request.path === usagePath));
+    const claudeValue = JSON.parse(api.requests.find((request) => request.method === "POST").body).embeds[0].fields[0].value;
+    assert.match(claudeValue, /Extra usage: \*\*\$12\.50\*\* spent$/);
+    assert.doesNotMatch(claudeValue, /Limit resets/);
+  }
 });
 
 test("manual JSON posting does not open or write the configured history database", async () => {
