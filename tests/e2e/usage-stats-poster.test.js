@@ -220,14 +220,147 @@ test("poster posts a Claude usage embed through the configured Discord endpoint"
   ]);
 });
 
-function installNativeClaude(workspace, version) {
+// A native Claude Code install. Its binary logs each run beside the test state
+// and, when `refreshed` maps the Keychain item the run uses to a new
+// credential, saves that credential like Claude Code's own token refresh.
+function installNativeClaude(workspace, version, { refreshed = {}, exitCode = 0 } = {}) {
   const versionsDir = path.join(workspace.homeDir, ".local", "share", "claude", "versions");
   const binDir = path.join(workspace.homeDir, ".local", "bin");
   fs.mkdirSync(versionsDir, { recursive: true });
   fs.mkdirSync(binDir, { recursive: true });
-  fs.writeFileSync(path.join(versionsDir, version), "#!/bin/sh\n", { mode: 0o755 });
+  const stateLock = path.resolve("tests/e2e/support/state-lock.cjs");
+  fs.writeFileSync(
+    path.join(versionsDir, version),
+    `#!${process.execPath}
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+const { withStateLock } = require(${JSON.stringify(stateLock)});
+const stateDir = process.env.CCDM_TEST_STATE;
+const configDir = process.env.CLAUDE_CONFIG_DIR ?? null;
+const service = configDir
+  ? "Claude Code-credentials-" + crypto.createHash("sha256").update(configDir).digest("hex").slice(0, 8)
+  : "Claude Code-credentials";
+fs.appendFileSync(path.join(stateDir, "native-claude.log"), JSON.stringify({ args: process.argv.slice(2), configDir, cwd: process.cwd(), service }) + "\\n");
+const refreshed = ${JSON.stringify(refreshed)};
+if (refreshed[service]) {
+  withStateLock(stateDir, () => {
+    const file = path.join(stateDir, "state.json");
+    const state = JSON.parse(fs.readFileSync(file, "utf8"));
+    state.fixtures.security.credentials[service] = { claudeAiOauth: refreshed[service] };
+    fs.writeFileSync(file, JSON.stringify(state, null, 2));
+  });
+}
+process.exit(${exitCode});
+`,
+    { mode: 0o755 },
+  );
   fs.symlinkSync(path.join(versionsDir, version), path.join(binDir, "claude"));
 }
+
+function nativeClaudeRuns(workspace) {
+  const log = path.join(workspace.stateDir, "native-claude.log");
+  return fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line)) : [];
+}
+
+function seedClaudeHome(workspace, name, email) {
+  const dir = path.join(workspace.homeDir, name);
+  fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, ".claude.json"), `${JSON.stringify({ oauthAccount: { emailAddress: email } })}\n`);
+  return dir;
+}
+
+test("poster has Claude Code refresh an expired Claude login before reporting it", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi({ accounts: { "fixture-iv-fresh": "iv@example.test" } });
+  seedPosterWorkspace(workspace, api.baseUrl);
+  const ivDir = seedClaudeHome(workspace, ".claude-iv", "iv@example.test");
+  const ivService = serviceFor(ivDir);
+  const future = Date.now() + 8 * 60 * 60 * 1000;
+  const state = readState(workspace.stateDir);
+  state.fixtures.security.credentials[ivService] = {
+    claudeAiOauth: { accessToken: "fixture-iv-stale", refreshToken: "fixture-iv-refresh", expiresAt: Date.now() - 6 * 86_400_000 },
+  };
+  writeState(state, workspace.stateDir);
+  installNativeClaude(workspace, "2.1.293", {
+    refreshed: { [ivService]: { accessToken: "fixture-iv-fresh", refreshToken: "fixture-iv-rotated", expiresAt: future } },
+  });
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", { cwd: workspace.tmpDir });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const runs = nativeClaudeRuns(workspace);
+  assert.equal(runs.length, 1);
+  assert.deepEqual(runs[0].args, [
+    "-p", "/usage", "--no-session-persistence", "--strict-mcp-config", "--setting-sources", "", "--output-format", "json",
+  ]);
+  assert.equal(runs[0].configDir, ivDir);
+  assert.ok(!runs[0].cwd.startsWith(workspace.repoDir));
+  const claudeValue = JSON.parse(api.requests.find((request) => request.method === "POST").body).embeds[0].fields[0].value;
+  assert.match(claudeValue, /\*\*claude-iv\*\* \(Pro\)\n5-Hour: /);
+  assert.doesNotMatch(claudeValue, /expired/i);
+  assert.ok(api.requests.some((request) => request.authorization === "Bearer fixture-iv-fresh"));
+  assert.ok(!api.requests.some((request) => request.authorization === "Bearer fixture-iv-stale"));
+});
+
+test("poster refreshes a rejected Claude login once and retries", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi({
+    unauthorizedTokens: ["fixture-revoked-token"],
+    accounts: { "fixture-retry-token": "fixture@example.test" },
+  });
+  seedPosterWorkspace(workspace, api.baseUrl);
+  const defaultService = serviceFor(path.join(workspace.homeDir, ".claude"));
+  const state = readState(workspace.stateDir);
+  state.fixtures.security.credentials = {
+    "Claude Code-credentials": {
+      claudeAiOauth: { accessToken: "fixture-revoked-token", refreshToken: "fixture-refresh-token", expiresAt: Date.now() + 60_000 },
+    },
+  };
+  writeState(state, workspace.stateDir);
+  // ~/.claude has no hashed item, so Claude Code refreshes it as a default
+  // session, without CLAUDE_CONFIG_DIR.
+  installNativeClaude(workspace, "2.1.293", {
+    refreshed: {
+      "Claude Code-credentials": { accessToken: "fixture-retry-token", refreshToken: "fixture-rotated", expiresAt: Date.now() + 3_600_000 },
+    },
+  });
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", { cwd: workspace.tmpDir });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.deepEqual(nativeClaudeRuns(workspace).map((run) => [run.configDir, run.service]), [[null, "Claude Code-credentials"]]);
+  assert.ok(!readState(workspace.stateDir).fixtures.security.credentials[defaultService]);
+  const claudeValue = JSON.parse(api.requests.find((request) => request.method === "POST").body).embeds[0].fields[0].value;
+  assert.match(claudeValue, /^\*\*claude-p\*\* \(Pro\)\n5-Hour: /);
+});
+
+test("poster keeps the expired-login notice when Claude Code cannot refresh it", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  seedPosterWorkspace(workspace, api.baseUrl);
+  const failedDir = seedClaudeHome(workspace, ".claude-failed", "failed@example.test");
+  const noRefreshDir = seedClaudeHome(workspace, ".claude-norefresh", "norefresh@example.test");
+  const past = Date.now() - 60 * 60 * 1000;
+  const state = readState(workspace.stateDir);
+  state.fixtures.security.credentials[serviceFor(failedDir)] = {
+    claudeAiOauth: { accessToken: "fixture-failed-stale", refreshToken: "fixture-failed-refresh", expiresAt: past },
+  };
+  state.fixtures.security.credentials[serviceFor(noRefreshDir)] = {
+    claudeAiOauth: { accessToken: "fixture-norefresh-stale", expiresAt: past },
+  };
+  writeState(state, workspace.stateDir);
+  installNativeClaude(workspace, "2.1.293", { exitCode: 1 });
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", { cwd: workspace.tmpDir });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  // Only the login with a refresh token is attempted, and only once.
+  assert.deepEqual(nativeClaudeRuns(workspace).map((run) => run.configDir), [failedDir]);
+  const claudeValue = JSON.parse(api.requests.find((request) => request.method === "POST").body).embeds[0].fields[0].value;
+  assert.match(claudeValue, /\*\*claude-failed\*\*\n\*OAuth token expired — start a session on this account to refresh\*/);
+  assert.match(claudeValue, /\*\*claude-norefresh\*\*[\s\S]*Needs re-login: `CLAUDE_CONFIG_DIR=~\/\.claude-norefresh claude \/login`/);
+});
 
 test("poster shows Claude limit resets available when Claude Code is installed", async () => {
   const workspace = createWorkspace();
