@@ -1057,12 +1057,17 @@ CLAUDE_CODE_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 CLAUDE_RESET_GRANTS_USAGE_ENDPOINT = "/api/oauth/usage?cedar_ember=1"
 
 
-def claude_code_version():
-    """Return the installed native Claude Code version, or ``None``.
+CLAUDE_REFRESH_TIMEOUT_SECONDS = 60
 
-    The native installer links ``claude`` to ``versions/<version>``. Anthropic
-    reports limit-reset grants only to a recent Claude Code client, so without a
-    version the poster keeps the plain usage request and shows no reset count.
+
+def claude_code_executable():
+    """Return the installed native Claude Code binary, or ``None``.
+
+    The native installer links ``claude`` to ``versions/<version>``, so the
+    resolved name is the version. LaunchAgent runs lack ``~/.local/bin`` on
+    PATH, so that link is checked before PATH. Anthropic reports limit-reset
+    grants only to a recent Claude Code client, so without this binary the
+    poster keeps the plain usage request and shows no reset count.
     """
     candidates = [Path.home() / ".local" / "bin" / "claude"]
     found = shutil.which("claude")
@@ -1070,12 +1075,44 @@ def claude_code_version():
         candidates.append(Path(found))
     for candidate in candidates:
         try:
-            name = candidate.resolve(strict=True).name
+            resolved = candidate.resolve(strict=True)
         except (OSError, RuntimeError):
             continue
-        if CLAUDE_CODE_VERSION_RE.match(name):
-            return name
+        if CLAUDE_CODE_VERSION_RE.match(resolved.name):
+            return resolved
     return None
+
+
+def refresh_claude_login(executable, config_dir):
+    """Have Claude Code refresh one home's login; return whether it ran cleanly.
+
+    Anthropic rotates the refresh token on every refresh, so the poster never
+    refreshes a token itself: a print-mode ``/usage`` makes Claude Code refresh
+    and save the new tokens under its own locking, without a model turn. With
+    ``config_dir`` ``None`` it runs as a default session, refreshing the plain
+    Keychain item. Settings, hooks, MCP servers, and the transcript are skipped.
+    """
+    env = {key: value for key, value in os.environ.items() if key != "CLAUDE_CONFIG_DIR"}
+    if config_dir is not None:
+        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    try:
+        with tempfile.TemporaryDirectory(prefix="ccdm-claude-refresh-") as cwd:
+            result = subprocess.run(
+                [
+                    str(executable), "-p", "/usage",
+                    "--no-session-persistence", "--strict-mcp-config", "--setting-sources", "",
+                    "--output-format", "json",
+                ],
+                cwd=cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=CLAUDE_REFRESH_TIMEOUT_SECONDS,
+            )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
 
 
 def _claude_headers(oauth, client_version=None):
@@ -1166,7 +1203,25 @@ def _request_claude_usage(base_url, oauth, fallbacks=(), email=None, client_vers
     raise ClaudeAccountMismatch("no Keychain login matches this Claude home's account")
 
 
-def _collect_claude_oauth_metric(base_url, services, label, dir_hint, email=None, cache=None, client_version=None):
+def _claude_refresh_target(services, cache, config_dir):
+    """Return how to refresh a home's login: ``(config_dir,)``, ``(None,)``, or ``None``.
+
+    Only a Keychain item with a refresh token can be refreshed. A home's own
+    hashed item is refreshed under ``CLAUDE_CONFIG_DIR``; the plain item only
+    for ``~/.claude``, whose default sessions use it, as a default session.
+    """
+    hashed = cache.get(services[0]) if services else None
+    if isinstance(hashed, dict) and hashed.get("refreshToken"):
+        return (config_dir,)
+    plain = cache.get(PLAIN_CLAUDE_SERVICE)
+    if config_dir == Path.home() / ".claude" and isinstance(plain, dict) and plain.get("refreshToken"):
+        return (None,)
+    return None
+
+
+def _collect_claude_oauth_metric(
+    base_url, services, label, dir_hint, email=None, cache=None, client_version=None, refresher=None
+):
     """Collect a credential-free, renderer-friendly Claude account metric.
 
     The returned object intentionally contains only display labels, rate-limit
@@ -1175,7 +1230,27 @@ def _collect_claude_oauth_metric(base_url, services, label, dir_hint, email=None
     writer.
     """
     metric = {"provider": "claude", "account": label, "limits": []}
+    cache = {} if cache is None else cache
     credentials = _read_oauth_credentials(services, cache)
+    refresh_attempted = False
+
+    def refresh():
+        """Refresh this home's login once per run; return whether to retry."""
+        nonlocal credentials, refresh_attempted
+        if refresher is None or refresh_attempted:
+            return False
+        refresh_attempted = True
+        config_dir = Path(dir_hint).expanduser()
+        target = _claude_refresh_target(services, cache, config_dir)
+        if target is None or not refresher(target[0]):
+            return False
+        for service in services:
+            cache.pop(service, None)
+        credentials = _read_oauth_credentials(services, cache)
+        return bool(credentials)
+
+    if credentials and _oauth_expired(credentials[0]):
+        refresh()
     if not credentials:
         metric["status"] = "unavailable"
         metric["reason"] = "Could not get OAuth token"
@@ -1194,7 +1269,17 @@ def _collect_claude_oauth_metric(base_url, services, label, dir_hint, email=None
         return metric
 
     try:
-        profile, usage = _request_claude_usage(base_url, oauth, credentials[1:], email, client_version)
+        try:
+            profile, usage = _request_claude_usage(base_url, oauth, credentials[1:], email, client_version)
+        except (ClaudeAccountMismatch, PosterHTTPError) as error:
+            # A revoked access token, or an expired one hidden behind another
+            # account's fresher plain item, may still have a usable refresh token.
+            if isinstance(error, PosterHTTPError) and error.status != 401:
+                raise
+            if not refresh() or _oauth_expired(credentials[0]):
+                raise
+            oauth = credentials[0]
+            profile, usage = _request_claude_usage(base_url, oauth, credentials[1:], email, client_version)
     except ClaudeAccountMismatch:
         metric["status"] = "unavailable"
         metric["reason"] = "No login for this account"
@@ -1262,10 +1347,12 @@ def collect_claude_metrics(config):
     """Return structured current Claude metrics for history and rendering."""
     metrics = []
     cache = {}
-    client_version = claude_code_version()
+    executable = claude_code_executable()
+    client_version = executable.name if executable else None
+    refresher = (lambda config_dir: refresh_claude_login(executable, config_dir)) if executable else None
     for index, (services, label, dir_hint, email) in enumerate(discover_claude_accounts()):
         metric = _collect_claude_oauth_metric(
-            config["anthropic_base_url"], services, label, dir_hint, email, cache, client_version
+            config["anthropic_base_url"], services, label, dir_hint, email, cache, client_version, refresher
         )
         if index > 0 and metric.get("missing_oauth"):
             metric["text"] = None
