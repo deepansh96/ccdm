@@ -1045,10 +1045,19 @@ test("poster reports named Codex Accounts in default-first alphabetical order", 
     }, null, 2)}\n`,
   );
   const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
+  const nowSeconds = Math.floor(Date.now() / 1000);
   fs.writeFileSync(responsesPath, `${JSON.stringify({
     [fs.realpathSync(defaultHome)]: {
       rateLimits: { planType: "chatgpt", primary: { usedPercent: 12 }, secondary: { usedPercent: 34 } },
-      rateLimitResetCredits: { availableCount: 2 },
+      rateLimitResetCredits: {
+        availableCount: 2,
+        credits: [
+          { status: "available", expiresAt: nowSeconds + 9 * 86400 },
+          { status: "available", expiresAt: nowSeconds + 3 * 86400 + 1800 },
+          { status: "available", expiresAt: nowSeconds - 3600 },
+          { status: "redeemed", expiresAt: nowSeconds + 86400 },
+        ],
+      },
     },
     [fs.realpathSync(alphaHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 56 }, secondary: { usedPercent: 78 } } },
     [fs.realpathSync(premiumHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 21 }, secondary: { usedPercent: 43 } } },
@@ -1076,7 +1085,7 @@ test("poster reports named Codex Accounts in default-first alphabetical order", 
   assert.match(codexValue, /\*\*codex-alpha\*\* \(ChatGPT\)[\s\S]*Weekly:.*78%/);
   assert.match(codexValue, /\*\*codex-premium\*\* \(ChatGPT\)[\s\S]*Weekly:.*43%/);
   assert.doesNotMatch(codexValue, /(?:5-Hour|7-Day):/);
-  assert.match(codexValue, /\*\*codex-default\*\*[\s\S]*Full resets available: \*\*2\*\*/);
+  assert.match(codexValue, /\*\*codex-default\*\*[\s\S]*Full resets available: \*\*2\*\*  use within 3d 0h\n/);
 });
 
 test("poster terminates a Codex process when stdout setup fails", async () => {
