@@ -781,7 +781,24 @@ def _valid_codex_rate_limits(value):
     )
 
 
-def format_codex_rate_limits(rate_limits, label, reset_credits=None, source_ts=None):
+def _codex_reset_credit_deadline(reset_credits, now=None):
+    """Return the earliest expiry among available, unexpired reset credits."""
+    now = now or datetime.now(timezone.utc)
+    deadline = None
+    credits = reset_credits.get("credits")
+    for credit in credits if isinstance(credits, list) else []:
+        if not isinstance(credit, dict) or credit.get("status") != "available":
+            continue
+        expires_at = _normalise_reset_timestamp(credit.get("expiresAt"))
+        if not expires_at:
+            continue
+        expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        if expires > now:
+            deadline = min(deadline, expires) if deadline else expires
+    return deadline.isoformat() if deadline else None
+
+
+def format_codex_rate_limits(rate_limits, label, reset_credits=None, source_ts=None, now=None):
     plan = _format_plan(rate_limits.get("planType", rate_limits.get("plan_type")))
     lines = [f"**{label}** ({plan})"]
     data = _codex_weekly_limit(rate_limits)
@@ -794,7 +811,11 @@ def format_codex_rate_limits(rate_limits, label, reset_credits=None, source_ts=N
     if reset_credits is None:
         reset_credits = rate_limits.get("rateLimitResetCredits")
     if isinstance(reset_credits, dict) and isinstance(reset_credits.get("availableCount"), int):
-        lines.append(f"Full resets available: **{reset_credits['availableCount']}**")
+        line = f"Full resets available: **{reset_credits['availableCount']}**"
+        deadline = _codex_reset_credit_deadline(reset_credits, now)
+        if deadline:
+            line += f"  use within {fmt_reset(deadline, now or datetime.now(timezone.utc))}"
+        lines.append(line)
     age_marker = _format_age_marker(source_ts)
     if age_marker:
         lines.append(age_marker)
