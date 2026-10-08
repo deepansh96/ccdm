@@ -12,6 +12,7 @@ import os
 import re
 import stat
 import select
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1052,12 +1053,70 @@ class ClaudeAccountMismatch(PosterError):
     """No readable credential belongs to the account a Claude home is logged in to."""
 
 
-def _claude_headers(oauth):
+CLAUDE_CODE_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+CLAUDE_RESET_GRANTS_USAGE_ENDPOINT = "/api/oauth/usage?cedar_ember=1"
+
+
+def claude_code_version():
+    """Return the installed native Claude Code version, or ``None``.
+
+    The native installer links ``claude`` to ``versions/<version>``. Anthropic
+    reports limit-reset grants only to a recent Claude Code client, so without a
+    version the poster keeps the plain usage request and shows no reset count.
+    """
+    candidates = [Path.home() / ".local" / "bin" / "claude"]
+    found = shutil.which("claude")
+    if found:
+        candidates.append(Path(found))
+    for candidate in candidates:
+        try:
+            name = candidate.resolve(strict=True).name
+        except (OSError, RuntimeError):
+            continue
+        if CLAUDE_CODE_VERSION_RE.match(name):
+            return name
+    return None
+
+
+def _claude_headers(oauth, client_version=None):
     return {
         "Authorization": f"Bearer {oauth['accessToken']}",
         "anthropic-beta": "oauth-2025-04-20",
-        "User-Agent": "claude-code/usage-stats-poster",
+        "User-Agent": (
+            f"claude-cli/{client_version} (external, cli)" if client_version else "claude-code/usage-stats-poster"
+        ),
     }
+
+
+def format_claude_limit_resets(status, now=None):
+    """Return the limit-reset line for a usage ``cedar_ember`` block, if any.
+
+    Ineligible accounts get no line. Paused and expired grants are not usable,
+    so they are left out of the count and the use-by deadline.
+    """
+    if not isinstance(status, dict) or status.get("eligible") is not True:
+        return None
+    now = now or datetime.now(timezone.utc)
+    available = 0
+    deadline = None
+    grants = status.get("grants")
+    for grant in grants if isinstance(grants, list) else []:
+        if not isinstance(grant, dict) or grant.get("paused") is True:
+            continue
+        left = grant.get("resets_left")
+        if isinstance(left, bool) or not isinstance(left, int) or left <= 0:
+            continue
+        ends_at = _normalise_reset_timestamp(grant.get("ends_at"))
+        if ends_at:
+            ends = datetime.fromisoformat(ends_at.replace("Z", "+00:00"))
+            if ends <= now:
+                continue
+            deadline = min(deadline, ends) if deadline else ends
+        available += left
+    line = f"Limit resets available: **{available}**"
+    if deadline:
+        line += f"  use within {fmt_reset(deadline.isoformat(), now)}"
+    return line
 
 
 def _profile_email(profile):
@@ -1065,7 +1124,7 @@ def _profile_email(profile):
     return claude_account_email({"emailAddress": account.get("email")}) if isinstance(account, dict) else None
 
 
-def _request_claude_usage(base_url, oauth, fallbacks=(), email=None):
+def _request_claude_usage(base_url, oauth, fallbacks=(), email=None, client_version=None):
     """Return ``(profile, usage)`` for the first credential that is ``email``'s.
 
     A 401 can come from a revoked login whose ``expiresAt`` is still in the
@@ -1092,13 +1151,22 @@ def _request_claude_usage(base_url, oauth, fallbacks=(), email=None):
             continue
         if email and _profile_email(profile) != email:
             continue
-        return profile, _request_json(base_url, "/api/oauth/usage", headers, "Anthropic usage")
+        if not client_version:
+            return profile, _request_json(base_url, "/api/oauth/usage", headers, "Anthropic usage")
+        # One request returns usage and limit-reset grants; Anthropic includes
+        # the grants only for a request identifying as Claude Code.
+        return profile, _request_json(
+            base_url,
+            CLAUDE_RESET_GRANTS_USAGE_ENDPOINT,
+            _claude_headers(candidate, client_version),
+            "Anthropic usage",
+        )
     if rejected:
         raise rejected
     raise ClaudeAccountMismatch("no Keychain login matches this Claude home's account")
 
 
-def _collect_claude_oauth_metric(base_url, services, label, dir_hint, email=None, cache=None):
+def _collect_claude_oauth_metric(base_url, services, label, dir_hint, email=None, cache=None, client_version=None):
     """Collect a credential-free, renderer-friendly Claude account metric.
 
     The returned object intentionally contains only display labels, rate-limit
@@ -1126,7 +1194,7 @@ def _collect_claude_oauth_metric(base_url, services, label, dir_hint, email=None
         return metric
 
     try:
-        profile, usage = _request_claude_usage(base_url, oauth, credentials[1:], email)
+        profile, usage = _request_claude_usage(base_url, oauth, credentials[1:], email, client_version)
     except ClaudeAccountMismatch:
         metric["status"] = "unavailable"
         metric["reason"] = "No login for this account"
@@ -1183,6 +1251,9 @@ def _collect_claude_oauth_metric(base_url, services, label, dir_hint, email=None
     extra_usage = usage.get("extra_usage", {}) if isinstance(usage, dict) else {}
     if isinstance(extra_usage, dict) and extra_usage.get("is_enabled"):
         lines.append(f"Extra usage: **${_safe_int(extra_usage.get('used_credits')) / 100:.2f}** spent")
+    reset_line = format_claude_limit_resets(usage.get("cedar_ember") if isinstance(usage, dict) else None)
+    if reset_line:
+        lines.append(reset_line)
     metric["text"] = "\n".join(lines)
     return metric
 
@@ -1191,8 +1262,11 @@ def collect_claude_metrics(config):
     """Return structured current Claude metrics for history and rendering."""
     metrics = []
     cache = {}
+    client_version = claude_code_version()
     for index, (services, label, dir_hint, email) in enumerate(discover_claude_accounts()):
-        metric = _collect_claude_oauth_metric(config["anthropic_base_url"], services, label, dir_hint, email, cache)
+        metric = _collect_claude_oauth_metric(
+            config["anthropic_base_url"], services, label, dir_hint, email, cache, client_version
+        )
         if index > 0 and metric.get("missing_oauth"):
             metric["text"] = None
         metrics.append(metric)
