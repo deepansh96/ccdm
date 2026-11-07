@@ -15,7 +15,7 @@ edges:
     condition: when understanding how components connect during setup
   - target: context/discord-security.md
     condition: when configuring the root token, Session Scope, guest roles, or root channel permissions
-last_updated: 2026-09-29
+last_updated: 2026-10-16
 ---
 
 # Setup
@@ -66,3 +66,5 @@ last_updated: 2026-09-29
 **Voice messages are not transcribed:** Install `openai-whisper` or ask the user to type the message.
 
 **Tools missing inside tmux:** Launch through the provided scripts, which use `zsh -ic`.
+
+**A session never starts and its launch times out:** read the pane with `tmux capture-pane -p -t <screen_name>` (a thread's panes are `<screen_name>-t-<thread_id>`). Interactive shells load `~/.zshrc`, so a prompt there blocks the shell before the agent runs; oh-my-zsh's `Would you like to update? [Y/n]` is the known one, and the launchers pass `DISABLE_AUTO_UPDATE=true DISABLE_UPDATE_PROMPT=true` for it. Any other prompt belongs in the user's rc file.
