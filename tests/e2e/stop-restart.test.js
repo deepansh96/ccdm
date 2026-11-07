@@ -331,6 +331,10 @@ test("restart-root-agent simulates root_agent cleanup, retry, fresh launch, and 
   assert.equal(isAlive(childPid), false);
   const session = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
   assert.equal(session.cwd, workspace.repoDir);
+  assert.deepEqual(session.wrapperEnv, {
+    DISABLE_AUTO_UPDATE: "true",
+    DISABLE_UPDATE_PROMPT: "true",
+  });
   assert.equal(session.env.CCDM_ROUTER_KEY_FILE, path.join(workspace.routerStateDir, "keys", ".root.key"));
   assert.deepEqual(session.sendKeys, [["Enter"]]);
   assert.equal(session.killAttempts, 2);
@@ -421,9 +425,15 @@ test("restart-root-codex-agent starts the root bot through the Codex bridge in R
     CCDM_ROUTER_STATE_DIR: workspace.routerStateDir,
     CHANNEL_ID: "root-channel-id",
     CODEX_HOME: codexHome,
+    DISABLE_AUTO_UPDATE: "true",
+    DISABLE_UPDATE_PROMPT: "true",
     PROJECT_DIR: workspace.repoDir,
     ROOT_BOT_APP_ID: "root-app",
     WS_PORT: port,
+  });
+  assert.deepEqual(session.wrapperEnv, {
+    DISABLE_AUTO_UPDATE: "true",
+    DISABLE_UPDATE_PROMPT: "true",
   });
   assert.equal(session.bridgeCommand, "node scripts/codex-bridge.js");
   assert.equal(session.killAttempts, 2);

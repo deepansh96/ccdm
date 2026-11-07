@@ -94,8 +94,9 @@ if tmux has-session -t root_agent 2>/dev/null; then
     fi
 fi
 
-# Start fresh in a detached tmux session
-tmux new-session -d -s root_agent -- zsh -ic "cd '$SCRIPT_DIR' && $ROOT_STATE_ASSIGNMENT claude $CHANNEL_ARGS --dangerously-skip-permissions"
+# Start fresh in a detached tmux session. zsh -i loads ~/.zshrc, so prompts
+# there (oh-my-zsh's update prompt) must be switched off for a headless launch.
+tmux new-session -d -s root_agent -- env DISABLE_AUTO_UPDATE=true DISABLE_UPDATE_PROMPT=true zsh -ic "cd '$SCRIPT_DIR' && $ROOT_STATE_ASSIGNMENT claude $CHANNEL_ARGS --dangerously-skip-permissions"
 
 if [ $? -ne 0 ]; then
     echo "Failed to create tmux session 'root_agent'" >&2

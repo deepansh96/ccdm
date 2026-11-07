@@ -226,7 +226,13 @@ test("no Discord credential reaches the thread session's environment, launch fil
   assert.equal(fs.statSync(path.join(workspace.routerStateDir, "keys", `.thread-${THREAD_ID}.key`)).mode & 0o777, 0o600);
   // The session runs in the project checkout, in its own tmux session.
   assert.equal(state.fixtures.tmux.sessions[THREAD_TMUX].cwd, workspace.tmpDir);
-  assert.deepEqual(state.fixtures.tmux.sessions[THREAD_TMUX].command.slice(0, 2), ["zsh", "-ic"]);
+  assert.deepEqual(state.fixtures.tmux.sessions[THREAD_TMUX].command.slice(0, 5), [
+    "env", "DISABLE_AUTO_UPDATE=true", "DISABLE_UPDATE_PROMPT=true", "zsh", "-ic",
+  ]);
+  assert.deepEqual(state.fixtures.tmux.sessions[THREAD_TMUX].wrapperEnv, {
+    DISABLE_AUTO_UPDATE: "true",
+    DISABLE_UPDATE_PROMPT: "true",
+  });
   const status = await runRouterCli(workspace, ["status"]);
   assert.match(status.stdout, new RegExp(`thread demo thread=${THREAD_ID} provider=claude connected=`));
 });

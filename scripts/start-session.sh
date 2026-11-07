@@ -289,7 +289,9 @@ e=json.load(open(sys.argv[1]))
 print(''.join(f" {k}='{v}'" for k,v in e.items()))
 PY
 )"
-  tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$PATH_DIR' && CCDM_ROUTER_KEY_FILE='$key_file'$reminder_env$CONFIG_DIR_ENV claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions --mcp-config '$mcp_config' --settings '$settings'$MODEL_FLAG$EFFORT_FLAG$RESUME_FLAG"
+  # zsh -i loads ~/.zshrc, so prompts there (oh-my-zsh's update prompt) must be
+  # switched off or a headless launch blocks before it starts anything.
+  tmux new-session -d -s "$SCREEN_NAME" -- env DISABLE_AUTO_UPDATE=true DISABLE_UPDATE_PROMPT=true zsh -ic "cd '$PATH_DIR' && CCDM_ROUTER_KEY_FILE='$key_file'$reminder_env$CONFIG_DIR_ENV claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions --mcp-config '$mcp_config' --settings '$settings'$MODEL_FLAG$EFFORT_FLAG$RESUME_FLAG"
   echo "Started Claude Router session in tmux session '$SCREEN_NAME'${RESUME_SESSION_ID:+ (resuming $RESUME_SESSION_ID)}"
 
   # Accept the per-launch development-channel confirmation, then wait for the

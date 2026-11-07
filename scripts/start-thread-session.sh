@@ -374,7 +374,9 @@ if [[ "$PROVIDER" == "codex" ]]; then
   [[ -n "${CCDM_THREAD_BOOT_TIMEOUT_S:-}" ]] && BOOT_TIMEOUT_ENV=" CCDM_THREAD_BOOT_TIMEOUT_S='$CCDM_THREAD_BOOT_TIMEOUT_S'"
   [[ -n "$RESUME_ID" ]] && CODEX_ENV+=" CODEX_RESUME_THREAD_ID='$RESUME_ID'"
   # The bridge runs from this checkout; its app-server and turns run in the project path.
-  if ! tmux new-session -d -s "$TMUX_NAME" -- zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' CCDM_CODEX_PROJECT='$PROJECT' CCDM_ROUTER_STATE_DIR='$ROUTER_STATE' CCDM_ROUTER_KEY_FILE='$KEY_FILE' CCDM_CHANNEL_READY_FILE='$LAUNCH_DIR/ready.json' CHANNEL_ID='$THREAD_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$ALLOWED_USER_IDS' CCDM_THREAD_ID='$THREAD_ID' CCDM_THREAD_PROVIDER='codex' CCDM_THREAD_BOOTSTRAP_FILE='$BOOTSTRAP_FILE' CCDM_THREAD_ACTIVITY_FILE='$LAUNCH_DIR/activity.json'$BOOT_TIMEOUT_ENV$CODEX_ENV node scripts/codex-bridge.js" >&2; then
+  # zsh -i loads ~/.zshrc, so prompts there (oh-my-zsh's update prompt) must be
+  # switched off or a headless launch blocks before it starts anything.
+  if ! tmux new-session -d -s "$TMUX_NAME" -- env DISABLE_AUTO_UPDATE=true DISABLE_UPDATE_PROMPT=true zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' CCDM_CODEX_PROJECT='$PROJECT' CCDM_ROUTER_STATE_DIR='$ROUTER_STATE' CCDM_ROUTER_KEY_FILE='$KEY_FILE' CCDM_CHANNEL_READY_FILE='$LAUNCH_DIR/ready.json' CHANNEL_ID='$THREAD_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$ALLOWED_USER_IDS' CCDM_THREAD_ID='$THREAD_ID' CCDM_THREAD_PROVIDER='codex' CCDM_THREAD_BOOTSTRAP_FILE='$BOOTSTRAP_FILE' CCDM_THREAD_ACTIVITY_FILE='$LAUNCH_DIR/activity.json'$BOOT_TIMEOUT_ENV$CODEX_ENV node scripts/codex-bridge.js" >&2; then
     fail "tmux could not start the thread session"
   fi
   echo "Started Codex thread bridge in tmux session '$TMUX_NAME'" >&2
@@ -468,7 +470,9 @@ e=json.load(open(sys.argv[1]))
 print(''.join(f" {k}='{v}'" for k,v in e.items()))
 PY
 )" || fail "The thread launch files could not be read"
-if ! tmux new-session -d -s "$TMUX_NAME" -- zsh -ic "cd '$PATH_DIR' && CCDM_ROUTER_KEY_FILE='$KEY_FILE'$REMINDER_ENV$CONFIG_DIR_ENV claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions --mcp-config '$LAUNCH_DIR/mcp.json' --settings '$LAUNCH_DIR/settings.json'$MODEL_FLAG$EFFORT_FLAG$RESUME_FLAG" >&2; then
+# zsh -i loads ~/.zshrc, so prompts there (oh-my-zsh's update prompt) must be
+# switched off or a headless launch blocks before it starts anything.
+if ! tmux new-session -d -s "$TMUX_NAME" -- env DISABLE_AUTO_UPDATE=true DISABLE_UPDATE_PROMPT=true zsh -ic "cd '$PATH_DIR' && CCDM_ROUTER_KEY_FILE='$KEY_FILE'$REMINDER_ENV$CONFIG_DIR_ENV claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions --mcp-config '$LAUNCH_DIR/mcp.json' --settings '$LAUNCH_DIR/settings.json'$MODEL_FLAG$EFFORT_FLAG$RESUME_FLAG" >&2; then
   fail "tmux could not start the thread session"
 fi
 echo "Started Claude thread session in tmux session '$TMUX_NAME'" >&2
