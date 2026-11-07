@@ -1,7 +1,7 @@
 ---
 name: agents
 description: Always-loaded project anchor for CCDM.
-last_updated: 2026-10-16
+last_updated: 2026-11-07
 ---
 
 # CCDM - Claude Code Discord Manager

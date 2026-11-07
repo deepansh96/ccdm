@@ -652,11 +652,23 @@ function runTmux() {
     const separatorIndex = args.indexOf("--");
     const name = args[sessionIndex + 1];
     const command = args.slice(separatorIndex + 1);
-    if (!name || separatorIndex === -1 || command[0] !== "zsh" || command[1] !== "-ic" || !command[2]) {
+    const wrapperEnv = {};
+    let shellIndex = 0;
+    if (command[shellIndex] === "env") {
+      shellIndex += 1;
+      while (shellIndex < command.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(command[shellIndex])) {
+        const assignment = command[shellIndex];
+        const equals = assignment.indexOf("=");
+        wrapperEnv[assignment.slice(0, equals)] = assignment.slice(equals + 1);
+        shellIndex += 1;
+      }
+    }
+    if (!name || separatorIndex === -1 || command[shellIndex] !== "zsh" ||
+        command[shellIndex + 1] !== "-ic" || !command[shellIndex + 2]) {
       console.error("unsupported tmux new-session invocation");
       process.exit(2);
     }
-    const shellCommand = command[2];
+    const shellCommand = command[shellIndex + 2];
     const tmuxState = readState().fixtures.tmux;
     const preexistingSession = tmuxState.sessions[name];
     if (tmuxState.newSessionFailures?.[name]) {
@@ -683,6 +695,7 @@ function runTmux() {
     const priorKillAttempts =
       tmuxState.lastKilledSessions?.[name]?.killAttempts ?? preexistingSession?.killAttempts ?? 0;
     const launch = parseTmuxLaunch(shellCommand);
+    launch.env = { ...wrapperEnv, ...launch.env };
     // A CCDM channel launch runs the fake claude, which hosts the real channel
     // server once the development-channel confirmation is accepted.
     const routerChannel = launch.kind === "claude-listener" && launch.claudeArgs.includes("server:ccdm");
@@ -719,6 +732,7 @@ function runTmux() {
       state.fixtures.tmux.sessions[name] = {
         name,
         command,
+        wrapperEnv,
         cwd: launch.cwd,
         env: launch.env,
         bridgeCommand: launch.bridgeCommand,

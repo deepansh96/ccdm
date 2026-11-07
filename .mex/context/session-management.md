@@ -16,7 +16,7 @@ edges:
     condition: when performing a start, stop, or restart
   - target: patterns/register-project.md
     condition: when registering or deregistering a project (channel, webhook, registry entry)
-last_updated: 2026-10-16
+last_updated: 2026-11-07
 ---
 
 # Session Management

@@ -15,7 +15,7 @@ edges:
     condition: when understanding how components connect during setup
   - target: context/discord-security.md
     condition: when configuring the root token, Session Scope, guest roles, or root channel permissions
-last_updated: 2026-10-16
+last_updated: 2026-11-07
 ---
 
 # Setup
