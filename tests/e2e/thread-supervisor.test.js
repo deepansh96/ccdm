@@ -256,6 +256,19 @@ test("the store reports user_version 1, and an unexpected column is refused", as
   assert.match(run.json.reason, /thread store schema is unsupported/);
 });
 
+test("status answers with no worker, and reads an existing store in a protected state dir", async () => {
+  const workspace = createRouterWorkspace({ ...routerRegistry(), root_channels: ["root-channel"] });
+  const stateDir = supervisorStateDir(workspace);
+  const before = await supervisorStatus(workspace);
+  assert.deepEqual([before.running, before.router, before.store], [false, "not-running", null]);
+  execFileSync(PYTHON, ["-c", "import sys; sys.dont_write_bytecode = True; from pathlib import Path; " +
+    "sys.path.insert(0, sys.argv[1]); from thread_supervisor import store; " +
+    "store.connect(Path(sys.argv[2]), create=True).close()", path.join(process.cwd(), "scripts"), stateDir]);
+  assertPrivate(stateDir);
+  const after = await supervisorStatus(workspace);
+  assert.deepEqual([after.running, after.store], [false, { user_version: 1 }]);
+});
+
 test("a status racing the store's creation never sees a half-made store", () => {
   const scripts = path.join(process.cwd(), "scripts");
   const base = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "ccdm-e2e-store-race-"));

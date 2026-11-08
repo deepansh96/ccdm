@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta, timezone
-import fcntl
 import importlib.util
 import json
 import os
@@ -21,6 +20,7 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
+from ccdmlib.platform import filelock  # noqa: E402
 from ccdmlib.platform.paths import state_root  # noqa: E402
 from ccdmlib.platform.private_fs import fix_hint, is_private  # noqa: E402
 
@@ -1012,10 +1012,9 @@ def status(state_dir: Path, project_root: Path | None = None) -> dict:
     running = False
     if lock_path.exists():
         with lock_path.open("r") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                fcntl.flock(lock, fcntl.LOCK_UN)
-            except BlockingIOError:
+            if filelock.try_lock(lock):
+                filelock.unlock(lock)
+            else:
                 running = True
     observer_channels = {}
     health_path = state_dir / "observer-health.json"
@@ -1794,9 +1793,7 @@ def main() -> int:
             EVENTS.private_directory(args.state_dir)
             with lock_path.open("a+") as lock:
                 os.chmod(lock_path, 0o600)
-                try:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
+                if not filelock.try_lock(lock):
                     raise ValueError("conversation observer is already running")
                 suspend_interrupted_sends(args.state_dir)
                 observer_env = {**os.environ, "CCDM_REMINDER_PROJECT_ROOT": str(args.project_root),

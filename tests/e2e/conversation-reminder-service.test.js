@@ -100,6 +100,17 @@ async function reconciledExchange(workspace, stateDir) {
   assert.equal(seeded.status, 0, seeded.stderr);
 }
 
+test("status answers with no worker, and reads an existing store in a protected state dir", async () => {
+  const workspace = createBridgeWorkspace();
+  const stateDir = setup(workspace);
+  const before = await command(workspace, stateDir, "status");
+  assert.deepEqual([before.status, before.worker_running], ["uninitialized", false]);
+  await command(workspace, stateDir, "sync");
+  assertPrivate(stateDir);
+  const after = await command(workspace, stateDir, "status");
+  assert.deepEqual([after.status, after.worker_running], ["ok", false]);
+});
+
 test("a reconciled Project Conversation gets its first emoji only after a full hour", async () => {
   const workspace = createBridgeWorkspace();
   const stateDir = setup(workspace);

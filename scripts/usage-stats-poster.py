@@ -3,7 +3,6 @@
 
 import argparse
 import contextlib
-import fcntl
 import hashlib
 import http.client
 import json
@@ -31,6 +30,7 @@ sys.dont_write_bytecode = True  # no __pycache__ beside the scripts
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from ccdmlib.platform import filelock  # noqa: E402
 from ccdmlib.platform.private_fs import ensure_private_dir, fix_hint, is_private  # noqa: E402
 
 ROOT_DIR = SCRIPT_DIR.parent
@@ -2365,14 +2365,15 @@ class HistoryStore:
             try:
                 nofollow = getattr(os, "O_NOFOLLOW", 0)
                 fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT | nofollow, 0o600)
-                os.fchmod(fd, 0o600)
+                if sys.platform != "win32":
+                    os.fchmod(fd, 0o600)
                 if not stat.S_ISREG(os.fstat(fd).st_mode):
                     raise PosterError("usage history lock must be a regular file")
             except OSError as error:
                 raise PosterError(f"unable to open usage history lock: {error}") from None
             try:
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    filelock.lock(fd)
                     lock_acquired = True
                 except OSError as error:
                     raise PosterError(f"unable to acquire usage history lock: {error}") from None
@@ -2408,7 +2409,7 @@ class HistoryStore:
             finally:
                 if lock_acquired:
                     try:
-                        fcntl.flock(fd, fcntl.LOCK_UN)
+                        filelock.unlock(fd)
                     except OSError as error:
                         raise PosterError(f"unable to release usage history lock: {error}") from None
         finally:
