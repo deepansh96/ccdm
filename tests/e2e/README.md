@@ -15,13 +15,29 @@ npm test
 npm run test:e2e
 ```
 
-Both run `tests/run-e2e.mjs`, which runs test files in parallel (`CCDM_E2E_JOBS`, default CPU count minus 2), longest first by the previous run's timings. A file that fails under parallel load is rerun alone; if it then passes it is reported as `FLAKY` and the run still succeeds. Pass test files to run only those. `npm run test:serial` runs one file at a time:
+Both run `tests/run-e2e.mjs`, which runs test files in parallel (`CCDM_E2E_JOBS`, default CPU count minus 2; see Runner Settings and Reports below), longest first by the previous run's timings. A file that fails under parallel load is rerun alone; if it then passes it is reported as `FLAKY` and the run still succeeds. Pass test files to run only those. `npm run test:serial` runs one file at a time:
 
 ```sh
 node --test --test-concurrency=1 tests/e2e/**/*.test.js
 ```
 
 Harness deadlines (`waitFor`, `waitForState`, the `runProcess` kill timer) are multiplied by `CCDM_E2E_TIMEOUT_SCALE` (default 4) so parallel load does not kill healthy runs; a passing test never waits them out. Fixture binaries are built once per content in a shared temp directory and linked into each workspace, and the repo's executable scripts are hard-linked rather than copied: macOS XProtect scans every newly written executable on first run, one at a time, which otherwise serializes parallel files.
+
+### Runner Settings and Reports
+
+`tests/run-e2e.mjs` reads these environment variables. On macOS and Linux the defaults keep the behaviour above; Windows gets a deadline, fewer jobs and no rerun by default.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CCDM_E2E_JOBS` | POSIX: CPU count minus 2, at least 2. Windows: CPU count minus 2, between 1 and 8 | Parallel test files. |
+| `CCDM_E2E_FILE_TIMEOUT_MS` | POSIX: none. Windows: `600000` (10 min) | Per-file deadline; `0` turns it off. A file past it is killed and reported as `TIMED OUT`. Only the process the runner started for that file is killed, with its children: its process group on POSIX (SIGTERM, then SIGKILL after 5 s), its process tree on Windows (`taskkill /T /F`). Timed-out files are not rerun. |
+| `CCDM_E2E_REPORT_DIR` | unset | Writes one TAP file per test file (`tests__e2e__<name>.test.js.tap`) and `summary.json`: per file its label, status, exit code, signal, tests, pass, fail, skipped, duration, timed out, crashed, rerun, flaky and workspace dirs, plus totals. Use an empty directory. |
+| `CCDM_E2E_KEEP_FAILED` | unset | `1` keeps the TAP output and workspace dirs of every file that did not pass, and prints them as `# kept workspace:`. Without `CCDM_E2E_REPORT_DIR` the TAP files go to a new `ccdm-e2e-report-*` temp dir, printed as `# report:`. |
+| `CCDM_E2E_NO_RERUN` | POSIX: unset (rerun on). Windows: `1` | `1` skips the rerun-alone step; `0` turns it back on. |
+
+Each file ends as passed, failed, crashed or timed out, and the summary counts each apart. A file is crashed when it was killed by a signal, printed no `# tests` line, or exited or threw outside a test: `node --test` reports that as a `not ok` named after the file with `exitCode:` or `signal:` in its YAML block, and exits 1 with `# fail 1`, so the exit code alone cannot tell.
+
+`createWorkspace()` prints `ccdm-e2e-workspace <dir>` on stderr. The runner removes those dirs after each file, so a killed file, whose own teardown never ran, leaves nothing behind; under `CCDM_E2E_KEEP_FAILED=1` the workspace teardown leaves its dir for the runner to decide. The runner's own tests use the fixture files in `tests/fixtures/runner/`, which the default run does not pick up.
 
 ## Harness Architecture
 
