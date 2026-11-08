@@ -47,6 +47,17 @@ filelock.unlock(reader)
 print(json.dumps(result))
 `;
 
+const DESCRIPTOR = `
+import json, os, sys
+from ccdmlib.platform import filelock
+descriptor = os.open(sys.argv[1], os.O_RDWR)
+other = open(sys.argv[1], "a+")
+result = [filelock.lock(descriptor), filelock.try_lock(other)]
+filelock.unlock(descriptor)
+result.append(filelock.try_lock(other))
+print(json.dumps(result))
+`;
+
 const SUPERVISOR_RUNNING = `
 import sys
 from pathlib import Path
@@ -80,6 +91,12 @@ export default [
     name: "two handles conflict in one process, a read-only handle can lock, and unlock frees it",
     async check(_outcomes, ctx) {
       assert.deepEqual(JSON.parse(output(await ctx.pythonScript(SAME_PROCESS, [lockFile(ctx)]))), [true, false, true]);
+    },
+  },
+  {
+    name: "a bare descriptor locks too, and with no deadline a free lock is taken at once",
+    async check(_outcomes, ctx) {
+      assert.deepEqual(JSON.parse(output(await ctx.pythonScript(DESCRIPTOR, [lockFile(ctx)]))), [true, false, true]);
     },
   },
   {
