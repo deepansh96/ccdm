@@ -143,7 +143,7 @@ def is_codex_bridge(command: str) -> bool:
         and has_env(command, "CHANNEL_ID", channel_id)
     )
 
-def find_pid() -> int | None:
+def find_pid() -> "int | None":
     try:
         ps = subprocess.check_output(
             ["ps", "axeww", "-o", "pid=,command="],

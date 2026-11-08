@@ -261,6 +261,29 @@ test("the annotation floor rejects `int | None` without the future import, and n
   assert.equal(fine.status, 0, fine.stderr || fine.stdout);
 });
 
+test("the annotation floor also reads Python heredocs in shell scripts", t => {
+  const script = body => `#!/bin/zsh\npython3 - "$1" <<'PY'\n${body}PY\necho done\n`;
+  const union = "def find_pid() -> int | None:\n    return None\n";
+  const bad = floorRun(t, "annotations", { "start.sh": script(union) });
+  assert.equal(bad.status, 1, bad.stderr || bad.stdout);
+  assert.match(bad.stderr, /start\.sh:3: `X \| Y` annotation/);
+
+  const second = floorRun(t, "annotations", { "start.sh": `${script("x = 1\n")}${script(union)}` });
+  assert.equal(second.status, 1, second.stderr || second.stdout);
+  assert.match(second.stderr, /start\.sh:8: `X \| Y` annotation/);
+
+  const broken = floorRun(t, "annotations", { "start.sh": script("def (:\n") });
+  assert.equal(broken.status, 1, broken.stderr || broken.stdout);
+  assert.match(broken.stderr, /does not parse/);
+
+  const fine = floorRun(t, "annotations", {
+    "future.sh": script(`from __future__ import annotations\n${union}`),
+    "quoted.sh": script('def find_pid() -> "int | None":\n    return None\n'),
+    "other.sh": "cat <<'EOF'\ndef f() -> int | None: not python\nEOF\n",
+  });
+  assert.equal(fine.status, 0, fine.stderr || fine.stdout);
+});
+
 test("the import floor fails when a ccdmlib module cannot be imported, and walks subpackages", t => {
   const good = { "ccdmlib/__init__.py": "", "ccdmlib/sub/__init__.py": "", "ccdmlib/sub/fine.py": "VALUE = 1\n" };
   const passing = floorRun(t, "imports", good);

@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """Python floor checks that vermin cannot make. Runs on the Mac's /usr/bin/python3.
 
-  annotations <dir>  no *.py under <dir> may use an `X | Y` annotation unless it
-                     has `from __future__ import annotations`
+  annotations <dir>  no *.py under <dir>, and no Python heredoc in a *.sh under it,
+                     may use an `X | Y` annotation unless it has
+                     `from __future__ import annotations`; on 3.9 each must also parse
   imports <scripts>  every module under <scripts>/ccdmlib must import here
 
 vermin's own union-types feature reports every bitwise `|`, such as
-`os.O_RDWR | os.O_CREAT`, and ignores the future import, so it cannot do the first.
+`os.O_RDWR | os.O_CREAT`, and ignores the future import, and vermin never reads
+shell scripts, so it cannot do the first.
 """
 
 import ast
 import importlib
 from pathlib import Path
+import re
 import sys
 
 sys.dont_write_bytecode = True
+
+HEREDOC = re.compile(r"<<-?\s*'(PY|PYEOF)'")
 
 
 def has_future_annotations(tree):
@@ -37,21 +42,45 @@ def is_union(annotation):
     )
 
 
+def source_problems(source, file, offset=0):
+    try:
+        tree = ast.parse(source, filename=str(file))
+    except SyntaxError as error:
+        version = ".".join(str(part) for part in sys.version_info[:2])
+        return [f"{file}:{(error.lineno or 0) + offset}: does not parse on Python {version}: {error.msg}"]
+    if has_future_annotations(tree):
+        return []
+    return [
+        f"{file}:{annotation.lineno + offset}: `X | Y` annotation without the future import"
+        for node in ast.walk(tree)
+        for annotation in annotations_of(node)
+        if is_union(annotation)
+    ]
+
+
+# Each heredoc's first-line offset in the script, and its Python source.
+def python_heredocs(text):
+    lines = text.split("\n")
+    index = 0
+    while index < len(lines):
+        opened = HEREDOC.search(lines[index])
+        index += 1
+        if not opened:
+            continue
+        start = index
+        while index < len(lines) and lines[index].strip() != opened.group(1):
+            index += 1
+        yield start, "\n".join(lines[start:index])
+        index += 1
+
+
 def annotation_problems(root):
     problems = []
     for file in sorted(root.rglob("*.py")):
-        try:
-            tree = ast.parse(file.read_text(encoding="utf-8"), filename=str(file))
-        except SyntaxError as error:
-            version = ".".join(str(part) for part in sys.version_info[:2])
-            problems.append(f"{file}:{error.lineno}: does not parse on Python {version}: {error.msg}")
-            continue
-        if has_future_annotations(tree):
-            continue
-        for node in ast.walk(tree):
-            for annotation in annotations_of(node):
-                if is_union(annotation):
-                    problems.append(f"{file}:{annotation.lineno}: `X | Y` annotation without the future import")
+        problems.extend(source_problems(file.read_text(encoding="utf-8"), file))
+    for file in sorted(root.rglob("*.sh")):
+        for offset, source in python_heredocs(file.read_text(encoding="utf-8")):
+            problems.extend(source_problems(source, file, offset))
     return problems
 
 
