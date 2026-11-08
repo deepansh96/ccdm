@@ -885,7 +885,9 @@ function commandLinesOf(pids) {
     const powershell = path.join(process.env.SystemRoot || "C:\\\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
     const filter = pids.map((pid) => \`ProcessId=\${pid}\`).join(" OR ");
     const script = \`[Console]::OutputEncoding=[Text.Encoding]::UTF8;Get-CimInstance Win32_Process -Filter '\${filter}' | ForEach-Object { [string]$_.ProcessId + ' ' + $_.CommandLine }\`;
-    const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 15000, windowsHide: true });
+    // PowerShell has no module cache under a workspace's empty profile, and on a
+    // CI runner that first start alone can take more than 15 seconds.
+    const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 60000, windowsHide: true });
     for (const line of String(result.stdout || "").split(/\\r?\\n/)) {
       const match = /^(\\d+) (.*)$/.exec(line);
       if (match) found.set(Number(match[1]), match[2]);
