@@ -66,7 +66,7 @@ test("state store reloads from disk and records fixture helpers", () => {
   assert.equal(snapshot["setup.sh"].sha256.length, 64);
 });
 
-test("command runner injects isolated environment and allowlisted PATH", async () => {
+test("command runner injects isolated environment and allowlisted PATH", platformGate("posix", "drives setup.sh, a zsh script"), async () => {
   const workspace = createWorkspace();
 
   const result = await runScript(workspace, "setup.sh", {

@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import test from "node:test";
+import nodeTest from "node:test";
 
+import { suiteTest } from "./support/platform.js";
 import { createWorkspace, runScript } from "./support/runner.js";
 import { readState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
+
+const test = suiteTest(nodeTest, import.meta.url);
 
 test.afterEach(async () => {
   await cleanup();

@@ -1,11 +1,53 @@
 {
-  "budget": 1,
+  "budget": 71,
   "skips": [
     {
       "file": "harness-safety.test.js",
       "test": "on POSIX, teardown still stops every process in a verified group",
       "tag": "posix",
       "reason": "Windows has no process groups to signal"
+    },
+    {
+      "file": "harness-safety.test.js",
+      "test": "command runner injects isolated environment and allowlisted PATH",
+      "tag": "posix",
+      "reason": "drives setup.sh, a zsh script"
+    },
+    {
+      "file": "conversation-reminder-launchagent.test.js",
+      "test": "*",
+      "tag": "posix",
+      "reason": "installs through launchd and a zsh script; Windows installers have their own suites"
+    },
+    {
+      "file": "router-installer.test.js",
+      "test": "*",
+      "tag": "posix",
+      "reason": "installs through launchd and a zsh script; Windows installers have their own suites"
+    },
+    {
+      "file": "thread-supervisor-launchagent.test.js",
+      "test": "*",
+      "tag": "posix",
+      "reason": "installs through launchd and a zsh script; Windows installers have their own suites"
+    },
+    {
+      "file": "usage-stats-installer.test.js",
+      "test": "*",
+      "tag": "posix",
+      "reason": "installs through launchd and a zsh script; Windows installers have their own suites"
+    },
+    {
+      "file": "setup.test.js",
+      "test": "*",
+      "tag": "posix",
+      "reason": "drives zsh scripts, which the Windows port replaces"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "*",
+      "tag": "posix",
+      "reason": "drives zsh scripts, which the Windows port replaces"
     }
   ]
 }

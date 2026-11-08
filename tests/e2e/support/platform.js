@@ -119,11 +119,19 @@ export function platformGate(tag, reason = "", platform = process.platform) {
   return { skip: reason ? `${tag}: ${reason}` : tag };
 }
 
-// For a suite gated as a whole in surfaces.js: options for every test in the file.
-export function suiteGate(file, platform = process.platform) {
+// For a suite gated as a whole in surfaces.js: its `test`, which skips every case
+// on an OS the suite does not run on. Elsewhere it is node:test's own function.
+// Use as `const test = suiteTest(nodeTest, import.meta.url);`.
+export function suiteTest(nodeTest, file, platform = process.platform) {
   const surface = runSurface(path.basename(fileURLToPath(file)));
-  if (surface.oses.includes(platform)) return {};
-  return { skip: `${surface.tag}: ${surface.reason}` };
+  if (surface.oses.includes(platform)) return nodeTest;
+  const skip = `${surface.tag}: ${surface.reason}`;
+  const gated = (name, ...rest) => {
+    const body = rest.at(-1);
+    const options = rest.length > 1 ? rest[0] : {};
+    return nodeTest(name, { ...options, skip }, body);
+  };
+  return Object.assign(gated, nodeTest);
 }
 
 function compilerPath(env) {

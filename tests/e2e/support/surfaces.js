@@ -14,6 +14,12 @@ export const TAG_SURFACES = Object.freeze({
 // single tests gated with platformGate(). Each entry also needs a line in
 // windows-skip-budget.json.
 const WHOLE_SUITES = Object.freeze({
+  "conversation-reminder-launchagent.test.js": { tag: "posix", reason: "installs through launchd and a zsh script; Windows installers have their own suites" },
+  "router-installer.test.js": { tag: "posix", reason: "installs through launchd and a zsh script; Windows installers have their own suites" },
+  "thread-supervisor-launchagent.test.js": { tag: "posix", reason: "installs through launchd and a zsh script; Windows installers have their own suites" },
+  "usage-stats-installer.test.js": { tag: "posix", reason: "installs through launchd and a zsh script; Windows installers have their own suites" },
+  "setup.test.js": { tag: "posix", reason: "drives zsh scripts, which the Windows port replaces" },
+  "stop-restart.test.js": { tag: "posix", reason: "drives zsh scripts, which the Windows port replaces" },
 });
 
 // The surface of one suite file (by basename), or of every listed suite.

@@ -8,7 +8,10 @@ import { runSurface, TAG_SURFACES } from "./support/surfaces.js";
 
 const E2E_DIR = fileURLToPath(new URL(".", import.meta.url));
 const BUDGET_FILE = "windows-skip-budget.json";
-const suites = () => fs.readdirSync(E2E_DIR).filter((name) => name.endsWith(".test.js")).sort();
+// Not this file: its own checks plant gates as sample text.
+const suites = () => fs.readdirSync(E2E_DIR)
+  .filter((name) => name.endsWith(".test.js") && name !== "windows-skip-budget.test.js")
+  .sort();
 const read = (name) => fs.readFileSync(path.join(E2E_DIR, name), "utf8");
 const skipsOnWindows = (tag) => !TAG_SURFACES[tag].includes("win32");
 
@@ -99,13 +102,19 @@ test("the number of Windows skips is within the budget", () => {
 });
 
 test("no suite gates by hand or calls python3 directly, and nothing is tagged darwin without being macOS-only", () => {
-  for (const file of suites().filter((name) => name !== "windows-skip-budget.test.js")) {
+  for (const file of suites()) {
     const source = read(file);
     assert.doesNotMatch(source, /\bskip:\s*process\.platform/, `${file} gates with process.platform; use platformGate`);
     assert.doesNotMatch(source, /\b(?:spawn|spawnSync|execFile|execFileSync|execFileAsync)\(\s*["']python3["']/, `${file} calls python3 directly; use PYTHON`);
     for (const gate of gatesIn(source)) {
       assert.notEqual(gate.tag, "darwin", `${file}:${gate.line}: darwin is for a real macOS facility only, not fixture tests that pass on Linux`);
     }
+  }
+});
+
+test("every suite gated as a whole takes its test from suiteTest", () => {
+  for (const name of Object.keys(runSurface())) {
+    assert.match(read(name), /const test = suiteTest\(nodeTest, import\.meta\.url\);/, name);
   }
 });
 

@@ -2,13 +2,16 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import test from "node:test";
+import nodeTest from "node:test";
 
 import { startFakeCodexServer } from "./support/bridge.js";
+import { suiteTest } from "./support/platform.js";
 import { createRouterWorkspace, routerEnv, startRouter } from "./support/router.js";
 import { createWorkspace, runScript } from "./support/runner.js";
 import { readState, seedFixtureProcess, seedRegistry, seedTmuxSession, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
+
+const test = suiteTest(nodeTest, import.meta.url);
 
 test.afterEach(async () => {
   await cleanup();

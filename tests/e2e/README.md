@@ -18,7 +18,7 @@ Each fixture tool is `<tool>.exe` plus `<tool>.shim`, hard-linked into each work
 - `interpreterFor(script)`: how to start a script. POSIX uses its shebang; Windows names the interpreter. `runScript()` goes through it.
 - `platformGate(tag, reason)`: test options for an OS tag. `posix` runs on Linux and macOS and is skipped on Windows. `darwin` runs only on macOS and only for a test that needs a real macOS facility; a test that passes on Linux with fixtures is never `darwin`. `win32` runs only on Windows.
 
-Write the gate on the `test(` line, directly or through a `const` holding it, so the budget check can read it. A suite gated as a whole goes in `tests/e2e/support/surfaces.js`, whose `runSurface()` records which suites run on which OS, and its tests use `suiteGate(import.meta.url)`.
+Write the gate on the `test(` line, directly or through a `const` holding it, so the budget check can read it. A suite gated as a whole goes in `tests/e2e/support/surfaces.js`, whose `runSurface()` records which suites run on which OS, and the file takes its `test` from `suiteTest(nodeTest, import.meta.url)`.
 
 Every test skipped on Windows needs an entry in `tests/e2e/windows-skip-budget.json` with its file, test name, tag and reason, and the total must fit `budget`. `tests/e2e/windows-skip-budget.test.js` fails on an unlisted skip, a stale entry, or a count over budget.
 
