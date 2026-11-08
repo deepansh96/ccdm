@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { assertIsolatedPath, buildCommandDiagnostics } from "./diagnostics.js";
+import { fixtureLauncher, gitBashTool, hookShell, interpreterFor, PYTHON } from "./platform.js";
 import { readState, recordCommandInvocation, writeState } from "./state.js";
 import { registerTeardownCallback, workspaceOwnsPid } from "./teardown.js";
 
@@ -15,6 +16,8 @@ export const TIMEOUT_SCALE = Number(process.env.CCDM_E2E_TIMEOUT_SCALE) || 4;
 export function scaledTimeout(ms) {
   return ms * TIMEOUT_SCALE;
 }
+
+const WIN = process.platform === "win32";
 
 const FORBIDDEN_WORKSPACE_ARTIFACTS = [
   "registry.json",
@@ -131,13 +134,16 @@ function shellQuote(value) {
 
 function hostCommandPath(name) {
   if (name === "python3") {
-    const python = spawnSync("python3", ["-c", "import sys; print(sys.executable)"], {
+    const python = spawnSync(PYTHON, ["-c", "import sys; print(sys.executable)"], {
       encoding: "utf8",
       windowsHide: true,
     });
     if (python.status === 0 && python.stdout.trim()) {
       return python.stdout.trim();
     }
+  }
+  if (WIN) {
+    return gitBashTool(name);
   }
   const result = spawnSync("/bin/sh", ["-lc", `command -v ${name}`], {
     encoding: "utf8",
@@ -155,7 +161,7 @@ function createFixtureRuntime(fixtureDir) {
   writeExecutable(
     runtime,
     `#!/usr/bin/env node
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -174,6 +180,9 @@ const stateFile = path.join(stateDir, "state.json");
 
 // Teardown signals a recorded PID only when its command line holds this path.
 const workspaceMarker = path.dirname(stateDir);
+
+// The shell Claude Code runs hook commands with on this OS.
+const HOOK_SHELL = ${JSON.stringify(hookShell())};
 
 function initialState() {
   return {
@@ -551,7 +560,7 @@ function runRouterClaudeHost() {
     for (const hook of (hooks[event] || []).flatMap((group) => group.hooks || [])) {
       if (hook.type !== "command") continue;
       const exitCode = await new Promise((done) => {
-        const child = spawn("/bin/sh", ["-c", hook.command], { env: hookEnv, stdio: ["pipe", "ignore", "ignore"], windowsHide: true });
+        const child = spawn(HOOK_SHELL, ["-c", hook.command], { env: hookEnv, stdio: ["pipe", "ignore", "ignore"], windowsHide: true });
         child.on("exit", done);
         child.stdin.end(input);
       });
@@ -850,7 +859,7 @@ function runPs() {
     console.error("unsupported ps invocation");
     process.exit(2);
   }
-  const rows = activeOwnedProcesses(readState());
+  const rows = reportableProcesses(readState());
   for (const row of rows) {
     process.stdout.write(\`\${String(row.pid).padStart(5, " ")} \${row.command}\\n\`);
   }
@@ -862,11 +871,42 @@ function runPgrep() {
     process.exit(2);
   }
   const parentPid = Number(args[1]);
-  const rows = activeOwnedProcesses(readState()).filter((row) => row.ppid === parentPid);
+  const rows = reportableProcesses(readState()).filter((row) => row.ppid === parentPid);
   for (const row of rows) {
     process.stdout.write(\`\${row.pid}\\n\`);
   }
   process.exit(rows.length > 0 ? 0 : 1);
+}
+
+// PID to command line, for those of \`pids\` still running.
+function commandLinesOf(pids) {
+  const found = new Map();
+  if (process.platform === "win32" && pids.length > 0) {
+    const powershell = path.join(process.env.SystemRoot || "C:\\\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    const filter = pids.map((pid) => \`ProcessId=\${pid}\`).join(" OR ");
+    const script = \`[Console]::OutputEncoding=[Text.Encoding]::UTF8;Get-CimInstance Win32_Process -Filter '\${filter}' | ForEach-Object { [string]$_.ProcessId + ' ' + $_.CommandLine }\`;
+    const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 15000, windowsHide: true });
+    for (const line of String(result.stdout || "").split(/\\r?\\n/)) {
+      const match = /^(\\d+) (.*)$/.exec(line);
+      if (match) found.set(Number(match[1]), match[2]);
+    }
+    return found;
+  }
+  const ps = fs.existsSync("/bin/ps") ? "/bin/ps" : "ps";
+  for (const pid of pids) {
+    const result = spawnSync(ps, ["-ww", "-o", "command=", "-p", String(pid)], { encoding: "utf8", timeout: 15000, windowsHide: true });
+    if (result.status === 0) found.set(pid, result.stdout.trim());
+  }
+  return found;
+}
+
+// What \`ps\` and \`pgrep\` report, which production code goes on to signal. Windows
+// reuses PIDs quickly, so there a row must also still hold this workspace's path.
+function reportableProcesses(state) {
+  const rows = activeOwnedProcesses(state);
+  if (process.platform !== "win32") return rows;
+  const commandLines = commandLinesOf(rows.map((row) => row.pid));
+  return rows.filter((row) => commandLines.get(row.pid)?.includes(workspaceMarker));
 }
 
 function runPkill() {
@@ -876,14 +916,26 @@ function runPkill() {
   }
   const parentPid = Number(args[2]);
   const rows = activeOwnedProcesses(readState()).filter((row) => row.ppid === parentPid);
+  const commandLines = commandLinesOf(rows.map((row) => row.pid));
+  let signalled = 0;
   for (const row of rows) {
+    // A recorded PID may have been reused; signal only what holds this workspace's path.
+    if (!commandLines.get(row.pid)?.includes(workspaceMarker)) {
+      updateState((state) => {
+        state.fixtures.pkillSkips = [...(state.fixtures.pkillSkips || []), { marker: workspaceMarker, pid: row.pid }];
+        return state;
+      });
+      console.error(\`ccdm-fixture-pkill skipped pid \${row.pid}: its command line does not hold \${workspaceMarker}\`);
+      continue;
+    }
     try {
       process.kill(row.pid, "SIGTERM");
+      signalled += 1;
     } catch {
       // The process may have already exited.
     }
   }
-  process.exit(rows.length > 0 ? 0 : 1);
+  process.exit(signalled > 0 ? 0 : 1);
 }
 
 function runClaude() {
@@ -1379,7 +1431,18 @@ switch (tool) {
   return runtime;
 }
 
-function createFixtureBin(fixtureDir, runtime, name) {
+// The Windows form of a fixture tool: the launcher, and the .shim it reads to
+// know what to start. One copy per tool, so hard links stay under NTFS's limit.
+function createWindowsFixture(fixtureDir, launcher, name, shimLines) {
+  fs.copyFileSync(launcher, path.join(fixtureDir, `${name}.exe`));
+  fs.writeFileSync(path.join(fixtureDir, `${name}.shim`), `${shimLines.join("\n")}\n`);
+}
+
+function createFixtureBin(fixtureDir, runtime, name, launcher) {
+  if (WIN) {
+    createWindowsFixture(fixtureDir, launcher, name, [process.execPath, runtime, name]);
+    return;
+  }
   writeExecutable(
     path.join(fixtureDir, name),
     `#!/bin/sh
@@ -1388,9 +1451,14 @@ exec ${shellQuote(process.execPath)} ${shellQuote(runtime)} ${shellQuote(name)} 
   );
 }
 
-function createHostWrapper(fixtureDir, name, target) {
-  const resolvedTarget = target ?? hostCommandPath(name);
+function createHostWrapper(fixtureDir, name, target, launcher) {
+  // The table's POSIX paths mean nothing on Windows; it finds each tool itself.
+  const resolvedTarget = WIN ? hostCommandPath(name) : target ?? hostCommandPath(name);
   if (!resolvedTarget || !fs.existsSync(resolvedTarget)) {
+    return;
+  }
+  if (WIN) {
+    createWindowsFixture(fixtureDir, launcher, name, [resolvedTarget]);
     return;
   }
   writeExecutable(
@@ -1409,22 +1477,25 @@ function buildFixtures(fixtureDir, runtimeDir, exclude, hostPaths) {
     throw new Error("Forced fixture build failure");
   }
   const runtime = path.join(runtimeDir, "fixture-runtime.cjs");
+  const launcher = WIN ? fixtureLauncher() : null;
   for (const tool of FIXTURE_TOOLS) {
     if (!exclude.has(tool)) {
-      if (tool === "sleep") {
+      if (tool === "sleep" && WIN) {
+        createWindowsFixture(fixtureDir, launcher, tool, [":noop"]);
+      } else if (tool === "sleep") {
         const truePath = ["/usr/bin/true", "/bin/true"].find((candidate) => fs.existsSync(candidate));
         if (!truePath) {
           throw new Error("Unable to create sleep fixture: true binary not found");
         }
         fs.symlinkSync(truePath, path.join(fixtureDir, tool));
       } else {
-        createFixtureBin(fixtureDir, runtime, tool);
+        createFixtureBin(fixtureDir, runtime, tool, launcher);
       }
     }
   }
   for (const [name, target] of hostPaths) {
     if (!exclude.has(name)) {
-      createHostWrapper(fixtureDir, name, target);
+      createHostWrapper(fixtureDir, name, target, launcher);
     }
   }
 }
@@ -1447,6 +1518,7 @@ function sharedFixtureDir(exclude) {
   const digest = createHash("sha256")
     .update(fs.readFileSync(new URL(import.meta.url)))
     .update(fs.readFileSync(new URL("./state-lock.cjs", import.meta.url)))
+    .update(fs.readFileSync(new URL("./fixture-shim.cs", import.meta.url)))
     .update(JSON.stringify([process.execPath, key, hostPaths]))
     .digest("hex")
     .slice(0, 16);
@@ -1472,11 +1544,24 @@ function sharedFixtureDir(exclude) {
   return dir;
 }
 
+// Windows needs no developer rights for a hard link. A copy only when a file has
+// reached NTFS's 1023 links (many kept workspaces).
+function linkOrCopy(source, destination) {
+  try {
+    fs.linkSync(source, destination);
+  } catch (error) {
+    if (error.code !== "EMLINK") throw error;
+    fs.copyFileSync(source, destination);
+  }
+}
+
 function createFixtures(fixtureDir, options = {}) {
   const shared = sharedFixtureDir(new Set(options.excludeFixtures ?? []));
   fs.mkdirSync(fixtureDir, { recursive: true });
   for (const name of fs.readdirSync(shared)) {
-    if (name !== ".complete") fs.symlinkSync(path.join(shared, name), path.join(fixtureDir, name));
+    if (name === ".complete") continue;
+    if (WIN) linkOrCopy(path.join(shared, name), path.join(fixtureDir, name));
+    else fs.symlinkSync(path.join(shared, name), path.join(fixtureDir, name));
   }
 }
 
@@ -1662,10 +1747,12 @@ export const createWorkspace = Object.freeze(function createWorkspace(options = 
 });
 
 function buildEnv(workspace, extraEnv = {}) {
-  return {
-    ...workspace.env,
-    ...extraEnv,
-  };
+  const env = { ...workspace.env, ...extraEnv };
+  // A test's own PYTHONPATH must not take away the os.kill(pid, 0) guard.
+  if (WIN && extraEnv.PYTHONPATH && workspace.env.PYTHONPATH) {
+    env.PYTHONPATH = `${workspace.env.PYTHONPATH}${path.delimiter}${extraEnv.PYTHONPATH}`;
+  }
+  return env;
 }
 
 function runProcess(workspace, command, args, options = {}) {
@@ -1673,7 +1760,9 @@ function runProcess(workspace, command, args, options = {}) {
   assertIsolatedPath(workspace, workspace.tmpDir);
   const env = buildEnv(workspace, options.env);
   const cwd = options.cwd ?? workspace.repoDir;
-  const child = spawn(command, args, {
+  // `command` stays what the test named; only how it starts differs on Windows.
+  const [program, ...interpreterArgs] = interpreterFor(command);
+  const child = spawn(program, [...interpreterArgs, ...args], {
     cwd,
     detached: true,
     env,
