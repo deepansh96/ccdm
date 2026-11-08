@@ -354,7 +354,7 @@ async function main() {
   console.log(`\n# files ${final.length} · parallel ${settings.jobs}${options}`);
   console.log(`# tests ${sum("tests")}\n# pass ${sum("pass")}\n# fail ${sum("fail")}\n# skipped ${sum("skipped")}`);
   console.log(`# duration_ms ${durationMs}`);
-  if (notPassed.length) {
+  if (crashed.length || timedOut.length) {
     console.log(`# files passed ${final.length - notPassed.length} · failed ${failed.length} · crashed ${crashed.length} · timed out ${timedOut.length}`);
   }
   if (failed.length) console.log(`# failed: ${failed.map(result => result.label).join(", ")}`);
