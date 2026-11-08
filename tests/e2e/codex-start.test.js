@@ -24,7 +24,7 @@ function createCodexWorkspace() {
 // The router default: `alpha` is a Codex project with no pool bot and no
 // `transport` field (`options.transport` sets one); the pool is empty.
 function buildCodexRegistry(workspace, options = {}) {
-  const projectPath = options.projectPath ?? path.join(workspace.tmpDir, 'project with spaces and "quotes"');
+  const projectPath = options.projectPath ?? path.join(workspace.tmpDir, "project with spaces & 50% off!");
   fs.mkdirSync(projectPath, { recursive: true });
   const registry = {
     discord_user_id: "allowed-user-id",
@@ -242,7 +242,7 @@ test("start-codex-session constructs a Router bridge tmux launch, removes stale 
     CODEX_HOME: codexHome,
     CODEX_SERVICE_TIER: "default",
     CODEX_RESUME_THREAD_ID: "",
-    PROJECT_DIR: path.join(workspace.tmpDir, 'project with spaces and "quotes"'),
+    PROJECT_DIR: path.join(workspace.tmpDir, "project with spaces & 50% off!"),
     WS_PORT: String(codex.port),
   });
   for (const forbidden of ["BOT_TOKEN", "DISCORD_STATE_DIR"]) {

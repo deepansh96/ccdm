@@ -73,7 +73,7 @@ test("MiMo setup creates private standalone provider state and launches through 
 
 test("MiMo setup handles quoted paths and both Token Plan credential types", async () => {
   for (const prefix of ["tp", "ttp"]) {
-    const fixture = setupFixture({ homeName: `mimo ${prefix} "quoted" 🚀` });
+    const fixture = setupFixture({ homeName: `mimo ${prefix} 'quoted' & 50% 🚀` });
     const result = await setup(fixture, { key: `${prefix}-fixture-testing-only`, args: ["--billing", "token-plan"] });
     assert.equal(result.exitCode, 0, result.stderr);
     const config = fs.readFileSync(path.join(fixture.home, "config.toml"), "utf8");
