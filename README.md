@@ -812,7 +812,19 @@ Add this to `~/.claude/settings.json`:
 | `scripts/cc-discord-nicknames.sh` | Records the context percentage only — no terminal UI dependency |
 | `scripts/cc-statusline-wrapper.sh` | Records the percentage AND pipes through [ccstatusline](https://github.com/sirmalloc/ccstatusline) for a terminal status bar |
 
-Both scripts use the `CCDM_ROUTER_KEY_FILE` that CCDM sets for its Claude sessions, and do nothing in other Claude sessions. When no percentage is available, replies post as `<project>-claude` with no suffix. Discord rejects webhook names containing `discord` or `clyde`, so the Router breaks those substrings with a zero-width joiner and truncates the project name first so the ` · N%` suffix survives the 80-character limit.
+`scripts/statusline-context.js` does the same recording in Node, with no bash or `jq`, so use it on Windows. It prints nothing by itself. To keep a status bar, pass that bar's existing command with `--chain`: it gets the same input, and its output is shown. Write Windows paths with forward slashes:
+
+```json
+"statusLine": {
+  "type": "command",
+  "command": "node 'C:/path/to/ccdm/scripts/statusline-context.js' --chain 'npx -y ccstatusline@latest'",
+  "padding": 0
+}
+```
+
+The chained command runs in `/bin/sh` on macOS and Linux. On Windows it runs in Git Bash when installed, otherwise in PowerShell.
+
+All of these scripts use the `CCDM_ROUTER_KEY_FILE` that CCDM sets for its Claude sessions, and do nothing in other Claude sessions. When no percentage is available, replies post as `<project>-claude` with no suffix. Discord rejects webhook names containing `discord` or `clyde`, so the Router breaks those substrings with a zero-width joiner and truncates the project name first so the ` · N%` suffix survives the 80-character limit.
 
 ## Preventing Sleep
 
