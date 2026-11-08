@@ -1517,6 +1517,8 @@ export const createWorkspace = Object.freeze(function createWorkspace(options = 
   rejectForbiddenSourceArtifacts(files);
 
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-e2e-"));
+  // tests/run-e2e.mjs reads this line to remove workspaces a killed file left behind.
+  process.stderr.write(`ccdm-e2e-workspace ${tmpRoot}\n`);
   const repoDir = path.join(tmpRoot, "repo");
   const homeDir = path.join(tmpRoot, "home");
   const tmpDir = path.join(tmpRoot, "tmp");
@@ -1561,7 +1563,8 @@ export const createWorkspace = Object.freeze(function createWorkspace(options = 
     } catch {
       // Workspace removal should still proceed if fixture cleanup cannot read state.
     }
-    fs.rmSync(tmpRoot, { force: true, recursive: true });
+    // With CCDM_E2E_KEEP_FAILED=1 the runner decides, once it knows the file's result.
+    if (process.env.CCDM_E2E_KEEP_FAILED !== "1") fs.rmSync(tmpRoot, { force: true, recursive: true });
   });
 
   return workspace;
