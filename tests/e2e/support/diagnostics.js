@@ -1,3 +1,4 @@
+import os from "node:os";
 import path from "node:path";
 
 import { readState, recordDiagnostic, snapshotFiles } from "./state.js";
@@ -66,15 +67,18 @@ export function assertIsolatedPath(workspace, targetPath) {
   const resolved = path.resolve(targetPath);
   const protectedPaths = [
     path.join(workspace.sourceRoot, "registry.json"),
-    path.join(process.env.HOME ?? "", ".claude"),
-    path.join(process.env.HOME ?? "", ".codex"),
+    path.join(os.homedir(), ".claude"),
+    path.join(os.homedir(), ".codex"),
   ].filter(Boolean);
 
   if (protectedPaths.some((protectedPath) => resolved === protectedPath || resolved.startsWith(`${protectedPath}${path.sep}`))) {
     recordProtectedPathViolation(workspace, resolved, "protected local state path");
   }
 
-  if (resolved.startsWith("/tmp/") && !resolved.startsWith(`${workspace.tmpRoot}${path.sep}`)) {
+  // /tmp/ stays alongside os.tmpdir(): on macOS os.tmpdir() is $TMPDIR, not /tmp.
+  const inGlobalTemp = resolved.startsWith(`${os.tmpdir()}${path.sep}`)
+    || (process.platform !== "win32" && resolved.startsWith("/tmp/"));
+  if (inGlobalTemp && !resolved.startsWith(`${workspace.tmpRoot}${path.sep}`)) {
     recordProtectedPathViolation(workspace, resolved, "unapproved global temp path");
   }
 }

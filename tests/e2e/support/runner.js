@@ -1390,6 +1390,10 @@ exec ${shellQuote(resolvedTarget)} "$@"
 function buildFixtures(fixtureDir, runtimeDir, exclude, hostPaths) {
   fs.mkdirSync(fixtureDir, { recursive: true });
   createFixtureRuntime(fixtureDir);
+  // Test-only seam: fails once the staging dir has content, on every OS.
+  if (process.env.CCDM_E2E_FAIL_FIXTURE_BUILD === "1") {
+    throw new Error("Forced fixture build failure");
+  }
   const runtime = path.join(runtimeDir, "fixture-runtime.cjs");
   for (const tool of FIXTURE_TOOLS) {
     if (!exclude.has(tool)) {
@@ -1435,8 +1439,13 @@ function sharedFixtureDir(exclude) {
   const dir = path.join(os.tmpdir(), `ccdm-e2e-fixtures-${digest}`);
   if (!fs.existsSync(path.join(dir, ".complete"))) {
     const staging = fs.mkdtempSync(`${dir}.staging-`);
-    buildFixtures(staging, dir, exclude, hostPaths);
-    fs.writeFileSync(path.join(staging, ".complete"), "");
+    try {
+      buildFixtures(staging, dir, exclude, hostPaths);
+      fs.writeFileSync(path.join(staging, ".complete"), "");
+    } catch (error) {
+      fs.rmSync(staging, { recursive: true, force: true });
+      throw error;
+    }
     try {
       fs.renameSync(staging, dir);
     } catch (error) {
@@ -1511,48 +1520,48 @@ async function terminateProcessGroup(pid, timeoutMs = 5000) {
   await waitForProcessGroupExit(pid, 1000);
 }
 
+// Node's os.homedir() reads USERPROFILE on Windows and os.tmpdir() reads TEMP/TMP;
+// Python reads USERPROFILE and tries TMPDIR before TEMP/TMP. SystemRoot, windir
+// and ComSpec come from the host because Windows programs fail to start without them.
+function workspaceEnv({ root, homeDir, tmpDir, stateDir, fixtureDir, platform = process.platform, hostEnv = process.env }) {
+  const env = {
+    CCDM_TEST_STATE: stateDir,
+    HOME: homeDir,
+    NODE_OPTIONS: "",
+    NODE_PATH: nodePath(root),
+    PATH: fixtureDir,
+    TMPDIR: tmpDir,
+  };
+  if (platform !== "win32") {
+    return env;
+  }
+  const homeDrive = path.win32.parse(homeDir).root.replace(/\\$/, "");
+  Object.assign(env, {
+    APPDATA: path.win32.join(homeDir, "AppData", "Roaming"),
+    HOMEDRIVE: homeDrive,
+    HOMEPATH: homeDir.slice(homeDrive.length),
+    LOCALAPPDATA: path.win32.join(homeDir, "AppData", "Local"),
+    PATHEXT: ".COM;.EXE",
+    TEMP: tmpDir,
+    TMP: tmpDir,
+    USERPROFILE: homeDir,
+  });
+  for (const key of ["SystemRoot", "windir", "ComSpec"]) {
+    if (hostEnv[key] !== undefined) env[key] = hostEnv[key];
+  }
+  return env;
+}
+
 export const createWorkspace = Object.freeze(function createWorkspace(options = {}) {
   const root = sourceRoot();
   const files = gitSourceFiles(root);
   rejectForbiddenSourceArtifacts(files);
 
-  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-e2e-"));
-  // tests/run-e2e.mjs reads this line to remove workspaces a killed file left behind.
-  process.stderr.write(`ccdm-e2e-workspace ${tmpRoot}\n`);
-  const repoDir = path.join(tmpRoot, "repo");
-  const homeDir = path.join(tmpRoot, "home");
-  const tmpDir = path.join(tmpRoot, "tmp");
-  const stateDir = path.join(tmpRoot, "state");
-  const fixtureDir = path.join(tmpRoot, "fixtures");
-  fs.mkdirSync(repoDir, { recursive: true });
-  fs.mkdirSync(homeDir, { recursive: true });
-  fs.mkdirSync(tmpDir, { recursive: true });
-  fs.mkdirSync(stateDir, { recursive: true });
-
-  copySourceFiles(root, repoDir, files);
-  assertWorkspaceClean(repoDir);
-  createFixtures(fixtureDir, options);
-  writeState(undefined, stateDir);
-
-  const workspace = Object.freeze({
-    env: Object.freeze({
-      CCDM_TEST_STATE: stateDir,
-      HOME: homeDir,
-      NODE_OPTIONS: "",
-      NODE_PATH: nodePath(root),
-      PATH: fixtureDir,
-      TMPDIR: tmpDir,
-    }),
-    fixtureDir,
-    homeDir,
-    repoDir,
-    sourceRoot: root,
-    stateDir,
-    tmpDir,
-    tmpRoot,
-  });
-
+  // Registered before anything exists, so a throw below leaves nothing behind after cleanup().
+  let tmpRoot;
+  let stateDir;
   registerTeardownCallback(async () => {
+    if (tmpRoot === undefined) return;
     try {
       const state = readState(stateDir);
       for (const row of state.fixtures.processes ?? []) {
@@ -1565,6 +1574,35 @@ export const createWorkspace = Object.freeze(function createWorkspace(options = 
     }
     // With CCDM_E2E_KEEP_FAILED=1 the runner decides, once it knows the file's result.
     if (process.env.CCDM_E2E_KEEP_FAILED !== "1") fs.rmSync(tmpRoot, { force: true, recursive: true });
+  });
+
+  tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-e2e-"));
+  // tests/run-e2e.mjs reads this line to remove workspaces a killed file left behind.
+  process.stderr.write(`ccdm-e2e-workspace ${tmpRoot}\n`);
+  stateDir = path.join(tmpRoot, "state");
+  const repoDir = path.join(tmpRoot, "repo");
+  const homeDir = path.join(tmpRoot, "home");
+  const tmpDir = path.join(tmpRoot, "tmp");
+  const fixtureDir = path.join(tmpRoot, "fixtures");
+  const env = workspaceEnv({ root, homeDir, tmpDir, stateDir, fixtureDir });
+  for (const dir of [repoDir, homeDir, tmpDir, stateDir, env.APPDATA, env.LOCALAPPDATA]) {
+    if (dir) fs.mkdirSync(dir, { recursive: true });
+  }
+
+  copySourceFiles(root, repoDir, files);
+  assertWorkspaceClean(repoDir);
+  createFixtures(fixtureDir, options);
+  writeState(undefined, stateDir);
+
+  const workspace = Object.freeze({
+    env: Object.freeze(env),
+    fixtureDir,
+    homeDir,
+    repoDir,
+    sourceRoot: root,
+    stateDir,
+    tmpDir,
+    tmpRoot,
   });
 
   return workspace;
@@ -1648,4 +1686,5 @@ export const runNodeEntrypoint = Object.freeze(async function runNodeEntrypoint(
 
 export const runnerInternals = Object.freeze({
   FORBIDDEN_WORKSPACE_ARTIFACTS,
+  workspaceEnv,
 });
