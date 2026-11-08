@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { PYTHON } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import { createBridgeWorkspace, injectDiscordMessage, injectDiscordReaction, waitForState } from "./support/bridge.js";
 import { routerEnv, startRouter } from "./support/router.js";
@@ -129,7 +130,7 @@ test("discovery arms an old completed-looking answer from its answer time, then 
   assert.equal(requested.discovery_requested, true);
   // History cannot identify earlier reminders, so the baseline starts a fresh streak.
   await command(workspace, stateDir, "sync");
-  const seeded = spawnSync("python3", ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute(\"UPDATE conversations SET consecutive_reminders=5 WHERE project='demo'\"); db.commit(); print(db.total_changes)", path.join(stateDir, "conversations.sqlite3")], { encoding: "utf8" });
+  const seeded = spawnSync(PYTHON, ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute(\"UPDATE conversations SET consecutive_reminders=5 WHERE project='demo'\"); db.commit(); print(db.total_changes)", path.join(stateDir, "conversations.sqlite3")], { encoding: "utf8" });
   assert.equal(seeded.stdout.trim(), "1", seeded.stderr);
   const worker = startWorker(workspace, stateDir, "2026-09-20T08:30:00Z");
   const ready = await waitForStatus(workspace, stateDir, current =>

@@ -7,6 +7,7 @@ import test from "node:test";
 import { injectDiscordMessage, startFakeCodexServer } from "./support/bridge.js";
 import { OWNER_ID, createRouterWorkspace, routerRegistry, routerWithWebhooks, runRouterCli,
   waitFor } from "./support/router.js";
+import { PYTHON } from "./support/platform.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 import { startThreadSupervisor, supervisorStateDir, supervisorStatus } from "./support/thread-supervisor.js";
@@ -330,7 +331,7 @@ test("a resume after the project switched its Claude home continues the conversa
 });
 
 // The launcher's recorded pid, which the supervisor stores once the launcher exits.
-const storedRuntimePid = workspace => JSON.parse(execFileSync("python3", ["-c", `import json, sqlite3, sys
+const storedRuntimePid = workspace => JSON.parse(execFileSync(PYTHON, ["-c", `import json, sqlite3, sys
 db = sqlite3.connect(sys.argv[1], timeout=5)
 print(json.dumps(db.execute("SELECT runtime_pid FROM threads WHERE thread_id = ?", (sys.argv[2],)).fetchone()[0]))`,
 path.join(supervisorStateDir(workspace), "threads.sqlite3"), THREAD_ID], { encoding: "utf8" }));
@@ -423,7 +424,7 @@ const CODEX_THREAD_UUID = "0199a5c4-7e1b-7c3d-9f2a-4b8e6d1c3a58";
 
 // The creation-request path gives this thread its Codex provider; the root bot creates it.
 function requestCodexThread(workspace) {
-  execFileSync("python3", ["-c", `import sqlite3, sys
+  execFileSync(PYTHON, ["-c", `import sqlite3, sys
 db = sqlite3.connect(sys.argv[1], timeout=5)
 db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
   first_message, requester_id, requester_kind, status, thread_id, created_at)

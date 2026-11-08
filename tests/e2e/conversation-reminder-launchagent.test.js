@@ -5,6 +5,7 @@ import test from "node:test";
 
 import { spawn, spawnSync } from "node:child_process";
 
+import { PYTHON } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import { routerEnv, runRouterCli, startBridge, startRouter, waitFor, writeProjectKey } from "./support/router.js";
 import {
@@ -71,7 +72,7 @@ async function service(workspace, context, name, expected = 0) {
 }
 
 function renderedAgent(workspace) {
-  const parsed = spawnSync("python3", ["-c",
+  const parsed = spawnSync(PYTHON, ["-c",
     "import json,plistlib,sys; print(json.dumps(plistlib.load(open(sys.argv[1],'rb'))))", plistPath(workspace)],
   { encoding: "utf8" });
   assert.equal(parsed.status, 0, parsed.stderr);

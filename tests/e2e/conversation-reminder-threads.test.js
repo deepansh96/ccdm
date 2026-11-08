@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { PYTHON } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import { createBridgeWorkspace, injectDiscordMessage, injectDiscordReaction, startFakeCodexServer } from "./support/bridge.js";
 import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerEnv, routerWithWebhooks, waitFor } from "./support/router.js";
@@ -100,7 +101,7 @@ PRAGMA user_version=7;
 `;
 
 function sql(database, script) {
-  const result = spawnSync("python3", ["-c", `import sqlite3,sys
+  const result = spawnSync(PYTHON, ["-c", `import sqlite3,sys
 db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()`, database, script], { encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr);
 }
@@ -116,7 +117,7 @@ function seedV7(workspace) {
 
 // Every conversation-scoped table, as stored rows in a stable order.
 function storeRows(database) {
-  const result = spawnSync("python3", ["-c", `import json,sqlite3,sys
+  const result = spawnSync(PYTHON, ["-c", `import json,sqlite3,sys
 db=sqlite3.connect(sys.argv[1]); db.row_factory=sqlite3.Row
 tables=["conversations","owner_sources","qualifications","pending_actions","delivery_intents",
         "discoveries","catch_ups","retired_assignments"]

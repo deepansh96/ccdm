@@ -7,6 +7,7 @@ import test from "node:test";
 
 import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerRegistry, routerWithWebhooks,
   waitFor } from "./support/router.js";
+import { PYTHON } from "./support/platform.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 import { startThreadSupervisor, supervisorCli, supervisorStateDir, supervisorStatus } from "./support/thread-supervisor.js";
@@ -122,7 +123,7 @@ test("a bot-created thread binds only for a pending creation request, taking its
   const first = await startThreadSupervisor(workspace);
   assert.equal((await first.stop()).exitCode, 0);
   const store = path.join(supervisorStateDir(workspace), "threads.sqlite3");
-  execFileSync("python3", ["-c", `import sqlite3, sys
+  execFileSync(PYTHON, ["-c", `import sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
 db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
   first_message, requester_id, requester_kind, status, thread_id, created_at)
@@ -153,7 +154,7 @@ test("a request matches the thread whose id it recorded, and a stale unrecorded 
   const store = path.join(supervisorStateDir(workspace), "threads.sqlite3");
   // request-1 already recorded its thread; request-2's creation never got
   // that far, an hour ago.
-  execFileSync("python3", ["-c", `import sqlite3, sys
+  execFileSync(PYTHON, ["-c", `import sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
 db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
   first_message, requester_id, requester_kind, status, thread_id, created_at)
@@ -252,11 +253,11 @@ test("the store reports user_version 1, and an unexpected column is refused", as
   assert.deepEqual((await supervisorStatus(workspace)).store, { user_version: 1 });
   assert.equal((await supervisor.stop()).exitCode, 0);
   const store = path.join(supervisorStateDir(workspace), "threads.sqlite3");
-  const version = execFileSync("python3", ["-c",
+  const version = execFileSync(PYTHON, ["-c",
     "import sqlite3, sys; print(sqlite3.connect(sys.argv[1]).execute('PRAGMA user_version').fetchone()[0])", store],
   { encoding: "utf8" });
   assert.equal(version.trim(), "1");
-  execFileSync("python3", ["-c", "import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); " +
+  execFileSync(PYTHON, ["-c", "import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); " +
     "db.execute('ALTER TABLE threads ADD COLUMN runtime_bot TEXT'); db.commit()", store]);
   const status = await supervisorCli(workspace, "status");
   assert.equal(status.exitCode, 2, status.stdout);
@@ -295,7 +296,7 @@ for round in range(30):
 print(json.dumps({"errors": errors, "reads": reads}))
 `;
   try {
-    const result = JSON.parse(execFileSync("python3", ["-c", race, scripts, base], { encoding: "utf8" }));
+    const result = JSON.parse(execFileSync(PYTHON, ["-c", race, scripts, base], { encoding: "utf8" }));
     assert.deepEqual(result.errors, []);
   } finally {
     fs.rmSync(base, { recursive: true, force: true });

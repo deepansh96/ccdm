@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { PYTHON } from "./support/platform.js";
 import { createWorkspace, runScript } from "./support/runner.js";
 import { waitForState } from "./support/bridge.js";
 import { routerEnv, startRouter } from "./support/router.js";
@@ -92,7 +93,7 @@ async function awaitingExchange(workspace, stateDir, fields = {}) {
 // prerequisite and drive every assignment transition through executable surfaces.
 function markReconciled(stateDir) {
   const database = path.join(stateDir, "conversations.sqlite3");
-  const seeded = spawnSync("python3", ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute(\"UPDATE conversations SET reconciliation_status='ready' WHERE project='demo'\"); db.commit()", database], { encoding: "utf8" });
+  const seeded = spawnSync(PYTHON, ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute(\"UPDATE conversations SET reconciliation_status='ready' WHERE project='demo'\"); db.commit()", database], { encoding: "utf8" });
   assert.equal(seeded.status, 0, seeded.stderr);
 }
 

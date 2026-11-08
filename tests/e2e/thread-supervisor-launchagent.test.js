@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { PYTHON } from "./support/platform.js";
 import { createRouterWorkspace, routerWithWebhooks, runRouterCli } from "./support/router.js";
 import { runScript } from "./support/runner.js";
 import { readState, updateState } from "./support/state.js";
@@ -181,7 +182,7 @@ const operations = workspace =>
   readState(workspace.stateDir).fixtures.launchctl.invocations.map(({ operation }) => operation);
 
 function renderedAgent(workspace) {
-  const parsed = spawnSync("python3", ["-c",
+  const parsed = spawnSync(PYTHON, ["-c",
     "import json,plistlib,sys; print(json.dumps(plistlib.load(open(sys.argv[1],'rb'))))", plistPath(workspace)],
   { encoding: "utf8" });
   assert.equal(parsed.status, 0, parsed.stderr);

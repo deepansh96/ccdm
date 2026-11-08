@@ -5,6 +5,7 @@ import test from "node:test";
 
 import { spawnSync } from "node:child_process";
 
+import { PYTHON } from "./support/platform.js";
 import { runNodeEntrypoint, runScript } from "./support/runner.js";
 import {
   ROOT_TOKEN, createRouterWorkspace, routerEnv, runRouterCli, startRouter,
@@ -32,7 +33,7 @@ const operations = workspace =>
   readState(workspace.stateDir).fixtures.launchctl.invocations.map(({ operation }) => operation);
 
 function renderedAgent(workspace) {
-  const parsed = spawnSync("python3", ["-c",
+  const parsed = spawnSync(PYTHON, ["-c",
     "import json,plistlib,sys; print(json.dumps(plistlib.load(open(sys.argv[1],'rb'))))", plistPath(workspace)],
   { encoding: "utf8" });
   assert.equal(parsed.status, 0, parsed.stderr);
