@@ -8,14 +8,14 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { expandHome } = require("./platform/paths.js");
 
 const MODEL_COMMAND = /^\/model(?:\s|$)/;
 
 const isModelCommand = text => MODEL_COMMAND.test(String(text || "").trim());
 
 function expand(home) {
-  const value = String(home);
-  return path.normalize(value === "~" || value.startsWith("~/") ? path.join(os.homedir(), value.slice(1)) : value);
+  return path.normalize(expandHome(String(home)));
 }
 
 function displayPath(home) {

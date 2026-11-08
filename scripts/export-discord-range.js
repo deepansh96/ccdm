@@ -2,11 +2,12 @@
 
 const { createWriteStream } = require("node:fs");
 const { mkdir, mkdtemp, readFile, writeFile } = require("node:fs/promises");
-const { homedir, tmpdir } = require("node:os");
+const { tmpdir } = require("node:os");
 const path = require("node:path");
 const { Readable } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
 const { ResolveError, resolveConversation } = require("./conversation-resolver.js");
+const { expandHome } = require("./platform/paths.js");
 
 const API_BASE = "https://discord.com/api/v10";
 const MAX_MESSAGES = 10_000;
@@ -26,7 +27,7 @@ function validateIds(channelId, startId, endId) {
 // Operator-run exports read only the root token from root's Discord state
 // directory; there are no per-project bot tokens.
 async function rootToken() {
-  const stateDir = (process.env.ROOT_DISCORD_STATE_DIR || "~/.claude/channels/discord").replace(/^~(?=$|\/)/, homedir());
+  const stateDir = expandHome(process.env.ROOT_DISCORD_STATE_DIR || "~/.claude/channels/discord");
   let contents;
   try {
     contents = await readFile(path.join(stateDir, ".env"), "utf8");

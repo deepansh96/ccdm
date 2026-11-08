@@ -4,15 +4,7 @@
 const { readFile } = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
-
-// Expands a leading `~` or `~/` to the home directory, as guest-access.js and
-// the shell lifecycle scripts (Python's os.path.expanduser) do for registry paths.
-function expandHome(value) {
-  if (typeof value !== "string") return value;
-  if (value === "~") return os.homedir();
-  if (value.startsWith("~/")) return path.join(os.homedir(), value.slice(2));
-  return value;
-}
+const { expandHome } = require("../platform/paths.js");
 
 function stateDir() {
   return process.env.CCDM_ROUTER_STATE_DIR || path.join(os.homedir(), ".local/state/ccdm/router");

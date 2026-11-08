@@ -13,6 +13,7 @@
 const { existsSync, readFileSync, statSync } = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { expandHome } = require("./platform/paths.js");
 
 const LINK = /^https?:\/\/(?:(?:ptb|canary)\.)?discord(?:app)?\.com\/channels\/[^/\s]+\/([^/\s]+)(?:\/[^/\s]+)?\/?$/;
 
@@ -24,7 +25,7 @@ function registryPath() {
 
 function supervisorStateDir() {
   const override = process.env.CCDM_THREAD_SUPERVISOR_STATE_DIR;
-  if (override) return override.replace(/^~(?=$|\/)/, os.homedir());
+  if (override) return expandHome(override);
   return path.join(os.homedir(), ".local/state/ccdm/thread-supervisor");
 }
 
