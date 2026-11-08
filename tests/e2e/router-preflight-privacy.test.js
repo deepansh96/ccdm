@@ -122,7 +122,7 @@ test("a token directory that is not private blocks with fix text, and the fix cl
 function runPython(workspace, source, args) {
   return spawnSync(PYTHON, ["-c", source, ...args], {
     encoding: "utf8",
-    env: { ...routerEnv(workspace), PYTHONPATH: SCRIPTS },
+    env: { ...routerEnv(workspace), PYTHONPATH: SCRIPTS, PYTHONDONTWRITEBYTECODE: "1" },
     windowsHide: true,
   });
 }

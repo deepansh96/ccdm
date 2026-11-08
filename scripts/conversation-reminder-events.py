@@ -14,6 +14,7 @@ import sys
 import time
 from datetime import datetime
 
+sys.dont_write_bytecode = True  # no __pycache__ beside the scripts
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)

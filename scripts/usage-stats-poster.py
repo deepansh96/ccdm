@@ -27,6 +27,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+sys.dont_write_bytecode = True  # no __pycache__ beside the scripts
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
