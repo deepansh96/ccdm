@@ -1,0 +1,7 @@
+# Text files are stored and checked out with LF on every platform, so shell
+# and Python scripts keep working in a Windows clone whatever core.autocrlf says.
+* text=auto eol=lf
+
+# Windows command and PowerShell scripts are checked out with CRLF.
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
