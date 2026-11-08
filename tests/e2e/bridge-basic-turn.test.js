@@ -14,7 +14,7 @@ import {
   waitForState,
 } from "./support/bridge.js";
 import { assertPrivate, privateTempRoot } from "./support/platform.js";
-import { runRouterCli, startBridge, waitFor } from "./support/router.js";
+import { runRouterCli, startBridge } from "./support/router.js";
 import { readState, seedRegistry, updateState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -1918,7 +1918,7 @@ test("root's channel scope file is private and each rewrite replaces it whole un
     await injectMessageUntil(workspace, { channelId: "root-channel", content: `go ${index}`, id: `scope-${index}` },
       (state) => replied(state, index), 15000);
   }
-  await waitFor(() => fs.readFileSync(scopeFile, "utf8") === "", () => "the scope file to be cleared");
+  await waitForFinishedTurns(bridge, TURNS);
   reading = false;
   await reader;
 
