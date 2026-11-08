@@ -1,5 +1,5 @@
 {
-  "budget": 71,
+  "budget": 89,
   "skips": [
     {
       "file": "harness-safety.test.js",
@@ -48,6 +48,13 @@
       "test": "*",
       "tag": "posix",
       "reason": "drives zsh scripts, which the Windows port replaces"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "only runs on posix",
+      "tag": "posix",
+      "tests": 18,
+      "reason": "contract cases for POSIX-only behaviour: file modes, Unix sockets and absolute POSIX paths"
     }
   ]
 }

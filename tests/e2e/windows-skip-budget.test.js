@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { runSurface, TAG_SURFACES } from "./support/surfaces.js";
 
@@ -55,8 +55,23 @@ export function gatesIn(source) {
   return gates;
 }
 
-function windowsSkips() {
+// The platform contract's own cases say which OS family they run on.
+const CONTRACT_SUITE = "platform-contract.test.js";
+const CONTRACT_CASES = "only runs on posix";
+async function posixOnlyContractCases() {
+  const dir = path.join(E2E_DIR, "platform-contract");
+  let count = 0;
+  for (const name of fs.readdirSync(dir).filter((file) => file.endsWith(".cases.js"))) {
+    const { default: cases } = await import(pathToFileURL(path.join(dir, name)).href);
+    count += cases.filter((definition) => definition.only === "posix").length;
+  }
+  return count;
+}
+
+async function windowsSkips() {
   const skips = [];
+  const contractCases = await posixOnlyContractCases();
+  if (contractCases > 0) skips.push({ file: CONTRACT_SUITE, tag: "posix", test: CONTRACT_CASES, tests: contractCases });
   for (const file of suites()) {
     const surface = runSurface(file);
     if (surface.tag && skipsOnWindows(surface.tag)) {
@@ -73,8 +88,8 @@ function windowsSkips() {
 const budget = () => JSON.parse(read(BUDGET_FILE));
 const keyOf = (skip) => `${skip.file} :: ${skip.test}`;
 
-test("every Windows skip in the gates has an entry, with a tag and a reason, and no entry is stale", () => {
-  const skips = windowsSkips();
+test("every Windows skip in the gates has an entry, with a tag and a reason, and no entry is stale", async () => {
+  const skips = await windowsSkips();
   const { skips: entries } = budget();
 
   for (const skip of skips) assert.notEqual(skip.test, null, `${skip.file}:${skip.line} gates a test this check cannot name`);
@@ -84,6 +99,7 @@ test("every Windows skip in the gates has an entry, with a tag and a reason, and
     const entry = entryByKey.get(keyOf(skip));
     assert.ok(entry, `${keyOf(skip)} is skipped on Windows but has no entry in ${BUDGET_FILE}`);
     assert.equal(entry.tag, skip.tag, keyOf(skip));
+    if (skip.tests !== undefined) assert.equal(entry.tests, skip.tests, `${keyOf(skip)}: update its count of tests`);
   }
   for (const entry of entries) {
     assert.match(entry.reason ?? "", /\S/, `${keyOf(entry)} has no reason`);
@@ -91,9 +107,9 @@ test("every Windows skip in the gates has an entry, with a tag and a reason, and
   }
 });
 
-test("the number of Windows skips is within the budget", () => {
-  const count = windowsSkips().reduce((total, skip) => total
-    + (skip.test === "*" ? (read(skip.file).match(/^\s*test\(/gm) ?? []).length : 1), 0);
+test("the number of Windows skips is within the budget", async () => {
+  const count = (await windowsSkips()).reduce((total, skip) => total
+    + (skip.tests ?? (skip.test === "*" ? (read(skip.file).match(/^\s*test\(/gm) ?? []).length : 1)), 0);
   const { budget: allowed, skips } = budget();
 
   assert.ok(Number.isInteger(allowed), "budget must be a number of tests");
