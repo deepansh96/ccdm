@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Resolve and validate a Codex Home for a project or root launch."""
 
+from __future__ import annotations
+
 import json
 import os
 import stat

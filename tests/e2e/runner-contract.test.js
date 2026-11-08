@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { runnerSettings } from "../run-e2e.mjs";
+import { runnerSettings, windowsTreeToStop } from "../run-e2e.mjs";
 import { createWorkspace, runNodeEntrypoint, runScript } from "./support/runner.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 import {
@@ -114,6 +114,25 @@ test("runner defaults follow the platform and every setting can be overridden", 
     assert.equal(runnerSettings({ CCDM_E2E_REPORT_DIR: "report" }, platform, 4).reportDir, path.resolve("report"));
   }
   assert.throws(() => runnerSettings({ CCDM_E2E_FILE_TIMEOUT_MS: "soon" }, "linux", 4), /CCDM_E2E_FILE_TIMEOUT_MS/);
+});
+
+test("the Windows tree kill stops only the spawned process and children no older than their parent", () => {
+  const spawned = { earliest: 1000, latest: 2000 };
+  const processes = [
+    { pid: 10, parent: 1, created: 1500 },
+    { pid: 11, parent: 10, created: 1600 },
+    { pid: 12, parent: 11, created: 1700 },
+    // Its parent died long ago and PID 10 was reused by the spawned process.
+    { pid: 20, parent: 10, created: 900 },
+    { pid: 21, parent: 20, created: 950 },
+    { pid: 30, parent: 1, created: 1550 },
+  ];
+  assert.deepEqual(windowsTreeToStop(10, processes, spawned), [10, 11, 12]);
+
+  // The PID now belongs to a process created after the spawn, or is gone.
+  assert.deepEqual(windowsTreeToStop(10, processes, { earliest: 1000, latest: 1400 }), []);
+  assert.deepEqual(windowsTreeToStop(10, processes, { earliest: 1510, latest: 2000 }), []);
+  assert.deepEqual(windowsTreeToStop(99, processes, spawned), []);
 });
 
 test("runner reports passed, failed, crashed and timed-out files and kills only the timed-out file's tree", async t => {
