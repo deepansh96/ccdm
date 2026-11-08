@@ -5,14 +5,27 @@
 // channels and allowed users come from the registry too.
 const { randomBytes } = require("node:crypto");
 const { watch } = require("node:fs");
-const { chmod, mkdir, open, readFile, rename, rm, stat, unlink, writeFile } = require("node:fs/promises");
+const { chmod, mkdir, open, readFile, rename, stat, unlink, writeFile } = require("node:fs/promises");
 const path = require("node:path");
+
+const { removeDirWithRetry, renameWithRetry } = require("../platform/atomic.js");
+const { processAlive, processIdentity } = require("../platform/process.js");
 
 // How long registry writes must settle before a reload.
 const DEFAULT_RELOAD_DEBOUNCE_MS = 250;
 
+// On Windows an open can fail for a moment while a writer replaces the file. A
+// reload that gave up there would keep a stale routing table.
 async function readRegistry(file) {
-  return JSON.parse(await readFile(file, "utf8"));
+  const deadline = performance.now() + RENAME_BUDGET_MS;
+  for (let backoff = 1; ; backoff = Math.min(backoff * 2, MAX_BACKOFF_MS)) {
+    try {
+      return JSON.parse(await readFile(file, "utf8"));
+    } catch (error) {
+      if (!WIN32 || !SHARING_ERRORS.has(error.code) || performance.now() >= deadline) throw error;
+      await sleep(backoff);
+    }
+  }
 }
 
 const isObject = value => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -115,15 +128,26 @@ function watchRegistry(file, { debounceMs = DEFAULT_RELOAD_DEBOUNCE_MS, onLoad, 
 // Every registry read-modify-write, here and in scripts/registry-update.py
 // (the shell and Python writers), holds one cross-process lock: a
 // `registry.json.lock` directory beside the registry naming its holder's pid
-// (`owner`) and a nonce unique to that acquisition (`nonce`). A lock whose
-// holder died is reclaimed; a live holder is waited for up to
-// CCDM_REGISTRY_LOCK_TIMEOUT_MS (default 30 s).
+// (`owner`, exactly "<pid>\n") and a nonce unique to that acquisition (`nonce`).
+// On Windows, where PIDs are reused quickly, it also names the holder's start
+// time (`started`). A lock whose holder died is reclaimed; a live holder is
+// waited for up to CCDM_REGISTRY_LOCK_TIMEOUT_MS (default 30 s).
 //
-// Both implementations follow the same protocol, so they exclude each other:
+// Both implementations follow the same protocol (v2), so they exclude each
+// other, and each also excludes code from before v2 still running after an
+// update, because `owner` and the lock layout have not changed:
 // - A lock directory is built complete under a unique staging name and
-//   renamed into place, so the lock never exists without its owner. The
-//   rename fails while a (non-empty) lock exists.
-// - A holder releases by renaming its own lock aside, then deleting it.
+//   renamed into place, so the lock never exists without its owner. A rename
+//   that fails while a lock exists means "held": POSIX reports ENOTEMPTY or
+//   EEXIST, Windows usually EPERM. With no lock at the target the rename is
+//   retried for the rename budget, then the error is thrown.
+// - A holder releases by renaming its own lock aside, then deleting it, each
+//   with retries: on Windows a reader holding `owner` open blocks both for a
+//   moment. After the budget it writes a warning naming the lock to stderr and
+//   the update still resolves; a lock is never left behind silently.
+// - Liveness is processAlive (scripts/platform/process.js), given the `started`
+//   read with the lock instance. A lock without `started` is judged by PID.
+// - The registry is committed by a rename with the same retries.
 // - A dead holder's lock is removed only by the one waiter that owns the
 //   reclaim claim for that lock instance: `<lock>.reclaim-<key>`, itself a
 //   lock built the same way, keyed by the dead lock's nonce (or, for a lock
@@ -133,9 +157,23 @@ function watchRegistry(file, { debounceMs = DEFAULT_RELOAD_DEBOUNCE_MS, onLoad, 
 //   check cannot go stale, and a waiter that saw the dead owner too late finds
 //   a different instance and leaves it alone. A claim whose claimant died is
 //   reclaimed the same way.
+const WIN32 = process.platform === "win32";
 const LOCK_POLL_MS = 10;
 // Claims of claims, if claimants keep dying, before a waiter just waits.
 const MAX_RECLAIM_DEPTH = 4;
+// renameWithRetry's budget and largest backoff.
+const RENAME_BUDGET_MS = 2000;
+const MAX_BACKOFF_MS = 50;
+// A commit gets longer on Windows: retries that wake with a busy reader can
+// fail for the whole normal budget, and giving up here would lose the change.
+const COMMIT_BUDGET_MS = WIN32 ? 10000 : RENAME_BUDGET_MS;
+// How often a waiter opens the files inside a held lock. On Windows an open
+// file blocks the holder's release, so waiters must not poll them constantly.
+const HOLDER_CHECK_MS = WIN32 ? 200 : 0;
+const SHARING_ERRORS = new Set(["EPERM", "EACCES", "EBUSY"]);
+const LOCK_HELD_ERRORS = new Set(WIN32
+  ? [...SHARING_ERRORS, "ENOTEMPTY", "EEXIST"]
+  : ["ENOTEMPTY", "EEXIST"]);
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -145,73 +183,110 @@ function lockTimeoutMs() {
   return raw && Number.isFinite(value) && value >= 0 ? value : 30000;
 }
 
-function alive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error.code === "EPERM";
-  }
-}
-
 const uniqueSuffix = () => `${process.pid}-${randomBytes(8).toString("hex")}`;
 const readTrimmed = file => readFile(file, "utf8").then(text => text.trim(), () => null);
+// Anything but "not there" counts as there: a lock being deleted cannot be read.
+const pathExists = file => stat(file).then(() => true, error => error.code !== "ENOENT");
 
-// The lock instance at `dir`: its holder's pid and a key naming that instance
-// alone. Null when there is none, or it changed while being read.
+function warnNotRemoved(dir, error) {
+  process.stderr.write(`registry lock: ${dir} could not be removed: ${error.message}\n`);
+}
+
+// The lock instance at `dir`: its holder's pid and start time (null when not
+// recorded), and a key naming that instance alone. Null when there is none, or
+// it changed while being read.
 async function lockInstance(dir) {
   const before = await stat(dir, { bigint: true }).catch(() => null);
   if (!before) return null;
   const nonce = await readTrimmed(path.join(dir, "nonce"));
   const owner = await readTrimmed(path.join(dir, "owner"));
+  const started = await readTrimmed(path.join(dir, "started"));
   const after = await stat(dir, { bigint: true }).catch(() => null);
   if (owner === null || !after || after.ino !== before.ino || await readTrimmed(path.join(dir, "nonce")) !== nonce) return null;
   const pid = /^\d+$/.test(owner) ? Number(owner) : 0;
-  return { pid, key: nonce ? `n${nonce}` : `p${pid}-i${after.ino}` };
+  return { pid, started: /^\d+$/.test(started ?? "") ? started : null, key: nonce ? `n${nonce}` : `p${pid}-i${after.ino}` };
 }
 
 // The key of the instance at `dir` if its holder is dead, else null.
 async function deadKey(dir) {
   const instance = await lockInstance(dir);
-  return instance && !alive(instance.pid) ? instance.key : null;
+  return instance && !processAlive(instance.pid, instance.started) ? instance.key : null;
+}
+
+// Renames the complete `staging` onto `target`; false while `target` is held.
+async function publishLock(staging, target) {
+  const deadline = performance.now() + RENAME_BUDGET_MS;
+  for (let backoff = 1; ; backoff = Math.min(backoff * 2, MAX_BACKOFF_MS)) {
+    try {
+      await rename(staging, target);
+      return true;
+    } catch (error) {
+      if (!LOCK_HELD_ERRORS.has(error.code)) throw error;
+      if (await pathExists(target)) return false;
+      if (performance.now() >= deadline) throw error;
+      await sleep(backoff);
+    }
+  }
+}
+
+function removeStaging(staging) {
+  return removeDirWithRetry(staging).catch(error => warnNotRemoved(staging, error));
 }
 
 // Creates `target` owned by this process; its nonce, or null while held.
 async function createOwned(target) {
   const nonce = randomBytes(16).toString("hex");
+  const { startedAt } = processIdentity();
   const staging = `${target}.new-${uniqueSuffix()}`;
   await mkdir(staging, { mode: 0o700 });
+  let published;
   try {
     await writeFile(path.join(staging, "owner"), `${process.pid}\n`);
     await writeFile(path.join(staging, "nonce"), `${nonce}\n`);
-    await rename(staging, target);
-    return nonce;
+    if (startedAt !== null) await writeFile(path.join(staging, "started"), `${startedAt}\n`);
+    published = await publishLock(staging, target);
   } catch (error) {
-    await rm(staging, { recursive: true, force: true });
-    if (error.code === "ENOTEMPTY" || error.code === "EEXIST") return null;
+    await removeStaging(staging);
     throw error;
   }
+  if (published) return nonce;
+  await removeStaging(staging);
+  return null;
 }
 
-// Moves `dir` aside and deletes it.
+// Moves `dir` aside and deletes it. False only when `dir` is still in place.
 async function discard(dir) {
   const aside = `${dir}.gone-${uniqueSuffix()}`;
   try {
-    await rename(dir, aside);
-  } catch {
-    return;
+    await renameWithRetry(dir, aside);
+  } catch (error) {
+    if (error.code === "ENOENT") return true;
+    warnNotRemoved(dir, error);
+    return false;
   }
-  await rm(aside, { recursive: true, force: true });
+  await removeDirWithRetry(aside).catch(error => warnNotRemoved(aside, error));
+  return true;
 }
 
 // Removes `target` only while it is still this process's instance `nonce`.
 async function removeOwned(target, nonce) {
-  if (await readTrimmed(path.join(target, "nonce")) === nonce) await discard(target);
+  const file = path.join(target, "nonce");
+  const deadline = performance.now() + RENAME_BUDGET_MS;
+  let seen = await readTrimmed(file);
+  // On Windows a file can be briefly unreadable; that must not leak the lock.
+  while (WIN32 && seen === null && await pathExists(target)) {
+    if (performance.now() >= deadline) {
+      warnNotRemoved(target, new Error("its nonce cannot be read"));
+      return;
+    }
+    await sleep(LOCK_POLL_MS);
+    seen = await readTrimmed(file);
+  }
+  if (seen === nonce) await discard(target);
 }
 
 // Removes the dead instance `key` at `target`, holding its reclaim claim.
-// True when this waiter held the claim (the instance is gone either way).
+// True when this waiter held the claim and the instance is gone either way.
 async function reclaim(target, key, depth = 0) {
   const claim = `${target}.reclaim-${key}`;
   const nonce = await createOwned(claim);
@@ -221,21 +296,24 @@ async function reclaim(target, key, depth = 0) {
     return claimKey !== null && await reclaim(claim, claimKey, depth + 1);
   }
   try {
-    if (await deadKey(target) === key) await discard(target);
+    return await deadKey(target) !== key || await discard(target);
   } finally {
     await removeOwned(claim, nonce);
   }
-  return true;
 }
 
 async function acquireRegistryLock(file) {
   const lock = `${file}.lock`;
   const deadline = Date.now() + lockTimeoutMs();
+  let nextHolderCheck = 0;
   for (;;) {
     const nonce = await createOwned(lock);
     if (nonce) return () => removeOwned(lock, nonce);
-    const key = await deadKey(lock);
-    if (key !== null && await reclaim(lock, key)) continue;
+    if (performance.now() >= nextHolderCheck) {
+      nextHolderCheck = performance.now() + HOLDER_CHECK_MS;
+      const key = await deadKey(lock);
+      if (key !== null && await reclaim(lock, key)) continue;
+    }
     await testNoteBlocked();
     if (Date.now() >= deadline) {
       const holder = await readFile(path.join(lock, "owner"), "utf8").then(text => ` (held by pid ${text.trim()})`, () => "");
@@ -302,7 +380,7 @@ async function commitRegistry(file, registry) {
     }
     await chmod(temporary, mode);
     await testHold();
-    await rename(temporary, file);
+    await renameWithRetry(temporary, file, { budgetMs: COMMIT_BUDGET_MS });
   } catch (error) {
     await unlink(temporary).catch(() => {});
     throw error;

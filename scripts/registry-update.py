@@ -3,7 +3,7 @@
 
 The same lock protects scripts/router/registry.js: a `registry.json.lock`
 directory beside the registry, renamed into place complete with its holder's
-pid and a per-acquisition nonce.
+pid and a per-acquisition nonce (protocol v2; see below).
 Every read-modify-write holds it, rereads the registry, and commits through a
 unique adjacent temporary file renamed over the registry, keeping its mode, so
 readers (the Router's reload) only ever see a whole file and no writer drops
@@ -16,21 +16,45 @@ import errno
 import json
 import os
 import secrets
-import shutil
 import stat
 import sys
 import time
 from pathlib import Path
 
-# The lock protocol matches scripts/router/registry.js exactly (see the comment
-# there): a lock directory holds `owner` (pid) and `nonce` (unique to that
-# acquisition), is built under a unique staging name and renamed into place,
-# is released by renaming it aside, and a dead holder's lock is removed only by
-# the waiter holding `<lock>.reclaim-<key>` for that instance, after
-# rechecking the lock is still that dead instance.
+# This file is also loaded by path from a working directory outside scripts/.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+from ccdmlib.platform import atomic, proc  # noqa: E402
+
+# Lock protocol v2 matches scripts/router/registry.js exactly (see the comment
+# there). A lock directory holds `owner` (exactly "<pid>\n"), `nonce` (unique to
+# that acquisition) and, on Windows, `started` (the holder's start time). It is
+# built under a unique staging name and renamed into place; a rename failing
+# while a lock exists means "held", and with no lock there it is retried for the
+# rename budget. It is released by renaming it aside and deleting it, with
+# retries, ending in a stderr warning naming the lock rather than a silent leak.
+# Liveness is proc.alive with `started`; a lock without `started` is judged by
+# PID. The registry is committed by a rename with the same retries. A dead
+# holder's lock is removed only by the waiter holding `<lock>.reclaim-<key>` for
+# that instance, after rechecking the lock is still that dead instance.
 POLL_S = 0.01
 # Claims of claims, if claimants keep dying, before a waiter just waits.
 MAX_RECLAIM_DEPTH = 4
+RENAME_BUDGET_S = atomic.DEFAULT_BUDGET_MS / 1000
+MAX_BACKOFF_S = atomic.MAX_BACKOFF_SECONDS
+# A commit gets longer on Windows: retries that wake with a busy reader can
+# fail for the whole normal budget, and giving up here would lose the change.
+COMMIT_BUDGET_MS = 10000 if proc.WIN32 else atomic.DEFAULT_BUDGET_MS
+# How often a waiter opens the files inside a held lock. On Windows an open
+# file blocks the holder's release, so waiters must not poll them constantly.
+HOLDER_CHECK_S = 0.2 if proc.WIN32 else 0.0
+LOCK_HELD_ERRNOS = (
+    (errno.EPERM, errno.EACCES, errno.EBUSY, errno.ENOTEMPTY, errno.EEXIST)
+    if proc.WIN32
+    else (errno.ENOTEMPTY, errno.EEXIST)
+)
 
 
 def _timeout_s() -> float:
@@ -38,18 +62,6 @@ def _timeout_s() -> float:
         return max(0.0, float(os.environ.get("CCDM_REGISTRY_LOCK_TIMEOUT_MS") or 30000) / 1000)
     except ValueError:
         return 30.0
-
-
-def _alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
 
 
 def _unique_suffix() -> str:
@@ -63,15 +75,35 @@ def _read_trimmed(path: Path):
         return None
 
 
+def _path_exists(path: Path) -> bool:
+    """Anything but "not there" counts as there: a lock being deleted cannot be read."""
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _warn_not_removed(directory: Path, error) -> None:
+    try:
+        print(f"registry lock: {directory} could not be removed: {error}", file=sys.stderr)
+    except (OSError, ValueError):
+        pass
+
+
 def _lock_instance(directory: Path):
-    """The lock instance at `directory` as (pid, key), or None when there is
-    none or it changed while being read."""
+    """The lock instance at `directory` as (pid, key, started), or None when
+    there is none or it changed while being read. `started` is None when not
+    recorded."""
     try:
         before = os.stat(directory)
     except OSError:
         return None
     nonce = _read_trimmed(directory / "nonce")
     owner = _read_trimmed(directory / "owner")
+    started = _read_trimmed(directory / "started")
     try:
         after = os.stat(directory)
     except OSError:
@@ -79,54 +111,99 @@ def _lock_instance(directory: Path):
     if owner is None or after.st_ino != before.st_ino or _read_trimmed(directory / "nonce") != nonce:
         return None
     pid = int(owner) if owner.isascii() and owner.isdigit() else 0
-    return pid, (f"n{nonce}" if nonce else f"p{pid}-i{after.st_ino}")
+    started = started if started and started.isascii() and started.isdigit() else None
+    return pid, (f"n{nonce}" if nonce else f"p{pid}-i{after.st_ino}"), started
 
 
 def _dead_key(directory: Path):
     """The key of the instance at `directory` if its holder is dead, else None."""
     instance = _lock_instance(directory)
-    return instance[1] if instance and not _alive(instance[0]) else None
+    return instance[1] if instance and not proc.alive(instance[0], instance[2]) else None
+
+
+def _publish_lock(staging: Path, target: Path) -> bool:
+    """Renames the complete `staging` onto `target`; False while `target` is held."""
+    deadline = time.monotonic() + RENAME_BUDGET_S
+    backoff = 0.001
+    while True:
+        try:
+            os.rename(staging, target)
+            return True
+        except OSError as error:
+            if error.errno not in LOCK_HELD_ERRNOS:
+                raise
+            if _path_exists(target):
+                return False
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(backoff)
+            backoff = min(backoff * 2, MAX_BACKOFF_S)
+
+
+def _remove_staging(staging: Path) -> None:
+    try:
+        atomic.remove_dir_with_retry(staging)
+    except OSError as error:
+        _warn_not_removed(staging, error)
 
 
 def _create_owned(target: Path):
     """Creates `target` owned by this process; its nonce, or None while held."""
     nonce = secrets.token_hex(16)
+    _, started_at = proc.identity()
     staging = target.with_name(f"{target.name}.new-{_unique_suffix()}")
     os.mkdir(staging, 0o700)
     try:
-        (staging / "owner").write_text(f"{os.getpid()}\n")
-        (staging / "nonce").write_text(f"{nonce}\n")
-        os.rename(staging, target)
-        return nonce
-    except OSError as error:
-        shutil.rmtree(staging, ignore_errors=True)
-        if error.errno in (errno.ENOTEMPTY, errno.EEXIST):
-            return None
-        raise
+        # Bytes, not text: on Windows text mode would write "\r\n".
+        (staging / "owner").write_bytes(f"{os.getpid()}\n".encode("ascii"))
+        (staging / "nonce").write_bytes(f"{nonce}\n".encode("ascii"))
+        if started_at is not None:
+            (staging / "started").write_bytes(f"{started_at}\n".encode("ascii"))
+        published = _publish_lock(staging, target)
     except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
+        _remove_staging(staging)
         raise
+    if published:
+        return nonce
+    _remove_staging(staging)
+    return None
 
 
-def _discard(directory: Path) -> None:
-    """Moves `directory` aside and deletes it."""
+def _discard(directory: Path) -> bool:
+    """Moves `directory` aside and deletes it. False only when it is still in place."""
     aside = directory.with_name(f"{directory.name}.gone-{_unique_suffix()}")
     try:
-        os.rename(directory, aside)
-    except OSError:
-        return
-    shutil.rmtree(aside, ignore_errors=True)
+        atomic.rename_with_retry(directory, aside)
+    except FileNotFoundError:
+        return True
+    except OSError as error:
+        _warn_not_removed(directory, error)
+        return False
+    try:
+        atomic.remove_dir_with_retry(aside)
+    except OSError as error:
+        _warn_not_removed(aside, error)
+    return True
 
 
 def _remove_owned(target: Path, nonce: str) -> None:
     """Removes `target` only while it is still this process's instance `nonce`."""
-    if _read_trimmed(target / "nonce") == nonce:
+    deadline = time.monotonic() + RENAME_BUDGET_S
+    seen = _read_trimmed(target / "nonce")
+    # On Windows a file can be briefly unreadable; that must not leak the lock.
+    while proc.WIN32 and seen is None and _path_exists(target):
+        if time.monotonic() >= deadline:
+            _warn_not_removed(target, "its nonce cannot be read")
+            return
+        time.sleep(POLL_S)
+        seen = _read_trimmed(target / "nonce")
+    if seen == nonce:
         _discard(target)
 
 
 def _reclaim(target: Path, key: str, depth: int = 0) -> bool:
     """Removes the dead instance `key` at `target`, holding its reclaim claim.
-    True when this waiter held the claim (the instance is gone either way)."""
+    True when this waiter held the claim and the instance is gone either way."""
     claim = target.with_name(f"{target.name}.reclaim-{key}")
     nonce = _create_owned(claim)
     if nonce is None:
@@ -134,24 +211,25 @@ def _reclaim(target: Path, key: str, depth: int = 0) -> bool:
         claim_key = _dead_key(claim) if depth < MAX_RECLAIM_DEPTH else None
         return claim_key is not None and _reclaim(claim, claim_key, depth + 1)
     try:
-        if _dead_key(target) == key:
-            _discard(target)
+        return _dead_key(target) != key or _discard(target)
     finally:
         _remove_owned(claim, nonce)
-    return True
 
 
 def acquire(registry_path):
     """Takes the registry lock; returns the handle `release` takes."""
     lock = Path(f"{registry_path}.lock")
     deadline = time.monotonic() + _timeout_s()
+    next_holder_check = 0.0
     while True:
         nonce = _create_owned(lock)
         if nonce is not None:
             return lock, nonce
-        key = _dead_key(lock)
-        if key is not None and _reclaim(lock, key):
-            continue
+        if time.monotonic() >= next_holder_check:
+            next_holder_check = time.monotonic() + HOLDER_CHECK_S
+            key = _dead_key(lock)
+            if key is not None and _reclaim(lock, key):
+                continue
         _test_note_blocked()
         if time.monotonic() >= deadline:
             holder = ""
@@ -196,7 +274,7 @@ def _test_hold() -> None:
         try:
             os.unlink(f"{hold}.release")
             break
-        except FileNotFoundError:
+        except OSError:
             time.sleep(POLL_S)
     Path(f"{hold}.waiting").unlink(missing_ok=True)
 
@@ -206,14 +284,14 @@ def _commit(registry_path: Path, registry: dict) -> None:
     temporary = registry_path.with_name(f".{registry_path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
-        with os.fdopen(fd, "w") as target:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as target:
             json.dump(registry, target, indent=2)
             target.write("\n")
             target.flush()
             os.fsync(target.fileno())
         os.chmod(temporary, mode)
         _test_hold()
-        os.replace(temporary, registry_path)
+        atomic.replace_with_retry(temporary, registry_path, COMMIT_BUDGET_MS)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
