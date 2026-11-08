@@ -161,7 +161,6 @@ test("the workspace env on win32 isolates the profile and temp dirs and keeps wh
   const dirs = {
     fixtureDir: "C:\\w\\fixtures",
     homeDir: "C:\\w\\home",
-    repoDir: "C:\\w\\repo",
     root: "C:\\src",
     stateDir: "C:\\w\\state",
     tmpDir: "C:\\w\\tmp",
@@ -193,7 +192,7 @@ test("the workspace env on win32 isolates the profile and temp dirs and keeps wh
     NODE_PATH: path.join(dirs.root, "node_modules"),
     PATH: dirs.fixtureDir,
     PATHEXT: ".COM;.EXE",
-    PYTHONPATH: path.join(dirs.repoDir, "tests", "e2e", "support", "pysafe"),
+    PYTHONPATH: path.join(dirs.root, "tests", "e2e", "support", "pysafe"),
     SystemRoot: "C:\\Windows",
     TEMP: dirs.tmpDir,
     TMP: dirs.tmpDir,
@@ -204,7 +203,7 @@ test("the workspace env on win32 isolates the profile and temp dirs and keeps wh
 });
 
 test("the workspace env on POSIX is only the isolated values and the Python guard's path", () => {
-  const dirs = { fixtureDir: "/w/fixtures", homeDir: "/w/home", repoDir: "/w/repo", root: "/src", stateDir: "/w/state", tmpDir: "/w/tmp" };
+  const dirs = { fixtureDir: "/w/fixtures", homeDir: "/w/home", root: "/src", stateDir: "/w/state", tmpDir: "/w/tmp" };
   for (const platform of ["linux", "darwin"]) {
     assert.deepEqual(runnerInternals.workspaceEnv({ ...dirs, hostEnv: { SystemRoot: "unused" }, platform }), {
       CCDM_TEST_STATE: dirs.stateDir,
@@ -212,7 +211,7 @@ test("the workspace env on POSIX is only the isolated values and the Python guar
       NODE_OPTIONS: "",
       NODE_PATH: path.join(dirs.root, "node_modules"),
       PATH: dirs.fixtureDir,
-      PYTHONPATH: path.join(dirs.repoDir, "tests", "e2e", "support", "pysafe"),
+      PYTHONPATH: path.join(dirs.root, "tests", "e2e", "support", "pysafe"),
       TMPDIR: dirs.tmpDir,
     });
   }
@@ -470,7 +469,7 @@ test("os.kill(pid, 0) in a Python grandchild raises RuntimeError on win32 and is
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const report = JSON.parse(result.stdout.trim());
-  assert.ok(report.guard.startsWith(workspace.repoDir), report.guard);
+  assert.equal(report.guard, path.join(workspace.sourceRoot, "tests", "e2e", "support", "pysafe", "sitecustomize.py"));
   if (process.platform === "win32") {
     assert.equal(report.builtin, false);
     assert.equal(report.outcome, "RuntimeError: os.kill(pid, 0) is unsafe on Windows");

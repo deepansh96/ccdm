@@ -1572,15 +1572,16 @@ async function stopHeldChild(child) {
 // Node's os.homedir() reads USERPROFILE on Windows and os.tmpdir() reads TEMP/TMP;
 // Python reads USERPROFILE and tries TMPDIR before TEMP/TMP. SystemRoot, windir
 // and ComSpec come from the host because Windows programs fail to start without them.
-function workspaceEnv({ root, repoDir, homeDir, tmpDir, stateDir, fixtureDir, platform = process.platform, hostEnv = process.env }) {
+function workspaceEnv({ root, homeDir, tmpDir, stateDir, fixtureDir, platform = process.platform, hostEnv = process.env }) {
   const env = {
     CCDM_TEST_STATE: stateDir,
     HOME: homeDir,
     NODE_OPTIONS: "",
     NODE_PATH: nodePath(root),
     PATH: fixtureDir,
-    // The workspace's copy, so Python's bytecode stays out of the source tree.
-    PYTHONPATH: path.join(repoDir, "tests", "e2e", "support", "pysafe"),
+    // The source tree's copy: tests list the workspace repo exactly, and Python
+    // writes bytecode beside this file. __pycache__ is gitignored there.
+    PYTHONPATH: path.join(root, "tests", "e2e", "support", "pysafe"),
     TMPDIR: tmpDir,
   };
   if (platform !== "win32") {
@@ -1636,7 +1637,7 @@ export const createWorkspace = Object.freeze(function createWorkspace(options = 
   const homeDir = path.join(tmpRoot, "home");
   const tmpDir = path.join(tmpRoot, "tmp");
   const fixtureDir = path.join(tmpRoot, "fixtures");
-  const env = workspaceEnv({ root, repoDir, homeDir, tmpDir, stateDir, fixtureDir });
+  const env = workspaceEnv({ root, homeDir, tmpDir, stateDir, fixtureDir });
   for (const dir of [repoDir, homeDir, tmpDir, stateDir, env.APPDATA, env.LOCALAPPDATA]) {
     if (dir) fs.mkdirSync(dir, { recursive: true });
   }
