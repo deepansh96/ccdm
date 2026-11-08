@@ -47,9 +47,9 @@
 // createRouterTransport: the local Router, reached with the launch key read
 // from its private file; it holds no Discord credential.
 
-const { renameSync, writeFileSync } = require("fs");
 const { readFile } = require("fs/promises");
 const path = require("path");
+const { writeFileAtomicSync } = require("./platform/atomic.js");
 const { RouterClient } = require("./router/client.js");
 const { createEmergencyGateway } = require("./router/emergency.js");
 
@@ -228,10 +228,8 @@ function createRouterTransport({ project, role = "project", keyFile, launchDir, 
     setContextPct(pct) {
       contextPct = pct;
       const file = path.join(launchDir, "context.json");
-      const tmp = `${file}.${process.pid}.tmp`;
       try {
-        writeFileSync(tmp, `${JSON.stringify({ context_pct: pct })}\n`, { mode: 0o600 });
-        renameSync(tmp, file);
+        writeFileAtomicSync(file, `${JSON.stringify({ context_pct: pct })}\n`, { mode: 0o600 });
       } catch (err) {
         console.error(`Context percentage not recorded: ${err.message || err}`);
       }

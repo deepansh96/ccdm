@@ -11,7 +11,8 @@
 // Run as a Claude command hook (Stop, StopFailure) with the activity file as
 // its argument, it marks the turn ended.
 const fs = require("node:fs");
-const path = require("node:path");
+
+const { writeFileAtomicSync } = require("./platform/atomic.js");
 
 function markTurn(file, running) {
   if (!file) return;
@@ -23,12 +24,9 @@ function markTurn(file, running) {
     turn_running: running,
     last_turn_end_at: running ? previous.last_turn_end_at ?? null : new Date().toISOString(),
   };
-  const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.tmp`);
   try {
-    fs.writeFileSync(temporary, `${JSON.stringify(activity)}\n`, { mode: 0o600 });
-    fs.renameSync(temporary, file);
+    writeFileAtomicSync(file, `${JSON.stringify(activity)}\n`, { mode: 0o600 });
   } catch (error) {
-    fs.rmSync(temporary, { force: true });
     process.stderr.write(`thread activity: ${file} could not be written: ${error.message}\n`);
   }
 }
