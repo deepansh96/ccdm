@@ -731,6 +731,60 @@ test("Discord MCP fetch and download tools cover limits, attachment indexes, wri
   });
 });
 
+test("Discord MCP download_attachment keeps every download inside the save dir and POSIX names as they were", async () => {
+  const long = "a".repeat(300);
+  const cases = [
+    ["../../x", "x"],
+    ...(process.platform === "win32" ? [] : [
+      ["..", "file"],
+      [".", "file"],
+      ["/", "file"],
+      ["", "att-case-4"],
+      [`${long}.txt`, `${"a".repeat(251)}.txt`],
+      [long, "a".repeat(255)],
+      [`${"a".repeat(251)}.txt`, `${"a".repeat(251)}.txt`],
+      ["a.txt:b", "a.txt:b"],
+      ["report?.pdf", "report?.pdf"],
+      ["a<b>.txt", "a<b>.txt"],
+      ["CON.txt", "CON.txt"],
+      ["name. ", "name. "],
+      ["...", "..."],
+    ]),
+  ];
+  const url = (index) => `https://cdn.discordapp.com/attachments/channel/message/case-${index}`;
+  const { workspace } = await betaRouter();
+  seedHistory(workspace, "beta-channel", cases.map(([filename], index) => ({
+    id: `case-${index}`,
+    timestamp: "2026-05-28T10:00:00.000Z",
+    content: "file",
+    author: { username: "Alice", bot: false },
+    attachments: [{ id: `att-case-${index}`, filename, url: url(index) }],
+  })));
+  seedDiscord(workspace, (discord) => {
+    cases.forEach((_, index) => {
+      discord.attachments[url(index)] = { body: `body ${index}` };
+    });
+  });
+
+  const saveRoot = path.join(workspace.tmpDir, "hostile-downloads");
+  const saveDir = (index) => path.join(saveRoot, "nested", String(index));
+  const result = await runMcp(workspace, cases.map((_, index) => toolCall(index + 1, "download_attachment", {
+    message_id: `case-${index}`,
+    save_dir: saveDir(index),
+  })), betaMcpEnv(workspace));
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const output = responseById(result);
+  cases.forEach(([filename, expected], index) => {
+    const label = JSON.stringify(filename.slice(0, 20));
+    assert.equal(output.get(index + 1).result.content[0].text, path.join(saveDir(index), expected), label);
+    assert.deepEqual(fs.readdirSync(saveDir(index)), [expected], label);
+    assert.equal(fs.readFileSync(path.join(saveDir(index), expected), "utf8"), `body ${index}`, label);
+  });
+  assert.deepEqual(fs.readdirSync(saveRoot), ["nested"]);
+  assert.equal(fs.readdirSync(path.join(saveRoot, "nested")).length, cases.length);
+});
+
 test("Discord MCP surfaces fake REST API errors as MCP error content", async () => {
   // A short wait bound, so the Router reports a rate limit it cannot outlast.
   const { workspace, router } = await betaRouter({ routerOptions: { env: { CCDM_ROUTER_RATE_LIMIT_MAX_WAIT_MS: "200" } } });
