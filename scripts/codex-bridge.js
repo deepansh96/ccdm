@@ -7,11 +7,12 @@ const { renameSync, rmSync, writeFileSync } = require("fs");
 const os = require("os");
 const path = require("path");
 const WebSocket = require("ws");
+const { stateRoot } = require("./platform/paths.js");
 
 const MCP_SERVER_SCRIPT = path.resolve(__dirname, "discord-mcp-server.js");
 const ROOT_DIR = path.resolve(__dirname, "..");
 const REGISTRY_PATH = path.join(ROOT_DIR, "registry.json");
-const REMINDER_STATE_DIR = process.env.CCDM_REMINDER_STATE_DIR || path.join(os.homedir(), ".local", "state", "ccdm", "conversation-reminders");
+const REMINDER_STATE_DIR = process.env.CCDM_REMINDER_STATE_DIR || path.join(stateRoot(), "conversation-reminders");
 const REMINDER_CONTEXT_FILE = path.join(REMINDER_STATE_DIR, `active-codex-${process.pid}.json`);
 const REMINDER_RECEIPTS_DIR = path.join(REMINDER_STATE_DIR, "receipts");
 process.env.CCDM_REMINDER_PROJECT_ROOT = ROOT_DIR;

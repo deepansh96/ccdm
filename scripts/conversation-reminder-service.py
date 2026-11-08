@@ -11,10 +11,17 @@ import json
 import os
 from pathlib import Path
 import sqlite3
-import stat
 import subprocess
+import sys
 import time
 import uuid
+
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+from ccdmlib.platform.paths import state_root  # noqa: E402
+from ccdmlib.platform.private_fs import fix_hint, is_private  # noqa: E402
 
 
 EVENTS_PATH = Path(__file__).with_name("conversation-reminder-events.py")
@@ -149,7 +156,7 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
     existed = path.exists()
     if not existed and not create:
         return None
-    if existed and (stat.S_IMODE(path.stat().st_mode) & 0o077):
+    if existed and not is_private(path):
         raise ValueError("conversation store permissions are not private")
     if existed and path.stat().st_size == 0:
         raise ValueError("conversation store schema is unsupported")
@@ -389,7 +396,7 @@ def event_rows(state_dir: Path) -> list[sqlite3.Row]:
     path = EVENTS.database_path(state_dir)
     if not path.exists():
         return []
-    if stat.S_IMODE(path.stat().st_mode) & 0o077:
+    if not is_private(path):
         raise ValueError("event database permissions are not private")
     with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as source:
         source.row_factory = sqlite3.Row
@@ -899,9 +906,9 @@ def enablement_checks(project_root: Path, state_dir: Path, prepare: bool = True)
     # re-permissioned only after every other blocker has cleared.
     if prepare and not blockers:
         EVENTS.private_directory(state_dir)
-    private = state_dir.is_dir() and stat.S_IMODE(state_dir.stat().st_mode) & 0o077 == 0
+    private = state_dir.is_dir() and is_private(state_dir)
     if not prepare and state_dir.exists() and not private:
-        blockers.append("the reminder state directory is not private (expected mode 0700)")
+        blockers.append(f"the reminder state directory is not private ({fix_hint(state_dir, 'expected mode 0700')})")
     return {"blockers": blockers, "provider_prerequisites": prerequisites, "owner_configured": owner,
             "root_credentials": "present" if credentials else "missing",
             "state_dir_private": private,
@@ -1012,7 +1019,7 @@ def status(state_dir: Path, project_root: Path | None = None) -> dict:
     observer_channels = {}
     health_path = state_dir / "observer-health.json"
     if running and health_path.exists():
-        if stat.S_IMODE(health_path.stat().st_mode) & 0o077:
+        if not is_private(health_path):
             raise ValueError("observer health permissions are not private")
         health = json.loads(health_path.read_text(encoding="utf-8"))
         allowed = {"ready-observe-only", "blocked-assignment", "blocked-adapter-capability",
@@ -1200,7 +1207,7 @@ def supervisor_closed_threads(project: str) -> set[str]:
 
     Without a readable store nothing is known closed."""
     override = os.environ.get("CCDM_THREAD_SUPERVISOR_STATE_DIR")
-    state_dir = Path(override).expanduser() if override else Path.home() / ".local" / "state" / "ccdm" / "thread-supervisor"
+    state_dir = Path(override).expanduser() if override else state_root() / "thread-supervisor"
     path = state_dir / "threads.sqlite3"
     if not path.is_file():
         return set()

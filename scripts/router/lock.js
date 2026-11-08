@@ -6,6 +6,8 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
+const { ensurePrivateDirSync } = require("../platform/privacy.js");
+
 const LOCK_FILE = "router.lock";
 
 function holderAlive(pid) {
@@ -19,8 +21,7 @@ function holderAlive(pid) {
 }
 
 function acquireRouterLock(stateDir) {
-  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  fs.chmodSync(stateDir, 0o700);
+  ensurePrivateDirSync(stateDir);
   const lockPath = path.join(stateDir, LOCK_FILE);
   for (let attempt = 0; attempt < 2; attempt++) {
     let fd;

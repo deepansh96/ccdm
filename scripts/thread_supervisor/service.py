@@ -12,9 +12,10 @@ import json
 import os
 from pathlib import Path
 import sqlite3
-import stat
 import subprocess
 import sys
+
+from ccdmlib.platform.private_fs import fix_hint, is_private
 
 from . import registry, store
 from .paths import private_directory, write_private
@@ -67,8 +68,8 @@ def _configuration_blockers(project_root: Path, state_dir: Path) -> list[str]:
             blockers.append("registry.json has no CCDM owner (discord_user_id)")
         if not isinstance(current.get("guild_id"), str) or not current["guild_id"]:
             blockers.append("registry.json has no guild_id")
-    if state_dir.exists() and stat.S_IMODE(state_dir.stat().st_mode) & 0o077:
-        blockers.append("the thread supervisor state directory is not private (expected mode 0700)")
+    if state_dir.exists() and not is_private(state_dir):
+        blockers.append(f"the thread supervisor state directory is not private ({fix_hint(state_dir, 'expected mode 0700')})")
     try:
         store.inspect(state_dir)
     except (OSError, ValueError, sqlite3.Error) as error:

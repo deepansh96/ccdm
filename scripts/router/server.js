@@ -7,6 +7,7 @@ const { watch } = require("node:fs");
 const { chmod, mkdir, readFile, unlink } = require("node:fs/promises");
 const net = require("node:net");
 const path = require("node:path");
+const { ensurePrivateDir } = require("../platform/privacy.js");
 const { withDeadline } = require("./discord-rest.js");
 const { threadRoute } = require("./inbound.js");
 const { OpError, ScopeViolation } = require("./ops/errors.js");
@@ -391,8 +392,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
 
   return {
     async listen() {
-      await mkdir(stateDir, { recursive: true, mode: 0o700 });
-      await chmod(stateDir, 0o700);
+      await ensurePrivateDir(stateDir);
       await claimSocketPath(socketPath);
       await new Promise((resolve, reject) => {
         server.once("error", reject);
@@ -400,6 +400,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       });
       await chmod(socketPath, 0o600);
       await mkdir(keysDir, { recursive: true, mode: 0o700 });
+      if (process.platform === "win32") await ensurePrivateDir(keysDir);
       keysWatcher = watch(keysDir, () => {
         revokeStaleKeys().catch(error => log(`key_check_failed error=${error.message}`));
       });

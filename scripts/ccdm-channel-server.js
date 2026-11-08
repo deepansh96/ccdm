@@ -60,6 +60,8 @@ const { chmod, mkdir, readFile, rm, stat, writeFile } = require("node:fs/promise
 const os = require("node:os");
 const path = require("node:path");
 const { createInterface } = require("node:readline");
+const { stateRoot } = require("./platform/paths.js");
+const { isPrivateFile } = require("./platform/privacy.js");
 const reminder = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
 const { markTurn } = require("./thread-activity.js");
@@ -97,7 +99,7 @@ const REMINDERS = !ROOT;
 const CAPABILITY = REMINDERS && !THREAD;
 
 const REMINDER_PROJECT_ROOT = process.env.CCDM_REMINDER_PROJECT_ROOT || path.dirname(__dirname);
-const REMINDER_STATE_DIR = process.env.CCDM_REMINDER_STATE_DIR || path.join(os.homedir(), ".local", "state", "ccdm", "conversation-reminders");
+const REMINDER_STATE_DIR = process.env.CCDM_REMINDER_STATE_DIR || path.join(stateRoot(), "conversation-reminders");
 const REGISTRY_PATH = path.join(REMINDER_PROJECT_ROOT, "registry.json");
 const LAUNCH_ID = process.env.CCDM_CLAUDE_LAUNCH_ID || "";
 const capabilityPath = path.join(REMINDER_STATE_DIR, "capabilities", `${process.env.CCDM_CLAUDE_PROJECT || ""}.json`);
@@ -117,7 +119,7 @@ async function hasCommandHooks() {
   const file = process.env.CCDM_CLAUDE_HOOK_SETTINGS;
   if (!file) return false;
   try {
-    if ((await stat(file)).mode & 0o077) return false;
+    if (!isPrivateFile(file)) return false;
     const settings = JSON.parse(await readFile(file, "utf8"));
     if (settings.enabledPlugins?.["discord@claude-plugins-official"] !== false) return false;
     const expected = `node '${path.join(REMINDER_PROJECT_ROOT, "scripts", "claude-reminder-hook.js")}'`;

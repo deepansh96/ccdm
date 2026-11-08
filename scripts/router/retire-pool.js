@@ -9,8 +9,8 @@
 //   scripts/retire-pool.sh --apply    take them
 const { existsSync } = require("node:fs");
 const { chmod, copyFile, mkdir, rename } = require("node:fs/promises");
-const os = require("node:os");
 const path = require("node:path");
+const { stateRoot } = require("../platform/paths.js");
 const { discordRequest } = require("./discord-rest.js");
 const { expandHome, registryPath, rootToken } = require("./paths.js");
 const { readRegistry, updateRegistry } = require("./registry.js");
@@ -19,7 +19,7 @@ const REGISTRY_FIELDS = ["pool", "max_pool_size", "project_bot_role_id"];
 const PROJECT_FIELDS = ["bot_id", "bot_display_name", "transport"];
 
 function backupDir() {
-  return expandHome(process.env.CCDM_POOL_BACKUP_DIR) || path.join(os.homedir(), ".local/state/ccdm/pool-retirement");
+  return expandHome(process.env.CCDM_POOL_BACKUP_DIR) || path.join(stateRoot(), "pool-retirement");
 }
 
 async function privateDir(dir) {
