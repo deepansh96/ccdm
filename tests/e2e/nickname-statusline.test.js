@@ -4,7 +4,8 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { createWorkspace, runScript } from "./support/runner.js";
+import { gitBashSh, platformGate } from "./support/platform.js";
+import { createWorkspace, runNodeEntrypoint, runScript } from "./support/runner.js";
 import { readState, seedRegistry, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -247,4 +248,193 @@ test("curl fixture parses Discord nickname PATCH requests into the unified fake 
   assert.equal(patch.url, "https://discord.com/api/v10/guilds/guild-id/members/bot-app-id");
   assert.equal(patch.headers.Authorization, "Bot root-token");
   assert.deepEqual(JSON.parse(patch.body), { nick: "bot2-alpha-codex · 64%" });
+});
+
+const WIN = process.platform === "win32";
+const WINDOWS_ONLY = platformGate("win32", "this case only means anything on Windows");
+const STATUSLINE = "scripts/statusline-context.js";
+const CONTEXT_JSON = /^\{"context_pct": \d+(\.\d+)?\}\n$/;
+const nodeDir = path.dirname(process.execPath);
+const routerDir = (workspace) => path.join(workspace.tmpRoot, "router");
+const slashes = (value) => value.replaceAll("\\", "/");
+const statusJson = (pct) => `${JSON.stringify({ context_window: { used_percentage: pct } })}\n`;
+
+function seedLaunchDir(workspace, ...parts) {
+  const dir = path.join(routerDir(workspace), "launches", ...parts);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+const keyEnv = (workspace, name) => ({ CCDM_ROUTER_KEY_FILE: path.join(routerDir(workspace), "keys", `${name}.key`) });
+const runStatusline = (workspace, env, input, args = []) => runNodeEntrypoint(workspace, STATUSLINE, { args, env, input });
+
+// A workspace hides Git for Windows, so these name the real Git Bash.
+const gitRoot = () => path.resolve(path.dirname(gitBashSh()), "..", "..");
+const withGitBash = (env) => (WIN ? { ...env, CLAUDE_CODE_GIT_BASH_PATH: path.join(gitRoot(), "bin", "bash.exe") } : env);
+
+// A chained command that saves the exact stdin bytes and prints a marker.
+function chainFixture(workspace) {
+  const script = path.join(workspace.tmpDir, "chain-fixture.cjs");
+  const stdinFile = path.join(workspace.tmpDir, "chain-stdin.bin");
+  fs.writeFileSync(script, `const fs = require("node:fs");
+fs.writeFileSync(process.argv[2], fs.readFileSync(0));
+process.stdout.write("chained-output\\n");
+`);
+  const command = `'${slashes(process.execPath)}' '${slashes(script)}' '${slashes(stdinFile)}'`;
+  return { script, stdinFile, command };
+}
+
+function chainCmdFile(workspace, fixture) {
+  const cmd = path.join(workspace.tmpDir, "chain-fixture.cmd");
+  fs.writeFileSync(cmd, `@"${process.execPath}" "${fixture.script}" "${fixture.stdinFile}"\r\n`);
+  return cmd;
+}
+
+test("statusline-context records a project session's percentage and prints nothing", async () => {
+  const workspace = createWorkspace();
+  const launchDir = seedLaunchDir(workspace, "alpha");
+
+  const result = await runStatusline(workspace, keyEnv(workspace, "alpha"), statusJson(42));
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr, "");
+  assert.equal(fs.readFileSync(path.join(launchDir, "context.json"), "utf8"), '{"context_pct": 42}\n');
+});
+
+test("statusline-context records a thread session's percentage in that thread's own launch directory", async () => {
+  const workspace = createWorkspace();
+  const projectDir = seedLaunchDir(workspace, "beta");
+  const otherThread = seedLaunchDir(workspace, "alpha", "threads", "111");
+  const threadDir = seedLaunchDir(workspace, "beta", "threads", "222");
+
+  const result = await runStatusline(workspace, keyEnv(workspace, ".thread-222"), statusJson(17.5));
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(threadDir, "context.json"), "utf8")), { context_pct: 17.5 });
+  assert.equal(fs.existsSync(path.join(projectDir, "context.json")), false);
+  assert.equal(fs.existsSync(path.join(otherThread, "context.json")), false);
+});
+
+test("statusline-context leaves no file and exits 0 when there is nothing to record", async () => {
+  const workspace = createWorkspace();
+  const launchDir = seedLaunchDir(workspace, "alpha");
+  const key = keyEnv(workspace, "alpha");
+  const file = path.join(launchDir, "context.json");
+  const cases = [
+    ["no key file", {}, statusJson(42)],
+    ["missing launch dir", keyEnv(workspace, "gone"), statusJson(42)],
+    ["missing thread", keyEnv(workspace, ".thread-404"), statusJson(42)],
+    ["no field", key, `${JSON.stringify({ other: true })}\n`],
+    ["null field", key, statusJson(null)],
+    ["text field", key, statusJson("42")],
+    ["negative field", key, statusJson(-1)],
+    ["not JSON", key, "not json"],
+    ["empty stdin", key, undefined],
+  ];
+  for (const [name, env, input] of cases) {
+    const result = await runStatusline(workspace, env, input);
+    assert.equal(result.exitCode, 0, `${name}: ${result.stderr}`);
+    assert.equal(result.stdout, "", name);
+    assert.equal(result.stderr, "", name);
+    assert.equal(fs.existsSync(file), false, name);
+  }
+  assert.deepEqual(fs.readdirSync(path.join(routerDir(workspace), "launches")), ["alpha"]);
+});
+
+test("statusline-context --chain passes the identical stdin bytes on, prints the output and returns its exit code", async () => {
+  const workspace = createWorkspace();
+  const launchDir = seedLaunchDir(workspace, "alpha");
+  const fixture = chainFixture(workspace);
+  const input = Buffer.from('{"context_window":{"used_percentage":64},"note":"café"}\r\n', "utf8");
+
+  const chained = await runStatusline(workspace, withGitBash(keyEnv(workspace, "alpha")), input, ["--chain", fixture.command]);
+  assert.equal(chained.exitCode, 0, chained.stderr);
+  assert.equal(chained.stdout, "chained-output\n");
+  assert.deepEqual(fs.readFileSync(fixture.stdinFile), input);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(launchDir, "context.json"), "utf8")), { context_pct: 64 });
+
+  const failing = await runStatusline(workspace, withGitBash({}), statusJson(1), ["--chain", "exit 3"]);
+  assert.equal(failing.exitCode, 3, failing.stderr);
+});
+
+test("statusline-context runs a .cmd as the chained command through Git Bash", WINDOWS_ONLY, async () => {
+  const workspace = createWorkspace();
+  const fixture = chainFixture(workspace);
+  const input = Buffer.from(statusJson(9), "utf8");
+
+  const result = await runStatusline(workspace, withGitBash({}), input, ["--chain", `'${slashes(chainCmdFile(workspace, fixture))}'`]);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /chained-output/);
+  assert.deepEqual(fs.readFileSync(fixture.stdinFile), input);
+});
+
+test("statusline-context falls back to PowerShell for the chain when Git Bash is absent", WINDOWS_ONLY, async () => {
+  const workspace = createWorkspace();
+  const fixture = chainFixture(workspace);
+  const input = Buffer.from(statusJson(9), "utf8");
+
+  // PowerShell runs a .cmd only when PATHEXT lists it, which a workspace's does not.
+  const env = { PATH: path.join(process.env.SystemRoot, "System32"), PATHEXT: ".COM;.EXE;.BAT;.CMD" };
+  const result = await runStatusline(workspace, env, input, ["--chain", `& '${chainCmdFile(workspace, fixture)}'`]);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /chained-output/);
+  assert.deepEqual(fs.readFileSync(fixture.stdinFile), input);
+});
+
+test("statusline-context finds Git Bash through git on PATH and ignores a bare bash.exe", WINDOWS_ONLY, async () => {
+  const workspace = createWorkspace();
+  const fixture = chainFixture(workspace);
+  const decoyDir = path.join(workspace.tmpDir, "decoy");
+  fs.mkdirSync(decoyDir);
+  fs.writeFileSync(path.join(decoyDir, "bash.exe"), "not a program");
+  const PATH = [decoyDir, path.join(gitRoot(), "cmd")].join(path.delimiter);
+
+  const result = await runStatusline(workspace, { PATH }, statusJson(5), ["--chain", fixture.command]);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "chained-output\n");
+});
+
+test("statusline-context records with only Node's directory on PATH", async () => {
+  const workspace = createWorkspace();
+  const launchDir = seedLaunchDir(workspace, "alpha");
+
+  const result = await runStatusline(workspace, { ...keyEnv(workspace, "alpha"), PATH: nodeDir }, statusJson(33));
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(fs.readFileSync(path.join(launchDir, "context.json"), "utf8"), '{"context_pct": 33}\n');
+});
+
+test("a reader racing statusline-context writers only ever sees a whole context.json", async () => {
+  const workspace = createWorkspace();
+  const launchDir = seedLaunchDir(workspace, "alpha");
+  const file = path.join(launchDir, "context.json");
+  fs.writeFileSync(file, '{"context_pct": 1}\n');
+
+  let writing = true;
+  let reads = 0;
+  const reader = (async () => {
+    while (writing) {
+      try {
+        assert.match(fs.readFileSync(file, "utf8"), CONTEXT_JSON);
+        reads += 1;
+      } catch (error) {
+        // A Windows sharing error during the rename is no partial read.
+        if (!["EBUSY", "EPERM", "EACCES"].includes(error.code)) throw error;
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  })();
+
+  const writers = Array.from({ length: 12 }, (_, index) => runStatusline(workspace, keyEnv(workspace, "alpha"), statusJson(index + 2)));
+  const results = await Promise.all(writers);
+  writing = false;
+  await reader;
+
+  for (const result of results) assert.equal(result.exitCode, 0, result.stderr);
+  assert.ok(reads > 0);
+  assert.deepEqual(fs.readdirSync(launchDir), ["context.json"]);
 });
