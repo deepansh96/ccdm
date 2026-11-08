@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { assertPrivate } from "./support/platform.js";
 import { createWorkspace, runScript } from "./support/runner.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
@@ -259,7 +260,7 @@ test("event receiver binds receipts to the registered assignment and requires a 
   assert.deepEqual(readiness.events.map((row) => row.event_type), ["response_delivered", "response_delivered", "input_needed"]);
   assert.equal(readiness.events.at(-1).message_id, "discord-message-question");
   assert.equal(readiness.event_receiver.event_count, 3);
-  assert.equal(fs.statSync(path.join(stateDir, "events.sqlite3")).mode & 0o777, 0o600);
+  assertPrivate(path.join(stateDir, "events.sqlite3"));
   assert.doesNotMatch(fs.readFileSync(path.join(stateDir, "events.sqlite3"), "utf8"), /question body/);
 });
 

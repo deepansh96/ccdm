@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { assertPrivate } from "./support/platform.js";
 import { injectDiscordMessage, waitForState } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import {
@@ -116,9 +117,9 @@ test("no Discord bot or webhook token reaches the session environment, launch fi
   assert.deepEqual(Object.keys(mcpConfig.mcpServers), ["ccdm"]);
   assert.deepEqual(mcpConfig.mcpServers.ccdm.args, [path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js")]);
   for (const file of fs.readdirSync(launchDir)) {
-    assert.equal(fs.statSync(path.join(launchDir, file)).mode & 0o777, 0o600, file);
+    assertPrivate(path.join(launchDir, file), file);
   }
-  assert.equal(fs.statSync(path.join(workspace.routerStateDir, "keys", "demo.key")).mode & 0o777, 0o600);
+  assertPrivate(path.join(workspace.routerStateDir, "keys", "demo.key"));
 });
 
 function assertLaunchCleanedUp(workspace) {
@@ -240,7 +241,7 @@ test("the statusline's context percentage rides on the next reply's Project Iden
   assert.equal(await ownerMessageReply(workspace, "owner-message-2", 2), "demo-claude · 57%");
 
   const context = path.join(workspace.routerStateDir, "launches", "demo", "context.json");
-  assert.equal(fs.statSync(context).mode & 0o777, 0o600);
+  assertPrivate(context);
 
   const nicknames = await runStatusline(workspace, "scripts/cc-discord-nicknames.sh", 61);
   assert.equal(nicknames.exitCode, 0, nicknames.stderr || nicknames.stdout);
@@ -320,9 +321,9 @@ test("an owner's image and text file reach Claude as metadata and download_attac
   assert.match(path.basename(notes), /^\d+-att-2\.txt$/);
   assert.equal(fs.readFileSync(shot, "utf8"), "fake png bytes");
   assert.equal(fs.readFileSync(notes, "utf8"), "remember the milk\n");
-  assert.equal(fs.statSync(shot).mode & 0o777, 0o600);
-  assert.equal(fs.statSync(notes).mode & 0o777, 0o600);
-  assert.equal(fs.statSync(inbox).mode & 0o777, 0o700);
+  assertPrivate(shot);
+  assertPrivate(notes);
+  assertPrivate(inbox);
 });
 
 test("a reply with a file and reply_to posts as demo with the upload and a jump-link first line", async () => {
@@ -448,7 +449,7 @@ test("export_message_range returns the supplementary Discord MCP's exported-to l
   assert.match(text, /Message ID: 102/);
   assert.match(text, /Message ID: 103/);
   assert.doesNotMatch(text, /Message ID: 101/);
-  assert.equal(fs.statSync(exportPath).mode & 0o777, 0o600);
+  assertPrivate(exportPath);
 });
 
 test("a read past 100 messages returns the supplementary Discord MCP's saved-transcript line", async () => {
@@ -473,7 +474,7 @@ test("a read past 100 messages returns the supplementary Discord MCP's saved-tra
   assert.equal(lines.length, 120);
   assert.equal(lines[0], "[2026-09-27T10:00:00.000Z] Alice: message 1030 (id: 1030)");
   assert.equal(lines.at(-1), "[2026-09-27T10:00:00.000Z] Alice: message 1149 (id: 1149)");
-  assert.equal(fs.statSync(transcript).mode & 0o777, 0o600);
+  assertPrivate(transcript);
 });
 
 test("tool calls aimed at another channel surface scope_violation to Claude and touch nothing in Discord", async () => {

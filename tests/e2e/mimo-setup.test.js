@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { assertPrivate } from "./support/platform.js";
 import { createBridgeWorkspace, startFakeCodexServer } from "./support/bridge.js";
 import { routerEnv, routerWithWebhooks, writeRootToken } from "./support/router.js";
 import { runScript } from "./support/runner.js";
@@ -34,9 +35,9 @@ test("MiMo setup creates private standalone provider state and launches through 
   const result = await setup(fixture);
   assert.equal(result.exitCode, 0, result.stderr);
   assert.doesNotMatch(result.stdout + result.stderr, /sk-fixture-testing-only/);
-  assert.equal(fs.statSync(home).mode & 0o777, 0o700);
+  assertPrivate(home);
   for (const file of ["api-key", "config.toml", "model-catalogs.json", "ccdm-mimo.json"]) {
-    assert.equal(fs.statSync(path.join(home, file)).mode & 0o777, 0o600);
+    assertPrivate(path.join(home, file));
   }
   const configPath = path.join(home, "config.toml");
   const config = fs.readFileSync(configPath, "utf8");
@@ -133,7 +134,7 @@ test("MiMo rotation replaces only credentials after bridge config changes and re
   assert.doesNotMatch(result.stdout + result.stderr, /sk-replacement/);
   const keyPath = path.join(fixture.home, "api-key");
   assert.equal(fs.readFileSync(keyPath, "utf8"), "sk-replacement-testing-only\n");
-  assert.equal(fs.statSync(keyPath).mode & 0o777, 0o600);
+  assertPrivate(keyPath);
   assert.equal(fs.readFileSync(configPath, "utf8"), config);
   assert.equal(fs.readFileSync(path.join(fixture.home, "model-catalogs.json"), "utf8"), catalog);
   const mismatch = await setup(fixture, { key: "tp-fixture-testing-only", args: ["--rotate-key", "--billing", "token-plan"] });

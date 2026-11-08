@@ -1,8 +1,10 @@
 // What the harness needs to know about the host OS: which Python to run, how to
 // start a script, which tests run here, and the Windows fixture toolchain.
+import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -132,6 +134,30 @@ export function suiteTest(nodeTest, file, platform = process.platform) {
     return nodeTest(name, { ...options, skip }, body);
   };
   return Object.assign(gated, nodeTest);
+}
+
+// The permission bits of `target` on POSIX, for a test about a mode that is not
+// a privacy claim; null on Windows, which has no such bits.
+export function posixMode(target) {
+  return process.platform === "win32" ? null : fs.statSync(target).mode & 0o777;
+}
+
+// That `target` has this exact mode on POSIX; Windows has nothing to compare.
+export function assertPosixMode(target, mode) {
+  if (process.platform !== "win32") assert.equal(fs.statSync(target).mode & 0o777, mode);
+}
+
+// Private by this OS's rule: 0700 for a directory and 0600 for anything else on
+// POSIX, the DACL rule on Windows (see scripts/platform/privacy.js).
+export function assertPrivate(target, message) {
+  const info = fs.statSync(target);
+  if (process.platform !== "win32") {
+    assert.equal(info.mode & 0o777, info.isDirectory() ? 0o700 : 0o600, message);
+    return;
+  }
+  const privacy = createRequire(import.meta.url)("../../../scripts/platform/privacy.js");
+  if (info.isDirectory()) assert.deepEqual(privacy.privateDirBlockers(target), [], message);
+  else assert.equal(privacy.isPrivateFile(target), true, message ?? `${target} is not private`);
 }
 
 function compilerPath(env) {

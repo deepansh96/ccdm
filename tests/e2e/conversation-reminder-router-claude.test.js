@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { assertPrivate } from "./support/platform.js";
 import { injectDiscordMessage, waitForState } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import {
@@ -167,7 +168,7 @@ test("the router Claude capability marker lives with the channel server and is g
   const marker = JSON.parse(fs.readFileSync(context.markerPath, "utf8"));
   assert.deepEqual([marker.project, marker.channel_id, marker.assignment_generation, marker.transport,
     marker.hooks_configured, marker.reply_tool_verified], ["demo", "demo-channel", "gen-demo", "ccdm-channel-server", true, true]);
-  assert.equal(fs.statSync(context.markerPath).mode & 0o777, 0o600);
+  assertPrivate(context.markerPath);
   const ready = await readiness(context);
   assert.equal(ready.exitCode, 0, ready.stdout || ready.stderr);
   assert.deepEqual(JSON.parse(ready.stdout).unsupported_capabilities, []);

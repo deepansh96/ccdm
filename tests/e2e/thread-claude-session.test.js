@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { injectDiscordMessage } from "./support/bridge.js";
-import { PYTHON } from "./support/platform.js";
+import { PYTHON, assertPrivate } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerEnv, routerRegistry, routerWithWebhooks,
   runRouterCli, waitFor } from "./support/router.js";
@@ -222,9 +222,9 @@ test("no Discord credential reaches the thread session's environment, launch fil
       assert.equal(text.includes(secret), false, `${secret} leaked into ${text.slice(0, 200)}`);
     }
   }
-  assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
-  for (const file of files) assert.equal(fs.statSync(path.join(dir, file)).mode & 0o777, 0o600, file);
-  assert.equal(fs.statSync(path.join(workspace.routerStateDir, "keys", `.thread-${THREAD_ID}.key`)).mode & 0o777, 0o600);
+  assertPrivate(dir);
+  for (const file of files) assertPrivate(path.join(dir, file), file);
+  assertPrivate(path.join(workspace.routerStateDir, "keys", `.thread-${THREAD_ID}.key`));
   // The session runs in the project checkout, in its own tmux session.
   assert.equal(state.fixtures.tmux.sessions[THREAD_TMUX].cwd, workspace.tmpDir);
   assert.deepEqual(state.fixtures.tmux.sessions[THREAD_TMUX].command.slice(0, 2), ["zsh", "-ic"]);

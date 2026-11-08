@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { assertPrivate } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import { OWNER_ID, createRouterWorkspace, routerEnv } from "./support/router.js";
 import { readState } from "./support/state.js";
@@ -142,15 +143,15 @@ test("--apply removes every pool bot, deletes the role, backs up state and regis
     ],
     roleDeletes: [{ authorization: auth, guildId: "guild-id", roleId: "project-bot-role" }],
   });
-  assert.equal(fs.statSync(backup).mode & 0o777, 0o700);
+  assertPrivate(backup);
   for (const n of [2, 3, 9]) {
     assert.equal(fs.existsSync(stateDirOf(workspace, n)), false, `discord${n} is still in place`);
     const moved = path.join(backup, "state", `bot${n}`);
-    assert.equal(fs.statSync(moved).mode & 0o777, 0o700);
+    assertPrivate(moved);
     assert.equal(fs.readFileSync(path.join(moved, ".env"), "utf8"), `DISCORD_BOT_TOKEN=bot${n}-token\n`);
   }
   const registryBackup = path.join(backup, "registry.json");
-  assert.equal(fs.statSync(registryBackup).mode & 0o777, 0o600);
+  assertPrivate(registryBackup);
   assert.equal(fs.readFileSync(registryBackup, "utf8"), before);
   assert.deepEqual(readRegistry(workspace), {
     discord_user_id: OWNER_ID,

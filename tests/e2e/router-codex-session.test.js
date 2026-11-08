@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { assertPrivate } from "./support/platform.js";
 import { injectDiscordMessage, injectDiscordReaction, startFakeCodexServer, waitForState } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import {
@@ -164,9 +165,9 @@ test("no Discord bot or webhook token reaches the Codex session environment, lau
   }
   assert.equal(mcpWrites[0].message.params.value.env.CCDM_ROUTER_KEY_FILE, path.join(workspace.routerStateDir, "keys", "demo.key"));
   for (const file of fs.readdirSync(launchDir)) {
-    assert.equal(fs.statSync(path.join(launchDir, file)).mode & 0o777, 0o600, file);
+    assertPrivate(path.join(launchDir, file), file);
   }
-  assert.equal(fs.statSync(path.join(workspace.routerStateDir, "keys", "demo.key")).mode & 0o777, 0o600);
+  assertPrivate(path.join(workspace.routerStateDir, "keys", "demo.key"));
 });
 
 test("a router Codex launch whose Router hello fails exits non-zero and cleans up", async () => {

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { PYTHON } from "./support/platform.js";
+import { PYTHON, posixMode } from "./support/platform.js";
 import { createWorkspace, runScript } from "./support/runner.js";
 import { waitForState } from "./support/bridge.js";
 import { routerEnv, startRouter } from "./support/router.js";
@@ -344,7 +344,7 @@ test("the generation contract gives an identical re-registration a new generatio
   // before the registration workflow called the generation contract.
   assert.equal(await event(workspace, context.stateDir, "owner_activity", "queued-old", "2026-09-24T10:30:00Z",
     { actor_id: "owner", source_message_id: "queued-old-message", activity_kind: "message" }), "committed");
-  const before = fs.statSync(path.join(workspace.repoDir, "registry.json")).mode & 0o777;
+  const before = posixMode(path.join(workspace.repoDir, "registry.json"));
 
   const changed = await command(workspace, context.stateDir, "assignment-changed", { args: ["--project", "demo"] });
   assert.equal(changed.status, "changed");
@@ -353,7 +353,7 @@ test("the generation contract gives an identical re-registration a new generatio
   assert.equal(registry.projects.demo.assignment_generation, changed.assignment_generation);
   assert.notEqual(changed.assignment_generation, "generation-1");
   assert.equal(registry.projects.demo.webhook_id, "webhook");
-  assert.equal(fs.statSync(path.join(workspace.repoDir, "registry.json")).mode & 0o777, before);
+  assert.equal(posixMode(path.join(workspace.repoDir, "registry.json")), before);
   assert.doesNotMatch(JSON.stringify(changed), /fixture-root-token/);
 
   assert.equal(await event(workspace, context.stateDir, "turn_completed", "replayed-old", "2026-09-24T10:40:00Z", {

@@ -11,6 +11,7 @@ import {
   runRouterCli,
   waitFor,
 } from "./support/router.js";
+import { assertPrivate } from "./support/platform.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -100,7 +101,7 @@ test("a lost private webhook token is refetched through the bot on the next repl
   assert.equal(registry(workspace).projects.demo.webhook_id, "fake-webhook-1");
   assert.equal(registry(workspace).projects.demo.assignment_generation, undefined);
   const secretFile = path.join(workspace.routerStateDir, "webhooks", "demo.json");
-  assert.equal(fs.statSync(secretFile).mode & 0o777, 0o600);
+  assertPrivate(secretFile);
   const [webhook] = readState(workspace.stateDir).fixtures.discord.webhooks;
   assert.equal(JSON.parse(fs.readFileSync(secretFile, "utf8")).token, webhook.token);
 });
@@ -162,7 +163,7 @@ for (const [name, loseToken] of [["", false], [" and its private token is lost",
     assert.match(demoEntry.assignment_generation, /^gen-[0-9a-f]{32}$/);
     const secret = JSON.parse(fs.readFileSync(secretFile, "utf8"));
     assert.deepEqual([secret.webhook_id, secret.token], ["fake-webhook-2", "fake-webhook-token-2"]);
-    assert.equal(fs.statSync(secretFile).mode & 0o777, 0o600);
+    assertPrivate(secretFile);
   });
 }
 

@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { PYTHON } from "./support/platform.js";
+import { PYTHON, assertPrivate, assertPosixMode } from "./support/platform.js";
 import { createWorkspace, runScript } from "./support/runner.js";
 import { readState, updateState, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
@@ -432,7 +432,7 @@ test("manual JSON posting does not open or write the configured history database
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.equal(fs.existsSync(historyPath), false);
   assert.equal(fs.existsSync(path.join(sharedParent, ".history.lock")), false);
-  assert.equal(fs.statSync(sharedParent).mode & 0o777, 0o755);
+  assertPosixMode(sharedParent, 0o755);
   assert.equal(api.requests.filter((request) => request.method === "POST").length, 1);
 });
 
@@ -468,8 +468,8 @@ test("history store preserves shared parents and rejects unsupported schemas and
   seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
   const collected = await runScript(workspace, "scripts/usage-stats-poster.py", { args: ["--collect-only"] });
   assert.equal(collected.exitCode, 0, collected.stderr || collected.stdout);
-  assert.equal(fs.statSync(sharedParent).mode & 0o777, 0o755);
-  assert.equal(fs.statSync(featureDir).mode & 0o777, 0o700);
+  assertPosixMode(sharedParent, 0o755);
+  assertPrivate(featureDir);
 
   const probe = (code, ...args) => spawnSync(PYTHON, ["-c", [
     "import importlib.util, sys",
@@ -1869,8 +1869,8 @@ test("scheduled poster posts the original text report once per 30-minute slot wi
   assert.equal(query("select count(*) from posts")[0], "2");
   const payload = query("select payload_json from snapshots order by slot_utc").join("\n");
   assert.doesNotMatch(payload, /fixture-(oauth|root)-token|projects|history\.sqlite3/);
-  assert.equal(fs.statSync(historyPath).mode & 0o777, 0o600);
-  assert.equal(fs.statSync(path.dirname(historyPath)).mode & 0o777, 0o700);
+  assertPrivate(historyPath);
+  assertPrivate(path.dirname(historyPath));
 
   const oldSnapshot = spawnSync(PYTHON, ["-c", [
     "import json, sqlite3, sys",

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { assertPrivate } from "./support/platform.js";
 import { startFakeCodexServer } from "./support/bridge.js";
 import { createRouterWorkspace, routerEnv, routerWithWebhooks, runRouterCli } from "./support/router.js";
 import { createWorkspace, runScript } from "./support/runner.js";
@@ -249,7 +250,7 @@ test("start-codex-session constructs a Router bridge tmux launch, removes stale 
     assert.equal(session.shellCommand.includes(forbidden), false, forbidden);
   }
   assert.equal(session.bridgeCommand, "node scripts/codex-bridge.js");
-  assert.equal(fs.statSync(alphaKeyFile(workspace)).mode & 0o777, 0o600);
+  assertPrivate(alphaKeyFile(workspace));
   assert.equal(state.fixtures.codex.bridgeInvocations.length, 1);
   // The bridge's Codex app-server is the fake one on alpha's port.
   assert.equal(codex.clientMessages.filter((message) => message.method === "initialize").length, 1);
