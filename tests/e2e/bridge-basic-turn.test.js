@@ -13,7 +13,8 @@ import {
   startFakeCodexServer,
   waitForState,
 } from "./support/bridge.js";
-import { runRouterCli, startBridge } from "./support/router.js";
+import { assertPrivate, privateTempRoot } from "./support/platform.js";
+import { runRouterCli, startBridge, waitFor } from "./support/router.js";
 import { readState, seedRegistry, updateState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -1873,6 +1874,60 @@ test("root steers only the active channel and author, retaining the active grant
   assert.match(queued[1].params.input[0].text, /author_id: second-user-id/);
   assert.match(queued[2].params.input[0].text, /Message:\nfallback/);
   for (const turn of queued) assert.notEqual(grant(turn.params.input), activeGrant);
+  await bridge.stop();
+});
+
+test("root's channel scope file is private and each rewrite replaces it whole under a concurrent reader", async () => {
+  const workspace = createBridgeWorkspace();
+  seedRegistry(workspace, {
+    discord_user_id: "allowed-user-id",
+    guild_id: "guild-id",
+    root_channels: ["root-channel"],
+    projects: {},
+  });
+  const TURNS = 5;
+  const codex = await startFakeCodexServer(workspace, {
+    turns: Array.from({ length: TURNS }, (_, index) => ({ delta: `turn ${index} done` })),
+  });
+  const bridge = await startBridge(workspace, {
+    root: true, allowedUserIds: ["allowed-user-id"], botAppId: ROOT_BOT_USER_ID, rootBotAppId: ROOT_BOT_USER_ID,
+    channelId: "root-channel", port: codex.port, env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
+  await bridge.waitForOutput(/Root routing active for 1 configured channel/, 7000);
+  const scopeFile = codex.clientMessages
+    .find((m) => m.method === "config/value/write" && m.params.keyPath === "mcp_servers.discord-root")
+    .params.value.env.DISCORD_CHANNEL_SCOPE_FILE;
+  const scopeDir = path.dirname(scopeFile);
+  assert.equal(path.dirname(scopeDir), privateTempRoot(workspace));
+  assert.match(path.basename(scopeDir), /^codex-discord-scope-/);
+  assertPrivate(scopeFile);
+
+  const seen = new Set();
+  const inodes = new Set();
+  let reading = true;
+  const reader = (async () => {
+    while (reading) {
+      seen.add(await fs.promises.readFile(scopeFile, "utf8"));
+      inodes.add((await fs.promises.stat(scopeFile, { bigint: true })).ino);
+    }
+  })();
+  const turns = () => codex.clientMessages.filter((m) => m.method === "turn/start" &&
+    m.params.input?.[0]?.text?.startsWith("Discord routing metadata:"));
+  const replied = (state, index) => state.fixtures.discord.messages.some((m) => m.content === `turn ${index} done`);
+  for (let index = 0; index < TURNS; index += 1) {
+    await injectMessageUntil(workspace, { channelId: "root-channel", content: `go ${index}`, id: `scope-${index}` },
+      (state) => replied(state, index), 15000);
+  }
+  await waitFor(() => fs.readFileSync(scopeFile, "utf8") === "", () => "the scope file to be cleared");
+  reading = false;
+  await reader;
+
+  const grants = turns().map((turn) => turn.params.input[0].text.match(/channel_scope_token: (\S+)/)[1]);
+  assert.equal(grants.length, TURNS);
+  for (const value of seen) assert.ok(value === "" || grants.includes(value), `torn scope read: ${value}`);
+  assert.ok(inodes.size > 1, "the scope file was rewritten in place");
+  assert.deepEqual(fs.readdirSync(scopeDir), ["active"]);
+  assertPrivate(scopeFile);
   await bridge.stop();
 });
 

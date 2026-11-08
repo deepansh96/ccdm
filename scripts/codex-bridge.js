@@ -7,7 +7,9 @@ const { renameSync, rmSync, writeFileSync } = require("fs");
 const os = require("os");
 const path = require("path");
 const WebSocket = require("ws");
+const { writeFileAtomic } = require("./platform/atomic.js");
 const { stateRoot } = require("./platform/paths.js");
+const { privateTmpDir } = require("./platform/privacy.js");
 
 const MCP_SERVER_SCRIPT = path.resolve(__dirname, "discord-mcp-server.js");
 const ROOT_DIR = path.resolve(__dirname, "..");
@@ -297,9 +299,9 @@ function isCurrentTurnNotification(msg) {
 
 async function initializeDiscordChannelScope() {
   if (!ROOT_MULTI_CHANNEL) return;
-  discordChannelScopeDir = await mkdtemp(path.join(os.tmpdir(), "codex-discord-scope-"));
+  discordChannelScopeDir = privateTmpDir("codex-discord-scope-");
   discordChannelScopeFile = path.join(discordChannelScopeDir, "active");
-  await writeFile(discordChannelScopeFile, "", { mode: 0o600 });
+  await writeFileAtomic(discordChannelScopeFile, "");
 }
 
 function createDiscordChannelScopeToken(msg) {
@@ -319,12 +321,12 @@ async function activateDiscordChannelScope(token) {
   if (!discordChannelScopeFile || !token) {
     throw new Error("Missing Discord channel scope for root turn");
   }
-  await writeFile(discordChannelScopeFile, token, { mode: 0o600 });
+  await writeFileAtomic(discordChannelScopeFile, token);
 }
 
 async function clearDiscordChannelScope() {
   if (ROOT_MULTI_CHANNEL && discordChannelScopeFile) {
-    await writeFile(discordChannelScopeFile, "", { mode: 0o600 });
+    await writeFileAtomic(discordChannelScopeFile, "");
   }
 }
 
