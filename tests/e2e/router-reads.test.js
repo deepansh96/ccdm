@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { assertPrivate } from "./support/platform.js";
+import { assertPrivate, privateTempRoot } from "./support/platform.js";
 import { injectDiscordMessage } from "./support/bridge.js";
 import {
   OWNER_ID,
@@ -69,6 +69,8 @@ test("read_last_x_messages_in_channel over the inline limit returns a private tr
   assert.equal(result.count, 120);
   assert.equal(result.text, undefined);
   assertPrivate(result.path);
+  assert.equal(path.dirname(path.dirname(result.path)), privateTempRoot(workspace));
+  assert.match(path.basename(path.dirname(result.path)), /^discord-recent-/);
   const lines = fs.readFileSync(result.path, "utf8").split("\n");
   assert.equal(lines.length, 121);
   assert.equal(lines[0], "[2026-09-01T10:00:00.000Z] Owner: message 1031 (id: 1031)");
@@ -116,6 +118,8 @@ test("export_message_range writes the inclusive range in the export tool's forma
 
   const directory = path.dirname(result.path);
   assertPrivate(result.path);
+  assert.equal(path.dirname(directory), privateTempRoot(workspace));
+  assert.match(path.basename(directory), /^discord-export-/);
   assert.equal(fs.readFileSync(result.path, "utf8"), [
     "[2026-07-13T10:00:00.000Z] Alice (1)",
     "Message ID: 101",
@@ -128,7 +132,7 @@ test("export_message_range writes the inclusive range in the export tool's forma
     "middle",
     "Attachment: notes.txt",
     "URL: https://cdn.discordapp.com/a1",
-    `Saved: ${directory}/attachments/102-a1-notes.txt`,
+    `Saved: ${path.join(directory, "attachments", "102-a1-notes.txt")}`,
     "",
     "---",
     "",

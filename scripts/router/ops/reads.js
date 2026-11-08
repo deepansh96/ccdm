@@ -2,10 +2,10 @@
 
 // Reads of the session's own channel with the bot token, in the Discord MCP's
 // line format. Large reads and range exports land in private temporary files.
-const { mkdtemp, writeFile } = require("node:fs/promises");
-const { tmpdir } = require("node:os");
+const { writeFile } = require("node:fs/promises");
 const path = require("node:path");
 const { exportRange } = require("../../export-discord-range.js");
+const { privateTmpDir } = require("../../platform/privacy.js");
 const { isStale } = require("../attachments.js");
 const { discordRequest } = require("../discord-rest.js");
 const { OpError } = require("./errors.js");
@@ -52,7 +52,7 @@ async function readLastMessages(ctx, args) {
   const messages = (await recentMessages(ctx, count)).reverse();
   const text = messages.map(formatLine).join("\n");
   if (count <= INLINE_LIMIT) return { count: messages.length, text };
-  const directory = await mkdtemp(path.join(tmpdir(), "discord-recent-"));
+  const directory = privateTmpDir("discord-recent-");
   const transcript = path.join(directory, "messages.txt");
   await writeFile(transcript, `${text}\n`, { mode: 0o600 });
   return { count: messages.length, path: transcript };

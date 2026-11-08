@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 
 const { createWriteStream } = require("node:fs");
-const { mkdir, mkdtemp, readFile, writeFile } = require("node:fs/promises");
-const { tmpdir } = require("node:os");
+const { mkdir, readFile, writeFile } = require("node:fs/promises");
 const path = require("node:path");
 const { Readable } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
 const { ResolveError, resolveConversation } = require("./conversation-resolver.js");
 const { expandHome } = require("./platform/paths.js");
+const { privateTmpDir } = require("./platform/privacy.js");
 
 const API_BASE = "https://discord.com/api/v10";
 const MAX_MESSAGES = 10_000;
@@ -136,7 +136,7 @@ async function exportRange({ token, channelId, startId, endId, get }) {
     return discordGet(token, `${route}${search ? `?${search}` : ""}`);
   };
   const messages = await fetchMessages(get || directGet, channelId, startId, endId);
-  const directory = await mkdtemp(path.join(tmpdir(), "discord-export-"));
+  const directory = privateTmpDir("discord-export-");
   const saved = await downloadAttachments(messages, directory);
   const output = path.join(directory, "messages.txt");
   await writeFile(output, transcript(messages, saved), { mode: 0o600 });

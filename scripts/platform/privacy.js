@@ -23,6 +23,7 @@ const { stateRoot } = require("./paths.js");
 const WIN32 = process.platform === "win32";
 const DEFAULT_LABEL = "Private directory";
 const SYSTEM_SID = "S-1-5-18";
+const TMP_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const SE_FILE_OBJECT = 1;
 const OWNER_SECURITY_INFORMATION = 1;
 const DACL_SECURITY_INFORMATION = 4;
@@ -316,12 +317,26 @@ async function ensurePrivateDir(dir) {
   checkRepaired(target);
 }
 
+// Nothing else cleans <stateRoot>/tmp. A directory still in use can be held open,
+// so a failed removal is left for the next sweep.
+function sweepOldTmpDirs(root, prefix) {
+  const cutoff = Date.now() - TMP_RETENTION_MS;
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !entry.name.startsWith(prefix)) continue;
+    const dir = path.join(root, entry.name);
+    try {
+      if (fs.lstatSync(dir).mtimeMs < cutoff) fs.rmSync(dir, { recursive: true, force: true });
+    } catch { /* Retried by the next sweep. */ }
+  }
+}
+
 // A fresh private directory. Windows' temp directory is shared with what the user
 // runs, so there it lives under <stateRoot>/tmp.
 function privateTmpDir(prefix) {
   if (!WIN32) return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   const root = path.join(stateRoot(), "tmp");
   ensurePrivateDirSync(root);
+  sweepOldTmpDirs(root, prefix);
   const dir = fs.mkdtempSync(path.join(root, prefix));
   ensurePrivateDirSync(dir);
   return dir;
