@@ -11,11 +11,8 @@
 // prints the conversation as JSON, or exits 2 with a reason on stderr when the
 // input is unknown, ambiguous, or not in --project.
 const { existsSync, readFileSync } = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
-const { expandHome } = require("./platform/paths.js");
-
-const { stateRoot } = require("./platform/paths.js");
+const { expandHome, stateRoot } = require("./platform/paths.js");
 const { isPrivateFile } = require("./platform/privacy.js");
 
 const LINK = /^https?:\/\/(?:(?:ptb|canary)\.)?discord(?:app)?\.com\/channels\/[^/\s]+\/([^/\s]+)(?:\/[^/\s]+)?\/?$/;
