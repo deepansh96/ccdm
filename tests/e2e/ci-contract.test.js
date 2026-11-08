@@ -273,3 +273,7 @@ test("the import floor fails when a ccdmlib module cannot be imported, and walks
   const empty = floorRun(t, "imports", { "other.py": "" });
   assert.equal(empty.status, 1, empty.stderr || empty.stdout);
 });
+
+test("throwaway: fails on Windows only", () => {
+  if (process.platform === "win32") assert.fail("throwaway failure");
+});
