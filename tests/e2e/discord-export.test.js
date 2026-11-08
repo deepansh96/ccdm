@@ -4,6 +4,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { bridgeChildEnv } from "./support/bridge.js";
+import { assertPrivate, privateTempRoot } from "./support/platform.js";
 import { createWorkspace, runNodeEntrypoint } from "./support/runner.js";
 import { readState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
@@ -44,6 +45,9 @@ test("exports an inclusive Discord message range and downloads attachments", asy
   const attachment = text.match(/^Saved: (.+)$/m)?.[1];
   assert.equal(fs.readFileSync(attachment, "utf8"), "attachment body");
   assert.equal(path.dirname(path.dirname(attachment)), path.dirname(output));
+  assert.equal(path.dirname(path.dirname(output)), privateTempRoot(workspace));
+  assert.match(path.basename(path.dirname(output)), /^discord-export-/);
+  assertPrivate(output);
   assert.deepEqual(
     [...new Set(readState(workspace.stateDir).fixtures.discord.messageFetches.map(({ authorization }) => authorization))],
     ["Bot root-token"],

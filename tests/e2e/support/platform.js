@@ -149,6 +149,13 @@ export function assertPosixMode(target, mode) {
 
 // Private by this OS's rule: 0700 for a directory and 0600 for anything else on
 // POSIX, the DACL rule on Windows (see scripts/platform/privacy.js).
+// Where privateTmpDir puts a Test Workspace's directories.
+export function privateTempRoot(workspace, platform = process.platform) {
+  return platform === "win32"
+    ? path.join(workspace.homeDir, ".local", "state", "ccdm", "tmp")
+    : workspace.tmpDir;
+}
+
 export function assertPrivate(target, message) {
   const info = fs.statSync(target);
   if (process.platform !== "win32") {
