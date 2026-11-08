@@ -8,6 +8,15 @@ import { fileURLToPath } from "node:url";
 
 import { bridgeChildEnv, createBridgeWorkspace } from "./support/bridge.js";
 import { assertFixtureExecutable, assertIsolatedPath, redactSecrets } from "./support/diagnostics.js";
+import {
+  fixtureLauncher,
+  harnessPrerequisiteProblem,
+  hookShell,
+  interpreterFor,
+  platformGate,
+  PYTHON,
+  resolvePython,
+} from "./support/platform.js";
 import { createWorkspace, runNodeEntrypoint, runnerInternals, runScript } from "./support/runner.js";
 import {
   readState,
@@ -20,6 +29,8 @@ import {
 } from "./support/state.js";
 import { cleanup, registerTeardownCallback, teardownSkips, workspaceOwnsPid } from "./support/teardown.js";
 import { signalSupervisorWorker } from "./support/thread-supervisor.js";
+
+const WINDOWS_ONLY = platformGate("win32", "this case only means anything on Windows");
 
 test.afterEach(async () => {
   await cleanup();
@@ -219,12 +230,9 @@ test("the workspace env on POSIX is only the isolated values and the Python guar
 
 // The workspace PATH holds only fixtures, so the host interpreter goes by absolute path.
 function hostPythonPath() {
-  const candidates = process.platform === "win32" ? [["py", "-3"], ["python"]] : [["python3"]];
-  for (const [command, ...args] of candidates) {
-    const probe = spawnSync(command, [...args, "-c", "import sys; print(sys.executable)"], { encoding: "utf8" });
-    if (probe.status === 0 && probe.stdout.trim()) return probe.stdout.trim();
-  }
-  throw new Error("No host Python found");
+  const probe = spawnSync(PYTHON, ["-c", "import sys; print(sys.executable)"], { encoding: "utf8" });
+  assert.equal(probe.status, 0, probe.stderr);
+  return probe.stdout.trim();
 }
 
 function locationsSeenWith(env, cwd) {
@@ -378,7 +386,7 @@ test("teardown stops a process the harness holds a handle to", async () => {
   assert.notEqual(result.exitCode, 0);
 });
 
-test("on POSIX, teardown still stops every process in a verified group", { skip: process.platform === "win32" }, async () => {
+test("on POSIX, teardown still stops every process in a verified group", platformGate("posix", "Windows has no process groups to signal"), async () => {
   const workspace = probeWorkspace();
   const leaderCode = `
     const child = require("node:child_process").spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
@@ -401,7 +409,7 @@ test("on POSIX, teardown still stops every process in a verified group", { skip:
   }
 });
 
-test("a fixture's real launch carries the workspace marker, so teardown can stop it", { skip: process.platform === "win32" }, async () => {
+test("a fixture's real launch carries the workspace marker, so teardown can stop it", async () => {
   const workspace = createWorkspace();
   const keyFile = path.join(workspace.tmpDir, "router", "keys", "project.key");
   const started = spawnSync(path.join(workspace.fixtureDir, "tmux"), [
@@ -511,6 +519,294 @@ test("every harness spawn hides its window, and the fixture claude's hook PATH u
   }
   const runnerSource = fs.readFileSync(path.join(supportDir, "runner.js"), "utf8");
   assert.match(runnerSource, /const hookEnv = .*path\.delimiter/);
+});
+
+function seedChildOf(workspace, parentPid, pid) {
+  seedFixtureProcess(
+    { command: "child worker", owned: true, ownerStateDir: workspace.stateDir, pid, ppid: parentPid },
+    { stateDir: workspace.stateDir },
+  );
+}
+
+function runPkill(workspace, parentPid) {
+  return spawnSync(path.join(workspace.fixtureDir, "pkill"), ["-TERM", "-P", String(parentPid)], {
+    cwd: workspace.repoDir,
+    encoding: "utf8",
+    env: workspace.env,
+    windowsHide: true,
+  });
+}
+
+test("the fixture pkill leaves a seeded child without the workspace marker running, and logs the skip", async () => {
+  const workspace = createWorkspace();
+  const parentPid = 424242;
+  const sentinel = startSleeper();
+  try {
+    seedChildOf(workspace, parentPid, sentinel.pid);
+
+    const result = runPkill(workspace, parentPid);
+
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, new RegExp(`skipped pid ${sentinel.pid}`));
+    assert.equal(processAlive(sentinel.pid), true);
+    assert.deepEqual(readState(workspace.stateDir).fixtures.pkillSkips, [{ marker: workspace.tmpRoot, pid: sentinel.pid }]);
+  } finally {
+    sentinel.kill();
+  }
+});
+
+test("the fixture pkill signals a seeded child whose command line holds the workspace marker", async () => {
+  const workspace = createWorkspace();
+  const parentPid = 424243;
+  const child = startSleeper([workspace.tmpRoot]);
+  const exited = exitOf(child);
+  try {
+    seedChildOf(workspace, parentPid, child.pid);
+
+    const result = runPkill(workspace, parentPid);
+
+    assert.equal(result.status, 0, result.stderr);
+    await exited;
+    assert.equal(readState(workspace.stateDir).fixtures.pkillSkips, undefined);
+  } finally {
+    child.kill();
+  }
+});
+
+test("on win32 the fixture ps and pgrep leave out a live owned row without the workspace marker", WINDOWS_ONLY, () => {
+  const workspace = createWorkspace();
+  const parentPid = 424244;
+  const sentinel = startSleeper();
+  const owned = startSleeper([workspace.tmpRoot]);
+  const run = (tool, args) => spawnSync(path.join(workspace.fixtureDir, tool), args, { cwd: workspace.repoDir, encoding: "utf8", env: workspace.env, windowsHide: true });
+  try {
+    seedChildOf(workspace, parentPid, sentinel.pid);
+    seedChildOf(workspace, parentPid, owned.pid);
+
+    assert.equal(run("pgrep", ["-P", String(parentPid)]).stdout.trim(), String(owned.pid));
+    const listed = run("ps", ["axeww", "-o", "pid=,command="]).stdout;
+    assert.match(listed, new RegExp(`\\b${owned.pid}\\b`));
+    assert.doesNotMatch(listed, new RegExp(`\\b${sentinel.pid}\\b`));
+  } finally {
+    sentinel.kill();
+    owned.kill();
+  }
+});
+
+test("a SessionStart hook written as node '<forward-slash path>' runs through the fixture claude and records exit 0", async () => {
+  const workspace = createWorkspace();
+  const marker = path.join(workspace.tmpDir, "hook-ran");
+  const forwardSlash = (file) => file.split(path.sep).join("/");
+  const hookScript = path.join(workspace.tmpDir, "hook.js");
+  fs.writeFileSync(hookScript, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");\n`);
+  const settings = path.join(workspace.tmpDir, "settings.json");
+  fs.writeFileSync(settings, JSON.stringify({
+    hooks: { SessionStart: [{ hooks: [{ type: "command", command: `node '${forwardSlash(hookScript)}'` }] }] },
+  }));
+  const server = path.join(workspace.tmpDir, "server.js");
+  fs.writeFileSync(server, "setInterval(() => {}, 1000);\n");
+  const mcpConfig = path.join(workspace.tmpDir, "mcp.json");
+  fs.writeFileSync(mcpConfig, JSON.stringify({ mcpServers: { ccdm: { command: "node", args: [server] } } }));
+  const keyFile = path.join(workspace.tmpDir, "project.key");
+  const tmux = (args) => spawnSync(path.join(workspace.fixtureDir, "tmux"), args, {
+    cwd: workspace.repoDir, encoding: "utf8", env: workspace.env, windowsHide: true,
+  });
+
+  const started = tmux([
+    "new-session", "-d", "-s", "hook_session", "--", "zsh", "-ic",
+    `cd '${workspace.tmpDir}' && CCDM_ROUTER_KEY_FILE='${keyFile}' claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions --settings ${settings} --mcp-config ${mcpConfig}`,
+  ]);
+  assert.equal(started.status, 0, started.stderr);
+  const accepted = tmux(["send-keys", "-t", "hook_session", "Enter"]);
+  assert.equal(accepted.status, 0, accepted.stderr);
+
+  const deadline = Date.now() + 60000;
+  while (!readState(workspace.stateDir).fixtures.claude.hookRuns?.length && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.deepEqual(readState(workspace.stateDir).fixtures.claude.hookRuns, [{ event: "SessionStart", exitCode: 0 }]);
+  assert.equal(fs.readFileSync(marker, "utf8"), "ran");
+});
+
+test("hooks use /bin/sh on POSIX, and Git Bash on win32 or a clear failure without it", () => {
+  for (const platform of ["linux", "darwin"]) assert.equal(hookShell({ platform }), "/bin/sh");
+  assert.throws(() => hookShell({ env: { CCDM_E2E_GIT_SH: "Z:\\no\\sh.exe" }, platform: "win32" }), /Git Bash.*sh\.exe/s);
+});
+
+test("PYTHON resolution follows CCDM_PYTHON, then python3 on POSIX, then py -3 and python on win32, rejecting the Store stub", () => {
+  const unused = () => assert.fail("nothing to probe");
+  assert.equal(resolvePython({ env: { CCDM_PYTHON: "/opt/py" }, platform: "win32", probe: unused }), "/opt/py");
+  assert.equal(resolvePython({ env: {}, platform: "linux", probe: unused }), "python3");
+  assert.equal(resolvePython({ env: {}, platform: "darwin", probe: unused }), "python3");
+  const probeOf = (answers) => (command) => answers[command] ?? null;
+  assert.equal(resolvePython({ env: {}, platform: "win32", probe: probeOf({ py: "C:\\Py\\python.exe", python: "C:\\Other\\python.exe" }) }), "C:\\Py\\python.exe");
+  assert.equal(resolvePython({
+    env: {},
+    platform: "win32",
+    probe: probeOf({ py: "C:\\Users\\a\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe", python: "C:\\Other\\python.exe" }),
+  }), "C:\\Other\\python.exe");
+  assert.equal(resolvePython({ env: {}, platform: "win32", probe: probeOf({}) }), null);
+});
+
+test("platformGate runs posix on Linux and macOS, darwin only on macOS, and win32 only on Windows", () => {
+  const skipped = (tag, platform) => Boolean(platformGate(tag, "why", platform).skip);
+  assert.deepEqual(["linux", "darwin", "win32"].map((os_) => skipped("posix", os_)), [false, false, true]);
+  assert.deepEqual(["linux", "darwin", "win32"].map((os_) => skipped("darwin", os_)), [true, false, true]);
+  assert.deepEqual(["linux", "darwin", "win32"].map((os_) => skipped("win32", os_)), [true, true, false]);
+  assert.throws(() => platformGate("freebsd"), /Unknown platform tag/);
+});
+
+test("interpreterFor leaves POSIX to the shebang and names the interpreter on win32", () => {
+  const workspace = probeWorkspace();
+  const script = (name, content) => {
+    const file = path.join(workspace.tmpDir, name);
+    fs.writeFileSync(file, content);
+    return file;
+  };
+  const python = script("tool", "#!/usr/bin/env python3\n");
+  const node = script("tool.js", "#!/usr/bin/env node\n");
+
+  assert.deepEqual(interpreterFor(python, "linux"), [python]);
+  assert.deepEqual(interpreterFor(python, "darwin"), [python]);
+  assert.deepEqual(interpreterFor(python, "win32"), [PYTHON, python]);
+  assert.deepEqual(interpreterFor(node, "win32"), [process.execPath, node]);
+  assert.deepEqual(interpreterFor("C:\\x\\tool.exe", "win32"), ["C:\\x\\tool.exe"]);
+});
+
+test("the prerequisite check is silent off Windows and names a missing compiler on win32", () => {
+  for (const platform of ["linux", "darwin"]) {
+    assert.equal(harnessPrerequisiteProblem({ env: { CCDM_E2E_CSC: "/no/csc.exe" }, platform }), null);
+  }
+});
+
+test("a detached grandchild of a fixture tool does not hold the caller's pipes open", WINDOWS_ONLY, () => {
+  const workspace = probeWorkspace();
+  const middle = path.join(workspace.tmpDir, "middle.js");
+  fs.writeFileSync(middle, [
+    'const { spawn } = require("node:child_process");',
+    'spawn(process.execPath, ["-e", "setTimeout(() => {}, 15000)"], { detached: true, stdio: "ignore", windowsHide: true }).unref();',
+    "process.exit(0);",
+    "",
+  ].join("\n"));
+  const started = Date.now();
+
+  const result = spawnSync(launcherPair(workspace.tmpDir, "middle", [process.execPath, middle]), [], { encoding: "utf8", windowsHide: true });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(Date.now() - started < 10000, "spawnSync waited for the grandchild");
+});
+
+// A workspace-free launcher with a shim of our own, to check exactly what the child receives.
+function launcherPair(dir, name, shimLines) {
+  const exe = path.join(dir, `${name}.exe`);
+  fs.copyFileSync(fixtureLauncher(), exe);
+  fs.writeFileSync(path.join(dir, `${name}.shim`), `${shimLines.join("\n")}\n`);
+  return exe;
+}
+
+test("the launcher passes hostile arguments through unchanged and returns the exit code", WINDOWS_ONLY, () => {
+  const workspace = probeWorkspace();
+  const dump = path.join(workspace.tmpDir, "dump.js");
+  fs.writeFileSync(dump, "process.stdout.write(JSON.stringify(process.argv.slice(2))); process.exit(Number(process.env.CODE));\n");
+  const exe = launcherPair(workspace.tmpDir, "dump tool", [process.execPath, dump]);
+  const args = [
+    "with space", "it's", 'say "hi"', "a&b", "100%", "%PATH%", "wow!", "x^y", 'a\\"b', "C:\\dir\\", '\\\\"', "",
+    "trailing\\", " leading", "日本語", "🦈 and 🌊", "a\tb", "--flag=a b",
+  ];
+
+  const result = spawnSync(exe, args, { encoding: "utf8", env: { ...process.env, CODE: "37" }, windowsHide: true });
+
+  assert.equal(result.status, 37, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), args);
+});
+
+test("the launcher passes stdin through, sends a no-op shim to exit 0, and reports a bad program", WINDOWS_ONLY, () => {
+  const workspace = probeWorkspace();
+  const copy = path.join(workspace.tmpDir, "copy.js");
+  fs.writeFileSync(copy, "process.stdin.pipe(process.stdout);\n");
+  const piped = spawnSync(launcherPair(workspace.tmpDir, "copy", [process.execPath, copy]), [], {
+    encoding: "utf8", input: "through the pipe", windowsHide: true,
+  });
+  assert.equal(piped.status, 0, piped.stderr);
+  assert.equal(piped.stdout, "through the pipe");
+
+  const noop = spawnSync(launcherPair(workspace.tmpDir, "noop", [":noop"]), ["30"], { encoding: "utf8", windowsHide: true });
+  assert.equal(noop.status, 0, noop.stderr);
+
+  const bad = spawnSync(launcherPair(workspace.tmpDir, "bad", ["Z:\\no\\such.exe"]), [], { encoding: "utf8", windowsHide: true });
+  assert.equal(bad.status, 126);
+  assert.match(bad.stderr, /cannot start/);
+});
+
+test("workspaces get hard-linked tool.exe and tool.shim pairs, and a tool runs when found through PATH", WINDOWS_ONLY, () => {
+  const workspace = createWorkspace();
+  for (const file of ["jq.exe", "jq.shim", "sleep.exe", "sleep.shim", "python3.exe", "python3.shim"]) {
+    assert.ok(fs.statSync(path.join(workspace.fixtureDir, file)).nlink >= 2, `${file} is not a hard link`);
+  }
+
+  const jq = spawnSync("jq", [".guild_id"], { cwd: workspace.repoDir, encoding: "utf8", env: workspace.env, input: '{"guild_id":"123"}', windowsHide: true });
+  assert.equal(jq.status, 0, jq.stderr);
+  assert.equal(jq.stdout, "123\n");
+
+  const sleep = spawnSync("sleep", ["30"], { cwd: workspace.repoDir, encoding: "utf8", env: workspace.env, timeout: 15000, windowsHide: true });
+  assert.equal(sleep.status, 0, sleep.stderr);
+
+  const wrapper = "python3"; // The fixture, found through the workspace PATH.
+  const python = spawnSync(wrapper, ["-c", "import sys; print(sys.version_info[0])"], { cwd: workspace.repoDir, encoding: "utf8", env: workspace.env, windowsHide: true });
+  assert.equal(python.status, 0, python.stderr);
+  assert.equal(python.stdout.trim(), "3");
+});
+
+test("the launcher is compiled once per content hash and the next run reuses the cache", WINDOWS_ONLY, () => {
+  const emptyTemp = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-launcher-cache-"));
+  registerTeardownCallback(() => fs.rmSync(emptyTemp, { force: true, recursive: true }));
+  const platformUrl = new URL("./support/platform.js", import.meta.url).href;
+  const script = `import { fixtureLauncher } from ${JSON.stringify(platformUrl)}; console.log(fixtureLauncher());`;
+  const run = (extraEnv = {}) => spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    encoding: "utf8",
+    env: { ...process.env, ...extraEnv, TEMP: emptyTemp, TMP: emptyTemp, TMPDIR: emptyTemp },
+    windowsHide: true,
+  });
+
+  const first = run();
+  assert.equal(first.status, 0, first.stderr);
+  const exe = first.stdout.trim();
+  assert.ok(exe.startsWith(emptyTemp), exe);
+  const built = fs.statSync(exe).mtimeMs;
+
+  // With no compiler to call, only the cache can answer.
+  const second = run({ CCDM_E2E_CSC: path.join(emptyTemp, "missing-csc.exe") });
+  assert.equal(second.status, 0, second.stderr);
+  assert.equal(second.stdout.trim(), exe);
+  assert.equal(fs.statSync(exe).mtimeMs, built);
+});
+
+test("a missing csc.exe fails the build with a clear message and leaves nothing behind", WINDOWS_ONLY, () => {
+  const { afterCleanup, beforeCleanup, message } = createWorkspaceInEmptyTemp({}, { CCDM_E2E_CSC: "Z:\\no\\csc.exe" });
+
+  assert.match(message, /csc\.exe/);
+  assert.deepEqual(beforeCleanup.filter((name) => name.includes(".staging-")), []);
+  assert.deepEqual(afterCleanup, []);
+});
+
+test("npm test stops before any file runs when csc.exe is missing", WINDOWS_ONLY, () => {
+  const emptyTemp = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-no-csc-"));
+  registerTeardownCallback(() => fs.rmSync(emptyTemp, { force: true, recursive: true }));
+  const runner = fileURLToPath(new URL("../run-e2e.mjs", import.meta.url));
+  const probe = fileURLToPath(new URL("../fixtures/runner/pass.test.js", import.meta.url));
+  const started = Date.now();
+
+  const result = spawnSync(process.execPath, [runner, probe], {
+    cwd: path.dirname(path.dirname(path.dirname(runner))),
+    encoding: "utf8",
+    env: { ...process.env, CCDM_E2E_CSC: "Z:\\no\\csc.exe", TEMP: emptyTemp, TMP: emptyTemp, TMPDIR: emptyTemp },
+    windowsHide: true,
+  });
+
+  assert.equal(result.status, 1, result.stdout);
+  assert.match(result.stderr, /E2E run cannot start.*csc\.exe/s);
+  assert.doesNotMatch(result.stdout, /pass\.test\.js/);
+  assert.ok(Date.now() - started < 30000);
 });
 
 test("teardown callbacks run in LIFO order and cleanup failures are diagnostic records", async () => {

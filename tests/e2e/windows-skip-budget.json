@@ -1,0 +1,11 @@
+{
+  "budget": 1,
+  "skips": [
+    {
+      "file": "harness-safety.test.js",
+      "test": "on POSIX, teardown still stops every process in a verified group",
+      "tag": "posix",
+      "reason": "Windows has no process groups to signal"
+    }
+  ]
+}

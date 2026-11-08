@@ -112,7 +112,7 @@ function readRegistry(workspace) {
 }
 
 function seedOwnedProcess(workspace, command) {
-  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", workspace.tmpRoot], {
     detached: true,
     env: {
       CCDM_TEST_STATE: workspace.stateDir,

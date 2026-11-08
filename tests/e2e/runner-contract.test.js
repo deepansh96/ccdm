@@ -226,9 +226,7 @@ test("CCDM_E2E_NO_RERUN switches the rerun-alone step, which is off by default o
   }
 });
 
-test("createWorkspace announces its workspace on stderr and keeps it under CCDM_E2E_KEEP_FAILED=1", {
-  skip: process.platform === "win32" && "the workspace fixture binaries do not build on Windows yet",
-}, async () => {
+test("createWorkspace announces its workspace on stderr and keeps it under CCDM_E2E_KEEP_FAILED=1", async () => {
   const lines = [];
   const write = process.stderr.write;
   const saved = process.env.CCDM_E2E_KEEP_FAILED;
