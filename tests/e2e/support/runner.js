@@ -60,6 +60,8 @@ const HOST_WRAPPERS = new Map([
   ["sed", null],
   ["tr", "/usr/bin/tr"],
   ["wc", "/usr/bin/wc"],
+  // On Windows the production resolver looks for `py` and `python`, never `python3`.
+  ...(WIN ? [["python", null]] : []),
 ]);
 
 function sourceRoot() {
@@ -133,7 +135,7 @@ function shellQuote(value) {
 }
 
 function hostCommandPath(name) {
-  if (name === "python3") {
+  if (name === "python3" || name === "python") {
     const python = spawnSync(PYTHON, ["-c", "import sys; print(sys.executable)"], {
       encoding: "utf8",
       windowsHide: true,

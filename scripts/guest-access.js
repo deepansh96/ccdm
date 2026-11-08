@@ -2,9 +2,9 @@
 
 const fs = require("fs");
 const path = require("path");
-const os = require("os");
 const { ResolveError, resolveConversation } = require("./conversation-resolver.js");
 const { updateRegistry } = require("./router/registry.js");
+const { expandHome } = require("./platform/paths.js");
 
 const ROOT_DIR = path.resolve(__dirname, "..");
 const REGISTRY_PATH = path.join(ROOT_DIR, "registry.json");
@@ -27,13 +27,6 @@ function usage() {
   scripts/guest-access.js sync [project|channel_id|thread_id|link]
   scripts/guest-access.js list [project|channel_id|thread_id|link]`);
   process.exit(2);
-}
-
-function expandHome(value) {
-  if (!value) return value;
-  if (value === "~") return os.homedir();
-  if (value.startsWith("~/")) return path.join(os.homedir(), value.slice(2));
-  return value;
 }
 
 function readJson(file, fallback) {

@@ -1,14 +1,19 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 import { startFakeCodexServer } from "./support/bridge.js";
+import { platformGate } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import { OWNER_ID, createRouterWorkspace, routerEnv, runRouterCli, startRouter } from "./support/router.js";
 import { readState, seedFixtureProcess, seedTmuxSession, updateState, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
+
+const { resolveResume } = createRequire(import.meta.url)("../../scripts/router/resume.js");
 
 test.afterEach(async () => {
   await cleanup();
@@ -276,6 +281,47 @@ const claudeLaunches = (workspace) => readState(workspace.stateDir).fixtures.cla
 const threadRequests = (codex) => codex.clientMessages
   .filter((message) => message.method === "thread/resume" || message.method === "thread/start")
   .map((message) => [message.method, message.params.threadId]);
+
+// A registry path and what the provider recorded can spell the same drive differently.
+const otherDriveCase = (dir) => (dir[0] === dir[0].toUpperCase() ? dir[0].toLowerCase() : dir[0].toUpperCase()) + dir.slice(1);
+
+test("resume matches a Codex rollout whose directory differs only in drive-letter case", platformGate("win32", "Windows drive letters"), (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-resume-case-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, "codex-home");
+  const sessions = path.join(home, "sessions");
+  fs.mkdirSync(sessions, { recursive: true });
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  const id = "11111111-2222-4333-8444-555555555555";
+  fs.writeFileSync(path.join(sessions, `rollout-2026-${id}.jsonl`), `${JSON.stringify({
+    type: "session_meta",
+    payload: { id, cwd: otherDriveCase(project), originator: "codex-discord-bridge", source: "cli" },
+  })}\n`);
+  const entry = { type: "codex", path: project, codex_home: home };
+  const registryFile = path.join(root, "registry.json");
+  fs.writeFileSync(registryFile, JSON.stringify({ projects: { demo: entry } }));
+
+  assert.equal(resolveResume("demo", entry, { registryFile }).id, id);
+});
+
+test("resume matches a live Claude session whose directory differs only in drive-letter case", platformGate("win32", "Windows drive letters"), (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-resume-case-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, "claude-home");
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  const id = "11111111-2222-4333-8444-555555555555";
+  fs.mkdirSync(path.join(home, "sessions"), { recursive: true });
+  fs.writeFileSync(path.join(home, "sessions", `${process.pid}.json`), JSON.stringify({ cwd: otherDriveCase(project), sessionId: id }));
+  const transcriptDir = path.join(home, "projects", project.replace(/[^A-Za-z0-9]/g, "-"));
+  fs.mkdirSync(transcriptDir, { recursive: true });
+  fs.writeFileSync(path.join(transcriptDir, `${id}.jsonl`), "{}\n");
+  const entry = { type: "claude", path: project, claude_home: home, pid: process.pid };
+
+  assert.deepEqual(resolveResume("demo", entry, { registryFile: path.join(root, "registry.json") }),
+    { id, source: "live Claude session file" });
+});
 
 test("--resume resumes a Claude project's recorded session_id after the stop clears it", async () => {
   const { workspace } = poolClaudeWorkspace();

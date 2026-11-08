@@ -431,6 +431,34 @@ test("Claude reply tool exposes explicit interaction and input-needed fields", a
   assert.deepEqual(reply.inputSchema.properties.conversation_disposition.enum, ["progress", "input-needed"]);
 });
 
+test("the adapter drains an event into the reminder store through the resolved Python", async () => {
+  const workspace = createRouterWorkspace({
+    discord_user_id: OWNER_ID,
+    guild_id: "guild-id",
+    projects: { demo: { type: "claude", transport: "router", channel_id: "channel-1", assignment_generation: "generation-1",
+      webhook_id: WEBHOOK_ID, session_id: null, pid: null } },
+  });
+  const stateDir = reminderStateDir(workspace);
+  const drain = path.join(workspace.tmpDir, "drain-one-event.js");
+  fs.writeFileSync(drain, `
+const adapter = require(${JSON.stringify(path.join(workspace.repoDir, "scripts", "conversation-reminder-adapter.js"))});
+adapter.emitEvent("owner_activity", {
+  project: "demo", owner_id: ${JSON.stringify(OWNER_ID)}, channel_id: "channel-1",
+  bot_id: "router:${WEBHOOK_ID}", assignment_generation: "generation-1", provider: "claude",
+}, { actor_id: ${JSON.stringify(OWNER_ID)}, source_message_id: "owner-message-1", activity_kind: "message" })
+  .then(() => adapter.drainOutbox())
+  .then(result => process.stdout.write(JSON.stringify(result)));
+`);
+  const result = await runNodeEntrypoint(workspace, path.relative(workspace.repoDir, drain), {
+    env: { CCDM_REMINDER_PROJECT_ROOT: workspace.repoDir, CCDM_REMINDER_STATE_DIR: stateDir },
+  });
+  assert.equal(result.exitCode, 0, result.stderr);
+  // The first drain is emitEvent's own, so this one has nothing left to do.
+  assert.deepEqual(JSON.parse(result.stdout), { status: "complete", committed: 0, duplicates: 0, rejected: 0, stale: 0, pending: 0, outcomes: [] });
+  assert.equal(fs.readdirSync(path.join(stateDir, "outbox")).length, 0);
+  assert.ok(fs.existsSync(path.join(stateDir, "events.sqlite3")));
+});
+
 test("Claude event outbox replays after a receiver outage", async () => {
   const { workspace } = await claudeWorkspace();
   const channel = await startChannel(workspace, { receiverOutage: true });

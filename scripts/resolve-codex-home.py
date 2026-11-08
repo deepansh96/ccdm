@@ -7,6 +7,10 @@ import stat
 import sys
 from typing import Any
 
+if sys.platform == "win32":
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from ccdmlib.platform.paths import expand_home, is_abs
+
 
 class ResolverError(Exception):
     """An actionable configuration or Codex Home validation failure."""
@@ -52,7 +56,20 @@ def codex_accounts(registry: dict[str, Any]) -> dict[str, str]:
     return validated
 
 
+def expand_windows_path(raw_path: str, label: str) -> str:
+    try:
+        expanded = expand_home(raw_path)
+    except RuntimeError as error:
+        raise ResolverError(f"{label} path '{raw_path}' cannot resolve '~': {error}")
+    if not is_abs(expanded):
+        raise ResolverError(f"{label} path '{raw_path}' must be a drive or UNC path, or use '~'")
+    return os.path.normpath(expanded)
+
+
 def expand_path(raw_path: str, label: str) -> str:
+    if sys.platform == "win32":
+        return expand_windows_path(raw_path, label)
+
     if raw_path == "~" or raw_path.startswith("~/"):
         home = os.environ.get("HOME")
         if not home or not os.path.isabs(home):

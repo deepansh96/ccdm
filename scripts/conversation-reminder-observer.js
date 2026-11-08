@@ -14,8 +14,10 @@ const reminder = require("./conversation-reminder-adapter.js");
 const discovery = require("./conversation-reminder-discovery.js");
 const { RouterClient } = require("./router/client.js");
 const routerPaths = require("./router/paths.js");
+const { pythonInvocation } = require("./platform/tools.js");
 
 const exec = promisify(execFile);
+const python = async args => exec(...pythonInvocation(args));
 const script = path.join(__dirname, "conversation-reminder-service.py");
 const projectRoot = process.argv[process.argv.indexOf("--project-root") + 1] || path.resolve(__dirname, "..");
 const stateDir = process.argv[process.argv.indexOf("--state-dir") + 1] || path.join(os.homedir(), ".local/state/ccdm/conversation-reminders");
@@ -54,12 +56,12 @@ async function markHealth(project, state, generation) {
   if (health[project] === state) return;
   // Lost access or capability durably stops delivery for that assignment only.
   if (generation && SUSPENSIONS[state]) {
-    await exec(process.env.CCDM_REMINDER_PYTHON || "python3", [script, "suspend", "--state-dir", stateDir,
+    await python([script, "suspend", "--state-dir", stateDir,
       "--project", project, "--generation", generation, "--reason", SUSPENSIONS[state]]);
   } else if (generation && state === "ready-observe-only" && SUSPENSIONS[health[project]]) {
     // Access or adapter capability returned (for example a Claude session
     // restarted with its adapter); reconcile what was missed before any send.
-    await exec(process.env.CCDM_REMINDER_PYTHON || "python3", [script, "resume", "--state-dir", stateDir,
+    await python([script, "resume", "--state-dir", stateDir,
       "--project", project, "--generation", generation]);
   }
   health[project] = state;
@@ -110,7 +112,7 @@ async function threadAssignment(project, threadId) {
 }
 
 async function adapterReady(found) {
-  const readiness = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+  const readiness = await python(
     [path.join(__dirname, "conversation-reminder-readiness.py"), found.project, "--json",
       "--project-root", projectRoot, "--state-dir", stateDir]).then(result => JSON.parse(result.stdout))
     // A blocked readiness report exits nonzero but still explains its cause.
@@ -201,7 +203,7 @@ async function retiredCredentials() {
 }
 
 async function reportLeftover(action, reason) {
-  await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+  await python(
     [script, "leftover", "--state-dir", stateDir, "--action-id", action.action_id, "--reason", reason]);
 }
 
@@ -211,7 +213,7 @@ async function reportLeftover(action, reason) {
 const RETIRED_CLEANUP_ATTEMPTS = 3;
 
 async function cleanupRetired(project) {
-  const pending = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+  const pending = await python(
     [script, "actions", "--project-root", projectRoot, "--state-dir", stateDir]);
   const result = { completed: [], inaccessible: [] };
   for (const action of JSON.parse(pending.stdout).actions) {
@@ -258,7 +260,7 @@ async function cleanupRetired(project) {
         await reportLeftover(action, reason);
         result.inaccessible.push({ message_id: action.message_id, reason });
       } else {
-        await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+        await python(
           [script, "done", "--state-dir", stateDir, "--action-id", action.action_id]);
         result.completed.push(action.message_id);
       }
@@ -330,14 +332,14 @@ const IDENTITY_WINDOW_MS = 5 * 60000;
 const IDENTITY_PAGES = 5;
 
 async function recordRecoveredSend(intent, result) {
-  await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+  await python(
     [script, "result", "--project-root", projectRoot, "--state-dir", stateDir,
       "--nonce", intent.nonce, "--outcome", "sent", "--message-id", result.messageId,
       "--sent-at", result.sentAt]);
 }
 
 async function recoverIntents(scheduled = false) {
-  const listed = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+  const listed = await python(
     [script, "intents", "--state-dir", stateDir]);
   let recovered = 0;
   let released = 0;
@@ -421,7 +423,7 @@ async function recoverIntents(scheduled = false) {
     if (complete && await retryClockMs() > upper) {
       // The whole window is visible and the bot posted nothing: the request
       // never created a reminder, so the channel may reconcile and send again.
-      await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+      await python(
         [script, "result", "--project-root", projectRoot, "--state-dir", stateDir,
           "--nonce", intent.nonce, "--outcome", "absent"]);
       released++;
@@ -482,7 +484,7 @@ async function sideEffects(recoveryOnly = false) {
     if (!recoveryOnly) {
       await revalidate();
       await discovery.runPass({
-        service: async args => JSON.parse((await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+        service: async args => JSON.parse((await python(
           [script, ...args, "--project-root", projectRoot, "--state-dir", stateDir])).stdout),
         assignment, rootToken, rootUserId: rootUserId(), isClose: closeCommand,
       });
@@ -494,7 +496,7 @@ async function sideEffects(recoveryOnly = false) {
       nextIntentRecovery = performance.now() + INTENT_RECOVERY_MS;
       await recoverIntents(true);
     }
-    const pending = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+    const pending = await python(
       [script, "actions", "--project-root", projectRoot, "--state-dir", stateDir]);
     for (const action of JSON.parse(pending.stdout).actions) {
       if ((nextActionAttempt.get(action.action_id) || 0) > await retryClockMs()) continue;
@@ -538,11 +540,11 @@ async function sideEffects(recoveryOnly = false) {
         continue;
       }
       nextActionAttempt.delete(action.action_id);
-      await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+      await python(
         [script, "done", "--state-dir", stateDir, "--action-id", action.action_id]);
     }
     if (recoveryOnly) return { status: "recovery-complete", ...recovery };
-    const due = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+    const due = await python(
       [script, "claim", "--project-root", projectRoot, "--state-dir", stateDir]);
     const claim = JSON.parse(due.stdout).claim;
     if (!claim) return;
@@ -551,10 +553,10 @@ async function sideEffects(recoveryOnly = false) {
       "--nonce", claim.nonce];
     if (!found || found.project !== claim.project ||
         found.assignment_generation !== claim.assignment_generation) {
-      await exec(process.env.CCDM_REMINDER_PYTHON || "python3", [...args, "--outcome", "access"]);
+      await python([...args, "--outcome", "access"]);
       return;
     }
-    const checked = await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+    const checked = await python(
       [script, "validate", "--project-root", projectRoot, "--state-dir", stateDir,
         "--nonce", claim.nonce]);
     if (!JSON.parse(checked.stdout).valid) return;
@@ -586,7 +588,7 @@ async function sideEffects(recoveryOnly = false) {
     if (messageId) resultArgs.push("--message-id", messageId);
     if (sentAt) resultArgs.push("--sent-at", sentAt);
     if (Number.isFinite(retryAfter)) resultArgs.push("--retry-after", String(retryAfter));
-    await exec(process.env.CCDM_REMINDER_PYTHON || "python3", resultArgs);
+    await python(resultArgs);
   } catch (error) {
     if (recoveryOnly) throw error;
     process.stderr.write(`Conversation observer side effect pending: ${error.message}\n`);
@@ -622,7 +624,7 @@ function observationGap(connectedNow) {
   connected = false;
   gapSequence++;
   gapChain = gapChain.then(async () => {
-    await exec(process.env.CCDM_REMINDER_PYTHON || "python3",
+    await python(
       [script, "observation-gap", "--project-root", projectRoot, "--state-dir", stateDir]);
     connected = connectedNow;
   }).catch(error => {
