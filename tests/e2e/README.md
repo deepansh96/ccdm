@@ -1,5 +1,11 @@
 # CCDM Local-Fake E2E Harness
 
+## Windows Checkout
+
+On Windows, turn on Developer Mode and run `git config --global core.symlinks true` **before** cloning. `CLAUDE.md` and `.mex/AGENTS.md` are committed as symlinks to `AGENTS.md`; without symlink support Git checks them out as small text files holding the link target, so the root agent loads no runbook. The harness also links fixture binaries into each workspace with `fs.symlinkSync` (`tests/e2e/support/runner.js`), which fails without it. A clone made earlier keeps the text files: clone again after changing the setting. `tests/e2e/checkout-contract.test.js` fails, naming the file and this fix, when either file is neither a symlink to `AGENTS.md` nor a copy of it.
+
+`.gitattributes` checks every text file out with LF, whatever `core.autocrlf` says, and `*.cmd` and `*.ps1` with CRLF.
+
 ## Run Commands
 
 Run the default suite with:

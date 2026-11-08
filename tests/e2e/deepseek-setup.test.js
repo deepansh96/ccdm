@@ -76,7 +76,7 @@ test("DeepSeek setup creates private standalone provider state and launches thro
 });
 
 test("DeepSeek setup accepts environment credentials and quoted Unicode paths", async () => {
-  const fixture = setupFixture({ homeName: 'deepseek "quoted" 🚀' });
+  const fixture = setupFixture({ homeName: "deepseek 'quoted' & 50% 🚀" });
   const result = await runScript(fixture.workspace, "scripts/setup-codex-deepseek.py", {
     args: ["--home", fixture.home, "--catalog-file", fixture.catalog],
     env: { DEEPSEEK_API_KEY: "sk-environment-testing-only" },

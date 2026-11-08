@@ -31,7 +31,7 @@ function escapeRegex(value) {
 // Claude has no pool mode: `alpha` names no pool bot and no `transport`, and
 // is still served through the Router.
 function buildClaudeRegistry(workspace, options = {}) {
-  const projectPath = options.projectPath ?? path.join(workspace.tmpDir, 'project with spaces and "quotes"');
+  const projectPath = options.projectPath ?? path.join(workspace.tmpDir, "project with spaces & 50% off!");
   fs.mkdirSync(projectPath, { recursive: true });
   return {
     discord_user_id: OWNER_ID,
