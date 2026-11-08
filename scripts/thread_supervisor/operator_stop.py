@@ -9,10 +9,11 @@ no worker holds the store, its row set `stopped/operator`.
 
 from __future__ import annotations
 
-import fcntl
 import sqlite3
 import subprocess
 import sys
+
+from ccdmlib.platform import filelock
 
 from . import control, lifecycle, registry, store
 from .paths import default_state_dir, router_state_dir
@@ -55,9 +56,7 @@ def _mark_stopped(state_dir, project: str) -> None:
     if not path.exists():
         return
     with path.open("r") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        if not filelock.try_lock(lock):
             return
         db = store.connect(state_dir)
         if db is None:

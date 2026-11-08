@@ -540,14 +540,14 @@ test("history store preserves shared parents and rejects unsupported schemas and
   assert.match(deniedFchmod.stdout, /closed 1/);
 
   const deniedFlock = probe(
-    "def denied(*args, **kwargs):\n raise PermissionError('fixture flock permission denied')\nposter.fcntl.flock = denied\ntry:\n with poster.HistoryStore(sys.argv[2]).locked(): pass\nexcept poster.PosterError as error:\n print(error); raise SystemExit(1)",
+    "def denied(*args, **kwargs):\n raise PermissionError('fixture flock permission denied')\nposter.filelock.lock = denied\ntry:\n with poster.HistoryStore(sys.argv[2]).locked(): pass\nexcept poster.PosterError as error:\n print(error); raise SystemExit(1)",
     path.join(workspace.tmpDir, "flock-permission", "history.sqlite3"),
   );
   assert.equal(deniedFlock.status, 1);
   assert.match(deniedFlock.stdout, /unable to acquire usage history lock/);
 
   const deniedUnlock = probe(
-    "closed = []\nreal_close = poster.os.close\ndef tracked_close(fd):\n closed.append(fd)\n return real_close(fd)\nposter.os.close = tracked_close\nreal_flock = poster.fcntl.flock\ndef deny_unlock(fd, operation):\n if operation == poster.fcntl.LOCK_UN:\n  raise PermissionError('fixture unlock permission denied')\n return real_flock(fd, operation)\nposter.fcntl.flock = deny_unlock\ntry:\n with poster.HistoryStore(sys.argv[2]).locked(): pass\nexcept poster.PosterError as error:\n print(error)\nprint('closed', len(closed))",
+    "closed = []\nreal_close = poster.os.close\ndef tracked_close(fd):\n closed.append(fd)\n return real_close(fd)\nposter.os.close = tracked_close\ndef deny_unlock(fd):\n raise PermissionError('fixture unlock permission denied')\nposter.filelock.unlock = deny_unlock\ntry:\n with poster.HistoryStore(sys.argv[2]).locked(): pass\nexcept poster.PosterError as error:\n print(error)\nprint('closed', len(closed))",
     path.join(workspace.tmpDir, "unlock-permission", "history.sqlite3"),
   );
   assert.equal(deniedUnlock.status, 0);

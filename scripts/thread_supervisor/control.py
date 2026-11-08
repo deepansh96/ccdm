@@ -1,4 +1,5 @@
-"""The private control socket, `<state>/control.sock` (0600), that serves `threads.sh`.
+"""The private control socket, `<state>/control.sock` (0600), that serves `threads.sh`;
+on Windows, the authenticated pipe of `ccdmlib.platform.control`.
 
 One JSON request line in, one JSON response line out:
 `{"op": "create", "project", "name", "flags": {...}, "first_message"}` gets
@@ -19,51 +20,23 @@ store and the Router link are only ever used from that loop.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-import json
-import os
 from pathlib import Path
 import queue
-import socket
 import threading
+
+from ccdmlib.platform import control as channel
 
 from . import boot, capacity, commands, creation, lifecycle, registry, store
 
 
 SOCKET_NAME = "control.sock"
+PIPE_NAME = "supervisor"
 REPLY_TIMEOUT_SECONDS = 60
-LINE_LIMIT = 65536
 
 
-def socket_path(state_dir: Path) -> Path:
-    return state_dir / SOCKET_NAME
-
-
-@contextmanager
-def _in_directory(path: Path):
-    """Unix socket paths are limited to about 100 bytes, so bind and connect by
-    the socket's name from inside the state dir."""
-    previous = os.getcwd()
-    os.chdir(path)
+def _send(connection, response: dict) -> None:
     try:
-        yield
-    finally:
-        os.chdir(previous)
-
-
-def _read_line(connection: socket.socket) -> str:
-    data = b""
-    while b"\n" not in data and len(data) < LINE_LIMIT:
-        chunk = connection.recv(4096)
-        if not chunk:
-            break
-        data += chunk
-    return data.split(b"\n", 1)[0].decode("utf-8")
-
-
-def _send(connection: socket.socket, response: dict) -> None:
-    try:
-        connection.sendall((json.dumps(response) + "\n").encode("utf-8"))
+        connection.write_frame(response)
     except OSError:
         pass
 
@@ -74,35 +47,27 @@ def _error(code: str, message: str) -> dict:
 
 class ControlServer:
     def __init__(self, state_dir: Path, post):
-        self.path = socket_path(state_dir)
-        # The worker lock is held, so any socket already here is stale.
-        self.path.unlink(missing_ok=True)
         self.post = post
-        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        umask = os.umask(0o177)
-        try:
-            with _in_directory(state_dir):
-                self.socket.bind(SOCKET_NAME)
-        finally:
-            os.umask(umask)
-        os.chmod(self.path, 0o600)
-        self.socket.listen(8)
+        self.listener = channel.Listener(state_dir, SOCKET_NAME, PIPE_NAME, REPLY_TIMEOUT_SECONDS)
         threading.Thread(target=self._serve, daemon=True).start()
 
     def _serve(self) -> None:
         while True:
             try:
-                connection, _ = self.socket.accept()
+                connection = self.listener.accept()
             except OSError:
                 return
             threading.Thread(target=self._answer, args=(connection,), daemon=True).start()
 
-    def _answer(self, connection: socket.socket) -> None:
+    def _answer(self, connection) -> None:
         with connection:
-            connection.settimeout(REPLY_TIMEOUT_SECONDS)
             try:
-                request = json.loads(_read_line(connection))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                connection.authenticate()
+            except OSError:
+                return
+            try:
+                request = connection.read_frame()
+            except (OSError, ValueError):
                 request = None
             if not isinstance(request, dict):
                 return _send(connection, _error("invalid", "the request is not a JSON object"))
@@ -115,8 +80,7 @@ class ControlServer:
             _send(connection, response)
 
     def close(self) -> None:
-        self.socket.close()
-        self.path.unlink(missing_ok=True)
+        self.listener.close()
 
 
 def stop_threads(context, project) -> dict:
@@ -241,13 +205,10 @@ def on_control(context, frame: dict) -> None:
 
 def request(state_dir: Path, payload: dict) -> dict:
     """The client's side: one request to a running worker. Raises OSError when
-    no worker serves the socket, ValueError on a malformed answer."""
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(REPLY_TIMEOUT_SECONDS + 5)
-        with _in_directory(state_dir):
-            client.connect(SOCKET_NAME)
-        client.sendall((json.dumps(payload) + "\n").encode("utf-8"))
-        response = json.loads(_read_line(client))
+    no worker serves the channel, ValueError on a malformed answer."""
+    with channel.Client(state_dir, SOCKET_NAME, PIPE_NAME, REPLY_TIMEOUT_SECONDS + 5) as client:
+        client.write_frame(payload)
+        response = client.read_frame()
     if not isinstance(response, dict):
         raise ValueError("the thread supervisor's answer is not a JSON object")
     return response

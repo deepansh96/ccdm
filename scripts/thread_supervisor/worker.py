@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import fcntl
 import json
 import os
 from pathlib import Path
-import signal
 import sqlite3
 import sys
+
+from ccdmlib.platform import filelock
+from ccdmlib.platform.shutdown import on_shutdown
 
 from . import projects, store
 from .control import ControlServer
@@ -50,6 +51,10 @@ def health_path(state_dir: Path) -> Path:
     return state_dir / "worker.json"
 
 
+def stop_path(state_dir: Path) -> Path:
+    return state_dir / "stop"
+
+
 def write_health(state_dir: Path, link: Link, router: str) -> None:
     write_private(health_path(state_dir), json.dumps({"pid": os.getpid(), "link_pid": link.pid, "router": router}))
 
@@ -60,19 +65,18 @@ def run(project_root: Path, state_dir: Path, disabled=None) -> None:
     path = lock_path(state_dir)
     with path.open("a+") as lock:
         os.chmod(path, 0o600)
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise AlreadyRunning("thread supervisor is already running") from error
+        if not filelock.try_lock(lock):
+            raise AlreadyRunning("thread supervisor is already running")
         db = store.connect(state_dir, create=True)
         stopping = False
 
-        def stop(_signal, _frame):
+        def stop():
             nonlocal stopping
             stopping = True
 
-        signal.signal(signal.SIGTERM, stop)
-        signal.signal(signal.SIGINT, stop)
+        # The lock is held, so a marker already here was meant for an earlier worker.
+        stop_path(state_dir).unlink(missing_ok=True)
+        on_shutdown(stop, marker=stop_path(state_dir))
         # A fresh key each start, before the link says hello with it.
         link = Link(write_supervisor_key())
         context = Context(project_root, state_dir, db, link, watch=projects.Watch(project_root))
