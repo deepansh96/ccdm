@@ -10,10 +10,10 @@
 // CLI: conversation-resolver.js [--project <project>] <channel-id|thread-id|link|thread-name>
 // prints the conversation as JSON, or exits 2 with a reason on stderr when the
 // input is unknown, ambiguous, or not in --project.
-const { existsSync, readFileSync, statSync } = require("node:fs");
-const os = require("node:os");
+const { existsSync, readFileSync } = require("node:fs");
 const path = require("node:path");
-const { expandHome } = require("./platform/paths.js");
+const { expandHome, stateRoot } = require("./platform/paths.js");
+const { isPrivateFile } = require("./platform/privacy.js");
 
 const LINK = /^https?:\/\/(?:(?:ptb|canary)\.)?discord(?:app)?\.com\/channels\/[^/\s]+\/([^/\s]+)(?:\/[^/\s]+)?\/?$/;
 
@@ -26,7 +26,7 @@ function registryPath() {
 function supervisorStateDir() {
   const override = process.env.CCDM_THREAD_SUPERVISOR_STATE_DIR;
   if (override) return expandHome(override);
-  return path.join(os.homedir(), ".local/state/ccdm/thread-supervisor");
+  return path.join(stateRoot(), "thread-supervisor");
 }
 
 function loadRegistry(file) {
@@ -57,7 +57,7 @@ function sqlite() {
 function loadThreads(stateDir) {
   const file = path.join(stateDir, "threads.sqlite3");
   if (!existsSync(file)) return [];
-  if (statSync(file).mode & 0o077) throw new ResolveError("the thread store's permissions are not private");
+  if (!isPrivateFile(file)) throw new ResolveError("the thread store's permissions are not private");
   let db;
   try {
     db = new (sqlite().DatabaseSync)(file, { readOnly: true });

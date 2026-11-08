@@ -5,7 +5,7 @@ import nodeTest from "node:test";
 
 import { spawnSync } from "node:child_process";
 
-import { PYTHON, suiteTest } from "./support/platform.js";
+import { PYTHON, assertPrivate, suiteTest } from "./support/platform.js";
 import { runNodeEntrypoint, runScript } from "./support/runner.js";
 import {
   ROOT_TOKEN, createRouterWorkspace, routerEnv, runRouterCli, startRouter,
@@ -112,9 +112,9 @@ test("installer renders a secret-free LaunchAgent with private logs that relaunc
   for (const text of [expected, result.stdout, result.stderr]) {
     assert.doesNotMatch(text, new RegExp(`${ROOT_TOKEN}|pool-bot-token|DISCORD_BOT_TOKEN`));
   }
-  assert.equal(fs.statSync(workspace.routerStateDir).mode & 0o777, 0o700);
-  assert.equal(fs.statSync(path.join(workspace.routerStateDir, "router.log")).mode & 0o777, 0o600);
-  assert.equal(fs.statSync(path.join(workspace.routerStateDir, "router.err")).mode & 0o777, 0o600);
+  assertPrivate(workspace.routerStateDir);
+  assertPrivate(path.join(workspace.routerStateDir, "router.log"));
+  assertPrivate(path.join(workspace.routerStateDir, "router.err"));
   assert.deepEqual(fs.readdirSync(path.dirname(plistPath(workspace))), [`${LABEL}.plist`]);
 });
 

@@ -5,7 +5,7 @@ import nodeTest from "node:test";
 
 import { spawn, spawnSync } from "node:child_process";
 
-import { PYTHON, suiteTest } from "./support/platform.js";
+import { PYTHON, assertPrivate, suiteTest } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import { routerEnv, runRouterCli, startBridge, startRouter, waitFor, writeProjectKey } from "./support/router.js";
 import {
@@ -161,9 +161,9 @@ test("installer renders a secret-free LaunchAgent that supervises the foreground
     assert.doesNotMatch(text, /fixture-(root|project)-token|DISCORD_BOT_TOKEN/);
   }
   // Durable state and logs live in a private directory the installer prepares.
-  assert.equal(fs.statSync(context.stateDir).mode & 0o777, 0o700);
-  assert.equal(fs.statSync(path.join(context.stateDir, "service.log")).mode & 0o777, 0o600);
-  assert.equal(fs.statSync(path.join(context.stateDir, "service.err")).mode & 0o777, 0o600);
+  assertPrivate(context.stateDir);
+  assertPrivate(path.join(context.stateDir, "service.log"));
+  assertPrivate(path.join(context.stateDir, "service.err"));
   // Installing supervises the worker; it neither opts in nor contacts Discord.
   const state = readState(workspace.stateDir);
   assert.deepEqual(state.fixtures.discord.sends, []);
@@ -325,9 +325,9 @@ test("supervised and foreground launches share one worker, and disable keeps rel
   assert.equal((await manual).exitCode, 0);
   assert.equal(readState(workspace.stateDir).fixtures.discord.logins.length, routerLogins);
 
-  assert.equal(fs.statSync(context.stateDir).mode & 0o777, 0o700);
+  assertPrivate(context.stateDir);
   for (const name of ["conversations.sqlite3", "worker.lock", "service.log", "service.err"]) {
-    assert.equal(fs.statSync(path.join(context.stateDir, name)).mode & 0o777, 0o600, name);
+    assertPrivate(path.join(context.stateDir, name), name);
   }
 });
 

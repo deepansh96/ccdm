@@ -10,6 +10,7 @@ const { mkdir, readFile, rename, writeFile } = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const { promisify } = require("node:util");
+const { stateRoot } = require("./platform/paths.js");
 const reminder = require("./conversation-reminder-adapter.js");
 const discovery = require("./conversation-reminder-discovery.js");
 const { RouterClient } = require("./router/client.js");
@@ -20,7 +21,7 @@ const exec = promisify(execFile);
 const python = async args => exec(...pythonInvocation(args));
 const script = path.join(__dirname, "conversation-reminder-service.py");
 const projectRoot = process.argv[process.argv.indexOf("--project-root") + 1] || path.resolve(__dirname, "..");
-const stateDir = process.argv[process.argv.indexOf("--state-dir") + 1] || path.join(os.homedir(), ".local/state/ccdm/conversation-reminders");
+const stateDir = process.argv[process.argv.indexOf("--state-dir") + 1] || path.join(stateRoot(), "conversation-reminders");
 const recoverOnce = process.argv.includes("--recover-once");
 // REST-only retired cleanup for assignment-changed; it never connects to the Router.
 const cleanupRetiredOnce = process.argv.includes("--cleanup-retired-once");

@@ -7,7 +7,7 @@ import test from "node:test";
 
 import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerRegistry, routerWithWebhooks,
   waitFor } from "./support/router.js";
-import { PYTHON } from "./support/platform.js";
+import { PYTHON, assertPrivate } from "./support/platform.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 import { startThreadSupervisor, supervisorCli, supervisorStateDir, supervisorStatus } from "./support/thread-supervisor.js";
@@ -56,15 +56,6 @@ async function fence(workspace, id = "fence-thread") {
   injectThreads(workspace, [{ id, ownerId: OWNER_ID }]);
   await waitForBound(workspace, id);
   await waitFor(() => patches(workspace).some(patch => patch.threadId === id), () => `the ${id} PATCH`);
-}
-
-function modes(dir) {
-  const result = { [path.basename(dir)]: (fs.statSync(dir).mode & 0o777).toString(8) };
-  for (const name of fs.readdirSync(dir)) {
-    const file = path.join(dir, name);
-    if (fs.statSync(file).isFile()) result[name] = (fs.statSync(file).mode & 0o777).toString(8);
-  }
-  return result;
 }
 
 test("an owner-created thread binds, shows in status, and is PATCHed to a one-week auto-archive", async () => {
@@ -193,19 +184,17 @@ test(".supervisor.key is rewritten on each start, and the state is private", asy
   const keyFile = path.join(workspace.routerStateDir, "keys/.supervisor.key");
   const first = await startThreadSupervisor(workspace);
   const firstKey = fs.readFileSync(keyFile, "utf8");
-  assert.equal((fs.statSync(keyFile).mode & 0o777).toString(8), "600");
+  assertPrivate(keyFile);
   assert.equal((await first.stop()).exitCode, 0);
   await startThreadSupervisor(workspace);
   const secondKey = fs.readFileSync(keyFile, "utf8");
   assert.notEqual(secondKey, firstKey);
   assert.match(secondKey.trim(), /^[0-9a-f]{32,}$/);
   const stateDir = supervisorStateDir(workspace);
-  const stateModes = modes(stateDir);
-  assert.equal(stateModes["thread-supervisor"], "700");
-  assert.ok(stateModes["threads.sqlite3"], JSON.stringify(stateModes));
-  for (const [name, mode] of Object.entries(stateModes)) {
-    if (name !== "thread-supervisor") assert.equal(mode, "600", `${name}: ${JSON.stringify(stateModes)}`);
-  }
+  assertPrivate(stateDir);
+  const stateFiles = fs.readdirSync(stateDir).filter(name => fs.statSync(path.join(stateDir, name)).isFile());
+  assert.ok(stateFiles.includes("threads.sqlite3"), JSON.stringify(stateFiles));
+  for (const name of stateFiles) assertPrivate(path.join(stateDir, name), name);
 });
 
 // A process's environment: /proc/<pid>/environ on Linux, `ps -E` on macOS.

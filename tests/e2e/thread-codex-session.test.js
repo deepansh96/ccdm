@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { injectDiscordMessage, startFakeCodexServer } from "./support/bridge.js";
-import { PYTHON } from "./support/platform.js";
+import { PYTHON, assertPrivate } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerEnv, routerRegistry, routerWithWebhooks,
   runRouterCli, waitFor } from "./support/router.js";
@@ -217,9 +217,9 @@ test("no Discord credential reaches the Codex thread's environment, launch files
       assert.equal(text.includes(secret), false, `${secret} leaked into ${text.slice(0, 200)}`);
     }
   }
-  assert.equal(fs.statSync(launchDir).mode & 0o777, 0o700);
+  assertPrivate(launchDir);
   for (const file of fs.readdirSync(launchDir)) {
-    assert.equal(fs.statSync(path.join(launchDir, file)).mode & 0o777, 0o600, file);
+    assertPrivate(path.join(launchDir, file), file);
   }
 });
 

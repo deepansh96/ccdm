@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
-import { platformGate, PYTHON } from "./support/platform.js";
+import { assertPrivate, platformGate, PYTHON } from "./support/platform.js";
 import {
   connectSession,
   createRouterWorkspace,
@@ -76,7 +76,7 @@ async function assertBothChangesSurvive(workspace, router, reply, stop) {
   assert.deepEqual({ pid: other.pid, session_id: other.session_id }, { pid: null, session_id: null });
   // The reminder service's assignment-changed write survives too.
   assert.match(demo.assignment_generation, /^gen-[0-9a-f]{32}$/);
-  assert.equal(fs.statSync(registryFile(workspace)).mode & 0o777, 0o600);
+  assertPrivate(registryFile(workspace));
   assert.deepEqual(fs.readdirSync(workspace.repoDir).filter(name => /registry\.json\.(lock|.*\.tmp)/.test(name)), []);
   const status = await runRouterCli(workspace, ["status", "--json"]);
   assert.equal(status.exitCode, 0, status.stderr);

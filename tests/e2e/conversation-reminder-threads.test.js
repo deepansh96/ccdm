@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { PYTHON } from "./support/platform.js";
+import { PYTHON, assertPrivate } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import { createBridgeWorkspace, injectDiscordMessage, injectDiscordReaction, startFakeCodexServer } from "./support/bridge.js";
 import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerEnv, routerWithWebhooks, waitFor } from "./support/router.js";
@@ -249,7 +249,7 @@ test("the v7 store is backed up unchanged before migrating, and a v8 store is le
   await cli(workspace, stateDir, "status");
   assert.deepEqual(backups(stateDir), ["conversations.v7.backup.sqlite3"]);
   const backup = path.join(stateDir, "conversations.v7.backup.sqlite3");
-  assert.equal(fs.statSync(backup).mode & 0o777, 0o600);
+  assertPrivate(backup);
   assert.deepEqual(storeRows(backup), V7_STORE);
 
   // Re-running on the v8 store changes nothing and takes no second backup.

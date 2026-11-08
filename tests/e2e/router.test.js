@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { assertPrivate } from "./support/platform.js";
 import { injectDiscordMessage, injectDiscordReaction, runPreloadProbe } from "./support/bridge.js";
 import {
   OWNER_ID,
@@ -357,9 +358,9 @@ test("router status reports connected sessions and webhook presence without leak
     assert.equal(text.includes(token), false);
   }
   const secretFile = path.join(workspace.routerStateDir, "webhooks", "demo.json");
-  assert.equal(fs.statSync(secretFile).mode & 0o777, 0o600);
-  assert.equal(fs.statSync(workspace.routerStateDir).mode & 0o777, 0o700);
-  assert.equal(fs.statSync(workspace.socketPath).mode & 0o777, 0o600);
+  assertPrivate(secretFile);
+  assertPrivate(workspace.routerStateDir);
+  assertPrivate(workspace.socketPath);
 });
 
 test("router status names a missing Manage Webhooks permission in a project channel", async () => {

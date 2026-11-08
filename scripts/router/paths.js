@@ -4,10 +4,10 @@
 const { readFile } = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
-const { expandHome } = require("../platform/paths.js");
+const { expandHome, stateRoot } = require("../platform/paths.js");
 
 function stateDir() {
-  return process.env.CCDM_ROUTER_STATE_DIR || path.join(os.homedir(), ".local/state/ccdm/router");
+  return process.env.CCDM_ROUTER_STATE_DIR || path.join(stateRoot(), "router");
 }
 
 function socketPath() {

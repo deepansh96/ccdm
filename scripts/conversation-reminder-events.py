@@ -10,10 +10,17 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
-import stat
 import sys
 import time
 from datetime import datetime
+
+sys.dont_write_bytecode = True  # no __pycache__ beside the scripts
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+from ccdmlib.platform.paths import state_root  # noqa: E402
+from ccdmlib.platform.private_fs import ensure_private_dir, is_private  # noqa: E402
 
 
 SCHEMA_VERSION = 1
@@ -78,7 +85,7 @@ def default_state_dir() -> Path:
     override = os.environ.get("CCDM_REMINDER_STATE_DIR")
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".local" / "state" / "ccdm" / "conversation-reminders"
+    return state_root() / "conversation-reminders"
 
 
 def load_registry(project_root: Path) -> dict:
@@ -127,8 +134,7 @@ def assignment_for(registry: dict, project_name: str) -> dict:
 
 
 def private_directory(path: Path) -> None:
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(path, 0o700)
+    ensure_private_dir(path)
 
 
 def database_path(state_dir: Path) -> Path:
@@ -439,7 +445,7 @@ def status_for(state_dir: Path, project_name: str) -> dict:
     if not db_path.exists():
         return {"available": True, "event_count": 0, "pending_count": pending_count, "events": []}
     try:
-        if stat.S_IMODE(db_path.stat().st_mode) & 0o077:
+        if not is_private(db_path):
             return {"available": False, "reason": "event database permissions are not private", "event_count": 0, "pending_count": pending_count, "events": []}
         connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1)
         connection.row_factory = sqlite3.Row

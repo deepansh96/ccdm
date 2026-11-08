@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { assertPrivate, assertPosixMode } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import { injectDiscordMessage, waitForState } from "./support/bridge.js";
 import { ROOT_TOKEN, createRouterWorkspace, routerEnv, runRouterCli, startRouter } from "./support/router.js";
@@ -621,7 +622,7 @@ test("unmet Claude prerequisites block enablement and cannot be bypassed into Co
   assert.equal(enabled.delivery_enabled, true);
   assert.deepEqual(enabled.preflight.blockers, []);
   assert.equal(enabled.preflight.state_dir_private, true);
-  assert.equal(fs.statSync(context.stateDir).mode & 0o777, 0o700);
+  assertPrivate(context.stateDir);
   const again = startWorker(workspace, context);
   const sent = await waitForState(workspace, state => reminders(state).length === 1, 20000);
   assert.equal(reminders(sent)[0].authorization, `Bot ${ROOT_TOKEN}`);
@@ -664,14 +665,14 @@ test("a refused enable leaves an existing state directory's permissions unchange
   });
   assert.equal(refused.exitCode, 2);
   assert.match(JSON.parse(refused.stdout).reason, /set DISCORD_BOT_TOKEN/);
-  assert.equal(fs.statSync(context.stateDir).mode & 0o777, 0o755);
+  assertPosixMode(context.stateDir, 0o755);
   assert.deepEqual(fs.readdirSync(context.stateDir), []);
 
   // Once every blocker clears, enable prepares the private directory itself.
   fs.writeFileSync(rootEnvFile(workspace), `DISCORD_BOT_TOKEN=${ROOT_TOKEN}\n`, { mode: 0o600 });
   const enabled = await command(workspace, context, "enable");
   assert.deepEqual(enabled.preflight.blockers, []);
-  assert.equal(fs.statSync(context.stateDir).mode & 0o777, 0o700);
+  assertPrivate(context.stateDir);
 });
 
 test("a generation change during downtime rediscovers the new assignment and shares the catch-up spacing", async () => {

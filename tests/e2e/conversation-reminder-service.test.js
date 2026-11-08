@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { PYTHON } from "./support/platform.js";
+import { PYTHON, assertPrivate } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import { createBridgeWorkspace, injectDiscordMessage, injectDiscordReaction, waitForState } from "./support/bridge.js";
 import { routerEnv, startRouter } from "./support/router.js";
@@ -1865,7 +1865,7 @@ test("a v6 store migrates to v8, keying conversations and retired assignments by
   // The pre-migration store is kept privately beside the migrated one.
   assert.deepEqual(backups(stateDir), ["conversations.v6.backup.sqlite3"]);
   const backup = path.join(stateDir, "conversations.v6.backup.sqlite3");
-  assert.equal(fs.statSync(backup).mode & 0o777, 0o600);
+  assertPrivate(backup);
   const original = storeRows(backup);
   assert.equal(original.version, 6);
   assert.deepEqual(original.conversations[0].bot_id, "bot");

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { assertPrivate } from "./support/platform.js";
 import { collectProcess, injectDiscordMessage, injectDiscordReaction, startFakeCodexServer } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import { OWNER_ID, ROOT_TOKEN, connectSession, createRouterWorkspace, routerEnv, routerRegistry,
@@ -180,9 +181,9 @@ function threadsCli(workspace, args) {
 test("threads.sh create makes and starts a thread with an account alias, and a bad flag exits 2", async () => {
   const workspace = commandWorkspace();
   await supervised(workspace);
-  const socket = fs.statSync(path.join(supervisorStateDir(workspace), "control.sock"));
-  assert.ok(socket.isSocket());
-  assert.equal(socket.mode & 0o777, 0o600);
+  const socketPath = path.join(supervisorStateDir(workspace), "control.sock");
+  assert.ok(fs.statSync(socketPath).isSocket());
+  assertPrivate(socketPath);
 
   const created = await threadsCli(workspace, ["create", "demo", "cli-task", "--account", "work", "look at the logs"]);
   assert.equal(created.exitCode, 0, created.stderr || created.stdout);

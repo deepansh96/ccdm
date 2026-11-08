@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { assertPrivate } from "./support/platform.js";
 import { injectDiscordMessage, injectDiscordReaction, startFakeCodexServer, waitForState } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import {
@@ -248,7 +249,7 @@ test("no Discord token reaches the root Codex session environment, launch files,
   const mcpEnv = mcpWrites[0].params.value.env;
   assert.equal(mcpEnv.CCDM_ROUTER_KEY_FILE, path.join(workspace.routerStateDir, "keys", ".root.key"));
   assert.equal(mcpEnv.CCDM_ROUTER_ROLE, "root");
-  assert.equal(fs.statSync(path.join(workspace.routerStateDir, "keys", ".root.key")).mode & 0o777, 0o600);
+  assertPrivate(path.join(workspace.routerStateDir, "keys", ".root.key"));
 });
 
 test("a root Codex launch with no Router answering exits non-zero before launching or writing root's key", async () => {

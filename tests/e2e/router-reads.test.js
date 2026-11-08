@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { assertPrivate } from "./support/platform.js";
 import { injectDiscordMessage } from "./support/bridge.js";
 import {
   OWNER_ID,
@@ -67,7 +68,7 @@ test("read_last_x_messages_in_channel over the inline limit returns a private tr
 
   assert.equal(result.count, 120);
   assert.equal(result.text, undefined);
-  assert.equal(fs.statSync(result.path).mode & 0o777, 0o600);
+  assertPrivate(result.path);
   const lines = fs.readFileSync(result.path, "utf8").split("\n");
   assert.equal(lines.length, 121);
   assert.equal(lines[0], "[2026-09-01T10:00:00.000Z] Owner: message 1031 (id: 1031)");
@@ -114,7 +115,7 @@ test("export_message_range writes the inclusive range in the export tool's forma
   });
 
   const directory = path.dirname(result.path);
-  assert.equal(fs.statSync(result.path).mode & 0o777, 0o600);
+  assertPrivate(result.path);
   assert.equal(fs.readFileSync(result.path, "utf8"), [
     "[2026-07-13T10:00:00.000Z] Alice (1)",
     "Message ID: 101",

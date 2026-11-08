@@ -27,6 +27,12 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+sys.dont_write_bytecode = True  # no __pycache__ beside the scripts
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from ccdmlib.platform.private_fs import ensure_private_dir, fix_hint, is_private  # noqa: E402
+
 ROOT_DIR = SCRIPT_DIR.parent
 DEFAULT_CONFIG_PATH = ROOT_DIR / ".usage-stats-poster.json"
 REGISTRY_PATH = ROOT_DIR / "registry.json"
@@ -2255,8 +2261,9 @@ class HistoryStore:
                 # An existing feature directory is never chmod'd: custom
                 # database paths may live below a shared parent.  Require it
                 # to already be private instead of mutating unrelated state.
-                if directory_info.st_mode & 0o077:
-                    raise PosterError("usage history directory must be private (mode 0700 or stricter)")
+                if not is_private(self.history_dir):
+                    hint = fix_hint(self.history_dir, "mode 0700 or stricter")
+                    raise PosterError(f"usage history directory must be private ({hint})")
             else:
                 self.history_dir.parent.mkdir(parents=True, exist_ok=True)
                 try:
@@ -2266,7 +2273,7 @@ class HistoryStore:
                 directory_info = _lstat(self.history_dir)
                 if stat.S_ISLNK(directory_info.st_mode) or not stat.S_ISDIR(directory_info.st_mode):
                     raise PosterError("usage history directory must be a real directory")
-                os.chmod(self.history_dir, 0o700)
+                ensure_private_dir(self.history_dir)
 
             if self.db_path.exists():
                 _assert_regular_file(self.db_path, "usage history database")

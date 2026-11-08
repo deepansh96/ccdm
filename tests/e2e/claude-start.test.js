@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { assertPrivate } from "./support/platform.js";
 import { createWorkspace, runScript } from "./support/runner.js";
 import { OWNER_ID, createRouterWorkspace, routerEnv, routerWithWebhooks, runRouterCli } from "./support/router.js";
 import { readState, seedFixtureProcess, seedRegistry, seedTmuxSession, updateState } from "./support/state.js";
@@ -179,7 +180,7 @@ test("a Claude project with no transport field starts through the Router and rec
   assert.deepEqual(Object.keys(mcpConfig.mcpServers), ["ccdm"]);
   assert.deepEqual(mcpConfig.mcpServers.ccdm.args, [path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js")]);
   assert.equal(mcpConfig.mcpServers.ccdm.env.CCDM_CLAUDE_CHANNEL_ID, "channel-1");
-  assert.equal(fs.statSync(mcpConfigPath).mode & 0o777, 0o600);
+  assertPrivate(mcpConfigPath);
   assert.match(session.shellCommand, /--mcp-config/);
   assert.equal(fs.existsSync(path.join(workspace.homeDir, ".claude", ".claude.json")), false);
 });

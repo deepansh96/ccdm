@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { assertPrivate } from "./support/platform.js";
 import { bridgeChildEnv, collectProcess, createBridgeWorkspace, runPreloadProbe } from "./support/bridge.js";
 import {
   ROOT_TOKEN,
@@ -231,7 +232,7 @@ test("Discord MCP exports a message range through the latest message", async () 
   assert.match(text, /Message ID: 102/);
   assert.match(text, /Message ID: 103/);
   assert.doesNotMatch(text, /Message ID: 101/);
-  assert.equal(fs.statSync(exportPath).mode & 0o777, 0o600);
+  assertPrivate(exportPath);
 });
 
 test("Discord MCP reads 500 recent messages across API pages", async () => {
@@ -262,7 +263,7 @@ test("Discord MCP reads 500 recent messages across API pages", async () => {
   assert.equal(messages.length, 500);
   assert.equal(messages[0], "[2026-08-01T10:00:00.000Z] Alice: message 1005 (id: 1005)");
   assert.equal(messages.at(-1), "[2026-08-01T10:00:00.000Z] Alice: message 1504 (id: 1504)");
-  assert.equal(fs.statSync(transcript).mode & 0o777, 0o600);
+  assertPrivate(transcript);
   // The Router absorbed the 429 and retried the page with the bot token.
   const discord = readState(workspace.stateDir).fixtures.discord;
   assert.deepEqual(discord.restFailureUses, [{
