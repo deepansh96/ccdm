@@ -1,5 +1,5 @@
 {
-  "budget": 89,
+  "budget": 92,
   "skips": [
     {
       "file": "harness-safety.test.js",
@@ -48,6 +48,12 @@
       "test": "*",
       "tag": "posix",
       "reason": "drives zsh scripts, which the Windows port replaces"
+    },
+    {
+      "file": "macos-real-tools.test.js",
+      "test": "*",
+      "tag": "darwin",
+      "reason": "drives real Homebrew tmux and zsh on macOS"
     },
     {
       "file": "platform-contract.test.js",

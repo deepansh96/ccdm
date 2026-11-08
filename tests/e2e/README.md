@@ -322,7 +322,22 @@ Without the Live Gate the test is reported skipped before it creates anything. `
 
 ## CI Behavior
 
-GitHub Actions runs the Default CI Suite on `push` and `pull_request` with Node 22, `npm ci`, zsh, python3, jq, and `npm test`. CI executes the same local-fake command shown above and does not require live Discord, Claude, Codex, tmux, Keychain, OAuth, or npm-network credentials during scenario execution.
+GitHub Actions runs on `push` and `pull_request`. Port PRs target the `windows-port` integration branch, which reaches `main` only after the end canary passes. Every job uses Local Fakes and needs no live Discord, Claude, Codex, Keychain, OAuth, or npm-network credentials. `tests/e2e/ci-contract.test.js` asserts each job's shape.
+
+| Job | Runs on | What it does | Can fail the PR |
+| --- | --- | --- | --- |
+| `local-fake-e2e` | Linux, Node 22, Python 3.11 | Full suite, with `npm ci --omit=optional` | Yes |
+| `windows-e2e` | Windows, Node 22 and 24, Python 3.11 | Full suite; uploads the per-file report from `CCDM_E2E_REPORT_DIR` | No, it only warns (`continue-on-error`) |
+| `windows-required` | Windows, Node 22, Python 3.11 | Only the files in `tests/e2e/windows-required.txt` | Yes |
+| `macos-e2e` | macOS, Node 22, `/usr/bin/python3` 3.9 | Python floor checks, then the full suite, with `npm ci --omit=optional` | Yes |
+
+The Linux and macOS jobs fail if `koffi` or another native Windows package is installed.
+
+`macos-e2e` is the main Mac regression guard during the port. `CCDM_PYTHON` and the front of `PATH` select the Mac's own Python. `tmux`, `zsh`, `launchctl`, `security`, `ps` and `curl` stay fake in the Local Fake suite; no test runs the real `launchctl` or `security`. The one exception for real tools is `macos-real-tools.test.js`, which runs today's tmux command shapes against Homebrew tmux and real zsh, with `TMUX` unset and `TMUX_TMPDIR` inside its workspace, so it cannot reach your own tmux server.
+
+The Python floor on the Mac is 3.9. The job runs `vermin --target=3.9- --eval-annotations --violations scripts/` (the trailing `-` means "3.9 or later"; without it vermin demands exactly 3.9). vermin cannot tell an `X | Y` annotation from a bitwise `|`, so `support/python_floor.py annotations` rejects such an annotation in a file without `from __future__ import annotations`. `support/python_floor.py imports` imports every module under `scripts/ccdmlib/`, which catches a top-level `import msvcrt`, and the job loads the Python service entry points.
+
+To add a file to `tests/e2e/windows-required.txt`, first see it pass in the `windows-e2e` job, then append its repo-relative path on a line of its own. Parallel slices each add only their own lines; the later PR rebases.
 
 ## Hardcoded-Boundary Inventory
 
