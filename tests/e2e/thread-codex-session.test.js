@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { injectDiscordMessage, startFakeCodexServer } from "./support/bridge.js";
+import { PYTHON } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerEnv, routerRegistry, routerWithWebhooks,
   runRouterCli, waitFor } from "./support/router.js";
@@ -66,7 +67,7 @@ async function holdPort(port) {
 // through the PRD's store schema; the root bot then creates the thread.
 function requestThread(workspace, { provider = "codex", account = null } = {}) {
   const store = path.join(supervisorStateDir(workspace), "threads.sqlite3");
-  execFileSync("python3", ["-c", `import sqlite3, sys
+  execFileSync(PYTHON, ["-c", `import sqlite3, sys
 db = sqlite3.connect(sys.argv[1], timeout=5)
 db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
   first_message, requester_id, requester_kind, status, thread_id, created_at)

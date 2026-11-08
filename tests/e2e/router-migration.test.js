@@ -99,7 +99,7 @@ function assertRefusedWithoutWebhook(workspace, result, project, screen) {
 // The official Discord plugin listener a pool-era launch left running with the
 // pool bot's state directory.
 function spawnLegacyPoolListener(workspace, poolStateDir) {
-  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", workspace.tmpRoot], {
     detached: true, env: { CCDM_TEST_STATE: workspace.stateDir }, stdio: "ignore",
   });
   child.unref();

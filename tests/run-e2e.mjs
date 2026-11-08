@@ -216,6 +216,15 @@ function removeDirs(dirs) {
 }
 
 async function main() {
+  if (WIN) {
+    // One message before any file starts, not a failure in every scenario.
+    const { harnessPrerequisiteProblem } = await import("./e2e/support/platform.js");
+    const problem = harnessPrerequisiteProblem();
+    if (problem) {
+      console.error(`E2E run cannot start: ${problem}`);
+      process.exit(1);
+    }
+  }
   const settings = runnerSettings();
   const timingsFile = path.join(os.tmpdir(), "ccdm-e2e-timings.json");
   const started = Date.now();

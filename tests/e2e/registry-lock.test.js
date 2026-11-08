@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
+import { PYTHON } from "./support/platform.js";
 import {
   connectSession,
   createRouterWorkspace,
@@ -156,7 +157,7 @@ function registryModule(workspace) {
 function runPython(workspace, code, args = []) {
   const prelude = "import importlib.util,sys\n"
     + "spec=importlib.util.spec_from_file_location('ru',sys.argv[1]);ru=importlib.util.module_from_spec(spec);spec.loader.exec_module(ru)\n";
-  return execFileAsync("python3", ["-c", prelude + code, path.join(workspace.repoDir, "scripts/registry-update.py"), ...args],
+  return execFileAsync(PYTHON, ["-c", prelude + code, path.join(workspace.repoDir, "scripts/registry-update.py"), ...args],
     { encoding: "utf8" });
 }
 
@@ -183,7 +184,7 @@ test("a waiter that saw a dead owner too late leaves the live lock taken since i
 
   // A Python writer reclaims the dead lock and pauses holding it.
   fs.writeFileSync(`${hold}.armed`, "");
-  const first = execFileAsync("python3", [path.join(workspace.repoDir, "scripts/registry-update.py"),
+  const first = execFileAsync(PYTHON, [path.join(workspace.repoDir, "scripts/registry-update.py"),
     "set-project-fields", file, "other", '{"first": true}'], { env: { ...process.env, CCDM_TEST_REGISTRY_HOLD: hold } });
   first.catch(() => {});
   await waitFor(() => exists(`${hold}.waiting`), () => "the first writer to pause holding the lock");

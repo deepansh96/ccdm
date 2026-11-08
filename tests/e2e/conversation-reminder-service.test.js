@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { PYTHON } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import { createBridgeWorkspace, injectDiscordMessage, injectDiscordReaction, waitForState } from "./support/bridge.js";
 import { routerEnv, startRouter } from "./support/router.js";
@@ -95,7 +96,7 @@ async function reconciledExchange(workspace, stateDir) {
   // A later discovery slice will establish this state through reconciliation.
   // Seed only the prerequisite; drive and assert delivery through executable surfaces.
   const database = path.join(stateDir, "conversations.sqlite3");
-  const seeded = spawnSync("python3", ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute(\"UPDATE conversations SET reconciliation_status='ready' WHERE project='demo'\"); db.commit()", database], { encoding: "utf8" });
+  const seeded = spawnSync(PYTHON, ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute(\"UPDATE conversations SET reconciliation_status='ready' WHERE project='demo'\"); db.commit()", database], { encoding: "utf8" });
   assert.equal(seeded.status, 0, seeded.stderr);
 }
 
@@ -1422,7 +1423,7 @@ test("a versioned store with the wrong table shape fails closed", async () => {
   const stateDir = setup(workspace);
   fs.mkdirSync(stateDir, { recursive: true });
   const database = path.join(stateDir, "conversations.sqlite3");
-  const seeded = spawnSync("python3", ["-c", `import sqlite3,sys
+  const seeded = spawnSync(PYTHON, ["-c", `import sqlite3,sys
 db=sqlite3.connect(sys.argv[1]); db.executescript("""
 CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT); INSERT INTO settings VALUES('disabled','0');
 CREATE TABLE conversations(project TEXT PRIMARY KEY);
@@ -1562,7 +1563,7 @@ function streak(row) {
 }
 
 function sql(database, script) {
-  const result = spawnSync("python3", ["-c", `import sqlite3,sys
+  const result = spawnSync(PYTHON, ["-c", `import sqlite3,sys
 db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()`, database, script], { encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr);
 }
@@ -1570,7 +1571,7 @@ db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()`, dat
 test("the reminder gap follows 1h, then 2h per ignored reminder, capped at 24h", async () => {
   const workspace = createBridgeWorkspace();
   const script = path.join(workspace.repoDir, "scripts", "conversation-reminder-service.py");
-  const probe = spawnSync("python3", ["-c", `import importlib.util,json,sys
+  const probe = spawnSync(PYTHON, ["-c", `import importlib.util,json,sys
 spec=importlib.util.spec_from_file_location("service", sys.argv[1]); service=importlib.util.module_from_spec(spec)
 spec.loader.exec_module(service)
 print(json.dumps([service.reminder_gap(k).total_seconds() / 3600 for k in [*range(16), 1000]]))`, script],
@@ -1685,7 +1686,7 @@ test("a canceled send and a late send after reassignment never grow the streak",
 
 // Turn a live v8 store back into the v7 shape: no table is keyed by conversation.
 function downgradeToV7(database) {
-  const result = spawnSync("python3", ["-c", `import sqlite3,sys
+  const result = spawnSync(PYTHON, ["-c", `import sqlite3,sys
 db=sqlite3.connect(sys.argv[1])
 db.execute("DROP INDEX active_delivery_intent")
 for table in ("conversations","owner_sources","qualifications","pending_actions","delivery_intents",
@@ -1715,7 +1716,7 @@ test("a v5 store upgrades to v8, keeping a recorded reminder's pending due time"
   const upgraded = (await cli(withReminder, stateDir, "status")).conversations.demo;
   assert.deepEqual([...streak(upgraded), upgraded.reminder_message_id],
     ["awaiting-owner", "2026-09-24T13:00:00Z", 1, "r-1"]);
-  const version = spawnSync("python3", ["-c", "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('PRAGMA user_version').fetchone()[0])", database], { encoding: "utf8" });
+  const version = spawnSync(PYTHON, ["-c", "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('PRAGMA user_version').fetchone()[0])", database], { encoding: "utf8" });
   assert.equal(version.stdout.trim(), "8");
   // Every v5 assignment was a pool bot, so the row stays readable as history,
   // but the Router's webhook now speaks for demo: nothing sends until the
@@ -1739,7 +1740,7 @@ test("a fresh store is created at v8, and a v8 store without the streak or a fut
   const stateDir = setup(workspace);
   await cli(workspace, stateDir, "sync");
   const database = path.join(stateDir, "conversations.sqlite3");
-  const shape = spawnSync("python3", ["-c", `import json,sqlite3,sys
+  const shape = spawnSync(PYTHON, ["-c", `import json,sqlite3,sys
 db=sqlite3.connect(sys.argv[1])
 print(json.dumps([db.execute('PRAGMA user_version').fetchone()[0],
   'consecutive_reminders' in [row[1] for row in db.execute('PRAGMA table_info(conversations)')]]))`, database],
@@ -1824,7 +1825,7 @@ function seedV6(workspace) {
 }
 
 function storeRows(database) {
-  const result = spawnSync("python3", ["-c", `import json,sqlite3,sys
+  const result = spawnSync(PYTHON, ["-c", `import json,sqlite3,sys
 db=sqlite3.connect(sys.argv[1]); db.row_factory=sqlite3.Row
 print(json.dumps({"version": db.execute('PRAGMA user_version').fetchone()[0],
   "conversations": [dict(r) for r in db.execute('SELECT * FROM conversations ORDER BY project')],

@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { injectDiscordMessage, startFakeCodexServer } from "./support/bridge.js";
+import { PYTHON } from "./support/platform.js";
 import { OWNER_ID, createRouterWorkspace, routerRegistry, routerWithWebhooks, waitFor } from "./support/router.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
@@ -223,7 +224,7 @@ test("under the production 30-minute threshold a session whose turn just ended i
 
 // A pending creation request the root bot fulfils: the PRD's store schema.
 function requestCodexThread(workspace, thread) {
-  execFileSync("python3", ["-c", `import sqlite3, sys
+  execFileSync(PYTHON, ["-c", `import sqlite3, sys
 db = sqlite3.connect(sys.argv[1], timeout=5)
 db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
   first_message, requester_id, requester_kind, status, thread_id, created_at)

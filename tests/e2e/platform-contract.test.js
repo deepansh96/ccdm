@@ -27,13 +27,13 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { PYTHON } from "./support/platform.js";
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "../..");
 const CASES_DIR = path.join(HERE, "platform-contract");
 const WIN = process.platform === "win32";
 const FAMILY = WIN ? "win32" : "posix";
-// Until tests/e2e/support/platform.js exists to provide PYTHON.
-const PYTHON = process.env.CCDM_PYTHON || (WIN ? "python" : "python3");
 const CALL_TIMEOUT_MS = 30000;
 const DRIVERS = {
   node: [process.execPath, path.join(HERE, "support", "platform-driver.cjs")],

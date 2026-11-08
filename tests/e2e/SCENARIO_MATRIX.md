@@ -25,6 +25,11 @@ This matrix is append-only for issue #4 slices. Each slice should add covered sc
 | Harness | Allowlisted PATH/no fallthrough | Covered | Missing fixture tools fail without host PATH fallback. |
 | Harness | Runtime isolation guards | Covered | Developer registry, real Claude/Codex state, real tmux, Keychain, and global temp paths. |
 | Harness | Failure diagnostics/redaction | Covered | Commands, streams, exit code, fixture state, file snapshots, and secret redaction. |
+| Harness | Windows fixture launcher | Covered | `<tool>.exe` + `<tool>.shim` hard-linked into each workspace; compiled once per content hash; hostile arguments, stdin and exit codes pass through unchanged (`harness-safety`, Windows only). |
+| Harness | Windows missing toolchain | Covered | Without `csc.exe`, the build fails with a clear message and `npm test` stops before starting any file (`harness-safety`, Windows only). |
+| Harness | Windows fixture hooks | Covered | A `SessionStart` hook `node '<forward-slash path>'` runs through the fixture `claude` under Git Bash `sh` and records exit 0; POSIX runs the same case under `/bin/sh`. |
+| Harness | Windows skip budget | Covered | Each Windows skip has a `windows-skip-budget.json` entry with a reason; an unlisted skip, stale entry or count over budget fails `windows-skip-budget.test.js`. |
+| Fixture contracts | `pkill` workspace marker | Covered | Signals a seeded child only when its command line holds the workspace path; otherwise leaves it running and logs the skip, on Linux and Windows. |
 | Fixture contracts | tmux session tracking | Covered | `has-session`, `new-session`, command/env capture, pane output, send-key recording, and current exit-code behavior. |
 | Fixture contracts | process ownership | Covered | `ps axeww -o pid=,command=` and `pgrep -P` expose harness-owned rows and omit fabricated or foreign PID state. |
 | Fixture contracts | Claude listener | Covered | `--version`, `server:ccdm` channel argument validation (the official plugin launch is rejected), listener invocation recording, and fixture session metadata. |

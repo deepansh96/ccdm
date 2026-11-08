@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { PYTHON } from "./support/platform.js";
 import { createWorkspace, runScript } from "./support/runner.js";
 import { readState, updateState, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
@@ -446,7 +447,7 @@ test("missing or malformed Claude utilization is recorded as unavailable", async
   const result = await runScript(workspace, "scripts/usage-stats-poster.py", { args: ["--collect-only"] });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  const payloadProbe = spawnSync("python3", ["-c", [
+  const payloadProbe = spawnSync(PYTHON, ["-c", [
     "import sqlite3, sys",
     "connection = sqlite3.connect(sys.argv[1])",
     "print(connection.execute('select payload_json from snapshots').fetchone()[0])",
@@ -470,7 +471,7 @@ test("history store preserves shared parents and rejects unsupported schemas and
   assert.equal(fs.statSync(sharedParent).mode & 0o777, 0o755);
   assert.equal(fs.statSync(featureDir).mode & 0o777, 0o700);
 
-  const probe = (code, ...args) => spawnSync("python3", ["-c", [
+  const probe = (code, ...args) => spawnSync(PYTHON, ["-c", [
     "import importlib.util, sys",
     "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
     "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
@@ -479,7 +480,7 @@ test("history store preserves shared parents and rejects unsupported schemas and
   const schemaDir = path.join(workspace.tmpDir, "schema");
   fs.mkdirSync(schemaDir, 0o700);
   const unsupportedDb = path.join(schemaDir, "unsupported.sqlite3");
-  const created = spawnSync("python3", ["-c", [
+  const created = spawnSync(PYTHON, ["-c", [
     "import sqlite3, sys",
     "connection = sqlite3.connect(sys.argv[1]); connection.execute('pragma user_version=99'); connection.commit()",
   ].join("\n"), unsupportedDb], { encoding: "utf8" });
@@ -492,7 +493,7 @@ test("history store preserves shared parents and rejects unsupported schemas and
   assert.match(schemaFailure.stdout, /unsupported usage history schema version 99/);
 
   const legacyDb = path.join(schemaDir, "legacy-v0.sqlite3");
-  const legacy = spawnSync("python3", ["-c", [
+  const legacy = spawnSync(PYTHON, ["-c", [
     "import sqlite3, sys",
     "connection = sqlite3.connect(sys.argv[1])",
     "connection.executescript('CREATE TABLE snapshots (slot_utc TEXT PRIMARY KEY, generated_at TEXT NOT NULL, payload_json TEXT NOT NULL); CREATE TABLE posts (slot_utc TEXT PRIMARY KEY, posted_at TEXT NOT NULL, message_id TEXT NOT NULL); CREATE TABLE warnings (warning_key TEXT PRIMARY KEY, warned_at TEXT NOT NULL);')",
@@ -505,7 +506,7 @@ test("history store preserves shared parents and rejects unsupported schemas and
     legacyDb,
   );
   assert.equal(migrated.status, 0, migrated.stderr || migrated.stdout);
-  const migrationProbe = spawnSync("python3", ["-c", [
+  const migrationProbe = spawnSync(PYTHON, ["-c", [
     "import sqlite3, sys",
     "connection = sqlite3.connect(sys.argv[1])",
     "print(connection.execute('pragma user_version').fetchone()[0])",
@@ -577,7 +578,7 @@ test("history store preserves shared parents and rejects unsupported schemas and
 
 test("dashboard image read failures are surfaced as PosterError", () => {
   const missingImage = path.join(os.tmpdir(), `ccdm-missing-dashboard-${process.pid}.png`);
-  const probe = spawnSync("python3", ["-c", [
+  const probe = spawnSync(PYTHON, ["-c", [
     "import importlib.util, sys",
     "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
     "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
@@ -593,7 +594,7 @@ test("dashboard image read failures are surfaced as PosterError", () => {
 });
 
 test("Codex structured metrics reject invalid percentages and preserve numeric reset epochs", () => {
-  const probe = spawnSync("python3", ["-c", [
+  const probe = spawnSync(PYTHON, ["-c", [
     "import importlib.util, json, math, sys",
     "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
     "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
@@ -627,7 +628,7 @@ test("Codex structured metrics reject invalid percentages and preserve numeric r
 });
 
 test("Codex dashboard metrics are weekly only and old SQLite cards are translated at render time", () => {
-  const probe = spawnSync("python3", ["-c", [
+  const probe = spawnSync(PYTHON, ["-c", [
     "import importlib.util, json, sys",
     "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
     "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
@@ -646,7 +647,7 @@ test("Codex dashboard metrics are weekly only and old SQLite cards are translate
 });
 
 test("history uses valid SQLite slots as the authoritative chronological timestamp", () => {
-  const probe = spawnSync("python3", ["-c", [
+  const probe = spawnSync(PYTHON, ["-c", [
     "import importlib.util, json, sqlite3, sys, tempfile",
     "from pathlib import Path",
     "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
@@ -664,7 +665,7 @@ test("history uses valid SQLite slots as the authoritative chronological timesta
 });
 
 test("legacy Codex 5-hour and 7-day cards collapse to one weekly 7-day value", () => {
-  const probe = spawnSync("python3", ["-c", [
+  const probe = spawnSync(PYTHON, ["-c", [
     "import importlib.util, json, sys",
     "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
     "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
@@ -679,7 +680,7 @@ test("legacy Codex 5-hour and 7-day cards collapse to one weekly 7-day value", (
 });
 
 test("Claude API estimate notes retain only local costs, counts, and status", () => {
-  const probe = spawnSync("python3", ["-c", [
+  const probe = spawnSync(PYTHON, ["-c", [
     "import importlib.util, json, sys",
     "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
     "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
@@ -697,7 +698,7 @@ test("Claude API estimate notes retain only local costs, counts, and status", ()
 });
 
 test("missing Claude API config keeps the unavailable/manual status", () => {
-  const probe = spawnSync("python3", ["-c", [
+  const probe = spawnSync(PYTHON, ["-c", [
     "import importlib.util, json, sys",
     "from pathlib import Path",
     "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
@@ -1855,7 +1856,7 @@ test("scheduled poster posts the original text report once per 30-minute slot wi
   assert.equal(api.requests.filter((request) => request.method === "POST").length, 2);
 
   const query = (sql) => {
-    const result = spawnSync("python3", ["-c", [
+    const result = spawnSync(PYTHON, ["-c", [
       "import sqlite3, sys",
       "connection = sqlite3.connect(sys.argv[1])",
       "for row in connection.execute(sys.argv[2]):",
@@ -1871,7 +1872,7 @@ test("scheduled poster posts the original text report once per 30-minute slot wi
   assert.equal(fs.statSync(historyPath).mode & 0o777, 0o600);
   assert.equal(fs.statSync(path.dirname(historyPath)).mode & 0o777, 0o700);
 
-  const oldSnapshot = spawnSync("python3", ["-c", [
+  const oldSnapshot = spawnSync(PYTHON, ["-c", [
     "import json, sqlite3, sys",
     "connection = sqlite3.connect(sys.argv[1])",
     "connection.execute(\"insert or replace into snapshots(slot_utc, generated_at, payload_json) values (?, ?, ?)\", ('2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', json.dumps({'generated_at': '2024-01-01T00:00:00Z', 'cards': []})) )",
@@ -1948,7 +1949,7 @@ test("scheduled poster does not repost a slot whose Discord reply was lost", asy
   assert.match(later.stdout, /already posted/);
   assert.equal(posts(), 1);
 
-  const ledger = spawnSync("python3", ["-c", [
+  const ledger = spawnSync(PYTHON, ["-c", [
     "import sqlite3, sys",
     "print(sqlite3.connect(sys.argv[1]).execute('select message_id from posts').fetchone()[0])",
   ].join("\n"), historyPath], { encoding: "utf8" });
@@ -1968,7 +1969,7 @@ test("malformed current-slot snapshots are replaced by the next sanitized collec
 
   const first = await run();
   assert.equal(first.exitCode, 0, first.stderr || first.stdout);
-  const corrupt = spawnSync("python3", ["-c", [
+  const corrupt = spawnSync(PYTHON, ["-c", [
     "import sqlite3, sys",
     "connection = sqlite3.connect(sys.argv[1])",
     "connection.execute(\"update snapshots set payload_json = '{broken-json'\")",
@@ -1979,7 +1980,7 @@ test("malformed current-slot snapshots are replaced by the next sanitized collec
   const repaired = await run();
   assert.equal(repaired.exitCode, 0, repaired.stderr || repaired.stdout);
   assert.match(repaired.stderr, /replacing malformed usage snapshot/);
-  const payload = spawnSync("python3", ["-c", [
+  const payload = spawnSync(PYTHON, ["-c", [
     "import json, sqlite3, sys",
     "connection = sqlite3.connect(sys.argv[1])",
     "print(json.loads(connection.execute('select payload_json from snapshots').fetchone()[0])['generated_at'])",
@@ -2152,7 +2153,7 @@ async function startDeepseekBalanceApi(handler = () => ({
 }
 
 function probePoster(code, ...args) {
-  return spawnSync("python3", ["-c", [
+  return spawnSync(PYTHON, ["-c", [
     "import importlib.util, sys",
     "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
     "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
@@ -2161,7 +2162,7 @@ function probePoster(code, ...args) {
 }
 
 function probePosterTimed(timeoutMs, code, ...args) {
-  return spawnSync("python3", ["-c", [
+  return spawnSync(PYTHON, ["-c", [
     "import importlib.util, sys",
     "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
     "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
@@ -2228,7 +2229,7 @@ test("poster reports a DeepSeek balance and local-session coverage without quota
 
   const collected = await runScript(workspace, "scripts/usage-stats-poster.py", { args: ["--collect-only"] });
   assert.equal(collected.exitCode, 0, collected.stderr || collected.stdout);
-  const snapshot = spawnSync("python3", ["-c", [
+  const snapshot = spawnSync(PYTHON, ["-c", [
     "import sqlite3, sys",
     "connection = sqlite3.connect(sys.argv[1])",
     "print(connection.execute('select payload_json from snapshots').fetchone()[0])",

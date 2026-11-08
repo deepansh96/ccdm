@@ -5,13 +5,14 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
+import { PYTHON } from "./support/platform.js";
 
 const repoDir = path.resolve(".");
 const script = path.join(repoDir, "scripts", "usage-dashboard-renderer.py");
 const fixture = path.join(repoDir, "tests", "fixtures", "usage-dashboard.json");
 
 function runProbe(body) {
-  return spawnSync("python3", ["-c", [
+  return spawnSync(PYTHON, ["-c", [
     "import importlib.util, json",
     "from PIL import Image, ImageDraw",
     `spec = importlib.util.spec_from_file_location("renderer", ${JSON.stringify(script)})`,
@@ -35,7 +36,7 @@ function renderNotePng(target, note) {
 
 function runRenderer(output, input = fixture) {
   return new Promise((resolve) => {
-    const child = spawn("python3", [script, "--input", input, "--output", output], {
+    const child = spawn(PYTHON, [script, "--input", input, "--output", output], {
       cwd: repoDir,
       env: { ...process.env, PYTHONHASHSEED: "0" },
     });
@@ -68,7 +69,7 @@ test("usage dashboard renderer produces a deterministic PNG for multi-account hi
 test("usage dashboard renderer accepts stdin and keeps unavailable data non-fatal", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-dashboard-"));
   const output = path.join(directory, "stdin.png");
-  const child = spawn("python3", [script, "--input", "-", "--output", output], { cwd: repoDir });
+  const child = spawn(PYTHON, [script, "--input", "-", "--output", output], { cwd: repoDir });
   const payload = JSON.stringify({
     generated_at: "2026-08-18T20:30:00Z",
     cards: [{ key: "claude_5h", label: "Claude", window: "5-hour", available: false, reason: "No token" }],
@@ -83,7 +84,7 @@ test("usage dashboard renderer accepts stdin and keeps unavailable data non-fata
 });
 
 test("usage dashboard chart omits history-empty series but keeps rail cards", () => {
-  const probe = spawnSync("python3", ["-c", [
+  const probe = spawnSync(PYTHON, ["-c", [
     "import importlib.util, json",
     `spec = importlib.util.spec_from_file_location("renderer", ${JSON.stringify(script)})`,
     "module = importlib.util.module_from_spec(spec)",
@@ -106,7 +107,7 @@ test("usage dashboard chart omits history-empty series but keeps rail cards", ()
 });
 
 test("usage dashboard rail groups windows by provider and account", () => {
-  const probe = spawnSync("python3", ["-c", [
+  const probe = spawnSync(PYTHON, ["-c", [
     "import importlib.util, json",
     `spec = importlib.util.spec_from_file_location("renderer", ${JSON.stringify(script)})`,
     "module = importlib.util.module_from_spec(spec)",
@@ -120,7 +121,7 @@ test("usage dashboard rail groups windows by provider and account", () => {
 });
 
 test("usage dashboard rail subtitle summarizes every current limit window", () => {
-  const probe = spawnSync("python3", ["-c", [
+  const probe = spawnSync(PYTHON, ["-c", [
     "import importlib.util, json",
     `spec = importlib.util.spec_from_file_location("renderer", ${JSON.stringify(script)})`,
     "module = importlib.util.module_from_spec(spec)",
@@ -143,7 +144,7 @@ test("usage dashboard rail subtitle summarizes every current limit window", () =
 });
 
 test("usage dashboard chart spaces snapshots by elapsed time", () => {
-  const probe = spawnSync("python3", ["-c", [
+  const probe = spawnSync(PYTHON, ["-c", [
     "import importlib.util, json",
     `spec = importlib.util.spec_from_file_location("renderer", ${JSON.stringify(script)})`,
     "module = importlib.util.module_from_spec(spec)",
@@ -156,7 +157,7 @@ test("usage dashboard chart spaces snapshots by elapsed time", () => {
 });
 
 test("usage dashboard chart drops clustered interior ticks but keeps boundaries", () => {
-  const probe = spawnSync("python3", ["-c", [
+  const probe = spawnSync(PYTHON, ["-c", [
     "import importlib.util, json",
     `spec = importlib.util.spec_from_file_location("renderer", ${JSON.stringify(script)})`,
     "module = importlib.util.module_from_spec(spec)",
@@ -170,7 +171,7 @@ test("usage dashboard chart drops clustered interior ticks but keeps boundaries"
 });
 
 test("usage dashboard heading reflects valid history coverage", () => {
-  const probe = spawnSync("python3", ["-c", [
+  const probe = spawnSync(PYTHON, ["-c", [
     "import importlib.util, json",
     `spec = importlib.util.spec_from_file_location("renderer", ${JSON.stringify(script)})`,
     "module = importlib.util.module_from_spec(spec)",
@@ -196,7 +197,7 @@ test("usage dashboard heading reflects valid history coverage", () => {
 });
 
 test("usage dashboard uses dates on ticks when the history crosses days", () => {
-  const probe = spawnSync("python3", ["-c", [
+  const probe = spawnSync(PYTHON, ["-c", [
     "import importlib.util, json",
     `spec = importlib.util.spec_from_file_location("renderer", ${JSON.stringify(script)})`,
     "module = importlib.util.module_from_spec(spec)",
@@ -208,7 +209,7 @@ test("usage dashboard uses dates on ticks when the history crosses days", () => 
 });
 
 test("usage dashboard rail leaves a gap below the full-width value glyph", () => {
-  const probe = spawnSync("python3", ["-c", [
+  const probe = spawnSync(PYTHON, ["-c", [
     "import importlib.util, json",
     `spec = importlib.util.spec_from_file_location("renderer", ${JSON.stringify(script)})`,
     "module = importlib.util.module_from_spec(spec)",
@@ -225,7 +226,7 @@ test("usage dashboard rail leaves a gap below the full-width value glyph", () =>
 });
 
 test("usage dashboard reset annotations deduplicate markers and avoid label collisions", () => {
-  const probe = spawnSync("python3", ["-c", [
+  const probe = spawnSync(PYTHON, ["-c", [
     "import importlib.util, json",
     `spec = importlib.util.spec_from_file_location("renderer", ${JSON.stringify(script)})`,
     "module = importlib.util.module_from_spec(spec)",
@@ -243,7 +244,7 @@ test("usage dashboard reset annotations deduplicate markers and avoid label coll
 });
 
 test("usage dashboard chart insets percentage extrema while preserving linear mapping", () => {
-  const probe = spawnSync("python3", ["-c", [
+  const probe = spawnSync(PYTHON, ["-c", [
     "import importlib.util, json",
     `spec = importlib.util.spec_from_file_location("renderer", ${JSON.stringify(script)})`,
     "module = importlib.util.module_from_spec(spec)",

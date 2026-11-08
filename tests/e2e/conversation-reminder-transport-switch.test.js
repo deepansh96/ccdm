@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { PYTHON } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerEnv, runRouterCli, startRouter } from "./support/router.js";
 import { readState, updateState, writeState } from "./support/state.js";
@@ -59,7 +60,7 @@ async function event(context, type, id, time, fields) {
 }
 
 function sql(context, script) {
-  const result = spawnSync("python3", ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.commit()",
+  const result = spawnSync(PYTHON, ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.commit()",
     path.join(context.stateDir, "conversations.sqlite3"), script], { encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr);
 }
