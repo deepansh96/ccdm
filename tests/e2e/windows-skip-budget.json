@@ -1,5 +1,5 @@
 {
-  "budget": 89,
+  "budget": 93,
   "skips": [
     {
       "file": "harness-safety.test.js",
@@ -53,7 +53,7 @@
       "file": "platform-contract.test.js",
       "test": "only runs on posix",
       "tag": "posix",
-      "tests": 18,
+      "tests": 22,
       "reason": "contract cases for POSIX-only behaviour: file modes, Unix sockets and absolute POSIX paths"
     }
   ]
