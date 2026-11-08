@@ -66,7 +66,10 @@ function runProcess(command, args, { cwd, env, input = "" }) {
 // Every child is confined: its home is a temp directory and no CCDM setting of
 // the machine running the tests reaches it.
 function createContext() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-platform-"));
+  // macOS's temp dir is a long path behind a symlink: too long for a socket under
+  // the home, and not what a child's cwd reports.
+  const base = process.platform === "darwin" ? "/private/tmp" : os.tmpdir();
+  const dir = fs.mkdtempSync(path.join(base, "ccdm-platform-"));
   const work = path.join(dir, "work");
   const home = path.join(dir, "home");
   fs.mkdirSync(work);
