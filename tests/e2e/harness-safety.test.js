@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -148,22 +149,53 @@ test("failure diagnostics include command details and redact secrets", async () 
   assert.doesNotMatch(JSON.stringify(redactedBody), /ghp_|sk-ant-|Authorization: Bot [A-Za-z0-9_.-]+/);
 });
 
+test("a node:test file run directly reports TAP when the reporter comes through NODE_OPTIONS", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-reporter-"));
+  try {
+    const file = path.join(dir, "probe.test.mjs");
+    fs.writeFileSync(file, 'import test from "node:test";\ntest("reporter probe", () => {});\n');
+    // Without NODE_TEST_CONTEXT, which this file's own run sets.
+    const { NODE_TEST_CONTEXT, ...env } = process.env;
+    const child = spawn(process.execPath, [file], {
+      env: { ...env, NODE_OPTIONS: "--test-reporter=tap" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    const exitCode = await new Promise((resolve) => child.on("close", resolve));
+
+    assert.equal(exitCode, 0, stdout);
+    assert.match(stdout, /^TAP version \d+$/m);
+    assert.match(stdout, /^ok 1 - reporter probe$/m);
+    assert.match(stdout, /^# pass 1$/m);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("the Router live smoke test is skipped and touches nothing without the Live Gate", async () => {
   const workspace = createBridgeWorkspace();
   const fixturesBefore = readState(workspace.stateDir).fixtures;
 
   // Live secrets alone do not open the gate; the preload fails closed on any egress.
+  // A flag after the script is a script argument, so the reporter goes through
+  // NODE_OPTIONS (Node 23+ defaults to the spec reporter).
   const result = await runNodeEntrypoint(workspace, "tests/e2e/live-smoke.test.js", {
-    args: ["--test-reporter=tap"],
     env: bridgeChildEnv(workspace, {
       CCDM_LIVE_DISCORD_BOT_TOKEN: "placeholder-live-token",
       CCDM_LIVE_DISCORD_CHANNEL_ID: "placeholder-channel",
       CCDM_LIVE_DISCORD_USER_ID: "placeholder-owner",
+      NODE_OPTIONS: `${bridgeChildEnv(workspace).NODE_OPTIONS} --test-reporter=tap`,
     }),
     timeoutMs: 20000,
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.deepEqual(result.command, [process.execPath, path.join(workspace.repoDir, "tests/e2e/live-smoke.test.js")]);
+  assert.equal(result.env.NODE_OPTIONS,
+    `--require ${path.join(workspace.repoDir, "tests/e2e/support/preload.cjs")} --test-reporter=tap`);
   assert.match(result.stdout, /^ok 1 - live Router smoke: Claude and Codex round trips, webhook provenance, root mention, and cleanup # SKIP/m);
   assert.match(result.stdout, /^# skipped 1$/m);
   assert.match(result.stdout, /^# pass 0$/m);
