@@ -739,7 +739,7 @@ test("Discord MCP download_attachment keeps every download inside the save dir a
       ["..", "file"],
       [".", "file"],
       ["/", "file"],
-      ["", "att-case-3"],
+      ["", "att-case-4"],
       [`${long}.txt`, `${"a".repeat(251)}.txt`],
       [long, "a".repeat(255)],
       [`${"a".repeat(251)}.txt`, `${"a".repeat(251)}.txt`],
