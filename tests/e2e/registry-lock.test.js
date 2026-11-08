@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
-import { PYTHON } from "./support/platform.js";
+import { platformGate, PYTHON } from "./support/platform.js";
 import {
   connectSession,
   createRouterWorkspace,
@@ -148,17 +148,23 @@ test("a registry lock left by a dead writer is reclaimed, and a live holder's lo
   assert.equal(fs.readFileSync(path.join(lock, "owner"), "utf8"), `${process.pid}\n`);
 });
 
-// The workspace copy of the lock implementation, driven in this process.
+// The lock implementation, driven in this process: the workspace copy, except on
+// Windows, where only the repository's own node_modules has koffi.
+const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
+function registryPath(workspace) {
+  return path.join(process.platform === "win32" ? REPO_ROOT : workspace.repoDir, "scripts/router/registry.js");
+}
+
 function registryModule(workspace) {
-  return createRequire(import.meta.url)(path.join(workspace.repoDir, "scripts/router/registry.js"));
+  return createRequire(import.meta.url)(registryPath(workspace));
 }
 
 // Runs a Python snippet with the workspace's registry-update.py loaded as `ru`.
-function runPython(workspace, code, args = []) {
+function runPython(workspace, code, args = [], options = {}) {
   const prelude = "import importlib.util,sys\n"
     + "spec=importlib.util.spec_from_file_location('ru',sys.argv[1]);ru=importlib.util.module_from_spec(spec);spec.loader.exec_module(ru)\n";
   return execFileAsync(PYTHON, ["-c", prelude + code, path.join(workspace.repoDir, "scripts/registry-update.py"), ...args],
-    { encoding: "utf8" });
+    { encoding: "utf8", ...options });
 }
 
 function deadLock(lock) {
@@ -236,4 +242,217 @@ test("concurrent Node and Python writers racing to reclaim one dead lock all com
   const written = Object.keys(other).filter(key => /^(py|js)_\d_\d$/.test(key));
   assert.equal(written.length, 30, `lost writes: ${written.sort().join(", ")}`);
   assert.deepEqual(lockLitter(workspace), []);
+});
+
+test("registry-update.py loaded by path from a working directory outside scripts/ takes and releases the lock", async () => {
+  const workspace = createRouterWorkspace(routerRegistry({
+    other: { channel_id: "other-channel", type: "claude", screen_name: "other_session" },
+  }));
+  const file = registryFile(workspace);
+
+  await runPython(workspace, "ru.set_project_fields(sys.argv[2], 'other', {'from_outside': True})", [file], { cwd: workspace.tmpDir });
+
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).projects.other.from_outside, true);
+  assert.deepEqual(lockLitter(workspace), []);
+});
+
+const ON_WINDOWS = platformGate("win32", "exercises Windows file sharing and PID reuse");
+const otherProject = () => routerRegistry({ other: { channel_id: "other-channel", type: "claude", screen_name: "other_session" } });
+const RELEASE_WARNING = /could not be removed/;
+
+// A process that takes the lock, touches `<marker>.held`, and releases once
+// `<marker>.go` exists; resolves with its output.
+function holderProcess(language, workspace, file, marker) {
+  if (language === "python") {
+    return runPython(workspace, [
+      "import os,time",
+      "handle=ru.acquire(sys.argv[2])",
+      "open(sys.argv[3]+'.held','w').close()",
+      "while not os.path.exists(sys.argv[3]+'.go'): time.sleep(0.01)",
+      "ru.release(handle)",
+    ].join("\n"), [file, marker]);
+  }
+  const script = `
+    const fs = require("node:fs");
+    const [registry, file, marker] = process.argv.slice(1);
+    require(registry).withRegistryLock(file, async () => {
+      fs.writeFileSync(marker + ".held", "");
+      while (!fs.existsSync(marker + ".go")) await new Promise(resolve => setTimeout(resolve, 10));
+    });
+  `;
+  return execFileAsync(process.execPath, ["-e", script, registryPath(workspace), file, marker], { encoding: "utf8" });
+}
+
+// A Python reader that holds each of `files` open for holdMs, then closes them.
+// Python's open does not share delete access, the harder case for a rename.
+function heldOpen(files, holdMs, readyMarker) {
+  const script = [
+    "import sys,time",
+    "marker,hold=sys.argv[1],float(sys.argv[2])/1000",
+    "handles=[open(name) for name in sys.argv[3:]]",
+    "open(marker,'w').close()",
+    "time.sleep(hold)",
+    "[handle.close() for handle in handles]",
+  ].join("\n");
+  return execFileAsync(PYTHON, ["-c", script, readyMarker, String(holdMs), ...files], { encoding: "utf8" });
+}
+
+// Readers that keep opening registry.json and the current lock's owner until
+// `stop` exists: one Python, one Node (which shares delete access).
+const PYTHON_LOOP_READER = holdMs => [
+  "import os,sys,time",
+  "file,stop=sys.argv[1],sys.argv[2]",
+  "while not os.path.exists(stop):",
+  "    handles=[]",
+  "    for name in (file, file+'.lock/owner'):",
+  "        try: handles.append(open(name))",
+  "        except OSError: pass",
+  `    time.sleep(${holdMs / 1000})`,
+  "    [handle.close() for handle in handles]",
+  "    time.sleep(0.01)",
+].join("\n");
+
+const NODE_LOOP_READER = holdMs => `
+  const fs = require("node:fs");
+  const [file, stop] = process.argv.slice(1);
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  (async () => {
+    while (!fs.existsSync(stop)) {
+      const fds = [];
+      for (const name of [file, file + ".lock/owner"]) {
+        try { fds.push(fs.openSync(name, "r")); } catch {}
+      }
+      await sleep(${holdMs});
+      fds.forEach(fd => fs.closeSync(fd));
+      await sleep(10);
+    }
+  })();
+`;
+
+function startLoopReaders(file, stop) {
+  return [
+    execFileAsync(PYTHON, ["-c", PYTHON_LOOP_READER(5), file, stop], { encoding: "utf8" }),
+    execFileAsync(process.execPath, ["-e", NODE_LOOP_READER(5), file, stop], { encoding: "utf8" }),
+  ];
+}
+
+test("on Windows, a contended Node write waits for the holder and then succeeds instead of throwing EPERM", ON_WINDOWS, async () => {
+  const workspace = createRouterWorkspace(otherProject());
+  const file = registryFile(workspace);
+  const marker = path.join(workspace.tmpDir, "holder");
+  const { updateRegistry } = registryModule(workspace);
+  const holder = holderProcess("python", workspace, file, marker);
+  await waitFor(() => exists(`${marker}.held`), () => "the Python holder to take the lock");
+
+  const write = updateRegistry(file, registry => { registry.projects.other.contended = true; });
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).projects.other.contended, undefined, "wrote while the lock was held");
+  fs.writeFileSync(`${marker}.go`, "");
+  await Promise.all([holder, write]);
+
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).projects.other.contended, true);
+  assert.deepEqual(lockLitter(workspace), []);
+});
+
+test("on Windows, Node and Python writers racing past readers holding registry.json and owner open all land", ON_WINDOWS, async () => {
+  const workspace = createRouterWorkspace(otherProject());
+  const file = registryFile(workspace);
+  const stop = path.join(workspace.tmpDir, "stop-readers");
+  const readers = startLoopReaders(file, stop);
+  const { readRegistry, updateRegistry } = registryModule(workspace);
+  const writers = [];
+  const started = performance.now();
+  // The Router's reload path keeps reading a whole file throughout.
+  let sampling = true;
+  const sampler = (async () => {
+    while (sampling) {
+      await readRegistry(file);
+      await new Promise(resolve => setTimeout(resolve, 3));
+    }
+  })();
+  try {
+    for (let index = 0; index < 6; index++) {
+      writers.push(runPython(workspace, "ru.set_project_fields(sys.argv[2], 'other', {sys.argv[3]: True})", [file, `py_${index}`]));
+      writers.push(updateRegistry(file, registry => { registry.projects.other[`js_${index}`] = true; }));
+    }
+    const results = await Promise.all(writers);
+    for (const result of results) assert.doesNotMatch(result?.stderr ?? "", RELEASE_WARNING);
+  } finally {
+    sampling = false;
+    fs.writeFileSync(stop, "");
+    await Promise.all(readers);
+  }
+  await sampler;
+
+  assert.ok(performance.now() - started < 20000, "a writer waited as if for the 30 s lock timeout");
+  const { other } = JSON.parse(fs.readFileSync(file, "utf8")).projects;
+  assert.equal(Object.keys(other).filter(key => /^(py|js)_\d$/.test(key)).length, 12);
+  assert.deepEqual(lockLitter(workspace), []);
+});
+
+for (const language of ["node", "python"]) {
+  test(`on Windows, a ${language} release waits out a reader holding owner open and removes the lock`, ON_WINDOWS, async () => {
+    const workspace = createRouterWorkspace(otherProject());
+    const file = registryFile(workspace);
+    const lock = `${file}.lock`;
+    const marker = path.join(workspace.tmpDir, "holder");
+    const holder = holderProcess(language, workspace, file, marker);
+    await waitFor(() => exists(`${marker}.held`), () => "the holder to take the lock");
+    const reader = heldOpen([path.join(lock, "owner"), path.join(lock, "nonce")], 600, `${marker}.reading`);
+    await waitFor(() => exists(`${marker}.reading`), () => "the reader to open owner");
+
+    fs.writeFileSync(`${marker}.go`, "");
+    const [{ stderr }] = await Promise.all([holder, reader]);
+
+    assert.doesNotMatch(stderr, RELEASE_WARNING);
+    assert.equal(exists(lock), false);
+    assert.deepEqual(lockLitter(workspace), []);
+  });
+
+  test(`on Windows, a ${language} release blocked past its budget warns naming the lock and still finishes`, ON_WINDOWS, async () => {
+    const workspace = createRouterWorkspace(otherProject());
+    const file = registryFile(workspace);
+    const lock = `${file}.lock`;
+    const marker = path.join(workspace.tmpDir, "holder");
+    const holder = holderProcess(language, workspace, file, marker);
+    await waitFor(() => exists(`${marker}.held`), () => "the holder to take the lock");
+    const reader = heldOpen([path.join(lock, "owner")], 3500, `${marker}.reading`);
+    await waitFor(() => exists(`${marker}.reading`), () => "the reader to open owner");
+
+    fs.writeFileSync(`${marker}.go`, "");
+    const [{ stderr }] = await Promise.all([holder, reader]);
+
+    assert.match(stderr, /registry\.json\.lock could not be removed/);
+    assert.equal(exists(lock), true, "the blocked lock stays in place");
+  });
+}
+
+test("on Windows, a live PID with the wrong start time is reclaimed by both, and one without started is honored", ON_WINDOWS, async () => {
+  const workspace = createRouterWorkspace(otherProject());
+  const file = registryFile(workspace);
+  const lock = `${file}.lock`;
+  const { updateRegistry } = registryModule(workspace);
+  const plantLock = files => {
+    fs.mkdirSync(lock);
+    for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(lock, name), text);
+  };
+
+  plantLock({ owner: `${process.pid}\n`, nonce: "reused-node\n", started: "1\n" });
+  await updateRegistry(file, registry => { registry.projects.other.node_reclaimed = true; });
+  assert.equal(exists(lock), false);
+
+  plantLock({ owner: `${process.pid}\n`, nonce: "reused-python\n", started: "1\n" });
+  await runPython(workspace, "ru.set_project_fields(sys.argv[2], 'other', {'python_reclaimed': True})", [file]);
+  assert.equal(exists(lock), false);
+
+  const { other } = JSON.parse(fs.readFileSync(file, "utf8")).projects;
+  assert.deepEqual({ node: other.node_reclaimed, python: other.python_reclaimed }, { node: true, python: true });
+
+  plantLock({ owner: `${process.pid}\n` });
+  const env = { ...process.env, CCDM_REGISTRY_LOCK_TIMEOUT_MS: "200" };
+  await assert.rejects(
+    runPython(workspace, "ru.set_project_fields(sys.argv[2], 'other', {'x': True})", [file], { env }),
+    /is locked \(held by pid/,
+  );
+  assert.equal(fs.readFileSync(path.join(lock, "owner"), "utf8"), `${process.pid}\n`);
 });
