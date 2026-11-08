@@ -7,6 +7,7 @@ const { writeFile, mkdir, readFile } = require("fs/promises");
 const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
 const { stateDir } = require("./router/paths.js");
+const { safeFileName } = require("./platform/paths.js");
 
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const DISCORD_REPLY_TOKEN = process.env.DISCORD_REPLY_TOKEN;
@@ -426,7 +427,7 @@ async function handleToolCall(name, args) {
       const att = await routerRequest("download_attachment", channelId, { message_id, attachment_index });
       const dir = save_dir || process.cwd();
       await mkdir(dir, { recursive: true });
-      const filePath = path.join(dir, path.basename(att.name || att.id));
+      const filePath = path.join(dir, safeFileName(path.basename(att.name || att.id)));
       const res = await fetch(att.url);
       if (!res.ok) throw new Error(`Failed to download: ${res.status}`);
       await writeFile(filePath, Buffer.from(await res.arrayBuffer()));
