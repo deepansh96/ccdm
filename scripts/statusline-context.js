@@ -88,7 +88,7 @@ function findGitBash() {
 }
 
 function windowsPowerShell() {
-  const builtin = path.join(process.env.SystemRoot || "C:\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const builtin = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   return fs.existsSync(builtin) ? builtin : "powershell";
 }
 
