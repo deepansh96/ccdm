@@ -53,8 +53,8 @@ const REPORT_DIR = /CCDM_E2E_REPORT_DIR: \$\{\{ runner\.temp \}\}\/e2e-report/;
 // The native packages are checked for, and after the install that could add them.
 function assertsKoffiAbsent(job) {
   const install = job.search(/npm ci/);
-  const check = job.search(/for package in koffi\b/);
-  return install >= 0 && check > install && /\[ -e "node_modules\/\$package" \]/.test(job) && /exit 1/.test(job.slice(check));
+  const check = job.search(/for package in node_modules\/koffi\b/);
+  return install >= 0 && check > install && /\[ -e "\$package" \]/.test(job) && /exit 1/.test(job.slice(check));
 }
 
 const RULES = [
@@ -135,7 +135,7 @@ const BREAKS = {
   "linux runs on ubuntu": [LINUX, "ubuntu-latest", "macos-latest"],
   "linux uses Node 22": [LINUX, "node-version: 22", "node-version: 20"],
   "linux omits optional packages": [LINUX, "npm ci --omit=optional", "npm ci"],
-  "linux asserts koffi is absent": [LINUX, "for package in koffi node-pty", "for package in node-pty"],
+  "linux asserts koffi is absent": [LINUX, "for package in node_modules/koffi ", "for package in "],
   "linux verifies host tools": [LINUX, "apt-get install -y zsh python3 jq", "apt-get install -y python3"],
   "linux runs the suite": [LINUX, "- run: npm test", "- run: npm run lint"],
   "linux can fail the PR": [LINUX, "    runs-on: ubuntu-latest", "    runs-on: ubuntu-latest\n    continue-on-error: true"],
@@ -158,7 +158,7 @@ const BREAKS = {
   "macos uses Node 22": [MACOS, "node-version: 22", "node-version: 24"],
   "macos can fail the PR": [MACOS, "    timeout-minutes: 90", "    timeout-minutes: 90\n    continue-on-error: true"],
   "macos omits optional packages": [MACOS, "npm ci --omit=optional", "npm ci"],
-  "macos asserts koffi is absent": [MACOS, "for package in koffi node-pty", "for package in node-pty"],
+  "macos asserts koffi is absent": [MACOS, "for package in node_modules/koffi ", "for package in "],
   "macos exports /usr/bin/python3 as CCDM_PYTHON": [MACOS, "CCDM_PYTHON: /usr/bin/python3", "CCDM_PYTHON: /opt/homebrew/bin/python3"],
   "macos puts /usr/bin first on PATH": [MACOS, 'echo /usr/bin >> "$GITHUB_PATH"', "true"],
   "macos asserts Python 3.9": [MACOS, "== (3, 9)", "== (3, 11)"],
@@ -194,7 +194,7 @@ test("each real-tool name, a removed job and a late koffi check are all caught",
   assert.ok(violations(withoutMacos).includes("macos runs on macos"));
 
   const jobs = workflowJobs(WORKFLOW);
-  const koffiFirst = "for package in koffi; do exit 1; done\n- run: npm ci --omit=optional\n";
+  const koffiFirst = 'for package in node_modules/koffi; do [ -e "$package" ] && exit 1; done\n- run: npm ci --omit=optional\n';
   assert.equal(assertsKoffiAbsent(koffiFirst), false);
   assert.equal(assertsKoffiAbsent(jobs.get(LINUX)), true);
 });

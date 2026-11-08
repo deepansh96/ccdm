@@ -26,9 +26,9 @@ jobs:
 
       - name: Assert native Windows packages are absent
         run: |
-          for package in koffi node-pty @xterm @koromix; do
-            if [ -e "node_modules/$package" ]; then
-              echo "node_modules/$package is installed; Linux and macOS must not have it" >&2
+          for package in node_modules/koffi node_modules/node-pty node_modules/@xterm/* node_modules/@koromix/*; do
+            if [ -e "$package" ]; then
+              echo "$package is installed; Linux and macOS must not have it" >&2
               exit 1
             fi
           done
@@ -163,9 +163,9 @@ jobs:
 
       - name: Assert native Windows packages are absent
         run: |
-          for package in koffi node-pty @xterm @koromix; do
-            if [ -e "node_modules/$package" ]; then
-              echo "node_modules/$package is installed; Linux and macOS must not have it" >&2
+          for package in node_modules/koffi node_modules/node-pty node_modules/@xterm/* node_modules/@koromix/*; do
+            if [ -e "$package" ]; then
+              echo "$package is installed; Linux and macOS must not have it" >&2
               exit 1
             fi
           done
