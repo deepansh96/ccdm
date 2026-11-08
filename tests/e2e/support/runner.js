@@ -6,7 +6,7 @@ import path from "node:path";
 
 import { assertIsolatedPath, buildCommandDiagnostics } from "./diagnostics.js";
 import { readState, recordCommandInvocation, writeState } from "./state.js";
-import { registerTeardownCallback } from "./teardown.js";
+import { registerTeardownCallback, workspaceOwnsPid } from "./teardown.js";
 
 // Deadlines are upper bounds that a passing test never waits out, so they
 // scale with load: parallel files on a busy machine run slower than one file
@@ -63,6 +63,7 @@ function sourceRoot() {
   const result = spawnSync("git", ["rev-parse", "--show-toplevel"], {
     cwd: process.cwd(),
     encoding: "utf8",
+    windowsHide: true,
   });
   if (result.status !== 0) {
     throw new Error(result.stderr || "Unable to resolve git root");
@@ -74,6 +75,7 @@ function gitSourceFiles(root) {
   const result = spawnSync("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], {
     cwd: root,
     encoding: "buffer",
+    windowsHide: true,
   });
   if (result.status !== 0) {
     throw new Error(result.stderr.toString("utf8") || "Unable to list source files");
@@ -131,6 +133,7 @@ function hostCommandPath(name) {
   if (name === "python3") {
     const python = spawnSync("python3", ["-c", "import sys; print(sys.executable)"], {
       encoding: "utf8",
+      windowsHide: true,
     });
     if (python.status === 0 && python.stdout.trim()) {
       return python.stdout.trim();
@@ -138,6 +141,7 @@ function hostCommandPath(name) {
   }
   const result = spawnSync("/bin/sh", ["-lc", `command -v ${name}`], {
     encoding: "utf8",
+    windowsHide: true,
   });
   if (result.status !== 0) {
     return null;
@@ -167,6 +171,9 @@ if (!stateDir) {
 }
 
 const stateFile = path.join(stateDir, "state.json");
+
+// Teardown signals a recorded PID only when its command line holds this path.
+const workspaceMarker = path.dirname(stateDir);
 
 function initialState() {
   return {
@@ -360,13 +367,14 @@ function activeOwnedProcesses(state) {
 }
 
 function spawnPlaceholder() {
-  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", workspaceMarker], {
     detached: true,
     env: {
       CCDM_FIXTURE_PLACEHOLDER: "1",
       CCDM_TEST_STATE: stateDir,
     },
     stdio: "ignore",
+    windowsHide: true,
   });
   child.unref();
   return child.pid;
@@ -471,11 +479,15 @@ const DEV_CHANNEL_PROMPT = "WARNING: Loading development channels\\n\\n--dangero
 
 // The fake claude for a CCDM channel launch, detached like a tmux pane process.
 function spawnRouterClaude(name, launch) {
-  const child = spawn(process.execPath, [__filename, "claude", ...launch.claudeArgs], {
+  // Through the workspace's link to this file: __filename is in the shared
+  // fixture directory, which holds no workspace path.
+  const runtime = path.join(workspaceMarker, "fixtures", path.basename(__filename));
+  const child = spawn(process.execPath, [runtime, "claude", ...launch.claudeArgs], {
     cwd: launch.cwd,
     detached: true,
     env: { ...process.env, ...launch.env, CCDM_FIXTURE_TMUX_SESSION: name },
     stdio: "ignore",
+    windowsHide: true,
   });
   child.unref();
   return child.pid;
@@ -485,11 +497,12 @@ function spawnRouterClaude(name, launch) {
 // process, against the fake Codex app-server registered for its port.
 function spawnRouterBridge(launch) {
   const logFile = fs.openSync(path.join(stateDir, \`codex-bridge-\${Date.now()}.log\`), "a");
-  const child = spawn(process.execPath, [path.join(launch.cwd, "scripts/codex-bridge.js")], {
+  const child = spawn(process.execPath, [path.join(launch.cwd, "scripts/codex-bridge.js"), workspaceMarker], {
     cwd: launch.cwd,
     detached: true,
     env: { ...process.env, ...launch.env },
     stdio: ["ignore", logFile, logFile],
+    windowsHide: true,
   });
   fs.closeSync(logFile);
   child.unref();
@@ -532,13 +545,13 @@ function runRouterClaudeHost() {
   } catch {
     // No settings, no hooks.
   }
-  const hookEnv = { ...process.env, PATH: \`\${path.dirname(process.execPath)}:\${process.env.PATH || ""}\` };
+  const hookEnv = { ...process.env, PATH: \`\${path.dirname(process.execPath)}\${path.delimiter}\${process.env.PATH || ""}\` };
   async function runHooks(event, fields = {}) {
     const input = JSON.stringify({ hook_event_name: event, session_id: sessionId, ...fields });
     for (const hook of (hooks[event] || []).flatMap((group) => group.hooks || [])) {
       if (hook.type !== "command") continue;
       const exitCode = await new Promise((done) => {
-        const child = spawn("/bin/sh", ["-c", hook.command], { env: hookEnv, stdio: ["pipe", "ignore", "ignore"] });
+        const child = spawn("/bin/sh", ["-c", hook.command], { env: hookEnv, stdio: ["pipe", "ignore", "ignore"], windowsHide: true });
         child.on("exit", done);
         child.stdin.end(input);
       });
@@ -557,6 +570,7 @@ function runRouterClaudeHost() {
     const child = spawn(command, server.args || [], {
       env: serverEnv,
       stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
     });
     const logFile = path.join(stateDir, \`claude-channel-\${process.pid}.log\`);
     child.stderr.on("data", (chunk) => fs.appendFileSync(logFile, chunk));
@@ -1470,9 +1484,10 @@ function nodePath(root) {
   return path.join(root, "node_modules");
 }
 
+// Windows has no process groups, so there the group is the one process.
 function processGroupExists(pid) {
   try {
-    process.kill(-pid, 0);
+    process.kill(process.platform === "win32" ? pid : -pid, 0);
     return true;
   } catch {
     return false;
@@ -1490,8 +1505,19 @@ async function waitForProcessGroupExit(pid, timeoutMs = 5000) {
   return !processGroupExists(pid);
 }
 
-async function terminateProcessGroup(pid, timeoutMs = 5000) {
+// `leaderExited`: the process itself is gone, so its PID may be someone else's
+// now; only what is left of its group is signalled.
+async function terminateProcessGroup(pid, timeoutMs = 5000, { leaderExited = false } = {}) {
   if (!Number.isInteger(pid)) {
+    return;
+  }
+  if (process.platform === "win32") {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // The process may already be gone.
+    }
+    await waitForProcessGroupExit(pid, timeoutMs);
     return;
   }
   try {
@@ -1499,10 +1525,12 @@ async function terminateProcessGroup(pid, timeoutMs = 5000) {
   } catch {
     // The process group may already be gone.
   }
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch {
-    // The process may already be gone.
+  if (!leaderExited) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // The process may already be gone.
+    }
   }
   if (await waitForProcessGroupExit(pid, timeoutMs)) {
     return;
@@ -1512,12 +1540,33 @@ async function terminateProcessGroup(pid, timeoutMs = 5000) {
   } catch {
     // The process group may already be gone.
   }
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {
-    // The process may already be gone.
+  if (!leaderExited) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // The process may already be gone.
+    }
   }
   await waitForProcessGroupExit(pid, 1000);
+}
+
+// A handle the harness holds needs no marker check while the process lives.
+// On Windows an exited child's PID can already belong to something else.
+async function stopHeldChild(child) {
+  const exited = child.exitCode !== null || child.signalCode !== null;
+  if (process.platform !== "win32") {
+    await terminateProcessGroup(child.pid, 5000, { leaderExited: exited });
+    return;
+  }
+  if (exited || !Number.isInteger(child.pid)) return;
+  await new Promise((resolve) => {
+    const timer = setTimeout(resolve, scaledTimeout(5000));
+    child.once("close", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    child.kill();
+  });
 }
 
 // Node's os.homedir() reads USERPROFILE on Windows and os.tmpdir() reads TEMP/TMP;
@@ -1530,6 +1579,9 @@ function workspaceEnv({ root, homeDir, tmpDir, stateDir, fixtureDir, platform = 
     NODE_OPTIONS: "",
     NODE_PATH: nodePath(root),
     PATH: fixtureDir,
+    // The source tree's copy: tests list the workspace repo exactly, and Python
+    // writes bytecode beside this file. __pycache__ is gitignored there.
+    PYTHONPATH: path.join(root, "tests", "e2e", "support", "pysafe"),
     TMPDIR: tmpDir,
   };
   if (platform !== "win32") {
@@ -1565,7 +1617,8 @@ export const createWorkspace = Object.freeze(function createWorkspace(options = 
     try {
       const state = readState(stateDir);
       for (const row of state.fixtures.processes ?? []) {
-        if (row?.owned === true && row.ownerStateDir === stateDir && Number.isInteger(row.pid)) {
+        if (row?.owned === true && row.ownerStateDir === stateDir && Number.isInteger(row.pid)
+            && workspaceOwnsPid(row.pid, tmpRoot)) {
           await terminateProcessGroup(row.pid, 5000);
         }
       }
@@ -1625,10 +1678,9 @@ function runProcess(workspace, command, args, options = {}) {
     detached: true,
     env,
     stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
   });
-  registerTeardownCallback(async () => {
-    await terminateProcessGroup(child.pid, 5000);
-  });
+  registerTeardownCallback(() => stopHeldChild(child));
   if (options.input) {
     child.stdin.end(options.input);
   } else {
@@ -1649,7 +1701,8 @@ function runProcess(workspace, command, args, options = {}) {
   return new Promise((resolve) => {
     const timeout = setTimeout(() => {
       try {
-        process.kill(-child.pid, "SIGTERM");
+        if (process.platform === "win32") child.kill("SIGTERM");
+        else process.kill(-child.pid, "SIGTERM");
       } catch {
         // The process may have already exited.
       }

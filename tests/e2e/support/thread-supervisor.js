@@ -3,6 +3,7 @@ import path from "node:path";
 
 import { routerEnv, runRouterCli, waitFor } from "./router.js";
 import { runScript } from "./runner.js";
+import { workspaceOwnsPid } from "./teardown.js";
 
 // The Thread Supervisor's private state, under the Test Workspace's home.
 export function supervisorStateDir(workspace) {
@@ -48,6 +49,16 @@ export async function supervisorStatus(workspace) {
   return result.json;
 }
 
+// worker_pid comes from status on disk, so it may not be the worker any more.
+// Returns whether the worker was signalled.
+export function signalSupervisorWorker(workspace, workerPid) {
+  if (!workspaceOwnsPid(workerPid, workspace.tmpRoot)) return false;
+  try {
+    process.kill(workerPid, "SIGTERM");
+  } catch { /* Already gone. */ }
+  return true;
+}
+
 // Starts the real worker (`run`, the foreground mode) against the harness
 // Router and resolves once `router status` shows its link holding the
 // `supervisor` connection. `result` resolves with the worker's exit; `stop()`
@@ -72,9 +83,7 @@ export async function startThreadSupervisor(workspace, { env = {} } = {}) {
     workerPid: current.worker_pid,
     linkPid: current.link_pid,
     async stop() {
-      try {
-        process.kill(current.worker_pid, "SIGTERM");
-      } catch { /* Already gone. */ }
+      signalSupervisorWorker(workspace, current.worker_pid);
       return result;
     },
   };

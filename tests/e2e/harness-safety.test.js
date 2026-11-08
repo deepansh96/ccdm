@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { bridgeChildEnv, createBridgeWorkspace } from "./support/bridge.js";
 import { assertFixtureExecutable, assertIsolatedPath, redactSecrets } from "./support/diagnostics.js";
@@ -17,7 +18,8 @@ import {
   snapshotFiles,
   writeState,
 } from "./support/state.js";
-import { cleanup, registerTeardownCallback } from "./support/teardown.js";
+import { cleanup, registerTeardownCallback, teardownSkips, workspaceOwnsPid } from "./support/teardown.js";
+import { signalSupervisorWorker } from "./support/thread-supervisor.js";
 
 test.afterEach(async () => {
   await cleanup();
@@ -190,6 +192,7 @@ test("the workspace env on win32 isolates the profile and temp dirs and keeps wh
     NODE_PATH: path.join(dirs.root, "node_modules"),
     PATH: dirs.fixtureDir,
     PATHEXT: ".COM;.EXE",
+    PYTHONPATH: path.join(dirs.root, "tests", "e2e", "support", "pysafe"),
     SystemRoot: "C:\\Windows",
     TEMP: dirs.tmpDir,
     TMP: dirs.tmpDir,
@@ -199,7 +202,7 @@ test("the workspace env on win32 isolates the profile and temp dirs and keeps wh
   });
 });
 
-test("the workspace env on POSIX is only the isolated six values", () => {
+test("the workspace env on POSIX is only the isolated values and the Python guard's path", () => {
   const dirs = { fixtureDir: "/w/fixtures", homeDir: "/w/home", root: "/src", stateDir: "/w/state", tmpDir: "/w/tmp" };
   for (const platform of ["linux", "darwin"]) {
     assert.deepEqual(runnerInternals.workspaceEnv({ ...dirs, hostEnv: { SystemRoot: "unused" }, platform }), {
@@ -208,6 +211,7 @@ test("the workspace env on POSIX is only the isolated six values", () => {
       NODE_OPTIONS: "",
       NODE_PATH: path.join(dirs.root, "node_modules"),
       PATH: dirs.fixtureDir,
+      PYTHONPATH: path.join(dirs.root, "tests", "e2e", "support", "pysafe"),
       TMPDIR: dirs.tmpDir,
     });
   }
@@ -293,6 +297,220 @@ test("a failed fixture build leaves no staging dir and no workspace in its temp 
   assert.match(message, /Forced fixture build failure/);
   assert.deepEqual(beforeCleanup.filter((name) => name.includes(".staging-")), []);
   assert.deepEqual(afterCleanup, []);
+});
+
+// A process this test starts itself: the only kind these cases may signal or plant.
+function startSleeper(extraArgs = []) {
+  return spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", ...extraArgs], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+}
+
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+function exitOf(child) {
+  return new Promise((resolve) => child.once("exit", resolve));
+}
+
+async function waitUntilGone(pid, timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  while (processAlive(pid) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(processAlive(pid), false, `process ${pid} is still running`);
+}
+
+function seedOwnedRow(workspace, pid) {
+  seedFixtureProcess(
+    { command: "fixture process", owned: true, ownerStateDir: workspace.stateDir, pid, ppid: process.pid },
+    { stateDir: workspace.stateDir },
+  );
+}
+
+test("teardown leaves a recorded PID running when its command line lacks the workspace marker, and logs the skip", async () => {
+  const workspace = probeWorkspace();
+  const sentinel = startSleeper();
+  try {
+    seedOwnedRow(workspace, sentinel.pid);
+
+    await cleanup();
+
+    assert.equal(processAlive(sentinel.pid), true);
+    assert.ok(teardownSkips().some((skip) => skip.pid === sentinel.pid && skip.marker === workspace.tmpRoot));
+  } finally {
+    sentinel.kill();
+  }
+});
+
+test("teardown stops a recorded PID whose command line carries the workspace marker", async () => {
+  const workspace = probeWorkspace();
+  const owned = startSleeper([workspace.tmpRoot]);
+  const exited = exitOf(owned);
+  try {
+    seedOwnedRow(workspace, owned.pid);
+
+    await cleanup();
+    await exited;
+
+    assert.deepEqual(teardownSkips().filter((skip) => skip.pid === owned.pid), []);
+  } finally {
+    owned.kill();
+  }
+});
+
+test("teardown stops a process the harness holds a handle to", async () => {
+  const workspace = probeWorkspace();
+  fs.writeFileSync(path.join(workspace.repoDir, "hold.js"), "setInterval(() => {}, 1000);\n");
+  const running = runNodeEntrypoint(workspace, "hold.js", { timeoutMs: 120000 });
+
+  await cleanup();
+  const result = await running;
+
+  assert.notEqual(result.exitCode, 0);
+});
+
+test("on POSIX, teardown still stops every process in a verified group", { skip: process.platform === "win32" }, async () => {
+  const workspace = probeWorkspace();
+  const leaderCode = `
+    const child = require("node:child_process").spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    console.log(child.pid);
+    setInterval(() => {}, 1000);
+  `;
+  const leader = spawn(process.execPath, ["-e", leaderCode, workspace.tmpRoot], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+  const exited = exitOf(leader);
+  const member = await new Promise((resolve) => leader.stdout.once("data", (chunk) => resolve(Number(String(chunk).trim()))));
+  try {
+    seedOwnedRow(workspace, leader.pid);
+
+    await cleanup();
+    await exited;
+
+    await waitUntilGone(member);
+  } finally {
+    leader.kill();
+    if (processAlive(member)) process.kill(member, "SIGKILL");
+  }
+});
+
+test("a fixture's real launch carries the workspace marker, so teardown can stop it", { skip: process.platform === "win32" }, async () => {
+  const workspace = createWorkspace();
+  const keyFile = path.join(workspace.tmpDir, "router", "keys", "project.key");
+  const started = spawnSync(path.join(workspace.fixtureDir, "tmux"), [
+    "new-session", "-d", "-s", "project_session", "--", "zsh", "-ic",
+    `cd '${workspace.tmpDir}' && CCDM_ROUTER_KEY_FILE='${keyFile}' claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions`,
+  ], { cwd: workspace.repoDir, encoding: "utf8", env: workspace.env });
+  assert.equal(started.status, 0, started.stderr);
+  const { pid } = readState(workspace.stateDir).fixtures.processes.find((row) => row.owned);
+
+  assert.equal(workspaceOwnsPid(pid, workspace.tmpRoot), true);
+  await cleanup();
+
+  await waitUntilGone(pid);
+  assert.deepEqual(teardownSkips().filter((skip) => skip.pid === pid), []);
+});
+
+test("the thread supervisor's stop signals worker_pid only after the marker check", async () => {
+  const workspace = probeWorkspace();
+  const sentinel = startSleeper();
+  const worker = startSleeper([workspace.tmpRoot]);
+  const workerExited = exitOf(worker);
+  try {
+    assert.equal(signalSupervisorWorker(workspace, sentinel.pid), false);
+    assert.equal(processAlive(sentinel.pid), true);
+    assert.ok(teardownSkips().some((skip) => skip.pid === sentinel.pid));
+
+    assert.equal(signalSupervisorWorker(workspace, worker.pid), true);
+    await workerExited;
+  } finally {
+    sentinel.kill();
+    worker.kill();
+  }
+});
+
+test("os.kill(pid, 0) in a Python grandchild raises RuntimeError on win32 and is untouched on POSIX", async () => {
+  const workspace = probeWorkspace();
+  // On win32 it never makes the real call: an unguarded signal 0 would be Ctrl+C.
+  fs.writeFileSync(path.join(workspace.repoDir, "probe.py"), [
+    "import json, os, sitecustomize, sys",
+    "builtin = type(os.kill).__name__ == 'builtin_function_or_method'",
+    "if sys.platform == 'win32' and builtin:",
+    "    outcome = 'unguarded'",
+    "else:",
+    "    try:",
+    "        os.kill(os.getpid(), 0)",
+    "        outcome = 'returned'",
+    "    except BaseException as error:",
+    "        outcome = f'{type(error).__name__}: {error}'",
+    "print(json.dumps({'builtin': builtin, 'guard': sitecustomize.__file__, 'outcome': outcome}))",
+    "",
+  ].join("\n"));
+  fs.writeFileSync(path.join(workspace.repoDir, "launch.js"), [
+    'const { spawnSync } = require("node:child_process");',
+    'const result = spawnSync(process.argv[2], [process.argv[3]], { encoding: "utf8", windowsHide: true });',
+    'process.stdout.write(result.stdout ?? "");',
+    'process.stderr.write(result.stderr || String(result.error ?? ""));',
+    "process.exit(result.status ?? 1);",
+    "",
+  ].join("\n"));
+
+  const result = await runNodeEntrypoint(workspace, "launch.js", {
+    args: [hostPythonPath(), path.join(workspace.repoDir, "probe.py")],
+    timeoutMs: 30000,
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const report = JSON.parse(result.stdout.trim());
+  assert.equal(report.guard, path.join(workspace.sourceRoot, "tests", "e2e", "support", "pysafe", "sitecustomize.py"));
+  if (process.platform === "win32") {
+    assert.equal(report.builtin, false);
+    assert.equal(report.outcome, "RuntimeError: os.kill(pid, 0) is unsafe on Windows");
+  } else {
+    assert.equal(report.builtin, true);
+    assert.equal(report.outcome, "returned");
+  }
+});
+
+// Every spawn-family call in a source file, from its name to its closing paren.
+function spawnCalls(source) {
+  const calls = [];
+  for (const match of source.matchAll(/\b(?:spawn|spawnSync|execFile|execFileSync|execSync)\(/g)) {
+    let depth = 0;
+    let quote = null;
+    let end = match.index + match[0].length - 1;
+    for (; end < source.length; end += 1) {
+      const char = source[end];
+      if (char === "\\") end += 1;
+      else if (quote) quote = char === quote ? null : quote;
+      else if ("'\"`".includes(char)) quote = char;
+      else if (char === "(") depth += 1;
+      else if (char === ")" && --depth === 0) break;
+    }
+    calls.push(source.slice(match.index, end + 1));
+  }
+  return calls;
+}
+
+test("every harness spawn hides its window, and the fixture claude's hook PATH uses the platform delimiter", () => {
+  const supportDir = fileURLToPath(new URL("./support/", import.meta.url));
+  const calls = fs.readdirSync(supportDir)
+    .filter((name) => name.endsWith(".js"))
+    .flatMap((name) => spawnCalls(fs.readFileSync(path.join(supportDir, name), "utf8")).map((call) => ({ call, name })));
+
+  assert.ok(calls.length >= 15, `found only ${calls.length} spawn calls`);
+  for (const { call, name } of calls) {
+    assert.match(call, /windowsHide: true/, `${name}: ${call}`);
+  }
+  const runnerSource = fs.readFileSync(path.join(supportDir, "runner.js"), "utf8");
+  assert.match(runnerSource, /const hookEnv = .*path\.delimiter/);
 });
 
 test("teardown callbacks run in LIFO order and cleanup failures are diagnostic records", async () => {

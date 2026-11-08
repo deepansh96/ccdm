@@ -110,6 +110,7 @@ export function runPreloadProbe(workspace, code, extraEnv = {}) {
     detached: true,
     env,
     stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
   });
   const running = collectProcess(
     child,
@@ -139,7 +140,7 @@ function markCodexServer(workspace, port, values) {
 // the Test Workspace's.
 async function callRegisteredMcpTool(workspace, config, name, args) {
   const command = config.command === "node" ? process.execPath : config.command;
-  const child = spawn(command, config.args ?? [], { env: bridgeChildEnv(workspace, config.env ?? {}), stdio: ["pipe", "pipe", "pipe"] });
+  const child = spawn(command, config.args ?? [], { env: bridgeChildEnv(workspace, config.env ?? {}), stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
   let stderr = "";
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => {

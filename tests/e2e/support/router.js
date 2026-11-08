@@ -71,6 +71,7 @@ export async function startRouter(workspace, { env: extraEnv = {} } = {}) {
     detached: true,
     env,
     stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
   });
   const running = collectProcess(child, { command, cwd: workspace.repoDir, detached: true, env }, workspace);
   registerTeardownCallback(() => running.stop());
@@ -145,7 +146,7 @@ export async function waitFor(predicate, describe, timeoutMs = 5000) {
 // Fetches a URL the way a session process would, through the fake CDN.
 export function fetchThroughFakeCdn(workspace, url) {
   const script = `fetch(${JSON.stringify(url)}).then(async r => process.stdout.write(JSON.stringify({ status: r.status, body: await r.text() })))`;
-  const output = execFileSync(process.execPath, ["-e", script], { cwd: workspace.repoDir, env: routerEnv(workspace), encoding: "utf8" });
+  const output = execFileSync(process.execPath, ["-e", script], { cwd: workspace.repoDir, env: routerEnv(workspace), encoding: "utf8", windowsHide: true });
   return JSON.parse(output);
 }
 
@@ -307,6 +308,7 @@ export async function startBridge(workspace, options = {}) {
     detached: true,
     env,
     stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
   });
   const running = collectProcess(child, { command, cwd: workspace.repoDir, detached: true, env }, workspace);
   registerTeardownCallback(() => running.stop());
