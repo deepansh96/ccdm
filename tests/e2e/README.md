@@ -2,9 +2,27 @@
 
 ## Windows Checkout
 
-On Windows, turn on Developer Mode and run `git config --global core.symlinks true` **before** cloning. `CLAUDE.md` and `.mex/AGENTS.md` are committed as symlinks to `AGENTS.md`; without symlink support Git checks them out as small text files holding the link target, so the root agent loads no runbook. The harness also links fixture binaries into each workspace with `fs.symlinkSync` (`tests/e2e/support/runner.js`), which fails without it. A clone made earlier keeps the text files: clone again after changing the setting. `tests/e2e/checkout-contract.test.js` fails, naming the file and this fix, when either file is neither a symlink to `AGENTS.md` nor a copy of it.
+On Windows, turn on Developer Mode and run `git config --global core.symlinks true` **before** cloning. `CLAUDE.md` and `.mex/AGENTS.md` are committed as symlinks to `AGENTS.md`; without symlink support Git checks them out as small text files holding the link target, so the root agent loads no runbook. A clone made earlier keeps the text files: clone again after changing the setting. `tests/e2e/checkout-contract.test.js` fails, naming the file and this fix, when either file is neither a symlink to `AGENTS.md` nor a copy of it.
 
 `.gitattributes` checks every text file out with LF, whatever `core.autocrlf` says, and `*.cmd` and `*.ps1` with CRLF.
+
+## Running on Windows
+
+The suite needs Git for Windows, Python 3 and the .NET Framework `csc.exe` that ships with Windows. `npm test` stops before starting any file, with one message, when one of them is missing.
+
+Each fixture tool is `<tool>.exe` plus `<tool>.shim`, hard-linked into each workspace. The `.exe` is a launcher compiled from `tests/e2e/support/fixture-shim.cs` once per content hash and cached in a `ccdm-fixture-launcher-<hash>` temp directory. The `.shim` is UTF-8, one item per line: the program to start (or `:noop`, which exits 0 and is how `sleep` works), then any leading arguments. The launcher copies the caller's arguments from the raw command line, so the child parses exactly what the caller wrote.
+
+`tests/e2e/support/platform.js` holds what differs by OS:
+
+- `PYTHON`: `CCDM_PYTHON`, else `python3` on POSIX; on Windows the interpreter `py -3` runs, else `python`, never the Microsoft Store stub. Tests use this and never call `python3` directly. The `python3` fixture forwards to it, so `python3` inside a fixture or shell script still works.
+- `interpreterFor(script)`: how to start a script. POSIX uses its shebang; Windows names the interpreter. `runScript()` goes through it.
+- `platformGate(tag, reason)`: test options for an OS tag. `posix` runs on Linux and macOS and is skipped on Windows. `darwin` runs only on macOS and only for a test that needs a real macOS facility; a test that passes on Linux with fixtures is never `darwin`. `win32` runs only on Windows.
+
+Write the gate on the `test(` line, directly or through a `const` holding it, so the budget check can read it. A suite gated as a whole goes in `tests/e2e/support/surfaces.js`, whose `runSurface()` records which suites run on which OS, and its tests use `suiteGate(import.meta.url)`.
+
+Every test skipped on Windows needs an entry in `tests/e2e/windows-skip-budget.json` with its file, test name, tag and reason, and the total must fit `budget`. `tests/e2e/windows-skip-budget.test.js` fails on an unlisted skip, a stale entry, or a count over budget.
+
+Seams: `CCDM_E2E_CSC` and `CCDM_E2E_GIT_SH` name the compiler and `sh.exe`; a path that does not exist counts as missing.
 
 ## Run Commands
 
@@ -21,7 +39,7 @@ Both run `tests/run-e2e.mjs`, which runs test files in parallel (`CCDM_E2E_JOBS`
 node --test --test-concurrency=1 tests/e2e/**/*.test.js
 ```
 
-Harness deadlines (`waitFor`, `waitForState`, the `runProcess` kill timer) are multiplied by `CCDM_E2E_TIMEOUT_SCALE` (default 4) so parallel load does not kill healthy runs; a passing test never waits them out. Fixture binaries are built once per content in a shared temp directory and linked into each workspace, and the repo's executable scripts are hard-linked rather than copied: macOS XProtect scans every newly written executable on first run, one at a time, which otherwise serializes parallel files.
+Harness deadlines (`waitFor`, `waitForState`, the `runProcess` kill timer) are multiplied by `CCDM_E2E_TIMEOUT_SCALE` (default 4) so parallel load does not kill healthy runs; a passing test never waits them out. Fixture binaries are built once per content in a shared temp directory and linked into each workspace (symlinks on POSIX, hard links on Windows), and the repo's executable scripts are hard-linked rather than copied: macOS XProtect scans every newly written executable on first run, one at a time, which otherwise serializes parallel files.
 
 ### Runner Settings and Reports
 
