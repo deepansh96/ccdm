@@ -71,7 +71,9 @@ function normalized(workspace, text) {
     .sort((a, b) => b[1].length - a[1].length);
   let result = text;
   for (const [placeholder, dir] of paths) result = result.split(dir).join(placeholder);
-  return result.replace(/WS_PORT='\d+'/g, "WS_PORT='<PORT>'");
+  return result
+    .replace(/WS_PORT='\d+'/g, "WS_PORT='<PORT>'")
+    .replace(/CCDM_CLAUDE_LAUNCH_ID='[0-9a-f-]+'/g, "CCDM_CLAUDE_LAUNCH_ID='<LAUNCH_ID>'");
 }
 
 const LAUNCHERS = [
