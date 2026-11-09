@@ -474,18 +474,19 @@ test("an ended session reports not live, keeps its output for capture, and frees
   await waitForCapture(workspace, "brief", /fixture-up/);
 });
 
-test("a command that cannot start gets spawn_failed, and later ops and pty sessions get unsupported_op", onlyWindows, async () => {
+test("a command that cannot start gets spawn_failed, and later ops get unsupported_op", onlyWindows, async () => {
   const workspace = hostWorkspace();
   await startHost(workspace);
   const connection = await authenticated(workspace);
   const missing = await ask(connection, { id: 1, op: "new", name: "x", argv: ["no-such-program-p3-1a.exe"], cwd: workspace.fixtures, env: {}, pty: false, kind: "adhoc" });
   assert.equal(missing.error, "spawn_failed");
   assert.equal((await ask(connection, { id: 2, op: "has", name: "x" })).live, false);
-  for (const op of ["wait", "attach", "run-detached", "subscribe", "nonsense"]) {
+  for (const op of ["attach", "run-detached", "subscribe", "nonsense"]) {
     assert.equal((await ask(connection, { id: op, op })).error, "unsupported_op", op);
   }
-  const pty = await ask(connection, { id: 3, op: "new", name: "y", argv: [process.execPath], cwd: workspace.fixtures, env: {}, pty: true, kind: "adhoc" });
-  assert.equal(pty.error, "unsupported_op");
+  await newSession(workspace, "plain", echoSession(workspace));
+  const noPty = await ask(connection, { id: 3, op: "wait", name: "plain", regex: "x", timeoutMs: 10 });
+  assert.equal(noPty.error, "unsupported_op");
 });
 
 function userProfilePaths() {
@@ -705,4 +706,366 @@ test("with no host every subcommand fails fast with the start hint and starts no
   // A daemon that started would have created its private directory, lock and pipe name.
   await sleep(300);
   assert.equal(fs.existsSync(workspace.hostDir), false, "a client started the daemon");
+});
+
+// ConPTY sessions. Every program here is a small Node console fixture.
+const ptySession = (workspace, name, fixtureFile, { extra = [] } = {}) =>
+  cliOk(workspace, ["new-session", "-d", "-s", name, "-c", workspace.fixtures, "--kind", "adhoc", ...extra, "--", process.execPath, fixtureFile]);
+
+const STAY_ALIVE = "setInterval(() => {}, 1000);";
+
+// The OpenConsole processes the host started. The host is ours and alive, and
+// each one is checked to be younger than it, so a reused PID cannot pass.
+function openConsolesOf(host) {
+  const { processStartTime } = lazy("platform/process.js");
+  const powershell = path.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const script = `Get-CimInstance Win32_Process -Filter "ParentProcessId=${host.child.pid} AND Name='OpenConsole.exe'" | ForEach-Object { $_.ProcessId }`;
+  const probe = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", windowsHide: true });
+  assert.equal(probe.status, 0, probe.stderr);
+  const hostStarted = processStartTime(host.child.pid);
+  return probe.stdout.trim().split(/\s+/).filter(Boolean).map(Number).map(trackPid)
+    .filter(entry => entry.startedAt !== null && entry.startedAt >= hostStarted);
+}
+
+async function waitForHasSessionFalse(workspace, name) {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    if ((await cli(workspace, ["has-session", "-t", `=${name}`])).code === 1) return;
+    await sleep(25);
+  }
+  throw new Error(`${name} never ended`);
+}
+
+test("wait-for --then-send Enter accepts a prompt that appears later, and the program's next output reaches capture-pane", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  const dialog = fixture(workspace, "p3.1b-dialog.js", `
+    setTimeout(() => console.log("Do you trust this folder? Press Enter"), 500);
+    process.stdin.once("data", () => console.log("trusted-next"));
+    ${STAY_ALIVE}
+  `);
+  await ptySession(workspace, "dialog", dialog);
+  const accepted = await cliOk(workspace, ["wait-for", "-t", "=dialog", "--regex", "trust this folder", "--timeout", "30", "--then-send", "Enter"], { timeoutMs: 40000 });
+  assert.match(accepted.stdout, /trust this folder/);
+  await waitForCapture(workspace, "dialog", /trusted-next/);
+  await cliOk(workspace, ["kill-session", "-t", "=dialog", "--grace", "0"]);
+});
+
+test("wait-for with a regex that never appears gives matched:false and the last screen after the timeout, and the CLI exits 1", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  const quiet = fixture(workspace, "p3.1b-quiet.js", `console.log("quiet-screen"); ${STAY_ALIVE}`);
+  await ptySession(workspace, "quiet", quiet);
+  await waitForCapture(workspace, "quiet", /quiet-screen/);
+  const missed = await cli(workspace, ["wait-for", "-t", "=quiet", "--regex", "never-appears", "--timeout", "1", "--then-send", "Enter"]);
+  assert.equal(missed.code, 1, missed.stderr);
+  assert.match(missed.stdout, /quiet-screen/);
+  const connection = await authenticated(workspace);
+  const reply = await ask(connection, { id: 1, op: "wait", name: "quiet", regex: "never-appears", timeoutMs: 300 });
+  assert.equal(reply.matched, false);
+  assert.ok(reply.ms >= 300, `the wait returned after ${reply.ms} ms`);
+  assert.match(reply.screen, /quiet-screen/);
+  const invalid = await ask(connection, { id: 2, op: "wait", name: "quiet", regex: "(", timeoutMs: 10 });
+  assert.equal(invalid.ok, false);
+  assert.match(invalid.message, /invalid regex/);
+});
+
+test("a wait whose client went away sends nothing when its prompt appears later", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  const trigger = path.join(workspace.fixtures, "p3.1b-trigger.txt");
+  const late = fixture(workspace, "p3.1b-late.js", `
+    const fs = require("node:fs");
+    process.stdin.once("data", () => console.log("got-enter"));
+    console.log("waiting-for-trigger");
+    const timer = setInterval(() => {
+      if (fs.existsSync(${JSON.stringify(trigger)})) { clearInterval(timer); console.log("late-prompt"); }
+    }, 20);
+    ${STAY_ALIVE}
+  `);
+  await ptySession(workspace, "late", late);
+  await waitForCapture(workspace, "late", /waiting-for-trigger/);
+  const connection = await authenticated(workspace);
+  connection.send({ id: 1, op: "wait", name: "late", regex: "late-prompt", timeoutMs: 30000, thenSend: ["Enter"] });
+  await sleep(200);
+  connection.destroy();
+  await sleep(200);
+  fs.writeFileSync(trigger, "go");
+  await waitForCapture(workspace, "late", /late-prompt/);
+  await sleep(500);
+  assert.doesNotMatch(await capture(workspace, "late"), /got-enter/);
+});
+
+test("a program that sends DA1 gets a reply in under a second, and its first screen is not held back", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  const report = path.join(workspace.fixtures, "p3.1b-da1.json");
+  const da1 = fixture(workspace, "p3.1b-da1.js", `
+    const fs = require("node:fs");
+    process.stdin.setRawMode(true);
+    process.stdin.setEncoding("utf8");
+    console.log("first-screen");
+    let reply = "";
+    let started;
+    process.stdin.on("data", chunk => {
+      reply += chunk;
+      if (/\\x1b\\[\\?[0-9;]*c/.test(reply)) {
+        fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify({ ms: performance.now() - started, reply }));
+      }
+    });
+    setTimeout(() => { started = performance.now(); process.stdout.write("\\x1b[c"); }, 300);
+    ${STAY_ALIVE}
+  `);
+  const started = performance.now();
+  await ptySession(workspace, "da1", da1);
+  await waitForCapture(workspace, "da1", /first-screen/);
+  // Without an answer from the headless terminal the first screen takes over 3 s.
+  assert.ok(performance.now() - started < scaledTimeout(2500), "the first screen was held back");
+  await waitUntil(() => fs.existsSync(report), () => "the DA1 reply", 5000);
+  const { ms, reply } = JSON.parse(fs.readFileSync(report, "utf8"));
+  assert.ok(ms < 1000, `the DA1 reply took ${ms} ms`);
+  assert.match(reply, /\x1b\[\?[0-9;]*c/);
+});
+
+test("after the program exits has-session is false and capture-pane still shows its last screen until kill-session", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  const brief = fixture(workspace, "p3.1b-brief.js", `console.log("final-screen-line"); process.exit(7);`);
+  await ptySession(workspace, "brief", brief);
+  await waitForHasSessionFalse(workspace, "brief");
+  assert.match(await capture(workspace, "brief"), /final-screen-line/);
+  assert.equal((await cliOk(workspace, ["pids", "-t", "brief"])).stdout, "");
+  const connection = await authenticated(workspace);
+  const listed = (await ask(connection, { id: 1, op: "list" })).sessions.find(session => session.name === "brief");
+  assert.equal(listed.exit, 7);
+  assert.equal(listed.pty, true);
+  const ended = await ask(connection, { id: 2, op: "wait", name: "brief", regex: "final-screen-line", timeoutMs: 10 });
+  assert.equal(ended.matched, true);
+  const cannotSend = await ask(connection, { id: 3, op: "wait", name: "brief", regex: "final-screen-line", timeoutMs: 10, thenSend: ["Enter"] });
+  assert.equal(cannotSend.matched, false);
+  await cliOk(workspace, ["kill-session", "-t", "=brief"]);
+  const released = await cli(workspace, ["capture-pane", "-t", "=brief", "-p"]);
+  assert.equal(released.code, 1);
+});
+
+test("a session ends with its root program even when a child is still attached to the console", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  const report = path.join(workspace.fixtures, "p3.1b-lingering.json");
+  const lingering = fixture(workspace, "p3.1b-lingering.js", `
+    const { spawn } = require("node:child_process");
+    const fs = require("node:fs");
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "inherit" });
+    fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify({ child: child.pid }));
+    console.log("root-leaving");
+    setTimeout(() => process.exit(0), 300);
+  `);
+  await ptySession(workspace, "lingering", lingering);
+  await waitUntil(() => fs.existsSync(report), () => "the fixture's report");
+  const lingerer = trackPid(JSON.parse(fs.readFileSync(report, "utf8")).child);
+  await waitForHasSessionFalse(workspace, "lingering");
+  await waitUntil(() => !isAlive(lingerer), () => "the attached child to be gone");
+  assert.match(await capture(workspace, "lingering"), /root-leaving/);
+});
+
+test("kill-session on a PTY session removes the program, OpenConsole and a detached grandchild, and pids is then empty", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  const host = await startHost(workspace);
+  const report = path.join(workspace.fixtures, "p3.1b-tree.json");
+  const tree = fixture(workspace, "p3.1b-tree.js", `
+    const { spawn } = require("node:child_process");
+    const fs = require("node:fs");
+    const grandchild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore", windowsHide: true });
+    grandchild.unref();
+    fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify({ child: process.pid, grandchild: grandchild.pid }));
+    console.log("tree-ready");
+    // Ignores the console closing, so only the Job can stop it inside the grace.
+    process.on("SIGHUP", () => {});
+    ${STAY_ALIVE}
+  `);
+  await ptySession(workspace, "tree", tree);
+  await waitForCapture(workspace, "tree", /tree-ready/);
+  const { child, grandchild } = JSON.parse(fs.readFileSync(report, "utf8"));
+  const consoles = openConsolesOf(host);
+  assert.equal(consoles.length, 1, "expected one OpenConsole for the session");
+  const processes = [trackPid(child), trackPid(grandchild), ...consoles];
+  assert.ok(processes.every(isAlive), "the fixture tree did not start");
+  const jobPids = (await cliOk(workspace, ["pids", "-t", "tree"])).stdout.trim().split("\n").map(Number);
+  assert.ok(jobPids.includes(child));
+  assert.ok(jobPids.includes(grandchild));
+
+  await cliOk(workspace, ["kill-session", "-t", "=tree", "--grace", "300"]);
+  await waitUntil(() => processes.every(entry => !isAlive(entry)), () => "the program, OpenConsole and the grandchild to be gone");
+  assert.equal((await cliOk(workspace, ["pids", "-t", "tree"])).stdout, "");
+  assert.equal((await cli(workspace, ["has-session", "-t", "=tree"])).code, 1);
+  assert.deepEqual(openConsolesOf(host), []);
+});
+
+test("the grace phase closes the pseudo-console, so a program that handles SIGHUP ends before the Job is used", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  const marker = path.join(workspace.fixtures, "p3.1b-hup.txt");
+  const graceful = fixture(workspace, "p3.1b-hup.js", `
+    const fs = require("node:fs");
+    process.on("SIGHUP", () => { fs.writeFileSync(${JSON.stringify(marker)}, "hup"); process.exit(0); });
+    console.log("up");
+    ${STAY_ALIVE}
+  `);
+  await ptySession(workspace, "hup", graceful);
+  await waitForCapture(workspace, "hup", /up/);
+  const started = performance.now();
+  await cliOk(workspace, ["kill-session", "-t", "=hup", "--grace", "8000"]);
+  assert.ok(performance.now() - started < 7000, "the grace wait did not end when the program did");
+  assert.equal(fs.readFileSync(marker, "utf8"), "hup");
+});
+
+test("send-keys maps tmux key names for a console program and -l sends text as is", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  const report = path.join(workspace.fixtures, "p3.1b-keys.txt");
+  const keys = fixture(workspace, "p3.1b-keys.js", `
+    const fs = require("node:fs");
+    process.stdin.setRawMode(true);
+    process.stdin.on("data", chunk => fs.appendFileSync(${JSON.stringify(report)}, chunk.toString("hex") + "\\n"));
+    console.log("keys-ready");
+    ${STAY_ALIVE}
+  `);
+  await ptySession(workspace, "keys", keys);
+  await waitForCapture(workspace, "keys", /keys-ready/);
+  const received = () => fs.existsSync(report) ? fs.readFileSync(report, "utf8").trim().split("\n") : [];
+  for (const [args, expected] of [
+    [["Escape"], "1b"],
+    [["C-c"], "03"],
+    [["Tab"], "09"],
+    [["BSpace"], "7f"],
+    [["Up"], "1b5b41"],
+    [["Enter"], "0d"],
+    [["-l", "Enter"], Buffer.from("Enter").toString("hex")],
+  ]) {
+    const before = received().length;
+    await cliOk(workspace, ["send-keys", "-t", "=keys", ...args]);
+    await waitUntil(() => received().length > before && received().slice(before).join("") === expected,
+      () => `${args.join(" ")} to arrive as ${expected}; got ${received().slice(before).join(",")}`);
+  }
+});
+
+test("capture-pane -S - returns lines scrolled off the screen, and -J puts a wrapped 300-character URL back on one line", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  const url = `https://example.test/${"a".repeat(279)}`;
+  assert.equal(url.length, 300);
+  const printer = fixture(workspace, "p3.1b-printer.js", `
+    for (let i = 0; i < 120; i += 1) console.log("line-" + i);
+    console.log(${JSON.stringify(url)});
+    console.log("printer-done");
+    ${STAY_ALIVE}
+  `);
+  await ptySession(workspace, "printer", printer);
+  await waitForCapture(workspace, "printer", /printer-done/);
+
+  const screen = await capture(workspace, "printer");
+  assert.doesNotMatch(screen, /^line-0$/m);
+  assert.equal(screen.split("\n").length - 1, 50);
+  const history = await capture(workspace, "printer", ["-S", "-"]);
+  for (const line of ["line-0", "line-60", "line-119"]) assert.match(history, new RegExp(`^${line}$`, "m"));
+  const lastTen = await capture(workspace, "printer", ["-S", "-10"]);
+  assert.equal(lastTen.split("\n").length - 1, 60);
+
+  assert.equal(screen.split("\n").includes(url), false);
+  assert.ok(screen.split("\n").includes(url.slice(0, 200)), "without -J the URL stays wrapped at 200 columns");
+  assert.ok((await capture(workspace, "printer", ["-J"])).split("\n").includes(url), "-J did not unwrap the URL");
+  assert.ok((await capture(workspace, "printer", ["-S", "-", "-J"])).split("\n").includes(url), "-S - -J did not unwrap the URL");
+});
+
+test("wide characters are captured without shifting the line", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  // The second write lands in a later frame, so OpenConsole repaints only that
+  // cell by column: it lands right only if the screen counts the emoji as two wide.
+  const wide = fixture(workspace, "p3.1b-wide.js", `
+    console.log("│漢字🙂│");
+    process.stdout.write("🙂ab");
+    setTimeout(() => { process.stdout.write("\\x1b[4GZ\\n"); console.log("wide-done"); }, 400);
+    ${STAY_ALIVE}
+  `);
+  await ptySession(workspace, "wide", wide);
+  const lines = (await waitForCapture(workspace, "wide", /wide-done/)).split("\n");
+  assert.ok(lines.includes("│漢字🙂│"), `captured: ${lines.slice(0, 3).join("|")}`);
+  assert.ok(lines.includes("🙂aZ"), `captured: ${lines.slice(0, 3).join("|")}`);
+});
+
+test("shutdown ends PTY sessions and their consoles", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  const host = await startHost(workspace);
+  const report = path.join(workspace.fixtures, "p3.1b-stop.json");
+  const stopped = fixture(workspace, "p3.1b-stop.js", `
+    require("node:fs").writeFileSync(${JSON.stringify(report)}, String(process.pid));
+    console.log("up");
+    ${STAY_ALIVE}
+  `);
+  await ptySession(workspace, "stopped", stopped);
+  await waitForCapture(workspace, "stopped", /up/);
+  const processes = [trackPid(Number(fs.readFileSync(report, "utf8"))), ...openConsolesOf(host)];
+  assert.equal(processes.length, 2);
+  await cliOk(workspace, ["shutdown"]);
+  assert.equal(await host.closed, 0);
+  await waitUntil(() => processes.every(entry => !isAlive(entry)), () => "the program and OpenConsole to stop on shutdown");
+});
+
+test("without node-pty a PTY session is refused with a message that names it, and no-PTY sessions still start", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  const hide = fixture(workspace, "p3.1b-hide-pty.cjs", `
+    const Module = require("node:module");
+    const resolve = Module._resolveFilename;
+    Module._resolveFilename = function (request, ...rest) {
+      if (request === "node-pty") throw Object.assign(new Error("Cannot find module 'node-pty'"), { code: "MODULE_NOT_FOUND" });
+      return resolve.call(this, request, ...rest);
+    };
+  `);
+  await startHost(workspace, { env: { NODE_OPTIONS: `--require ${hide.replace(/\\/g, "/")}` } });
+  const refused = await cli(workspace, ["new-session", "-d", "-s", "p", "-c", workspace.fixtures, "--kind", "adhoc", "--", process.execPath, "-v"]);
+  assert.notEqual(refused.code, 0);
+  assert.match(refused.stderr, /node-pty/);
+  await newSession(workspace, "plain", echoSession(workspace));
+  await waitForCapture(workspace, "plain", /fixture-up/);
+});
+
+test("a PTY program that cannot start gets spawn_failed and leaves no console behind", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  const host = await startHost(workspace);
+  const connection = await authenticated(workspace);
+  for (const [id, frame] of [
+    [1, { argv: ["no-such-program-p3-1b"], cwd: workspace.fixtures }],
+    [2, { argv: [path.join(workspace.fixtures, "p3.1b-missing.exe")], cwd: workspace.fixtures }],
+    [3, { argv: [process.execPath], cwd: path.join(workspace.fixtures, "p3.1b-no-such-dir") }],
+  ]) {
+    const reply = await ask(connection, { id, op: "new", name: "bad", env: {}, pty: true, kind: "adhoc", ...frame });
+    assert.equal(reply.error, "spawn_failed", JSON.stringify(reply));
+  }
+  assert.equal((await ask(connection, { id: 4, op: "has", name: "bad" })).live, false);
+  assert.deepEqual(openConsolesOf(host), []);
+});
+
+test("a PTY session is launched with its own environment and kept in its Job, and a named log gets its output", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  const report = path.join(workspace.fixtures, "p3.1b-ptyenv.json");
+  const log = path.join(workspace.fixtures, "p3.1b-pty.log");
+  const reporter = fixture(workspace, "p3.1b-ptyenv.js", `
+    const fs = require("node:fs");
+    fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify({ pid: process.pid, env: process.env, argv: process.argv.slice(2), isTTY: process.stdout.isTTY }));
+    console.log("env-written");
+    ${STAY_ALIVE}
+  `);
+  await cliOk(workspace, ["new-session", "-d", "-s", "ptyenv", "-c", workspace.fixtures, "--kind", "adhoc", "-e", "P31B_EXPLICIT=value with space", "--log", log,
+    "--", process.execPath, reporter, "arg with space", 'quote"inside'], { env: { CCDM_ROUTER_KEY_FILE: "leak" } });
+  await waitForCapture(workspace, "ptyenv", /env-written/);
+  const seen = JSON.parse(fs.readFileSync(report, "utf8"));
+  assert.equal(seen.isTTY, true);
+  assert.deepEqual(seen.argv, ["arg with space", 'quote"inside']);
+  assert.equal(seen.env.P31B_EXPLICIT, "value with space");
+  assert.equal(seen.env.CCDM_SESSION_NAME, "ptyenv");
+  assert.equal(envValue(seen.env, "CCDM_ROUTER_KEY_FILE"), undefined);
+  assert.ok((await cliOk(workspace, ["pids", "-t", "ptyenv"])).stdout.trim().split("\n").map(Number).includes(seen.pid));
+  await cliOk(workspace, ["kill-session", "-t", "=ptyenv", "--grace", "0"]);
+  assert.match(fs.readFileSync(log, "utf8"), /env-written/);
 });
