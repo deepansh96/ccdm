@@ -29,3 +29,4 @@ tests/e2e/guest-access.test.js
 tests/e2e/large-read-private-temp.test.js
 tests/e2e/nickname-statusline.test.js
 tests/e2e/package-contract.test.js
+tests/e2e/session-host.test.js
