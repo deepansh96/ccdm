@@ -38,5 +38,6 @@ tests/e2e/conversation-reminder-codex.test.js
 tests/e2e/session-host-seam.test.js
 tests/e2e/tmux-golden.test.js
 tests/e2e/ccdm-cli.test.js
+tests/e2e/claude-start.test.js
 tests/e2e/stop-restart.test.js
 tests/e2e/codex-start.test.js

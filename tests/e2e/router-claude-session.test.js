@@ -14,6 +14,7 @@ import {
   routerWithWebhooks,
   runRouterCli,
 } from "./support/router.js";
+import { startFakeHost } from "./support/session-fixture.js";
 import { readState, seedTmuxSession, updateState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -36,11 +37,16 @@ function claudeRouterWorkspace() {
   return workspace;
 }
 
-// The Bash launchers read UTF-8 pane text through Python, which on Windows defaults to the ANSI code page.
-const WINDOWS_LAUNCHER_ENV = process.platform === "win32" ? { PYTHONUTF8: "1" } : {};
+// On Windows the launcher goes through the fake ccdm-host, sharing the fixture's session table.
+const fakeHosts = new WeakMap();
+async function launcherEnv(workspace) {
+  if (process.platform !== "win32") return {};
+  if (!fakeHosts.has(workspace)) fakeHosts.set(workspace, await startFakeHost(workspace, { env: routerEnv(workspace) }));
+  return fakeHosts.get(workspace).env;
+}
 
-function startSession(workspace, extraEnv = {}) {
-  return runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace, { ...WINDOWS_LAUNCHER_ENV, ...extraEnv }), timeoutMs: 30000 });
+async function startSession(workspace, extraEnv = {}) {
+  return runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace, { ...(await launcherEnv(workspace)), ...extraEnv }), timeoutMs: 30000 });
 }
 
 test("start-session launches a router Claude project whose channel server says hello to the Router", async () => {
@@ -118,14 +124,14 @@ test("no Discord bot or webhook token reaches the session environment, launch fi
     }
   }
   assert.deepEqual(Object.keys(mcpConfig.mcpServers), ["ccdm"]);
-  assert.deepEqual(mcpConfig.mcpServers.ccdm.args.map((arg) => path.resolve(arg)), [path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js")]);
-  // The Bash launcher cannot protect these on Windows; P3.3's launcher will.
-  if (process.platform !== "win32") {
-    for (const file of fs.readdirSync(launchDir)) {
-      assertPrivate(path.join(launchDir, file), file);
-    }
-    assertPrivate(path.join(workspace.routerStateDir, "keys", "demo.key"));
+  // A Windows temp folder can carry a short (8.3) name; the `ccdm` entry starts Python from the long one.
+  const repoAsLaunched = process.platform === "win32" ? fs.realpathSync.native(workspace.repoDir) : workspace.repoDir;
+  assert.equal(path.resolve(mcpConfig.mcpServers.ccdm.args[0]), path.join(repoAsLaunched, "scripts", "ccdm-channel-server.js"));
+  assert.deepEqual(mcpConfig.mcpServers.ccdm.args.slice(1), process.platform === "win32" ? ["--ccdm-key-file", path.join(workspace.routerStateDir, "keys", "demo.key")] : []);
+  for (const file of fs.readdirSync(launchDir)) {
+    assertPrivate(path.join(launchDir, file), file);
   }
+  assertPrivate(path.join(workspace.routerStateDir, "keys", "demo.key"));
 });
 
 function assertLaunchCleanedUp(workspace) {
@@ -153,7 +159,7 @@ test("a launch whose development-channel confirmation never appears exits non-ze
   assertLaunchCleanedUp(workspace);
 });
 
-test("a launch whose Router hello fails exits non-zero and cleans up", platformGate("posix", "the Bash launcher cleanup; Windows launcher is P3.3"), async () => {
+test("a launch whose Router hello fails exits non-zero and cleans up", async () => {
   const workspace = claudeRouterWorkspace();
   // demo has its webhook, but no Router is running, so the channel server's
   // hello cannot succeed.
@@ -177,7 +183,7 @@ test("a launch whose Router hello fails exits non-zero and cleans up", platformG
   assertLaunchCleanedUp(workspace);
 });
 
-test("after stop-session the Router treats the channel as offline and the next owner message gets 💤", platformGate("posix", "stop-session.sh is zsh; the Windows stop path is P3.3"), async () => {
+test("after stop-session the Router treats the channel as offline and the next owner message gets 💤", async () => {
   const workspace = claudeRouterWorkspace();
   const router = await routerWithWebhooks(workspace, ["demo"]);
   const started = await startSession(workspace);
@@ -246,9 +252,8 @@ test("the statusline's context percentage rides on the next reply's Project Iden
   assert.equal(second.exitCode, 0, second.stderr || second.stdout);
   assert.equal(await ownerMessageReply(workspace, "owner-message-2", 2), "demo-claude · 57%");
 
-  // The Bash launcher cannot make its launch directory private on Windows; P3.3's launcher will.
   const context = path.join(workspace.routerStateDir, "launches", "demo", "context.json");
-  if (process.platform !== "win32") assertPrivate(context);
+  assertPrivate(context);
 
   const nicknames = await runStatusline(workspace, "scripts/cc-discord-nicknames.sh", 61);
   assert.equal(nicknames.exitCode, 0, nicknames.stderr || nicknames.stdout);
