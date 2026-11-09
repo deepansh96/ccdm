@@ -103,7 +103,12 @@ MODE = _winapi.PIPE_WAIT  # Byte mode has no flag of its own.
 def instance():
     return _winapi.CreateNamedPipe(pipe, OPEN, MODE, 2, 4096, 4096, 0, _winapi.NULL)
 def serve(handle):
-    _winapi.ConnectNamedPipe(handle, False)
+    try:
+        _winapi.ConnectNamedPipe(handle, False)
+    except OSError as error:
+        # A client can arrive between CreateNamedPipe and ConnectNamedPipe: it is connected.
+        if error.winerror != _winapi.ERROR_PIPE_CONNECTED:
+            raise
     request = json.loads(_winapi.ReadFile(handle, 4096)[0])
     reply = json.dumps({"type": "server_proof_ok", "proof": ipc.server_proof(secret, request["nonce"])}) + "\\n"
     _winapi.WriteFile(handle, reply.encode("utf-8"))
