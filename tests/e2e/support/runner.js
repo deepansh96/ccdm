@@ -474,7 +474,7 @@ function parseGenericLaunch(shellCommand) {
   for (const envMatch of match[2].matchAll(/([A-Za-z_][A-Za-z0-9_]*)='((?:[^']|'\\'')*)'/g)) {
     env[envMatch[1]] = unescapeSingleQuotes(envMatch[2]);
   }
-  const argv = match[3].match(/'(?:[^']|'\\'')*'|[^\s]+/g)
+  const argv = match[3].match(/'(?:[^']|'\\'')*'|[^\\s]+/g)
     .map(word => (word.startsWith("'") ? unescapeSingleQuotes(word.slice(1, -1)) : word));
   return { cwd: unescapeSingleQuotes(match[1]), env, argv };
 }
@@ -483,7 +483,8 @@ function parseTmuxLaunch(shellCommand) {
   if (shellCommand.endsWith(" node scripts/codex-bridge.js")) {
     return { kind: "codex-bridge", ...parseCodexBridgeLaunch(shellCommand) };
   }
-  if (!shellCommand.includes("server:ccdm")) {
+  // Every Claude launch still goes through the listener checks.
+  if (!shellCommand.includes(" claude ")) {
     return { kind: "generic", ...parseGenericLaunch(shellCommand) };
   }
   return { kind: "claude-listener", ...parseClaudeLaunch(shellCommand) };

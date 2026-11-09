@@ -309,6 +309,8 @@ test("reminders assignment-changed runs the script with the resolved Python and 
   const { workspace, ccdm } = await world(FRONTS[0]);
   // No shebang and no execute bit: only a named interpreter can run it.
   const service = path.join(workspace.repoDir, "scripts", "conversation-reminder-service.py");
+  // A workspace's executable may be a hard link to the checkout's: replace it, never write through it.
+  fs.rmSync(service);
   fs.writeFileSync(service, [
     "import json, sys",
     "print(json.dumps({'argv': sys.argv[1:], 'python': sys.executable}))",
