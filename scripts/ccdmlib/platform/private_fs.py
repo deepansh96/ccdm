@@ -29,6 +29,10 @@ DEFAULT_LABEL = "Private directory"
 _SYSTEM_SID = "S-1-5-18"
 _FULL_CONTROL = {"FA", "GA", "0x1f01ff"}
 _FILE_ERRORS = {2: "ENOENT", 3: "ENOENT", 5: "EACCES"}
+# Where icacls /inheritance:r keeps the inherited entries as explicit ones, as it
+# does on GitHub's Windows runner, they can only be named on the next read. One
+# round for owner and inheritance, one for those entries, one to spare.
+_MAX_REPAIR_ROUNDS = 3
 
 if WIN32:
     import ctypes
@@ -316,18 +320,19 @@ def ensure_private_dir(path: PathLike) -> None:
         os.chmod(directory, 0o700)
         return
     target = os.path.abspath(directory)
-    problems = _win32_dir_problems(target)
-    if not problems:
-        return
-    for _, args in problems:
-        try:
-            completed = subprocess.run([_icacls(), target, *args], stdin=subprocess.DEVNULL,
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                       creationflags=subprocess.CREATE_NO_WINDOW, check=False)
-        except OSError as error:
-            raise PermissionError(f"cannot make {target} private: {error}") from None
-        if completed.returncode != 0:
-            raise PermissionError(f"cannot make {target} private: icacls {args[0]} exited with {completed.returncode}")
+    for _round in range(_MAX_REPAIR_ROUNDS):
+        problems = _win32_dir_problems(target)
+        if not problems:
+            return
+        for _, args in problems:
+            try:
+                completed = subprocess.run([_icacls(), target, *args], stdin=subprocess.DEVNULL,
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                           creationflags=subprocess.CREATE_NO_WINDOW, check=False)
+            except OSError as error:
+                raise PermissionError(f"cannot make {target} private: {error}") from None
+            if completed.returncode != 0:
+                raise PermissionError(f"cannot make {target} private: icacls {args[0]} exited with {completed.returncode}")
     remaining = _win32_dir_problems(target)
     if remaining:
         raise PermissionError(f"cannot make {target} private: " + "; ".join(_format_problems(target, remaining, DEFAULT_LABEL)))

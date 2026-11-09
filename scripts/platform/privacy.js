@@ -24,6 +24,10 @@ const WIN32 = process.platform === "win32";
 const DEFAULT_LABEL = "Private directory";
 const SYSTEM_SID = "S-1-5-18";
 const TMP_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+// Where icacls /inheritance:r keeps the inherited entries as explicit ones, as it
+// does on GitHub's Windows runner, they can only be named on the next read. One
+// round for owner and inheritance, one for those entries, one to spare.
+const MAX_REPAIR_ROUNDS = 3;
 const SE_FILE_OBJECT = 1;
 const OWNER_SECURITY_INFORMATION = 1;
 const DACL_SECURITY_INFORMATION = 4;
@@ -287,12 +291,14 @@ function ensurePrivateDirSync(dir) {
     return;
   }
   const target = path.resolve(dir);
-  const problems = win32DirProblems(target);
-  if (problems.length === 0) return;
-  for (const { args } of problems) {
-    const result = spawnSync(icaclsPath(), [target, ...args], { stdio: "ignore", windowsHide: true });
-    if (result.error) throw result.error;
-    if (result.status !== 0) throw repairFailed(target, `icacls ${args[0]} exited with ${result.status}`);
+  for (let round = 0; round < MAX_REPAIR_ROUNDS; round += 1) {
+    const problems = win32DirProblems(target);
+    if (problems.length === 0) return;
+    for (const { args } of problems) {
+      const result = spawnSync(icaclsPath(), [target, ...args], { stdio: "ignore", windowsHide: true });
+      if (result.error) throw result.error;
+      if (result.status !== 0) throw repairFailed(target, `icacls ${args[0]} exited with ${result.status}`);
+    }
   }
   checkRepaired(target);
 }
@@ -304,14 +310,16 @@ async function ensurePrivateDir(dir) {
     return;
   }
   const target = path.resolve(dir);
-  const problems = win32DirProblems(target);
-  if (problems.length === 0) return;
   const run = promisify(execFile);
-  for (const { args } of problems) {
-    try {
-      await run(icaclsPath(), [target, ...args], { windowsHide: true });
-    } catch (error) {
-      throw repairFailed(target, `icacls ${args[0]} exited with ${error.code}`);
+  for (let round = 0; round < MAX_REPAIR_ROUNDS; round += 1) {
+    const problems = win32DirProblems(target);
+    if (problems.length === 0) return;
+    for (const { args } of problems) {
+      try {
+        await run(icaclsPath(), [target, ...args], { windowsHide: true });
+      } catch (error) {
+        throw repairFailed(target, `icacls ${args[0]} exited with ${error.code}`);
+      }
     }
   }
   checkRepaired(target);
