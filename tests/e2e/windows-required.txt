@@ -16,4 +16,3 @@ tests/e2e/large-read-private-temp.test.js
 tests/e2e/nickname-statusline.test.js
 tests/e2e/package-contract.test.js
 tests/e2e/router-preflight-privacy.test.js
-tests/e2e/usage-stats-poster.test.js
