@@ -86,6 +86,8 @@ def _is_listener(command: str) -> bool:
 
 def _listener_pids(key_file: Path) -> list[int]:
     """The thread's listener processes: those whose environment carries exactly its key path."""
+    if sys.platform == "win32":
+        return []  # No environment to read there; the session host stops the whole session.
     target = os.path.normpath(str(key_file))
     try:
         ps = subprocess.check_output(["ps", "axeww", "-o", "pid=,command="], text=True, stderr=subprocess.DEVNULL)
