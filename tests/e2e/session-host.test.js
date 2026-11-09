@@ -1223,24 +1223,28 @@ test("a read-only attach never resizes, the last writer sets the size, and the f
 test("output printed while attaching is neither lost nor shown twice", onlyWindows, async () => {
   const workspace = hostWorkspace();
   await startHost(workspace);
+  // Prints until the test says stop, so a slow machine cannot finish it before the attach.
+  const stop = path.join(workspace.fixtures, "p3.1c-counter-stop.txt");
   const counter = fixture(workspace, "p3.1c-counter.js", `
+    const fs = require("node:fs");
     let i = 0;
     const timer = setInterval(() => {
       for (let n = 0; n < 5; n += 1) console.log("count-" + (i++) + "-end");
-      if (i >= 600) { clearInterval(timer); console.log("counter-done"); }
+      if (fs.existsSync(${JSON.stringify(stop)})) { clearInterval(timer); console.log("counter-done"); }
     }, 5);
     ${STAY_ALIVE}
   `);
   await ptySession(workspace, "counter", counter);
-  await waitForCapture(workspace, "counter", /count-20-end/);
+  await waitForCapture(workspace, "counter", /count-\d+-end/);
   const { connection, reply } = await attachFrames(workspace, "counter");
+  const numbers = text => [...plainText(text).matchAll(/count-(\d+)-end/g)].map(match => Number(match[1]));
   let stream = "";
   while (!plainText(stream).includes("counter-done")) {
     const frame = await connection.next();
     assert.ok(frame, "the stream closed early");
     if (frame.out) stream += frame.out;
+    if (numbers(stream).length > 0 && !fs.existsSync(stop)) fs.writeFileSync(stop, "stop");
   }
-  const numbers = text => [...plainText(text).matchAll(/count-(\d+)-end/g)].map(match => Number(match[1]));
   const before = numbers(reply.snapshot);
   const after = numbers(stream);
   assert.ok(before.length > 0, "the snapshot had no counter lines");
