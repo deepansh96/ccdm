@@ -1213,7 +1213,11 @@ test("a registry and project path containing a quote and spaces reach the sessio
   assert.equal(fs.realpathSync.native(session.cwd), fs.realpathSync.native(workspace.repoDir));
   assert.equal(session.env.PROJECT_DIR, projectPath);
   assert.equal(session.env.WS_PORT, String(codex.port));
-  assert.equal(readRegistry(workspace).projects.alpha.pid, session.pid);
+  const state = readState(workspace.stateDir);
+  const bridgeLogs = fs.readdirSync(workspace.stateDir).filter(name => name.startsWith("codex-bridge-"))
+    .map(name => fs.readFileSync(path.join(workspace.stateDir, name), "utf8")).join("\n");
+  assert.equal(readRegistry(workspace).projects.alpha.pid, session.pid,
+    `${result.stdout}\n${JSON.stringify(state.fixtures.processes.map(row => [row.pid, row.command]))}\n${bridgeLogs}`);
   if (!WIN) assert.match(session.shellCommand, /o'\\''neil'\\''s project/);
 });
 
