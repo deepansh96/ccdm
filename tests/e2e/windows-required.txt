@@ -32,3 +32,4 @@ tests/e2e/package-contract.test.js
 tests/e2e/session-host.test.js
 tests/e2e/claude-channel-lifecycle.test.js
 tests/e2e/router-claude-session.test.js
+tests/e2e/ipc-pipe-listener.test.js
