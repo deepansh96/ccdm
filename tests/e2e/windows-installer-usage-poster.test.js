@@ -138,7 +138,8 @@ test("the task always runs the poster with --collect-only, with the resolved too
   assert.equal(installed.exitCode, 0, installed.stderr || installed.stdout);
   const stateRoot = defaultStateRoot(workspace);
   const config = readConfig(stateRoot);
-  assert.deepEqual(config.command, [PYTHON, path.join(workspace.repoDir, "scripts", "usage-stats-poster.py"), "--collect-only"]);
+  // Python reports the long form of a path; a CI temp folder can be an 8.3 short name.
+  assert.deepEqual(config.command, [PYTHON, path.join(fs.realpathSync.native(workspace.repoDir), "scripts", "usage-stats-poster.py"), "--collect-only"]);
   assert.deepEqual(Object.keys(config.env).sort(), ["CCDM_CODEX_PATH", "CCDM_STATE_ROOT", "PATH", "PYTHONUTF8"]);
   assert.equal(config.env.CCDM_CODEX_PATH, codex);
   assert.equal(config.env.CCDM_STATE_ROOT, stateRoot);
