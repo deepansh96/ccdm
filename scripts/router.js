@@ -14,7 +14,8 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
-const { onShutdown } = require("./platform/process.js");
+const { stateRoot } = require("./platform/paths.js");
+const { onShutdown, processAlive } = require("./platform/process.js");
 const { serviceInstalled } = require("./platform/services.js");
 const { createAttachmentCache } = require("./router/attachments.js");
 const { RouterClient } = require("./router/client.js");
@@ -198,6 +199,24 @@ async function serve() {
   log(`router ready: ${table.projects.size} router project(s), socket ${socketPath()}`);
 }
 
+// What the service host last wrote; on Windows there is no launchctl to ask.
+function reportServiceState() {
+  let recorded;
+  try {
+    recorded = JSON.parse(fs.readFileSync(path.join(stateRoot(), "services", "router.state.json"), "utf8"));
+  } catch {
+    return;
+  }
+  const alive = processAlive(recorded.host_pid, recorded.host_started_at ?? null);
+  if (recorded.state !== "disabled" && !alive) {
+    console.error(`service: not running (last state ${recorded.state})`);
+    return;
+  }
+  const next = Date.parse(recorded.next_start_at ?? "");
+  const wait = Number.isNaN(next) ? "" : ` (next start in ${Math.max(0, Math.ceil((next - Date.now()) / 1000))}s)`;
+  console.error(`service: ${recorded.state}${wait}`);
+}
+
 async function status(json = false) {
   const client = new RouterClient({ role: "status", timeoutMs: 5000 });
   let result;
@@ -206,6 +225,7 @@ async function status(json = false) {
     result = await client.request("status");
   } catch (error) {
     console.error(`router unreachable at ${socketPath()}: ${error.message}`);
+    if (process.platform === "win32") reportServiceState();
     process.exitCode = 1;
     return;
   } finally {

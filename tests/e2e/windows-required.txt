@@ -40,3 +40,4 @@ tests/e2e/tmux-golden.test.js
 tests/e2e/ccdm-cli.test.js
 tests/e2e/stop-restart.test.js
 tests/e2e/codex-start.test.js
+tests/e2e/windows-installer-router.test.js
