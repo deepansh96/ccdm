@@ -1,5 +1,5 @@
 {
-  "budget": 135,
+  "budget": 136,
   "skips": [
     {
       "file": "codex-start.test.js",
@@ -186,6 +186,12 @@
       "test": "restart-root-codex-agent rejects a channel missing from the registry's root channels before stopping the current root",
       "tag": "posix",
       "reason": "root Codex stays POSIX until D2"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "a root restart run as the detached copy starts root without CCDM_DETACHED",
+      "tag": "posix",
+      "reason": "a tmux session inherits its creator's environment; ccdm-host passes a session only what it is given"
     },
     {
       "file": "router-root-codex.test.js",

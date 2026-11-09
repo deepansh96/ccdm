@@ -15,6 +15,7 @@ import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 // Why a case runs only on Linux and macOS.
 const POSIX_STOP = "reads listeners from the fixture ps and sends POSIX signals; Windows has its own cases here";
 const TMUX_ROOT = "drives tmux's kill retry and the fixture pkill; the fake-host root cases here run on Windows";
+const TMUX_INHERITS = "a tmux session inherits its creator's environment; ccdm-host passes a session only what it is given";
 // Owner decision D2: the Windows root is Claude-only, so `restart-root --provider codex` is refused there.
 const CODEX_ROOT = "root Codex stays POSIX until D2";
 const NO_ACTIVE_SESSION = process.platform === "win32" ? "No active session" : "No active tmux session";
@@ -1265,6 +1266,21 @@ for (const backend of ROOT_BACKENDS) {
     assert.deepEqual(rootSession(workspace).sendKeys, [["Enter"]]);
   });
 }
+
+test("a root restart run as the detached copy starts root without CCDM_DETACHED", platformGate("posix", TMUX_INHERITS), async () => {
+  const workspace = createRouterWorkspace();
+  await startRouter(workspace);
+
+  const result = await restartRoot(workspace, { backend: "tmux", env: { CCDM_DETACHED: "1" } });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  // Root with the variable could not hand off its own next restart.
+  const environments = readState(workspace.stateDir).fixtures.claude.sessionEnvironments;
+  assert.deepEqual(environments.map(({ process: name }) => name), ["claude", "ccdm"]);
+  for (const { process: name, env } of environments) {
+    assert.equal("CCDM_DETACHED" in env, false, `${name} was started with CCDM_DETACHED`);
+  }
+});
 
 test("root's launch settings carry the statusLine command on Windows and are unchanged elsewhere", async () => {
   const workspace = createRouterWorkspace();
