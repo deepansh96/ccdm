@@ -55,13 +55,16 @@
 // live process only: it is written after the Router hello and removed when
 // this process exits or its Router session ends.
 const { execFile, spawn } = require("node:child_process");
-const { readFileSync, renameSync, rmSync, writeFileSync } = require("node:fs");
-const { chmod, mkdir, readFile, rm, stat, writeFile } = require("node:fs/promises");
+const { readFileSync, rmSync } = require("node:fs");
+const { readFile, rm, stat, writeFile } = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const { createInterface } = require("node:readline");
+const { writeFileAtomic, writeFileAtomicSync } = require("./platform/atomic.js");
+const { hookCommand } = require("./platform/hooks.js");
 const { stateRoot } = require("./platform/paths.js");
-const { isPrivateFile } = require("./platform/privacy.js");
+const { onShutdown, processStartTime } = require("./platform/process.js");
+const { ensurePrivateDir, isPrivateFile } = require("./platform/privacy.js");
 const reminder = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
 const { markTurn } = require("./thread-activity.js");
@@ -103,6 +106,8 @@ const REMINDER_STATE_DIR = process.env.CCDM_REMINDER_STATE_DIR || path.join(stat
 const REGISTRY_PATH = path.join(REMINDER_PROJECT_ROOT, "registry.json");
 const LAUNCH_ID = process.env.CCDM_CLAUDE_LAUNCH_ID || "";
 const capabilityPath = path.join(REMINDER_STATE_DIR, "capabilities", `${process.env.CCDM_CLAUDE_PROJECT || ""}.json`);
+// With the pid, names this process in its marker. Null on POSIX, where the pid alone does.
+const STARTED_AT = CAPABILITY ? processStartTime(process.pid) : null;
 
 // Owner messages this session may answer, by message ID.
 const interactions = new Map();
@@ -111,7 +116,8 @@ let inputNeededMarker = null;
 
 function removeCapabilityMarker() {
   try {
-    if (JSON.parse(readFileSync(capabilityPath, "utf8")).pid === process.pid) rmSync(capabilityPath, { force: true });
+    const marker = JSON.parse(readFileSync(capabilityPath, "utf8"));
+    if (marker.pid === process.pid && (marker.started_at ?? null) === STARTED_AT) rmSync(capabilityPath, { force: true });
   } catch { /* Absent or replaced markers need no cleanup. */ }
 }
 
@@ -122,7 +128,7 @@ async function hasCommandHooks() {
     if (!isPrivateFile(file)) return false;
     const settings = JSON.parse(await readFile(file, "utf8"));
     if (settings.enabledPlugins?.["discord@claude-plugins-official"] !== false) return false;
-    const expected = `node '${path.join(REMINDER_PROJECT_ROOT, "scripts", "claude-reminder-hook.js")}'`;
+    const expected = hookCommand(path.join(REMINDER_PROJECT_ROOT, "scripts", "claude-reminder-hook.js"));
     return ["SessionStart", "Stop", "StopFailure", "SessionEnd"].every(event =>
       settings.hooks?.[event]?.some(group => group.hooks?.some(hook =>
         hook.type === "command" && hook.command === expected,
@@ -150,11 +156,8 @@ async function writeCapabilityMarker(granted) {
     await rm(capabilityPath, { force: true });
     return;
   }
-  const directory = path.dirname(capabilityPath);
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  await chmod(directory, 0o700);
-  const tmp = `${capabilityPath}.${process.pid}.tmp`;
-  await writeFile(tmp, JSON.stringify({
+  await ensurePrivateDir(path.dirname(capabilityPath));
+  await writeFileAtomic(capabilityPath, JSON.stringify({
     schema_version: 1,
     project: assignment.project,
     channel_id: assignment.channel_id,
@@ -165,8 +168,8 @@ async function writeCapabilityMarker(granted) {
     reply_tool_verified: true,
     launch_id: LAUNCH_ID,
     pid: process.pid,
-  }) + "\n", { mode: 0o600 });
-  renameSync(tmp, capabilityPath);
+    started_at: STARTED_AT,
+  }) + "\n");
 }
 
 // An owner message opens an interaction the reply tool can name (by
@@ -256,8 +259,7 @@ async function saveAttachment(attachment) {
   const name = attachment.name ?? attachment.id;
   const ext = (name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : "bin").replace(/[^a-zA-Z0-9]/g, "") || "bin";
   const inbox = path.join(process.env.CCDM_ROUTER_STATE_DIR || "", "inbox", process.env.CCDM_CLAUDE_PROJECT || "");
-  await mkdir(inbox, { recursive: true, mode: 0o700 });
-  await chmod(inbox, 0o700);
+  await ensurePrivateDir(inbox);
   const file = path.join(inbox, `${Date.now()}-${attachment.id}.${ext}`);
   await writeFile(file, bytes, { mode: 0o600 });
   return file;
@@ -409,9 +411,7 @@ function send(frame) {
 function reportReady(outcome) {
   const file = process.env.CCDM_CHANNEL_READY_FILE;
   if (!file) return;
-  const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(outcome)}\n`, { mode: 0o600 });
-  renameSync(tmp, file);
+  writeFileAtomicSync(file, `${JSON.stringify(outcome)}\n`);
 }
 
 function attachmentMeta(attachments = []) {
@@ -521,10 +521,30 @@ function scheduleRestart(project) {
 // Reminder events are recorded in arrival order, after any stranded outbox.
 let reminderEvents = REMINDERS ? reminder.drainOutbox() : Promise.resolve();
 if (CAPABILITY) process.on("exit", removeCapabilityMarker);
-for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(signal, () => process.exit(0));
+onShutdown(() => process.exit(0));
+
+// `--ccdm-key-file` only lets stop paths find this server by its command line
+// on Windows. The key still comes from CCDM_ROUTER_KEY_FILE, so the two must agree.
+function keyFileFlagProblem() {
+  const at = process.argv.indexOf("--ccdm-key-file");
+  if (at === -1) return "";
+  const flag = process.argv[at + 1];
+  if (!flag) return "--ccdm-key-file needs a path";
+  const fromEnv = process.env.CCDM_ROUTER_KEY_FILE;
+  if (!fromEnv) return "";
+  const canonical = file => (process.platform === "win32" ? path.resolve(file).toLowerCase() : path.resolve(file));
+  return canonical(flag) === canonical(fromEnv) ? ""
+    : `--ccdm-key-file ${flag} and CCDM_ROUTER_KEY_FILE ${fromEnv} name different files`;
+}
 
 function main() {
   const project = process.env.CCDM_CLAUDE_PROJECT;
+  const flagProblem = keyFileFlagProblem();
+  if (flagProblem) {
+    reportReady({ ok: false, error: flagProblem });
+    process.stderr.write(`ccdm channel: ${flagProblem}\n`);
+    process.exit(1);
+  }
   let key;
   try {
     key = readFileSync(process.env.CCDM_ROUTER_KEY_FILE, "utf8").trim();

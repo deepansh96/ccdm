@@ -158,6 +158,16 @@ function hostCommandPath(name) {
   return result.stdout.trim() || null;
 }
 
+// The shell and flags Claude Code runs a hook command with on this OS: Git Bash
+// on Windows, or PowerShell when Git is absent.
+function fixtureHookShell() {
+  if (!WIN) return [hookShell(), "-c"];
+  const bash = gitBashTool("bash");
+  if (bash) return [bash, "-c"];
+  const windowsDir = process.env.SystemRoot || "C:\\Windows";
+  return [path.join(windowsDir, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"), "-NoProfile", "-Command"];
+}
+
 function createFixtureRuntime(fixtureDir) {
   const runtime = path.join(fixtureDir, "fixture-runtime.cjs");
   fs.copyFileSync(new URL("./state-lock.cjs", import.meta.url), path.join(fixtureDir, "state-lock.cjs"));
@@ -185,7 +195,7 @@ const stateFile = path.join(stateDir, "state.json");
 const workspaceMarker = path.dirname(stateDir);
 
 // The shell Claude Code runs hook commands with on this OS.
-const HOOK_SHELL = ${JSON.stringify(hookShell())};
+const HOOK_SHELL = ${JSON.stringify(fixtureHookShell())};
 
 function initialState() {
   return {
@@ -568,7 +578,7 @@ function runRouterClaudeHost() {
     for (const hook of (hooks[event] || []).flatMap((group) => group.hooks || [])) {
       if (hook.type !== "command") continue;
       const exitCode = await new Promise((done) => {
-        const child = spawn(HOOK_SHELL, ["-c", hook.command], { env: hookEnv, stdio: ["pipe", "ignore", "ignore"], windowsHide: true });
+        const child = spawn(HOOK_SHELL[0], [...HOOK_SHELL.slice(1), hook.command], { env: hookEnv, stdio: ["pipe", "ignore", "ignore"], windowsHide: true });
         child.on("exit", done);
         child.stdin.end(input);
       });
