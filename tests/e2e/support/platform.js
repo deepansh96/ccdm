@@ -1,7 +1,7 @@
 // What the harness needs to know about the host OS: which Python to run, how to
 // start a script, which tests run here, and the Windows fixture toolchain.
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { createRequire } from "node:module";
@@ -176,9 +176,10 @@ function compilerPath(env) {
 }
 
 const SHIM_SOURCE = fileURLToPath(new URL("./fixture-shim.cs", import.meta.url));
-const launcherDigest = () => createHash("sha256").update(fs.readFileSync(SHIM_SOURCE)).digest("hex").slice(0, 16);
+const CTRL_BREAK_SOURCE = fileURLToPath(new URL("./ctrl-break.cs", import.meta.url));
+const sourceDigest = source => createHash("sha256").update(fs.readFileSync(source)).digest("hex").slice(0, 16);
 // Deliberately not "ccdm-e2e-*": the runner treats those as a dead test's workspaces.
-const launcherDir = () => path.join(os.tmpdir(), `ccdm-fixture-launcher-${launcherDigest()}`);
+const launcherDir = () => path.join(os.tmpdir(), `ccdm-fixture-launcher-${sourceDigest(SHIM_SOURCE)}`);
 const launcherExe = dir => path.join(dir, "fixture-shim.exe");
 
 const NO_COMPILER = "The E2E fixtures need the .NET Framework compiler csc.exe, which ships with Windows, "
@@ -188,18 +189,21 @@ const NO_COMPILER = "The E2E fixtures need the .NET Framework compiler csc.exe, 
 // The launcher compiled from fixture-shim.cs. Built once per content hash and
 // published by rename, so parallel test files can race for it safely.
 export function fixtureLauncher(env = process.env) {
-  const dir = launcherDir();
-  const exe = launcherExe(dir);
+  return compiledOnce(SHIM_SOURCE, launcherDir(), "fixture-shim.exe", env);
+}
+
+function compiledOnce(source, dir, exeName, env) {
+  const exe = path.join(dir, exeName);
   if (fs.existsSync(exe)) return exe;
   const compiler = compilerPath(env);
   if (!compiler) throw new Error(NO_COMPILER);
   const staging = fs.mkdtempSync(`${dir}.staging-`);
   try {
     const compiled = spawnSync(compiler, [
-      "/nologo", "/target:exe", "/optimize+", `/out:${launcherExe(staging)}`, SHIM_SOURCE,
+      "/nologo", "/target:exe", "/optimize+", `/out:${path.join(staging, exeName)}`, source,
     ], { encoding: "utf8", windowsHide: true });
     if (compiled.status !== 0) {
-      throw new Error(`csc.exe could not compile fixture-shim.cs: ${compiled.stdout || compiled.stderr || compiled.error}`);
+      throw new Error(`csc.exe could not compile ${path.basename(source)}: ${compiled.stdout || compiled.stderr || compiled.error}`);
     }
     try {
       fs.renameSync(staging, dir);
@@ -211,6 +215,23 @@ export function fixtureLauncher(env = process.env) {
     fs.rmSync(staging, { recursive: true, force: true });
   }
   return exe;
+}
+
+// Starts a process that can later get sendCtrlBreak. On Windows it runs under
+// the ctrl-break launcher: own process group, shared hidden console, and no
+// stdin of its own (the launcher reads the harness's commands from it). Elsewhere
+// a plain spawn.
+export function spawnWithCtrlBreak(command, args, options = {}) {
+  if (process.platform !== "win32") return spawn(command, args, options);
+  const launcher = compiledOnce(CTRL_BREAK_SOURCE,
+    path.join(os.tmpdir(), `ccdm-ctrl-break-${sourceDigest(CTRL_BREAK_SOURCE)}`), "ctrl-break.exe", process.env);
+  return spawn(launcher, [command, ...args], { ...options, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+}
+
+// Ctrl+Break, delivered to a child started with spawnWithCtrlBreak.
+export function sendCtrlBreak(child) {
+  if (process.platform !== "win32") throw new Error("sendCtrlBreak exists only on Windows");
+  child.stdin.write("break\n");
 }
 
 // Why this host cannot run the suite, or null. npm test asks once, before

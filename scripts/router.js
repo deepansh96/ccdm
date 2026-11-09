@@ -12,9 +12,10 @@
 //   scripts/router.js probe <project>         post a connection notice through the project's webhook
 //   scripts/router.js migrate-root-config     copy root channels and users from root access.json
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
+const { onShutdown } = require("./platform/process.js");
+const { serviceInstalled } = require("./platform/services.js");
 const { createAttachmentCache } = require("./router/attachments.js");
 const { RouterClient } = require("./router/client.js");
 const { discordRequest } = require("./router/discord-rest.js");
@@ -32,7 +33,6 @@ const { deleteWebhook, ensureWebhook } = require("./router/webhooks.js");
 const OFFLINE_EMOJI = "💤";
 // Thread bits granted at the guild rather than in a project channel.
 const GUILD_THREAD_PERMISSIONS = ["ViewAuditLog"];
-const THREAD_SUPERVISOR_PLIST = path.join("Library", "LaunchAgents", "com.ccdm.thread-supervisor.plist");
 
 function log(line) {
   console.log(`[router] ${line}`);
@@ -188,8 +188,8 @@ async function serve() {
     client.destroy();
     process.exit(0);
   };
-  process.on("SIGTERM", stop);
-  process.on("SIGINT", stop);
+  // POSIX keeps exactly these two: launchd relaunches a Router that dies by any other signal.
+  onShutdown(stop, process.platform === "win32" ? {} : { signals: ["SIGTERM", "SIGINT"] });
 
   await client.login(token);
   await ready;
@@ -250,7 +250,7 @@ async function status(json = false) {
 
 // Thread Conversations are enabled once the supervisor is installed, configured, or connected.
 function threadsEnabled(result) {
-  if (result.supervisor?.connected || fs.existsSync(path.join(os.homedir(), THREAD_SUPERVISOR_PLIST))) return true;
+  if (result.supervisor?.connected || serviceInstalled("thread-supervisor")) return true;
   try {
     return Object.hasOwn(JSON.parse(fs.readFileSync(registryPath(), "utf8")), "thread_session_caps");
   } catch {

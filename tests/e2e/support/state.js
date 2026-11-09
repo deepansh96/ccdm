@@ -95,6 +95,10 @@ function initialState() {
       npm: {
         invocations: [],
       },
+      schtasks: {
+        invocations: [],
+        tasks: [],
+      },
       npx: {
         invocations: [],
       },
@@ -206,6 +210,10 @@ function normalizeState(value) {
         unloadFailuresRemaining: value?.fixtures?.launchctl?.unloadFailuresRemaining ?? 0,
       },
       processes: value?.fixtures?.processes ?? [],
+      schtasks: {
+        invocations: value?.fixtures?.schtasks?.invocations ?? [],
+        tasks: value?.fixtures?.schtasks?.tasks ?? [],
+      },
       registry: value?.fixtures?.registry ?? null,
       tmux: {
         ...(value?.fixtures?.tmux ?? {}),

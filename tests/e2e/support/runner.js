@@ -38,6 +38,7 @@ const FIXTURE_TOOLS = new Set([
   "pgrep",
   "pkill",
   "ps",
+  "schtasks",
   "security",
   "sleep",
   "tmux",
@@ -235,6 +236,7 @@ function initialState() {
       },
       network: { blocked: [] },
       launchctl: { invocations: [], loaded: [], loadFailuresRemaining: 0, unloadFailuresRemaining: 0 },
+      schtasks: { invocations: [], tasks: [] },
       npm: { invocations: [] },
       npx: { invocations: [] },
       processes: [],
@@ -318,6 +320,10 @@ function normalizeState(value) {
         unloadFailuresRemaining: value?.fixtures?.launchctl?.unloadFailuresRemaining || 0,
       },
       processes: value?.fixtures?.processes || [],
+      schtasks: {
+        invocations: value?.fixtures?.schtasks?.invocations || [],
+        tasks: value?.fixtures?.schtasks?.tasks || [],
+      },
       security: {
         credentials: value?.fixtures?.security?.credentials || {},
         invocations: value?.fixtures?.security?.invocations || [],
@@ -1342,6 +1348,21 @@ function runCodex() {
   }, 500);
 }
 
+// Answers \`/query /tn <name>\` by exit code from the workspace's own state. It
+// is a fixture for a read: it refuses every other schtasks call.
+function runSchtasks() {
+  const [verb, flag, name] = args;
+  if (!/^\\/query$/i.test(verb || "") || !/^\\/tn$/i.test(flag || "") || !name) {
+    console.error("unsupported schtasks invocation");
+    process.exit(2);
+  }
+  updateState((nextState) => {
+    nextState.fixtures.schtasks.invocations.push({ name });
+    return nextState;
+  });
+  process.exit(readState().fixtures.schtasks.tasks.includes(name) ? 0 : 1);
+}
+
 function runLaunchctl() {
   const operation = args[0];
   if (!["load", "unload", "list"].includes(operation)) {
@@ -1404,6 +1425,9 @@ switch (tool) {
     break;
   case "launchctl":
     runLaunchctl();
+    break;
+  case "schtasks":
+    runSchtasks();
     break;
   case "curl":
     runCurl();

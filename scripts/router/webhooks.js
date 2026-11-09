@@ -3,8 +3,9 @@
 // Webhook manager. Each project channel has one `ccdm-<project>` webhook; its
 // id is public registry data, its token a credential kept only here, in
 // private Router state (0600).
-const { mkdir, readFile, rename, rm, writeFile } = require("node:fs/promises");
+const { readFile, rename, rm, writeFile } = require("node:fs/promises");
 const path = require("node:path");
+const { ensurePrivateDir } = require("../platform/privacy.js");
 const { DiscordError, discordRequest } = require("./discord-rest.js");
 const { webhookName } = require("./identity.js");
 const { OpError } = require("./ops/errors.js");
@@ -32,7 +33,7 @@ async function readWebhookSecret(stateDir, project) {
 
 async function writeWebhookSecret(stateDir, project, secret) {
   const file = secretPath(stateDir, project);
-  await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  await ensurePrivateDir(path.dirname(file));
   const temporary = `${file}.${process.pid}.tmp`;
   await writeFile(temporary, `${JSON.stringify(secret)}\n`, { mode: 0o600 });
   await rename(temporary, file);

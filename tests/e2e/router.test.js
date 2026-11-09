@@ -92,8 +92,14 @@ test("a registry with no transport fields and no pool routes every project throu
 
 test("the network guard permits Unix sockets inside the Test Workspace and blocks other egress", async () => {
   const workspace = createRouterWorkspace();
-  const inside = path.join(workspace.tmpRoot, "probe.sock");
-  const outside = path.join(os.tmpdir(), `ralph-127-outside-${process.pid}.sock`);
+  const windowsPipe = process.platform === "win32";
+  const inside = windowsPipe ? `\\\\.\\pipe\\ccdm-probe-${process.pid}-inside` : path.join(workspace.tmpRoot, "probe.sock");
+  const outside = windowsPipe ? `\\\\.\\pipe\\ccdm-probe-${process.pid}-outside` : path.join(os.tmpdir(), `ralph-127-outside-${process.pid}.sock`);
+  if (windowsPipe) {
+    // The guard allows only pipe names the workspace published.
+    fs.mkdirSync(workspace.routerStateDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(workspace.routerStateDir, "probe.pipe"), inside);
+  }
   const result = await runPreloadProbe(workspace, `
     const net = require("node:net");
     const server = net.createServer(socket => socket.end("pong"));
@@ -360,7 +366,13 @@ test("router status reports connected sessions and webhook presence without leak
   const secretFile = path.join(workspace.routerStateDir, "webhooks", "demo.json");
   assertPrivate(secretFile);
   assertPrivate(workspace.routerStateDir);
-  assertPrivate(workspace.socketPath);
+  if (process.platform === "win32") {
+    // A pipe is no file: the private things are the name and the secret.
+    assertPrivate(path.join(workspace.routerStateDir, "router.pipe"));
+    assertPrivate(path.join(workspace.routerStateDir, "router.secret"));
+  } else {
+    assertPrivate(workspace.socketPath);
+  }
 });
 
 test("router status names a missing Manage Webhooks permission in a project channel", async () => {

@@ -1,5 +1,5 @@
 {
-  "budget": 102,
+  "budget": 104,
   "skips": [
     {
       "file": "harness-safety.test.js",
@@ -61,6 +61,18 @@
       "tag": "posix",
       "tests": 28,
       "reason": "contract cases for POSIX-only behaviour: file modes, Unix sockets and absolute POSIX paths"
+    },
+    {
+      "file": "router-pipe.test.js",
+      "test": "a live Unix socket blocks serve when no lock exists",
+      "tag": "posix",
+      "reason": "a Unix socket path can be held by a live listener; named pipes have no such path"
+    },
+    {
+      "file": "router-pipe.test.js",
+      "test": "on POSIX, serve ignores stdin EOF and dies by signal on SIGHUP",
+      "tag": "posix",
+      "reason": "launchd's relaunch rule depends on POSIX signals"
     }
   ]
 }

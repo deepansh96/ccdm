@@ -6,6 +6,7 @@ import net from "node:net";
 import path from "node:path";
 
 import { bridgeChildEnv, collectProcess, createBridgeWorkspace } from "./bridge.js";
+import { spawnWithCtrlBreak } from "./platform.js";
 import { runNodeEntrypoint, scaledTimeout } from "./runner.js";
 import { seedRegistry, updateState } from "./state.js";
 import { registerTeardownCallback } from "./teardown.js";
@@ -43,6 +44,37 @@ export function createRouterWorkspace(registry = routerRegistry()) {
   writeRootToken(workspace);
   seedRegistry(workspace, registry);
   return workspace;
+}
+
+const ipc = () => createRequire(import.meta.url)("../../../scripts/platform/ipc.js");
+
+// The path a raw socket connects to right now.
+export function routerSocketPath(workspace) {
+  return typeof workspace.socketPath === "function" ? workspace.socketPath().path : workspace.socketPath;
+}
+
+// Makes `server` the workspace's Router: on Windows it publishes a pipe name and
+// a secret as the real one does. Returns the secret (null on POSIX).
+export async function listenAsRouter(workspace, server) {
+  fs.mkdirSync(workspace.routerStateDir, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") {
+    await new Promise((resolve) => server.listen(workspace.socketPath, resolve));
+    return null;
+  }
+  const { pipe, secret } = ipc().publishPipe(workspace.routerStateDir, "router");
+  await new Promise((resolve) => server.listen(pipe, resolve));
+  return secret;
+}
+
+// A fake Router's answer to the client's proof frame.
+export function proofReply(frame, secret) {
+  return { type: "server_proof_ok", proof: ipc().serverProof(secret, frame.nonce) };
+}
+
+// Hard-stops a Router; the kill a crash looks like.
+export function killRouter(running) {
+  if (process.platform === "win32") running.child.kill("SIGKILL");
+  else process.kill(-running.child.pid, "SIGKILL");
 }
 
 // Launchers find node through CCDM_ROUTER_NODE, since the fixture PATH has none.
@@ -105,7 +137,7 @@ export async function connectSession(workspace, project, key, { env = {} } = {})
 // `send` takes a frame object or a literal line; `frames` collects every
 // parsed frame the Router sends back; `closed` resolves when the Router hangs up.
 export async function rawRouterSocket(workspace) {
-  const socket = net.connect(workspace.socketPath);
+  const socket = net.connect(routerSocketPath(workspace));
   registerTeardownCallback(() => socket.destroy());
   await new Promise((resolve, reject) => {
     socket.once("connect", resolve);
@@ -213,7 +245,7 @@ export async function connectRoot(workspace, key) {
 // A stand-in Router that answers `router status` but refuses every other
 // hello, so a root launch passes its health check and then fails its hello.
 export async function startRefusingRouter(workspace) {
-  fs.mkdirSync(workspace.routerStateDir, { recursive: true, mode: 0o700 });
+  let secret = null;
   const server = net.createServer((socket) => {
     let buffer = "";
     const reply = (frame) => socket.write(`${JSON.stringify(frame)}\n`);
@@ -224,7 +256,8 @@ export async function startRefusingRouter(workspace) {
       while ((newline = buffer.indexOf("\n")) >= 0) {
         const frame = JSON.parse(buffer.slice(0, newline));
         buffer = buffer.slice(newline + 1);
-        if (frame.type === "hello" && frame.role === "status") reply({ type: "hello_ok", v: 1, scope: null });
+        if (frame.type === "server_proof") reply(proofReply(frame, secret));
+        else if (frame.type === "hello" && frame.role === "status") reply({ type: "hello_ok", v: 1, scope: null });
         else if (frame.type === "hello") {
           reply({ type: "hello_error", v: 1, error: { code: "unauthorized", message: "refused" } });
           socket.end();
@@ -235,9 +268,20 @@ export async function startRefusingRouter(workspace) {
       }
     });
   });
-  await new Promise((resolve) => server.listen(workspace.socketPath, resolve));
+  secret = await listenAsRouter(workspace, server);
   registerTeardownCallback(() => new Promise((resolve) => server.close(resolve)));
   return server;
+}
+
+// A Router that can be sent Ctrl+Break (see sendCtrlBreak in platform.js).
+export async function startRouterWithConsole(workspace, { env: extraEnv = {} } = {}) {
+  const env = routerEnv(workspace, extraEnv);
+  const command = [process.execPath, path.join(workspace.repoDir, "scripts/router.js"), "serve"];
+  const child = spawnWithCtrlBreak(command[0], command.slice(1), { cwd: workspace.repoDir, env, stdio: ["pipe", "pipe", "pipe"] });
+  const running = collectProcess(child, { command, cwd: workspace.repoDir, env }, workspace);
+  registerTeardownCallback(() => running.stop());
+  await running.waitForOutput(/router ready/);
+  return running;
 }
 
 const bridgeRouters = new WeakMap();

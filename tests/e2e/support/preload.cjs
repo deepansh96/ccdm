@@ -1136,10 +1136,31 @@ function unixPathFromNetArgs(args) {
   return null;
 }
 
-// Local sockets such as the Router's are allowed only inside the Test Workspace.
+// The pipe names published in this Test Workspace's Router state.
+function workspacePipeNames(workspaceRoot) {
+  const names = new Set();
+  for (const dir of new Set([process.env.CCDM_ROUTER_STATE_DIR, path.join(workspaceRoot, "router")].filter(Boolean))) {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const entry of entries.filter(name => name.endsWith(".pipe"))) {
+      try {
+        names.add(fs.readFileSync(path.join(dir, entry), "utf8").trim().toLowerCase());
+      } catch { /* Being replaced. */ }
+    }
+  }
+  return names;
+}
+
+// Local sockets such as the Router's are allowed only inside the Test Workspace,
+// and a named pipe only if the workspace published its name.
 function isWorkspaceSocket(socketPath) {
   if (!socketPath || !stateDir) return false;
   const workspaceRoot = path.dirname(path.resolve(stateDir));
+  if (/^\\\\[.?]\\pipe\\/i.test(socketPath)) return workspacePipeNames(workspaceRoot).has(socketPath.toLowerCase());
   return path.resolve(socketPath).startsWith(`${workspaceRoot}${path.sep}`);
 }
 

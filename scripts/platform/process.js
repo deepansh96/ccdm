@@ -63,4 +63,28 @@ function processAlive(pid, startedAt = null) {
   return actual === null || actual === startedAt;
 }
 
-module.exports = { processAlive, processIdentity, processStartTime };
+const DEFAULT_SHUTDOWN_SIGNALS = Object.freeze(["SIGINT", "SIGTERM", "SIGHUP", ...(WIN32 ? ["SIGBREAK"] : [])]);
+
+// Calls `fn` once, with the signal name or "stdin", when this process is asked
+// to stop. Stdin EOF counts only when asked for. Returns a function that
+// removes the handlers.
+function onShutdown(fn, { signals = DEFAULT_SHUTDOWN_SIGNALS, stdinEof = false } = {}) {
+  let fired = false;
+  const trigger = reason => {
+    if (fired) return;
+    fired = true;
+    fn(reason);
+  };
+  const onStdinEnd = () => trigger("stdin");
+  for (const signal of signals) process.on(signal, trigger);
+  if (stdinEof) {
+    process.stdin.on("end", onStdinEnd);
+    process.stdin.resume();
+  }
+  return () => {
+    for (const signal of signals) process.off(signal, trigger);
+    if (stdinEof) process.stdin.off("end", onStdinEnd);
+  };
+}
+
+module.exports = { onShutdown, processAlive, processIdentity, processStartTime };

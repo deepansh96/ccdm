@@ -4,14 +4,28 @@
 const { readFile } = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
+const { ipcEndpoint, readIpcSecret } = require("../platform/ipc.js");
 const { expandHome, stateRoot } = require("../platform/paths.js");
 
 function stateDir() {
   return process.env.CCDM_ROUTER_STATE_DIR || path.join(stateRoot(), "router");
 }
 
+// Where the Router is found, for messages: its socket on POSIX, and on Windows
+// the file naming the pipe of the current start.
 function socketPath() {
-  return path.join(stateDir(), "router.sock");
+  return path.join(stateDir(), process.platform === "win32" ? "router.pipe" : "router.sock");
+}
+
+// Where a client connects right now and the secret the server must prove it
+// holds (POSIX has none). On Windows both change at every Router start and
+// this throws while either file is missing, so resolve it again for each
+// attempt. The pipe name is read first: publishPipe writes the secret first,
+// so a new name is never paired with the previous start's secret.
+function routerEndpoint() {
+  const dir = stateDir();
+  const endpoint = ipcEndpoint(dir, "router");
+  return { path: endpoint, secret: process.platform === "win32" ? readIpcSecret(dir, "router") : null };
 }
 
 function registryPath() {
@@ -33,4 +47,4 @@ async function rootToken() {
   return token;
 }
 
-module.exports = { expandHome, registryPath, rootStateDir, rootToken, socketPath, stateDir };
+module.exports = { expandHome, registryPath, rootStateDir, rootToken, routerEndpoint, socketPath, stateDir };

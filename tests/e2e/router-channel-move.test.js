@@ -11,6 +11,8 @@ import {
   OWNER_ID,
   connectSession,
   createRouterWorkspace,
+  listenAsRouter,
+  proofReply,
   routerEnv,
   routerRegistry,
   routerWithWebhooks,
@@ -112,10 +114,23 @@ test("the client adopts scope changes only for its own project, with a channel, 
   fs.mkdirSync(workspace.routerStateDir, { recursive: true, mode: 0o700 });
   const frame = (value) => `${JSON.stringify(value)}\n`;
   const scopeChanged = (scope) => frame({ type: "event", event: "scope_changed", scope });
+  let secret = null;
+  const earlyScope = () => scopeChanged({ project: "demo", channel_id: "early-channel", type: "claude" });
   const server = net.createServer((socket) => {
-    // Before hello_ok: ignored.
-    socket.write(scopeChanged({ project: "demo", channel_id: "early-channel", type: "claude" }));
-    socket.once("data", () => {
+    // Before hello_ok: ignored. On Windows the server must prove itself first.
+    if (process.platform !== "win32") socket.write(earlyScope());
+    let buffer = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      if (!buffer.endsWith("\n")) return;
+      const incoming = JSON.parse(buffer);
+      buffer = "";
+      if (incoming.type === "server_proof") {
+        socket.write(frame(proofReply(incoming, secret)));
+        socket.write(earlyScope());
+        return;
+      }
       socket.write(frame({ type: "hello_ok", v: 1, scope: { project: "demo", channel_id: "demo-channel", type: "claude" } }));
       socket.write(scopeChanged({ project: "beta", channel_id: "beta-channel", type: "codex" }));
       socket.write(scopeChanged({ project: "demo", channel_id: "", type: "claude" }));
@@ -124,7 +139,7 @@ test("the client adopts scope changes only for its own project, with a channel, 
       socket.write(scopeChanged({ project: "demo", channel_id: "moved-channel", type: "claude" }));
     });
   });
-  await new Promise((resolve) => server.listen(workspace.socketPath, resolve));
+  secret = await listenAsRouter(workspace, server);
   registerTeardownCallback(() => new Promise((resolve) => server.close(resolve)));
   const { RouterClient } = createRequire(import.meta.url)(path.join(workspace.repoDir, "scripts/router/client.js"));
   const client = new RouterClient({ socketPath: workspace.socketPath, project: "demo", key: "demo-key" });

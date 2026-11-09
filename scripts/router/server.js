@@ -1,12 +1,15 @@
 "use strict";
 
-// The Router's private Unix socket: NDJSON frames, a versioned hello with a
-// per-project key, request/response by id, and events pushed to sessions.
+// The Router's private endpoint (a Unix socket, or on Windows a named pipe
+// whose name and secret are published per start): NDJSON frames, a versioned
+// hello with a per-project key, request/response by id, and events pushed to
+// sessions.
 const crypto = require("node:crypto");
 const { watch } = require("node:fs");
 const { chmod, mkdir, readFile, unlink } = require("node:fs/promises");
 const net = require("node:net");
 const path = require("node:path");
+const { createIpcListener, publishPipe, serverProof, unpublishPipe } = require("../platform/ipc.js");
 const { ensurePrivateDir } = require("../platform/privacy.js");
 const { withDeadline } = require("./discord-rest.js");
 const { threadRoute } = require("./inbound.js");
@@ -37,6 +40,9 @@ function keysMatch(expected, actual) {
   const b = Buffer.from(String(actual ?? ""));
   return a.length > 0 && a.length === b.length && crypto.timingSafeEqual(a, b);
 }
+
+// The nonce of a server_proof frame: see scripts/platform/ipc.js.
+const validNonce = nonce => typeof nonce === "string" && /^[0-9a-f]{64}$/.test(nonce);
 
 // A frame is a JSON object with a string type; requests also need a string id.
 function parseFrame(line) {
@@ -101,6 +107,8 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
   const violations = [];
   const keysDir = path.join(stateDir, "keys");
   let keysWatcher = null;
+  // This start's secret on Windows; POSIX has no server proof.
+  let proofSecret = null;
 
   async function readKey(file) {
     try {
@@ -374,7 +382,11 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
         }
         // Requests wait for an in-flight hello so they see its outcome, but not for each other.
         let handled;
-        if (frame.type === "hello" && !connection.role && !connection.hello) {
+        if (proofSecret && frame.type === "server_proof" && validNonce(frame.nonce) && !connection.proofSent
+          && !connection.role && !connection.hello) {
+          connection.proofSent = true;
+          handled = Promise.resolve(send(socket, { type: "server_proof_ok", proof: serverProof(proofSecret, frame.nonce) }));
+        } else if (frame.type === "hello" && !connection.role && !connection.hello) {
           handled = connection.hello = hello(connection, frame);
         } else if (frame.type === "request") {
           handled = (connection.hello ?? Promise.resolve()).catch(() => {}).then(() => request(connection, frame));
@@ -388,17 +400,26 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     socket.on("close", () => forget(connection));
   }
 
-  const server = net.createServer(onConnection);
+  const listener = createIpcListener(onConnection);
+
+  async function listenOnPipe() {
+    // publishPipe can throw part-way when something holds the files; the start fails.
+    const { pipe, secret } = publishPipe(stateDir, "router");
+    process.once("exit", () => unpublishPipe(stateDir, "router", pipe));
+    proofSecret = secret;
+    await listener.listen(pipe);
+  }
+
+  async function listenOnSocket() {
+    await claimSocketPath(socketPath);
+    await listener.listen(socketPath);
+    await chmod(socketPath, 0o600);
+  }
 
   return {
     async listen() {
       await ensurePrivateDir(stateDir);
-      await claimSocketPath(socketPath);
-      await new Promise((resolve, reject) => {
-        server.once("error", reject);
-        server.listen(socketPath, resolve);
-      });
-      await chmod(socketPath, 0o600);
+      await (process.platform === "win32" ? listenOnPipe() : listenOnSocket());
       await mkdir(keysDir, { recursive: true, mode: 0o700 });
       if (process.platform === "win32") await ensurePrivateDir(keysDir);
       keysWatcher = watch(keysDir, () => {
@@ -474,7 +495,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       rootSession?.socket.destroy();
       observerSession?.socket.destroy();
       supervisorSession?.socket.destroy();
-      server.close();
+      listener.close();
     },
   };
 }

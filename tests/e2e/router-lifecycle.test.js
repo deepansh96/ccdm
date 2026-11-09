@@ -7,6 +7,7 @@ import {
   OWNER_ID,
   connectSession,
   createRouterWorkspace,
+  killRouter,
   rawRouterSocket,
   runRouterCli,
   startRouter,
@@ -114,7 +115,7 @@ test("after the Router is killed and restarted, a session reconnects on its own 
   let reconnectedAt = null;
   demo.client.once("reconnect", () => { reconnectedAt = Date.now(); });
 
-  process.kill(-first.child.pid, "SIGKILL");
+  killRouter(first);
   await first.closed;
   const startedAt = Date.now();
   await assert.rejects(demo.client.request("reply", { channel_id: "demo-channel", text: "while down" }),

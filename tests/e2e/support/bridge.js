@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { WebSocketServer } from "ws";
 
@@ -34,12 +35,20 @@ export function bridgeChildEnv(workspace, extraEnv = {}) {
   };
 }
 
+// A client's way to the Router: the socket path on POSIX. On Windows a resolver
+// for RouterClient, since every Router start publishes a new pipe name and secret.
+function routerSocket(routerStateDir) {
+  if (process.platform !== "win32") return path.join(routerStateDir, "router.sock");
+  const { ipcEndpoint, readIpcSecret } = createRequire(import.meta.url)("../../../scripts/platform/ipc.js");
+  return () => ({ path: ipcEndpoint(routerStateDir, "router"), secret: readIpcSecret(routerStateDir, "router") });
+}
+
 // The Router's private state lives inside the Test Workspace; a short path
 // keeps the socket under the platform's Unix-socket length limit.
 export function createBridgeWorkspace(options = {}) {
   const base = createWorkspace(options);
   const routerStateDir = path.join(base.tmpRoot, "router");
-  const workspace = Object.freeze({ ...base, routerStateDir, socketPath: path.join(routerStateDir, "router.sock") });
+  const workspace = Object.freeze({ ...base, routerStateDir, socketPath: routerSocket(routerStateDir) });
   overlayRoots.set(workspace, writeOverlay(workspace));
   return workspace;
 }

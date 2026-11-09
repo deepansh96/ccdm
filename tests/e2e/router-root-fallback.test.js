@@ -10,6 +10,7 @@ import {
   OWNER_ID,
   ROOT_TOKEN,
   createRouterWorkspace,
+  killRouter,
   routerEnv,
   routerRegistry,
   routerWithWebhooks,
@@ -103,7 +104,7 @@ for (const [mode, { launch, restart }] of Object.entries(MODES)) {
     // Nothing reaches Discord directly while the Router serves root.
     assert.deepEqual(readState(workspace.stateDir).fixtures.discord.logins ?? [], [{ token: ROOT_TOKEN }]);
 
-    process.kill(-router.child.pid, "SIGKILL");
+    killRouter(router);
     await router.closed;
 
     // After the threshold root logs in with its own token and says so in the primary root channel.
@@ -150,7 +151,7 @@ for (const [mode, { launch, restart }] of Object.entries(MODES)) {
     const workspace = rootWorkspace();
     const router = await routerWithWebhooks(workspace, ["demo"]);
     const root = await launch(workspace);
-    process.kill(-router.child.pid, "SIGKILL");
+    killRouter(router);
     await router.closed;
     await waitForState(workspace, (next) => next.fixtures.discord.messages.some((m) => m.content === NOTICE), 15000);
     const keyFile = path.join(workspace.routerStateDir, "keys", ".root.key");
@@ -173,7 +174,7 @@ for (const [mode, { launch, restart }] of Object.entries(MODES)) {
 
 // Stops the Router and waits for root's fallback notice.
 async function routerDown(workspace, router) {
-  process.kill(-router.child.pid, "SIGKILL");
+  killRouter(router);
   await router.closed;
   await waitForState(workspace, (next) => next.fixtures.discord.messages.some((m) => m.content === NOTICE), 15000);
 }
