@@ -202,11 +202,14 @@ def accept_dialogs(name: str, cwd: str, project_path: str, deadline: float) -> D
     raise LaunchFailed(_CHANNEL_PROMPT_MISSING)
 
 
-def wait_ready(name: str, ready_file: str, deadline: float, dialogs: Optional[Dialogs] = None) -> Mapping[str, Any]:
+def wait_ready(
+    name: str, ready_file: str, deadline: float, dialogs: Optional[Dialogs] = None, exited: Optional[str] = None
+) -> Mapping[str, Any]:
     """Wait for the channel server's ``ready.json``; returns it once it says ``ok``.
 
     While it waits it still answers the auto-mode offer. Raises
-    :class:`LaunchFailed` with today's message on a refused or missing hello.
+    :class:`LaunchFailed` with today's message on a refused or missing hello. With
+    ``exited``, a session that ends first fails at once, with that message.
     """
     dialogs = dialogs or Dialogs(name)
     retryable = (FileNotFoundError, json.JSONDecodeError, PermissionError) if WIN32 else (FileNotFoundError, json.JSONDecodeError)
@@ -215,6 +218,8 @@ def wait_ready(name: str, ready_file: str, deadline: float, dialogs: Optional[Di
             with open(ready_file, encoding="utf-8") as handle:
                 outcome = json.load(handle)
         except retryable:
+            if exited is not None and not session_host.is_live(name):
+                raise LaunchFailed(exited)
             try:
                 dialogs.dismiss_auto_mode_offer(_screen(name))
             except session_host.SessionHostError:
