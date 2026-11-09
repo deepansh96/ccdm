@@ -19,7 +19,6 @@ const WHOLE_SUITES = Object.freeze({
   "thread-supervisor-launchagent.test.js": { tag: "posix", reason: "installs through launchd and a zsh script; Windows installers have their own suites" },
   "usage-stats-installer.test.js": { tag: "posix", reason: "installs through launchd and a zsh script; Windows installers have their own suites" },
   "setup.test.js": { tag: "posix", reason: "drives zsh scripts, which the Windows port replaces" },
-  "stop-restart.test.js": { tag: "posix", reason: "drives zsh scripts, which the Windows port replaces" },
   "macos-real-tools.test.js": { tag: "darwin", reason: "drives real Homebrew tmux and zsh on macOS" },
 });
 
