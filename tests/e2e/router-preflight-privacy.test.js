@@ -55,6 +55,17 @@ async function preflight(workspace, env = {}) {
   return { exitCode: result.exitCode, ...JSON.parse(result.stdout), stderr: result.stderr };
 }
 
+// Runs the printed fix lines and preflights again. On GitHub's Windows runner
+// removing inheritance leaves entries that only the next preflight can name.
+async function clearWithFixLines(workspace, firstBlockers) {
+  let blockers = firstBlockers;
+  for (let round = 0; round < 3 && blockers.length > 0; round += 1) {
+    runFixLines(blockers);
+    blockers = (await preflight(workspace)).blockers;
+  }
+  assert.deepEqual(blockers, []);
+}
+
 function assertBlocked(result, dir) {
   assert.equal(result.exitCode, 1, JSON.stringify(result));
   assert.equal(result.ready, false);
@@ -77,11 +88,10 @@ test("an inherited state directory blocks, and its printed fix lines clear it", 
   fs.mkdirSync(workspace.routerStateDir);
   const blocked = await preflight(workspace);
   assertBlocked(blocked, workspace.routerStateDir);
-  assert.match(blocked.blockers[0], /Router state directory .* inherits permissions/);
-  runFixLines(blocked.blockers);
-  const fixed = await preflight(workspace);
-  assert.deepEqual(fixed.blockers, []);
-  assert.equal(fixed.exitCode, 0);
+  // An elevated process's new directory also gets an owner line, printed first.
+  assert.ok(blocked.blockers.some(line => /Router state directory .* inherits permissions/.test(line)), blocked.blockers.join("\n"));
+  await clearWithFixLines(workspace, blocked.blockers);
+  assert.equal((await preflight(workspace)).exitCode, 0);
 });
 
 test("an explicit foreign entry blocks, and its printed fix lines clear it", windowsOnly, async () => {
@@ -115,8 +125,7 @@ test("a token directory that is not private blocks with fix text, and the fix cl
   const blocked = await preflight(workspace);
   assertBlocked(blocked, tokenDir(workspace));
   assert.match(blocked.blockers[0], /Root token directory/);
-  runFixLines(blocked.blockers);
-  assert.deepEqual((await preflight(workspace)).blockers, []);
+  await clearWithFixLines(workspace, blocked.blockers);
 });
 
 function runPython(workspace, source, args) {

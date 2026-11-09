@@ -55,6 +55,17 @@ async function foreignEntryDir(ctx) {
 }
 
 const me = ctx => ctx.node("privacy.currentUserSid");
+
+// Runs the printed fix lines and reads the directory again. On GitHub's Windows
+// runner removing inheritance leaves entries that only the next read can name.
+async function clearWithFixLines(ctx, dir, firstLines, runLine) {
+  let lines = firstLines;
+  for (let round = 0; round < 3 && lines.length > 0; round += 1) {
+    for (const line of fixCommands(lines)) runLine(line);
+    lines = await ctx.node("privacy.privateDirBlockers", dir);
+  }
+  assert.deepEqual(lines, []);
+}
 const foreignOwner = "S-1-5-21-1000000000-1000000001-1000000002-1234";
 
 // Each row: name, SDDL built from this user's SID, the problem words expected per line.
@@ -104,7 +115,12 @@ const windowsCases = [
   {
     name: "a directory with inheritance on blocks with its fix line",
     ...blockers,
-    setup: inheritedDir,
+    // An elevated process's new directory is owned by Administrators, a separate line.
+    setup: async ctx => {
+      const dir = inheritedDir(ctx);
+      icacls(dir, "/setowner", `*${await me(ctx)}`);
+      return dir;
+    },
     args: (ctx, dir) => [dir],
     check: async ({ node, python }, ctx, dir) => {
       const sid = await me(ctx);
@@ -173,8 +189,7 @@ const windowsCases = [
     args: (ctx, dir) => [dir],
     check: async ({ node }, ctx, dir) => {
       assert.ok(node.value.length >= 2, node.value.join("\n"));
-      for (const line of fixCommands(node.value)) runInCmd(line);
-      assert.deepEqual(await ctx.node("privacy.privateDirBlockers", dir), []);
+      await clearWithFixLines(ctx, dir, node.value, runInCmd);
       assert.deepEqual(await ctx.py("private_fs.blockers", dir), []);
     },
   },
@@ -189,8 +204,7 @@ const windowsCases = [
     },
     args: (ctx, dir) => [dir],
     check: async ({ node }, ctx, dir) => {
-      for (const line of fixCommands(node.value)) runInPowerShell(line);
-      assert.deepEqual(await ctx.node("privacy.privateDirBlockers", dir), []);
+      await clearWithFixLines(ctx, dir, node.value, runInPowerShell);
     },
   },
   {
