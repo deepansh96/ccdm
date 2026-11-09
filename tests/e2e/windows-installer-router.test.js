@@ -491,6 +491,8 @@ def register(subparsers):
 
 test("install-service for a known service without a module exits 2 with 'not available yet'", async () => {
   const workspace = createRouterWorkspace();
+  // Every service gets its module in time, so the case takes one away.
+  fs.rmSync(path.join(workspace.repoDir, "scripts/ccdmlib/cli/services/host.py"));
 
   const result = await ccdm(workspace, ["install-service", "host"]);
 
