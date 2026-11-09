@@ -22,6 +22,11 @@ function writeOverlay(workspace) {
   return overlayRoot;
 }
 
+// NODE_OPTIONS splits on spaces, and a backslash escapes inside its quotes.
+function nodeOptionPath(file) {
+  return /\s/.test(file) ? `"${file.replaceAll("\\", "/")}"` : file;
+}
+
 export function bridgeChildEnv(workspace, extraEnv = {}) {
   const overlayRoot = overlayRoots.get(workspace) ?? writeOverlay(workspace);
   overlayRoots.set(workspace, overlayRoot);
@@ -29,7 +34,7 @@ export function bridgeChildEnv(workspace, extraEnv = {}) {
   return {
     ...workspace.env,
     CCDM_TEST_ACCELERATE_TYPING: "1",
-    NODE_OPTIONS: `--require ${path.join(workspace.repoDir, "tests/e2e/support/preload.cjs")}`,
+    NODE_OPTIONS: `--require ${nodeOptionPath(path.join(workspace.repoDir, "tests/e2e/support/preload.cjs"))}`,
     NODE_PATH: nodePath,
     ...extraEnv,
   };
