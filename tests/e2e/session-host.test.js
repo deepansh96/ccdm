@@ -505,6 +505,7 @@ function userProfilePaths() {
       LOCALAPPDATA = [Environment]::GetFolderPath('LocalApplicationData');
       ProgramData = [Environment]::GetFolderPath('CommonApplicationData');
       TEMP = $temp;
+      WindowsSession = [string](Get-Process -Id $PID).SessionId;
     } | ConvertTo-Json -Compress
   `;
   const probe = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", windowsHide: true });
@@ -553,9 +554,21 @@ test("a session sees the profile variables of a fresh logon, not the host's, and
   // The host's own environment lies about every one of these; the session must not.
   await startHost(workspace);
   const { env, childStatus, childError } = await sessionEnvironment(workspace, "profile", { tcpPort: server.address().port });
-  const expected = userProfilePaths();
+  const { WindowsSession: windowsSession, ...expected } = userProfilePaths();
+  // Short and long forms of a path are the same folder.
+  const longForm = value => {
+    try {
+      return fs.realpathSync.native(value).toLowerCase();
+    } catch {
+      return value.toLowerCase();
+    }
+  };
+  // On a machine with per-session temp folders, Windows adds the session id to TEMP at logon.
+  const withoutSessionFolder = value => value.replace(new RegExp(`\\\\${windowsSession}$`), "");
   for (const [name, value] of Object.entries(expected)) {
-    assert.equal(envValue(env, name)?.toLowerCase(), value.toLowerCase(), name);
+    const actual = envValue(env, name);
+    assert.ok(actual, `${name} is missing`);
+    assert.equal(longForm(name === "TEMP" ? withoutSessionFolder(actual) : actual), longForm(value), name);
   }
   assert.equal(childStatus, 0, childError);
   await waitUntil(() => received.join("").includes("from-session-child"), () => "the child's TCP write");
