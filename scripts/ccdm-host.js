@@ -11,6 +11,7 @@ const { callHost } = require("./host/client.js");
 
 const REQUEST_MARGIN_MS = 15000;
 const DEFAULT_GRACE_MS = 3000;
+const DEFAULT_WAIT_SECONDS = 30;
 
 class UsageError extends Error {}
 
@@ -112,6 +113,22 @@ const COMMANDS = {
     const { text } = await callHost("capture", { name: target(flags), history, join: Boolean(flags["-J"]) });
     write(text);
     return 0;
+  },
+  // Waits inside the host for the screen to match, then sends the keys there too.
+  async "wait-for"(args) {
+    const { flags } = parseFlags(args, { values: ["-t", "--regex", "--timeout", "--then-send"] });
+    const regex = flags["--regex"]?.at(-1);
+    if (!regex) throw new UsageError("--regex <pattern> is required");
+    const seconds = flags["--timeout"] ? Number(flags["--timeout"].at(-1)) : DEFAULT_WAIT_SECONDS;
+    if (!Number.isFinite(seconds) || seconds < 0) throw new UsageError("--timeout needs a number of seconds");
+    const timeoutMs = Math.round(seconds * 1000);
+    const { matched, screen } = await callHost(
+      "wait",
+      { name: target(flags), regex, timeoutMs, thenSend: flags["--then-send"] ?? [] },
+      { timeoutMs: timeoutMs + REQUEST_MARGIN_MS },
+    );
+    write(screen);
+    return matched ? 0 : 1;
   },
   async "kill-session"(args) {
     const { flags } = parseFlags(args, { values: ["-t", "--grace"] });

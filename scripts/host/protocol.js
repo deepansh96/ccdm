@@ -20,7 +20,7 @@ const MAX_HELLO_FRAME = 64 * 1024;
 const MAX_FRAME = 8 * 1024 * 1024;
 
 // Specified in v1 and answered once the named slice lands.
-const LATER_OPS = new Set(["wait", "attach", "run-detached", "subscribe"]);
+const LATER_OPS = new Set(["attach", "run-detached", "subscribe"]);
 
 const KINDS = new Set(["project", "thread", "root", "adhoc"]);
 

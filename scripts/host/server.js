@@ -16,6 +16,7 @@ const { ensurePrivateDirSync } = require("../platform/privacy.js");
 const { onShutdown, processAlive, processIdentity, processStartTime } = require("../platform/process.js");
 const { sessionEnvironment } = require("./env.js");
 const { createSessionJob, jobPolicyProblem } = require("./jobs.js");
+const { startConsole } = require("./pty.js");
 const {
   ERRORS, HostError, KINDS, LATER_OPS, MAX_FRAME, MAX_HELLO_FRAME, MISMATCH_MESSAGE, PROTOCOL_VERSION,
   encode, errorResponse, okResponse, parseFrame,
@@ -26,6 +27,7 @@ const TAIL_CHARS = 256 * 1024;
 // `capture` without history stands for one screen.
 const SCREEN_LINES = 50;
 const POLL_MS = 50;
+const DEFAULT_WAIT_MS = 30000;
 const JOB_EXIT_WAIT_MS = 5000;
 const RETAINED_ENDED_SESSIONS = 100;
 const REJECT_FLUSH_MS = 100;
@@ -121,7 +123,8 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
     const { job } = session;
     (async () => {
       try {
-        job.terminate(session.exit);
+        // Windows exit codes are unsigned; node-pty can report them as negative.
+        job.terminate(session.exit >>> 0);
         const deadline = Date.now() + JOB_EXIT_WAIT_MS;
         while (Date.now() < deadline && job.pids().length > 0) await sleep(POLL_MS);
       } catch (error) {
@@ -145,7 +148,30 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
     }
   }
 
-  async function startSession({ name, argv, cwd, env: explicit, kind, log: requestedLog }) {
+  // Synchronous from spawn to Job, like the no-PTY branch.
+  function startPtySession(session, { argv, cwd, explicit, requestedLog }) {
+    try {
+      const childEnv = sessionEnvironment(session.name, explicit ?? {}, env);
+      session.job = createSessionJob();
+      if (requestedLog) fs.mkdirSync(path.dirname(requestedLog), { recursive: true });
+      session.log = requestedLog ?? null;
+      session.console = startConsole({
+        argv, cwd, env: childEnv, job: session.job, log: requestedLog,
+        onEnd: code => endSession(session, code),
+      });
+      session.pid = session.console.pid;
+      session.startedAt = processStartTime(session.pid);
+      writeJournal();
+      log(`session ${session.name} started under ConPTY (pid ${session.pid})`);
+      return okResponse(null, { pid: session.pid });
+    } catch (error) {
+      sessions.delete(session.name);
+      session.job?.close();
+      throw new HostError(ERRORS.SPAWN_FAILED, error.message);
+    }
+  }
+
+  async function startSession({ name, argv, cwd, env: explicit, kind, log: requestedLog, pty }) {
     if (typeof name !== "string" || !name || name.startsWith("=")) {
       throw new HostError(ERRORS.SPAWN_FAILED, "a session needs a name that does not start with =");
     }
@@ -159,12 +185,13 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
     }
 
     const session = {
-      name, kind, pty: false, exit: null, released: false, pid: null, startedAt: null,
-      created: Math.floor(Date.now() / 1000), log: null, tail: "", job: null, child: null, finished: null,
+      name, kind, pty: Boolean(pty), exit: null, released: false, pid: null, startedAt: null,
+      created: Math.floor(Date.now() / 1000), log: null, tail: "", job: null, child: null, console: null, finished: null,
     };
     session.done = new Promise(resolve => { session.finished = resolve; });
     // Taken before the first await, so two racing requests cannot both start.
     sessions.set(name, session);
+    if (session.pty) return startPtySession(session, { argv, cwd, explicit, requestedLog });
 
     let logFd = null;
     try {
@@ -225,7 +252,8 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
     const seen = new Set(session.job ? session.job.pids() : []);
     const note = () => { for (const pid of session.job ? session.job.pids() : []) seen.add(pid); };
     if (session.exit === null) {
-      session.child.stdin.end();
+      if (session.pty) session.console.closeInput();
+      else session.child.stdin.end();
       const deadline = Date.now() + graceMs;
       while (Date.now() < deadline && session.exit === null) {
         note();
@@ -241,6 +269,7 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
     await Promise.race([session.done, sleep(JOB_EXIT_WAIT_MS)]);
     session.released = true;
     session.tail = "";
+    session.console = null;
     writeJournal();
     return [...seen];
   }
@@ -251,7 +280,6 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
   const OPS = {
     async new(frame) {
       if (stopping) throw stoppingError();
-      if (frame.pty) throw new HostError(ERRORS.UNSUPPORTED_OP, "pty sessions are not supported yet");
       return startSession(frame);
     },
     has({ name }) {
@@ -266,16 +294,40 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
     send({ name, keys, literal }) {
       const session = liveSession(name);
       if (!Array.isArray(keys)) throw new HostError(ERRORS.UNSUPPORTED_OP, "keys must be an array");
+      if (session.pty) {
+        session.console.send(keys, literal);
+        return okResponse(null);
+      }
       for (const key of keys) {
         const text = String(key);
         session.child.stdin.write(literal ? text : NO_PTY_KEYS.get(text) ?? text);
       }
       return okResponse(null);
     },
-    capture({ name, history }) {
+    capture({ name, history, join }) {
       const session = knownSession(name);
       if (session.released) throw unknownSession(name);
-      return okResponse(null, { text: captureText(session, history) });
+      const text = session.pty ? session.console.capture({ history, join: join === true }) : captureText(session, history);
+      return okResponse(null, { text });
+    },
+    async wait({ name, regex, timeoutMs = DEFAULT_WAIT_MS, thenSend = [] }, abandons) {
+      const session = knownSession(name);
+      if (session.released) throw unknownSession(name);
+      if (!session.pty) throw new HostError(ERRORS.UNSUPPORTED_OP, "wait needs a PTY session");
+      if (!Array.isArray(thenSend)) throw new HostError(ERRORS.UNSUPPORTED_OP, "thenSend must be an array");
+      if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new HostError(ERRORS.UNSUPPORTED_OP, "timeoutMs must be a number");
+      let compiled;
+      try {
+        compiled = new RegExp(regex, "m");
+      } catch (error) {
+        throw new HostError(ERRORS.UNSUPPORTED_OP, `invalid regex: ${error.message}`);
+      }
+      const { promise, cancel } = session.console.wait({ regex: compiled, timeoutMs, thenSend });
+      // A client that went away no longer wants its keys sent.
+      abandons.add(cancel);
+      const result = await promise;
+      abandons.delete(cancel);
+      return okResponse(null, result);
     },
     pids({ name }) {
       const session = knownSession(name);
@@ -296,14 +348,14 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
     },
   };
 
-  async function dispatch(frame) {
+  async function dispatch(frame, abandons) {
     const handler = Object.hasOwn(OPS, frame.op) ? OPS[frame.op] : null;
     if (!handler) {
       const message = LATER_OPS.has(frame.op) ? `${frame.op} is not supported yet` : `unknown op: ${frame.op}`;
       return errorResponse(frame.id, ERRORS.UNSUPPORTED_OP, message);
     }
     try {
-      return { ...await handler(frame), id: frame.id ?? null };
+      return { ...await handler(frame, abandons), id: frame.id ?? null };
     } catch (error) {
       const code = error instanceof HostError ? error.code : ERRORS.UNSUPPORTED_OP;
       return errorResponse(frame.id, code, error.message);
@@ -316,6 +368,8 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
     let authenticated = false;
     let refused = false;
     let buffer = "";
+    const abandons = new Set();
+    socket.on("close", () => { for (const abandon of abandons) abandon(); });
     const send = frame => { if (!socket.destroyed) socket.write(encode(frame)); };
     const refuse = (id, code, message) => {
       send(errorResponse(id, code, message));
@@ -348,7 +402,7 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
         } else if (!frame) {
           send(errorResponse(null, ERRORS.UNSUPPORTED_OP, "malformed frame"));
         } else {
-          dispatch(frame).then(send);
+          dispatch(frame, abandons).then(send);
         }
       }
       if (buffer.length > (authenticated ? MAX_FRAME : MAX_HELLO_FRAME)) socket.destroy();
