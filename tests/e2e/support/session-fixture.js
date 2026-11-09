@@ -244,7 +244,9 @@ export function createSessionFixture(context) {
       process.exit(refusal.status);
     }
     const launch = parseTmuxLaunch(shellCommand);
-    const parsedArgv = launch.kind === "codex-bridge" ? launch.bridgeCommand.split(" ") : ["claude", ...launch.claudeArgs.map(unquote)];
+    const parsedArgv = launch.kind === "codex-bridge"
+      ? launch.bridgeCommand.split(" ")
+      : launch.kind === "generic" ? launch.argv : ["claude", ...launch.claudeArgs.map(unquote)];
     launchSession(name, launch, {
       command,
       shellCommand,
