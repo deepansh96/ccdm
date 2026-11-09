@@ -1,8 +1,9 @@
 "use strict";
 
-// Starts `ccdm restart-session` for a channel's /restart. Stopping a session ends
-// everything in it, so the helper runs outside: a direct detached process on
-// macOS and Linux, a child of ccdm-host on Windows, in no session's Job.
+// Starts `ccdm restart-session` for a channel's /restart, and `ccdm restart-root`
+// for root Codex's. Stopping a session ends everything in it, so the helper runs
+// outside: a direct detached process on macOS and Linux, a child of ccdm-host on
+// Windows, in no session's Job.
 const path = require("node:path");
 
 const { stateRoot } = require("../platform/paths.js");
@@ -32,6 +33,34 @@ function helperEnv() {
   return env;
 }
 
+// What a root restart reads besides the account: which root channel, port and users.
+const ROOT_VARIABLES = [
+  "ROOT_CODEX_HOME", "ROOT_CODEX_CHANNEL_ID", "ROOT_CODEX_WS_PORT", "ROOT_CODEX_ALLOWED_USER_IDS",
+  "ROOT_CODEX_BOT_APP_ID", "ROOT_DISCORD_STATE_DIR",
+];
+
+// The same log a `ccdm restart-root` run from inside root's own session writes.
+function rootRestartLogPath() {
+  return path.join(stateRoot(), "logs", "restart-root-root_agent.log");
+}
+
+// Starts `ccdm restart-root --provider codex <channel>` for root Codex's /restart.
+// Root keeps its own command: `restart-session` never restarts root.
+async function scheduleRootRestart(channelId, { afterPid, afterStartedAt } = {}) {
+  const log = rootRestartLogPath();
+  const args = [CCDM_ENTRY, "restart-root", "--provider", "codex"];
+  if (afterPid) args.push("--after-pid", String(afterPid));
+  if (afterPid && afterStartedAt) args.push("--after-started-at", String(afterStartedAt));
+  args.push("--", String(channelId));
+  const helper = helperEnv();
+  for (const name of ROOT_VARIABLES) {
+    if (process.env[name]) helper[name] = process.env[name];
+  }
+  const [command, argv, { env }] = pythonInvocation(args, { env: helper });
+  await sessionHost.runDetached([command, ...argv], { cwd: ROOT_DIR, env, log });
+  return log;
+}
+
 // `afterPid` and `afterStartedAt` name a process the helper waits for first.
 async function scheduleProjectRestart(project, { afterPid, afterStartedAt } = {}) {
   const log = restartLogPath(project);
@@ -43,4 +72,4 @@ async function scheduleProjectRestart(project, { afterPid, afterStartedAt } = {}
   return log;
 }
 
-module.exports = { restartLogPath, scheduleProjectRestart };
+module.exports = { restartLogPath, rootRestartLogPath, scheduleProjectRestart, scheduleRootRestart };
