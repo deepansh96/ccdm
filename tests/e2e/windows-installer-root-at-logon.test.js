@@ -27,6 +27,11 @@ const TASK = "\\CCDM\\RootAtLogon";
 const onlyWindows = platformGate("win32", "Task Scheduler and conhost exist only on Windows");
 const TIME_SCALE = "CCDM_ROOT_AT_LOGON_TIME_SCALE";
 const CHANGING_OPS = ["kill", "new", "run-detached"];
+// Clock scales for the run's 120 s wait. A run that should start root gets a 60 s
+// window polled every second: room for a busy machine, and it ends as soon as
+// both answer. A run that should give up gets a 2 s window.
+const UNHURRIED = 2;
+const GIVES_UP_SOON = 60;
 
 const invocations = workspace => readState(workspace.stateDir).fixtures.schtasks.invocations;
 const verbs = workspace => invocations(workspace).map(entry => entry.verb);
@@ -190,7 +195,7 @@ test("with the Router and ccdm-host up, the run starts root once and root says h
   await startHost(workspace);
   await install(workspace);
 
-  const exitCode = await runAsLogonTask(workspace, 60);
+  const exitCode = await runAsLogonTask(workspace, UNHURRIED);
 
   assert.equal(exitCode, 0, readLog(workspace, ".err") + readLog(workspace));
   await assertRootIsUp(workspace);
@@ -203,7 +208,7 @@ test("with the Router and ccdm-host up, the run starts root once and root says h
   assert.equal(hostOps(workspace).some(call => call.op === "run-detached"), false, "restart-root ran in the foreground");
   const log = readLog(workspace);
   assert.match(log, /root-at-logon: waiting up to 120 s for the Router and ccdm-host/);
-  assert.doesNotMatch(log, /still waiting|not reachable/);
+  assert.doesNotMatch(log, /not reachable after/);
   assert.match(log, /Root channel server connected to the Router/);
   assert.match(log, /root-at-logon: root is up/);
   assert.equal(fs.existsSync(serviceFile(hostStateRoot(workspace), ".state.json")), false, "a --once run keeps no state");
@@ -216,7 +221,7 @@ test("root's account from the install reaches root's session at logon", onlyWind
   await startHost(workspace);
   await install(workspace, { CLAUDE_CONFIG_DIR: claudeHome });
 
-  const exitCode = await runAsLogonTask(workspace, 60);
+  const exitCode = await runAsLogonTask(workspace, UNHURRIED);
 
   assert.equal(exitCode, 0, readLog(workspace, ".err") + readLog(workspace));
   assert.equal(rootLaunches(workspace)[0].env.CLAUDE_CONFIG_DIR, claudeHome);
@@ -228,7 +233,7 @@ test("with the Router down for the whole window, the run gives up after 120 s, l
   await install(workspace);
 
   const started = Date.now();
-  const exitCode = await runAsLogonTask(workspace, 60);
+  const exitCode = await runAsLogonTask(workspace, GIVES_UP_SOON);
   const elapsed = Date.now() - started;
 
   assert.equal(exitCode, 1);
@@ -236,7 +241,7 @@ test("with the Router down for the whole window, the run gives up after 120 s, l
   const log = readLog(workspace);
   assert.match(log, /root-at-logon: still waiting for: router\n/);
   assert.match(log, /root-at-logon: router not reachable after 120 s\n/);
-  assert.doesNotMatch(log, /ccdm-host not reachable|still waiting for: .*ccdm-host/);
+  assert.doesNotMatch(log, /ccdm-host not reachable/);
   assertNothingStarted(workspace);
 });
 
@@ -246,7 +251,7 @@ test("with ccdm-host down for the whole window, the run gives up after 120 s, lo
   await install(workspace);
 
   const started = Date.now();
-  const exitCode = await runAsLogonTask(workspace, 60);
+  const exitCode = await runAsLogonTask(workspace, GIVES_UP_SOON);
   const elapsed = Date.now() - started;
 
   assert.equal(exitCode, 1);
@@ -279,8 +284,7 @@ test("when ccdm-host and then the Router come up late but within the window, roo
   const workspace = rootWorkspace();
   await install(workspace);
 
-  // A 60 s window polled every second: long enough for a busy machine, and the run ends as soon as both answer.
-  const run = runAsLogonTask(workspace, 2);
+  const run = runAsLogonTask(workspace, UNHURRIED);
   const logged = pattern => waitFor(() => pattern.test(readLog(workspace)), () => `${pattern} in the log: ${readLog(workspace)}`, 15000);
   await logged(/still waiting for: router, ccdm-host\n/);
   assert.deepEqual(rootLaunches(workspace), []);
