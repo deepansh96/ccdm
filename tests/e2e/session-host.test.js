@@ -1414,6 +1414,183 @@ test("a subscribe client gets one exit event with the code for each session that
   await waitForHasSessionFalse(workspace, "unheard");
 });
 
+// Keep-awake: the host with CCDM_HOST_KEEP_AWAKE=1 and the fake power seam, which
+// keeps what it holds in a file. No test here reaches the Windows power calls.
+const POWER_POLL_MS = 50;
+
+function powerWorkspace() {
+  const workspace = hostWorkspace();
+  const powerDir = path.join(workspace.tmpRoot, "p5.2-power");
+  const powerEnv = { CCDM_HOST_KEEP_AWAKE: "1", CCDM_HOST_POWER_FAKE: powerDir, CCDM_HOST_POWER_POLL_MS: String(POWER_POLL_MS) };
+  return { ...workspace, powerDir, powerEnv };
+}
+
+function readPower(workspace) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(workspace.powerDir, "requests.json"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+const holds = (workspace, expected) => waitUntil(
+  () => (JSON.stringify(readPower(workspace)?.held) === JSON.stringify(expected) ? readPower(workspace) : null),
+  `the power seam to hold ${JSON.stringify(expected)}`,
+);
+const setPowerSource = (workspace, source) => fs.writeFileSync(path.join(workspace.powerDir, "ac"), source);
+// Long enough for several polls of the power source to have run.
+const severalPolls = () => sleep(POWER_POLL_MS * 8);
+
+// Exits as soon as anything arrives on stdin, so a test can end it without kill-session.
+const exitsOnInput = workspace => fixture(workspace, "p5.2-exits-on-input.js", `
+  console.log("waiting");
+  process.stdin.once("data", () => process.exit(0));
+`);
+
+test("one project session on AC holds \"CCDM: 1 sessions\", a thread session makes it 2, and the request goes when the last one stops", onlyWindows, async () => {
+  const workspace = powerWorkspace();
+  await startHost(workspace, { env: workspace.powerEnv });
+  assert.deepEqual(readPower(workspace), { held: [], calls: [] });
+
+  await newSession(workspace, "alpha_session", echoSession(workspace), { kind: "project" });
+  await holds(workspace, ["CCDM: 1 sessions"]);
+  await newSession(workspace, "alpha_session-t-1", exitsOnInput(workspace), { kind: "thread" });
+  const two = await holds(workspace, ["CCDM: 2 sessions"]);
+  // The new request is held before the old one is released.
+  assert.deepEqual(two.calls, [["hold", "CCDM: 1 sessions"], ["hold", "CCDM: 2 sessions"], ["release", "CCDM: 1 sessions"]]);
+
+  // One session ends on its own, the other through kill-session.
+  await cliOk(workspace, ["send-keys", "-t", "=alpha_session-t-1", "bye", "Enter"]);
+  await holds(workspace, ["CCDM: 1 sessions"]);
+  await cliOk(workspace, ["kill-session", "-t", "=alpha_session"]);
+  const none = await holds(workspace, []);
+  assert.deepEqual(none.calls.slice(3), [
+    ["hold", "CCDM: 1 sessions"], ["release", "CCDM: 2 sessions"], ["release", "CCDM: 1 sessions"],
+  ]);
+});
+
+test("root and adhoc sessions never hold a request, and are not counted beside a project session", onlyWindows, async () => {
+  const workspace = powerWorkspace();
+  await startHost(workspace, { env: workspace.powerEnv });
+  await newSession(workspace, "root_agent", echoSession(workspace), { kind: "root" });
+  await newSession(workspace, "scratch", echoSession(workspace), { kind: "adhoc" });
+  await waitForCapture(workspace, "scratch", /fixture-up/);
+  await severalPolls();
+  assert.deepEqual(readPower(workspace), { held: [], calls: [] });
+
+  await newSession(workspace, "alpha_session", echoSession(workspace), { kind: "project" });
+  await holds(workspace, ["CCDM: 1 sessions"]);
+  await cliOk(workspace, ["kill-session", "-t", "=alpha_session"]);
+  await holds(workspace, []);
+  assert.equal((await cli(workspace, ["has-session", "-t", "=root_agent"])).code, 0);
+  assert.equal((await cli(workspace, ["has-session", "-t", "=scratch"])).code, 0);
+});
+
+test("on battery the request is released, back on AC it is held again, and a shutdown releases it", onlyWindows, async () => {
+  const workspace = powerWorkspace();
+  const host = await startHost(workspace, { env: workspace.powerEnv });
+  setPowerSource(workspace, "battery");
+  await newSession(workspace, "alpha_session", echoSession(workspace), { kind: "project" });
+  await waitForCapture(workspace, "alpha_session", /fixture-up/);
+  await severalPolls();
+  assert.deepEqual(readPower(workspace), { held: [], calls: [] }, "a session started on battery holds nothing");
+
+  setPowerSource(workspace, "ac");
+  await holds(workspace, ["CCDM: 1 sessions"]);
+  setPowerSource(workspace, "battery");
+  await holds(workspace, []);
+  await newSession(workspace, "beta_session", echoSession(workspace), { kind: "project" });
+  await severalPolls();
+  assert.deepEqual(readPower(workspace).held, []);
+  setPowerSource(workspace, "ac");
+  await holds(workspace, ["CCDM: 2 sessions"]);
+
+  await cliOk(workspace, ["shutdown"]);
+  assert.equal(await host.closed, 0);
+  assert.deepEqual(readPower(workspace).held, []);
+});
+
+test("a host started without CCDM_HOST_KEEP_AWAKE never touches the power seam", onlyWindows, async () => {
+  const workspace = powerWorkspace();
+  await startHost(workspace, { env: { CCDM_HOST_POWER_FAKE: workspace.powerDir, CCDM_HOST_POWER_POLL_MS: String(POWER_POLL_MS) } });
+  await newSession(workspace, "alpha_session", echoSession(workspace), { kind: "project" });
+  await waitForCapture(workspace, "alpha_session", /fixture-up/);
+  await severalPolls();
+  assert.equal(fs.existsSync(workspace.powerDir), false);
+});
+
+test("the Windows seam creates a SystemRequired request with the reason, clears and closes it, and only a known battery counts as battery", () => {
+  const { win32PowerSeam } = lazy("host/power.js");
+  const calls = [];
+  let acLine = 1;
+  let nextHandle = 100;
+  const api = {
+    CloseHandle: handle => calls.push(["CloseHandle", handle]),
+    GetLastError: () => 5,
+    GetSystemPowerStatus: (status) => {
+      status[0] = acLine;
+      return 1;
+    },
+    PowerClearRequest: (handle, type) => calls.push(["PowerClearRequest", handle, type]),
+    PowerCreateRequest: (context) => {
+      calls.push(["PowerCreateRequest", context]);
+      return nextHandle;
+    },
+    PowerSetRequest: (handle, type) => calls.push(["PowerSetRequest", handle, type]),
+  };
+  const seam = win32PowerSeam(api);
+
+  const release = seam.hold("CCDM: 3 sessions");
+  assert.deepEqual(calls, [
+    ["PowerCreateRequest", { Version: 0, Flags: 1, SimpleReasonString: "CCDM: 3 sessions", Reserved: [0, 0] }],
+    ["PowerSetRequest", 100, 1],
+  ]);
+  release();
+  assert.deepEqual(calls.slice(2), [["PowerClearRequest", 100, 1], ["CloseHandle", 100]]);
+
+  for (const [line, onAc] of [[1, true], [0, false], [255, true]]) {
+    acLine = line;
+    assert.equal(seam.onAc(), onAc, `ACLineStatus ${line}`);
+  }
+
+  // INVALID_HANDLE_VALUE is the failure of PowerCreateRequest; a failed set closes what was created.
+  nextHandle = -1;
+  assert.throws(() => seam.hold("CCDM: 1 sessions"), /PowerCreateRequest failed \(Windows error 5\)/);
+  nextHandle = 200;
+  api.PowerSetRequest = () => 0;
+  calls.length = 0;
+  assert.throws(() => seam.hold("CCDM: 1 sessions"), /PowerSetRequest failed/);
+  assert.deepEqual(calls.at(-1), ["CloseHandle", 200]);
+});
+
+test("a power seam that fails never throws into the host, is reported once, and is tried again at the next poll", async () => {
+  const { POLL_MS, createKeepAwake } = lazy("host/power.js");
+  assert.equal(POLL_MS, 30000);
+  const held = [];
+  const lines = [];
+  let failing = true;
+  const seam = {
+    onAc: () => true,
+    hold(reason) {
+      if (failing) throw new Error("no power service");
+      held.push(reason);
+      return () => held.splice(held.indexOf(reason), 1);
+    },
+  };
+  const keepAwake = createKeepAwake({ seam, pollMs: 10, log: line => lines.push(line) });
+
+  keepAwake.update([{ kind: "project" }, { kind: "root" }]);
+  await sleep(100);
+  assert.deepEqual(held, []);
+  assert.deepEqual(lines, ["keep-awake is not available: no power service"]);
+
+  failing = false;
+  await waitUntil(() => held.length === 1, "the request after the seam recovered");
+  assert.deepEqual(held, ["CCDM: 1 sessions"]);
+  keepAwake.close();
+  assert.deepEqual(held, []);
+});
+
 // `ccdm attach`: the owner's command, run under its own pseudo-console.
 const THREAD_ID = "1500000000000000001";
 
