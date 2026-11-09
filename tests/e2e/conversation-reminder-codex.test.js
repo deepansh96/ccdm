@@ -1021,8 +1021,9 @@ test("a bridge killed hard during a turn leaves its context, and the next start 
   running.bridge.child.kill("SIGKILL");
   await running.bridge.closed;
   assert.equal(fs.existsSync(running.contextFile), true);
-  // The fixture notices its bridge has gone, and so leaves no process behind.
-  await waitForState(workspace, (state) => state.fixtures.codex.servers[String(running.codex.port)].watchdogFired === true, 10000);
+  // POSIX: the fixture notices its bridge has gone. Windows: Node keeps a child
+  // in a kill-on-close job, so the launcher and its own job go with the bridge.
+  if (!WIN32) await waitForState(workspace, (state) => state.fixtures.codex.servers[String(running.codex.port)].watchdogFired === true, 10000);
   await assertAppServerGone(running.appServer, running.heldPort);
 
   const next = await startDemoBridge(workspace, { port: running.codex.port, env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" } });
