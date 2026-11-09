@@ -311,9 +311,8 @@ test("a successful scoped Codex reply produces a progress receipt and a complete
   assert.ok(reply.stdout.trim(), JSON.stringify({ exitCode: reply.exitCode, stderr: reply.stderr, stdout: reply.stdout }));
   assert.equal(JSON.parse(reply.stdout).result.content[0].text, "sent (id: fake-message-1)");
   codex.releaseTurn("answer-turn");
-  await new Promise((resolve) => setTimeout(resolve, 200));
-  const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  const events = JSON.parse(result.stdout).events;
+  // Each event is a Python run; a loaded machine outlasts any fixed delay.
+  const events = await waitForEvents(workspace, (rows) => rows.some((event) => event.event_type === "turn_completed"));
   assert.deepEqual(events.map((event) => event.event_type), ["owner_activity", "response_delivered", "turn_completed"]);
   assert.equal(events[0].provider_session_id, "thread-1");
   assert.equal(events[1].message_id, "fake-message-1");
@@ -378,6 +377,8 @@ test("a failed Discord reply and tool start cannot qualify Codex completion", as
   assert.equal(JSON.parse(reply.stdout).result.isError, true);
   assert.deepEqual(readState(workspace.stateDir).fixtures.discord.restFailureUses, [{ method: "POST", path: execute, status: 503 }]);
   codex.releaseTurn("failed-reply-turn");
+  // Wait for the owner's event, then settle so a wrongly recorded receipt or completion would show up.
+  await waitForEvents(workspace, (rows) => rows.some((event) => event.event_type === "owner_activity"));
   await new Promise((resolve) => setTimeout(resolve, 200));
   const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
   assert.deepEqual(JSON.parse(result.stdout).events.map((event) => event.event_type), ["owner_activity"]);
@@ -392,6 +393,8 @@ test("failed Codex turns do not send or record optional fallback text", async ()
   await bridge.waitForOutput(/Listening in #demo/, 7000);
   injectDiscordMessage(workspace, { id: "failed-turn-owner", content: "try this" });
   await waitForState(workspace, (state) => state.fixtures.discord.deliveredMessages.some((message) => message.id === "failed-turn-owner"));
+  // Wait for the owner's event, then settle so wrongly sent or recorded fallback text would show up.
+  await waitForEvents(workspace, (rows) => rows.some((event) => event.event_type === "owner_activity"));
   await new Promise((resolve) => setTimeout(resolve, 200));
   const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
   assert.deepEqual(JSON.parse(result.stdout).events.map((event) => event.event_type), ["owner_activity"]);
@@ -463,9 +466,7 @@ test("a steered owner message gets a new response correlation within the active 
   assert.equal(JSON.parse(fs.readFileSync(contextFile, "utf8")).interaction_id, "second-owner");
   assert.equal(JSON.parse((await send("second answer")).stdout).result.isError, undefined);
   codex.releaseTurn("steer-turn");
-  await new Promise((resolve) => setTimeout(resolve, 200));
-  const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  const events = JSON.parse(result.stdout).events;
+  const events = await waitForEvents(workspace, (rows) => rows.some((event) => event.event_type === "turn_completed"));
   assert.deepEqual(events.filter((event) => event.event_type === "response_delivered").map((event) => event.interaction_id), ["first-owner", "second-owner"]);
   assert.deepEqual(events.find((event) => event.event_type === "turn_completed").delivered_message_ids, ["fake-message-2"]);
   await bridge.stop();
@@ -716,6 +717,8 @@ test("a Codex completion without confirmed success status cannot qualify a respo
   });
   assert.equal(JSON.parse(reply.stdout).result.isError, undefined);
   codex.releaseTurn("unknown-status-turn");
+  // Wait for both events, then settle so a wrongly qualified completion would show up.
+  await waitForEvents(workspace, (rows) => ["owner_activity", "response_delivered"].every((type) => rows.some((event) => event.event_type === type)));
   await new Promise((resolve) => setTimeout(resolve, 150));
   const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
   assert.deepEqual(JSON.parse(result.stdout).events.map((event) => event.event_type), ["owner_activity", "response_delivered"]);
