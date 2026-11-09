@@ -21,3 +21,11 @@ tests/e2e/router-threads.test.js
 tests/e2e/router-webhooks.test.js
 tests/e2e/router-writes.test.js
 tests/e2e/router.test.js
+tests/e2e/platform-contract.test.js
+tests/e2e/checkout-contract.test.js
+tests/e2e/discord-export.test.js
+tests/e2e/documentation-audit.test.js
+tests/e2e/guest-access.test.js
+tests/e2e/large-read-private-temp.test.js
+tests/e2e/nickname-statusline.test.js
+tests/e2e/package-contract.test.js
