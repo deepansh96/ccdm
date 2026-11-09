@@ -183,7 +183,7 @@ test("a launch whose Router hello fails exits non-zero and cleans up", async () 
   assertLaunchCleanedUp(workspace);
 });
 
-test("after stop-session the Router treats the channel as offline and the next owner message gets 💤", platformGate("posix", "stop-session.sh is zsh until the Windows stop path lands in P3.5"), async () => {
+test("after stop-session the Router treats the channel as offline and the next owner message gets 💤", async () => {
   const workspace = claudeRouterWorkspace();
   const router = await routerWithWebhooks(workspace, ["demo"]);
   const started = await startSession(workspace);
