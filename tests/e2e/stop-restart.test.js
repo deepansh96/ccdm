@@ -4,17 +4,18 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { startFakeCodexServer } from "./support/bridge.js";
+import { startFakeCodexServer, waitForState } from "./support/bridge.js";
 import { PYTHON, platformGate } from "./support/platform.js";
-import { createRouterWorkspace, routerEnv, startRouter } from "./support/router.js";
+import { createRouterWorkspace, routerEnv, runRouterCli, startRouter } from "./support/router.js";
 import { createWorkspace, runScript } from "./support/runner.js";
-import { hostOps, startFakeHost } from "./support/session-fixture.js";
-import { readState, seedFixtureProcess, seedRegistry, seedTmuxSession, writeState } from "./support/state.js";
+import { hostOps, sessionCalls, startFakeHost } from "./support/session-fixture.js";
+import { readState, seedFixtureProcess, seedRegistry, seedTmuxSession, updateState, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 
 // Why a case runs only on Linux and macOS.
 const POSIX_STOP = "reads listeners from the fixture ps and sends POSIX signals; Windows has its own cases here";
-const ROOT_RESTART = "restart-root-agent.sh is zsh; root restart is ported by P3.8";
+const TMUX_ROOT = "drives tmux's kill retry and the fixture pkill; the fake-host root cases here run on Windows";
+// Owner decision D2: the Windows root is Claude-only, so `restart-root --provider codex` is refused there.
 const CODEX_ROOT = "root Codex stays POSIX until D2";
 const NO_ACTIVE_SESSION = process.platform === "win32" ? "No active session" : "No active tmux session";
 
@@ -569,7 +570,56 @@ test("the shim and scripts/ccdm stop-session give the same output and exit codes
   assert.match(unknown.stderr, /unknown project: nosuch/);
 });
 
-test("restart-root-agent simulates root_agent cleanup, retry, fresh launch, and development-channel send-key", platformGate("posix", ROOT_RESTART), async () => {
+// ---- restart-root: tmux on Linux and macOS, the fake ccdm-host everywhere ----
+
+const WIN = process.platform === "win32";
+const DEFAULT_BACKEND = WIN ? "ccdm-host" : "tmux";
+const ROOT_BACKENDS = WIN ? ["ccdm-host"] : ["tmux", "ccdm-host"];
+const SESSION_WORD = WIN ? "session" : "tmux session";
+// A Windows temp folder can carry a short (8.3) name; the `ccdm` entry starts Python from the long one.
+const repoAsLaunched = workspace => (WIN ? fs.realpathSync.native(workspace.repoDir) : workspace.repoDir);
+// What a launch ran: the tmux string, or the argv the fake host received.
+const launchText = session => session.shellCommand ?? session.command.join(" ");
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+const rootHosts = new WeakMap();
+async function rootHost(workspace) {
+  if (!rootHosts.has(workspace)) rootHosts.set(workspace, await startFakeHost(workspace, { env: routerEnv(workspace) }));
+  return rootHosts.get(workspace);
+}
+
+async function restartRoot(workspace, { args = [], backend = DEFAULT_BACKEND, env = {}, script = "restart-root-agent.sh" } = {}) {
+  const backendEnv = backend === "tmux" ? {} : (await rootHost(workspace)).env;
+  return runScript(workspace, script, { args, env: routerEnv(workspace, { ...backendEnv, ...env }), timeoutMs: 30000 });
+}
+
+function rootFiles(workspace) {
+  const launchDir = path.join(workspace.routerStateDir, "launches", ".root");
+  return {
+    key: path.join(workspace.routerStateDir, "keys", ".root.key"),
+    mcp: path.join(launchDir, "mcp.json"),
+    settings: path.join(launchDir, "settings.json"),
+    ready: path.join(launchDir, "ready.json"),
+  };
+}
+
+// Windows names the key file on the channel server's command line: another process's environment is not readable there.
+function channelServerArgs(workspace) {
+  const script = path.join(repoAsLaunched(workspace), "scripts", "ccdm-channel-server.js");
+  return WIN ? [script, "--ccdm-key-file", rootFiles(workspace).key] : [script];
+}
+
+const rootSession = workspace => readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
+const outputLines = result => result.stdout.split(/\r?\n/).filter(Boolean);
+
+async function waitUntilGone(pids) {
+  for (let waited = 0; pids.some(isAlive); waited += WAIT_STEP_MS) {
+    assert.ok(waited < 10000, `still running: ${pids.filter(isAlive).join(" ")}`);
+    await sleep(WAIT_STEP_MS);
+  }
+}
+
+test("restart-root-agent simulates root_agent cleanup, retry, fresh launch, and development-channel send-key", platformGate("posix", TMUX_ROOT), async () => {
   const workspace = createRouterWorkspace();
   await startRouter(workspace);
   const panePid = spawnOwnedProcess(workspace, "zsh root pane");
@@ -592,7 +642,7 @@ test("restart-root-agent simulates root_agent cleanup, retry, fresh launch, and 
   assert.equal(session.killAttempts, 2);
 });
 
-test("the retired reminder-adapter opt-in and a selected root state directory leave root Claude on the Router", platformGate("posix", ROOT_RESTART), async () => {
+test("the retired reminder-adapter opt-in and a selected root state directory leave root Claude on the Router", async () => {
   const workspace = createRouterWorkspace();
   await startRouter(workspace);
   const selectedState = path.join(workspace.homeDir, "selected-root-discord");
@@ -600,26 +650,26 @@ test("the retired reminder-adapter opt-in and a selected root state directory le
   fs.mkdirSync(pluginDir, { recursive: true });
   fs.writeFileSync(path.join(pluginDir, "server.ts"), "// fixture official plugin\n");
 
-  const result = await runScript(workspace, "restart-root-agent.sh", {
-    env: routerEnv(workspace, {
+  const result = await restartRoot(workspace, {
+    env: {
       CCDM_CLAUDE_REMINDER_ADAPTER: "1",
       ROOT_DISCORD_STATE_DIR: selectedState,
       CCDM_FIXTURE_CLAUDE_VERSION: "1.0.0 (Claude Code fixture)",
-    }),
-    timeoutMs: 20000,
+    },
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.match(result.stdout, /Root channel server connected to the Router/);
   const session = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
-  assert.match(session.shellCommand, /--dangerously-load-development-channels server:ccdm/);
-  assert.equal(session.env.CCDM_ROUTER_KEY_FILE, path.join(workspace.routerStateDir, "keys", ".root.key"));
+  assert.match(launchText(session), /--dangerously-load-development-channels server:ccdm/);
+  assert.equal(session.env.CCDM_ROUTER_KEY_FILE, rootFiles(workspace).key);
   for (const forbidden of ["DISCORD_STATE_DIR", "plugin:discord", "server:discord"]) {
-    assert.equal(session.shellCommand.includes(forbidden), false, forbidden);
+    assert.equal(launchText(session).includes(forbidden), false, forbidden);
+    assert.equal(JSON.stringify(session.env).includes(forbidden), false, forbidden);
   }
-  const config = JSON.parse(fs.readFileSync(path.join(workspace.routerStateDir, "launches", ".root", "mcp.json"), "utf8"));
+  const config = JSON.parse(fs.readFileSync(rootFiles(workspace).mcp, "utf8"));
   assert.deepEqual(Object.keys(config.mcpServers), ["ccdm"]);
-  assert.deepEqual(config.mcpServers.ccdm.args, [path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js")]);
+  assert.deepEqual(config.mcpServers.ccdm.args, channelServerArgs(workspace));
   assert.equal(fs.existsSync(selectedState), false);
   assert.equal(fs.existsSync(path.join(workspace.homeDir, ".claude", "channels", "discord", "ccdm-root-reminder-mcp.json")), false);
 });
@@ -680,6 +730,8 @@ test("restart-root-codex-agent starts the root bot through the Codex bridge in R
     PROJECT_DIR: workspace.repoDir,
     ROOT_BOT_APP_ID: "root-app",
     WS_PORT: port,
+    // Every session carries its own name: a restart asked for from inside root reads it.
+    CCDM_SESSION_NAME: "root_agent",
   });
   assert.equal(session.bridgeCommand, "node scripts/codex-bridge.js");
   assert.equal(session.killAttempts, 2);
@@ -1029,31 +1081,281 @@ test("restart-root-codex-agent rejects a channel missing from the registry's roo
   assert.equal(isAlive(childPid), true);
 });
 
-test("restart-root-agent launch failures include command diagnostics", platformGate("posix", ROOT_RESTART), async () => {
+test("restart-root-agent launch failures include command diagnostics", async () => {
   const workspace = createRouterWorkspace();
   await startRouter(workspace);
   const state = readState(workspace.stateDir);
   state.fixtures.tmux.newSessionFailures = { root_agent: 1 };
   writeState(state, workspace.stateDir);
 
-  const result = await runScript(workspace, "restart-root-agent.sh", { env: routerEnv(workspace), timeoutMs: 20000 });
+  const result = await restartRoot(workspace);
 
   assert.notEqual(result.exitCode, 0);
-  assert.match(result.stderr, /Failed to create tmux session 'root_agent'|fixture tmux new-session failure/);
+  assert.match(result.stderr, /fixture tmux new-session failure/);
+  assert.match(result.stderr, new RegExp(`Failed to create ${SESSION_WORD} 'root_agent'`));
   assert.deepEqual(result.diagnostics.command, [path.join(workspace.repoDir, "restart-root-agent.sh")]);
   assert.equal(result.diagnostics.fixtureState.fixtures.tmux.newSessionFailures.root_agent, 0);
 });
 
-test("restart-root-agent teardown failures are recorded as diagnostics", platformGate("posix", ROOT_RESTART), async () => {
+test("restart-root-agent teardown failures are recorded as diagnostics", async () => {
   const workspace = createRouterWorkspace();
   await startRouter(workspace);
   registerTeardownCallback(() => {
     throw new Error("restart cleanup failure");
   });
 
-  const result = await runScript(workspace, "restart-root-agent.sh", { env: routerEnv(workspace), timeoutMs: 20000 });
+  const result = await restartRoot(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   await cleanup({ stateDir: workspace.stateDir });
   assert.match(JSON.stringify(readState(workspace.stateDir).diagnostics.cleanupFailures), /restart cleanup failure/);
+});
+
+// ---- restart-root: who runs it, the hand-off, and Claude's start-up prompts ----
+
+const ROOT_PROMPT_SCREEN = "WARNING: Loading development channels\n\n--dangerously-load-development-channels is for local channel development only.\n";
+const CHANGING_OPS = ["kill", "new", "run-detached"];
+const CHANGING_TMUX = ["kill-session", "new-session"];
+const changes = workspace => sessionCalls(workspace)
+  .filter(call => CHANGING_OPS.includes(call.op) || CHANGING_TMUX.includes(call.args?.[0]));
+
+test("on the fake host, restart-root from a plain terminal and from a project session runs in the foreground: the old root is stopped and a new one starts with a fresh key", async () => {
+  const workspace = createRouterWorkspace();
+  await startRouter(workspace);
+  const files = rootFiles(workspace);
+  const first = await restartRoot(workspace, { backend: "ccdm-host" });
+  assert.equal(first.exitCode, 0, first.stderr || first.stdout);
+  const old = rootSession(workspace);
+  const oldKey = fs.readFileSync(files.key, "utf8");
+
+  const second = await restartRoot(workspace, { backend: "ccdm-host", env: { CCDM_SESSION_NAME: "alpha_session" } });
+
+  assert.equal(second.exitCode, 0, second.stderr || second.stdout);
+  for (const result of [first, second]) {
+    assert.deepEqual(outputLines(result), [
+      "Root channel server connected to the Router",
+      `Restarted root agent in ${SESSION_WORD} 'root_agent'`,
+      "Attach with: scripts/ccdm attach root",
+    ]);
+  }
+  await waitUntilGone(old.job);
+  assert.notEqual(rootSession(workspace).pid, old.pid);
+  assert.notEqual(fs.readFileSync(files.key, "utf8"), oldKey);
+  const ops = hostOps(workspace);
+  assert.equal(ops.some(call => call.op === "run-detached"), false, "nothing was handed off");
+  const launches = ops.filter(call => call.op === "new");
+  assert.equal(launches.length, 2);
+  const stopped = ops.findLastIndex(call => call.op === "kill");
+  assert.ok(stopped >= 0 && stopped < ops.lastIndexOf(launches[1]), "the old root is stopped before the new one starts");
+  assert.equal(ops[stopped].name, "root_agent");
+  assert.equal(ops[stopped].graceMs, 2000);
+  const { name, kind, pty, cwd, env } = launches[1];
+  assert.deepEqual({ name, kind, pty, cwd }, { name: "root_agent", kind: "root", pty: true, cwd: repoAsLaunched(workspace) });
+  assert.equal(env.CCDM_SESSION_NAME, "root_agent");
+  assert.equal(env.CCDM_ROUTER_KEY_FILE, files.key);
+  assert.equal("CCDM_DETACHED" in env, false);
+  const status = await runRouterCli(workspace, ["status"]);
+  assert.match(status.stdout, /sessions: 1\n  root root scope=/);
+});
+
+test("run from inside root's own session, restart-root exits 0 at once and a detached copy outside the old root's Job brings a new root to its Router hello", async () => {
+  const workspace = createRouterWorkspace();
+  await startRouter(workspace);
+  const files = rootFiles(workspace);
+  const first = await restartRoot(workspace, { backend: "ccdm-host" });
+  assert.equal(first.exitCode, 0, first.stderr || first.stdout);
+  const old = rootSession(workspace);
+  const oldKey = fs.readFileSync(files.key, "utf8");
+  const claudeHome = path.join(workspace.homeDir, "root-claude-home");
+  const log = path.join((await rootHost(workspace)).stateRoot, "logs", "restart-root-root_agent.log");
+
+  const handedOff = await restartRoot(workspace, {
+    backend: "ccdm-host",
+    env: { CCDM_SESSION_NAME: "root_agent", CLAUDE_CONFIG_DIR: claudeHome },
+  });
+
+  assert.equal(handedOff.exitCode, 0, handedOff.stderr || handedOff.stdout);
+  assert.match(handedOff.stdout, /^ccdm: restart-root continues in a detached process \(pid \d+\); log: .*restart-root-root_agent\.log\s*$/);
+  const done = await waitForState(workspace, (next) => {
+    const session = next.fixtures.tmux.sessions.root_agent;
+    return session && session.pid !== old.pid && session.devChannelPrompt === "accepted";
+  }, 30000);
+  for (let waited = 0; !/Restarted root agent in/.test(fs.readFileSync(log, "utf8")); waited += WAIT_STEP_MS) {
+    assert.ok(waited < 30000, `the detached copy never finished: ${fs.readFileSync(log, "utf8")}`);
+    await sleep(WAIT_STEP_MS);
+  }
+  const helpers = done.fixtures.sessionHost.detached;
+  assert.equal(helpers.length, 1);
+  const [helper] = helpers;
+  assert.equal(old.job.includes(helper.pid), false, "the helper was never in the old root's Job");
+  assert.equal(helper.argv.at(-1), "restart-root");
+  assert.equal(helper.log, log);
+  assert.equal(helper.env.CCDM_DETACHED, "1");
+  assert.equal("CCDM_SESSION_NAME" in helper.env, false);
+  assert.equal(helper.env.CCDM_ROUTER_STATE_DIR, workspace.routerStateDir);
+  assert.equal(helper.env.CLAUDE_CONFIG_DIR, claudeHome, "root comes back on the same account");
+  await waitUntilGone(old.job);
+  assert.notEqual(fs.readFileSync(files.key, "utf8"), oldKey);
+  const launch = hostOps(workspace).filter(call => call.op === "new").at(-1);
+  assert.equal(launch.env.CCDM_SESSION_NAME, "root_agent");
+  assert.equal(launch.env.CLAUDE_CONFIG_DIR, claudeHome);
+  assert.equal("CCDM_DETACHED" in launch.env, false, "the new root can hand off its own restart again");
+  assert.equal(JSON.parse(fs.readFileSync(files.ready, "utf8")).ok, true);
+  const status = await runRouterCli(workspace, ["status"]);
+  assert.match(status.stdout, /sessions: 1\n  root root scope=/);
+});
+
+test("with the Router down, restart-root refuses with today's message, also from inside root, and the running root and its key stay", async () => {
+  const workspace = createRouterWorkspace();
+  const files = rootFiles(workspace);
+  const rootPid = spawnBystander();
+  seedTmuxSession("root_agent", { pid: rootPid, job: [rootPid] }, { stateDir: workspace.stateDir });
+  writePrivate(files.key, "the running root's key\n");
+
+  for (const env of [{}, { CCDM_SESSION_NAME: "root_agent" }]) {
+    const result = await restartRoot(workspace, { env });
+
+    assert.equal(result.exitCode, 1, result.stdout);
+    assert.match(result.stderr, /The Router is not answering, so root was not restarted: the running root and its key are unchanged\. Start the Router \(.*, or node scripts\/router\.js serve\) and retry\./);
+    assert.equal(result.stdout, "");
+  }
+  assert.deepEqual(changes(workspace), [], "nothing was stopped, started or handed off");
+  assert.equal(rootSession(workspace).pid, rootPid);
+  assert.equal(isAlive(rootPid), true);
+  assert.equal(fs.readFileSync(files.key, "utf8"), "the running root's key\n");
+});
+
+for (const backend of ROOT_BACKENDS) {
+  test(`${backend}: a root launch in an untrusted repo folder accepts the folder-trust prompt without help and reaches the Router`, async () => {
+    const workspace = createRouterWorkspace();
+    await startRouter(workspace);
+    updateState(workspace.stateDir, (state) => { state.fixtures.claude.trustPrompt = true; });
+
+    const result = await restartRoot(workspace, { backend });
+
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /Root channel server connected to the Router/);
+    const session = rootSession(workspace);
+    assert.equal(session.cwd, repoAsLaunched(workspace), "the folder trusted is the repo root it launched in");
+    assert.deepEqual(session.sendKeys, [["Enter"], ["Enter"]]);
+    assert.equal(session.trustPrompt, "accepted");
+    assert.equal(session.devChannelPrompt, "accepted");
+  });
+
+  test(`${backend}: an already-trusted root launch accepts the channel prompt within 1 s of it appearing`, async () => {
+    const workspace = createRouterWorkspace();
+    await startRouter(workspace);
+    updateState(workspace.stateDir, (state) => { state.fixtures.tmux.devChannelPrompt = "never"; });
+
+    const running = restartRoot(workspace, { backend });
+    await waitForState(workspace, next => Boolean(next.fixtures.tmux.sessions.root_agent), 20000);
+    await sleep(800);
+    assert.equal(rootSession(workspace).sendKeys, undefined, "no key is sent before a prompt is on screen");
+    const appeared = performance.now();
+    updateState(workspace.stateDir, (state) => {
+      Object.assign(state.fixtures.tmux.sessions.root_agent, { paneOutput: ROOT_PROMPT_SCREEN, devChannelPrompt: "pending" });
+    });
+    while (!rootSession(workspace).sendKeys) {
+      assert.ok(performance.now() - appeared < 1000, "Enter was not sent within 1 s of the channel prompt");
+      await sleep(20);
+    }
+    const result = await running;
+
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+    assert.deepEqual(rootSession(workspace).sendKeys, [["Enter"]]);
+  });
+}
+
+test("root's launch settings carry the statusLine command on Windows and are unchanged elsewhere", async () => {
+  const workspace = createRouterWorkspace();
+  await startRouter(workspace);
+
+  const result = await restartRoot(workspace);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const files = rootFiles(workspace);
+  const settings = JSON.parse(fs.readFileSync(files.settings, "utf8"));
+  assert.deepEqual(settings.enabledPlugins, { "discord@claude-plugins-official": false });
+  if (WIN) {
+    const script = path.join(repoAsLaunched(workspace), "scripts", "statusline-context.js").replaceAll("\\", "/");
+    assert.deepEqual(settings.statusLine, { type: "command", command: `node '${script}'` });
+  } else {
+    assert.deepEqual(Object.keys(settings), ["enabledPlugins"]);
+  }
+  assert.deepEqual(JSON.parse(fs.readFileSync(files.mcp, "utf8")).mcpServers.ccdm.args, channelServerArgs(workspace));
+});
+
+test("on Windows, restart-root --provider codex is refused with a message naming the pending decision, and nothing changes", platformGate("win32", "the refusal is Windows-only; root Codex runs on Linux and macOS"), async () => {
+  const workspace = createRouterWorkspace();
+  await startRouter(workspace);
+  seedRootCodexFiles(workspace);
+  const files = rootFiles(workspace);
+  const rootPid = spawnBystander();
+  seedTmuxSession("root_agent", { pid: rootPid, job: [rootPid] }, { stateDir: workspace.stateDir });
+  writePrivate(files.key, "the running root's key\n");
+
+  for (const [script, args] of [
+    ["restart-root-codex-agent.sh", ["root-channel-id"]],
+    ["scripts/ccdm", ["restart-root", "--provider", "codex", "root-channel-id"]],
+  ]) {
+    const result = await restartRoot(workspace, { script, args });
+
+    assert.equal(result.exitCode, 1, `${script}: ${result.stdout}`);
+    assert.match(result.stderr, /^Root Codex is not available on Windows yet: the Windows root is Claude-only until the owner's decision on a Codex root there \(D2\) is made\./);
+    assert.equal(result.stdout, "");
+  }
+  assert.deepEqual(changes(workspace), []);
+  assert.equal(isAlive(rootPid), true);
+  assert.equal(fs.readFileSync(files.key, "utf8"), "the running root's key\n");
+});
+
+test("the root restart shims and scripts/ccdm restart-root give the same output and exit codes", async () => {
+  const workspace = createRouterWorkspace();
+  const viaBoth = async (shim, shimArgs, commandArgs) => {
+    const viaShim = await restartRoot(workspace, { script: shim, args: shimArgs });
+    const viaCommand = await restartRoot(workspace, { script: "scripts/ccdm", args: commandArgs });
+    const label = `${shim} ${shimArgs.join(" ")}`;
+    assert.equal(viaCommand.exitCode, viaShim.exitCode, label);
+    assert.equal(viaCommand.stdout, viaShim.stdout, label);
+    assert.equal(viaCommand.stderr, viaShim.stderr, label);
+    return viaShim;
+  };
+
+  for (const [shim, provider] of [["restart-root-agent.sh", []], ["restart-root-codex-agent.sh", ["--provider", "codex"]]]) {
+    const help = await viaBoth(shim, ["--help"], ["restart-root", ...provider, "--help"]);
+    assert.equal(help.exitCode, 0, help.stderr);
+    assert.match(help.stdout, /usage: ccdm restart-root/);
+  }
+  const channelForClaude = await viaBoth("restart-root-agent.sh", ["root-channel-id"], ["restart-root", "root-channel-id"]);
+  assert.equal(channelForClaude.exitCode, 2);
+  assert.match(channelForClaude.stderr, /a channel is only for root Codex: add --provider codex/);
+  // No Router is running in this workspace.
+  const routerDown = await viaBoth("restart-root-agent.sh", [], ["restart-root"]);
+  assert.equal(routerDown.exitCode, 1);
+  assert.match(routerDown.stderr, /The Router is not answering, so root was not restarted/);
+  const codex = await viaBoth("restart-root-codex-agent.sh", ["missing-channel"], ["restart-root", "--provider", "codex", "missing-channel"]);
+  assert.equal(codex.exitCode, 1);
+  assert.match(codex.stderr, WIN ? /Root Codex is not available on Windows yet/ : /No root_channels in .*registry\.json\./);
+  assert.deepEqual(changes(workspace), []);
+  assert.equal(fs.existsSync(rootFiles(workspace).key), false);
+});
+
+test("no nohup or shell string is left in the root restart paths", () => {
+  const workspace = createWorkspace();
+  for (const file of [
+    "restart-root-agent.sh",
+    "restart-root-codex-agent.sh",
+    "scripts/ccdmlib/cli/restart_root.py",
+    "scripts/ccdmlib/cli/_detach.py",
+    "scripts/lib/restart-helper.js",
+    "scripts/codex-bridge.js",
+  ]) {
+    const source = fs.readFileSync(path.join(workspace.repoDir, file), "utf8");
+    assert.doesNotMatch(source, /\bnohup\b|["']\/bin\/sh["']|\bsh\s+-c\b|\bzsh\s+-ic\b/, file);
+  }
+  for (const shim of ["restart-root-agent.sh", "restart-root-codex-agent.sh"]) {
+    const lines = fs.readFileSync(path.join(workspace.repoDir, shim), "utf8").split("\n").filter(line => line && !line.startsWith("#"));
+    assert.equal(lines.length, 1, shim);
+    assert.match(lines[0], /^exec "\$\(cd "\$\(dirname "\$0"\)" && pwd\)\/scripts\/ccdm" restart-root /, shim);
+  }
 });

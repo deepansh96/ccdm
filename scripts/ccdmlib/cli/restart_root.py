@@ -48,6 +48,7 @@ _BRIDGE_SCRIPT = "scripts/codex-bridge.js"
 _TMUX_GRACE_MS = 1000
 _HOST_GRACE_MS = 2000
 _JOB_EMPTY_WAIT_S = 5.0
+_UNLINK_BUDGET_S = 2.0
 _ROUTER_CHECK_TIMEOUT_S = 15
 _DEFAULT_CODEX_LAUNCH_TIMEOUT_S = 120
 _DEFAULT_ROOT_WS_PORT = "18399"
@@ -131,10 +132,16 @@ def _files() -> _Files:
 
 def _unlink(*paths: str) -> None:
     for path in paths:
-        try:
-            Path(path).unlink(missing_ok=True)
-        except OSError:
-            pass  # A just-stopped process can still hold it; the next launch replaces it.
+        # A just-stopped process can hold its files for a moment on Windows.
+        deadline = time.monotonic() + _UNLINK_BUDGET_S
+        while True:
+            try:
+                Path(path).unlink(missing_ok=True)
+                break
+            except OSError:
+                if not WIN32 or time.monotonic() >= deadline:
+                    break  # The next launch replaces it.
+                time.sleep(0.05)
 
 
 # --- the Router check ----------------------------------------------------

@@ -1,5 +1,5 @@
 {
-  "budget": 127,
+  "budget": 135,
   "skips": [
     {
       "file": "codex-start.test.js",
@@ -107,13 +107,7 @@
       "file": "stop-restart.test.js",
       "test": "restart-root-agent simulates root_agent cleanup, retry, fresh launch, and development-channel send-key",
       "tag": "posix",
-      "reason": "restart-root-agent.sh is zsh; root restart is ported by P3.8"
-    },
-    {
-      "file": "stop-restart.test.js",
-      "test": "the retired reminder-adapter opt-in and a selected root state directory leave root Claude on the Router",
-      "tag": "posix",
-      "reason": "restart-root-agent.sh is zsh; root restart is ported by P3.8"
+      "reason": "drives tmux's kill retry and the fixture pkill; the fake-host root cases in this file run on Windows"
     },
     {
       "file": "stop-restart.test.js",
@@ -194,16 +188,10 @@
       "reason": "root Codex stays POSIX until D2"
     },
     {
-      "file": "stop-restart.test.js",
-      "test": "restart-root-agent launch failures include command diagnostics",
+      "file": "router-root-codex.test.js",
+      "test": "*",
       "tag": "posix",
-      "reason": "restart-root-agent.sh is zsh; root restart is ported by P3.8"
-    },
-    {
-      "file": "stop-restart.test.js",
-      "test": "restart-root-agent teardown failures are recorded as diagnostics",
-      "tag": "posix",
-      "reason": "restart-root-agent.sh is zsh; root restart is ported by P3.8"
+      "reason": "root Codex stays on Linux and macOS until the owner's decision on a Windows Codex root (D2)"
     },
     {
       "file": "macos-real-tools.test.js",

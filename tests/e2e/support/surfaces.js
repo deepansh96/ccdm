@@ -19,6 +19,7 @@ const WHOLE_SUITES = Object.freeze({
   "thread-supervisor-launchagent.test.js": { tag: "posix", reason: "installs through launchd and a zsh script; Windows installers have their own suites" },
   "usage-stats-installer.test.js": { tag: "posix", reason: "installs through launchd and a zsh script; Windows installers have their own suites" },
   "setup.test.js": { tag: "posix", reason: "drives zsh scripts, which the Windows port replaces" },
+  "router-root-codex.test.js": { tag: "posix", reason: "root Codex stays on Linux and macOS until the owner's decision on a Windows Codex root (D2)" },
   "macos-real-tools.test.js": { tag: "darwin", reason: "drives real Homebrew tmux and zsh on macOS" },
 });
 
