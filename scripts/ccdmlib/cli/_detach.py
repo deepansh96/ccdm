@@ -35,11 +35,14 @@ def _is_own_session(target_session: str) -> bool:
         raise
 
 
-def detach_if_self(target_session: str, argv: Optional[Sequence[str]] = None) -> None:
+def detach_if_self(
+    target_session: str, argv: Optional[Sequence[str]] = None, forward: Sequence[str] = ()
+) -> None:
     """Return to run in the foreground, or hand off and exit 0 if the target is the caller's own.
 
     ``target_session`` is the session name. ``argv`` is the command line without
-    the program name, ``sys.argv[1:]`` by default.
+    the program name, ``sys.argv[1:]`` by default. ``forward`` names variables the
+    detached copy needs besides the ``CCDM*`` ones, when the caller has them set.
     """
     if os.environ.get(_DETACHED) == "1" or not _is_own_session(target_session):
         return
@@ -49,6 +52,7 @@ def detach_if_self(target_session: str, argv: Optional[Sequence[str]] = None) ->
     log.parent.mkdir(parents=True, exist_ok=True)
     # ccdm-host starts helpers with none of the CCDM* names unless they are passed.
     env = {name: value for name, value in os.environ.items() if name.upper().startswith("CCDM")}
+    env.update({name: os.environ[name] for name in forward if os.environ.get(name)})
     env.pop(_SESSION_NAME, None)
     env.update({_DETACHED: "1", "PYTHONUTF8": "1"})
     started = session_host.run_detached([sys.executable, str(_ENTRY), *arguments], env=env, log=str(log))
