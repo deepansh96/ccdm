@@ -19,11 +19,11 @@ Each request gets one response echoing its `id`: `{id, ok:true, …result}` or `
 | `new` | `{name, argv[], cwd, env{}, pty, kind, log?}`; `kind` is `project`, `thread`, `root` or `adhoc` | `{pid}`; a live duplicate name gets `duplicate_session` |
 | `has` | `{name}`, exact match only | `{live}` |
 | `list` | `{}` | `{sessions:[{name, kind, pid, created, exit, pty}]}`; `created` is Unix seconds, `exit` is `null` while live |
-| `send` | `{name, keys[], literal}` | `{}`; no-PTY writes to stdin |
-| `capture` | `{name, history:false\|true\|N, join:false}` | `{text}`; no-PTY returns the in-memory tail of the log (false: one screen) |
+| `send` | `{name, keys[], literal}` | `{}`; no-PTY writes to stdin; PTY maps tmux key names (`Enter` is `\r`) and writes to the console |
+| `capture` | `{name, history:false\|true\|N, join:false}` | `{text}`; no-PTY returns the in-memory tail of the log (false: one screen); PTY renders the screen (false: the viewport, N: N scrollback rows above it, true: all), and `join` unwraps rows the terminal wrapped |
 | `pids` | `{name}` | `{pids}` from the session's Job |
-| `kill` | `{name, graceMs=3000}` | `{killed:[pid]}`; grace phase (no-PTY: close stdin), then `TerminateJobObject` |
-| `wait` | `{name, regex, timeoutMs, thenSend?[]}` | `{matched, ms, screen}`; answers `unsupported_op` until the ConPTY slice |
+| `kill` | `{name, graceMs=3000}` | `{killed:[pid]}`; grace phase (no-PTY: close stdin; PTY: close the console's input), then `TerminateJobObject` |
+| `wait` | `{name, regex, timeoutMs, thenSend?[]}` | `{matched, ms, screen}`; PTY sessions only, otherwise `unsupported_op`; see below |
 | `attach` | `{name, readOnly}`, then stream frames | `unsupported_op` until the attach slice |
 | `run-detached` | `{argv[], cwd, env{}, log}` | `{pid}`; `unsupported_op` until the attach slice |
 | `subscribe` | `{}`, then `{event:"exit", name, code}` pushes | `unsupported_op` until the attach slice |
@@ -31,6 +31,16 @@ Each request gets one response echoing its `id`: `{id, ok:true, …result}` or `
 | `shutdown` | `{}` | `{}`; kills every session (grace, then Job), clears the journal, exits |
 
 After a session's program exits, `has` is false and its output stays readable through `capture` until `kill-session` or a new `new` with that name. `kill` releases the name, and `pids` then answers an empty list.
+
+## ConPTY sessions
+
+`new` without `--no-pty` runs the program under node-pty with the bundled `conpty.dll` and `OpenConsole.exe` (`useConptyDll`), 200 by 50, with 10000 rows of scrollback. The program goes into the session's Job right after spawn. Every byte of output also goes into a `@xterm/headless` terminal with the Unicode 11 width tables, and that terminal's replies go back to the console. The bundled OpenConsole sends DA1 at startup and holds the first screen for about 3 s until something answers.
+
+`wait` checks the rendered viewport, wrapped rows joined, when it arrives and after each output chunk. On a match it sends `thenSend` in the same turn of the event loop, so the check and the send cannot race. A timeout gives `matched:false` with the last screen. If the program ends first the wait returns at once; it can match only when it had no keys to send. A wait whose client disconnects is dropped and sends nothing.
+
+The grace phase of `kill` closes the console's input pipe rather than calling node-pty's `kill()`, which calls `TerminateProcess` on the program immediately when `useConptyDll` is on. With the pipe closed, OpenConsole shuts down and sends its clients `CTRL_CLOSE`, which Node programs see as `SIGHUP`. That and two other details (the input pipe's error handler, stopping the output worker) use node-pty private fields, which is why its version is pinned exactly and must be rechecked on an upgrade.
+
+A session still ends when its root program exits. OpenConsole stays while any client is attached, so the host watches the Job for the root and empties the Job when it is gone. After the last output has been parsed the screen is kept as plain text and the terminal is released. A log is written only when `new` names one, since the raw stream of a full-screen program is large.
 
 ## Session environment
 
@@ -45,6 +55,7 @@ All are exact-version `optionalDependencies`, loaded lazily on win32 only and ab
 | `koffi` | 3.3.4 | Yes (`cnoke --prebuild`); loads from the prebuilt `@koromix/koffi-win32-x64` even when npm does not run it | Jobs, `CreateEnvironmentBlock`, process start times |
 | `node-pty` | 1.1.0 | Yes (`install`: `node scripts/prebuild.js \|\| node-gyp rebuild`; `postinstall`: `node scripts/post-install.js`); ships prebuilt binaries | ConPTY sessions |
 | `@xterm/headless` | 6.0.0 | No | The ConPTY session's screen |
+| `@xterm/addon-unicode11` | 0.9.0 | No | Character widths on that screen, matching OpenConsole's |
 
 ## Considered Options
 
