@@ -7,7 +7,7 @@ import path from "node:path";
 import { assertIsolatedPath, buildCommandDiagnostics } from "./diagnostics.js";
 import { fixtureLauncher, gitBashTool, hookShell, interpreterFor, PYTHON } from "./platform.js";
 import { readState, recordCommandInvocation, writeState } from "./state.js";
-import { registerTeardownCallback, workspaceOwnsPid } from "./teardown.js";
+import { createWorkspaceJob, registerTeardownCallback, workspaceOwnsPid } from "./teardown.js";
 
 // Deadlines are upper bounds that a passing test never waits out, so they
 // scale with load: parallel files on a busy machine run slower than one file
@@ -1725,11 +1725,16 @@ export const createWorkspace = Object.freeze(function createWorkspace(options = 
   // Registered before anything exists, so a throw below leaves nothing behind after cleanup().
   let tmpRoot;
   let stateDir;
+  let workspaceJob;
   registerTeardownCallback(async () => {
     if (tmpRoot === undefined) return;
+    const stopping = workspaceJob?.stop();
+    if (stopping) await stopping;
     try {
       const state = readState(stateDir);
       for (const row of state.fixtures.processes ?? []) {
+        // What the job ended is gone by now; the marker check is for what it never held.
+        if (WIN && Number.isInteger(row?.pid) && !processGroupExists(row.pid)) continue;
         if (row?.owned === true && row.ownerStateDir === stateDir && Number.isInteger(row.pid)
             && workspaceOwnsPid(row.pid, tmpRoot)) {
           await terminateProcessGroup(row.pid, 5000);
@@ -1758,6 +1763,9 @@ export const createWorkspace = Object.freeze(function createWorkspace(options = 
   copySourceFiles(root, repoDir, files);
   assertWorkspaceClean(repoDir);
   createFixtures(fixtureDir, options);
+  if (WIN) {
+    workspaceJob = createWorkspaceJob(fixtureDir, { killWaitMs: scaledTimeout(3000), launcherWaitMs: scaledTimeout(4000) });
+  }
   writeState(undefined, stateDir);
 
   const workspace = Object.freeze({

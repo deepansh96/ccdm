@@ -71,6 +71,10 @@ Test Workspaces are assembled from Git-visible source files: tracked files plus 
 
 The teardown manager exposes `registerTeardownCallback(fn)` and `cleanup()`. Callbacks run idempotently in LIFO order on normal test cleanup and through process-level handlers for assertion failure, uncaught exception, unhandled rejection, `SIGINT`, `SIGTERM`, and process exit. Cleanup failures are recorded in fixture diagnostics.
 
+On Windows every workspace owns a job object. `createWorkspace()` creates it, keeps its only handle in the test process, and writes its name to `.job` in the fixtures dir. Each fixture launcher (`fixture-shim.cs`) puts its child in that job and in a job of its own, before the child runs, so every descendant is a member. Killing a launcher ends its tree. When a launcher's child exits by itself the launcher exits too, and a detached grandchild (a fixture tmux session) stays running in the workspace job until teardown, as it would on POSIX.
+
+Teardown sets the workspace's stop event. Each running launcher forwards `CTRL_BREAK_EVENT` to its child's process group, waits 2 seconds, then ends its tree; a launcher also does this on a real Ctrl+Break. The harness then waits for `.live` (one delete-on-close file per running launcher) to empty, terminates the job and closes it. If the test process dies, the kernel closes the job and the tree goes with it. A process is signalled this way only because a launcher of this workspace put it in the job, so no PID or command line is consulted. Recorded PIDs still running afterwards, which the job never held, keep the old path: stopped only when their command line holds the workspace marker.
+
 ## Fixture State
 
 `$CCDM_TEST_STATE/state.json` uses schema version `1`:

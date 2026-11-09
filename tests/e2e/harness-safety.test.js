@@ -16,6 +16,8 @@ import {
   platformGate,
   PYTHON,
   resolvePython,
+  sendCtrlBreak,
+  spawnWithCtrlBreak,
 } from "./support/platform.js";
 import { createWorkspace, runNodeEntrypoint, runnerInternals, runScript } from "./support/runner.js";
 import {
@@ -807,6 +809,227 @@ test("npm test stops before any file runs when csc.exe is missing", WINDOWS_ONLY
   assert.match(result.stderr, /E2E run cannot start.*csc\.exe/s);
   assert.doesNotMatch(result.stdout, /pass\.test\.js/);
   assert.ok(Date.now() - started < 30000);
+});
+
+async function waitForFile(file, timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!fs.existsSync(file) || fs.readFileSync(file, "utf8") === "") {
+    assert.ok(Date.now() < deadline, `${file} never appeared`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return fs.readFileSync(file, "utf8");
+}
+
+// A script that starts a detached grandchild, writes "<own pid> <grandchild pid>"
+// to `pids`, then exits or stays.
+function treeScript(dir, pids, { stay }) {
+  const script = path.join(dir, "tree.js");
+  fs.writeFileSync(script, [
+    'const { spawn } = require("node:child_process");',
+    'const grandchild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore", windowsHide: true });',
+    "grandchild.unref();",
+    `require("node:fs").writeFileSync(${JSON.stringify(pids)}, process.pid + " " + grandchild.pid);`,
+    stay ? "setInterval(() => {}, 1000);" : "process.exit(0);",
+    "",
+  ].join("\n"));
+  return script;
+}
+
+// A script that reports it is ready and then answers Ctrl+Break as told.
+function breakScript(dir, ready, onBreak) {
+  const script = path.join(dir, "break.js");
+  fs.writeFileSync(script, [
+    'const fs = require("node:fs");',
+    `process.on("SIGBREAK", () => { ${onBreak} });`,
+    `fs.writeFileSync(${JSON.stringify(ready)}, String(process.pid));`,
+    "setInterval(() => {}, 1000);",
+    "",
+  ].join("\n"));
+  return script;
+}
+
+test("a detached grandchild that outlives its fixture tool is gone after teardown", WINDOWS_ONLY, async () => {
+  const workspace = probeWorkspace();
+  const pids = path.join(workspace.tmpDir, "pids");
+  const tool = launcherPair(workspace.fixtureDir, "leaver", [process.execPath, treeScript(workspace.tmpDir, pids, { stay: false })]);
+
+  const result = spawnSync(tool, [], { encoding: "utf8", windowsHide: true });
+  assert.equal(result.status, 0, result.stderr);
+  const grandchild = Number((await waitForFile(pids)).split(" ")[1]);
+  assert.equal(processAlive(grandchild), true, "the grandchild should outlive the tool until teardown");
+
+  await cleanup();
+
+  await waitUntilGone(grandchild);
+});
+
+test("an idle fake codex app-server whose starter has gone is stopped at teardown", WINDOWS_ONLY, async () => {
+  const workspace = createWorkspace();
+  const port = "45871";
+  const state = readState(workspace.stateDir);
+  state.fixtures.codex.servers[port] = { ready: true };
+  writeState(state, workspace.stateDir);
+  const starter = path.join(workspace.tmpDir, "starter.js");
+  fs.writeFileSync(starter, [
+    'const { spawn } = require("node:child_process");',
+    `spawn(${JSON.stringify(path.join(workspace.fixtureDir, "codex.exe"))}, ["app-server", "--listen", "ws://127.0.0.1:${port}"], { detached: true, stdio: "ignore", windowsHide: true }).unref();`,
+    "",
+  ].join("\n"));
+
+  assert.equal(spawnSync(process.execPath, [starter], { env: workspace.env, windowsHide: true }).status, 0);
+  const deadline = Date.now() + 20000;
+  let server;
+  while (!server && Date.now() < deadline) {
+    server = readState(workspace.stateDir).fixtures.codex.appServerInvocations[0]?.pid;
+    if (!server) await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(server, "the fake app-server never recorded itself");
+  assert.equal(processAlive(server), true);
+
+  await cleanup();
+
+  await waitUntilGone(server);
+  assert.equal(fs.existsSync(workspace.tmpRoot), false, "a running launcher would hold the workspace open");
+});
+
+test("the launcher forwards Ctrl+Break, and a child that handles it exits cleanly with its own code", WINDOWS_ONLY, async () => {
+  const workspace = probeWorkspace();
+  const ready = path.join(workspace.tmpDir, "ready");
+  const handled = path.join(workspace.tmpDir, "handled");
+  const script = breakScript(workspace.tmpDir, ready, `fs.writeFileSync(${JSON.stringify(handled)}, "yes"); process.exit(5);`);
+  const launcher = spawnWithCtrlBreak(launcherPair(workspace.fixtureDir, "polite", [process.execPath, script]), []);
+  const exited = new Promise((resolve) => launcher.once("exit", resolve));
+  const child = Number(await waitForFile(ready));
+
+  const started = Date.now();
+  sendCtrlBreak(launcher);
+  const code = await exited;
+
+  assert.equal(code, 5);
+  assert.equal(fs.readFileSync(handled, "utf8"), "yes");
+  assert.ok(Date.now() - started < 1900, "the child should not have used the whole grace period");
+  await waitUntilGone(child);
+});
+
+test("a child that ignores Ctrl+Break is killed when the grace period ends", WINDOWS_ONLY, async () => {
+  const workspace = probeWorkspace();
+  const ready = path.join(workspace.tmpDir, "ready");
+  const script = breakScript(workspace.tmpDir, ready, "/* ignored */");
+  const launcher = spawnWithCtrlBreak(launcherPair(workspace.fixtureDir, "stubborn", [process.execPath, script]), []);
+  const exited = new Promise((resolve) => launcher.once("exit", resolve));
+  const child = Number(await waitForFile(ready));
+
+  const started = Date.now();
+  sendCtrlBreak(launcher);
+  const code = await exited;
+
+  assert.equal(code, 1);
+  assert.ok(Date.now() - started >= 1800, "the child got less than the grace period");
+  await waitUntilGone(child);
+});
+
+test("teardown gives Ctrl+Break to the child of a launcher that has no console", WINDOWS_ONLY, async () => {
+  const workspace = probeWorkspace();
+  // Outside the workspace, which teardown removes.
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-harness-break-"));
+  try {
+    const ready = path.join(outside, "ready");
+    const handled = path.join(outside, "handled");
+    const script = breakScript(outside, ready, `fs.writeFileSync(${JSON.stringify(handled)}, "yes"); process.exit(0);`);
+    const launcher = spawn(launcherPair(workspace.fixtureDir, "detached", [process.execPath, script]), [], {
+      detached: true, stdio: "ignore", windowsHide: true,
+    });
+    const child = Number(await waitForFile(ready));
+
+    await cleanup();
+
+    assert.equal(fs.readFileSync(handled, "utf8"), "yes");
+    await waitUntilGone(child);
+    await waitUntilGone(launcher.pid);
+  } finally {
+    fs.rmSync(outside, { force: true, recursive: true });
+  }
+});
+
+test("killing the launcher directly kills its whole tree", WINDOWS_ONLY, async () => {
+  const workspace = probeWorkspace();
+  const pids = path.join(workspace.tmpDir, "pids");
+  // In tmpDir there is no .job file: only the launcher's own job can end this tree.
+  const tool = launcherPair(workspace.tmpDir, "stayer", [process.execPath, treeScript(workspace.tmpDir, pids, { stay: true })]);
+  const launcher = spawn(tool, [], { stdio: "ignore", windowsHide: true });
+  const [child, grandchild] = (await waitForFile(pids)).split(" ").map(Number);
+  assert.equal(processAlive(grandchild), true);
+
+  launcher.kill();
+
+  await waitUntilGone(child);
+  await waitUntilGone(grandchild);
+});
+
+test("job teardown leaves a live process alone even when its PID is planted in fixture state", WINDOWS_ONLY, async () => {
+  const workspace = probeWorkspace();
+  const pids = path.join(workspace.tmpDir, "pids");
+  const tool = launcherPair(workspace.fixtureDir, "leaver", [process.execPath, treeScript(workspace.tmpDir, pids, { stay: false })]);
+  assert.equal(spawnSync(tool, [], { windowsHide: true }).status, 0);
+  const grandchild = Number((await waitForFile(pids)).split(" ")[1]);
+  const sentinel = startSleeper();
+  try {
+    seedOwnedRow(workspace, sentinel.pid);
+
+    await cleanup();
+
+    await waitUntilGone(grandchild);
+    assert.equal(processAlive(sentinel.pid), true);
+    assert.ok(teardownSkips().some((skip) => skip.pid === sentinel.pid && skip.marker === workspace.tmpRoot));
+  } finally {
+    sentinel.kill();
+  }
+});
+
+test("the launcher and workspace job work when the test runner is already inside a job", WINDOWS_ONLY, async () => {
+  const support = (file) => JSON.stringify(new URL(`./support/${file}`, import.meta.url).href);
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-harness-nested-"));
+  try {
+    const script = path.join(scratch, "nested.mjs");
+    fs.writeFileSync(script, [
+      'import { spawnSync } from "node:child_process";',
+      'import fs from "node:fs";',
+      'import path from "node:path";',
+      `import { fixtureLauncher } from ${support("platform.js")};`,
+      `import { createWorkspace } from ${support("runner.js")};`,
+      `import { cleanup } from ${support("teardown.js")};`,
+      'const workspace = createWorkspace({ excludeFixtures: ["sleep"] });',
+      'const pids = path.join(workspace.tmpDir, "pids");',
+      'const tree = path.join(workspace.tmpDir, "tree.js");',
+      `fs.writeFileSync(tree, ${JSON.stringify(fs.readFileSync(treeScript(scratch, "PIDS", { stay: false }), "utf8"))}.replace('"PIDS"', JSON.stringify(pids)));`,
+      'const exe = path.join(workspace.fixtureDir, "leaver.exe");',
+      "fs.copyFileSync(fixtureLauncher(), exe);",
+      'fs.writeFileSync(path.join(workspace.fixtureDir, "leaver.shim"), process.execPath + "\\n" + tree + "\\n");',
+      'const started = spawnSync(exe, [], { encoding: "utf8", windowsHide: true });',
+      'const grandchild = Number(fs.readFileSync(pids, "utf8").split(" ")[1]);',
+      "const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };",
+      "const aliveBefore = alive(grandchild);",
+      "await cleanup();",
+      "const deadline = Date.now() + 20000;",
+      "while (alive(grandchild) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));",
+      "process.stdout.write(JSON.stringify({ aliveBefore, goneAfter: !alive(grandchild), status: started.status, stderr: started.stderr }));",
+      "process.exit(0);",
+      "",
+    ].join("\n"));
+
+    // ctrl-break.exe runs its program inside a job, so everything in nested.mjs starts inside one.
+    const runner = spawnWithCtrlBreak(process.execPath, [script]);
+    let stdout = "";
+    let stderr = "";
+    runner.stdout.on("data", (chunk) => { stdout += chunk; });
+    runner.stderr.on("data", (chunk) => { stderr += chunk; });
+    const code = await new Promise((resolve) => runner.once("exit", resolve));
+
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(JSON.parse(stdout), { aliveBefore: true, goneAfter: true, status: 0, stderr: "" });
+  } finally {
+    fs.rmSync(scratch, { force: true, recursive: true });
+  }
 });
 
 test("teardown callbacks run in LIFO order and cleanup failures are diagnostic records", async () => {
