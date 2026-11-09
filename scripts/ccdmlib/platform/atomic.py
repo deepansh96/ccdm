@@ -62,6 +62,24 @@ def remove_dir_with_retry(path: PathLike, budget_ms: int = DEFAULT_BUDGET_MS) ->
     _with_retry(remove, REMOVE_ERRORS, budget_ms)
 
 
+def remove_tree_with_retry(path: PathLike, budget_ms: int = DEFAULT_BUDGET_MS) -> None:
+    """Remove a file or a directory tree; what is already gone is fine.
+
+    Retries a process that still holds it open, then raises: the caller decides how to report it.
+    """
+
+    def remove() -> None:
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+    _with_retry(remove, REMOVE_ERRORS, budget_ms)
+
+
 def write_file_atomic(file: PathLike, data: Union[str, bytes], mode: int = 0o600) -> None:
     """Python twin of ``writeFileAtomic``: the target is never partly written."""
     target = Path(file)

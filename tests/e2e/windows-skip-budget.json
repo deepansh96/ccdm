@@ -45,9 +45,147 @@
     },
     {
       "file": "stop-restart.test.js",
-      "test": "*",
+      "test": "sleep fixture resolves fixture-mode delays quickly",
       "tag": "posix",
-      "reason": "drives zsh scripts, which the Windows port replaces"
+      "reason": "reads listeners from the fixture ps and sends POSIX signals; Windows has its own cases in this file"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "stop-session stops a Claude session and clears registry metadata",
+      "tag": "posix",
+      "reason": "reads listeners from the fixture ps and sends POSIX signals; Windows has its own cases in this file"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "stop-session stops a Codex bridge session from seeded registry and process state",
+      "tag": "posix",
+      "reason": "reads listeners from the fixture ps and sends POSIX signals; Windows has its own cases in this file"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "stop-session sweeps orphan Claude and Codex listener processes",
+      "tag": "posix",
+      "reason": "reads listeners from the fixture ps and sends POSIX signals; Windows has its own cases in this file"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "during cutover, stop-session also sweeps a legacy pool Claude listener for the project's former pool bot",
+      "tag": "posix",
+      "reason": "reads listeners from the fixture ps and sends POSIX signals; Windows has its own cases in this file"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "stop-session sweeps an orphaned CCDM channel server and removes the launch key",
+      "tag": "posix",
+      "reason": "reads listeners from the fixture ps and sends POSIX signals; Windows has its own cases in this file"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "stop-session escalates SIGTERM-resistant child processes to SIGKILL",
+      "tag": "posix",
+      "reason": "reads listeners from the fixture ps and sends POSIX signals; Windows has its own cases in this file"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "restart-root-agent simulates root_agent cleanup, retry, fresh launch, and development-channel send-key",
+      "tag": "posix",
+      "reason": "restart-root-agent.sh is zsh; root restart is ported by P3.8"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "the retired reminder-adapter opt-in and a selected root state directory leave root Claude on the Router",
+      "tag": "posix",
+      "reason": "restart-root-agent.sh is zsh; root restart is ported by P3.8"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "restart-root-codex-agent starts the root bot through the Codex bridge in Router root mode",
+      "tag": "posix",
+      "reason": "root Codex stays POSIX until D2"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "restart-root-codex-agent uses the Default Codex Account when no emergency override is set",
+      "tag": "posix",
+      "reason": "root Codex stays POSIX until D2"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "restart-root-codex-agent rejects malformed global named-account selectors before teardown",
+      "tag": "posix",
+      "reason": "root Codex stays POSIX until D2"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "restart-root-codex-agent rejects an unknown Default Codex Account before root teardown",
+      "tag": "posix",
+      "reason": "root Codex stays POSIX until D2"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "restart-root-codex-agent rejects a Default Codex Account and Legacy Codex Home conflict",
+      "tag": "posix",
+      "reason": "root Codex stays POSIX until D2"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "restart-root-codex-agent keeps ROOT_CODEX_HOME above the shared home",
+      "tag": "posix",
+      "reason": "root Codex stays POSIX until D2"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "restart-root-codex-agent validates the selected home before tearing down root_agent",
+      "tag": "posix",
+      "reason": "root Codex stays POSIX until D2"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "restart-root-codex-agent rejects every invalid selected home before root teardown",
+      "tag": "posix",
+      "reason": "root Codex stays POSIX until D2"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "restart-root-codex-agent uses ambient CODEX_HOME when the registry has no home",
+      "tag": "posix",
+      "reason": "root Codex stays POSIX until D2"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "restart-root-codex-agent lets ROOT_CODEX_HOME recover from a broken registry home",
+      "tag": "posix",
+      "reason": "root Codex stays POSIX until D2"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "restart-root-codex-agent re-reads the registry home on every restart",
+      "tag": "posix",
+      "reason": "root Codex stays POSIX until D2"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "restart-root-codex-agent keeps the legacy default without home overrides",
+      "tag": "posix",
+      "reason": "root Codex stays POSIX until D2"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "restart-root-codex-agent rejects a channel missing from the registry's root channels before stopping the current root",
+      "tag": "posix",
+      "reason": "root Codex stays POSIX until D2"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "restart-root-agent launch failures include command diagnostics",
+      "tag": "posix",
+      "reason": "restart-root-agent.sh is zsh; root restart is ported by P3.8"
+    },
+    {
+      "file": "stop-restart.test.js",
+      "test": "restart-root-agent teardown failures are recorded as diagnostics",
+      "tag": "posix",
+      "reason": "restart-root-agent.sh is zsh; root restart is ported by P3.8"
     },
     {
       "file": "macos-real-tools.test.js",

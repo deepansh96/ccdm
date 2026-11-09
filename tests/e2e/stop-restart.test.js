@@ -2,16 +2,21 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import nodeTest from "node:test";
+import test from "node:test";
 
 import { startFakeCodexServer } from "./support/bridge.js";
-import { suiteTest } from "./support/platform.js";
+import { PYTHON, platformGate } from "./support/platform.js";
 import { createRouterWorkspace, routerEnv, startRouter } from "./support/router.js";
 import { createWorkspace, runScript } from "./support/runner.js";
+import { hostOps, startFakeHost } from "./support/session-fixture.js";
 import { readState, seedFixtureProcess, seedRegistry, seedTmuxSession, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 
-const test = suiteTest(nodeTest, import.meta.url);
+// Why a case runs only on Linux and macOS.
+const POSIX_STOP = "reads listeners from the fixture ps and sends POSIX signals; Windows has its own cases here";
+const ROOT_RESTART = "restart-root-agent.sh is zsh; root restart is ported by P3.8";
+const CODEX_ROOT = "root Codex stays POSIX until D2";
+const NO_ACTIVE_SESSION = process.platform === "win32" ? "No active session" : "No active tmux session";
 
 test.afterEach(async () => {
   await cleanup();
@@ -73,6 +78,7 @@ function spawnOwnedProcess(workspace, command, options = {}) {
       CCDM_TEST_STATE: workspace.stateDir,
     },
     stdio: "ignore",
+    windowsHide: true,
   });
   child.unref();
   registerTeardownCallback(() => {
@@ -134,10 +140,10 @@ async function rootCodexRouterEnv(workspace, extraEnv = {}) {
 }
 
 async function stopProject(workspace) {
-  return runScript(workspace, "scripts/stop-session.sh", { args: ["alpha"] });
+  return runScript(workspace, "scripts/stop-session.sh", { args: ["alpha"], timeoutMs: 30000 });
 }
 
-test("sleep fixture resolves fixture-mode delays quickly", () => {
+test("sleep fixture resolves fixture-mode delays quickly", platformGate("posix", POSIX_STOP), () => {
   const workspace = createWorkspace();
   const started = performance.now();
 
@@ -147,7 +153,7 @@ test("sleep fixture resolves fixture-mode delays quickly", () => {
   assert.ok(performance.now() - started < 100);
 });
 
-test("stop-session stops a Claude session and clears registry metadata", async () => {
+test("stop-session stops a Claude session and clears registry metadata", platformGate("posix", POSIX_STOP), async () => {
   const workspace = createWorkspace();
   const registry = buildRegistry(workspace);
   const pid = spawnOwnedProcess(workspace, claudeCommand(workspace));
@@ -167,7 +173,7 @@ test("stop-session stops a Claude session and clears registry metadata", async (
   assert.equal(readRegistry(workspace).projects.alpha.session_id, null);
 });
 
-test("stop-session stops a Codex bridge session from seeded registry and process state", async () => {
+test("stop-session stops a Codex bridge session from seeded registry and process state", platformGate("posix", POSIX_STOP), async () => {
   const workspace = createWorkspace();
   const registry = buildRegistry(workspace, { sessionType: "codex" });
   const pid = spawnOwnedProcess(workspace, codexBridgeCommand());
@@ -207,12 +213,12 @@ test("stop-session handles already-stopped projects", async () => {
   const result = await stopProject(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  assert.match(result.stdout, /No active tmux session 'alpha_session' found/);
+  assert.match(result.stdout, new RegExp(`${NO_ACTIVE_SESSION} 'alpha_session' found`));
   assert.match(result.stdout, /Stopped Discord session 'alpha'/);
   assert.equal(readRegistry(workspace).projects.alpha.pid, null);
 });
 
-test("stop-session sweeps orphan Claude and Codex listener processes", async () => {
+test("stop-session sweeps orphan Claude and Codex listener processes", platformGate("posix", POSIX_STOP), async () => {
   const claudeWorkspace = createWorkspace();
   const claudeRegistry = buildRegistry(claudeWorkspace);
   const claudePid = spawnOwnedProcess(claudeWorkspace, claudeCommand(claudeWorkspace));
@@ -242,7 +248,7 @@ test("stop-session sweeps orphan Claude and Codex listener processes", async () 
   assert.equal(isAlive(appServerPid), false);
 });
 
-test("during cutover, stop-session also sweeps a legacy pool Claude listener for the project's former pool bot", async () => {
+test("during cutover, stop-session also sweeps a legacy pool Claude listener for the project's former pool bot", platformGate("posix", POSIX_STOP), async () => {
   const workspace = createWorkspace();
   const stateDir = (n) => path.join(workspace.homeDir, ".claude", "channels", `discord${n}`);
   // alpha still names its former pool bot; bot3 serves another project.
@@ -268,7 +274,7 @@ test("during cutover, stop-session also sweeps a legacy pool Claude listener for
   assert.equal(readRegistry(workspace).projects.alpha.pid, null);
 });
 
-test("stop-session sweeps an orphaned CCDM channel server and removes the launch key", async () => {
+test("stop-session sweeps an orphaned CCDM channel server and removes the launch key", platformGate("posix", POSIX_STOP), async () => {
   const workspace = createWorkspace();
   const registry = buildRegistry(workspace);
   seedRegistry(workspace, registry);
@@ -286,7 +292,7 @@ test("stop-session sweeps an orphaned CCDM channel server and removes the launch
   assert.equal(fs.existsSync(keyFile), false);
 });
 
-test("stop-session escalates SIGTERM-resistant child processes to SIGKILL", async () => {
+test("stop-session escalates SIGTERM-resistant child processes to SIGKILL", platformGate("posix", POSIX_STOP), async () => {
   const workspace = createWorkspace();
   const registry = buildRegistry(workspace);
   const parentPid = spawnOwnedProcess(workspace, claudeCommand(workspace));
@@ -317,7 +323,253 @@ test("stop-session skips Codex listener sweep when required registry fields are 
   assert.equal(isAlive(orphanPid), true);
 });
 
-test("restart-root-agent simulates root_agent cleanup, retry, fresh launch, and development-channel send-key", async () => {
+// ---- stop-session through the fake ccdm-host, and what any backend must do ----
+
+const WIN_ONLY = "Windows finds session processes by their command line";
+const WAIT_STEP_MS = 50;
+
+// Stopped at teardown through the handle this test holds, so nothing else can be hit.
+function spawnWithArgs(args, program = process.execPath, leading = ["-e", "setInterval(() => {}, 1000)", "--"]) {
+  const child = spawn(program, [...leading, ...args], { detached: true, stdio: "ignore", windowsHide: true });
+  child.unref();
+  registerTeardownCallback(() => {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // It has already ended.
+    }
+  });
+  return child.pid;
+}
+
+const spawnBystander = () => spawnWithArgs([]);
+
+function writePrivate(file, text) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, text, { mode: 0o600 });
+}
+
+// One project with its key, launch files, thread launch files and capability marker on disk.
+async function hostWorld(overrides = {}) {
+  const workspace = createWorkspace();
+  const fake = await startFakeHost(workspace);
+  const routerDir = path.join(fake.stateRoot, "router");
+  const launchDir = path.join(routerDir, "launches", "alpha");
+  const files = {
+    key: path.join(routerDir, "keys", "alpha.key"),
+    launchDir,
+    mcp: path.join(launchDir, "mcp.json"),
+    settings: path.join(launchDir, "run", "settings.json"),
+    threadLaunch: path.join(launchDir, "threads", "123", "mcp.json"),
+    marker: path.join(fake.stateRoot, "conversation-reminders", "capabilities", "alpha.json"),
+  };
+  writePrivate(files.key, "key\n");
+  writePrivate(files.mcp, "{}\n");
+  writePrivate(files.settings, "{}\n");
+  writePrivate(files.threadLaunch, "{}\n");
+  writePrivate(files.marker, "{}\n");
+  const stop = (args = ["alpha"], env = {}) => runScript(workspace, "scripts/stop-session.sh", {
+    args, env: { ...fake.env, ...env }, timeoutMs: 30000,
+  });
+  return { workspace, fake, files, stop, registry: buildRegistry(workspace, overrides) };
+}
+
+function assertClaudeStateGone(world) {
+  assert.equal(fs.existsSync(world.files.key), false, "key file");
+  assert.equal(fs.existsSync(world.files.mcp), false, "launch file");
+  assert.equal(fs.existsSync(world.files.settings), false, "launch directory entry");
+  assert.equal(fs.existsSync(world.files.marker), false, "capability marker");
+  const registry = readRegistry(world.workspace).projects.alpha;
+  assert.equal(registry.pid, null);
+  assert.equal(registry.session_id, null);
+}
+
+test("on Windows, a stopped session leaves nothing from its Job and no process carrying its key-file argument", platformGate("win32", WIN_ONLY), async () => {
+  const world = await hostWorld();
+  const root = spawnWithArgs(["--mcp-config", world.files.mcp]);
+  const child = spawnWithArgs(["--ccdm-key-file", world.files.key]);
+  world.registry.projects.alpha.pid = root;
+  world.registry.projects.alpha.pid_started_at = "133000000000000000";
+  seedRegistry(world.workspace, world.registry);
+  seedTmuxSession("alpha_session", { pid: root, job: [root, child] }, { stateDir: world.workspace.stateDir });
+
+  const result = await world.stop();
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.equal(readRegistry(world.workspace).projects.alpha.pid_started_at, null);
+  assert.match(result.stdout, new RegExp(`Stopping recorded process tree for 'alpha' \\(pid ${root}\\)`));
+  assert.match(result.stdout, /Stopped session 'alpha_session'/);
+  assert.doesNotMatch(result.stdout, /tmux/);
+  assert.match(result.stdout, /Stopped Discord session 'alpha'/);
+  assert.equal(isAlive(root), false);
+  assert.equal(isAlive(child), false);
+  assertClaudeStateGone(world);
+  assert.equal(fs.existsSync(world.files.threadLaunch), true, "a plain stop keeps threads/");
+  const ops = hostOps(world.workspace).map(call => call.op);
+  const killed = ops.indexOf("kill");
+  assert.ok(killed >= 0, ops.join(" "));
+  assert.equal(hostOps(world.workspace)[killed].graceMs, 2000);
+  assert.ok(ops.lastIndexOf("pids") > killed, `the session is confirmed empty after the kill: ${ops.join(" ")}`);
+});
+
+test("on Windows, the launch directory goes once no thread launch is left", platformGate("win32", WIN_ONLY), async () => {
+  const world = await hostWorld();
+  fs.rmSync(path.join(world.files.launchDir, "threads"), { recursive: true });
+  seedRegistry(world.workspace, world.registry);
+
+  const result = await world.stop();
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.equal(fs.existsSync(world.files.launchDir), false);
+  assertClaudeStateGone(world);
+});
+
+test("on Windows, an orphan listener outside the Job is found by its key-file argument and killed", platformGate("win32", WIN_ONLY), async () => {
+  const world = await hostWorld();
+  seedRegistry(world.workspace, world.registry);
+  // The launcher's form and the same path with forward slashes are one path.
+  const orphan = spawnWithArgs(["--ccdm-key-file", world.files.key.replaceAll("\\", "/")]);
+  const launchOrphan = spawnWithArgs(["--settings", world.files.settings]);
+
+  const result = await world.stop();
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /No active session 'alpha_session' found/);
+  assert.match(result.stdout, /Cleaning remaining listener process\(es\):/);
+  assert.match(result.stdout, new RegExp(`^  ${orphan}$`, "m"));
+  assert.match(result.stdout, new RegExp(`^  ${launchOrphan}$`, "m"));
+  assert.equal(isAlive(orphan), false);
+  assert.equal(isAlive(launchOrphan), false);
+  assertClaudeStateGone(world);
+});
+
+test("on Windows, a Codex stop leaves no app-server on the bridge's port and keeps other ports", platformGate("win32", WIN_ONLY), async () => {
+  const world = await hostWorld({ sessionType: "codex" });
+  seedRegistry(world.workspace, world.registry);
+  const bridge = spawnWithArgs(["--ccdm-key-file", world.files.key]);
+  const appServer = spawnWithArgs(["app-server", "--listen", "ws://127.0.0.1:18342"]);
+  const otherPort = spawnWithArgs(["app-server", "--listen", "ws://127.0.0.1:18343"]);
+
+  const result = await world.stop();
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.equal(isAlive(bridge), false);
+  assert.equal(isAlive(appServer), false);
+  assert.equal(isAlive(otherPort), true);
+  assert.equal(readRegistry(world.workspace).projects.alpha.pid, null);
+  assert.equal(fs.existsSync(world.files.key), true, "the Codex launcher owns its key file");
+});
+
+test("on Windows, an unrelated process whose PID was planted in state survives, as do near matches", platformGate("win32", WIN_ONLY), async () => {
+  const world = await hostWorld();
+  const planted = spawnBystander();
+  world.registry.projects.alpha.pid = planted;
+  seedRegistry(world.workspace, world.registry);
+  const launches = path.dirname(world.files.launchDir);
+  const nearMisses = [
+    spawnWithArgs(["--ccdm-key-file", `${world.files.key}.bak`]),
+    spawnWithArgs(["--ccdm-key-file", path.join(path.dirname(world.files.key), "beta.key")]),
+    spawnWithArgs(["--mcp-config", path.join(launches, "alpha2", "mcp.json")]),
+    spawnWithArgs(["--mcp-config", world.files.threadLaunch]),
+    // The flag and the path, but not as the flag's value.
+    spawnWithArgs([world.files.key, "--ccdm-key-file"]),
+    // A program that is no listener, with a launch file named.
+    spawnWithArgs([world.files.mcp], PYTHON, ["-c", "import time; time.sleep(600)"]),
+  ];
+
+  const result = await world.stop();
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, new RegExp(`Skipping recorded pid ${planted}: it no longer belongs to 'alpha'`));
+  assert.equal(isAlive(planted), true);
+  for (const pid of nearMisses) assert.equal(isAlive(pid), true, `process ${pid} is not this session's`);
+  assert.equal(readRegistry(world.workspace).projects.alpha.pid, null);
+});
+
+test("on Windows, a launch file that stays held fails the stop loudly and leaves the registry", platformGate("win32", WIN_ONLY), async () => {
+  const world = await hostWorld();
+  world.registry.projects.alpha.pid = 4242;
+  seedRegistry(world.workspace, world.registry);
+  // Python's open() shares nothing for deletion, so this holds the file against removal.
+  const holderScript = "import sys, time\nhandle = open(sys.argv[1], 'r')\nopen(sys.argv[2], 'w').close()\ntime.sleep(600)\n";
+  const ready = path.join(world.workspace.tmpDir, "holding");
+  spawnWithArgs([world.files.mcp, ready], PYTHON, ["-c", holderScript]);
+  for (let waited = 0; !fs.existsSync(ready); waited += WAIT_STEP_MS) {
+    assert.ok(waited < 15000, "the file holder never started");
+    await new Promise(resolve => setTimeout(resolve, WAIT_STEP_MS));
+  }
+
+  const result = await world.stop();
+
+  assert.equal(result.exitCode, 1, result.stdout);
+  assert.match(result.stderr, /could not be removed/);
+  assert.doesNotMatch(result.stdout, /Stopped Discord session/);
+  assert.equal(readRegistry(world.workspace).projects.alpha.pid, 4242);
+});
+
+test("on Windows, a stop from inside the session moves to a detached copy that finishes the job", platformGate("win32", WIN_ONLY), async () => {
+  const world = await hostWorld();
+  const root = spawnBystander();
+  seedRegistry(world.workspace, world.registry);
+  seedTmuxSession("alpha_session", { pid: root, job: [root] }, { stateDir: world.workspace.stateDir });
+
+  const result = await world.stop(["alpha"], { CCDM_SESSION_NAME: "alpha_session" });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /continues in a detached process/);
+  for (let waited = 0; readRegistry(world.workspace).projects.alpha.session_id !== null; waited += WAIT_STEP_MS) {
+    assert.ok(waited < 20000, "the detached copy never cleared the registry");
+    await new Promise(resolve => setTimeout(resolve, WAIT_STEP_MS));
+  }
+  assert.equal(isAlive(root), false);
+});
+
+test("a registry path containing a single quote works", async () => {
+  const workspace = createWorkspace();
+  const repoDir = path.join(workspace.tmpRoot, "it's the repo");
+  fs.cpSync(workspace.repoDir, repoDir, { recursive: true });
+  const quoted = { ...workspace, repoDir };
+  seedRegistry(quoted, buildRegistry(quoted));
+
+  const result = await stopProject(quoted);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /Stopped Discord session 'alpha'/);
+  assert.equal(readRegistry(quoted).projects.alpha.pid, null);
+  assert.equal(readRegistry(quoted).projects.alpha.session_id, null);
+});
+
+test("the shim and scripts/ccdm stop-session give the same output and exit codes", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, buildRegistry(workspace));
+  const viaBoth = async (args) => {
+    const shim = await runScript(workspace, "scripts/stop-session.sh", { args, timeoutMs: 30000 });
+    const command = await runScript(workspace, "scripts/ccdm", { args: ["stop-session", ...args], timeoutMs: 30000 });
+    assert.equal(command.exitCode, shim.exitCode, args.join(" "));
+    assert.equal(command.stdout, shim.stdout, args.join(" "));
+    assert.equal(command.stderr, shim.stderr, args.join(" "));
+    return shim;
+  };
+
+  for (const args of [[], ["alpha", "--bogus"], ["alpha", "--all", "extra"]]) {
+    const refused = await viaBoth(args);
+    assert.equal(refused.exitCode, 1, args.join(" "));
+    assert.match(refused.stdout, /^Usage: .*stop-session.* <project_name> \[--threads\|--all\]$/m);
+  }
+  const help = await viaBoth(["--help"]);
+  assert.equal(help.exitCode, 0);
+  assert.equal(readRegistry(workspace).projects.alpha.session_id, "existing-session", "--help changes nothing");
+
+  const stopped = await viaBoth(["alpha"]);
+  assert.equal(stopped.exitCode, 0, stopped.stderr);
+  assert.match(stopped.stdout, /Stopped Discord session 'alpha'/);
+
+  const unknown = await viaBoth(["nosuch"]);
+  assert.equal(unknown.exitCode, 1);
+  assert.match(unknown.stderr, /unknown project: nosuch/);
+});
+
+test("restart-root-agent simulates root_agent cleanup, retry, fresh launch, and development-channel send-key", platformGate("posix", ROOT_RESTART), async () => {
   const workspace = createRouterWorkspace();
   await startRouter(workspace);
   const panePid = spawnOwnedProcess(workspace, "zsh root pane");
@@ -340,7 +592,7 @@ test("restart-root-agent simulates root_agent cleanup, retry, fresh launch, and 
   assert.equal(session.killAttempts, 2);
 });
 
-test("the retired reminder-adapter opt-in and a selected root state directory leave root Claude on the Router", async () => {
+test("the retired reminder-adapter opt-in and a selected root state directory leave root Claude on the Router", platformGate("posix", ROOT_RESTART), async () => {
   const workspace = createRouterWorkspace();
   await startRouter(workspace);
   const selectedState = path.join(workspace.homeDir, "selected-root-discord");
@@ -372,7 +624,7 @@ test("the retired reminder-adapter opt-in and a selected root state directory le
   assert.equal(fs.existsSync(path.join(workspace.homeDir, ".claude", "channels", "discord", "ccdm-root-reminder-mcp.json")), false);
 });
 
-test("restart-root-codex-agent starts the root bot through the Codex bridge in Router root mode", async () => {
+test("restart-root-codex-agent starts the root bot through the Codex bridge in Router root mode", platformGate("posix", CODEX_ROOT), async () => {
   const workspace = createRouterWorkspace();
   const codexHome = path.join(workspace.homeDir, ".codex-ccdm");
   fs.mkdirSync(codexHome, { recursive: true });
@@ -433,7 +685,7 @@ test("restart-root-codex-agent starts the root bot through the Codex bridge in R
   assert.equal(session.killAttempts, 2);
 });
 
-test("restart-root-codex-agent uses the Default Codex Account when no emergency override is set", async () => {
+test("restart-root-codex-agent uses the Default Codex Account when no emergency override is set", platformGate("posix", CODEX_ROOT), async () => {
   const workspace = createRouterWorkspace();
   const defaultAccountHome = path.join(workspace.homeDir, ".codex-default-account");
   fs.mkdirSync(defaultAccountHome, { recursive: true });
@@ -453,7 +705,7 @@ test("restart-root-codex-agent uses the Default Codex Account when no emergency 
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent.env.CODEX_HOME, defaultAccountHome);
 });
 
-test("restart-root-codex-agent rejects malformed global named-account selectors before teardown", async () => {
+test("restart-root-codex-agent rejects malformed global named-account selectors before teardown", platformGate("posix", CODEX_ROOT), async () => {
   const cases = [
     {
       name: "map wrong type",
@@ -498,7 +750,7 @@ test("restart-root-codex-agent rejects malformed global named-account selectors 
   }
 });
 
-test("restart-root-codex-agent rejects an unknown Default Codex Account before root teardown", async () => {
+test("restart-root-codex-agent rejects an unknown Default Codex Account before root teardown", platformGate("posix", CODEX_ROOT), async () => {
   const workspace = createWorkspace();
   const registry = buildRegistry(workspace, { sessionType: "codex" });
   registry.codex_accounts = { configured: path.join(workspace.homeDir, ".codex-configured") };
@@ -520,7 +772,7 @@ test("restart-root-codex-agent rejects an unknown Default Codex Account before r
   assert.equal(isAlive(childPid), true);
 });
 
-test("restart-root-codex-agent rejects a Default Codex Account and Legacy Codex Home conflict", async () => {
+test("restart-root-codex-agent rejects a Default Codex Account and Legacy Codex Home conflict", platformGate("posix", CODEX_ROOT), async () => {
   const workspace = createWorkspace();
   const accountHome = path.join(workspace.homeDir, ".codex-account");
   const legacyHome = path.join(workspace.homeDir, ".codex-legacy");
@@ -541,7 +793,7 @@ test("restart-root-codex-agent rejects a Default Codex Account and Legacy Codex 
   assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {});
 });
 
-test("restart-root-codex-agent keeps ROOT_CODEX_HOME above the shared home", async () => {
+test("restart-root-codex-agent keeps ROOT_CODEX_HOME above the shared home", platformGate("posix", CODEX_ROOT), async () => {
   const workspace = createRouterWorkspace();
   const rootHome = path.join(workspace.homeDir, ".codex-root");
   const defaultAccountHome = path.join(workspace.homeDir, ".codex-default-account");
@@ -563,7 +815,7 @@ test("restart-root-codex-agent keeps ROOT_CODEX_HOME above the shared home", asy
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent.env.CODEX_HOME, rootHome);
 });
 
-test("restart-root-codex-agent validates the selected home before tearing down root_agent", async () => {
+test("restart-root-codex-agent validates the selected home before tearing down root_agent", platformGate("posix", CODEX_ROOT), async () => {
   const workspace = createWorkspace();
   const missingHome = path.join(workspace.homeDir, ".missing-root-codex");
   seedRegistry(workspace, buildRegistry(workspace, { codexHome: missingHome }));
@@ -584,7 +836,7 @@ test("restart-root-codex-agent validates the selected home before tearing down r
   assert.deepEqual(Object.keys(state.fixtures.tmux.sessions), ["root_agent"]);
 });
 
-test("restart-root-codex-agent rejects every invalid selected home before root teardown", async () => {
+test("restart-root-codex-agent rejects every invalid selected home before root teardown", platformGate("posix", CODEX_ROOT), async () => {
   const cases = [
     {
       name: "missing",
@@ -669,7 +921,7 @@ test("restart-root-codex-agent rejects every invalid selected home before root t
   }
 });
 
-test("restart-root-codex-agent uses ambient CODEX_HOME when the registry has no home", async () => {
+test("restart-root-codex-agent uses ambient CODEX_HOME when the registry has no home", platformGate("posix", CODEX_ROOT), async () => {
   const workspace = createRouterWorkspace();
   const ambientHome = path.join(workspace.homeDir, ".codex-ambient");
   fs.mkdirSync(ambientHome, { recursive: true });
@@ -686,7 +938,7 @@ test("restart-root-codex-agent uses ambient CODEX_HOME when the registry has no 
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent.env.CODEX_HOME, ambientHome);
 });
 
-test("restart-root-codex-agent lets ROOT_CODEX_HOME recover from a broken registry home", async () => {
+test("restart-root-codex-agent lets ROOT_CODEX_HOME recover from a broken registry home", platformGate("posix", CODEX_ROOT), async () => {
   const workspace = createRouterWorkspace();
   const rootHome = path.join(workspace.homeDir, ".codex-emergency");
   fs.mkdirSync(rootHome, { recursive: true });
@@ -705,7 +957,7 @@ test("restart-root-codex-agent lets ROOT_CODEX_HOME recover from a broken regist
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent.env.CODEX_HOME, rootHome);
 });
 
-test("restart-root-codex-agent re-reads the registry home on every restart", async () => {
+test("restart-root-codex-agent re-reads the registry home on every restart", platformGate("posix", CODEX_ROOT), async () => {
   const workspace = createRouterWorkspace();
   const firstHome = path.join(workspace.homeDir, ".codex-first");
   const secondHome = path.join(workspace.homeDir, ".codex-second");
@@ -739,7 +991,7 @@ test("restart-root-codex-agent re-reads the registry home on every restart", asy
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.root_agent.env.CODEX_HOME, secondHome);
 });
 
-test("restart-root-codex-agent keeps the legacy default without home overrides", async () => {
+test("restart-root-codex-agent keeps the legacy default without home overrides", platformGate("posix", CODEX_ROOT), async () => {
   const workspace = createRouterWorkspace();
   fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
   seedRegistry(workspace, buildRegistry(workspace));
@@ -758,7 +1010,7 @@ test("restart-root-codex-agent keeps the legacy default without home overrides",
   );
 });
 
-test("restart-root-codex-agent rejects a channel missing from the registry's root channels before stopping the current root", async () => {
+test("restart-root-codex-agent rejects a channel missing from the registry's root channels before stopping the current root", platformGate("posix", CODEX_ROOT), async () => {
   const workspace = createWorkspace();
   seedRegistry(workspace, buildRegistry(workspace));
   const panePid = spawnOwnedProcess(workspace, "zsh root pane");
@@ -777,7 +1029,7 @@ test("restart-root-codex-agent rejects a channel missing from the registry's roo
   assert.equal(isAlive(childPid), true);
 });
 
-test("restart-root-agent launch failures include command diagnostics", async () => {
+test("restart-root-agent launch failures include command diagnostics", platformGate("posix", ROOT_RESTART), async () => {
   const workspace = createRouterWorkspace();
   await startRouter(workspace);
   const state = readState(workspace.stateDir);
@@ -792,7 +1044,7 @@ test("restart-root-agent launch failures include command diagnostics", async () 
   assert.equal(result.diagnostics.fixtureState.fixtures.tmux.newSessionFailures.root_agent, 0);
 });
 
-test("restart-root-agent teardown failures are recorded as diagnostics", async () => {
+test("restart-root-agent teardown failures are recorded as diagnostics", platformGate("posix", ROOT_RESTART), async () => {
   const workspace = createRouterWorkspace();
   await startRouter(workspace);
   registerTeardownCallback(() => {
