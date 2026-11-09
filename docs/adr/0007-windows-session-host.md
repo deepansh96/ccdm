@@ -76,3 +76,4 @@ All are exact-version `optionalDependencies`, loaded lazily on win32 only and ab
 - A crash, or anything else that stops the host, takes every session with it. The journal `sessions.json` is rewritten at each start, so it never names a session from before a crash.
 - A helper a session starts cannot outlive that session; surviving a restart needs `run-detached`, which runs outside every Job.
 - Clients need `koffi` only indirectly: the daemon is the one process that loads it, and every subcommand except `serve` runs without it.
+- `koffi` now creates and serves the named pipe (Router and host), which is how it gets an owner-only DACL and refuses remote clients. If it cannot load, `serve` exits non-zero naming the pipe DACL and never falls back to Node's default.
