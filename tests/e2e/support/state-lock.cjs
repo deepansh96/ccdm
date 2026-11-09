@@ -14,12 +14,15 @@ function withStateLock(stateDir, action) {
   if (!stateDir) return action();
   fs.mkdirSync(stateDir, { recursive: true });
   const lock = path.join(stateDir, "state.lock");
+  const deadline = Date.now() + STALE_LOCK_MS;
   for (;;) {
     try {
       fs.mkdirSync(lock);
       break;
     } catch (error) {
-      if (error.code !== "EEXIST") throw error;
+      // On Windows a lock directory still being removed refuses a new one with EPERM.
+      const transient = (error.code === "EPERM" || error.code === "EACCES") && Date.now() < deadline;
+      if (error.code !== "EEXIST" && !transient) throw error;
       try {
         if (Date.now() - fs.statSync(lock).mtimeMs > STALE_LOCK_MS) fs.rmdirSync(lock);
       } catch { /* Another waiter already cleared or replaced it. */ }
