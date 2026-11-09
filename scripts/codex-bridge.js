@@ -38,6 +38,7 @@ process.env.CCDM_REMINDER_CONTEXT_FILE = REMINDER_CONTEXT_FILE;
 process.env.CCDM_REMINDER_RECEIPTS_DIR = REMINDER_RECEIPTS_DIR;
 const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { createRouterTransport } = require("./codex-bridge-transport.js");
+const { arrivalOrder } = require("./lib/arrival-order.js");
 const { scheduleProjectRestart } = require("./lib/restart-helper.js");
 const { markTurn } = require("./thread-activity.js");
 const modelInfo = require("./model-info.js");
@@ -1595,13 +1596,11 @@ const holdUntilBootstrap = (kind, handler) => async (event, next) => {
 // starts once that one has finished, or has called `next()` because what it
 // decided is in place and only app-server work remains. Messages and commands
 // then take effect in arrival order, and a stuck turn holds back no later one.
-let lastDiscordEvent = Promise.resolve();
-const inArrivalOrder = (handler) => (event) => {
-  const previous = lastDiscordEvent;
-  let next;
-  lastDiscordEvent = new Promise((resolve) => { next = resolve; });
-  return previous.then(() => handler(event, next)).finally(next);
-};
+// A handler that hangs before that point stops holding the others after the
+// limit, so a stuck download or helper cannot make the bridge deaf.
+const inArrivalOrder = arrivalOrder({
+  timeoutMs: Number(process.env.CCDM_CODEX_EVENT_ORDER_TIMEOUT_MS) || 30000,
+});
 
 async function startThreadConversation() {
   const bootstrap = await awaitThreadBootstrap();
@@ -1622,12 +1621,12 @@ async function startThreadConversation() {
   const pending = heldThreadEvents.filter(([kind, , event]) => !(kind === "message" && included.has(event.id)));
   heldThreadEvents = null;
   // Lined up in one go, so a live event that arrives meanwhile runs after them.
-  await Promise.all(pending.map(([, handler, event]) => inArrivalOrder(handler)(event)));
+  await Promise.all(pending.map(([kind, handler, event]) => inArrivalOrder(kind, handler)(event)));
 }
 
 function startDiscordBot() {
   discordTransport.onScopeChange(applyProjectScope);
-  discordTransport.onReaction(inArrivalOrder(holdUntilBootstrap("reaction", async (event, next = () => {}) => {
+  discordTransport.onReaction(inArrivalOrder("reaction", holdUntilBootstrap("reaction", async (event, next = () => {}) => {
     if (!(await shouldHandleDiscordReaction(event.channelId, event.user))) return;
     let reaction;
     try {
@@ -1672,7 +1671,7 @@ function startDiscordBot() {
     await routed;
   })));
 
-  discordTransport.onMessage(inArrivalOrder(holdUntilBootstrap("message", async (msg, next = () => {}) => {
+  discordTransport.onMessage(inArrivalOrder("message", holdUntilBootstrap("message", async (msg, next = () => {}) => {
     if (!msg.author.bot && isCloseCommand(msg.content)) {
       // Root management routing reserves /close in every registered project
       // channel, whichever provider serves it; a project bridge only its own.
