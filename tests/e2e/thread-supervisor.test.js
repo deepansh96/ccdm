@@ -213,6 +213,7 @@ test("the supervisor holds no Discord token and sends nothing to Discord but Rou
   await waitFor(() => patches(workspace).length === 1, () => "the auto-archive PATCH");
   for (const pid of [supervisor.workerPid, supervisor.linkPid]) {
     assert.ok(Number.isInteger(pid), `pid ${pid}`);
+    if (process.platform === "win32") continue;  // Another process's environment cannot be read there.
     const environment = processEnvironment(pid);
     // The Router state override proves the environment was read.
     assert.match(environment, /CCDM_ROUTER_STATE_DIR=/);
@@ -223,6 +224,7 @@ test("the supervisor holds no Discord token and sends nothing to Discord but Rou
   const stateDir = supervisorStateDir(workspace);
   // Every file, past the control socket.
   for (const name of fs.readdirSync(stateDir).filter(name => fs.statSync(path.join(stateDir, name)).isFile())) {
+    if (process.platform === "win32" && name === "worker.lock") continue;  // Held under a mandatory lock; it stays empty.
     const content = fs.readFileSync(path.join(stateDir, name));
     assert.ok(!content.includes(ROOT_TOKEN), `${name} holds the token`);
   }
