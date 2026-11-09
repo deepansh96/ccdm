@@ -1122,12 +1122,16 @@ test("on Windows a real ccdm-host holds the bridge's stdin open until the sessio
   const notes = () => fs.readFileSync(report, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line));
 
   const env = routerEnv(workspace, { CCDM_STATE_ROOT: path.join(workspace.tmpRoot, "real-host-state"), CCDM_SESSION_HOST: "ccdm-host" });
+  // The Router env carries a preload that blocks pipes; the host and its CLI use neither.
+  const hostEnv = { ...workspace.env, CCDM_STATE_ROOT: env.CCDM_STATE_ROOT, CCDM_SESSION_HOST: "ccdm-host" };
   const hostScript = path.join(workspace.repoDir, "scripts", "ccdm-host.js");
   const hostCli = args => new Promise((resolve) => {
-    const child = spawn(process.execPath, [hostScript, ...args], { cwd: workspace.repoDir, env, stdio: "ignore", windowsHide: true });
-    child.once("close", resolve);
+    const child = spawn(process.execPath, [hostScript, ...args], { cwd: workspace.repoDir, env: hostEnv, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    let output = "";
+    for (const stream of [child.stdout, child.stderr]) stream.setEncoding("utf8").on("data", text => { output += text; });
+    child.once("close", code => resolve({ code, output }));
   });
-  const host = spawn(process.execPath, [hostScript, "serve", "--allow-in-job"], { cwd: workspace.repoDir, env, stdio: ["ignore", "pipe", "inherit"], windowsHide: true });
+  const host = spawn(process.execPath, [hostScript, "serve", "--allow-in-job"], { cwd: workspace.repoDir, env: hostEnv, stdio: ["ignore", "pipe", "inherit"], windowsHide: true });
   const hostClosed = new Promise(resolve => host.once("close", resolve));
   registerTeardownCallback(async () => {
     if (host.exitCode === null) await hostCli(["shutdown"]);
@@ -1155,7 +1159,8 @@ test("on Windows a real ccdm-host holds the bridge's stdin open until the sessio
   await new Promise(resolve => setTimeout(resolve, 1500));
   assert.equal(notes().some(note => note.eof), false, "the bridge saw its stdin close while the session was running");
 
-  assert.equal(await hostCli(["kill-session", "-t", "=alpha_codex", "--grace", "8000"]), 0);
+  const stopped = await hostCli(["kill-session", "-t", "=alpha_codex", "--grace", "8000"]);
+  assert.equal(stopped.code, 0, stopped.output);
   assert.equal(notes().some(note => note.eof), true, "stopping the session did not close the bridge's stdin");
   await waitForExit(started.pid);
 });
