@@ -1,15 +1,20 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
+import net from "node:net";
 import path from "node:path";
 import test from "node:test";
 
-import { assertPrivate } from "./support/platform.js";
+import { assertPrivate, platformGate, sendCtrlBreak } from "./support/platform.js";
 import { createWorkspace, runScript } from "./support/runner.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 import { bridgeChildEnv, createBridgeWorkspace, injectDiscordMessage, injectDiscordReaction, startFakeCodexServer, waitForState } from "./support/bridge.js";
 import { routerEnv, runRouterCli, startBridge } from "./support/router.js";
+
+const { processAlive } = createRequire(import.meta.url)("../../scripts/platform/process.js");
+const WIN32 = process.platform === "win32";
 
 test.afterEach(async () => {
   await cleanup();
@@ -406,9 +411,10 @@ test("owner reactions, including one on a recorded reminder, are activity but re
   injectDiscordReaction(workspace, { id: "ordinary-reaction", emoji: "custom_emoji", messageId: "ordinary-message" });
   injectDiscordReaction(workspace, { id: "reminder-reaction", emoji: "👍", messageId: "reminder-1" });
   await waitForState(workspace, (state) => state.fixtures.discord.deliveredReactions.length === 2);
+  // Each event is a Python run; a loaded machine outlasts any fixed delay.
+  const events = await waitForEvents(workspace, (rows) => rows.length >= 2);
+  // Settle so a wrongly started turn would show up.
   await new Promise((resolve) => setTimeout(resolve, 150));
-  const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  const events = JSON.parse(result.stdout).events;
   assert.deepEqual(events.map((event) => [event.event_type, event.activity_kind, event.source_message_id]), [
     ["owner_activity", "reaction", "ordinary-message"], ["owner_activity", "reaction", "reminder-1"]]);
   assert.equal(codex.clientMessages.filter((message) => message.method === "turn/start").length, 1);
@@ -595,14 +601,20 @@ test("a Codex root consumes a root-mention /close in a Claude project channel wi
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert.equal(userTurns().length, 1);
   assert.doesNotMatch(JSON.stringify(userTurns()[0].params.input), /\/close/);
-  const status = await runScript(workspace, "scripts/conversation-reminder-events.py", {
-    args: ["status", "--project", "claude-demo", "--state-dir",
-      path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders")],
-  });
-  assert.equal(status.exitCode, 0, status.stderr);
-  const events = JSON.parse(status.stdout).events;
-  assert.deepEqual(events.filter((event) => event.event_type === "close_requested")
-    .map((event) => [event.source_message_id, event.provider]), [["root-close", "ccdm-root"]]);
+  const closeRequests = async () => {
+    const status = await runScript(workspace, "scripts/conversation-reminder-events.py", {
+      args: ["status", "--project", "claude-demo", "--state-dir",
+        path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders")],
+    });
+    assert.equal(status.exitCode, 0, status.stderr);
+    return JSON.parse(status.stdout).events.filter((event) => event.event_type === "close_requested");
+  };
+  let requests = await closeRequests();
+  for (let attempt = 0; attempt < 100 && requests.length === 0; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    requests = await closeRequests();
+  }
+  assert.deepEqual(requests.map((event) => [event.source_message_id, event.provider]), [["root-close", "ccdm-root"]]);
   await bridge.stop();
 });
 
@@ -685,6 +697,7 @@ test("unexpected Codex runtime exit records session termination", async () => {
   await bridge.closed;
   const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
   assert.deepEqual(JSON.parse(result.stdout).events.map((event) => event.event_type), ["session_terminated"]);
+  await assertAppServerGone(state.fixtures.codex.appServerInvocations[0]);
 });
 
 test("a Codex completion without confirmed success status cannot qualify a response", async () => {
@@ -751,9 +764,8 @@ test("a completion notification without a turn ID cannot end the active Codex ex
   });
   assert.equal(JSON.parse(reply.stdout).result.isError, undefined);
   codex.releaseTurn("identified-turn");
-  await new Promise((resolve) => setTimeout(resolve, 150));
-  const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  assert.deepEqual(JSON.parse(result.stdout).events.map((event) => event.event_type), ["owner_activity", "response_delivered", "turn_completed"]);
+  const events = await waitForEvents(workspace, (rows) => rows.length >= 3);
+  assert.deepEqual(events.map((event) => event.event_type), ["owner_activity", "response_delivered", "turn_completed"]);
   await bridge.stop();
 });
 
@@ -859,4 +871,167 @@ test("a delivered scoped reply stays successful when its reminder receipt cannot
   const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
   assert.equal(JSON.parse(result.stdout).events.some((event) => event.event_type === "turn_completed"), false);
   await bridge.stop();
+});
+
+// A port the fake app-server process holds until it is gone.
+function unusedPort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      server.close(() => resolve(port));
+    });
+  });
+}
+
+function portFree(port) {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.once("error", () => resolve(false));
+    server.listen(port, "127.0.0.1", () => server.close(() => resolve(true)));
+  });
+}
+
+async function eventually(check, message, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.fail(message);
+}
+
+// On Windows the PID, paired with its start time. A POSIX orphan can linger as a
+// zombie in a container with no init, so there the freed port is the evidence.
+async function assertAppServerGone(appServer, heldPort = null) {
+  if (WIN32) await eventually(() => !processAlive(appServer.pid, appServer.startedAt), `app-server ${appServer.pid} is still running`);
+  if (heldPort) await eventually(() => portFree(heldPort), `port ${heldPort} is still held`);
+}
+
+function serverRecord(workspace, port) {
+  return readState(workspace.stateDir).fixtures.codex.servers[String(port)];
+}
+
+function registeredConfig(codex) {
+  return codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
+}
+
+async function terminationEvents(workspace) {
+  const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
+  return JSON.parse(result.stdout).events.filter((event) => event.event_type === "session_terminated");
+}
+
+// A demo bridge in the middle of a turn, its reminder context on disk, with a
+// fake app-server holding a port of its own.
+async function bridgeDuringTurn(workspace, { bridgeOptions = {}, turns = [] } = {}) {
+  bridgeRegistry(workspace);
+  const heldPort = await unusedPort();
+  const codex = await startFakeCodexServer(workspace, {
+    fixture: { heldPort, recordSignals: true },
+    turns: [{ turnId: "held-turn", waitForRelease: true }, ...turns],
+  });
+  const bridge = await startDemoBridge(workspace, { port: codex.port, ...bridgeOptions });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
+  const state = await waitForState(workspace, (snapshot) => snapshot.fixtures.codex.appServerInvocations.length > 0);
+  injectDiscordMessage(workspace, { id: "held-owner", content: "work on this" });
+  const contextFile = await waitForContextFile(codex);
+  return { appServer: state.fixtures.codex.appServerInvocations[0], bridge, codex, contextFile, heldPort };
+}
+
+async function waitForContextFile(codex) {
+  const contextFile = registeredConfig(codex).params.value.env.CCDM_REMINDER_CONTEXT_FILE;
+  await eventually(() => fs.existsSync(contextFile), `${contextFile} never appeared`);
+  return contextFile;
+}
+
+// Runs one stop request against a bridge in the middle of a turn.
+async function assertCleanStop({ bridgeOptions = {}, stop, oneSigterm = false, treeKilled = false }) {
+  const workspace = createBridgeWorkspace();
+  const running = await bridgeDuringTurn(workspace, { bridgeOptions });
+  stop(running.bridge);
+  const result = await running.bridge.closed;
+  assert.equal(result.exitCode, 0, `${result.stdout}\n${result.stderr}`);
+  assert.equal(fs.existsSync(running.contextFile), false);
+  assert.deepEqual((await terminationEvents(workspace)).map((event) => event.provider_session_id), ["thread-1"]);
+  await assertAppServerGone(running.appServer, running.heldPort);
+  if (oneSigterm) {
+    // Long enough for a second signal to have arrived before the fixture exits.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.deepEqual(serverRecord(workspace, running.codex.port).signals, ["SIGTERM"]);
+  }
+  // The tree kill stopped it, not the fixture noticing the bridge had gone.
+  if (treeKilled) assert.equal(serverRecord(workspace, running.codex.port).watchdogFired, undefined);
+}
+
+test("stdin EOF ends the Windows bridge cleanly and leaves no app-server", platformGate("win32", "on POSIX the bridge ignores stdin"), async () => {
+  await assertCleanStop({ stop: (bridge) => bridge.child.stdin.end(), treeKilled: true });
+});
+
+test("Ctrl+Break ends the Windows bridge cleanly and leaves no app-server", platformGate("win32", "Ctrl+Break exists only on Windows"), async () => {
+  await assertCleanStop({ bridgeOptions: { ctrlBreak: true }, stop: (bridge) => sendCtrlBreak(bridge.child) });
+});
+
+test("SIGINT ends the POSIX bridge cleanly with one SIGTERM to the app-server", platformGate("posix", "Windows has no signal to send a detached process"), async () => {
+  await assertCleanStop({ oneSigterm: true, stop: (bridge) => process.kill(bridge.child.pid, "SIGINT") });
+});
+
+test("SIGTERM ends the POSIX bridge cleanly with one SIGTERM to the app-server", platformGate("posix", "Windows never delivers SIGTERM"), async () => {
+  await assertCleanStop({ oneSigterm: true, stop: (bridge) => process.kill(bridge.child.pid, "SIGTERM") });
+});
+
+test("the POSIX bridge ignores stdin EOF", platformGate("posix", "on Windows stdin EOF is the stop request"), async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace);
+  const bridge = await startDemoBridgeWithRegistry(workspace, { port: codex.port, stdin: "pipe" });
+  await bridge.waitForOutput(/Listening in #demo/, 7000);
+  bridge.child.stdin.end();
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.equal(bridge.child.exitCode, null);
+  assert.equal(bridge.child.signalCode, null);
+  await bridge.stop();
+});
+
+function startDemoBridgeWithRegistry(workspace, options) {
+  bridgeRegistry(workspace);
+  return startDemoBridge(workspace, options);
+}
+
+test("a bridge whose Router hello is refused takes its app-server with it", async () => {
+  const workspace = createBridgeWorkspace();
+  bridgeRegistry(workspace);
+  const wrongKeyFile = path.join(workspace.tmpDir, "wrong.key");
+  fs.writeFileSync(wrongKeyFile, "not-the-launch-key\n", { mode: 0o600 });
+  const heldPort = await unusedPort();
+  const codex = await startFakeCodexServer(workspace, { deferListen: true, fixture: { heldPort }, port: await unusedPort() });
+  const bridge = await startDemoBridge(workspace, { port: codex.port, env: { CCDM_ROUTER_KEY_FILE: wrongKeyFile } });
+  // Only once the app-server is up can the bridge get as far as its hello.
+  const state = await waitForState(workspace, (snapshot) => snapshot.fixtures.codex.appServerInvocations.length > 0, 7000);
+  await codex.listen();
+  const result = await bridge.closed;
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /Discord startup failed/);
+  await assertAppServerGone(state.fixtures.codex.appServerInvocations[0], heldPort);
+  if (WIN32) assert.equal(serverRecord(workspace, codex.port).watchdogFired, undefined);
+});
+
+test("a bridge killed hard during a turn leaves its context, and the next start removes it and answers", async () => {
+  const workspace = createBridgeWorkspace();
+  const running = await bridgeDuringTurn(workspace, { turns: [{ delta: "Answered after restart" }] });
+  running.bridge.child.kill("SIGKILL");
+  await running.bridge.closed;
+  assert.equal(fs.existsSync(running.contextFile), true);
+  // POSIX: the fixture notices its bridge has gone. Windows: Node keeps a child
+  // in a kill-on-close job, so the launcher and its own job go with the bridge.
+  if (!WIN32) await waitForState(workspace, (state) => state.fixtures.codex.servers[String(running.codex.port)].watchdogFired === true, 10000);
+  await assertAppServerGone(running.appServer, running.heldPort);
+
+  const next = await startDemoBridge(workspace, { port: running.codex.port, env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" } });
+  await next.waitForOutput(/Codex-Discord bridge running/, 7000);
+  assert.equal(fs.existsSync(running.contextFile), false);
+  await next.waitForOutput(/Listening in #demo/, 7000);
+  injectDiscordMessage(workspace, { id: "after-restart", content: "are you back" });
+  const state = await waitForState(workspace, (snapshot) => snapshot.fixtures.discord.messages.some((message) => message.content === "Answered after restart"), 7000);
+  assert.ok(state.fixtures.discord.deliveredMessages.some((message) => message.id === "after-restart"));
+  await next.stop();
 });

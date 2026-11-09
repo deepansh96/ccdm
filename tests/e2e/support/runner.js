@@ -527,7 +527,13 @@ function spawnRouterBridge(launch) {
   const child = spawn(process.execPath, [path.join(launch.cwd, "scripts/codex-bridge.js"), workspaceMarker], {
     cwd: launch.cwd,
     detached: true,
-    env: { ...process.env, ...launch.env },
+    // A tmux fixture has no stdin to hold open, so this bridge gets NUL and stops
+    // only when killed. On Windows PATH alone cannot name the fixture Codex.
+    env: {
+      ...process.env,
+      ...launch.env,
+      ...(process.platform === "win32" ? { CCDM_CODEX_PATH: path.join(workspaceMarker, "fixtures", "codex.exe") } : {}),
+    },
     stdio: ["ignore", logFile, logFile],
     windowsHide: true,
   });
@@ -1338,6 +1344,7 @@ function runCodex() {
       env: { WS_PORT: process.env.WS_PORT },
       pid: process.pid,
       port,
+      startedAt: processModule().processStartTime(process.pid),
     });
     return nextState;
   });
@@ -1349,12 +1356,89 @@ function runCodex() {
   if (server.exitImmediately) {
     process.exit(server.exitCode ?? 1);
   }
-  process.on("SIGTERM", () => process.exit(0));
-  process.on("SIGINT", () => process.exit(0));
+  // Fields on the server record, for tests of how this process was stopped.
+  const markServer = (values) => updateState((nextState) => {
+    Object.assign(nextState.fixtures.codex.servers[port], values(nextState.fixtures.codex.servers[port]));
+    return nextState;
+  });
+  // A held port lets a test see that this process's sockets went with it. The
+  // protocol server is the test's own and stays up throughout.
+  if (server.heldPort) require("node:net").createServer().listen(server.heldPort, "127.0.0.1");
+  const onSignal = (signal) => {
+    if (!server.recordSignals) process.exit(0);
+    markServer((record) => ({ signals: [...(record.signals || []), signal] }));
+    setTimeout(() => process.exit(0), 300);
+  };
+  process.on("SIGTERM", () => onSignal("SIGTERM"));
+  process.on("SIGINT", () => onSignal("SIGINT"));
+  // For a test of teardown, which must also stop a fake that does not go by itself.
+  if (server.outliveBridge) {
+    setInterval(() => {}, 1000);
+    return;
+  }
   // Like a pane process, it goes when its bridge does, never left orphaned.
-  const parent = process.ppid;
+  watchBridge(() => {
+    try {
+      markServer(() => ({ watchdogFired: true }));
+    } finally {
+      // Teardown may already have removed the workspace; go regardless.
+      process.exit(0);
+    }
+  });
+}
+
+function processModule() {
+  return require(path.join(workspaceMarker, "repo", "scripts", "platform", "process.js"));
+}
+
+// The process that started \`pid\`, whether or not that one is still running.
+function parentPidOf(pid) {
+  const koffi = require("koffi");
+  const HANDLE = koffi.pointer(koffi.opaque());
+  const kernel32 = koffi.load("kernel32.dll");
+  const OpenProcess = kernel32.func("__stdcall", "OpenProcess", HANDLE, ["uint32_t", "int", "uint32_t"]);
+  const CloseHandle = kernel32.func("__stdcall", "CloseHandle", "int", [HANDLE]);
+  const BasicInformation = koffi.struct({
+    exitStatus: "uintptr_t", peb: "uintptr_t", affinity: "uintptr_t", priority: "uintptr_t", pid: "uintptr_t", parent: "uintptr_t",
+  });
+  const NtQueryInformationProcess = koffi.load("ntdll.dll").func("__stdcall", "NtQueryInformationProcess", "int32_t",
+    [HANDLE, "int32_t", koffi.out(koffi.pointer(BasicInformation)), "uint32_t", koffi.pointer("uint32_t")]);
+  const handle = OpenProcess(0x1000, 0, pid);
+  if (!handle) return null;
+  try {
+    const information = {};
+    const status = NtQueryInformationProcess(handle, 0, information, koffi.sizeof(BasicInformation), null);
+    return status === 0 ? Number(information.parent) : null;
+  } finally {
+    CloseHandle(handle);
+  }
+}
+
+// Calls \`onGone\` when the bridge that started this fake is gone. POSIX reparents
+// an orphan, so its ppid changes. On Windows ppid never changes, and the parent
+// is the fixture launcher, which lives as long as this process; the bridge is
+// the launcher's parent. A PID can be reused, so it is paired with its start time.
+function watchBridge(onGone) {
+  if (process.platform !== "win32") {
+    const parent = process.ppid;
+    setInterval(() => {
+      if (process.ppid !== parent) onGone();
+    }, 500);
+    return;
+  }
+  const { processStartTime } = processModule();
+  const launcherStarted = processStartTime(process.ppid);
+  const bridge = parentPidOf(process.ppid);
+  const bridgeStarted = bridge === null ? null : processStartTime(bridge);
+  // A process younger than the launcher took the dead bridge's PID.
+  if (bridgeStarted === null || launcherStarted === null || BigInt(bridgeStarted) > BigInt(launcherStarted)) {
+    onGone();
+    return;
+  }
+  // The bridge runs as this user, so a start time that cannot be read means the
+  // PID now belongs to something else; only an exact match counts as the bridge.
   setInterval(() => {
-    if (process.ppid !== parent) process.exit(0);
+    if (processStartTime(bridge) !== bridgeStarted) onGone();
   }, 500);
 }
 

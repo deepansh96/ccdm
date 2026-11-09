@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import childProcess from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import test from "node:test";
 import WebSocket from "ws";
@@ -13,10 +15,13 @@ import {
   startFakeCodexServer,
   waitForState,
 } from "./support/bridge.js";
-import { assertPrivate, privateTempRoot } from "./support/platform.js";
+import { assertPrivate, platformGate, privateTempRoot } from "./support/platform.js";
 import { runRouterCli, startBridge } from "./support/router.js";
 import { readState, seedRegistry, updateState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
+
+const { killTree, killTreeSync, rememberSpawn } = createRequire(import.meta.url)("../../scripts/platform/process.js");
+const WIN32 = process.platform === "win32";
 
 test.afterEach(async () => {
   await cleanup();
@@ -1246,7 +1251,7 @@ test("bridge sends the bootstrap instruction turn after idle compact completion"
   await bridge.stop();
 });
 
-test("bridge restarts its own Codex session from slash command", async () => {
+test("bridge restarts its own Codex session from slash command", platformGate("posix", "the channel /restart still runs /bin/sh and tmux; the Windows port of it is its own ticket"), async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace);
   seedRegistry(workspace, {
@@ -1747,7 +1752,7 @@ test("bridge fixture resolves ws from the harness NODE_PATH before launch", asyn
   const result = await runPreloadProbe(workspace, "console.log(require.resolve('ws'))");
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  assert.match(result.stdout, /node_modules\/ws\/index\.js/);
+  assert.match(result.stdout, /node_modules[\\/]ws[\\/]index\.js/);
 });
 
 async function waitFor(predicate, timeoutMs = 1000) {
@@ -1926,7 +1931,14 @@ test("root's channel scope file is private and each rewrite replaces it whole un
   assert.equal(grants.length, TURNS);
   for (const value of seen) assert.ok(value === "" || grants.includes(value), `torn scope read: ${value}`);
   assert.ok(inodes.size > 1, "the scope file was rewritten in place");
-  assert.deepEqual(fs.readdirSync(scopeDir), ["active"]);
+  // A rewrite after the last turn may be mid-rename, so one clean listing is the
+  // evidence: a temporary file that truly leaked would be in every listing.
+  let entries = fs.readdirSync(scopeDir);
+  for (let attempt = 0; attempt < 100 && entries.length > 1; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    entries = fs.readdirSync(scopeDir);
+  }
+  assert.deepEqual(entries, ["active"]);
   assertPrivate(scopeFile);
   await bridge.stop();
 });
@@ -2000,4 +2012,101 @@ test("failed bootstrap completion without a separate error event fails startup",
   assert.equal(result.exitCode, 1);
   assert.match(result.stderr, /provider bootstrap failure/);
   assert.doesNotMatch(result.stdout, /Discord bot logged in|Listening in/);
+});
+
+test("the MCP server is registered with the absolute path of the running Node", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace);
+  const bridge = await startBridge(workspace, { port: codex.port });
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
+  const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
+  assert.equal(config.params.value.command, process.execPath);
+  await bridge.stop();
+});
+
+test("the bridge starts the Codex that CCDM_CODEX_PATH names", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace);
+  const missing = path.join(workspace.tmpDir, process.platform === "win32" ? "no-such-codex.exe" : "no-such-codex");
+  const bridge = await startBridge(workspace, { port: codex.port, env: { CCDM_CODEX_PATH: missing } });
+  const result = await bridge.closed;
+  assert.notEqual(result.exitCode, 0);
+  assert.ok(result.stderr.includes(missing), result.stderr);
+  assert.equal(readState(workspace.stateDir).fixtures.codex.appServerInvocations.length, 0);
+});
+
+test("the bridge never runs a .cmd as Codex", platformGate("win32", "only Windows has .cmd files"), async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace);
+  const shim = path.join(workspace.tmpDir, "codex.cmd");
+  fs.writeFileSync(shim, "@exit /b 0\r\n");
+  const bridge = await startBridge(workspace, { port: codex.port, env: { CCDM_CODEX_PATH: shim } });
+  const result = await bridge.closed;
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /ignoring CCDM_CODEX_PATH=.*a \.cmd or \.bat cannot be started without a shell/);
+  assert.match(result.stderr, /Codex was not found/);
+});
+
+test("--ccdm-key-file naming the launch key behaves like no flag", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace);
+  const keyFile = path.join(workspace.routerStateDir, "keys", "alpha.key");
+  const bridge = await startBridge(workspace, { args: ["--ccdm-key-file", keyFile], port: codex.port });
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
+  await bridge.stop();
+});
+
+test("--ccdm-key-file naming a different file stops the bridge and names both", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace);
+  const other = path.join(workspace.tmpDir, "other.key");
+  const keyFile = path.join(workspace.routerStateDir, "keys", "alpha.key");
+  const bridge = await startBridge(workspace, { args: ["--ccdm-key-file", other], port: codex.port });
+  const result = await bridge.closed;
+  assert.notEqual(result.exitCode, 0);
+  assert.ok(result.stderr.includes(other), result.stderr);
+  assert.ok(result.stderr.includes(keyFile), result.stderr);
+  assert.equal(readState(workspace.stateDir).fixtures.codex.appServerInvocations.length, 0);
+});
+
+// A stand-in for a ChildProcess, whose `kill` must never reach a real process.
+function fakeChild(values) {
+  return { exitCode: null, kill() { this.kills = (this.kills ?? 0) + 1; }, pid: 999999, signalCode: null, ...values };
+}
+
+function exitedChild() {
+  const child = childProcess.spawn(process.execPath, ["-e", ""], { stdio: "ignore", windowsHide: true });
+  rememberSpawn(child);
+  return new Promise((resolve) => child.once("close", () => resolve(child)));
+}
+
+test("an exited app-server gets no kill, and no taskkill on Windows", async (t) => {
+  const spawnSync = t.mock.method(childProcess, "spawnSync", () => ({ status: 0 }));
+  const spawn = t.mock.method(childProcess, "spawn", () => { throw new Error("spawn must not run"); });
+  const exited = fakeChild({ exitCode: 0 });
+  killTreeSync(exited);
+  await killTree(exited);
+  const signalled = fakeChild({ signalCode: "SIGTERM" });
+  killTreeSync(signalled);
+  assert.equal(spawnSync.mock.callCount(), 0);
+  assert.equal(spawn.mock.callCount(), 0);
+  assert.equal(exited.kills, undefined);
+  assert.equal(signalled.kills, undefined);
+});
+
+test("a freed PID is not killed even though the handle still looks running", platformGate("win32", "PID reuse is guarded by creation time on Windows"), async (t) => {
+  const child = await exitedChild();
+  const reused = fakeChild({ pid: child.pid });
+  const spawnSync = t.mock.method(childProcess, "spawnSync", () => ({ status: 0 }));
+  killTreeSync(reused);
+  killTreeSync(Object.assign(child, { exitCode: null, signalCode: null }));
+  assert.equal(spawnSync.mock.callCount(), 0);
+});
+
+test("the POSIX stop is one SIGTERM to the child, however many paths ask", platformGate("posix", "Windows stops a tree with taskkill"), async () => {
+  const signals = [];
+  const child = fakeChild({ kill: (signal) => signals.push(signal) });
+  await killTree(child);
+  killTreeSync(child);
+  assert.deepEqual(signals, ["SIGTERM"]);
 });

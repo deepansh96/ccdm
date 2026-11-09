@@ -867,7 +867,7 @@ test("an idle fake codex app-server whose starter has gone is stopped at teardow
   const workspace = createWorkspace();
   const port = "45871";
   const state = readState(workspace.stateDir);
-  state.fixtures.codex.servers[port] = { ready: true };
+  state.fixtures.codex.servers[port] = { outliveBridge: true, ready: true };
   writeState(state, workspace.stateDir);
   const starter = path.join(workspace.tmpDir, "starter.js");
   fs.writeFileSync(starter, [
