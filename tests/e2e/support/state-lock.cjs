@@ -33,4 +33,18 @@ function withStateLock(stateDir, action) {
   }
 }
 
-module.exports = { withStateLock };
+// Windows refuses a rename over a file another process has open, and readers
+// poll state.json without the lock.
+function replaceStateFile(from, to) {
+  const deadline = Date.now() + STALE_LOCK_MS;
+  for (;;) {
+    try {
+      return fs.renameSync(from, to);
+    } catch (error) {
+      if (!["EPERM", "EACCES", "EBUSY"].includes(error.code) || Date.now() > deadline) throw error;
+      Atomics.wait(pause, 0, 0, 5);
+    }
+  }
+}
+
+module.exports = { replaceStateFile, withStateLock };

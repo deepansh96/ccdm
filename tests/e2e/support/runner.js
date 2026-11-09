@@ -168,7 +168,7 @@ const { spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const { withStateLock } = require("./state-lock.cjs");
+const { replaceStateFile, withStateLock } = require("./state-lock.cjs");
 
 const tool = process.argv[2];
 const args = process.argv.slice(3);
@@ -350,7 +350,7 @@ function writeState(nextState) {
   fs.mkdirSync(stateDir, { recursive: true });
   const tmp = path.join(stateDir, \`.state.\${process.pid}.\${Date.now()}.tmp\`);
   fs.writeFileSync(tmp, \`\${JSON.stringify(normalizeState(nextState), null, 2)}\\n\`);
-  fs.renameSync(tmp, stateFile);
+  replaceStateFile(tmp, stateFile);
 }
 
 function updateState(updater) {

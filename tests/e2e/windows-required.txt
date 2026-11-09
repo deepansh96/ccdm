@@ -7,3 +7,17 @@ tests/e2e/harness-safety.test.js
 tests/e2e/runner-contract.test.js
 tests/e2e/usage-dashboard-renderer.test.js
 tests/e2e/windows-skip-budget.test.js
+tests/e2e/discord-mcp.test.js
+tests/e2e/router-lifecycle.test.js
+tests/e2e/router-pipe.test.js
+tests/e2e/router-preflight-privacy.test.js
+tests/e2e/router-rate-limits.test.js
+tests/e2e/router-reads.test.js
+tests/e2e/router-registry.test.js
+tests/e2e/router-root.test.js
+tests/e2e/router-supervisor-ops.test.js
+tests/e2e/router-thread-scope.test.js
+tests/e2e/router-threads.test.js
+tests/e2e/router-webhooks.test.js
+tests/e2e/router-writes.test.js
+tests/e2e/router.test.js

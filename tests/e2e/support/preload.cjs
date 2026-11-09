@@ -4,7 +4,7 @@ const https = require("node:https");
 const net = require("node:net");
 const path = require("node:path");
 
-const { withStateLock } = require("./state-lock.cjs");
+const { replaceStateFile, withStateLock } = require("./state-lock.cjs");
 
 const originalHttpRequest = http.request.bind(http);
 const originalHttpGet = http.get.bind(http);
@@ -68,7 +68,7 @@ function writeState(state) {
   fs.mkdirSync(stateDir, { recursive: true });
   const tmp = path.join(stateDir, `.state.${process.pid}.${Date.now()}.tmp`);
   fs.writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
-  fs.renameSync(tmp, stateFile);
+  replaceStateFile(tmp, stateFile);
 }
 
 function updateState(updater) {

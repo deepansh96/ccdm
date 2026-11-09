@@ -222,7 +222,7 @@ function compiledOnce(source, dir, exeName, env) {
 // stdin of its own (the launcher reads the harness's commands from it). Elsewhere
 // a plain spawn.
 export function spawnWithCtrlBreak(command, args, options = {}) {
-  if (process.platform !== "win32") return spawn(command, args, options);
+  if (process.platform !== "win32") return spawn(command, args, { ...options, windowsHide: true });
   const launcher = compiledOnce(CTRL_BREAK_SOURCE,
     path.join(os.tmpdir(), `ccdm-ctrl-break-${sourceDigest(CTRL_BREAK_SOURCE)}`), "ctrl-break.exe", process.env);
   return spawn(launcher, [command, ...args], { ...options, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });

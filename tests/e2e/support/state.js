@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 
-const { withStateLock } = createRequire(import.meta.url)("./state-lock.cjs");
+const { replaceStateFile, withStateLock } = createRequire(import.meta.url)("./state-lock.cjs");
 
 export const STATE_SCHEMA_VERSION = 1;
 
@@ -243,7 +243,7 @@ export function writeState(nextState, explicitStateDir) {
   const file = stateFile(dir);
   const tmp = path.join(dir, `.state.${process.pid}.${Date.now()}.tmp`);
   fs.writeFileSync(tmp, `${JSON.stringify(normalizeState(nextState), null, 2)}\n`);
-  fs.renameSync(tmp, file);
+  replaceStateFile(tmp, file);
   return readState(dir);
 }
 
