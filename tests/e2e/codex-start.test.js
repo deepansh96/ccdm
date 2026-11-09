@@ -1072,7 +1072,7 @@ test("on Windows the bridge starts as a no-PTY project session with the key file
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.match(result.stdout, /Bridge connected to the Router \(scope channel-id\)/);
   assert.doesNotMatch(result.stdout, /tmux/);
-  assert.match(result.stdout, /Attach with: node scripts\/ccdm-host\.js attach -t alpha_codex/);
+  assert.match(result.stdout, /Attach with: scripts\/ccdm attach alpha\r?$/m);
 
   const state = readState(workspace.stateDir);
   const [launch] = state.fixtures.sessionHost.launches;

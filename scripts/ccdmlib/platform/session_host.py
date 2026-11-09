@@ -487,8 +487,7 @@ def attach_hint(name: str, target: Optional[str] = None) -> str:
     """The line a launcher prints; the launcher decides which stream."""
     if _is_tmux():
         return f"Attach with: tmux attach -t {name}"
-    # Until the owner-facing `scripts/ccdm attach` exists, the command that does attach.
-    return f"Attach with: node scripts/ccdm-host.js attach -t {name}"
+    return f"Attach with: scripts/ccdm attach {target or name}"
 
 
 def run_detached(

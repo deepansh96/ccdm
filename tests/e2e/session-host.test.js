@@ -10,9 +10,12 @@ import net from "node:net";
 import path from "node:path";
 import test from "node:test";
 
-import { assertPrivate, platformGate } from "./support/platform.js";
-import { createWorkspace, scaledTimeout } from "./support/runner.js";
+import { assertPrivate, platformGate, PYTHON } from "./support/platform.js";
+import { createWorkspace, runScript, scaledTimeout } from "./support/runner.js";
+import { tmuxCalls } from "./support/session-fixture.js";
+import { seedRegistry, seedTmuxSession } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
+import { supervisorStateDir } from "./support/thread-supervisor.js";
 
 const onlyWindows = platformGate("win32", "ccdm-host is the Windows session host; other platforms use tmux");
 const PIPE_NAME = /^\\\\\.\\pipe\\ccdm-[0-9a-f]{32}-host$/;
@@ -1071,12 +1074,14 @@ test("a PTY session is launched with its own environment and kept in its Job, an
 });
 
 // Attach. The client runs under its own pseudo-console, standing in for a terminal tab.
-function attachClient(workspace, args) {
+const attachClient = (workspace, args) => consoleClient(workspace, [process.execPath, workspace.script, "attach", ...args]);
+
+function consoleClient(workspace, argv) {
   const job = lazy("host/jobs.js").createSessionJob();
   let ended;
   const exited = new Promise(resolve => { ended = resolve; });
   const terminal = lazy("host/pty.js").startConsole({
-    argv: [process.execPath, workspace.script, "attach", ...args],
+    argv,
     cwd: workspace.fixtures,
     env: workspace.childEnv(),
     job,
@@ -1091,7 +1096,7 @@ function attachClient(workspace, args) {
     } catch { /* It already ended. */ }
     await Promise.race([exited, sleep(5000)]);
   });
-  return { exited, screen: () => terminal.capture({}), type: text => terminal.send([text], true) };
+  return { exited, screen: () => terminal.capture({}), type: text => terminal.send([text], true), resize: (cols, rows) => terminal.resize(cols, rows) };
 }
 
 // Prints a marker, then reports each piece of raw input and every window size it has.
@@ -1407,4 +1412,219 @@ test("a subscribe client gets one exit event with the code for each session that
   connection.destroy();
   await newSession(workspace, "unheard", brief);
   await waitForHasSessionFalse(workspace, "unheard");
+});
+
+// `ccdm attach`: the owner's command, run under its own pseudo-console.
+const THREAD_ID = "1500000000000000001";
+
+function attachWorkspace() {
+  const workspace = hostWorkspace();
+  seedRegistry(workspace, {
+    discord_user_id: "allowed-user-id",
+    projects: {
+      alpha: { path: workspace.tmpDir, screen_name: "alpha_session", channel_id: "channel-alpha", type: "claude" },
+      codex: { path: workspace.tmpDir, screen_name: "codex_session", channel_id: "channel-codex", type: "codex" },
+    },
+  });
+  // A Workspace's PATH has no node; the launchers' override names it.
+  return { ...workspace, childEnv: extra => workspace.childEnv({ CCDM_ROUTER_NODE: process.execPath, ...extra }) };
+}
+
+const ccdmAttachClient = (workspace, args) =>
+  consoleClient(workspace, [PYTHON, path.join(workspace.repoDir, "scripts", "ccdm.py"), "attach", ...args]);
+
+const ccdmAttach = (workspace, args, env = {}) =>
+  runScript(workspace, "scripts/ccdm", { args: ["attach", ...args], env: workspace.childEnv(env), timeoutMs: 30000 });
+
+async function sees(client, text) {
+  await waitUntil(() => client.screen().includes(text), text, 15000).catch(() => assert.fail(`${text} never reached the client; saw ${client.screen()}`));
+}
+
+test("ccdm attach <project> shows the screen, passes input and window size, and Ctrl-] exits 0 with the session still live", onlyWindows, async () => {
+  const workspace = attachWorkspace();
+  await startHost(workspace);
+  const { file, currentSize } = attachFixture(workspace);
+  await ptySession(workspace, "alpha_session", file);
+  await waitForCapture(workspace, "alpha_session", /before-attach/);
+
+  const client = ccdmAttachClient(workspace, ["alpha"]);
+  await sees(client, "before-attach");
+  client.type("hello");
+  await waitForCapture(workspace, "alpha_session", /got:hello/);
+  client.resize(90, 30);
+  await waitUntil(() => currentSize() === "90x30", () => `the new size; saw ${currentSize()}`);
+
+  client.type("\x1d");
+  assert.equal(await client.exited, 0);
+  assert.equal((await cli(workspace, ["has-session", "-t", "=alpha_session"])).code, 0);
+});
+
+for (const flag of ["-r", "--read-only"]) {
+  test(`ccdm attach ${flag} shows the screen, drops input and does not resize the session`, onlyWindows, async () => {
+    const workspace = attachWorkspace();
+    await startHost(workspace);
+    const { file, currentSize } = attachFixture(workspace);
+    await ptySession(workspace, "alpha_session", file);
+    await waitForCapture(workspace, "alpha_session", /before-attach/);
+
+    const client = ccdmAttachClient(workspace, ["alpha", flag]);
+    await sees(client, "before-attach");
+    client.type("dropped");
+    client.resize(90, 30);
+    await sleep(500);
+    assert.doesNotMatch(await capture(workspace, "alpha_session"), /got:/);
+    assert.equal(currentSize(), "200x50");
+
+    client.type("\x1d");
+    assert.equal(await client.exited, 0);
+    assert.equal((await cli(workspace, ["has-session", "-t", "=alpha_session"])).code, 0);
+  });
+}
+
+test("ccdm attach root attaches to root_agent", onlyWindows, async () => {
+  const workspace = attachWorkspace();
+  await startHost(workspace);
+  await ptySession(workspace, "root_agent", attachFixture(workspace).file);
+  await waitForCapture(workspace, "root_agent", /before-attach/);
+
+  const client = ccdmAttachClient(workspace, ["root"]);
+  await sees(client, "before-attach");
+  client.type("\x1d");
+  assert.equal(await client.exited, 0);
+});
+
+test("ccdm attach exits 0 when the session ends while attached", onlyWindows, async () => {
+  const workspace = attachWorkspace();
+  await startHost(workspace);
+  await ptySession(workspace, "alpha_session", attachFixture(workspace).file);
+  await waitForCapture(workspace, "alpha_session", /before-attach/);
+
+  const client = ccdmAttachClient(workspace, ["alpha"]);
+  await sees(client, "before-attach");
+  client.type("q");
+  assert.equal(await client.exited, 0);
+  await sees(client, "ended with code 3");
+});
+
+test("ccdm attach names an unknown target and a stopped project, and shows an ended session's last screen", onlyWindows, async () => {
+  const workspace = attachWorkspace();
+
+  const noHost = await ccdmAttach(workspace, ["alpha"]);
+  assert.equal(noHost.exitCode, 1, noHost.stderr);
+  assert.match(noHost.stderr, /Session 'alpha_session' for project 'alpha' is not running/);
+
+  await startHost(workspace);
+  const unknown = await ccdmAttach(workspace, ["ghost"]);
+  assert.equal(unknown.exitCode, 2, unknown.stderr);
+  assert.match(unknown.stderr, /Unknown project or session: ghost/);
+
+  const stopped = await ccdmAttach(workspace, ["alpha"]);
+  assert.equal(stopped.exitCode, 1, stopped.stderr);
+  assert.match(stopped.stderr, /Session 'alpha_session' for project 'alpha' is not running/);
+  assert.equal(stopped.stdout, "");
+
+  await ptySession(workspace, "alpha_session", fixture(workspace, "p3.9-ends.js", `console.log("final-screen-line"); process.exit(7);`));
+  await waitForHasSessionFalse(workspace, "alpha_session");
+  const ended = await ccdmAttach(workspace, ["alpha"]);
+  assert.equal(ended.exitCode, 1, ended.stderr);
+  assert.match(ended.stdout, /final-screen-line/);
+  assert.match(ended.stderr, /Session 'alpha_session' for project 'alpha' is not running/);
+});
+
+// Prints numbered lines until the stop file appears, as a bridge writes its log.
+function outputFixture(workspace, stopFile) {
+  return fixture(workspace, "p3.9-output.js", `
+    const fs = require("node:fs");
+    let line = 0;
+    setInterval(() => {
+      if (fs.existsSync(${JSON.stringify(stopFile)})) process.exit(0);
+      console.log("output-line-" + line + "-end");
+      line += 1;
+    }, 100);
+    process.stdin.resume();
+  `);
+}
+
+test("ccdm attach on a no-PTY session follows its output once, and Ctrl-] exits 0 with the session still live", onlyWindows, async () => {
+  const workspace = attachWorkspace();
+  await startHost(workspace);
+  await newSession(workspace, "codex_session", outputFixture(workspace, path.join(workspace.fixtures, "p3.9-stop")));
+  await waitForCapture(workspace, "codex_session", /output-line-0-end/);
+
+  const client = ccdmAttachClient(workspace, ["codex"]);
+  await sees(client, "following its output");
+  await sees(client, "output-line-0-end");
+  const last = Number(/output-line-(\d+)-end/.exec((await capture(workspace, "codex_session")).trim().split("\n").at(-1))[1]);
+  await sees(client, `output-line-${last + 6}-end`);
+  assert.equal(client.screen().split(`output-line-${last}-end`).length, 2, client.screen());
+
+  client.type("\x1d");
+  assert.equal(await client.exited, 0);
+  assert.equal((await cli(workspace, ["has-session", "-t", "=codex_session"])).code, 0);
+});
+
+test("ccdm attach on a no-PTY session exits 0 when it ends and 1 when the host goes away", onlyWindows, async () => {
+  const workspace = attachWorkspace();
+  const host = await startHost(workspace);
+  const stopFile = path.join(workspace.fixtures, "p3.9-stop");
+  await newSession(workspace, "codex_session", outputFixture(workspace, stopFile));
+  await waitForCapture(workspace, "codex_session", /output-line-0-end/);
+
+  const ending = ccdmAttachClient(workspace, ["codex"]);
+  await sees(ending, "output-line-0-end");
+  fs.writeFileSync(stopFile, "");
+  assert.equal(await ending.exited, 0);
+  await sees(ending, "[session codex_session ended]");
+
+  fs.rmSync(stopFile);
+  await newSession(workspace, "codex_session", outputFixture(workspace, stopFile));
+  await waitForCapture(workspace, "codex_session", /output-line-0-end/);
+  const orphaned = ccdmAttachClient(workspace, ["codex"]);
+  await sees(orphaned, "output-line-0-end");
+  host.child.kill();
+  assert.equal(await orphaned.exited, 1);
+  await sees(orphaned, "ccdm-host is not running");
+});
+
+test("ccdm attach on tmux runs tmux attach, -r for read-only, and resolves root and a thread", async () => {
+  const workspace = attachWorkspace();
+  for (const name of ["alpha_session", "root_agent", `alpha_session-t-${THREAD_ID}`]) {
+    seedTmuxSession(name, {}, { stateDir: workspace.stateDir });
+  }
+  const { ensurePrivateDirSync } = lazy("platform/privacy.js");
+  const stateDir = supervisorStateDir(workspace);
+  ensurePrivateDirSync(stateDir);
+  const store = path.join(stateDir, "threads.sqlite3");
+  const db = new (require("node:sqlite").DatabaseSync)(store);
+  db.exec("CREATE TABLE threads (thread_id TEXT, project TEXT, name TEXT, provider TEXT, resolved_provider TEXT, state TEXT)");
+  db.prepare("INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?)").run(THREAD_ID, "alpha", "fix-login", "claude", "claude", "live");
+  db.close();
+  fs.chmodSync(store, 0o600);
+  const env = { CCDM_SESSION_HOST: "tmux", CCDM_ROUTER_NODE: process.execPath, CCDM_THREAD_SUPERVISOR_STATE_DIR: stateDir };
+
+  const cases = [
+    [["alpha"], ["attach", "-t", "alpha_session"]],
+    [["alpha", "-r"], ["attach", "-r", "-t", "alpha_session"]],
+    [["alpha", "--read-only"], ["attach", "-r", "-t", "alpha_session"]],
+    [["root"], ["attach", "-t", "root_agent"]],
+    [["alpha", "--thread", THREAD_ID], ["attach", "-t", `alpha_session-t-${THREAD_ID}`]],
+    [["alpha", "--thread", `https://discord.com/channels/guild-id/${THREAD_ID}`], ["attach", "-t", `alpha_session-t-${THREAD_ID}`]],
+  ];
+  for (const [args, expected] of cases) {
+    const result = await ccdmAttach(workspace, args, env);
+    assert.equal(result.exitCode, 0, `${args.join(" ")}: ${result.stderr}`);
+    assert.deepEqual(tmuxCalls(workspace).filter(call => call[0] === "attach").at(-1), expected);
+  }
+
+  const before = tmuxCalls(workspace).filter(call => call[0] === "attach").length;
+  const stopped = await ccdmAttach(workspace, ["codex"], env);
+  assert.equal(stopped.exitCode, 1, stopped.stderr);
+  assert.match(stopped.stderr, /Session 'codex_session' for project 'codex' is not running/);
+  const unknown = await ccdmAttach(workspace, ["ghost"], env);
+  assert.equal(unknown.exitCode, 2, unknown.stderr);
+  assert.match(unknown.stderr, /ghost/);
+  const wrongProject = await ccdmAttach(workspace, ["codex", "--thread", THREAD_ID], env);
+  assert.notEqual(wrongProject.exitCode, 0);
+  assert.match(wrongProject.stderr, /not a thread of project 'codex'/);
+  assert.equal(tmuxCalls(workspace).filter(call => call[0] === "attach").length, before);
 });
