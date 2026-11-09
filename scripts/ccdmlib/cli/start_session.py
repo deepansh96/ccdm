@@ -55,9 +55,9 @@ def _read_project(registry: Path, name: str) -> _Project:
         effort = ""
     elif not isinstance(effort, str) or effort not in _EFFORTS:
         sys.exit("Invalid claude_effort (expected low, medium, high, xhigh, or max)")
-    claude_home = os.path.expanduser(project["claude_home"]) if project.get("claude_home") else ""
+    claude_home = _launch.expand_path(project["claude_home"]) if project.get("claude_home") else ""
     return _Project(
-        os.path.expanduser(project["path"]),
+        _launch.expand_path(project["path"]),
         project["screen_name"],
         project.get("model") or "",
         effort,
@@ -73,7 +73,7 @@ def _resume_ok(project: _Project, session_id: str) -> bool:
     if any(os.path.isfile(candidate) for candidate in candidates):
         return True
     print(
-        f"No saved Claude transcript for session {session_id} in {os.path.expanduser(home)} (looked for {candidates[0]})",
+        f"No saved Claude transcript for session {session_id} in {home} (looked for {candidates[0]})",
         file=sys.stderr,
     )
     return False

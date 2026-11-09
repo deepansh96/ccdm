@@ -103,10 +103,15 @@ def launch_deadline(variable: str = "CCDM_CLAUDE_LAUNCH_TIMEOUT_S") -> float:
     return time.monotonic() + float(os.environ.get(variable) or _DEFAULT_LAUNCH_TIMEOUT_S)
 
 
+def expand_path(value: str) -> str:
+    """``~`` expanded, with Windows separators on Windows (``expanduser`` leaves ``/`` there)."""
+    expanded = os.path.expanduser(value)
+    return os.path.normpath(expanded) if WIN32 else expanded
+
+
 def effective_claude_home(claude_home: str) -> str:
     """The folder Claude uses: the project's ``claude_home``, ``CLAUDE_CONFIG_DIR``, or ``~/.claude``."""
-    home = claude_home or os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(str(Path.home()), ".claude")
-    return os.path.expanduser(home)
+    return expand_path(claude_home or os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(str(Path.home()), ".claude"))
 
 
 def transcript_paths(claude_home: str, cwd: str, session_id: str) -> List[str]:
