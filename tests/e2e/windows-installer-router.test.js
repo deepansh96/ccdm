@@ -63,7 +63,9 @@ function installEnv(workspace, extra = {}) {
   });
 }
 
-const ccdm = (workspace, args, env = {}) => runScript(workspace, "scripts/ccdm.py", {
+// Python directly on Windows; on POSIX scripts/ccdm.py is not executable and the sh entry starts it.
+const CCDM_ENTRY = process.platform === "win32" ? "scripts/ccdm.py" : "scripts/ccdm";
+const ccdm = (workspace, args, env = {}) => runScript(workspace, CCDM_ENTRY, {
   args, env: installEnv(workspace, env), timeoutMs: scaledTimeout(30000),
 });
 
