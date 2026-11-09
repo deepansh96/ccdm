@@ -10,11 +10,13 @@ import math
 import os
 import re
 import stat
+import queue
 import select
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import sqlite3
 from decimal import Decimal, InvalidOperation
@@ -30,14 +32,23 @@ sys.dont_write_bytecode = True  # no __pycache__ beside the scripts
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from ccdmlib.platform import filelock  # noqa: E402
+from ccdmlib.platform import credentials as claude_credentials  # noqa: E402
+from ccdmlib.platform import exe, filelock, paths, proc  # noqa: E402
 from ccdmlib.platform.private_fs import ensure_private_dir, fix_hint, is_private  # noqa: E402
 
+WIN32 = sys.platform == "win32"
+# Windows runs on the same accounts as the Mac, which stays the only poster.
+COLLECT_ONLY_PLATFORM = WIN32
+COLLECT_ONLY_MESSAGE = "Windows collects usage only; run with --collect-only"
 ROOT_DIR = SCRIPT_DIR.parent
 DEFAULT_CONFIG_PATH = ROOT_DIR / ".usage-stats-poster.json"
 REGISTRY_PATH = ROOT_DIR / "registry.json"
-PLAIN_CLAUDE_SERVICE = "Claude Code-credentials"
-DEFAULT_HISTORY_DB_PATH = Path.home() / "Library" / "Application Support" / "CCDM" / "usage-stats" / "history.sqlite3"
+PLAIN_CLAUDE_SERVICE = claude_credentials.PLAIN_KEYCHAIN_SERVICE
+DEFAULT_HISTORY_DB_PATH = (
+    paths.state_root() / "usage-stats" / "history.sqlite3"
+    if WIN32
+    else Path.home() / "Library" / "Application Support" / "CCDM" / "usage-stats" / "history.sqlite3"
+)
 HISTORY_RETENTION_DAYS = 365
 HISTORY_WARNING_BYTES = 5 * 1024 * 1024 * 1024
 HISTORY_WARNING_INTERVAL = timedelta(hours=24)
@@ -263,30 +274,22 @@ def get_claude_api_stats(config_dir, label, now=None, estimate=None):
     ])
 
 
-def _read_oauth_credential(service):
-    try:
-        result = subprocess.run(
-            ["security", "find-generic-password", "-s", service, "-w"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    try:
-        credential = json.loads(result.stdout.strip())
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return None
-    if not isinstance(credential, dict):
-        return None
-    oauth = credential.get("claudeAiOauth")
-    if not isinstance(oauth, dict):
-        return None
-    if not isinstance(oauth.get("accessToken"), str) or not oauth["accessToken"]:
-        return None
-    return oauth
+CREDENTIAL_PROBLEMS = "credential-file-problems"
+CREDENTIAL_NOTICES = "credential-file-notices"
+
+
+def _read_oauth_credential(service, cache=None):
+    if not isinstance(service, claude_credentials.CredentialFile):
+        return claude_credentials.read_keychain_item(service)
+    cache = {} if cache is None else cache
+    result = claude_credentials.read_credentials_file(service.config_dir)
+    cache.setdefault(CREDENTIAL_PROBLEMS, {})[service] = result.reason
+    noticed = cache.setdefault(CREDENTIAL_NOTICES, set())
+    for line in (*result.refusals, *result.warnings):
+        if line not in noticed:
+            noticed.add(line)
+            print(f"Warning: {line}", file=sys.stderr)
+    return result.oauth
 
 
 def _request_json(base_url, endpoint, headers, label):
@@ -309,7 +312,7 @@ def _request_json(base_url, endpoint, headers, label):
 def claude_oauth_account(config_json_path):
     """Return the ``oauthAccount`` Claude Code stored for a home, if any."""
     try:
-        data = json.loads(Path(config_json_path).read_text())
+        data = json.loads(Path(config_json_path).read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError):
         return None
     if not isinstance(data, dict):
@@ -352,25 +355,16 @@ def _read_oauth_credentials(services, cache=None):
     cache = {} if cache is None else cache
     for service in services:
         if service not in cache:
-            cache[service] = _read_oauth_credential(service)
+            cache[service] = _read_oauth_credential(service, cache)
     credentials = [cache[service] for service in services if cache[service]]
     return sorted(credentials, key=_oauth_expiry, reverse=True)
 
 
 def claude_home_services(config_dir):
-    """Keychain services that can hold one Claude home's login, hashed first.
-
-    Claude Code keeps a home's OAuth credential in ``Claude Code-credentials``
-    when ``CLAUDE_CONFIG_DIR`` is unset, and in
-    ``Claude Code-credentials-<first 8 hex of sha256(dir path)>`` when the
-    variable is set explicitly. Remote logins always set the variable, even
-    for ``~/.claude``, while default sessions do not, so ``~/.claude`` can
-    have a live credential in either item.
-    """
-    hashed = f"{PLAIN_CLAUDE_SERVICE}-" + hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
-    if config_dir == Path.home() / ".claude":
-        return [hashed, PLAIN_CLAUDE_SERVICE]
-    return [hashed]
+    """Where one Claude home's login can be: Keychain items, hashed first, or its file."""
+    if claude_credentials.uses_keychain():
+        return claude_credentials.keychain_services(config_dir)
+    return [claude_credentials.credential_file(config_dir)]
 
 
 def discover_claude_accounts():
@@ -406,7 +400,7 @@ def discover_claude_accounts():
             continue
         email = claude_account_email(oauth_account)
         services = claude_home_services(config_dir)
-        if email:
+        if email and claude_credentials.uses_keychain():
             services.append(PLAIN_CLAUDE_SERVICE)
         accounts.append((services, config_dir.name.lstrip("."), f"~/{config_dir.name}", email))
     return accounts
@@ -526,7 +520,9 @@ def parse_config(raw):
     if not isinstance(raw, dict):
         raise PosterError("poster config must contain a JSON object")
     channel_id = raw.get("discord_channel_id", raw.get("channel_id"))
-    if not isinstance(channel_id, str) or not channel_id.strip():
+    if COLLECT_ONLY_PLATFORM:
+        channel_id = None
+    elif not isinstance(channel_id, str) or not channel_id.strip():
         raise PosterError("poster config requires discord_channel_id")
 
     api_accounts = raw.get("claude_api_accounts", [])
@@ -589,7 +585,7 @@ def parse_config(raw):
 
 def load_config(path):
     try:
-        raw = json.loads(path.read_text())
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise PosterError(f"poster config not found: {path.name}") from None
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -597,15 +593,20 @@ def load_config(path):
     return parse_config(raw)
 
 
-def load_registry_data(path):
+def load_registry(path):
     try:
-        registry = json.loads(path.read_text())
+        registry = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise PosterError("registry.json not found next to the repository") from None
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         raise PosterError("unable to read valid registry.json") from None
     if not isinstance(registry, dict):
         raise PosterError("unable to read valid registry.json")
+    return registry
+
+
+def load_registry_data(path):
+    registry = load_registry(path)
     state_dir = Path(os.environ.get("ROOT_DISCORD_STATE_DIR") or "~/.claude/channels/discord").expanduser()
     try:
         lines = (state_dir / ".env").read_text().splitlines()
@@ -828,18 +829,62 @@ def format_codex_rate_limits(rate_limits, label, reset_credits=None, source_ts=N
     return "\n".join(lines)
 
 
+CODEX_REQUEST_TIMEOUT_SECONDS = 10
+
+
+def _start_line_reader(stream):
+    """A pipe cannot be polled on Windows, so a daemon thread reads it into a queue.
+
+    Returns ``read_line(deadline)``: one line, or ``None`` at EOF or at the deadline.
+    """
+    lines = queue.Queue()
+
+    def pump():
+        try:
+            for line in iter(stream.readline, b""):
+                lines.put(line.rstrip(b"\r\n"))
+        except (OSError, ValueError):
+            pass
+        lines.put(None)
+
+    threading.Thread(target=pump, daemon=True).start()
+
+    def read_line(deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            return lines.get(timeout=remaining)
+        except queue.Empty:
+            return None
+
+    return read_line
+
+
 def read_codex_rate_limits(codex_home):
     """Read one Codex Home's live rate limits through the local app-server boundary."""
     environment = os.environ.copy()
     environment.pop("ROOT_CODEX_HOME", None)
     environment["CODEX_HOME"] = str(codex_home)
+    command = ["codex", "app-server", "--stdio"]
+    launch_options = {}
+    if WIN32:
+        # A bare name or a .cmd cannot start here, so the resolver names the program.
+        try:
+            resolved = exe.codex()
+        except exe.ToolNotFound:
+            return None
+        command = [resolved["command"], *resolved["args"], "app-server", "--stdio"]
+        environment.update(resolved["env"])
+        launch_options["creationflags"] = subprocess.CREATE_NO_WINDOW
     try:
         process = subprocess.Popen(
-            ["codex", "app-server", "--stdio"],
+            command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             env=environment,
+            **launch_options,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -849,6 +894,13 @@ def read_codex_rate_limits(codex_home):
             process.stdin.close()
         except (OSError, ValueError):
             pass
+        if WIN32:
+            # Codex is a tree on Windows (a launcher and its children), so all of it stops.
+            with contextlib.suppress(OSError):
+                proc.kill_tree(process.pid)
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                process.wait(timeout=2)
+            return
         try:
             process.terminate()
             process.wait(timeout=2)
@@ -862,12 +914,13 @@ def read_codex_rate_limits(codex_home):
     stdout_buffer = bytearray()
     try:
         stdout_fd = process.stdout.fileno()
-        os.set_blocking(stdout_fd, False)
+        if not WIN32:
+            os.set_blocking(stdout_fd, False)
     except (AttributeError, OSError, ValueError):
         terminate_process()
         return None
 
-    def read_line(deadline):
+    def read_posix_line(deadline):
         while True:
             try:
                 line_end = stdout_buffer.index(b"\n")
@@ -901,6 +954,8 @@ def read_codex_rate_limits(codex_home):
                 return line
             stdout_buffer.extend(chunk)
 
+    read_line = _start_line_reader(process.stdout) if WIN32 else read_posix_line
+
     def request(request_id, method, params=None):
         message = {"jsonrpc": "2.0", "id": request_id, "method": method}
         if params is not None:
@@ -910,7 +965,7 @@ def read_codex_rate_limits(codex_home):
             process.stdin.flush()
         except (BrokenPipeError, OSError, ValueError):
             return None
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + CODEX_REQUEST_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             line = read_line(deadline)
             if line is None:
@@ -1096,6 +1151,12 @@ def claude_code_executable():
     grants only to a recent Claude Code client, so without this binary the
     poster keeps the plain usage request and shows no reset count.
     """
+    if WIN32:
+        # Windows has no versions/<version> link; the version comes from the program.
+        try:
+            return Path(exe.claude()["command"])
+        except exe.ToolNotFound:
+            return None
     candidates = [Path.home() / ".local" / "bin" / "claude"]
     found = shutil.which("claude")
     if found:
@@ -1108,6 +1169,30 @@ def claude_code_executable():
         if CLAUDE_CODE_VERSION_RE.match(resolved.name):
             return resolved
     return None
+
+
+def _windows_subprocess_options():
+    """No console window, and output decoded as UTF-8 instead of the ANSI code page."""
+    return {"creationflags": subprocess.CREATE_NO_WINDOW, "encoding": "utf-8", "errors": "replace"} if WIN32 else {}
+
+
+def claude_code_client_version(executable):
+    """The client version of a Claude Code binary, or ``None`` when it cannot be told."""
+    if not WIN32:
+        return executable.name
+    try:
+        result = subprocess.run(
+            [str(executable), "--version"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            **_windows_subprocess_options(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    words = (result.stdout or "").split()
+    return words[0] if result.returncode == 0 and words and CLAUDE_CODE_VERSION_RE.match(words[0]) else None
 
 
 def refresh_claude_login(executable, config_dir):
@@ -1136,6 +1221,7 @@ def refresh_claude_login(executable, config_dir):
                 capture_output=True,
                 text=True,
                 timeout=CLAUDE_REFRESH_TIMEOUT_SECONDS,
+                **_windows_subprocess_options(),
             )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -1278,6 +1364,14 @@ def _collect_claude_oauth_metric(
 
     if credentials and _oauth_expired(credentials[0]):
         refresh()
+    problems = cache.get(CREDENTIAL_PROBLEMS, {})
+    problem = next((problems[service] for service in services if problems.get(service)), None)
+    if not credentials and problem:
+        # Read but unusable: a refused or unparsable file, not a home with no login.
+        metric["status"] = "unavailable"
+        metric["reason"] = problem
+        metric["text"] = f"**{label}**\n*{problem}*"
+        return metric
     if not credentials:
         metric["status"] = "unavailable"
         metric["reason"] = "Could not get OAuth token"
@@ -1375,7 +1469,7 @@ def collect_claude_metrics(config):
     metrics = []
     cache = {}
     executable = claude_code_executable()
-    client_version = executable.name if executable else None
+    client_version = claude_code_client_version(executable) if executable else None
     refresher = (lambda config_dir: refresh_claude_login(executable, config_dir)) if executable else None
     for index, (services, label, dir_hint, email) in enumerate(discover_claude_accounts()):
         metric = _collect_claude_oauth_metric(
@@ -1383,6 +1477,8 @@ def collect_claude_metrics(config):
         )
         if index > 0 and metric.get("missing_oauth"):
             metric["text"] = None
+        if not claude_credentials.uses_keychain() and metric.get("status") == "unavailable" and not metric.get("missing_oauth"):
+            print(f"Warning: Claude limits skipped for {label}: {metric['reason']}", file=sys.stderr)
         metrics.append(metric)
     for account in config["claude_api_accounts"]:
         # API-key transcript accounts have no comparable percentage limit. Keep
@@ -1476,6 +1572,13 @@ def _metric_from_codex_rate_limits(rate_limits, label, source="live", source_ts=
     return metric
 
 
+def _windows_file_is_private(path):
+    try:
+        return is_private(path)
+    except (OSError, ValueError):
+        return False
+
+
 def _read_bounded_regular_text(path, limit, *, private=False):
     """Read a bounded regular, non-symlink file, or return ``None``.
 
@@ -1487,8 +1590,10 @@ def _read_bounded_regular_text(path, limit, *, private=False):
     or world readable.
     """
     flags = os.O_RDONLY
-    for name in ("O_NONBLOCK", "O_CLOEXEC", "O_NOFOLLOW"):
+    for name in ("O_NONBLOCK", "O_CLOEXEC", "O_NOFOLLOW", "O_BINARY"):
         flags |= getattr(os, name, 0)
+    if private and WIN32 and not _windows_file_is_private(path):
+        return None
     try:
         descriptor = os.open(path, flags)
     except OSError:
@@ -1497,7 +1602,7 @@ def _read_bounded_regular_text(path, limit, *, private=False):
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
             return None
-        if private:
+        if private and not WIN32:
             if info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
                 return None
             get_owner = getattr(os, "geteuid", None)
@@ -1965,6 +2070,7 @@ def collect_deepseek_metrics(config, registry, now=None, usage_module=_DEEPSEEK_
             "text": "\n".join([f"**{label}** (API)"] + text_lines),
             "status": "available" if balance.get("status") == "available" else "unavailable",
             "reason": None if balance.get("status") == "available" else balance.get("reason"),
+            "balance": balance,
         })
     return metrics
 
@@ -2147,10 +2253,36 @@ def _safe_label(value, fallback):
     return cleaned[:160] or fallback
 
 
+def _deepseek_history_card(metric):
+    """The balance card a Windows snapshot keeps for a later merged view.
+
+    The Mac leaves DeepSeek out of history (its note is display-only); Windows
+    only collects, so without this card its balance would never be recorded.
+    """
+    balance = metric.get("balance") if isinstance(metric.get("balance"), dict) else {}
+    available = balance.get("status") == "available"
+    card = {
+        "provider": "deepseek",
+        "account": _safe_label(metric.get("account"), "unknown"),
+        "window": "balance",
+        "available": available,
+        "status": "available" if available else "unavailable",
+    }
+    if available:
+        card["is_available"] = balance.get("is_available") is True
+        card["balances"] = [dict(entry) for entry in balance.get("entries", []) if isinstance(entry, dict)]
+    else:
+        card["reason"] = _safe_label(metric.get("reason"), "DeepSeek balance unavailable")[:200]
+    return card
+
+
 def _safe_history_cards(metrics):
     cards = []
     for metric in metrics:
         if not isinstance(metric, dict):
+            continue
+        if COLLECT_ONLY_PLATFORM and metric.get("source") == "deepseek":
+            cards.append(_deepseek_history_card(metric))
             continue
         provider = _safe_label(metric.get("provider"), "usage").lower()
         account = _safe_label(metric.get("account"), "unknown")
@@ -2694,12 +2826,18 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if COLLECT_ONLY_PLATFORM and not (args.collect_only or args.validate_config):
+        print(COLLECT_ONLY_MESSAGE, file=sys.stderr)
+        return 2
     try:
         config = load_config(args.config)
         if args.validate_config:
             print("Poster configuration is valid")
             return 0
-        registry, bot_token = load_registry_data(REGISTRY_PATH)
+        # Windows never posts, so it never reads root's bot token.
+        registry, bot_token = (
+            (load_registry(REGISTRY_PATH), None) if COLLECT_ONLY_PLATFORM else load_registry_data(REGISTRY_PATH)
+        )
         scheduled = (
             args.scheduled
             or args.post_now

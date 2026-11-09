@@ -11,6 +11,13 @@ import sys
 import tempfile
 import urllib.request
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.dont_write_bytecode = True  # no __pycache__ beside the scripts
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from ccdmlib.platform.private_fs import ensure_private_dir  # noqa: E402
+
 
 CATALOG_URL = "https://cdn.deepseek.com/api-docs/codex-deepseek-setup-en.sh"
 MODEL = "deepseek-flash"
@@ -145,6 +152,7 @@ def main():
     catalog = read_catalog(args.catalog_file)
     # Validate everything before creating the home; never overwrite existing state.
     home.mkdir(mode=0o700, parents=True)
+    ensure_private_dir(home)
     write_private(home / "api-key", key + "\n")
     write_private(home / "model-catalogs.json", json.dumps(catalog, indent=2) + "\n")
     write_private(home / "config.toml", configuration(home, args.with_exa))

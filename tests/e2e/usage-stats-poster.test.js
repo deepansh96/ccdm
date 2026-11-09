@@ -6,8 +6,9 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { createRequire } from "node:module";
 
-import { PYTHON, assertPrivate, assertPosixMode } from "./support/platform.js";
+import { PYTHON, assertPrivate, assertPosixMode, fixtureLauncher, platformGate } from "./support/platform.js";
 import { createWorkspace, runScript } from "./support/runner.js";
 import { readState, updateState, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
@@ -15,6 +16,44 @@ import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 test.afterEach(async () => {
   await cleanup();
 });
+
+const WIN = process.platform === "win32";
+const WINDOWS_ONLY = platformGate("win32", "Windows-only poster behaviour");
+const POSTER = "scripts/usage-stats-poster.py";
+
+// Windows never posts usage. These cases cover what the Mac posts, so on Windows
+// the same code runs with the collect-only gate switched off, against the Local
+// Fake Discord. The cases about the gate itself use runScript.
+const POSTING_DRIVER = `import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("poster", Path(__file__).parent / "scripts" / "usage-stats-poster.py")
+poster = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(poster)
+poster.COLLECT_ONLY_PLATFORM = False
+raise SystemExit(poster.main(sys.argv[1:]))
+`;
+
+async function runPoster(workspace, options = {}) {
+  if (!WIN) return runScript(workspace, POSTER, options);
+  const env = {
+    CCDM_CLAUDE_CREDENTIALS_STORE: "keychain",
+    CCDM_CODEX_PATH: path.join(workspace.fixtureDir, "codex.exe"),
+    ...options.env,
+  };
+  const args = options.args ?? [];
+  if (args.includes("--collect-only") || args.includes("--validate-config") || args.includes("--help")) {
+    return runScript(workspace, POSTER, { ...options, env });
+  }
+  const driver = "poster-posting-driver.py";
+  fs.writeFileSync(path.join(workspace.repoDir, driver), POSTING_DRIVER);
+  return runScript(workspace, driver, { ...options, env });
+}
+
+// A directory the privacy check accepts: mode 0700, or a protected DACL on Windows.
+function protectDir(dir) {
+  if (WIN) createRequire(import.meta.url)("../../scripts/platform/privacy.js").ensurePrivateDirSync(dir);
+  else fs.chmodSync(dir, 0o700);
+}
 
 function serviceFor(configDir) {
   return `Claude Code-credentials-${crypto.createHash("sha256").update(configDir).digest("hex").slice(0, 8)}`;
@@ -190,7 +229,7 @@ test("poster posts a Claude usage embed through the configured Discord endpoint"
   const api = await startPosterApi();
   seedPosterWorkspace(workspace, api.baseUrl);
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", { cwd: workspace.tmpDir });
+  const result = await runPoster(workspace, { cwd: workspace.tmpDir });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.match(result.stdout, /Posted \(message ID: message-1\)/);
@@ -224,25 +263,35 @@ test("poster posts a Claude usage embed through the configured Discord endpoint"
 // A native Claude Code install. Its binary logs each run beside the test state
 // and, when `refreshed` maps the Keychain item the run uses to a new
 // credential, saves that credential like Claude Code's own token refresh.
-function installNativeClaude(workspace, version, { refreshed = {}, exitCode = 0 } = {}) {
+function installNativeClaude(workspace, version, { refreshed = {}, exitCode = 0, credentialsFile = null } = {}) {
   const versionsDir = path.join(workspace.homeDir, ".local", "share", "claude", "versions");
   const binDir = path.join(workspace.homeDir, ".local", "bin");
   fs.mkdirSync(versionsDir, { recursive: true });
   fs.mkdirSync(binDir, { recursive: true });
   const stateLock = path.resolve("tests/e2e/support/state-lock.cjs");
+  // The Windows form has no versions/<version> link: a launcher that prints its version.
+  const scriptPath = path.join(versionsDir, WIN ? `${version}.cjs` : version);
   fs.writeFileSync(
-    path.join(versionsDir, version),
+    scriptPath,
     `#!${process.execPath}
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const { withStateLock } = require(${JSON.stringify(stateLock)});
+if (process.argv[2] === "--version") {
+  console.log(${JSON.stringify(`${version} (Claude Code)`)});
+  process.exit(0);
+}
 const stateDir = process.env.CCDM_TEST_STATE;
 const configDir = process.env.CLAUDE_CONFIG_DIR ?? null;
 const service = configDir
   ? "Claude Code-credentials-" + crypto.createHash("sha256").update(configDir).digest("hex").slice(0, 8)
   : "Claude Code-credentials";
 fs.appendFileSync(path.join(stateDir, "native-claude.log"), JSON.stringify({ args: process.argv.slice(2), configDir, cwd: process.cwd(), service }) + "\\n");
+const credentialsFile = ${JSON.stringify(credentialsFile)};
+if (credentialsFile) {
+  fs.writeFileSync(path.join(credentialsFile.dir, ".credentials.json"), JSON.stringify({ claudeAiOauth: credentialsFile.oauth }));
+}
 const refreshed = ${JSON.stringify(refreshed)};
 if (refreshed[service]) {
   withStateLock(stateDir, () => {
@@ -256,6 +305,11 @@ process.exit(${exitCode});
 `,
     { mode: 0o755 },
   );
+  if (WIN) {
+    fs.copyFileSync(fixtureLauncher(), path.join(binDir, "claude.exe"));
+    fs.writeFileSync(path.join(binDir, "claude.shim"), `${process.execPath}\n${scriptPath}\n`);
+    return;
+  }
   fs.symlinkSync(path.join(versionsDir, version), path.join(binDir, "claude"));
 }
 
@@ -287,7 +341,7 @@ test("poster has Claude Code refresh an expired Claude login before reporting it
     refreshed: { [ivService]: { accessToken: "fixture-iv-fresh", refreshToken: "fixture-iv-rotated", expiresAt: future } },
   });
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", { cwd: workspace.tmpDir });
+  const result = await runPoster(workspace, { cwd: workspace.tmpDir });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const runs = nativeClaudeRuns(workspace);
@@ -327,7 +381,7 @@ test("poster refreshes a rejected Claude login once and retries", async () => {
     },
   });
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", { cwd: workspace.tmpDir });
+  const result = await runPoster(workspace, { cwd: workspace.tmpDir });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.deepEqual(nativeClaudeRuns(workspace).map((run) => [run.configDir, run.service]), [[null, "Claude Code-credentials"]]);
@@ -353,7 +407,7 @@ test("poster keeps the expired-login notice when Claude Code cannot refresh it",
   writeState(state, workspace.stateDir);
   installNativeClaude(workspace, "2.1.293", { exitCode: 1 });
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", { cwd: workspace.tmpDir });
+  const result = await runPoster(workspace, { cwd: workspace.tmpDir });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   // Only the login with a refresh token is attempted, and only once.
@@ -382,7 +436,7 @@ test("poster shows Claude limit resets available when Claude Code is installed",
   seedPosterWorkspace(workspace, api.baseUrl);
   installNativeClaude(workspace, "2.1.293");
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", { cwd: workspace.tmpDir });
+  const result = await runPoster(workspace, { cwd: workspace.tmpDir });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const usageRequest = api.requests.find((request) => request.path.startsWith("/api/oauth/usage"));
@@ -409,7 +463,7 @@ test("poster omits Claude limit resets for an ineligible account or without Clau
     [ineligible, ineligibleApi, "/api/oauth/usage?cedar_ember=1"],
     [missing, missingApi, "/api/oauth/usage"],
   ]) {
-    const result = await runScript(workspace, "scripts/usage-stats-poster.py", { cwd: workspace.tmpDir });
+    const result = await runPoster(workspace, { cwd: workspace.tmpDir });
     assert.equal(result.exitCode, 0, result.stderr || result.stdout);
     assert.ok(api.requests.some((request) => request.path === usagePath));
     const claudeValue = JSON.parse(api.requests.find((request) => request.method === "POST").body).embeds[0].fields[0].value;
@@ -427,7 +481,7 @@ test("manual JSON posting does not open or write the configured history database
   fs.chmodSync(sharedParent, 0o755);
   seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+  const result = await runPoster(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.equal(fs.existsSync(historyPath), false);
@@ -444,7 +498,7 @@ test("missing or malformed Claude utilization is recorded as unavailable", async
   const historyPath = path.join(workspace.homeDir, "history", "history.sqlite3");
   seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", { args: ["--collect-only"] });
+  const result = await runPoster(workspace, { args: ["--collect-only"] });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const payloadProbe = spawnSync(PYTHON, ["-c", [
@@ -466,7 +520,7 @@ test("history store preserves shared parents and rejects unsupported schemas and
   fs.mkdirSync(sharedParent);
   fs.chmodSync(sharedParent, 0o755);
   seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
-  const collected = await runScript(workspace, "scripts/usage-stats-poster.py", { args: ["--collect-only"] });
+  const collected = await runPoster(workspace, { args: ["--collect-only"] });
   assert.equal(collected.exitCode, 0, collected.stderr || collected.stdout);
   assertPosixMode(sharedParent, 0o755);
   assertPrivate(featureDir);
@@ -479,6 +533,7 @@ test("history store preserves shared parents and rejects unsupported schemas and
   ].join("\n"), path.join("scripts", "usage-stats-poster.py"), ...args], { encoding: "utf8" });
   const schemaDir = path.join(workspace.tmpDir, "schema");
   fs.mkdirSync(schemaDir, 0o700);
+  protectDir(schemaDir);
   const unsupportedDb = path.join(schemaDir, "unsupported.sqlite3");
   const created = spawnSync(PYTHON, ["-c", [
     "import sqlite3, sys",
@@ -513,7 +568,7 @@ test("history store preserves shared parents and rejects unsupported schemas and
     "print(connection.execute('select payload_json from snapshots').fetchone()[0])",
   ].join("\n"), legacyDb], { encoding: "utf8" });
   assert.equal(migrationProbe.status, 0, migrationProbe.stderr);
-  assert.match(migrationProbe.stdout, /^1\n/);
+  assert.match(migrationProbe.stdout, /^1\r?\n/);
   assert.match(migrationProbe.stdout, /cards/);
 
   const atomicInitialization = probe(
@@ -522,22 +577,29 @@ test("history store preserves shared parents and rejects unsupported schemas and
   );
   assert.equal(atomicInitialization.status, 0, atomicInitialization.stderr);
   assert.match(atomicInitialization.stdout, /unable to initialize usage history schema atomically/);
-  assert.match(atomicInitialization.stdout, /\n0\n0\s*$/);
+  assert.match(atomicInitialization.stdout, /\r?\n0\r?\n0\s*$/);
 
+  // Made ahead: on Windows protecting a new directory starts icacls, which needs os.open.
+  const permissionDir = path.join(workspace.tmpDir, "permission");
+  fs.mkdirSync(permissionDir, 0o700);
+  protectDir(permissionDir);
   const deniedOpen = probe(
     "def denied(*args, **kwargs):\n raise PermissionError('fixture lock permission denied')\nposter.os.open = denied\ntry:\n with poster.HistoryStore(sys.argv[2]).locked(): pass\nexcept poster.PosterError as error:\n print(error); raise SystemExit(1)",
-    path.join(workspace.tmpDir, "permission", "history.sqlite3"),
+    path.join(permissionDir, "history.sqlite3"),
   );
   assert.equal(deniedOpen.status, 1);
   assert.match(deniedOpen.stdout, /unable to open usage history lock/);
 
-  const deniedFchmod = probe(
-    "closed = []\nreal_close = poster.os.close\ndef tracked_close(fd):\n closed.append(fd)\n return real_close(fd)\nposter.os.close = tracked_close\ndef denied(*args, **kwargs):\n raise PermissionError('fixture fchmod permission denied')\nposter.os.fchmod = denied\ntry:\n with poster.HistoryStore(sys.argv[2]).locked(): pass\nexcept poster.PosterError as error:\n print(error)\nprint('closed', len(closed))",
-    path.join(workspace.tmpDir, "fchmod-permission", "history.sqlite3"),
-  );
-  assert.equal(deniedFchmod.status, 0);
-  assert.match(deniedFchmod.stdout, /unable to open usage history lock/);
-  assert.match(deniedFchmod.stdout, /closed 1/);
+  // Windows has no fchmod; the DACL of the new lock file comes from its directory.
+  if (!WIN) {
+    const deniedFchmod = probe(
+      "closed = []\nreal_close = poster.os.close\ndef tracked_close(fd):\n closed.append(fd)\n return real_close(fd)\nposter.os.close = tracked_close\ndef denied(*args, **kwargs):\n raise PermissionError('fixture fchmod permission denied')\nposter.os.fchmod = denied\ntry:\n with poster.HistoryStore(sys.argv[2]).locked(): pass\nexcept poster.PosterError as error:\n print(error)\nprint('closed', len(closed))",
+      path.join(workspace.tmpDir, "fchmod-permission", "history.sqlite3"),
+    );
+    assert.equal(deniedFchmod.status, 0);
+    assert.match(deniedFchmod.stdout, /unable to open usage history lock/);
+    assert.match(deniedFchmod.stdout, /closed 1/);
+  }
 
   const deniedFlock = probe(
     "def denied(*args, **kwargs):\n raise PermissionError('fixture flock permission denied')\nposter.filelock.lock = denied\ntry:\n with poster.HistoryStore(sys.argv[2]).locked(): pass\nexcept poster.PosterError as error:\n print(error); raise SystemExit(1)",
@@ -567,6 +629,7 @@ test("history store preserves shared parents and rejects unsupported schemas and
 
   const lockDir = path.join(workspace.tmpDir, "lock-history");
   fs.mkdirSync(lockDir, 0o700);
+  protectDir(lockDir);
   fs.symlinkSync(path.join(workspace.tmpDir, "lock-target"), path.join(lockDir, ".history.lock"));
   const lockFailure = probe(
     "try:\n with poster.HistoryStore(sys.argv[2]).locked(): pass\nexcept poster.PosterError as error:\n print(error); raise SystemExit(1)",
@@ -652,7 +715,7 @@ test("history uses valid SQLite slots as the authoritative chronological timesta
     "from pathlib import Path",
     "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
     "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
-    "root = Path(tempfile.mkdtemp()); root.chmod(0o700)",
+    "root = Path(tempfile.mkdtemp()); root.chmod(0o700); poster.ensure_private_dir(root)",
     "store = poster.HistoryStore(root / 'history.sqlite3')",
     "with store.locked() as connection:",
     " connection.execute(\"insert into snapshots values (?, ?, ?)\", ('2026-08-18T12:20:00Z', 'wrong', json.dumps({'generated_at': '2099-01-01T00:00:00Z', 'cards': []})) )",
@@ -744,7 +807,7 @@ test("poster discovers labeled extra Claude OAuth config directories with derive
   };
   writeState(state, workspace.stateDir);
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+  const result = await runPoster(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const post = api.requests.find((request) => request.method === "POST");
@@ -804,7 +867,7 @@ test("poster gives each Claude OAuth HTTP 401 an account-specific login action",
   };
   writeState(state, workspace.stateDir);
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+  const result = await runPoster(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const post = api.requests.find((request) => request.method === "POST");
@@ -829,7 +892,7 @@ async function runPosterWithDefaultHomeCredentials(credentialsFor) {
     state.fixtures.security.credentials = credentialsFor(hashedService);
   });
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+  const result = await runPoster(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const post = api.requests.find((request) => request.method === "POST");
@@ -929,7 +992,7 @@ test("poster reports each Claude home only with a login that belongs to its acco
   };
   writeState(state, workspace.stateDir);
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+  const result = await runPoster(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const post = api.requests.find((request) => request.method === "POST");
@@ -950,7 +1013,7 @@ test("poster uses N/A when the Claude organization value is malformed", async ()
   const api = await startPosterApi({ organization: ["not", "an", "object"] });
   seedPosterWorkspace(workspace, api.baseUrl);
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", { cwd: workspace.tmpDir });
+  const result = await runPoster(workspace, { cwd: workspace.tmpDir });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const post = api.requests.find((request) => request.method === "POST");
@@ -977,7 +1040,7 @@ test("poster falls back when Codex JSON-RPC returns a non-object response", asyn
     [fs.realpathSync(codexHome)]: { mode: "non-object" },
   }, null, 2)}\n`);
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+  const result = await runPoster(workspace, {
     env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
   });
 
@@ -1011,7 +1074,7 @@ test("poster reads Codex JSON-RPC lines already buffered above the descriptor", 
     },
   }, null, 2)}\n`);
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+  const result = await runPoster(workspace, {
     env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
   });
 
@@ -1064,7 +1127,7 @@ test("poster reports named Codex Accounts in default-first alphabetical order", 
     [fs.realpathSync(premiumHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 21 }, secondary: { usedPercent: 43 } } },
   }, null, 2)}\n`);
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+  const result = await runPoster(workspace, {
     env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
   });
 
@@ -1096,6 +1159,7 @@ test("poster terminates a Codex process when stdout setup fails", async () => {
     probe,
     `#!/usr/bin/env python3
 import runpy
+import sys
 from pathlib import Path
 
 poster = runpy.run_path("scripts/usage-stats-poster.py", run_name="poster_fd_cleanup_probe")
@@ -1110,6 +1174,7 @@ class FakeStdin:
 
 class FakeProcess:
     def __init__(self):
+        self.pid = 4242
         self.stdin = FakeStdin()
         self.stdout = BrokenStdout()
         self.terminated = 0
@@ -1126,9 +1191,15 @@ class FakeProcess:
 
 process = FakeProcess()
 poster["subprocess"].Popen = lambda *args, **kwargs: process
+tree_kills = []
+poster["proc"].kill_tree = tree_kills.append
+poster["exe"].codex = lambda: {"command": "codex.exe", "args": [], "env": {}}
 assert poster["read_codex_rate_limits"](Path("/fixture/codex")) is None
-assert process.terminated == 1
-assert process.killed == 0
+if sys.platform == "win32":
+    assert tree_kills == [4242]
+else:
+    assert process.terminated == 1
+    assert process.killed == 0
 print("fd cleanup verified")
 `,
   );
@@ -1166,7 +1237,7 @@ test("poster deduplicates named aliases that share a Codex Home", async () => {
     [fs.realpathSync(otherHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 22 } } },
   }, null, 2)}\n`);
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+  const result = await runPoster(workspace, {
     env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
   });
 
@@ -1205,7 +1276,7 @@ test("poster falls back to raw Codex Homes in a legacy registry", async () => {
     [fs.realpathSync(projectHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 42 } } },
   }, null, 2)}\n`);
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+  const result = await runPoster(workspace, {
     env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
   });
 
@@ -1241,7 +1312,7 @@ test("poster reports a missing configured Codex Home as unavailable", async () =
     [fs.realpathSync(availableHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 19 } } },
   }, null, 2)}\n`);
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+  const result = await runPoster(workspace, {
     env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
   });
 
@@ -1292,7 +1363,7 @@ test("poster falls back to recent Codex session tokens after a live rate-limit f
     [fs.realpathSync(codexHome)]: { mode: "error" },
   }, null, 2)}\n`);
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+  const result = await runPoster(workspace, {
     env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
   });
 
@@ -1347,7 +1418,7 @@ test("poster preserves stale rate-limit fallback age and ignores a newer malform
     [fs.realpathSync(codexHome)]: { mode: "error" },
   }, null, 2)}\n`);
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+  const result = await runPoster(workspace, {
     env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
   });
 
@@ -1393,7 +1464,7 @@ test("poster preserves stale token-count fallback age markers", async () => {
     [fs.realpathSync(codexHome)]: { mode: "error" },
   }, null, 2)}\n`);
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+  const result = await runPoster(workspace, {
     env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
   });
 
@@ -1426,7 +1497,7 @@ test("poster discovers only registry Codex Homes, not ROOT_CODEX_HOME", async ()
     [fs.realpathSync(configuredHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 17 } } },
   }, null, 2)}\n`);
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+  const result = await runPoster(workspace, {
     env: {
       CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath,
       ROOT_CODEX_HOME: leakedHome,
@@ -1493,7 +1564,7 @@ test("poster reports malformed named Codex registry fields instead of degrading 
       }, null, 2)}\n`,
     );
 
-    const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+    const result = await runPoster(workspace);
 
     assert.equal(result.exitCode, 1);
     assert.match(result.stderr, error);
@@ -1532,7 +1603,7 @@ test("poster merges named accounts with project legacy homes and deduplicates sh
     [fs.realpathSync(projectHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 33 } } },
   }, null, 2)}\n`);
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+  const result = await runPoster(workspace, {
     env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
   });
 
@@ -1576,7 +1647,7 @@ test("poster merges top-level legacy homes with named accounts when no top-level
     [fs.realpathSync(projectLegacyHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 47 } } },
   }, null, 2)}\n`);
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+  const result = await runPoster(workspace, {
     env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
   });
 
@@ -1619,7 +1690,7 @@ test("poster labels a shared home with the alphabetically first alias without a 
     [fs.realpathSync(sharedHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 24 } } },
   }, null, 2)}\n`);
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+  const result = await runPoster(workspace, {
     env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath },
   });
 
@@ -1649,8 +1720,8 @@ test("poster import, help, and config validation do not access runtime services"
   fs.chmodSync(importProbe, 0o755);
 
   const imported = await runScript(workspace, "import-poster.sh");
-  const help = await runScript(workspace, "scripts/usage-stats-poster.py", { args: ["--help"] });
-  const validated = await runScript(workspace, "scripts/usage-stats-poster.py", { args: ["--validate-config"] });
+  const help = await runPoster(workspace, { args: ["--help"] });
+  const validated = await runPoster(workspace, { args: ["--validate-config"] });
 
   assert.equal(imported.exitCode, 0, imported.stderr || imported.stdout);
   assert.match(imported.stdout, /imported/);
@@ -1673,7 +1744,7 @@ test("poster accepts endpoint overrides from the test environment", async () => 
   delete config.discord_base_url;
   fs.writeFileSync(path.join(workspace.repoDir, ".usage-stats-poster.json"), `${JSON.stringify(config)}\n`);
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+  const result = await runPoster(workspace, {
     env: {
       CCDM_ANTHROPIC_BASE_URL: api.baseUrl,
       CCDM_DISCORD_BASE_URL: api.baseUrl,
@@ -1718,7 +1789,7 @@ test("poster includes hand-authored Claude API-account cost estimates", async ()
     claude_api_accounts: [{ path: "~/.claude-api", label: "Fixture API" }],
   });
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+  const result = await runPoster(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const post = api.requests.find((request) => request.method === "POST");
@@ -1740,7 +1811,7 @@ test("poster truncates long Claude sections at Discord's field limit", async () 
   }));
   seedPosterWorkspace(workspace, api.baseUrl, { claude_api_accounts: accounts });
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+  const result = await runPoster(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const post = api.requests.find((request) => request.method === "POST");
@@ -1754,7 +1825,7 @@ test("poster truncates long Claude sections at Discord's field limit", async () 
 test("poster reports missing config, Keychain, and endpoint failures without credentials", async () => {
   const malformedWorkspace = createWorkspace();
   fs.writeFileSync(path.join(malformedWorkspace.repoDir, ".usage-stats-poster.json"), "{broken\n");
-  const malformed = await runScript(malformedWorkspace, "scripts/usage-stats-poster.py", {
+  const malformed = await runPoster(malformedWorkspace, {
     args: ["--validate-config"],
   });
   assert.equal(malformed.exitCode, 1);
@@ -1767,7 +1838,7 @@ test("poster reports missing config, Keychain, and endpoint failures without cre
   const missingAuthState = readState(missingAuthWorkspace.stateDir);
   missingAuthState.fixtures.security.credentials = {};
   writeState(missingAuthState, missingAuthWorkspace.stateDir);
-  const missingAuth = await runScript(missingAuthWorkspace, "scripts/usage-stats-poster.py");
+  const missingAuth = await runPoster(missingAuthWorkspace);
   assert.equal(missingAuth.exitCode, 0, missingAuth.stderr || missingAuth.stdout);
   const missingAuthPost = api.requests.find((request) => request.method === "POST");
   assert.ok(missingAuthPost);
@@ -1776,7 +1847,7 @@ test("poster reports missing config, Keychain, and endpoint failures without cre
 
   const unreachableWorkspace = createWorkspace();
   seedPosterWorkspace(unreachableWorkspace, "http://127.0.0.1:1");
-  const unreachable = await runScript(unreachableWorkspace, "scripts/usage-stats-poster.py");
+  const unreachable = await runPoster(unreachableWorkspace);
   assert.equal(unreachable.exitCode, 1);
   assert.match(unreachable.stderr, /Discord post failed|endpoint/);
   assert.doesNotMatch(`${unreachable.stdout}\n${unreachable.stderr}`, /fixture-(oauth|root)-token/);
@@ -1812,7 +1883,7 @@ test("scheduled poster posts the original text report once per 30-minute slot wi
       rateLimits: { planType: "chatgpt", primary: { usedPercent: 42, windowDurationMins: 10080 } },
     },
   }, null, 2)}\n`);
-  const run = (now) => runScript(workspace, "scripts/usage-stats-poster.py", {
+  const run = (now) => runPoster(workspace, {
     args: ["--scheduled"],
     env: {
       CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath,
@@ -1900,7 +1971,7 @@ test("scheduled poster retries a failed or skipped slot on any later run in that
   const api = await startPosterApi({ failedPosts: 1 });
   const historyPath = path.join(workspace.homeDir, "Library", "Application Support", "CCDM", "usage-stats", "history.sqlite3");
   seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
-  const run = (now) => runScript(workspace, "scripts/usage-stats-poster.py", {
+  const run = (now) => runPoster(workspace, {
     args: ["--scheduled"],
     env: { CCDM_TEST_NOW: now, CCDM_USAGE_STATS_NOTIFY: "0" },
   });
@@ -1933,7 +2004,7 @@ test("scheduled poster does not repost a slot whose Discord reply was lost", asy
   const api = await startPosterApi({ droppedPosts: 1 });
   const historyPath = path.join(workspace.homeDir, "Library", "Application Support", "CCDM", "usage-stats", "history.sqlite3");
   seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
-  const run = (now) => runScript(workspace, "scripts/usage-stats-poster.py", {
+  const run = (now) => runPoster(workspace, {
     args: ["--scheduled"],
     env: { CCDM_TEST_NOW: now, CCDM_USAGE_STATS_NOTIFY: "0" },
   });
@@ -1962,7 +2033,7 @@ test("malformed current-slot snapshots are replaced by the next sanitized collec
   const api = await startPosterApi();
   const historyPath = path.join(workspace.homeDir, "history", "history.sqlite3");
   seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
-  const run = () => runScript(workspace, "scripts/usage-stats-poster.py", {
+  const run = () => runPoster(workspace, {
     args: ["--collect-only"],
     env: { CCDM_TEST_NOW: "2026-08-18T12:20:00Z", CCDM_USAGE_STATS_NOTIFY: "0" },
   });
@@ -1999,7 +2070,7 @@ test("poster never falls back to a project pool token when root credentials are 
     JSON.stringify({ pool: [{ id: "bot1", token: "fixture-project-token" }], projects: {} }),
   );
   fs.unlinkSync(path.join(workspace.homeDir, ".claude/channels/discord/.env"));
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+  const result = await runPoster(workspace);
   assert.notEqual(result.exitCode, 0);
   assert.match(result.stderr, /cannot read root Discord credentials/);
   assert.equal(api.requests.length, 0);
@@ -2013,7 +2084,7 @@ test("poster can use a custom root state directory with a router-only registry",
   fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), JSON.stringify({ projects: {} }));
   const custom = path.join(workspace.homeDir, "custom root");
   fs.renameSync(path.join(workspace.homeDir, ".claude/channels/discord"), custom);
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", { env: { ROOT_DISCORD_STATE_DIR: custom } });
+  const result = await runPoster(workspace, { env: { ROOT_DISCORD_STATE_DIR: custom } });
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(api.requests.find(r => r.method === "POST").authorization, "Bot fixture-root-token");
 });
@@ -2059,6 +2130,7 @@ const SEEDED_SESSION_STAMP = new Date(Date.now() - 1000).toISOString();
 function seedDeepseekHome(workspace, alias, options = {}) {
   const home = path.join(workspace.homeDir, alias);
   fs.mkdirSync(home, { recursive: true });
+  if (WIN) protectDir(home);
   if (options.marker !== undefined) {
     fs.writeFileSync(path.join(home, "ccdm-deepseek.json"), JSON.stringify(options.marker));
   }
@@ -2158,7 +2230,7 @@ function probePoster(code, ...args) {
     "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
     "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
     code,
-  ].join("\n"), path.join("scripts", "usage-stats-poster.py"), ...args], { encoding: "utf8" });
+  ].join("\n"), path.join("scripts", "usage-stats-poster.py"), ...args], { encoding: "utf8", env: { ...process.env, PYTHONUTF8: "1" } });
 }
 
 function probePosterTimed(timeoutMs, code, ...args) {
@@ -2167,7 +2239,7 @@ function probePosterTimed(timeoutMs, code, ...args) {
     "spec = importlib.util.spec_from_file_location('poster', sys.argv[1])",
     "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
     code,
-  ].join("\n"), path.join("scripts", "usage-stats-poster.py"), ...args], { encoding: "utf8", timeout: timeoutMs });
+  ].join("\n"), path.join("scripts", "usage-stats-poster.py"), ...args], { encoding: "utf8", env: { ...process.env, PYTHONUTF8: "1" }, timeout: timeoutMs });
 }
 
 test("poster reports a DeepSeek balance and local-session coverage without quota cards", async () => {
@@ -2201,7 +2273,7 @@ test("poster reports a DeepSeek balance and local-session coverage without quota
     `${JSON.stringify({ projects: {}, codex_accounts: { "deepseek-flash": home } }, null, 2)}\n`,
   );
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+  const result = await runPoster(workspace);
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const post = api.requests.find((request) => request.method === "POST");
   assert.ok(post);
@@ -2227,7 +2299,7 @@ test("poster reports a DeepSeek balance and local-session coverage without quota
   assert.equal(readState(workspace.stateDir).fixtures.codex.stdioInvocations.length, 0);
   assert.equal(fs.existsSync(sentinel), false, "poster must never execute config.toml auth commands");
 
-  const collected = await runScript(workspace, "scripts/usage-stats-poster.py", { args: ["--collect-only"] });
+  const collected = await runPoster(workspace, { args: ["--collect-only"] });
   assert.equal(collected.exitCode, 0, collected.stderr || collected.stdout);
   const snapshot = spawnSync(PYTHON, ["-c", [
     "import sqlite3, sys",
@@ -2235,8 +2307,14 @@ test("poster reports a DeepSeek balance and local-session coverage without quota
     "print(connection.execute('select payload_json from snapshots').fetchone()[0])",
   ].join("\n"), historyPath], { encoding: "utf8" });
   assert.equal(snapshot.status, 0, snapshot.stderr);
-  assert.doesNotMatch(snapshot.stdout, /Balance|12\.34/);
-  assert.doesNotMatch(snapshot.stdout, /deepseek-flash/);
+  if (WIN) {
+    // Windows only collects, so its snapshot keeps the balance for the merged view.
+    assert.match(snapshot.stdout, /"provider":"deepseek"/);
+    assert.match(snapshot.stdout, /12\.34/);
+  } else {
+    assert.doesNotMatch(snapshot.stdout, /Balance|12\.34/);
+    assert.doesNotMatch(snapshot.stdout, /deepseek-flash/);
+  }
   assert.doesNotMatch(snapshot.stdout, /sk-fixture-deepseek-key/);
 });
 
@@ -2259,7 +2337,7 @@ test("DeepSeek coverage reports unavailable without hiding the real balance", as
     `${JSON.stringify({ projects: {}, codex_accounts: { "deepseek-flash": home } }, null, 2)}\n`,
   );
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+  const result = await runPoster(workspace);
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const payload = JSON.parse(api.requests.find((request) => request.method === "POST").body);
   const codexField = payload.embeds[0].fields.find(({ name }) => name === "Codex");
@@ -2309,7 +2387,7 @@ test("DeepSeek key grouping issues one balance request per distinct key", async 
     }, null, 2)}\n`,
   );
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+  const result = await runPoster(workspace);
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const authorizations = balance.requests.map((request) => request.authorization).sort();
   assert.deepEqual(authorizations, ["Bearer sk-distinct-key-value", "Bearer sk-shared-key-value"]);
@@ -2372,7 +2450,7 @@ test("malformed or redirecting DeepSeek balance responses stay unavailable and u
       `${JSON.stringify({ projects: {}, codex_accounts: { "deepseek-flash": home } }, null, 2)}\n`,
     );
 
-    const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+    const result = await runPoster(workspace);
     assert.equal(result.exitCode, 0, `${testCase.name}: ${result.stderr || result.stdout}`);
     const payload = api.requests.find((request) => request.method === "POST");
     const codexField = JSON.parse(payload.body).embeds[0].fields.find(({ name }) => name === "Codex");
@@ -2388,54 +2466,75 @@ test("malformed or redirecting DeepSeek balance responses stay unavailable and u
 });
 
 test("DeepSeek home marker and private key are required and validated", () => {
+  const keyPrivacyCases = WIN
+    ? [
+      // On Windows a key is private by its DACL: mode bits mean nothing there.
+      "poster.subprocess.run(['icacls', str(loose / 'api-key'), '/grant', '*S-1-5-11:(R)'], check=True, capture_output=True)",
+      "print('loose', poster.read_deepseek_key(loose) is None)",
+      "shared = root / 'shared'",
+      "shared.mkdir()",
+      "(shared / 'ccdm-deepseek.json').write_text(json.dumps({'provider': 'deepseek', 'version': 1}))",
+      "(shared / 'api-key').write_text('sk-valid-key-value\\n')",
+      "print('unprotected_dir', poster.read_deepseek_key(shared) is None)",
+    ]
+    : [
+      "os.chmod(loose / 'api-key', 0o644)",
+      "print('loose', poster.read_deepseek_key(loose) is None)",
+      "foreign = root / 'foreign'",
+      "foreign.mkdir()",
+      "(foreign / 'ccdm-deepseek.json').write_text(json.dumps({'provider': 'deepseek', 'version': 1}))",
+      "(foreign / 'api-key').write_text('sk-valid-key-value\\n')",
+      "os.chmod(foreign / 'api-key', 0o600)",
+      "real_euid = os.geteuid()",
+      "poster.os.geteuid = lambda: real_euid + 4242",
+      "print('foreign_owner', poster.read_deepseek_key(foreign) is None)",
+      "poster.os.geteuid = lambda: real_euid",
+      "print('current_owner', poster.read_deepseek_key(foreign) == 'sk-valid-key-value')",
+      "linked = root / 'linked'",
+      "linked.mkdir()",
+      "(linked / 'ccdm-deepseek.json').write_text(json.dumps({'provider': 'deepseek', 'version': 1}))",
+      "(linked / 'real-key').write_text('sk-valid-key-value\\n')",
+      "os.chmod(linked / 'real-key', 0o600)",
+      "os.symlink(linked / 'real-key', linked / 'api-key')",
+      "print('symlink', poster.read_deepseek_key(linked) is None)",
+    ];
   const probe = probePoster([
     "import json, os, tempfile",
     "from pathlib import Path",
     "root = Path(tempfile.mkdtemp())",
     "exact = root / 'exact'",
     "exact.mkdir()",
+    "poster.ensure_private_dir(exact)",
     "(exact / 'ccdm-deepseek.json').write_text(json.dumps({'provider': 'deepseek', 'version': 1}))",
     "(exact / 'api-key').write_text('sk-valid-key-value\\n')",
     "os.chmod(exact / 'api-key', 0o600)",
     "print('exact', poster.is_deepseek_home(exact), poster.read_deepseek_key(exact) == 'sk-valid-key-value')",
     "wrong = root / 'wrong'",
     "wrong.mkdir()",
+    "poster.ensure_private_dir(wrong)",
     "(wrong / 'ccdm-deepseek.json').write_text(json.dumps({'provider': 'other', 'version': 1}))",
     "(wrong / 'api-key').write_text('sk-valid-key-value\\n')",
     "os.chmod(wrong / 'api-key', 0o600)",
     "print('wrong', poster.is_deepseek_home(wrong))",
     "loose = root / 'loose'",
     "loose.mkdir()",
+    "poster.ensure_private_dir(loose)",
     "(loose / 'ccdm-deepseek.json').write_text(json.dumps({'provider': 'deepseek', 'version': 1}))",
     "(loose / 'api-key').write_text('sk-valid-key-value\\n')",
-    "os.chmod(loose / 'api-key', 0o644)",
-    "print('loose', poster.read_deepseek_key(loose) is None)",
-    "foreign = root / 'foreign'",
-    "foreign.mkdir()",
-    "(foreign / 'ccdm-deepseek.json').write_text(json.dumps({'provider': 'deepseek', 'version': 1}))",
-    "(foreign / 'api-key').write_text('sk-valid-key-value\\n')",
-    "os.chmod(foreign / 'api-key', 0o600)",
-    "real_euid = os.geteuid()",
-    "poster.os.geteuid = lambda: real_euid + 4242",
-    "print('foreign_owner', poster.read_deepseek_key(foreign) is None)",
-    "poster.os.geteuid = lambda: real_euid",
-    "print('current_owner', poster.read_deepseek_key(foreign) == 'sk-valid-key-value')",
-    "linked = root / 'linked'",
-    "linked.mkdir()",
-    "(linked / 'ccdm-deepseek.json').write_text(json.dumps({'provider': 'deepseek', 'version': 1}))",
-    "(linked / 'real-key').write_text('sk-valid-key-value\\n')",
-    "os.chmod(linked / 'real-key', 0o600)",
-    "os.symlink(linked / 'real-key', linked / 'api-key')",
-    "print('symlink', poster.read_deepseek_key(linked) is None)",
+    ...keyPrivacyCases,
     "print('nokey', poster.read_deepseek_key(root / 'missing') is None)",
   ].join("\n"));
   assert.equal(probe.status, 0, probe.stderr || probe.stdout);
   assert.match(probe.stdout, /^exact True True$/m);
   assert.match(probe.stdout, /^wrong False$/m);
   assert.match(probe.stdout, /^loose True$/m);
-  assert.match(probe.stdout, /^foreign_owner True$/m);
-  assert.match(probe.stdout, /^current_owner True$/m);
-  assert.match(probe.stdout, /^symlink True$/m);
+  if (WIN) {
+    assert.match(probe.stdout, /^unprotected_dir True$/m);
+  } else {
+    assert.match(probe.stdout, /^foreign_owner True$/m);
+    assert.match(probe.stdout, /^current_owner True$/m);
+    assert.match(probe.stdout, /^symlink True$/m);
+  }
   assert.match(probe.stdout, /^nokey True$/m);
 });
 
@@ -2447,19 +2546,21 @@ test("DeepSeek credential reads never block on a FIFO", () => {
     "home = root / 'home'",
     "home.mkdir()",
     "(home / 'ccdm-deepseek.json').write_text(json.dumps({'version': 1, 'provider': 'deepseek'}))",
-    "os.mkfifo(home / 'api-key')",
+    "make_special = os.mkfifo if hasattr(os, 'mkfifo') else os.mkdir",
+    "remove_special = os.unlink if hasattr(os, 'mkfifo') else os.rmdir",
+    "make_special(home / 'api-key')",
     "start = time.monotonic()",
     "key = poster.read_deepseek_key(home)",
     "key_elapsed = time.monotonic() - start",
     "print('fifo_key', key is None, key_elapsed < 2.0)",
-    "os.unlink(home / 'api-key')",
+    "remove_special(home / 'api-key')",
     "os.unlink(home / 'ccdm-deepseek.json')",
-    "os.mkfifo(home / 'ccdm-deepseek.json')",
+    "make_special(home / 'ccdm-deepseek.json')",
     "start = time.monotonic()",
     "marker = poster.is_deepseek_home(home)",
     "marker_elapsed = time.monotonic() - start",
     "print('fifo_marker', marker is False, marker_elapsed < 2.0)",
-    "os.unlink(home / 'ccdm-deepseek.json')",
+    "remove_special(home / 'ccdm-deepseek.json')",
     "(home / 'ccdm-deepseek.json').write_text(json.dumps({'version': 1, 'provider': 'deepseek'}))",
     "print('marker_after', poster.is_deepseek_home(home))",
   ].join("\n"));
@@ -2505,6 +2606,7 @@ test("DeepSeek metric stays a codex display-only note and never shadows ordinary
     "root = Path(tempfile.mkdtemp())",
     "deepseek_home = root / 'deepseek'",
     "deepseek_home.mkdir()",
+    "poster.ensure_private_dir(deepseek_home)",
     "(deepseek_home / 'ccdm-deepseek.json').write_text(json.dumps({'version': 1, 'provider': 'deepseek'}))",
     "(deepseek_home / 'api-key').write_text('sk-unit-test-key\\n')",
     "os.chmod(deepseek_home / 'api-key', 0o600)",
@@ -2529,8 +2631,10 @@ test("DeepSeek metric stays a codex display-only note and never shadows ordinary
   ].join("\n"));
   assert.equal(probe.status, 0, probe.stderr || probe.stdout);
   assert.match(probe.stdout, /^shape codex True deepseek$/m);
-  assert.match(probe.stdout, /^cards \[\('work', 'Weekly', 42\.0\)\]$/m);
-  assert.match(probe.stdout, /^deepseek_card False$/m);
+  assert.match(probe.stdout, WIN
+    ? /^cards \[\('work', 'Weekly', 42\.0\), \('deepseek-flash', 'balance', None\)\]\r?$/m
+    : /^cards \[\('work', 'Weekly', 42\.0\)\]$/m);
+  assert.match(probe.stdout, WIN ? /^deepseek_card True\r?$/m : /^deepseek_card False$/m);
   assert.match(probe.stdout, /^note_title deepseek-flash · API$/m);
   assert.match(probe.stdout, /^first_line Balance: \*\*\$3\.50\*\*$/m);
 });
@@ -2653,6 +2757,7 @@ test("legacy get_codex_stats reports real DeepSeek balance instead of a placehol
     "root = Path(tempfile.mkdtemp())",
     "home = root / 'deepseek'",
     "home.mkdir()",
+    "poster.ensure_private_dir(home)",
     "(home / 'ccdm-deepseek.json').write_text(json.dumps({'version': 1, 'provider': 'deepseek'}))",
     "(home / 'api-key').write_text('sk-unit-test-key\\n')",
     "os.chmod(home / 'api-key', 0o600)",
@@ -2738,7 +2843,7 @@ test("scheduled poster posts a referenced DeepSeek block with the inline used-ba
     `${JSON.stringify({ projects: {}, codex_accounts: { "deepseek-flash": home } }, null, 2)}\n`,
   );
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+  const result = await runPoster(workspace, {
     args: ["--scheduled"],
     env: { CCDM_TEST_NOW: "2026-09-23T10:30:00Z", CCDM_USAGE_STATS_NOTIFY: "0" },
   });
@@ -2774,7 +2879,7 @@ test("scheduled poster never renders or attaches images even when the renderer i
   // Simulate a host without Pillow and without the trend renderer at all.
   fs.rmSync(path.join(workspace.repoDir, "scripts", "usage-dashboard-renderer.py"), { force: true });
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+  const result = await runPoster(workspace, {
     args: ["--scheduled"],
     env: { CCDM_TEST_NOW: "2026-09-23T10:30:00Z", CCDM_USAGE_STATS_NOTIFY: "0" },
   });
@@ -2806,6 +2911,7 @@ test("DeepSeek reference budget is per-group and omitted on a shared-key conflic
     "def mkhome(name, key):",
     "    home = root / name",
     "    home.mkdir()",
+    "    poster.ensure_private_dir(home)",
     "    (home / 'ccdm-deepseek.json').write_text(json.dumps({'version': 1, 'provider': 'deepseek'}))",
     "    (home / 'api-key').write_text(key + '\\n')",
     "    os.chmod(home / 'api-key', 0o600)",
@@ -2864,4 +2970,399 @@ test("DeepSeek block keeps amount-only output when the balance or local usage is
   assert.match(probe.stdout, /^no_usage This month: \*unavailable \(Local DeepSeek usage collector unavailable\)\*$/m);
   assert.match(probe.stdout, /^no_balance Balance: \*unavailable \(DeepSeek balance unavailable \(HTTP 401\)\)\*$/m);
   assert.match(probe.stdout, /^no_balance_usage This month: \*\*1\.3k tokens\*\* · 1 session · partial$/m);
+});
+
+// Claude credentials from .credentials.json: fixture homes only. The store override
+// lets these run on every OS; the Windows default is proven by the win32 cases.
+const FILE_STORE = { CCDM_CLAUDE_CREDENTIALS_STORE: "file" };
+
+function protectCredentialsDir(workspace, dir) {
+  fs.mkdirSync(dir, { recursive: true });
+  if (!WIN) return;
+  const sid = spawnSync(PYTHON, ["-c", "import sys; sys.path.insert(0, 'scripts'); from ccdmlib.platform.private_fs import current_user_sid; print(current_user_sid())"], { cwd: workspace.repoDir, encoding: "utf8" });
+  assert.equal(sid.status, 0, sid.stderr);
+  const icacls = spawnSync("icacls", [dir, "/inheritance:r", "/grant:r", `*${sid.stdout.trim()}:(OI)(CI)F`, "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"], { encoding: "utf8" });
+  assert.equal(icacls.status, 0, icacls.stdout);
+}
+
+function writeCredentialsFile(workspace, oauth, { name = ".claude", raw = null } = {}) {
+  const dir = path.join(workspace.homeDir, name);
+  protectCredentialsDir(workspace, dir);
+  const file = path.join(dir, ".credentials.json");
+  fs.writeFileSync(file, raw ?? JSON.stringify({ claudeAiOauth: oauth }));
+  return file;
+}
+
+function readSnapshot(historyPath) {
+  const probe = spawnSync(PYTHON, ["-c", [
+    "import sqlite3, sys",
+    "connection = sqlite3.connect(sys.argv[1])",
+    "print(connection.execute('select payload_json from snapshots').fetchone()[0])",
+  ].join("\n"), historyPath], { encoding: "utf8" });
+  assert.equal(probe.status, 0, probe.stderr);
+  return probe.stdout;
+}
+
+test("poster reads Claude limits from .credentials.json and leaves the file untouched", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  seedPosterWorkspace(workspace, api.baseUrl);
+  const file = writeCredentialsFile(workspace, { accessToken: "fixture-oauth-token", refreshToken: "fixture-refresh", expiresAt: Date.now() + 3_600_000 });
+  const before = fs.readFileSync(file);
+  const mtimeBefore = fs.statSync(file).mtimeMs;
+
+  const result = await runPoster(workspace, { env: FILE_STORE });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const claudeValue = JSON.parse(api.requests.find((request) => request.method === "POST").body).embeds[0].fields[0].value;
+  assert.match(claudeValue, /\*\*claude-p\*\* \(Pro\)/);
+  assert.match(claudeValue, /5-Hour:.*37%/);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.security.invocations, []);
+  assert.deepEqual(fs.readFileSync(file), before, ".credentials.json must not change");
+  assert.equal(fs.statSync(file).mtimeMs, mtimeBefore);
+  assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /fixture-(oauth-token|refresh)/);
+});
+
+test("poster has Claude Code refresh an expired .credentials.json once, then re-reads it", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  seedPosterWorkspace(workspace, api.baseUrl);
+  writeCredentialsFile(workspace, { accessToken: "fixture-stale", refreshToken: "fixture-refresh", expiresAt: Date.now() - 3_600_000 });
+  const configDir = path.join(workspace.homeDir, ".claude");
+  installNativeClaude(workspace, "2.1.293", {
+    credentialsFile: { dir: configDir, oauth: { accessToken: "fixture-oauth-token", refreshToken: "fixture-rotated", expiresAt: Date.now() + 3_600_000 } },
+  });
+
+  const result = await runPoster(workspace, { env: FILE_STORE });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const runs = nativeClaudeRuns(workspace);
+  assert.equal(runs.length, 1);
+  assert.deepEqual(runs[0].args.slice(0, 2), ["-p", "/usage"]);
+  assert.equal(runs[0].configDir, configDir);
+  assert.match(JSON.parse(api.requests.find((request) => request.method === "POST").body).embeds[0].fields[0].value, /5-Hour:.*37%/);
+  assert.ok(api.requests.every((request) => request.authorization !== "Bearer fixture-stale"));
+});
+
+test("a stale .credentials.json is skipped with a reason and never refreshed directly", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const historyPath = path.join(workspace.homeDir, "history", "history.sqlite3");
+  seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
+  writeCredentialsFile(workspace, { accessToken: "fixture-stale", refreshToken: "fixture-refresh", expiresAt: Date.now() - 3_600_000 });
+
+  const result = await runPoster(workspace, { args: ["--collect-only"], env: FILE_STORE });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stderr, /Claude limits skipped for claude-p: OAuth token expired/);
+  const snapshot = readSnapshot(historyPath);
+  assert.match(snapshot, /OAuth token expired/);
+  assert.equal(api.requests.length, 0, "a stale token must not reach Anthropic");
+});
+
+test("an unparsable .credentials.json is retried and then skipped with a reason", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const historyPath = path.join(workspace.homeDir, "history", "history.sqlite3");
+  seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
+  writeCredentialsFile(workspace, null, { raw: '{"claudeAiOauth": {"accessTo' });
+
+  const result = await runPoster(workspace, { args: ["--collect-only"], env: FILE_STORE });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stderr, /Claude limits skipped for claude-p: Claude credentials file could not be read/);
+  assert.match(readSnapshot(historyPath), /Claude credentials file could not be read/);
+  assert.equal(api.requests.length, 0);
+});
+
+test("a read that catches a half-written credentials file succeeds on the retry, with the handle closed in between", () => {
+  const workspace = createWorkspace();
+  const home = path.join(workspace.homeDir, ".claude-retry");
+  protectCredentialsDir(workspace, home);
+  const file = path.join(home, ".credentials.json");
+  fs.writeFileSync(file, '{"claudeAiOauth"');
+  const probe = probePoster([
+    "import json, os",
+    "from pathlib import Path",
+    "credentials = poster.claude_credentials",
+    "path = sys.argv[2]",
+    "sleeps = []",
+    "def sleep(seconds):",
+    "    sleeps.append(seconds)",
+    "    os.replace(path + '.new', path)",  // a rename over the file, as Claude Code saves it
+    "open(path + '.new', 'w').write(json.dumps({'claudeAiOauth': {'accessToken': 'fixture-token'}}))",
+    "credentials.time.sleep = sleep",
+    "result = credentials.read_credentials_file(Path(path).parent)",
+    "print('token', result.oauth['accessToken'], result.reason)",
+    "print('retries', len(sleeps))",
+  ].join("\n"), file);
+  assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+  assert.match(probe.stdout, /^token fixture-token None$/m);
+  assert.match(probe.stdout, /^retries 1$/m);
+});
+
+test("the credentials reader honours CLAUDE_SECURESTORAGE_CONFIG_DIR and treats a missing file as no login", () => {
+  const workspace = createWorkspace();
+  const secure = path.join(workspace.homeDir, "secure-store");
+  protectCredentialsDir(workspace, secure);
+  fs.writeFileSync(path.join(secure, ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "fixture-secure-token" } }));
+  const probe = spawnSync(PYTHON, ["-c", [
+    "import importlib.util, sys",
+    "from pathlib import Path",
+    "sys.path.insert(0, 'scripts')",
+    "from ccdmlib.platform import credentials",
+    "print('found', credentials.read_credentials_file(Path(sys.argv[1])).oauth['accessToken'])",
+    "import os",
+    "del os.environ['CLAUDE_SECURESTORAGE_CONFIG_DIR']",
+    "missing = credentials.read_credentials_file(Path(sys.argv[1]))",
+    "print('missing', missing.oauth, missing.reason)",
+  ].join("\n"), path.join(workspace.homeDir, ".claude-no-file")], {
+    encoding: "utf8",
+    env: { ...process.env, CLAUDE_SECURESTORAGE_CONFIG_DIR: secure, CCDM_CLAUDE_CREDENTIALS_STORE: "file" },
+  });
+  assert.equal(probe.status, 0, probe.stderr);
+  assert.match(probe.stdout, /^found fixture-secure-token$/m);
+  assert.match(probe.stdout, /^missing None None$/m);
+});
+
+test("a config without discord_channel_id is refused where the poster posts", () => {
+  const probe = probePoster([
+    "poster.COLLECT_ONLY_PLATFORM = False",
+    "try:",
+    "    poster.parse_config({})",
+    "except poster.PosterError as error:",
+    "    print(error)",
+  ].join("\n"));
+  assert.equal(probe.status, 0, probe.stderr);
+  assert.equal(probe.stdout.trim(), "poster config requires discord_channel_id");
+});
+
+test("Windows refuses every posting invocation before reading the bot token", WINDOWS_ONLY, async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  seedPosterWorkspace(workspace, api.baseUrl);
+  fs.rmSync(path.join(workspace.homeDir, ".claude", "channels", "discord", ".env"));
+
+  for (const options of [
+    { args: [] },
+    { args: ["--scheduled"] },
+    { args: ["--post-now"] },
+    { args: [], env: { CCDM_USAGE_STATS_AUTOMATED: "1" } },
+  ]) {
+    const result = await runScript(workspace, POSTER, options);
+    assert.equal(result.exitCode, 2, JSON.stringify(options));
+    assert.match(result.stderr, /Windows collects usage only; run with --collect-only/);
+  }
+  assert.deepEqual(api.requests, []);
+});
+
+function icaclsGrant(target, entry) {
+  const result = spawnSync("icacls", [target, "/grant", entry], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stdout);
+}
+
+test("the credential gate accepts the expected entries, refuses other writers and warns about other readers", WINDOWS_ONLY, async () => {
+  const oauth = { accessToken: "fixture-oauth-token", expiresAt: Date.now() + 3_600_000 };
+
+  const clean = createWorkspace();
+  const cleanApi = await startPosterApi();
+  seedPosterWorkspace(clean, cleanApi.baseUrl, { history_db_path: path.join(clean.homeDir, "history", "h.sqlite3") });
+  writeCredentialsFile(clean, oauth);
+  const accepted = await runScript(clean, POSTER, { args: ["--collect-only"], env: { CCDM_CODEX_PATH: path.join(clean.fixtureDir, "codex.exe") } });
+  assert.equal(accepted.exitCode, 0, accepted.stderr || accepted.stdout);
+  assert.doesNotMatch(accepted.stderr, /Warning/);
+  assert.ok(cleanApi.requests.some((request) => request.authorization === "Bearer fixture-oauth-token"));
+
+  const writable = createWorkspace();
+  const writableApi = await startPosterApi();
+  seedPosterWorkspace(writable, writableApi.baseUrl, { history_db_path: path.join(writable.homeDir, "history", "h.sqlite3") });
+  const writableFile = writeCredentialsFile(writable, oauth);
+  icaclsGrant(writableFile, "*S-1-5-11:(M)");
+  const refused = await runScript(writable, POSTER, { args: ["--collect-only"], env: { CCDM_CODEX_PATH: path.join(writable.fixtureDir, "codex.exe") } });
+  assert.equal(refused.exitCode, 0, refused.stderr || refused.stdout);
+  assert.match(refused.stderr, /can be changed by S-1-5-11/);
+  assert.match(refused.stderr, /icacls ".*\.credentials\.json" \/remove:g \*S-1-5-11/);
+  assert.equal(writableApi.requests.length, 0, "a refused credentials file must not be used");
+  assert.match(readSnapshot(path.join(writable.homeDir, "history", "h.sqlite3")), /can be changed by another account/);
+
+  const readable = createWorkspace();
+  const readableApi = await startPosterApi();
+  seedPosterWorkspace(readable, readableApi.baseUrl, { history_db_path: path.join(readable.homeDir, "history", "h.sqlite3") });
+  const readableFile = writeCredentialsFile(readable, oauth);
+  icaclsGrant(readableFile, "*S-1-5-11:(R)");
+  const warned = await runScript(readable, POSTER, { args: ["--collect-only"], env: { CCDM_CODEX_PATH: path.join(readable.fixtureDir, "codex.exe") } });
+  assert.equal(warned.exitCode, 0, warned.stderr || warned.stdout);
+  assert.match(warned.stderr, /Warning: .*can be read by S-1-5-11/);
+  assert.ok(readableApi.requests.some((request) => request.authorization === "Bearer fixture-oauth-token"));
+});
+
+test("the credential gate tells an inherited entry to be removed at the folder", WINDOWS_ONLY, async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: path.join(workspace.homeDir, "history", "h.sqlite3") });
+  const claudeDir = path.join(workspace.homeDir, ".claude");
+  protectCredentialsDir(workspace, claudeDir);
+  icaclsGrant(claudeDir, "*S-1-5-11:(OI)(R)");
+  fs.writeFileSync(path.join(claudeDir, ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "fixture-oauth-token", expiresAt: Date.now() + 3_600_000 } }));
+
+  const result = await runScript(workspace, POSTER, { args: ["--collect-only"], env: { CCDM_CODEX_PATH: path.join(workspace.fixtureDir, "codex.exe") } });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stderr, /can be read by S-1-5-11; to stop that, run icacls ".*\.claude" \/inheritance:d && icacls ".*\.claude" \/remove:g \*S-1-5-11/);
+  assert.ok(api.requests.some((request) => request.authorization === "Bearer fixture-oauth-token"));
+});
+
+test("the credentials reader opens with share-delete and holds no handle afterwards", WINDOWS_ONLY, () => {
+  const workspace = createWorkspace();
+  const file = path.join(workspace.homeDir, "held.json");
+  const replacement = `${file}.new`;
+  fs.writeFileSync(file, "old");
+  fs.writeFileSync(replacement, "new");
+  const probe = spawnSync(PYTHON, ["-c", [
+    "import os, sys",
+    "sys.path.insert(0, 'scripts')",
+    "from ccdmlib.platform import credentials",
+    "descriptor = credentials._open_shared(sys.argv[1])",
+    "os.unlink(sys.argv[1])",  // only a share-delete handle allows this while open
+    "os.close(descriptor)",
+    "os.replace(sys.argv[2], sys.argv[1])",
+    "data = credentials._read_bytes(sys.argv[1])",
+    "os.replace(sys.argv[1], sys.argv[2])",  // no handle is left open by the read
+    "print('replaced', data.decode())",
+  ].join("\n"), file, replacement], { encoding: "utf8" });
+  assert.equal(probe.status, 0, probe.stderr);
+  assert.match(probe.stdout, /^replaced new$/m);
+});
+
+test("Windows --collect-only records Claude, Codex and DeepSeek under the state root and sends nothing to Discord", WINDOWS_ONLY, async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const balance = await startDeepseekBalanceApi();
+  const stateRoot = path.join(workspace.homeDir, "state-root");
+  const codexHome = path.join(workspace.homeDir, ".codex-collect");
+  fs.mkdirSync(codexHome);
+  const deepseekHome = path.join(workspace.homeDir, ".codex-deepseek");
+  const catalog = path.join(workspace.tmpDir, "catalog.json");
+  fs.writeFileSync(catalog, JSON.stringify({ models: [{
+    slug: "deepseek-flash", use_responses_lite: false, supports_reasoning_summaries: true,
+    tool_mode: null, shell_type: "shell_command", apply_patch_tool_type: "freeform",
+    input_modalities: ["text", "image"], supported_reasoning_levels: [{ effort: "high" }],
+  }] }));
+  const setup = await runScript(workspace, "scripts/setup-codex-deepseek.py", {
+    args: ["--home", deepseekHome, "--catalog-file", catalog],
+    env: { DEEPSEEK_API_KEY: "sk-fixture-deepseek-key" },
+  });
+  assert.equal(setup.exitCode, 0, setup.stderr || setup.stdout);
+  writeCredentialsFile(workspace, { accessToken: "fixture-oauth-token", expiresAt: Date.now() + 3_600_000 });
+  fs.writeFileSync(path.join(workspace.repoDir, ".usage-stats-poster.json"), `${JSON.stringify({
+    anthropic_base_url: api.baseUrl,
+    discord_base_url: api.baseUrl,
+    deepseek_base_url: balance.baseUrl,
+  })}\n`);
+  fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), `${JSON.stringify({
+    projects: {},
+    codex_accounts: { "codex-collect": codexHome, "deepseek-flash": deepseekHome },
+    default_codex_account: "codex-collect",
+  })}\n`);
+  const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
+  fs.writeFileSync(responsesPath, `${JSON.stringify({
+    [fs.realpathSync(codexHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 12 }, secondary: { usedPercent: 34 } } },
+  })}\n`);
+
+  const result = await runScript(workspace, POSTER, {
+    args: ["--collect-only"],
+    env: {
+      CCDM_CODEX_PATH: path.join(workspace.fixtureDir, "codex.exe"),
+      CCDM_STATE_ROOT: stateRoot,
+      CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath,
+    },
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /Collected usage snapshot/);
+  const historyPath = path.join(stateRoot, "usage-stats", "history.sqlite3");
+  assert.equal(fs.existsSync(historyPath), true);
+  assertPrivate(path.dirname(historyPath));
+  const cards = JSON.parse(readSnapshot(historyPath)).cards;
+  assert.ok(cards.some((card) => card.provider === "claude" && card.window === "5-hour" && card.used_percent === 37));
+  assert.ok(cards.some((card) => card.provider === "codex" && card.account === "codex-collect" && card.used_percent === 34));
+  const deepseek = cards.find((card) => card.provider === "deepseek");
+  assert.equal(deepseek?.account, "deepseek-flash");
+  assert.equal(deepseek?.available, true, JSON.stringify(deepseek));
+  assert.equal(deepseek.balances[0].total, "12.34");
+  assert.equal(balance.requests[0].authorization, "Bearer sk-fixture-deepseek-key");
+  assert.ok(!api.requests.some((request) => request.method === "POST" || request.path.includes("/channels/")));
+  assert.doesNotMatch(readSnapshot(historyPath), /sk-fixture-deepseek-key|fixture-oauth-token/);
+});
+
+test("the Claude client version comes from claude --version on Windows", WINDOWS_ONLY, async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi({ resetGrants: { eligible: true, grants: [{ id: "launch", resets_left: 1, paused: false }] } });
+  seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: path.join(workspace.homeDir, "history", "h.sqlite3") });
+  writeCredentialsFile(workspace, { accessToken: "fixture-oauth-token", expiresAt: Date.now() + 3_600_000 });
+  installNativeClaude(workspace, "2.1.293");
+
+  const result = await runScript(workspace, POSTER, { args: ["--collect-only"], env: { CCDM_CODEX_PATH: path.join(workspace.fixtureDir, "codex.exe") } });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const usage = api.requests.find((request) => request.path === "/api/oauth/usage?cedar_ember=1");
+  assert.equal(usage?.userAgent, "claude-cli/2.1.293 (external, cli)");
+});
+
+test("a hung Codex app-server is stopped at the deadline with its whole tree", WINDOWS_ONLY, async () => {
+  const workspace = createWorkspace();
+  const pidFile = path.join(workspace.tmpDir, "hung-pids.json");
+  const hung = path.join(workspace.tmpDir, "hung-codex.cjs");
+  fs.writeFileSync(hung, `const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+fs.writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify([process.pid, child.pid]));
+setInterval(() => {}, 1000);
+`);
+  const launcher = path.join(workspace.tmpDir, "hung-codex.exe");
+  fs.copyFileSync(fixtureLauncher(), launcher);
+  fs.writeFileSync(path.join(workspace.tmpDir, "hung-codex.shim"), `${process.execPath}\n${hung}\n`);
+  const codexHome = path.join(workspace.homeDir, ".codex-hung");
+  fs.mkdirSync(codexHome);
+  const probeFile = "hung-codex-probe.py";
+  fs.writeFileSync(path.join(workspace.repoDir, probeFile), [
+    "import importlib.util, sys, time",
+    "from pathlib import Path",
+    "spec = importlib.util.spec_from_file_location('poster', Path(__file__).parent / 'scripts' / 'usage-stats-poster.py')",
+    "poster = importlib.util.module_from_spec(spec); spec.loader.exec_module(poster)",
+    "poster.CODEX_REQUEST_TIMEOUT_SECONDS = 2",
+    "started = time.monotonic()",
+    "result = poster.read_codex_rate_limits(Path(sys.argv[1]))",
+    "print('result', result, round(time.monotonic() - started) <= 12)",
+  ].join("\n"));
+
+  const result = await runScript(workspace, probeFile, { args: [codexHome], env: { CCDM_CODEX_PATH: launcher } });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /^result None True$/m);
+  const pids = JSON.parse(fs.readFileSync(pidFile, "utf8"));
+  assert.equal(pids.length, 2);
+  const stillRunning = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const deadline = Date.now() + 5000;
+  while (pids.some(stillRunning) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(pids.filter(stillRunning), [], "the hung app-server and its child must be gone");
+});
+
+test("osascript is never called on Windows", WINDOWS_ONLY, () => {
+  const probe = probePoster([
+    "from datetime import datetime, timezone",
+    "import sqlite3, tempfile",
+    "from pathlib import Path",
+    "root = Path(tempfile.mkdtemp())",
+    "poster.ensure_private_dir(root)",
+    "store = poster.HistoryStore(root / 'history.sqlite3')",
+    "poster.HISTORY_WARNING_BYTES = 0",
+    "calls = []",
+    "poster.subprocess.run = lambda *args, **kwargs: calls.append(args)",
+    "with store.locked() as connection:",
+    "    store.maybe_warn_size(connection, datetime.now(timezone.utc))",
+    "print('calls', len(calls))",
+  ].join("\n"));
+  assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+  assert.match(probe.stdout, /^calls 0$/m);
 });
