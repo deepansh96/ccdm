@@ -19,6 +19,7 @@ const { runDetached } = require("./detached.js");
 const { sessionEnvironment } = require("./env.js");
 const { createEvents } = require("./events.js");
 const { createSessionJob, jobPolicyProblem } = require("./jobs.js");
+const { keepAwakeFromEnv } = require("./power.js");
 const { startConsole } = require("./pty.js");
 const {
   ERRORS, HostError, KINDS, MAX_FRAME, MAX_HELLO_FRAME, MISMATCH_MESSAGE, PROTOCOL_VERSION,
@@ -87,7 +88,7 @@ function closeAfterFlush(socket) {
   setTimeout(() => socket.destroy(), REJECT_FLUSH_MS);
 }
 
-function createHost({ hostDir, env = process.env, log = () => {} }) {
+function createHost({ hostDir, env = process.env, log = () => {}, keepAwake = null }) {
   // name -> session. An ended session stays until a new one takes its name, so
   // its output can still be read; `released` marks one that kill-session removed.
   const sessions = new Map();
@@ -98,9 +99,12 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
 
   const journalPath = path.join(hostDir, "sessions.json");
 
+  // Runs at every change to the set of live sessions, so the keep-awake count
+  // follows the same moments as the journal.
   function writeJournal() {
     const live = [...sessions.values()].filter(session => session.exit === null && !session.released)
       .map(({ name, kind, pid, startedAt, created, pty, log: logFile }) => ({ name, kind, pid, startedAt, created, pty, log: logFile }));
+    keepAwake?.update(live);
     writeFileAtomicSync(journalPath, `${JSON.stringify({ version: 1, sessions: live }, null, 2)}\n`);
   }
 
@@ -457,6 +461,7 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
       log(`stopping: ${reason}`);
       await Promise.all(live().map(session => killSession(session).catch(() => {})));
       writeJournal();
+      keepAwake?.close();
       try {
         listener?.close();
       } catch { /* It may already be closed. */ }
@@ -480,7 +485,7 @@ async function serve({ allowInJob = false } = {}) {
   }
   const hostDir = path.join(stateRoot(), "host");
   const log = line => process.stdout.write(`ccdm-host: ${line}\n`);
-  const host = createHost({ hostDir, log });
+  const host = createHost({ hostDir, log, keepAwake: keepAwakeFromEnv(process.env, log) });
   try {
     await host.start();
   } catch (error) {
