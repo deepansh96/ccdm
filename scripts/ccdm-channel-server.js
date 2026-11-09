@@ -44,8 +44,7 @@
 // Router `command` events run here, never as a Claude turn: /compact and
 // /clear are typed into this session's own terminal through
 // `ccdm send-claude-command`, /pause queues inbound events until /unpause, and
-// /restart relaunches this project (never root) through stop-session.sh and
-// start-session.sh.
+// /restart relaunches this project (never root) through `ccdm restart-session`.
 //
 // Conversation Reminder events are recorded here through the reminder
 // adapter module (owner interactions, delivered replies, input requests, and
@@ -53,7 +52,7 @@
 // capability marker `<reminder state>/capabilities/<project>.json` proves this
 // live process only: it is written after the Router hello and removed when
 // this process exits or its Router session ends.
-const { execFile, spawn } = require("node:child_process");
+const { execFile } = require("node:child_process");
 const { readFileSync, rmSync } = require("node:fs");
 const { readFile, rm, stat, writeFile } = require("node:fs/promises");
 const os = require("node:os");
@@ -65,6 +64,7 @@ const { stateRoot } = require("./platform/paths.js");
 const { onShutdown, processStartTime } = require("./platform/process.js");
 const { ensurePrivateDir, isPrivateFile } = require("./platform/privacy.js");
 const { pythonInvocation } = require("./platform/tools.js");
+const { scheduleProjectRestart } = require("./lib/restart-helper.js");
 const sessionHost = require("./lib/session-host.js");
 const reminder = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
@@ -486,10 +486,6 @@ function bootstrapNotification(bootstrap) {
   };
 }
 
-function shellQuote(value) {
-  return `'${String(value).replace(/'/g, "'\\''")}'`;
-}
-
 // This thread's own session. The suffix keeps a name inherited from elsewhere, such
 // as the project's session, from receiving the thread's command.
 function ownThreadSession() {
@@ -513,24 +509,6 @@ function relayClaudeCommand(project, command) {
       else resolve(stdout);
     });
   });
-}
-
-// Stopping the session kills this process tree, so the restart runs in a
-// backgrounded subshell that the launching shell leaves behind.
-function scheduleRestart(project) {
-  const logPath = path.join(os.tmpdir(), `ccdm-restart-${project.replace(/[^a-zA-Z0-9._-]/g, "_")}.log`);
-  const steps = [
-    `cd ${shellQuote(ROOT_DIR)}`,
-    `./scripts/stop-session.sh ${shellQuote(project)}`,
-    `./scripts/start-session.sh ${shellQuote(project)}`,
-  ].join(" && ");
-  // This chain has left the session. With the session's name, stop-session would
-  // hand off to another process and start-session would find the old session live.
-  const env = { ...process.env };
-  delete env.CCDM_SESSION_NAME;
-  const child = spawn("/bin/sh", ["-c", `(${steps}) >> ${shellQuote(logPath)} 2>&1 &`], { detached: true, env, stdio: "ignore" });
-  child.unref();
-  return logPath;
 }
 
 // Reminder events are recorded in arrival order, after any stranded outbox.
@@ -667,8 +645,13 @@ function main() {
     restart: async event => {
       await react(event, "🔄");
       await say(event, "Restarting session — fresh session coming up.");
-      const logPath = scheduleRestart(project);
-      process.stderr.write(`ccdm channel: restart scheduled for '${project}'; log: ${logPath}\n`);
+      try {
+        // Stopping the session ends this process, so the helper runs outside it.
+        const logPath = await scheduleProjectRestart(project);
+        process.stderr.write(`ccdm channel: restart scheduled for '${project}'; log: ${logPath}\n`);
+      } catch (error) {
+        await say(event, `**Error:** Failed to restart — ${error.message}`);
+      }
     },
   };
   async function relayAcknowledged(event, name) {

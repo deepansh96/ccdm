@@ -22,6 +22,7 @@ from . import _launch
 
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
 _SHIM_ARGV0 = "CCDM_SHIM_ARGV0"  # Set by scripts/start-session.sh: its own $0, for the usage line.
+_HOST_VARIABLES = ("CCDM_STATE_ROOT", "CCDM_SESSION_HOST", "CCDM_HOST_SOCKET")
 _USAGE_ARGUMENTS = "<project_name> [--resume <session_id>]"
 
 
@@ -187,6 +188,9 @@ def _session_env(claude: Sequence[Any], project: _Project, launch: _Launch, remi
     elif session_host.backend_name() != "tmux" and os.environ.get("CLAUDE_CONFIG_DIR"):
         # ccdm-host builds the session's environment from nothing but this.
         env["CLAUDE_CONFIG_DIR"] = os.environ["CLAUDE_CONFIG_DIR"]
+    if session_host.backend_name() != "tmux":
+        # The session's channel server finds this same host for /restart and the relay.
+        env.update({name: os.environ[name] for name in _HOST_VARIABLES if os.environ.get(name)})
     env.update(claude[2])
     return env
 
