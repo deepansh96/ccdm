@@ -9,6 +9,9 @@ this file changes. A service module defines:
     TEMPLATE = "router.task.xml.in"        # in scripts/win/
     def plan(context) -> Plan              # may raise ServiceError
     def before_uninstall(context) -> None  # optional, runs before the stop file
+    ACCEPTS_OPTIONS = True                 # optional; `context.options` holds the
+                                           # words after the name, refused otherwise
+    def register(subparsers) -> None       # optional, for a subcommand of its own
 
 macOS and Linux keep their ``.sh`` installers, which ``install-service`` runs.
 
@@ -90,13 +93,19 @@ class Plan(NamedTuple):
     env: Dict[str, str]
     allowed_env: FrozenSet[str]
     private_dirs: List[str]
+    # False for a task that runs on its own schedule through `service-host.js --once`:
+    # it is not started by the installer and picks its own triggers.
+    supervised: bool = True
+    # More __PLACEHOLDER__ values for this service's template.
+    template_values: Optional[Dict[str, str]] = None
 
 
 class Context:
     """One service's names and paths."""
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, options: Sequence[str] = ()) -> None:
         self.name = name
+        self.options = list(options)
         self.task = f"\\CCDM\\{SERVICE_TASKS[name]}"
         self.state_root = state_root()
         self.service_dir = self.state_root / "services"
@@ -344,6 +353,7 @@ def _render(context: Context, plan: Plan, template: str) -> str:
         "__SERVICE_HOST__": str(WIN_DIR / "service-host.js"),
         "__CONFIG__": str(context.config),
         "__WORKING_DIR__": plan.cwd,
+        **(plan.template_values or {}),
     }
     rendered = (WIN_DIR / template).read_text(encoding="utf-8")
     if set(_PLACEHOLDER.findall(rendered)) - set(values):
@@ -373,10 +383,6 @@ def _validate(context: Context, plan: Plan, rendered: str) -> None:
 
     checks = {
         "the task name": text("t:RegistrationInfo/t:URI") == context.task,
-        "a logon trigger naming the current user":
-            bool(text("t:Triggers/t:LogonTrigger/t:UserId"))
-            and text("t:Triggers/t:LogonTrigger/t:UserId") == text("t:Principals/t:Principal/t:UserId"),
-        "a 5-minute watchdog trigger": text("t:Triggers/t:TimeTrigger/t:Repetition/t:Interval") == "PT5M",
         "an interactive token": text("t:Principals/t:Principal/t:LogonType") == "InteractiveToken",
         "no time limit": text("t:Settings/t:ExecutionTimeLimit") == "PT0S",
         "no stop on battery": text("t:Settings/t:StopIfGoingOnBatteries") == "false"
@@ -384,6 +390,12 @@ def _validate(context: Context, plan: Plan, rendered: str) -> None:
         "no second instance": text("t:Settings/t:MultipleInstancesPolicy") == "IgnoreNew",
         "a headless conhost": (text("t:Actions/t:Exec/t:Command") or "").lower().endswith("conhost.exe"),
     }
+    if plan.supervised:
+        checks["a logon trigger naming the current user"] = (
+            bool(text("t:Triggers/t:LogonTrigger/t:UserId"))
+            and text("t:Triggers/t:LogonTrigger/t:UserId") == text("t:Principals/t:Principal/t:UserId")
+        )
+        checks["a 5-minute watchdog trigger"] = text("t:Triggers/t:TimeTrigger/t:Repetition/t:Interval") == "PT5M"
     arguments = text("t:Actions/t:Exec/t:Arguments") or ""
     checks["the service host"] = arguments.startswith(f'--headless "{plan.node}" ') and str(context.config) in arguments
     missing = [what for what, ok in checks.items() if not ok]
@@ -434,11 +446,13 @@ def _restore(context: Context, prior_xml: Optional[str], prior_config: Optional[
     return restored
 
 
-def _install_windows(name: str) -> int:
+def _install_windows(name: str, options: Sequence[str]) -> int:
     module = _module_for(name)
     if module is None:
         return _not_available(name)
-    context = Context(name)
+    if options and not getattr(module, "ACCEPTS_OPTIONS", False):
+        raise ServiceError(2, f"ccdm: install-service {name} takes no options: {' '.join(options)}")
+    context = Context(name, options)
     plan: Plan = module.plan(context)
     rendered = _render(context, plan, module.TEMPLATE)
     _validate(context, plan, rendered)
@@ -465,6 +479,11 @@ def _install_windows(name: str) -> int:
     context.candidate.unlink(missing_ok=True)
     context.disabled.unlink(missing_ok=True)
     context.stop_file.unlink(missing_ok=True)
+    if not plan.supervised:
+        print(f"Task {context.task} installed")
+        print(f"Standard output log: {context.log}")
+        print(f"Standard error log: {context.err}")
+        return 0
     started_at = time.time()
     started = _schtasks("/run", "/tn", context.task)
     if started.returncode != 0:
@@ -510,7 +529,7 @@ def _describe(context: Context) -> str:
         return "not installed"
     state = _read_state(context)
     if state is None:
-        return f"installed, not started (task {context.task})"
+        return f"installed (task {context.task})"
     recorded = state.get("state")
     if recorded != "disabled" and not _host_alive(context):
         return f"stopped (last state {recorded}, task {context.task})"
@@ -565,11 +584,11 @@ def install_service(args: argparse.Namespace) -> int:
     if not _known(args.name):
         return 2
     if WIN32:
-        return _handle(lambda: _install_windows(args.name))
+        return _handle(lambda: _install_windows(args.name, args.options))
     installer = _POSIX_INSTALLERS.get(args.name)
     if installer is None:
         return _not_available(args.name)
-    return subprocess.call([str(SCRIPTS_DIR / installer)])
+    return subprocess.call([str(SCRIPTS_DIR / installer), *args.options])
 
 
 def uninstall_service(args: argparse.Namespace) -> int:
@@ -591,6 +610,8 @@ def service_status(args: argparse.Namespace) -> int:
 def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
     install = subparsers.add_parser("install-service", help="install a CCDM background service and start it")
     install.add_argument("name", metavar="<name>")
+    install.add_argument("options", metavar="[options]", nargs=argparse.REMAINDER,
+                         help="passed to the service's installer")
     install.set_defaults(func=install_service)
     uninstall = subparsers.add_parser("uninstall-service", help="stop and remove a CCDM background service (Windows)")
     uninstall.add_argument("name", metavar="<name>")
@@ -598,3 +619,10 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
     status = subparsers.add_parser("service-status", help="show the installed CCDM background services (Windows)")
     status.add_argument("name", metavar="<name>", nargs="?", default=None)
     status.set_defaults(func=service_status)
+    for name in SERVICE_TASKS:
+        try:
+            module = _module_for(name)
+            if module is not None and callable(getattr(module, "register", None)):
+                module.register(subparsers)
+        except Exception as error:  # One broken service must not take away the others.
+            print(f"ccdm: skipping service module {name}: {error!r}", file=sys.stderr)

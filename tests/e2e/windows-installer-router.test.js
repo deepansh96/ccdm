@@ -419,6 +419,58 @@ test("--once runs the command once with the same logging and returns its exit co
   assert.equal(fs.existsSync(serviceFile(workspace, ".disabled")), false);
 });
 
+test("a service that takes no options refuses them before any schtasks call", onlyWindows, async () => {
+  const workspace = createRouterWorkspace();
+  protectTokenDir(workspace);
+
+  const result = await ccdm(workspace, ["install-service", "router", "--interval", "600"]);
+
+  assert.equal(result.exitCode, 2, result.stderr || result.stdout);
+  assert.match(result.stderr, /takes no options/);
+  assert.deepEqual(invocations(workspace), []);
+});
+
+test("a later service adds only its module and template: options, template values, no start, its own subcommand", onlyWindows, async () => {
+  const workspace = createRouterWorkspace();
+  const winDir = path.join(workspace.repoDir, "scripts", "win");
+  const template = fs.readFileSync(path.join(winDir, "router.task.xml.in"), "utf8")
+    .replace(/<LogonTrigger>[\s\S]*?<\/LogonTrigger>\s*/, "")
+    .replace("<Interval>PT5M</Interval>", "<Interval>__INTERVAL__</Interval>");
+  fs.writeFileSync(path.join(winDir, "usage-poster.task.xml.in"), template);
+  fs.writeFileSync(path.join(workspace.repoDir, "scripts/ccdmlib/cli/services/usage_poster.py"), `
+from . import ROOT_DIR, Plan, require_node
+
+TEMPLATE = "usage-poster.task.xml.in"
+ACCEPTS_OPTIONS = True
+
+
+def plan(context):
+    node = require_node()
+    return Plan(node=node, command=[node, "-e", "0"], cwd=str(ROOT_DIR), env={"PATH": "x"},
+                allowed_env=frozenset(("PATH",)), private_dirs=[], supervised=False,
+                template_values={"__INTERVAL__": context.options[1]})
+
+
+def hidden(_args):
+    print("hidden-ran")
+    return 0
+
+
+def register(subparsers):
+    subparsers.add_parser("fixture-hidden").set_defaults(func=hidden)
+`);
+
+  const result = await ccdm(workspace, ["install-service", "usage-poster", "--interval", "PT10M"]);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const name = "\\CCDM\\UsagePoster";
+  assert.match(readState(workspace.stateDir).fixtures.schtasks.definitions[name], /<Interval>PT10M<\/Interval>/);
+  assert.equal(verbs(workspace).includes("/run"), false, "a scheduled task is not started at install");
+  const hidden = await ccdm(workspace, ["fixture-hidden"]);
+  assert.equal(hidden.exitCode, 0, hidden.stderr);
+  assert.match(hidden.stdout, /hidden-ran/);
+});
+
 test("install-service for a known service without a module exits 2 with 'not available yet'", async () => {
   const workspace = createRouterWorkspace();
 
