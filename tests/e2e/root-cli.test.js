@@ -336,7 +336,7 @@ test("reminders assignment-changed runs the script with the resolved Python and 
   const seen = JSON.parse(result.stdout.trim());
   assert.deepEqual(seen.argv, ["assignment-changed", "--project", "alpha"]);
   if (WIN) assert.equal(fs.realpathSync(seen.python).toLowerCase(), fs.realpathSync(PYTHON).toLowerCase());
-  else assert.equal(fs.readFileSync(wrapperLog, "utf8").trim().split("\n").at(-1), service);
+  else assert.equal(fs.readFileSync(wrapperLog, "utf8").trim().split("\n").at(-1), fs.realpathSync(service));
 });
 
 test("on Windows, the pinned RELAY_INSTRUCTIONS command types /foo and then Enter into the caller's own session", onlyWindows, async () => {
