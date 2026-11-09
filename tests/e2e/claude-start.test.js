@@ -7,7 +7,7 @@ import test from "node:test";
 import { PYTHON, assertPrivate, platformGate } from "./support/platform.js";
 import { createWorkspace, runScript } from "./support/runner.js";
 import { OWNER_ID, createRouterWorkspace, routerEnv, routerWithWebhooks, runRouterCli } from "./support/router.js";
-import { startFakeHost } from "./support/session-fixture.js";
+import { AUTO_MODE_OFFER, startFakeHost } from "./support/session-fixture.js";
 import { readState, seedFixtureProcess, seedRegistry, seedTmuxSession, updateState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 
@@ -601,6 +601,20 @@ for (const backend of BACKENDS) {
 
     assert.equal(result.exitCode, 0, result.stderr || result.stdout);
     assert.match(result.stdout, /Channel server connected to the Router/);
+    assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session.sendKeys, [["Escape"], ["Enter"]]);
+  });
+
+  test(`${backend}: an auto-mode offer still on screen after Esc does not get a second Esc`, async () => {
+    const workspace = seededWorkspace();
+    const projectPath = readRegistry(workspace).projects.alpha.path;
+    seedTmuxSession("alpha_session", { paneOutput: AUTO_MODE_OFFER }, { stateDir: workspace.stateDir });
+
+    const run = await runAcceptDialogs(workspace, "alpha_session", projectPath, projectPath, { backend, timeout: 10 });
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    updateState(workspace.stateDir, (state) => { state.fixtures.tmux.sessions.alpha_session.paneOutput = PROMPT_SCREEN; });
+    await run.exited;
+
+    assert.deepEqual(JSON.parse(run.output().stdout.trim()), { ok: true });
     assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session.sendKeys, [["Escape"], ["Enter"]]);
   });
 
