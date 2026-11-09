@@ -1,5 +1,5 @@
 {
-  "budget": 117,
+  "budget": 120,
   "skips": [
     {
       "file": "harness-safety.test.js",
@@ -133,6 +133,24 @@
       "test": "the POSIX bridge ignores stdin EOF",
       "tag": "posix",
       "reason": "on Windows stdin EOF is the stop request"
+    },
+    {
+      "file": "tmux-golden.test.js",
+      "test": "the six launchers issue today's exact tmux new-session strings",
+      "tag": "posix",
+      "reason": "the launchers are zsh scripts until their port slices land"
+    },
+    {
+      "file": "session-host-seam.test.js",
+      "test": "node runDetached on POSIX outlives its caller and carries no session name",
+      "tag": "posix",
+      "reason": "POSIX detaches with a new session; Windows goes through ccdm-host"
+    },
+    {
+      "file": "session-host-seam.test.js",
+      "test": "python run_detached on POSIX outlives its caller and carries no session name",
+      "tag": "posix",
+      "reason": "POSIX detaches with a new session; Windows goes through ccdm-host"
     }
   ]
 }

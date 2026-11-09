@@ -171,6 +171,7 @@ function fixtureHookShell() {
 function createFixtureRuntime(fixtureDir) {
   const runtime = path.join(fixtureDir, "fixture-runtime.cjs");
   fs.copyFileSync(new URL("./state-lock.cjs", import.meta.url), path.join(fixtureDir, "state-lock.cjs"));
+  fs.copyFileSync(new URL("./session-fixture.js", import.meta.url), path.join(fixtureDir, "session-fixture.mjs"));
   writeExecutable(
     runtime,
     `#!/usr/bin/env node
@@ -561,10 +562,20 @@ function runRouterClaudeHost() {
   // \`fixtures.claude.holdHellosIn\` keeps a thread's channel server (and so its
   // Router hello) from starting until the thread's id leaves the list.
   const heldThread = String(process.env.CCDM_ROUTER_KEY_FILE || "").match(/\\.thread-([^/]+)\\.key$/)?.[1];
+  // new-session starts this process before it records the session, so a session
+  // that is missing is only gone once it has been seen. The limit ends the wait
+  // when new-session failed after starting it.
+  const recordedWithinMs = 30000;
+  const waitingSince = Date.now();
+  let sessionSeen = false;
   const waitForAccept = setInterval(() => {
     const state = readState();
     const session = state.fixtures.tmux.sessions[sessionName];
-    if (!session) process.exit(0);
+    if (!session) {
+      if (sessionSeen || Date.now() - waitingSince > recordedWithinMs) process.exit(0);
+      return;
+    }
+    sessionSeen = true;
     if (session.devChannelPrompt !== "accepted") return;
     if (heldThread && (state.fixtures.claude.holdHellosIn || []).includes(heldThread)) return;
     clearInterval(waitForAccept);
@@ -681,204 +692,37 @@ function runRouterClaudeHost() {
   }
 }
 
+// tmux and the fake ccdm-host are the two fronts of one session model:
+// tests/e2e/support/session-fixture.js, copied beside this file.
+async function sessionFixture() {
+  const { createSessionFixture } = await import("./session-fixture.mjs");
+  return createSessionFixture({
+    DEV_CHANNEL_PROMPT, isAlive, normalizeSessionTarget, parseTmuxLaunch, readState,
+    recordClaudeInvocation, recordCodexBridgeInvocation, spawnPlaceholder, spawnRouterBridge, spawnRouterClaude,
+    stateDir, unquote, updateState, writeClaudeSession,
+  });
+}
+
+function fixtureFailure(error) {
+  console.error(error);
+  process.exit(1);
+}
+
 function runTmux() {
-  const subcommand = args[0];
-  if (subcommand === "has-session") {
-    const targetIndex = args.indexOf("-t");
-    const name = normalizeSessionTarget(args[targetIndex + 1]);
-    const session = readState().fixtures.tmux.sessions[name];
-    if (session?.startupMode === "exit") {
-      updateState((state) => { delete state.fixtures.tmux.sessions[name]; return state; });
-      process.exit(1);
-    }
-    process.exit(session ? 0 : 1);
-  }
+  sessionFixture().then((fixture) => fixture.runTmux(args)).catch(fixtureFailure);
+}
 
-  if (subcommand === "new-session") {
-    const sessionIndex = args.indexOf("-s");
-    const separatorIndex = args.indexOf("--");
-    const name = args[sessionIndex + 1];
-    const command = args.slice(separatorIndex + 1);
-    if (!name || separatorIndex === -1 || command[0] !== "zsh" || command[1] !== "-ic" || !command[2]) {
-      console.error("unsupported tmux new-session invocation");
-      process.exit(2);
-    }
-    const shellCommand = command[2];
-    const tmuxState = readState().fixtures.tmux;
-    const preexistingSession = tmuxState.sessions[name];
-    if (tmuxState.newSessionFailures?.[name]) {
-      updateState((state) => {
-        state.fixtures.tmux.newSessionFailures[name] -= 1;
-        return state;
-      });
-      console.error("fixture tmux new-session failure");
-      process.exit(1);
-    }
-    // \`earlyExits[name]\` launches start and exit at once: the session is gone
-    // before anything can look at its pane.
-    if (tmuxState.earlyExits?.[name]) {
-      updateState((state) => {
-        state.fixtures.tmux.earlyExits[name] -= 1;
-        return state;
-      });
-      process.exit(0);
-    }
-    if (preexistingSession?.newSessionStatus) {
-      console.error("fixture tmux new-session failure");
-      process.exit(preexistingSession.newSessionStatus);
-    }
-    const priorKillAttempts =
-      tmuxState.lastKilledSessions?.[name]?.killAttempts ?? preexistingSession?.killAttempts ?? 0;
-    const launch = parseTmuxLaunch(shellCommand);
-    // A CCDM channel launch runs the fake claude, which hosts the real channel
-    // server once the development-channel confirmation is accepted.
-    const routerChannel = launch.kind === "claude-listener" && launch.claudeArgs.includes("server:ccdm");
-    const routerBridge = launch.kind === "codex-bridge" && Boolean(launch.env.CCDM_ROUTER_KEY_FILE);
-    const pid = routerChannel
-      ? spawnRouterClaude(name, launch)
-      : routerBridge ? spawnRouterBridge(launch) : spawnPlaceholder();
-    // A \`--resume <id>\` launch continues that session, as Claude does.
-    const resumeIndex = launch.kind === "claude-listener" ? launch.claudeArgs.indexOf("--resume") : -1;
-    const sessionId = resumeIndex >= 0 ? unquote(launch.claudeArgs[resumeIndex + 1]) : \`fixture-session-\${pid}\`;
-    const processCommand =
-      routerBridge
-        ? \`node scripts/codex-bridge.js CHANNEL_ID='\${launch.env.CHANNEL_ID}' WS_PORT='\${launch.env.WS_PORT}' CCDM_ROUTER_KEY_FILE='\${launch.env.CCDM_ROUTER_KEY_FILE}'\`
-        : launch.kind === "codex-bridge"
-        ? \`node scripts/codex-bridge.js CHANNEL_ID='\${launch.env.CHANNEL_ID}' BOT_APP_ID='\${launch.env.BOT_APP_ID}' WS_PORT='\${launch.env.WS_PORT}'\`
-        : \`claude \${launch.claudeArgs.join(" ")} CCDM_ROUTER_KEY_FILE='\${launch.env.CCDM_ROUTER_KEY_FILE}'\`;
-    const devChannelPrompt = routerChannel ? (tmuxState.devChannelPrompt === "never" ? "never" : "pending") : undefined;
-    const paneOutput =
-      launch.kind === "codex-bridge"
-        ? "Codex-Discord bridge running\\nListening in #channel-id\\n"
-        : devChannelPrompt === "pending"
-          ? DEV_CHANNEL_PROMPT
-          : devChannelPrompt === "never"
-            ? "Starting Claude Code\\n"
-            : "Listening for channel messages\\n";
-
-    updateState((state) => {
-      if (state.fixtures.tmux.sessions[name]) {
-        const existing = state.fixtures.tmux.sessions[name];
-        if (existing.killFailuresRemaining || existing.newSessionStatus) {
-          throw new Error(\`duplicate tmux session: \${name}\`);
-        }
-      }
-      state.fixtures.tmux.sessions[name] = {
-        name,
-        command,
-        cwd: launch.cwd,
-        env: launch.env,
-        bridgeCommand: launch.bridgeCommand,
-        paneOutput,
-        ...(devChannelPrompt ? { devChannelPrompt } : {}),
-        pid,
-        killAttempts: priorKillAttempts,
-        shellCommand,
-        startupMode: tmuxState.startupMode,
-      };
-      state.fixtures.processes.push({
-        command: processCommand,
-        kind: launch.kind,
-        owned: true,
-        ownerStateDir: stateDir,
-        pid,
-        ppid: process.pid,
-      });
-      return state;
-    });
-    if (launch.kind === "codex-bridge") {
-      recordCodexBridgeInvocation({
-        command: launch.bridgeCommand,
-        cwd: launch.cwd,
-        env: launch.env,
-        pid,
-      });
-    } else {
-      recordClaudeInvocation({
-        args: launch.claudeArgs,
-        cwd: launch.cwd,
-        env: launch.env,
-        pid,
-        sessionId,
-      });
-      // \`fixtures.claude.omitSessionFile\`: Claude never writes its session file.
-      if (!readState().fixtures.claude.omitSessionFile) writeClaudeSession(pid, sessionId, launch.env.CLAUDE_CONFIG_DIR);
-    }
-    process.exit(0);
-  }
-
-  if (subcommand === "kill-session") {
-    const targetIndex = args.indexOf("-t");
-    const name = normalizeSessionTarget(args[targetIndex + 1]);
-    const state = readState();
-    const session = state.fixtures.tmux.sessions[name];
-    if (!session) {
-      process.exit(1);
-    }
-    updateState((nextState) => {
-      const nextSession = nextState.fixtures.tmux.sessions[name];
-      nextSession.killAttempts = (nextSession.killAttempts || 0) + 1;
-      if (nextSession.killFailuresRemaining > 0) {
-        nextSession.killFailuresRemaining -= 1;
-      } else {
-        nextState.fixtures.tmux.lastKilledSessions = {
-          ...(nextState.fixtures.tmux.lastKilledSessions || {}),
-          [name]: { killAttempts: nextSession.killAttempts },
-        };
-        delete nextState.fixtures.tmux.sessions[name];
-      }
-      return nextState;
-    });
-    process.exit(session.killFailuresRemaining > 0 ? 1 : 0);
-  }
-
-  if (subcommand === "display-message") {
-    const targetIndex = args.indexOf("-t");
-    const name = normalizeSessionTarget(args[targetIndex + 1]);
-    const session = readState().fixtures.tmux.sessions[name];
-    if (!session) {
-      process.exit(1);
-    }
-    if (args.includes("#{pane_pid}")) {
-      process.stdout.write(session.panePid ? \`\${session.panePid}\\n\` : "");
-      process.exit(0);
-    }
-    console.error(\`unsupported tmux display-message format: \${args.join(" ")}\`);
-    process.exit(2);
-  }
-
-  if (subcommand === "capture-pane") {
-    const targetIndex = args.indexOf("-t");
-    const name = normalizeSessionTarget(args[targetIndex + 1]);
-    const session = readState().fixtures.tmux.sessions[name];
-    if (!session) {
-      process.exit(1);
-    }
-    process.stdout.write(session.paneOutput || "");
-    process.exit(0);
-  }
-
-  if (subcommand === "send-keys") {
-    const targetIndex = args.indexOf("-t");
-    const name = normalizeSessionTarget(args[targetIndex + 1]);
-    updateState((state) => {
-      const session = state.fixtures.tmux.sessions[name] || { name };
-      session.sendKeys = [...(session.sendKeys || []), args.slice(targetIndex + 2)];
-      if (session.devChannelPrompt === "pending" && args[targetIndex + 2] === "Enter") {
-        session.devChannelPrompt = "accepted";
-        session.paneOutput = "Listening for channel messages from: server:ccdm\\n";
-      }
-      state.fixtures.tmux.sessions[name] = session;
-      return state;
-    });
-    process.exit(0);
-  }
-
-  console.error(\`unsupported tmux command: \${args.join(" ")}\`);
-  process.exit(2);
+function runFakeHost() {
+  sessionFixture().then((fixture) => fixture.runFakeHost()).catch(fixtureFailure);
 }
 
 function runPs() {
+  if (args.join(" ") === "-axo pid=,ppid=") {
+    for (const row of reportableProcesses(readState())) {
+      process.stdout.write(\`\${String(row.pid).padStart(5, " ")} \${String(row.ppid).padStart(5, " ")}\\n\`);
+    }
+    return;
+  }
   if (args.join(" ") !== "axeww -o pid=,command=") {
     console.error("unsupported ps invocation");
     process.exit(2);
@@ -936,6 +780,7 @@ function reportableProcesses(state) {
 }
 
 function runPkill() {
+  fs.appendFileSync(path.join(stateDir, "session-calls.ndjson"), \`\${JSON.stringify({ front: "pkill", args })}\\n\`);
   if (args[0] !== "-TERM" || args[1] !== "-P" || !args[2] || args.length !== 3) {
     console.error("unsupported pkill invocation");
     process.exit(2);
@@ -1502,6 +1347,9 @@ switch (tool) {
   case "tmux":
     runTmux();
     break;
+  case "ccdm-host-fake":
+    runFakeHost();
+    break;
   case "ps":
     runPs();
     break;
@@ -1640,6 +1488,7 @@ function sharedFixtureDir(exclude) {
   const digest = createHash("sha256")
     .update(fs.readFileSync(new URL(import.meta.url)))
     .update(fs.readFileSync(new URL("./state-lock.cjs", import.meta.url)))
+    .update(fs.readFileSync(new URL("./session-fixture.js", import.meta.url)))
     .update(fs.readFileSync(new URL("./fixture-shim.cs", import.meta.url)))
     .update(JSON.stringify([process.execPath, key, hostPaths]))
     .digest("hex")
@@ -1811,6 +1660,21 @@ function workspaceEnv({ root, homeDir, tmpDir, stateDir, fixtureDir, platform = 
   return env;
 }
 
+// On Windows a process killed a moment ago can keep the directory for a little
+// while longer, and rmSync does not retry that error itself.
+async function removeWorkspaceRoot(root) {
+  const deadline = Date.now() + scaledTimeout(1000);
+  for (;;) {
+    try {
+      fs.rmSync(root, { force: true, recursive: true });
+      return;
+    } catch (error) {
+      if (!WIN || Date.now() >= deadline || !["EBUSY", "EPERM", "ENOTEMPTY"].includes(error.code)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+}
+
 export const createWorkspace = Object.freeze(function createWorkspace(options = {}) {
   const root = sourceRoot();
   const files = gitSourceFiles(root);
@@ -1838,7 +1702,7 @@ export const createWorkspace = Object.freeze(function createWorkspace(options = 
       // Workspace removal should still proceed if fixture cleanup cannot read state.
     }
     // With CCDM_E2E_KEEP_FAILED=1 the runner decides, once it knows the file's result.
-    if (process.env.CCDM_E2E_KEEP_FAILED !== "1") fs.rmSync(tmpRoot, { force: true, recursive: true });
+    if (process.env.CCDM_E2E_KEEP_FAILED !== "1") await removeWorkspaceRoot(tmpRoot);
   });
 
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-e2e-"));
