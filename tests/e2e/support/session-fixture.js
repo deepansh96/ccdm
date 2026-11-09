@@ -506,7 +506,7 @@ export function createSessionFixture(context) {
 
 // Starts the fake ccdm-host for a workspace. `env` is what a seam call needs to
 // find it. The fixture runtime is the same one the fixture commands run.
-export async function startFakeHost(workspace, { badProof = false } = {}) {
+export async function startFakeHost(workspace, { badProof = false, env = workspace.env } = {}) {
   const { registerTeardownCallback } = await import("./teardown.js");
   const stateRoot = path.join(workspace.tmpRoot, "fake-host-state");
   const hostDir = path.join(stateRoot, "host");
@@ -514,7 +514,7 @@ export async function startFakeHost(workspace, { badProof = false } = {}) {
   const child = spawn(process.execPath, [runtime, "ccdm-host-fake", workspace.tmpRoot], {
     cwd: workspace.tmpRoot,
     env: {
-      ...workspace.env,
+      ...env,
       CCDM_FAKE_HOST_DIR: hostDir,
       ...(badProof ? { CCDM_FAKE_HOST_BAD_PROOF: "1" } : {}),
     },

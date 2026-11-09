@@ -84,7 +84,7 @@ const LAUNCH_TIMEOUT_MS = WIN ? 30000 : undefined;
 const fakeHosts = new WeakMap();
 async function backendEnv(workspace, backend = DEFAULT_BACKEND) {
   if (backend === "tmux") return { CCDM_SESSION_HOST: "tmux" };
-  if (!fakeHosts.has(workspace)) fakeHosts.set(workspace, await startFakeHost(workspace));
+  if (!fakeHosts.has(workspace)) fakeHosts.set(workspace, await startFakeHost(workspace, { env: routerEnv(workspace) }));
   return fakeHosts.get(workspace).env;
 }
 

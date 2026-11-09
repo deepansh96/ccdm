@@ -41,7 +41,7 @@ function claudeRouterWorkspace() {
 const fakeHosts = new WeakMap();
 async function launcherEnv(workspace) {
   if (process.platform !== "win32") return {};
-  if (!fakeHosts.has(workspace)) fakeHosts.set(workspace, await startFakeHost(workspace));
+  if (!fakeHosts.has(workspace)) fakeHosts.set(workspace, await startFakeHost(workspace, { env: routerEnv(workspace) }));
   return fakeHosts.get(workspace).env;
 }
 
@@ -124,7 +124,8 @@ test("no Discord bot or webhook token reaches the session environment, launch fi
     }
   }
   assert.deepEqual(Object.keys(mcpConfig.mcpServers), ["ccdm"]);
-  assert.deepEqual(mcpConfig.mcpServers.ccdm.args.map((arg) => path.resolve(arg)), [path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js")]);
+  assert.equal(path.resolve(mcpConfig.mcpServers.ccdm.args[0]), path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js"));
+  assert.deepEqual(mcpConfig.mcpServers.ccdm.args.slice(1), process.platform === "win32" ? ["--ccdm-key-file", path.join(workspace.routerStateDir, "keys", "demo.key")] : []);
   for (const file of fs.readdirSync(launchDir)) {
     assertPrivate(path.join(launchDir, file), file);
   }
