@@ -159,6 +159,25 @@ test("a root launch whose Router hello fails exits non-zero and removes root's k
   assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", ".root.key")), false);
 });
 
+test("a Claude root offers no /restart: its session stays and no restart helper starts", async () => {
+  const workspace = rootWorkspace();
+  await routerWithWebhooks(workspace, ["demo"]);
+  const restarted = await restartRoot(workspace);
+  assert.equal(restarted.exitCode, 0, restarted.stderr || restarted.stdout);
+  const before = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
+
+  injectDiscordMessage(workspace, { id: "restart", channelId: "root-channel", content: "/restart",
+    author: { id: OWNER_ID, username: "Owner" } });
+  injectDiscordMessage(workspace, { id: "after", channelId: "root-channel", content: "fence",
+    author: { id: OWNER_ID, username: "Owner" } });
+
+  const done = await waitForState(workspace, (next) => next.fixtures.claude.channelNotifications?.some(({ meta }) => meta.message_id === "after"), 10000);
+  assert.equal(done.fixtures.tmux.sessions.root_agent.pid, before.pid);
+  assert.equal(done.fixtures.tmux.lastKilledSessions?.root_agent?.killAttempts ?? 0, before.killAttempts ?? 0);
+  assert.equal(fs.existsSync(path.join(workspace.homeDir, ".local", "state", "ccdm", "logs", "restart-root_agent.log")), false);
+  assert.deepEqual(done.fixtures.discord.messages, []);
+});
+
 test("/model in a root channel is answered by root Claude's channel server from its home, never reaching Claude", async () => {
   const workspace = rootWorkspace();
   fs.mkdirSync(path.join(workspace.homeDir, ".claude"), { recursive: true });

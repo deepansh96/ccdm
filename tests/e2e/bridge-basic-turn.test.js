@@ -16,7 +16,8 @@ import {
   waitForState,
 } from "./support/bridge.js";
 import { assertPrivate, platformGate, privateTempRoot } from "./support/platform.js";
-import { runRouterCli, startBridge } from "./support/router.js";
+import { routerEnv, runRouterCli, startBridge } from "./support/router.js";
+import { startFakeHost } from "./support/session-fixture.js";
 import { readState, seedRegistry, updateState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -1251,8 +1252,9 @@ test("bridge sends the bootstrap instruction turn after idle compact completion"
   await bridge.stop();
 });
 
-test("bridge restarts its own Codex session from slash command", platformGate("posix", "the channel /restart still runs /bin/sh and tmux; the Windows port of it is its own ticket"), async () => {
+test("bridge restarts its own Codex session from slash command", async () => {
   const workspace = createBridgeWorkspace();
+  const hostEnv = process.platform === "win32" ? (await startFakeHost(workspace, { env: routerEnv(workspace) })).env : {};
   const codex = await startFakeCodexServer(workspace);
   seedRegistry(workspace, {
     root_bot_app_id: ROOT_BOT_USER_ID,
@@ -1271,7 +1273,7 @@ test("bridge restarts its own Codex session from slash command", platformGate("p
     },
   });
   fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
-  const bridge = await startBridge(workspace, { port: codex.port });
+  const bridge = await startBridge(workspace, { port: codex.port, env: hostEnv });
 
   await bridge.waitForOutput(/Listening in #alpha/, 7000);
   await injectMessageUntil(

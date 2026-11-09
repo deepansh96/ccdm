@@ -11,7 +11,7 @@ const WebSocket = require("ws");
 const { writeFileAtomic } = require("./platform/atomic.js");
 const { safeFileName, samePath, stateRoot } = require("./platform/paths.js");
 const { privateTmpDir } = require("./platform/privacy.js");
-const { killTree, killTreeSync, onShutdown, rememberSpawn } = require("./platform/process.js");
+const { killTree, killTreeSync, onShutdown, processIdentity, rememberSpawn } = require("./platform/process.js");
 const { resolveCommand } = require("./platform/tools.js");
 
 const WIN32 = process.platform === "win32";
@@ -38,6 +38,7 @@ process.env.CCDM_REMINDER_CONTEXT_FILE = REMINDER_CONTEXT_FILE;
 process.env.CCDM_REMINDER_RECEIPTS_DIR = REMINDER_RECEIPTS_DIR;
 const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { createRouterTransport } = require("./codex-bridge-transport.js");
+const { scheduleProjectRestart } = require("./lib/restart-helper.js");
 const { markTurn } = require("./thread-activity.js");
 const modelInfo = require("./model-info.js");
 const routerPaths = require("./router/paths.js");
@@ -211,21 +212,10 @@ async function findCurrentProject() {
   return { projectName: ROUTER_PROJECT, screenName: project.screen_name };
 }
 
-function scheduleRestart(projectName, screenName) {
-  const safeName = projectName.replace(/[^a-zA-Z0-9._-]/g, "_");
-  const logPath = path.join(os.tmpdir(), `ccdm-restart-${safeName}.log`);
-  const command = [
-    `while kill -0 ${process.pid} 2>/dev/null; do sleep 1; done`,
-    `tmux kill-session -t ${shellQuote(`=${screenName}`)} 2>/dev/null || true`,
-    `cd ${shellQuote(ROOT_DIR)} && ./scripts/start-codex-session.sh ${shellQuote(projectName)} >> ${shellQuote(logPath)} 2>&1`,
-  ].join("; ");
-  const child = spawn("/bin/sh", ["-c", command], {
-    detached: true,
-    env: process.env,
-    stdio: "ignore",
-  });
-  child.unref();
-  return logPath;
+// The helper waits for this process to exit, so this bridge finishes its own cleanup first.
+function scheduleRestart(projectName) {
+  const { pid, startedAt } = processIdentity();
+  return scheduleProjectRestart(projectName, { afterPid: pid, afterStartedAt: startedAt });
 }
 
 function scheduleRootRestart() {
@@ -1819,7 +1809,7 @@ function startDiscordBot() {
           return;
         }
         const { projectName, screenName } = await findCurrentProject();
-        const logPath = scheduleRestart(projectName, screenName);
+        const logPath = await scheduleRestart(projectName);
         await sendToDiscord("Restarting session — fresh thread coming up.", channelId);
         console.log(`Restart scheduled for '${projectName}' (${screenName}); log: ${logPath}`);
         cleanup();
