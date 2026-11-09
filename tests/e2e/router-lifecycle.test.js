@@ -1,14 +1,20 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import { createRequire } from "node:module";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import { injectDiscordMessage } from "./support/bridge.js";
+import { platformGate } from "./support/platform.js";
 import {
   OWNER_ID,
   connectSession,
   createRouterWorkspace,
   killRouter,
   rawRouterSocket,
+  routerEnv,
   runRouterCli,
   startRouter,
   waitFor,
@@ -19,6 +25,86 @@ import { cleanup } from "./support/teardown.js";
 
 test.afterEach(async () => {
   await cleanup();
+});
+
+const onlyWindows = platformGate("win32", "the pipe DACL and remote-client refusal are Windows behaviour");
+const scriptsModule = name => createRequire(import.meta.url)(`../../scripts/platform/${name}.js`);
+
+function tryConnect(endpoint) {
+  return new Promise((resolve) => {
+    const client = net.connect(endpoint);
+    client.once("connect", () => { client.destroy(); resolve(null); });
+    client.once("error", error => resolve(error.code));
+  });
+}
+
+// The DACL half of an SDDL string as [flags, ...entries], with each entry split
+// on ";", so an entry for anyone but the owner cannot hide.
+function daclEntries(sddl) {
+  const dacl = sddl.slice(sddl.indexOf("D:") + 2);
+  return { flags: dacl.slice(0, dacl.indexOf("(")), entries: dacl.match(/\([^)]*\)/g).map(entry => entry.slice(1, -1).split(";")) };
+}
+
+test("on Windows the Router pipe grants only the owner, on every instance", onlyWindows, async () => {
+  const workspace = createRouterWorkspace();
+  await startRouter(workspace);
+  const pipe = fs.readFileSync(path.join(workspace.routerStateDir, "router.pipe"), "utf8").trim();
+  const owner = scriptsModule("privacy").currentUserSid();
+  const { readPipeSddl } = scriptsModule("ipc");
+
+  // Each read is a client on a fresh instance. Faster than the Router makes
+  // new instances, a read finds them all busy and tries again.
+  const sddls = [];
+  const readWhenFree = () => {
+    try {
+      sddls.push(readPipeSddl(pipe));
+      return true;
+    } catch (error) {
+      if (!/error 231\b/.test(error.message)) throw error;
+      return false;
+    }
+  };
+  for (let reads = 0; reads < 6; reads += 1) await waitFor(readWhenFree, () => "a free pipe instance");
+
+  for (const sddl of sddls) {
+    const { flags, entries } = daclEntries(sddl);
+    // SDDL prints the machine's built-in Administrator (RID 500) as LA.
+    const trustee = owner.endsWith("-500") ? "LA" : owner;
+    assert.equal(flags, "P");
+    assert.deepEqual(entries, [["A", "", "FA", "", "", trustee]]);
+  }
+});
+
+test("on Windows the Router pipe refuses the path a remote client would use, and takes the local one", onlyWindows, async (t) => {
+  const workspace = createRouterWorkspace();
+  await startRouter(workspace);
+  const pipe = fs.readFileSync(path.join(workspace.routerStateDir, "router.pipe"), "utf8").trim();
+  const remotePath = target => target.replace("\\\\.\\", `\\\\${os.hostname()}\\`);
+  const control = net.createServer(socket => socket.destroy());
+  const controlPipe = `${pipe}-control`;
+  await new Promise(resolve => control.listen(controlPipe, resolve));
+  t.after(() => new Promise(resolve => control.close(resolve)));
+
+  assert.equal(await tryConnect(pipe), null);
+  // Without a working SMB loopback the remote path proves nothing either way.
+  const controlResult = await tryConnect(remotePath(controlPipe));
+  if (controlResult !== null) {
+    t.skip(`the SMB path to this machine is not available here: ${controlResult}`);
+    return;
+  }
+  assert.equal(await tryConnect(remotePath(pipe)), "EPERM");
+});
+
+test("on Windows serve exits non-zero naming the pipe DACL when the pipe cannot be created", onlyWindows, async () => {
+  const workspace = createRouterWorkspace();
+
+  const result = await runRouterCli(workspace, ["serve"], { env: routerEnv(workspace, { CCDM_TEST_PIPE_CREATE_FAILS: "1" }) });
+
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /pipe DACL/);
+  for (const name of ["router.pipe", "router.secret"]) {
+    assert.equal(fs.existsSync(path.join(workspace.routerStateDir, name)), false, `${name} survives the failed start`);
+  }
 });
 
 test("a new key for a project revokes the connected session, routes to the new key, and refuses the old one", async () => {
