@@ -35,3 +35,5 @@ tests/e2e/router-claude-session.test.js
 tests/e2e/ipc-pipe-listener.test.js
 tests/e2e/bridge-basic-turn.test.js
 tests/e2e/conversation-reminder-codex.test.js
+tests/e2e/session-host-seam.test.js
+tests/e2e/tmux-golden.test.js
