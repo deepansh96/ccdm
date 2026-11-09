@@ -1136,10 +1136,11 @@ function unixPathFromNetArgs(args) {
   return null;
 }
 
-// The pipe names published in this Test Workspace's Router state.
+// The pipe names published in this Test Workspace's Router and session host state.
 function workspacePipeNames(workspaceRoot) {
   const names = new Set();
-  for (const dir of new Set([process.env.CCDM_ROUTER_STATE_DIR, path.join(workspaceRoot, "router")].filter(Boolean))) {
+  const hostDir = process.env.CCDM_STATE_ROOT && path.join(process.env.CCDM_STATE_ROOT, "host");
+  for (const dir of new Set([process.env.CCDM_ROUTER_STATE_DIR, path.join(workspaceRoot, "router"), hostDir].filter(Boolean))) {
     let entries = [];
     try {
       entries = fs.readdirSync(dir);

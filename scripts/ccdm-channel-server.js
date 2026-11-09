@@ -43,8 +43,8 @@
 // `context_pct`, or omit it when the file is missing or unreadable.
 //
 // Router `command` events run here, never as a Claude turn: /compact and
-// /clear are typed into this session's own tmux pane through
-// send-claude-command.sh, /pause queues inbound events until /unpause, and
+// /clear are typed into this session's own terminal through
+// `ccdm send-claude-command`, /pause queues inbound events until /unpause, and
 // /restart relaunches this project (never root) through stop-session.sh and
 // start-session.sh.
 //
@@ -65,6 +65,8 @@ const { hookCommand } = require("./platform/hooks.js");
 const { stateRoot } = require("./platform/paths.js");
 const { onShutdown, processStartTime } = require("./platform/process.js");
 const { ensurePrivateDir, isPrivateFile } = require("./platform/privacy.js");
+const { pythonInvocation } = require("./platform/tools.js");
+const sessionHost = require("./lib/session-host.js");
 const reminder = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
 const { markTurn } = require("./thread-activity.js");
@@ -95,7 +97,12 @@ const THREAD_ID = ROOT ? "" : process.env.CCDM_THREAD_ID || "";
 const THREAD = Boolean(THREAD_ID);
 // Mirrors COMMANDS and THREAD_COMMANDS in scripts/router/inbound.js.
 const RELAYED_COMMANDS = THREAD ? "/pause, /unpause and /compact" : "/pause, /unpause, /compact, /clear and /restart";
-const RELAY_INSTRUCTIONS = `Discord relays only ${RELAYED_COMMANDS} as commands; any other slash command the owner sends arrives as a plain message and does not run. When the owner sends one, or asks you to run one (such as a skill only they may invoke), type it into your own tmux pane: tmux send-keys -t "$TMUX_PANE" -l '/<command>' && tmux send-keys -t "$TMUX_PANE" Enter. It runs when your current turn ends.`;
+// Claude's working directory is the project, so Windows names the checkout in full.
+// Git Bash runs the `ccdm` entry; PowerShell would need `ccdm.cmd`, which is why this names the tool.
+const TYPE_INTO_OWN_SESSION = process.platform === "win32"
+  ? `session with the Bash tool: "${ROOT_DIR.replace(/\\/g, "/")}/scripts/ccdm" session send "$CCDM_SESSION_NAME" --literal '/<command>' --enter`
+  : `tmux pane: tmux send-keys -t "$TMUX_PANE" -l '/<command>' && tmux send-keys -t "$TMUX_PANE" Enter`;
+const RELAY_INSTRUCTIONS = `Discord relays only ${RELAYED_COMMANDS} as commands; any other slash command the owner sends arrives as a plain message and does not run. When the owner sends one, or asks you to run one (such as a skill only they may invoke), type it into your own ${TYPE_INTO_OWN_SESSION}. It runs when your current turn ends.`;
 // A project's channel session and a thread session record reminder events;
 // only the channel session proves the project's capability.
 const REMINDERS = !ROOT;
@@ -484,20 +491,25 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
-// A thread session types the command into its own pane, never the project's.
-function typeIntoOwnPane(command) {
-  const target = `=${process.env.CCDM_THREAD_TMUX}:`;
-  const tmux = args => new Promise((resolve, reject) => {
-    execFile("tmux", args, (error, stdout, stderr) => error ? reject(new Error(stderr.trim() || error.message)) : resolve(stdout));
-  });
-  if (!process.env.CCDM_THREAD_TMUX) return Promise.reject(new Error("this thread session has no tmux session"));
-  return tmux(["send-keys", "-t", target, "-l", `/${command}`]).then(() => tmux(["send-keys", "-t", target, "Enter"]));
+// This thread's own session. CCDM_THREAD_TMUX is the name until the thread launcher
+// sets CCDM_SESSION_NAME; the suffix keeps a name inherited from elsewhere, such as
+// the project's session, from receiving the thread's command.
+function ownThreadSession() {
+  return [process.env.CCDM_SESSION_NAME, process.env.CCDM_THREAD_TMUX].find(name => name?.endsWith(`-t-${THREAD_ID}`));
+}
+
+// A thread session types the command into its own session, never the project's.
+async function typeIntoOwnSession(command) {
+  const session = ownThreadSession();
+  if (!session) throw new Error(process.platform === "win32" ? "this thread session has no session name" : "this thread session has no tmux session");
+  await sessionHost.sendText(session, `/${command}`);
+  await sessionHost.sendKey(session, "Enter");
 }
 
 function relayClaudeCommand(project, command) {
-  if (THREAD) return typeIntoOwnPane(command);
+  if (THREAD) return typeIntoOwnSession(command);
   return new Promise((resolve, reject) => {
-    execFile(path.join(ROOT_DIR, "scripts", "send-claude-command.sh"), ["--project", project, command], (error, stdout, stderr) => {
+    execFile(...pythonInvocation([path.join(ROOT_DIR, "scripts", "ccdm.py"), "send-claude-command", "--project", project, command]), (error, stdout, stderr) => {
       if (error) reject(new Error(stderr.trim() || error.message));
       else resolve(stdout);
     });
