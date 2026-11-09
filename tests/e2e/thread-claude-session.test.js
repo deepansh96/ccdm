@@ -511,7 +511,7 @@ test("on Windows a drive or UNC conversation home passes the check and a relativ
 
 test("a relative conversation home is refused on every OS, and on POSIX one holding a backslash", async () => {
   const workspace = threadWorkspace();
-  for (const home of WIN ? ["homes\claude-alt"] : ["homes/claude-alt", "/tmp/with\backslash"]) {
+  for (const home of WIN ? ["homes\\claude-alt"] : ["homes/claude-alt", "/tmp/with\\backslash"]) {
     const refused = await homeRun(workspace, home);
     assert.equal(refused.returncode, 2, refused.stderr);
     assert.equal(refused.stderr.trim(), `Invalid conversation home: '${home}'`);

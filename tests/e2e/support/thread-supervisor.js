@@ -68,7 +68,7 @@ export async function supervisorStatus(workspace) {
 // there the worker is asked through the stop file, as a service manager would.
 export function signalSupervisorWorker(workspace, workerPid) {
   if (!workspaceOwnsPid(workerPid, workspace.tmpRoot)) return false;
-  if (process.platform === "win32") {
+  if (process.platform === "win32" && fs.existsSync(supervisorStateDir(workspace))) {
     fs.writeFileSync(path.join(supervisorStateDir(workspace), "stop"), "");
     return true;
   }
