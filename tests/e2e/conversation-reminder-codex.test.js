@@ -571,9 +571,10 @@ test("exact mention forms of /close are consumed, including a guest command", as
   await waitForState(workspace, (state) => state.fixtures.discord.deliveredMessages.length === 3);
   const events = await waitForEvents(workspace, (rows) => rows.length >= 2);
   await new Promise((resolve) => setTimeout(resolve, 150));
-  // The bridge handles Discord messages in arrival order, so the closes are
-  // recorded in the order they were sent; each exact mention form once.
-  assert.deepEqual(events.map((event) => event.source_message_id), ["root-mention-close", "root-bang-mention-close"]);
+  // The closes go to the reminder service, not through the bridge's own event
+  // order, so the order they commit in is not checked; each exact mention form
+  // is recorded once.
+  assert.deepEqual(events.map((event) => event.source_message_id).sort(), ["root-bang-mention-close", "root-mention-close"]);
   assert.deepEqual(events.map((event) => event.event_type), ["close_requested", "close_requested"]);
   assert.equal(codex.clientMessages.filter((message) => message.method === "turn/start").length, 1);
   await worker.stop();
