@@ -1371,6 +1371,11 @@ function runCodex() {
   };
   process.on("SIGTERM", () => onSignal("SIGTERM"));
   process.on("SIGINT", () => onSignal("SIGINT"));
+  // For a test of teardown, which must also stop a fake that does not go by itself.
+  if (server.outliveBridge) {
+    setInterval(() => {}, 1000);
+    return;
+  }
   // Like a pane process, it goes when its bridge does, never left orphaned.
   watchBridge(() => {
     try {
