@@ -24,9 +24,9 @@ Each request gets one response echoing its `id`: `{id, ok:true, …result}` or `
 | `pids` | `{name}` | `{pids}` from the session's Job |
 | `kill` | `{name, graceMs=3000}` | `{killed:[pid]}`; grace phase (no-PTY: close stdin; PTY: close the console's input), then `TerminateJobObject` |
 | `wait` | `{name, regex, timeoutMs, thenSend?[]}` | `{matched, ms, screen}`; PTY sessions only, otherwise `unsupported_op`; see below |
-| `attach` | `{name, readOnly}`, then stream frames | `unsupported_op` until the attach slice |
-| `run-detached` | `{argv[], cwd, env{}, log}` | `{pid}`; `unsupported_op` until the attach slice |
-| `subscribe` | `{}`, then `{event:"exit", name, code}` pushes | `unsupported_op` until the attach slice |
+| `attach` | `{name, readOnly, size?:[c,r]}` | `{snapshot, cols, rows, exit}`, then stream frames; PTY sessions only, otherwise `unsupported_op`; see below |
+| `run-detached` | `{argv[], cwd, env{}, log}`; `log` is absolute | `{pid}`; see below |
+| `subscribe` | `{}` | `{}`, then `{event:"exit", name, code}` pushes for every session that ends |
 | `ping` | `{}` | `{}` |
 | `shutdown` | `{}` | `{}`; kills every session (grace, then Job), clears the journal, exits |
 
@@ -42,6 +42,14 @@ The grace phase of `kill` closes the console's input pipe rather than calling no
 
 A session still ends when its root program exits. OpenConsole stays while any client is attached, so the host watches the Job for the root and empties the Job when it is gone. After the last output has been parsed the screen is kept as plain text and the terminal is released. A log is written only when `new` names one, since the raw stream of a full-screen program is large.
 
+## Attach and helpers
+
+`attach` answers with the session's current screen, serialized by `@xterm/addon-serialize` after everything received so far has been parsed, and from then on sends each later chunk as `{out}`. Output is handed over in the parser's own order, so a chunk is either in the snapshot or in the stream, never both or neither. The client sends `{in}`, `{resize:[c,r]}` and `{detach:true}`; `{exit: code}` closes the stream when the program ends. A client more than 8 MB behind is disconnected.
+
+A read-only attach drops `{in}` and `{resize}`, and never resizes. An interactive attach may pass `size` so the snapshot is already drawn for its window. Several clients may attach at once, and the last one to resize sets the size. When a client that set the size leaves, the size goes to the previous one that set it, or back to 200 by 50 when none is left. An ended session has only plain text left, so `attach` answers with that screen and its `exit` code, followed at once by `{exit}`.
+
+`ccdm-host attach -t <name> [-r|--read-only]` draws on the alternate screen in raw mode and needs a real terminal. Ctrl-] detaches on the client's side and exits 0; the session keeps running. A helper run with `run-detached` is a child of the host, in no session's Job, with stdout and stderr appended to `log`. Its environment is rebuilt the way a session's is, plus the request's `env`, and it never has `CCDM_SESSION_NAME`, even when the request names it.
+
 ## Session environment
 
 A session's environment is rebuilt for every launch. The base is `CreateEnvironmentBlock(<user token>, FALSE)`, which gives what a fresh Explorer process gets. Nothing is inherited from the host, which may have been started from a shell full of agent settings. Next, a test seam (`CCDM_HOST_ENV_KEYS`, unset in production) merges named registry keys, then `cleanEnv` removes `CLAUDE*`, `ANTHROPIC*`, `MCP_*` and `CCDM*`, and finally the launch's explicit variables and `CCDM_SESSION_NAME=<name>` are added.
@@ -56,6 +64,7 @@ All are exact-version `optionalDependencies`, loaded lazily on win32 only and ab
 | `node-pty` | 1.1.0 | Yes (`install`: `node scripts/prebuild.js \|\| node-gyp rebuild`; `postinstall`: `node scripts/post-install.js`); ships prebuilt binaries | ConPTY sessions |
 | `@xterm/headless` | 6.0.0 | No | The ConPTY session's screen |
 | `@xterm/addon-unicode11` | 0.9.0 | No | Character widths on that screen, matching OpenConsole's |
+| `@xterm/addon-serialize` | 0.14.0 | No | The snapshot an attaching client sees first; loaded at the first attach |
 
 ## Considered Options
 

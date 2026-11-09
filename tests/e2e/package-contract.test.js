@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import test from "node:test";
 
-const CONPTY_PACKAGES = ["node-pty", "@xterm/headless", "@xterm/addon-unicode11"];
+const CONPTY_PACKAGES = ["node-pty", "@xterm/headless", "@xterm/addon-unicode11", "@xterm/addon-serialize"];
 
 test("the ConPTY packages are exact-version optional dependencies", () => {
   const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
