@@ -2,7 +2,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { PassThrough } = require("node:stream");
 
-const { withStateLock } = require("./state-lock.cjs");
+const { replaceStateFile, withStateLock } = require("./state-lock.cjs");
 
 const stateDir = process.env.CCDM_TEST_STATE;
 const stateFile = stateDir ? path.join(stateDir, "state.json") : null;
@@ -16,7 +16,7 @@ function writeState(state) {
   if (!stateDir || !stateFile) return;
   const tmp = path.join(stateDir, `.state.${process.pid}.${Date.now()}.tmp`);
   fs.writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
-  fs.renameSync(tmp, stateFile);
+  replaceStateFile(tmp, stateFile);
 }
 
 function updateState(updater) {

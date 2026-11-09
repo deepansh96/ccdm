@@ -3,7 +3,7 @@
 // Shared Router client library: connect, hello, correlate requests with
 // timeouts, emit pushed events, and reconnect with capped exponential backoff.
 //
-//   const client = new RouterClient({ socketPath, project, key, role: "project" });
+//   const client = new RouterClient({ project, key, role: "project" });
 //   // A thread session names its thread and provider:
 //   //   new RouterClient({ project, key, role: "thread", threadId, provider: "claude" });
 //   // `listener: false` connects for operations only: no events, and the
@@ -33,11 +33,18 @@
 // arrives before hello_ok is ignored, and is never emitted.
 //
 // Failed requests reject with an Error whose `code` is the Router's error code.
+//
+// Where to connect is resolved again for every connect and reconnect, because
+// on Windows each Router start has a new pipe name and secret. When there is a
+// secret, the Router must prove it holds it (scripts/platform/ipc.js) before
+// anything else goes out, the key included; a failed or missing proof is
+// `router_unavailable`, like a Router that is not up.
 const crypto = require("node:crypto");
 const { EventEmitter } = require("node:events");
 const net = require("node:net");
 const { requestTimeoutMs } = require("./deadlines.js");
-const { socketPath: defaultSocketPath } = require("./paths.js");
+const { readIpcSecret, verifyServerProof } = require("../platform/ipc.js");
+const { routerEndpoint, stateDir } = require("./paths.js");
 
 const PROTOCOL_VERSION = 1;
 const DEFAULT_RECONNECT_BACKOFF = Object.freeze({ minMs: 500, maxMs: 30000 });
@@ -56,11 +63,19 @@ function reconnectBackoff(env = process.env) {
   return { minMs, maxMs: Math.max(minMs, bound(env.CCDM_ROUTER_RECONNECT_MAX_MS, DEFAULT_RECONNECT_BACKOFF.maxMs)) };
 }
 
+// `endpoint` is a resolver returning `{ path, secret }`, or a fixed path. On
+// Windows a fixed path still has to pass the proof.
+function endpointResolver(endpoint) {
+  if (typeof endpoint === "function") return endpoint;
+  return () => ({ path: endpoint, secret: process.platform === "win32" ? readIpcSecret(stateDir(), "router") : null });
+}
+
 class RouterClient extends EventEmitter {
-  constructor({ socketPath = defaultSocketPath(), project, key, role = "project", listener = true, timeoutMs = 10000,
+  constructor({ endpoint, socketPath, project, key, role = "project", listener = true, timeoutMs = 10000,
     reconnect = role !== "status", beforeHello = null, threadId = null, provider = null, env = process.env } = {}) {
     super();
-    Object.assign(this, { socketPath, project, key, role, listener, timeoutMs, reconnect, beforeHello, threadId, provider,
+    this.resolveEndpoint = endpointResolver(endpoint ?? socketPath ?? routerEndpoint);
+    Object.assign(this, { project, key, role, listener, timeoutMs, reconnect, beforeHello, threadId, provider,
       backoff: reconnectBackoff(env) });
     this.socket = null;
     this.ready = false;
@@ -103,12 +118,30 @@ class RouterClient extends EventEmitter {
         fn(value);
       }
     };
-    const socket = net.connect(this.socketPath);
+    let target;
+    try {
+      target = this.resolveEndpoint();
+      if (process.platform === "win32" && !target.secret) throw new Error("no router secret");
+    } catch (error) {
+      settle(reject, routerError("router_unavailable", error.message));
+      if (this.connectedOnce && this.reconnect && !this.ended) this.scheduleReconnect();
+      return;
+    }
+    const socket = net.connect(target.path);
     this.socket = socket;
     let revoked = false;
     let buffer = "";
+    // With a secret, the hello waits for a valid proof; until then this is the nonce.
+    const nonce = target.secret ? crypto.randomBytes(32).toString("hex") : null;
+    let proven = !nonce;
+    let proofTimer = null;
+    const refuse = reason => {
+      clearTimeout(proofTimer);
+      settle(reject, routerError("router_unavailable", reason));
+      socket.destroy();
+    };
     socket.setEncoding("utf8");
-    socket.once("connect", async () => {
+    const sayHello = async () => {
       if (this.connectedOnce && this.beforeHello) {
         try {
           await this.beforeHello();
@@ -119,6 +152,11 @@ class RouterClient extends EventEmitter {
         ...(this.project ? { project: this.project } : {}), ...(this.key ? { key: this.key } : {}),
         ...(this.role === "thread" ? { thread_id: this.threadId, provider: this.provider } : {}),
         ...(this.listener ? {} : { listener: false }) });
+    };
+    socket.once("connect", () => {
+      if (proven) return void sayHello();
+      proofTimer = setTimeout(() => refuse("the Router did not prove itself"), this.timeoutMs);
+      socket.write(`${JSON.stringify({ type: "server_proof", nonce })}\n`);
     });
     socket.on("data", chunk => {
       buffer += chunk;
@@ -131,6 +169,15 @@ class RouterClient extends EventEmitter {
         try {
           frame = JSON.parse(line);
         } catch {
+          continue;
+        }
+        if (!proven) {
+          if (frame.type !== "server_proof_ok" || !verifyServerProof(target.secret, nonce, frame.proof)) {
+            return refuse("the Router's proof failed");
+          }
+          proven = true;
+          clearTimeout(proofTimer);
+          sayHello();
           continue;
         }
         if (frame.type === "hello_ok") {
@@ -159,6 +206,7 @@ class RouterClient extends EventEmitter {
     });
     socket.on("error", error => settle(reject, routerError("router_unavailable", error.message)));
     socket.on("close", () => {
+      clearTimeout(proofTimer);
       const wasReady = this.ready;
       this.ready = false;
       settle(reject, routerError("router_unavailable", "connection closed"));

@@ -7,17 +7,20 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const { ensurePrivateDirSync } = require("../platform/privacy.js");
+const { processAlive, processIdentity } = require("../platform/process.js");
 
 const LOCK_FILE = "router.lock";
 
-function holderAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error.code === "EPERM";
-  }
+// "<pid>\n" on POSIX. On Windows "<pid> <startedAt>\n", because a PID comes
+// back into use quickly: a live PID with another start time is a stale lock.
+function lockContent() {
+  const { pid, startedAt } = processIdentity();
+  return startedAt === null ? `${pid}\n` : `${pid} ${startedAt}\n`;
+}
+
+function holderOf(lockPath) {
+  const text = fs.readFileSync(lockPath, "utf8");
+  return { pid: Number.parseInt(text, 10), startedAt: text.trim().split(/\s+/)[1] ?? null };
 }
 
 function acquireRouterLock(stateDir) {
@@ -29,14 +32,14 @@ function acquireRouterLock(stateDir) {
       fd = fs.openSync(lockPath, "wx", 0o600);
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
-      const pid = Number.parseInt(fs.readFileSync(lockPath, "utf8"), 10);
-      if (holderAlive(pid)) {
+      const { pid, startedAt } = holderOf(lockPath);
+      if (processAlive(pid, startedAt)) {
         throw new Error(`another Router is already running (pid ${pid}); stop it before starting a new one`);
       }
       fs.rmSync(lockPath, { force: true });
       continue;
     }
-    fs.writeSync(fd, `${process.pid}\n`);
+    fs.writeSync(fd, lockContent());
     fs.closeSync(fd);
     let held = true;
     const release = () => {
@@ -44,7 +47,7 @@ function acquireRouterLock(stateDir) {
       held = false;
       // Only remove the lock this process still owns.
       try {
-        if (Number.parseInt(fs.readFileSync(lockPath, "utf8"), 10) === process.pid) fs.rmSync(lockPath, { force: true });
+        if (holderOf(lockPath).pid === process.pid) fs.rmSync(lockPath, { force: true, maxRetries: 5, retryDelay: 20 });
       } catch {
         // Already gone.
       }

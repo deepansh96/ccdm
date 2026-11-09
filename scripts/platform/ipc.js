@@ -12,6 +12,7 @@
 // ccdmlib/platform/ipc.py is the Python twin.
 const crypto = require("node:crypto");
 const fs = require("node:fs");
+const net = require("node:net");
 const path = require("node:path");
 
 const { writeFileAtomicSync } = require("./atomic");
@@ -61,4 +62,40 @@ function prepareIpcListen(endpoint) {
   }
 }
 
-module.exports = { ipcEndpoint, prepareIpcListen, publishPipe, readIpcSecret, serverProof, verifyServerProof };
+// Removes what publishPipe wrote, unless a later start has published its own.
+function unpublishPipe(stateDir, name, pipe) {
+  const named = path.join(stateDir, `${name}.pipe`);
+  try {
+    if (fs.readFileSync(named, "utf8").trim() !== pipe) return;
+  } catch {
+    return;
+  }
+  for (const file of [named, path.join(stateDir, `${name}.secret`)]) {
+    try {
+      fs.rmSync(file, { force: true, maxRetries: 5, retryDelay: 20 });
+    } catch { /* The next start replaces it. */ }
+  }
+}
+
+// The listening half of an endpoint, and the only place that knows how a server
+// is created. `onConnection` gets a duplex stream it uses through setEncoding,
+// write, destroy, destroyed and on("data" | "error" | "close"). A pipe hardened
+// with a user-only DACL replaces this body on win32 and nothing above it.
+function createIpcListener(onConnection) {
+  const server = net.createServer(onConnection);
+  return {
+    listen(endpoint) {
+      return new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(endpoint, resolve);
+      });
+    },
+    close() {
+      server.close();
+    },
+  };
+}
+
+module.exports = {
+  createIpcListener, ipcEndpoint, prepareIpcListen, publishPipe, readIpcSecret, serverProof, unpublishPipe, verifyServerProof,
+};
