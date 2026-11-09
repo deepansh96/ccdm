@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
-import { PYTHON } from "./support/platform.js";
+import { PYTHON, platformGate } from "./support/platform.js";
 
 const repoDir = path.resolve(".");
 const script = path.join(repoDir, "scripts", "usage-dashboard-renderer.py");
@@ -511,4 +511,18 @@ test("usage dashboard renders many cards plus multiline notes deterministically"
   assert.equal(bytes.readUInt32BE(16), 1600);
   assert.equal(bytes.readUInt32BE(20), 1000);
   assert.deepEqual(bytes, fs.readFileSync(second));
+});
+
+test("the renderer finds a Windows font", platformGate("win32", "Windows fonts"), () => {
+  const probe = spawnSync(PYTHON, ["-c", [
+    "import importlib.util, sys",
+    "spec = importlib.util.spec_from_file_location('renderer', sys.argv[1])",
+    "module = importlib.util.module_from_spec(spec); sys.modules['renderer'] = module; spec.loader.exec_module(module)",
+    "print(module._font(12).path)",
+    "print(module._font(12, bold=True).path)",
+  ].join("\n"), path.join("scripts", "usage-dashboard-renderer.py")], { encoding: "utf8" });
+  assert.equal(probe.status, 0, probe.stderr);
+  const [regular, bold] = probe.stdout.trim().split(/\r?\n/);
+  assert.match(regular, /(?:segoeui|arial)\.ttf$/i);
+  assert.match(bold, /(?:segoeuib|arialbd)\.ttf$/i);
 });
