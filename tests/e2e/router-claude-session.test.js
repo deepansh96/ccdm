@@ -40,7 +40,7 @@ function claudeRouterWorkspace() {
 const WINDOWS_LAUNCHER_ENV = process.platform === "win32" ? { PYTHONUTF8: "1" } : {};
 
 function startSession(workspace, extraEnv = {}) {
-  return runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace, { ...WINDOWS_LAUNCHER_ENV, ...extraEnv }) });
+  return runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace, { ...WINDOWS_LAUNCHER_ENV, ...extraEnv }), timeoutMs: 30000 });
 }
 
 test("start-session launches a router Claude project whose channel server says hello to the Router", async () => {
