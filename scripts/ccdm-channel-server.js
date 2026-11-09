@@ -16,7 +16,6 @@
 //   CCDM_THREAD_ID            set by start-thread-session.sh: this session serves that thread
 //   CCDM_THREAD_PROVIDER      the thread's provider (`claude`)
 //   CCDM_THREAD_BOOTSTRAP_FILE  the Thread Supervisor's bootstrap for this launch
-//   CCDM_THREAD_TMUX          this thread session's own tmux session
 //   CCDM_THREAD_ACTIVITY_FILE   this launch's activity.json, marked turn_running on each notification
 //
 // In thread mode the server says hello as the `thread` role, so its Session
@@ -491,11 +490,11 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
-// This thread's own session. CCDM_THREAD_TMUX is the name until the thread launcher
-// sets CCDM_SESSION_NAME; the suffix keeps a name inherited from elsewhere, such as
-// the project's session, from receiving the thread's command.
+// This thread's own session. The suffix keeps a name inherited from elsewhere, such
+// as the project's session, from receiving the thread's command.
 function ownThreadSession() {
-  return [process.env.CCDM_SESSION_NAME, process.env.CCDM_THREAD_TMUX].find(name => name?.endsWith(`-t-${THREAD_ID}`));
+  const name = process.env.CCDM_SESSION_NAME;
+  return name?.endsWith(`-t-${THREAD_ID}`) ? name : undefined;
 }
 
 // A thread session types the command into its own session, never the project's.
