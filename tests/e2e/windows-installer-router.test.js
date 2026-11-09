@@ -390,6 +390,22 @@ setInterval(() => {}, 1000);`);
   assert.equal(fs.existsSync(serviceFile(workspace, ".stop")), false);
 });
 
+test("a host that cannot write its marker still exits instead of lingering without a daemon", async () => {
+  const workspace = createRouterWorkspace();
+  const go = path.join(workspace.tmpDir, "go");
+  const daemon = fakeDaemon(workspace, `setInterval(() => { if (fs.existsSync(${JSON.stringify(go)})) process.exit(0); }, 20);`);
+  const host = startHost(workspace, writeConfig(workspace, daemon));
+  await waitFor("the daemon to start", () => readServiceState(workspace)?.state === "running");
+  await waitFor("the daemon to run", () => runCount(workspace) === 1);
+  // A directory in the marker's place makes writing it fail.
+  fs.mkdirSync(serviceFile(workspace, ".disabled"));
+
+  fs.writeFileSync(go, "now\n");
+
+  assert.equal(await host.exitedWith, 1);
+  assert.equal(fs.existsSync(serviceFile(workspace, ".lock")), false, "the lock is released");
+});
+
 test("a log over 10 MiB rotates and at most three old files stay", async () => {
   const workspace = createRouterWorkspace();
   const chunk = 11 * 1024 * 1024;

@@ -161,10 +161,10 @@ function startDaemon(config, logs) {
 function requestDaemonStop(child, logs) {
   if (process.platform !== "win32") return child.kill("SIGTERM");
   try {
-    const koffi = require("koffi");
-    const generate = koffi.load("kernel32.dll").func("__stdcall", "GenerateConsoleCtrlEvent", "int", ["uint32_t", "uint32_t"]);
-    // Group 0 is every process on this console: this host, which ignores it, and the daemon.
-    return generate(CTRL_BREAK_EVENT, 0) !== 0;
+      const koffi = require("koffi");
+      const generate = koffi.load("kernel32.dll").func("__stdcall", "GenerateConsoleCtrlEvent", "int", ["uint32_t", "uint32_t"]);
+      // Group 0 is every process on this console: this host, which ignores it, and the daemon.
+      return generate(CTRL_BREAK_EVENT, 0) !== 0;
   } catch (error) {
     logs.err.write(`service-host: cannot send Ctrl+Break: ${error.message}\n`);
     return false;
@@ -292,6 +292,10 @@ async function supervise(config) {
     writeState("disabled", { last_exit_code: lastExit });
   };
 
+  // A failure here, such as a state folder that has gone, must still end this
+  // process: its stop-file timer would otherwise keep it alive with no daemon,
+  // holding the lock that makes every watchdog run exit.
+  try {
   for (;;) {
     current = startDaemon(config, logs);
     const { pid } = current.child;
@@ -337,6 +341,10 @@ async function supervise(config) {
       return finish(0);
     }
   }
+  } catch (error) {
+    console.error(`service-host: ${error.message}`);
+    return finish(1);
+  }
 }
 
 async function main() {
@@ -347,10 +355,10 @@ async function main() {
 
 if (require.main === module) {
   main().then((code) => {
-    process.exitCode = code;
+    process.exit(code);
   }, (error) => {
     console.error(`service-host: ${error.message}`);
-    process.exitCode = 1;
+    process.exit(1);
   });
 }
 
