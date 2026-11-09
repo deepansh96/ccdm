@@ -1579,6 +1579,36 @@ db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()`, dat
   assert.equal(result.status, 0, result.stderr);
 }
 
+test("the worker reads a ledger with no events table as empty, and still surfaces other database errors", async () => {
+  const workspace = createBridgeWorkspace();
+  const script = path.join(workspace.repoDir, "scripts", "conversation-reminder-service.py");
+  const stateDir = path.join(workspace.tmpDir, "missing-table-state");
+  const probe = spawnSync(PYTHON, ["-c", `import importlib.util,json,sqlite3,sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location("service", sys.argv[1]); service=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(service)
+service.is_private=lambda path: True
+state=Path(sys.argv[2]); state.mkdir()
+path=service.EVENTS.database_path(state); path.parent.mkdir(parents=True,exist_ok=True)
+def read():
+    return [len(service.event_rows(state)), len(service.rows_matching(state,"p","g","1=1"))]
+def error(reader):
+    try:
+        reader(); return None
+    except sqlite3.OperationalError as caught:
+        return str(caught)
+db=sqlite3.connect(path); db.execute("CREATE TABLE other (id INTEGER)"); db.commit(); db.close()
+empty=read()
+db=sqlite3.connect(path); db.execute("CREATE TABLE events (id INTEGER)"); db.commit(); db.close()
+print(json.dumps([empty, error(lambda: service.event_rows(state)), error(lambda: service.rows_matching(state,"p","g","1=1"))]))`,
+  script, stateDir], { encoding: "utf8" });
+  assert.equal(probe.status, 0, probe.stderr);
+  const [empty, eventRowsError, rowsMatchingError] = JSON.parse(probe.stdout);
+  assert.deepEqual(empty, [0, 0]);
+  assert.match(eventRowsError, /no such column/);
+  assert.match(rowsMatchingError, /no such column/);
+});
+
 test("the reminder gap follows 1h, then 2h per ignored reminder, capped at 24h", async () => {
   const workspace = createBridgeWorkspace();
   const script = path.join(workspace.repoDir, "scripts", "conversation-reminder-service.py");

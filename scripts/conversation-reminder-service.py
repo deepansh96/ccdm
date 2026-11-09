@@ -393,15 +393,26 @@ def clock_now() -> datetime:
     return iso(Path(clock_file).read_text(encoding="utf-8").strip()) if clock_file else datetime.now(timezone.utc)
 
 
+def query_events(path: Path, query: str, parameters: tuple = ()) -> list[sqlite3.Row]:
+    # The writer creates the database file just before its table, so a reader
+    # in that gap has no events yet. Any other database error still surfaces.
+    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as source:
+        source.row_factory = sqlite3.Row
+        try:
+            return source.execute(query, parameters).fetchall()
+        except sqlite3.OperationalError as error:
+            if str(error) != "no such table: events":
+                raise
+            return []
+
+
 def event_rows(state_dir: Path) -> list[sqlite3.Row]:
     path = EVENTS.database_path(state_dir)
     if not path.exists():
         return []
     if not is_private(path):
         raise ValueError("event database permissions are not private")
-    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as source:
-        source.row_factory = sqlite3.Row
-        return source.execute("SELECT commit_order, event_id, payload_json FROM events ORDER BY commit_order").fetchall()
+    return query_events(path, "SELECT commit_order, event_id, payload_json FROM events ORDER BY commit_order")
 
 
 def usable_assignment(registry: dict, name: str) -> dict | None:
@@ -1346,10 +1357,8 @@ def rows_matching(state_dir: Path, project: str, generation: str, condition: str
     path = EVENTS.database_path(state_dir)
     if not path.exists():
         return []
-    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as source:
-        source.row_factory = sqlite3.Row
-        return source.execute(f"""SELECT interaction_id,source_message_id,event_time FROM events
-            WHERE project=? AND assignment_generation=? AND {condition}""", (project, generation)).fetchall()
+    return query_events(path, f"""SELECT interaction_id,source_message_id,event_time FROM events
+        WHERE project=? AND assignment_generation=? AND {condition}""", (project, generation))
 
 
 def pending_actions(state_dir: Path) -> dict:
