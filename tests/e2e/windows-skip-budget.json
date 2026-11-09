@@ -1,5 +1,5 @@
 {
-  "budget": 120,
+  "budget": 125,
   "skips": [
     {
       "file": "harness-safety.test.js",
@@ -151,6 +151,36 @@
       "test": "python run_detached on POSIX outlives its caller and carries no session name",
       "tag": "posix",
       "reason": "POSIX detaches with a new session; Windows goes through ccdm-host"
+    },
+    {
+      "file": "ccdm-cli.test.js",
+      "test": "--help lists a registered subcommand in zsh",
+      "tag": "posix",
+      "reason": "zsh is the owner's shell on macOS"
+    },
+    {
+      "file": "ccdm-cli.test.js",
+      "test": "a shim run by absolute path from / under env -i gives the same output as from the repo root",
+      "tag": "posix",
+      "reason": "emulates the bare environment of a macOS LaunchAgent"
+    },
+    {
+      "file": "ccdm-cli.test.js",
+      "test": "fake tmux: a lifecycle command against another session runs in the foreground",
+      "tag": "posix",
+      "reason": "the tmux front is POSIX; Windows goes through ccdm-host"
+    },
+    {
+      "file": "ccdm-cli.test.js",
+      "test": "fake tmux: from the target's own session name it re-dispatches and exits 0",
+      "tag": "posix",
+      "reason": "the tmux front is POSIX; Windows goes through ccdm-host"
+    },
+    {
+      "file": "ccdm-cli.test.js",
+      "test": "fake tmux: from a PID in the target's pids it re-dispatches and exits 0",
+      "tag": "posix",
+      "reason": "the tmux front is POSIX; Windows goes through ccdm-host"
     }
   ]
 }
