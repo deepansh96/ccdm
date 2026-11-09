@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import test from "node:test";
+import nodeTest from "node:test";
 
-import { assertPrivate } from "./support/platform.js";
+import { assertPrivate, suiteTest } from "./support/platform.js";
 import { injectDiscordMessage, injectDiscordReaction, startFakeCodexServer, waitForState } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import {
@@ -20,6 +20,10 @@ import {
 } from "./support/router.js";
 import { readState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
+
+// Root Codex stays on Linux and macOS until the owner's decision on a Windows Codex root (D2):
+// `restart-root --provider codex` refuses there, which stop-restart.test.js checks.
+const test = suiteTest(nodeTest, import.meta.url);
 
 test.afterEach(async () => {
   await cleanup();
@@ -225,6 +229,23 @@ test("/restart in the primary root channel relaunches root Codex through the res
     discordMessage(workspace, { id: `after-restart-${attempt}`, channelId: "root-channel", content: "back?" });
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
+});
+
+test("/restart hands root Codex's relaunch to one detached `ccdm restart-root`, logged under the state root", async () => {
+  const { workspace } = await rootCodex();
+  const before = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
+  const log = path.join(workspace.homeDir, ".local", "state", "ccdm", "logs", "restart-root-root_agent.log");
+
+  discordMessage(workspace, { id: "root-restart", channelId: "root-channel", content: "/restart" });
+
+  await waitForState(workspace, (next) => {
+    const session = next.fixtures.tmux.sessions.root_agent;
+    return session && session.pid !== before.pid;
+  }, 30000);
+  // The helper waited for the old bridge, then did the stop and the start itself.
+  await waitFor(() => fs.existsSync(log) && /Restarted root Codex agent in tmux session 'root_agent'/.test(fs.readFileSync(log, "utf8")),
+    () => `the restart log: ${fs.existsSync(log) ? fs.readFileSync(log, "utf8") : "missing"}`, 30000);
+  assert.match(fs.readFileSync(log, "utf8"), /Channel: root-channel/);
 });
 
 test("no Discord token reaches the root Codex session environment, launch files, or bridge MCP config", async () => {

@@ -52,4 +52,5 @@ tests/e2e/router-codex-session.test.js
 tests/e2e/root-cli.test.js
 tests/e2e/windows-installer-usage-poster.test.js
 tests/e2e/arrival-order.test.js
+tests/e2e/router-root-claude.test.js
 tests/e2e/windows-installer-host.test.js

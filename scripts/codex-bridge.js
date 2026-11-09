@@ -39,7 +39,7 @@ process.env.CCDM_REMINDER_RECEIPTS_DIR = REMINDER_RECEIPTS_DIR;
 const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { createRouterTransport } = require("./codex-bridge-transport.js");
 const { arrivalOrder } = require("./lib/arrival-order.js");
-const { scheduleProjectRestart } = require("./lib/restart-helper.js");
+const { scheduleProjectRestart, scheduleRootRestart: scheduleRootRestartHelper } = require("./lib/restart-helper.js");
 const { markTurn } = require("./thread-activity.js");
 const modelInfo = require("./model-info.js");
 const routerPaths = require("./router/paths.js");
@@ -200,10 +200,6 @@ function envFlag(defaultValue, ...names) {
   return defaultValue;
 }
 
-function shellQuote(value) {
-  return `'${String(value).replaceAll("'", "'\"'\"'")}'`;
-}
-
 async function findCurrentProject() {
   const registry = JSON.parse(await readFile(REGISTRY_PATH, "utf8"));
   const project = registry.projects?.[ROUTER_PROJECT];
@@ -219,19 +215,11 @@ function scheduleRestart(projectName) {
   return scheduleProjectRestart(projectName, { afterPid: pid, afterStartedAt: startedAt });
 }
 
+// Root restarts through its own command, `ccdm restart-root`, as a helper outside
+// this session. It waits for this process too.
 function scheduleRootRestart() {
-  const logPath = path.join(os.tmpdir(), "ccdm-restart-root-codex.log");
-  const command = [
-    `while kill -0 ${process.pid} 2>/dev/null; do sleep 1; done`,
-    `cd ${shellQuote(ROOT_DIR)} && ./restart-root-codex-agent.sh ${shellQuote(CHANNEL_ID)} >> ${shellQuote(logPath)} 2>&1`,
-  ].join("; ");
-  const child = spawn("/bin/sh", ["-c", command], {
-    detached: true,
-    env: process.env,
-    stdio: "ignore",
-  });
-  child.unref();
-  return logPath;
+  const { pid, startedAt } = processIdentity();
+  return scheduleRootRestartHelper(CHANNEL_ID, { afterPid: pid, afterStartedAt: startedAt });
 }
 
 // With `timeoutMs`, a request the app-server never answers rejects instead
@@ -1822,7 +1810,7 @@ function startDiscordBot() {
       await discordTransport.react(msg, "🔄");
       try {
         if (ROOT_MULTI_CHANNEL) {
-          const logPath = scheduleRootRestart();
+          const logPath = await scheduleRootRestart();
           await sendToDiscord("Restarting root session — fresh thread coming up.", channelId);
           console.log(`Root restart scheduled; log: ${logPath}`);
           cleanup();
