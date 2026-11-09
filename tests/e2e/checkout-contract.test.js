@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -90,4 +91,42 @@ test("symlinks to AGENTS.md are accepted and symlinks elsewhere fail", (t) => {
   const problems = runbookLinkProblems(root);
   assert.equal(problems.length, 1, problems.join("\n"));
   assert.match(problems[0], /^CLAUDE\.md is a symlink to OTHER\.md, not to AGENTS\.md\./);
+});
+
+// Windows clones do not track the executable bit, so `scripts/ccdm` and each
+// shim keep mode 100755 only if it is set in the index. A file checked out
+// without the bit is a "Permission denied" for a LaunchAgent.
+const SHIM_EXEC = /^\s*exec\s+"\$\(cd\s.*\bccdm"\s/m;
+
+function trackedModes() {
+  const listed = spawnSync("git", ["ls-files", "-s", "-z"], { cwd: REPO, encoding: "utf8", windowsHide: true });
+  assert.equal(listed.status, 0, listed.stderr);
+  return listed.stdout.split("\0").filter(Boolean).map((row) => {
+    return { mode: row.split(" ", 1)[0], file: row.slice(row.indexOf("\t") + 1) };
+  });
+}
+
+function executableModeProblems(rows, textOf) {
+  const needsExecutable = ({ file }) => file === "scripts/ccdm" || (file.endsWith(".sh") && SHIM_EXEC.test(textOf(file)));
+  return rows.filter(row => needsExecutable(row) && row.mode !== "100755").map(({ mode, file }) => `${file} is mode ${mode}, not 100755`);
+}
+
+test("scripts/ccdm and every shim are committed as mode 100755", () => {
+  const rows = trackedModes();
+  assert.ok(rows.some(({ file, mode }) => file === "scripts/ccdm" && mode === "100755"), "scripts/ccdm must be tracked as 100755");
+  assert.deepEqual(executableModeProblems(rows, file => fs.readFileSync(path.join(REPO, ...file.split("/")), "utf8")), []);
+});
+
+test("a shim without the executable bit is named", () => {
+  const shim = 'exec "$(cd "$(dirname "$0")" && pwd)/ccdm" stop "$@"\n';
+  const rows = [
+    { mode: "100644", file: "scripts/stop-session.sh" },
+    { mode: "100644", file: "scripts/not-a-shim.sh" },
+    { mode: "100644", file: "scripts/ccdm" },
+  ];
+  const texts = { "scripts/stop-session.sh": shim, "scripts/not-a-shim.sh": "echo hello\n" };
+  assert.deepEqual(executableModeProblems(rows, file => texts[file]), [
+    "scripts/stop-session.sh is mode 100644, not 100755",
+    "scripts/ccdm is mode 100644, not 100755",
+  ]);
 });
