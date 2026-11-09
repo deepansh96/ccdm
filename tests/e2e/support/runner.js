@@ -562,10 +562,20 @@ function runRouterClaudeHost() {
   // \`fixtures.claude.holdHellosIn\` keeps a thread's channel server (and so its
   // Router hello) from starting until the thread's id leaves the list.
   const heldThread = String(process.env.CCDM_ROUTER_KEY_FILE || "").match(/\\.thread-([^/]+)\\.key$/)?.[1];
+  // new-session starts this process before it records the session, so a session
+  // that is missing is only gone once it has been seen. The limit ends the wait
+  // when new-session failed after starting it.
+  const recordedWithinMs = 30000;
+  const waitingSince = Date.now();
+  let sessionSeen = false;
   const waitForAccept = setInterval(() => {
     const state = readState();
     const session = state.fixtures.tmux.sessions[sessionName];
-    if (!session) process.exit(0);
+    if (!session) {
+      if (sessionSeen || Date.now() - waitingSince > recordedWithinMs) process.exit(0);
+      return;
+    }
+    sessionSeen = true;
     if (session.devChannelPrompt !== "accepted") return;
     if (heldThread && (state.fixtures.claude.holdHellosIn || []).includes(heldThread)) return;
     clearInterval(waitForAccept);
