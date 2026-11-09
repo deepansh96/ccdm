@@ -222,6 +222,16 @@ test("with live sessions install-service host exits 1, names each one, prints th
   assert.ok(project.alive() && root.alive(), "the sessions were left running");
   assert.equal(serviceHost.exitCode, null, "the service host was left running");
 
+  // From inside a session the command would be ended by its own stop of the host.
+  for (const args of [["install-service", "host", "--force"], ["uninstall-service", "host"]]) {
+    const inside = await ccdm(workspace, args, { CCDM_SESSION_NAME: "root_agent" });
+    assert.equal(inside.exitCode, 1, `${args.join(" ")}: ${inside.stderr || inside.stdout}`);
+    assert.match(inside.stderr, /cannot run inside a CCDM session \(root_agent\)/);
+  }
+  assert.equal(invocations(workspace).length, before);
+  assert.equal(fs.existsSync(serviceFile(workspace, ".stop")), false);
+  assert.ok(project.alive() && root.alive());
+
   const { result } = await install(workspace, ["--force"]);
 
   assert.match(result.stdout, /--force: ending 2 live sessions/);

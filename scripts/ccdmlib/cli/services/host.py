@@ -53,6 +53,14 @@ def _force(options: Sequence[str]) -> bool:
     return bool(options)
 
 
+def _refuse_inside_a_session(what: str) -> None:
+    """Stopping the host ends the session a command runs in, and the command with it."""
+    name = os.environ.get("CCDM_SESSION_NAME")
+    if name:
+        raise ServiceError(1, f"Error: {what} cannot run inside a CCDM session ({name}): stopping the host "
+                              "would end this command half-way. Run it from a terminal outside CCDM.")
+
+
 def _run_node(node: str, args: Sequence[str], timeout: float) -> "subprocess.CompletedProcess[bytes]":
     return subprocess.run(
         [node, *args], cwd=str(ROOT_DIR), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -173,6 +181,7 @@ def plan(context: Context) -> Plan:
     if sessions:
         if not force:
             raise _refusal(sessions)
+        _refuse_inside_a_session("install-service host --force")
         print(f"--force: ending {len(sessions)} live session{'' if len(sessions) == 1 else 's'}")
         for line in _session_lines(sessions):
             print(line)
@@ -194,6 +203,7 @@ def before_uninstall(context: Context) -> None:
     sessions = _live_sessions()
     if not sessions:
         return
+    _refuse_inside_a_session("uninstall-service host")
     print(f"Ending {len(sessions)} live session{'' if len(sessions) == 1 else 's'} with the host")
     for line in _session_lines(sessions):
         print(line)
