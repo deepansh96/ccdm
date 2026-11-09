@@ -247,8 +247,7 @@ const hostBackend = {
     const { sessions } = await call("list");
     return sessions.filter(session => session.exit === null).map(({ name, kind, pid }) => ({ name, kind, pid }));
   },
-  // Until the owner-facing `scripts/ccdm attach` exists, the command that does attach.
-  attachHint: name => `Attach with: node scripts/ccdm-host.js attach -t ${name}`,
+  attachHint: (name, target) => `Attach with: scripts/ccdm attach ${target ?? name}`,
   async runDetached(argv, { cwd, env, log } = {}) {
     // The host resolves neither against the caller, and it needs an absolute log.
     const request = { argv, cwd: cwd ?? process.cwd(), env: withoutSessionName(env), log: log && path.resolve(log) };

@@ -5,6 +5,10 @@ tests/e2e/ci-contract.test.js
 tests/e2e/deepseek-local-usage.test.js
 tests/e2e/harness-safety.test.js
 tests/e2e/runner-contract.test.js
+tests/e2e/thread-capacity.test.js
+tests/e2e/thread-claude-session.test.js
+tests/e2e/thread-codex-session.test.js
+tests/e2e/thread-supervisor.test.js
 tests/e2e/usage-dashboard-renderer.test.js
 tests/e2e/windows-skip-budget.test.js
 tests/e2e/discord-mcp.test.js
@@ -45,3 +49,5 @@ tests/e2e/codex-start.test.js
 tests/e2e/windows-installer-router.test.js
 tests/e2e/restart-session.test.js
 tests/e2e/router-codex-session.test.js
+tests/e2e/root-cli.test.js
+tests/e2e/windows-installer-usage-poster.test.js

@@ -1,17 +1,18 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
 import { injectDiscordMessage } from "./support/bridge.js";
-import { PYTHON, assertPrivate } from "./support/platform.js";
+import { PYTHON, assertPrivate, platformGate } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
-import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerEnv, routerRegistry, routerWithWebhooks,
+import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerRegistry, routerWithWebhooks,
   runRouterCli, waitFor } from "./support/router.js";
+import { tmuxCalls } from "./support/session-fixture.js";
 import { readState, updateState } from "./support/state.js";
-import { cleanup } from "./support/teardown.js";
-import { startThreadSupervisor, supervisorStateDir, supervisorStatus } from "./support/thread-supervisor.js";
+import { cleanup, registerTeardownCallback } from "./support/teardown.js";
+import { startThreadHost, startThreadSupervisor, supervisorEnv, supervisorStateDir, supervisorStatus } from "./support/thread-supervisor.js";
 
 test.afterEach(cleanup);
 
@@ -120,7 +121,7 @@ test("an owner message in a new thread boots a Claude session whose first notifi
 // Claude runs its statusline with its own environment, which carries the
 // thread launch's key path.
 function runStatusline(workspace, pct) {
-  return runScript(workspace, "scripts/cc-statusline-wrapper.sh", {
+  return runScript(workspace, process.platform === "win32" ? "scripts/statusline-context.js" : "scripts/cc-statusline-wrapper.sh", {
     env: { CCDM_ROUTER_KEY_FILE: path.join(workspace.routerStateDir, "keys", `.thread-${THREAD_ID}.key`) },
     input: `${JSON.stringify({ context_window: { used_percentage: pct } })}\n`,
   });
@@ -227,7 +228,8 @@ test("no Discord credential reaches the thread session's environment, launch fil
   assertPrivate(path.join(workspace.routerStateDir, "keys", `.thread-${THREAD_ID}.key`));
   // The session runs in the project checkout, in its own tmux session.
   assert.equal(state.fixtures.tmux.sessions[THREAD_TMUX].cwd, workspace.tmpDir);
-  assert.deepEqual(state.fixtures.tmux.sessions[THREAD_TMUX].command.slice(0, 2), ["zsh", "-ic"]);
+  if (process.platform === "win32") assert.equal(state.fixtures.sessionHost.launches.at(-1).kind, "thread");
+  else assert.deepEqual(state.fixtures.tmux.sessions[THREAD_TMUX].command.slice(0, 2), ["zsh", "-ic"]);
   const status = await runRouterCli(workspace, ["status"]);
   assert.match(status.stdout, new RegExp(`thread demo thread=${THREAD_ID} provider=claude connected=`));
 });
@@ -356,7 +358,7 @@ test("a second launch for the same thread is refused while the first runs", asyn
   const key = fs.readFileSync(keyFile, "utf8");
 
   const second = await runScript(workspace, "scripts/start-thread-session.sh", {
-    args: ["demo", THREAD_ID, "--provider", "claude"], env: routerEnv(workspace),
+    args: ["demo", THREAD_ID, "--provider", "claude"], env: supervisorEnv(workspace),
   });
 
   assert.notEqual(second.exitCode, 0, second.stdout);
@@ -371,13 +373,14 @@ test("a second launch for the same thread is refused while the first runs", asyn
 test("a failed launch's cleanup leaves the key and launch dir a newer launch of the thread took over", async () => {
   const workspace = threadWorkspace();
   await routerWithWebhooks(workspace, ["demo"]);
+  if (process.platform === "win32") await startThreadHost(workspace);
   createThread(workspace);
   await waitFor(() => discord(workspace).threads?.[THREAD_ID], () => "the thread in Discord");
   updateState(workspace.stateDir, state => {
     state.fixtures.claude.holdHellosIn = [THREAD_ID];
   });
   const launching = runScript(workspace, "scripts/start-thread-session.sh", {
-    args: ["demo", THREAD_ID, "--provider", "claude"], env: routerEnv(workspace, { CCDM_THREAD_BOOT_TIMEOUT_S: "30" }),
+    args: ["demo", THREAD_ID, "--provider", "claude"], env: supervisorEnv(workspace, { CCDM_THREAD_BOOT_TIMEOUT_S: "30" }),
   });
   const keyFile = path.join(workspace.routerStateDir, "keys", `.thread-${THREAD_ID}.key`);
   const launchDir = path.join(workspace.routerStateDir, "launches", "demo", "threads", THREAD_ID);
@@ -391,7 +394,7 @@ test("a failed launch's cleanup leaves the key and launch dir a newer launch of 
   updateState(workspace.stateDir, state => {
     delete state.fixtures.tmux.sessions[THREAD_TMUX];
   });
-  process.kill(-pid, "SIGKILL");
+  process.kill(process.platform === "win32" ? pid : -pid, "SIGKILL");
 
   const result = await launching;
   assert.notEqual(result.exitCode, 0, result.stdout);
@@ -432,4 +435,229 @@ test("a resumed session's bootstrap carries the message that resumed it but not 
   const resumed = notifications(workspace)[1].content;
   assert.equal(occurrences(resumed, "picking this back up"), 1, resumed);
   assert.equal(occurrences(resumed, "The parser drops trailing commas"), 0, resumed);
+});
+
+// ---- the launcher, on each backend ----
+
+const WIN = process.platform === "win32";
+// Windows has only the fake ccdm-host; POSIX runs each case on tmux and on the fake host.
+const BACKENDS = WIN ? ["ccdm-host"] : ["tmux", "ccdm-host"];
+const KEY_FILE_FLAG = "--ccdm-key-file";
+const keyPath = workspace => path.join(workspace.routerStateDir, "keys", `.thread-${THREAD_ID}.key`);
+
+// `workspace` with its thread session on `backend`: the worker's env for it.
+async function backendSession(workspace, backend) {
+  if (backend === "ccdm-host") await startThreadHost(workspace);
+  await supervised(workspace);
+}
+
+// Through run() itself: the in-process contract, with no shell in the way.
+const RUN_LAUNCHER = `
+import json, os, sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, sys.argv[1])
+from ccdmlib.cli import start_thread_session as launcher
+print(json.dumps(launcher.run(json.loads(sys.argv[2]), dict(os.environ), os.getcwd())))
+`;
+
+function launcherRun(workspace, argv, env = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(PYTHON, ["-c", RUN_LAUNCHER, path.join(workspace.repoDir, "scripts"), JSON.stringify(argv)], {
+      cwd: workspace.tmpRoot, env: supervisorEnv(workspace, env), encoding: "utf8", windowsHide: true,
+    }, (error, stdout, stderr) => {
+      if (error) return reject(new Error(`${error.message}: ${stderr}`));
+      const [returncode, out, err] = JSON.parse(stdout.trim().split("\n").at(-1));
+      resolve({ returncode, stdout: out, stderr: err });
+    });
+  });
+}
+
+const homeRun = (workspace, home) => launcherRun(workspace, ["demo", THREAD_ID, "--provider", "claude", "--home", home]);
+
+function assertNothingStarted(workspace) {
+  assert.deepEqual(readState(workspace.stateDir).fixtures.claude.invocations, []);
+  assert.equal(fs.existsSync(keyPath(workspace)), false);
+  assert.deepEqual(tmuxCalls(workspace).filter(args => args[0] === "new-session"), []);
+}
+
+for (const value of ["with'quote", 'with"quote', "with$dollar", "with`backtick", "with\nnewline"]) {
+  const shown = JSON.stringify(value);
+  test(`a conversation home holding ${shown} is refused with exit 2, on every OS`, async () => {
+    const workspace = threadWorkspace();
+    const home = WIN ? `X:\\homes\\${value}` : `/tmp/${value}`;
+    const result = await homeRun(workspace, home);
+    assert.equal(result.returncode, 2, result.stderr);
+    assert.equal(result.stderr.trim(), `Invalid conversation home: '${home}'`);
+    assert.equal(result.stdout, "");
+    assertNothingStarted(workspace);
+  });
+}
+
+test("on Windows a drive or UNC conversation home passes the check and a relative one is refused", platformGate("win32", "Windows path forms"), async () => {
+  const workspace = threadWorkspace();
+  for (const home of ["X:\\homes\\claude-alt", "\\\\server\\share\\claude-alt"]) {
+    // Past the shape check: the home simply does not exist on this machine.
+    const accepted = await homeRun(workspace, home);
+    assert.equal(accepted.returncode, 1, accepted.stderr);
+    assert.equal(accepted.stderr.trim(), `The conversation's home ${home} is missing`);
+  }
+  for (const home of ["homes\\claude-alt", "\\homes\\claude-alt"]) {
+    const refused = await homeRun(workspace, home);
+    assert.equal(refused.returncode, 2, refused.stderr);
+    assert.match(refused.stderr, /Invalid conversation home/);
+  }
+  assertNothingStarted(workspace);
+});
+
+test("a relative conversation home is refused on every OS, and on POSIX one holding a backslash", async () => {
+  const workspace = threadWorkspace();
+  for (const home of WIN ? ["homes\\claude-alt"] : ["homes/claude-alt", "/tmp/with\\backslash"]) {
+    const refused = await homeRun(workspace, home);
+    assert.equal(refused.returncode, 2, refused.stderr);
+    assert.equal(refused.stderr.trim(), `Invalid conversation home: '${home}'`);
+  }
+  assertNothingStarted(workspace);
+});
+
+test("run() gives the command's usage, exit code and id checks, with nothing on stdout", async () => {
+  const workspace = threadWorkspace();
+  const usage = await launcherRun(workspace, ["demo"]);
+  assert.equal(usage.returncode, 2);
+  assert.match(usage.stderr, /^Usage: .* <project> <thread_id> --provider claude\|codex /);
+  const badId = await launcherRun(workspace, ["demo", "../evil", "--provider", "claude"]);
+  assert.equal(badId.returncode, 2);
+  assert.equal(badId.stderr.trim(), "Invalid thread id: '../evil'");
+  const badResume = await launcherRun(workspace, ["demo", THREAD_ID, "--provider", "claude", "--resume", "no/such"]);
+  assert.equal(badResume.returncode, 2);
+  assert.equal(badResume.stderr.trim(), "Invalid conversation id to resume: 'no/such'");
+  assert.equal(badId.stdout + badResume.stdout + usage.stdout, "");
+  assertNothingStarted(workspace);
+});
+
+test("boot needs no shell script: a thread boots to live with the shim gone, through its one launcher", async () => {
+  const workspace = threadWorkspace();
+  fs.rmSync(path.join(workspace.repoDir, "scripts", "start-thread-session.sh"));
+  await supervised(workspace);
+  await liveThread(workspace);
+  assert.equal(readState(workspace.stateDir).fixtures.claude.invocations.length, 1);
+});
+
+for (const backend of BACKENDS) {
+  test(`${backend}: a launch that shows the folder-trust prompt, then the channel prompt, reaches the Router`, async () => {
+    const workspace = threadWorkspace();
+    updateState(workspace.stateDir, state => { state.fixtures.claude.trustPrompt = true; });
+    await backendSession(workspace, backend);
+    await liveThread(workspace);
+    const session = readState(workspace.stateDir).fixtures.tmux.sessions[THREAD_TMUX];
+    assert.deepEqual(session.sendKeys, [["Enter"], ["Enter"]]);
+    assert.deepEqual([session.trustPrompt, session.devChannelPrompt], ["accepted", "accepted"]);
+    const status = await runRouterCli(workspace, ["status"]);
+    assert.match(status.stdout, new RegExp(`thread demo thread=${THREAD_ID} provider=claude connected=`));
+  });
+
+  test(`${backend}: an already-trusted launch accepts the channel prompt within 1 s of it appearing`, async () => {
+    const workspace = threadWorkspace();
+    await backendSession(workspace, backend);
+    createThread(workspace);
+    await threadRow(workspace);
+    threadMessage(workspace, "boot-message-1", "please fix the parser");
+    let appeared;
+    for (;;) {
+      const session = readState(workspace.stateDir).fixtures.tmux.sessions[THREAD_TMUX];
+      if (session?.devChannelPrompt === "pending" && appeared === undefined) appeared = performance.now();
+      if (session?.devChannelPrompt === "accepted") break;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    assert.ok(appeared === undefined || performance.now() - appeared < 1000, "Enter came more than 1 s after the channel prompt");
+    await threadRow(workspace, row => row.state === "live");
+    assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions[THREAD_TMUX].sendKeys, [["Enter"]]);
+  });
+
+  test(`${backend}: the thread mcp.json args carry the key file, the launch env holds no CCDM_THREAD_TMUX, and the hook strings are hook_command()'s`, async () => {
+    const workspace = threadWorkspace();
+    await backendSession(workspace, backend);
+    await liveThread(workspace);
+    const dir = launchDir(workspace);
+    const mcp = JSON.parse(fs.readFileSync(path.join(dir, "mcp.json"), "utf8")).mcpServers.ccdm;
+    const scriptsDir = path.join(fs.realpathSync.native(workspace.repoDir), "scripts");
+    assert.deepEqual(mcp.args, [path.join(scriptsDir, "ccdm-channel-server.js"), KEY_FILE_FLAG, keyPath(workspace)]);
+    assert.equal("CCDM_THREAD_TMUX" in mcp.env, false);
+    const launch = readState(workspace.stateDir).fixtures.sessionHost.launches.at(-1);
+    assert.equal("CCDM_THREAD_TMUX" in launch.env, false);
+    assert.equal(launch.env.CCDM_SESSION_NAME, THREAD_TMUX);
+
+    const python = script => execFileSync(PYTHON, ["-B", "-c", `import sys
+sys.path.insert(0, sys.argv[1])
+from ccdmlib.platform.hooks import hook_command
+print(hook_command(*sys.argv[2:]))`, path.join(workspace.repoDir, "scripts"), ...script], { encoding: "utf8" }).trim();
+    const expected = (...parts) => {
+      const command = python(parts);
+      if (!WIN) assert.equal(command, `node ${parts.map(part => `'${part}'`).join(" ")}`);
+      else assert.equal(command, `node ${parts.map(part => `'${part.replaceAll("\\", "/")}'`).join(" ")}`);
+      return command;
+    };
+    const activity = expected(path.join(scriptsDir, "thread-activity.js"), path.join(dir, "activity.json"));
+    const reminder = expected(path.join(scriptsDir, "claude-reminder-hook.js"));
+    const settings = JSON.parse(fs.readFileSync(path.join(dir, "settings.json"), "utf8"));
+    const commands = event => settings.hooks[event][0].hooks.map(hook => hook.command);
+    assert.deepEqual(commands("Stop"), [activity, reminder]);
+    assert.deepEqual(commands("StopFailure"), [activity, reminder]);
+    assert.deepEqual(commands("SessionStart"), [reminder]);
+    assert.deepEqual(commands("SessionEnd"), [reminder]);
+    if (WIN) {
+      assert.deepEqual(settings.statusLine, { type: "command", command: `node '${path.join(scriptsDir, "statusline-context.js").replaceAll("\\", "/")}'` });
+    } else {
+      assert.equal("statusLine" in settings, false);
+    }
+  });
+}
+
+test("a thread's own session gets the state root and backend it needs to find the host", async () => {
+  const workspace = threadWorkspace();
+  const host = await startThreadHost(workspace);
+  await supervised(workspace);
+  await liveThread(workspace);
+  const launch = readState(workspace.stateDir).fixtures.sessionHost.launches.at(-1);
+  assert.equal(launch.env.CCDM_STATE_ROOT, host.env.CCDM_STATE_ROOT);
+  assert.equal(launch.env.CCDM_SESSION_HOST, "ccdm-host");
+});
+
+test("on Windows a second launch of a live thread is refused because a process carries its key file", platformGate("win32", "POSIX finds listeners by their environment"), async () => {
+  const workspace = threadWorkspace();
+  await routerWithWebhooks(workspace, ["demo"]);
+  await startThreadHost(workspace);
+  const listener = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", KEY_FILE_FLAG, keyPath(workspace)],
+    { stdio: "ignore", windowsHide: true });
+  const exited = new Promise(resolve => listener.once("exit", resolve));
+  registerTeardownCallback(async () => {
+    listener.kill();
+    await exited;
+  });
+  await new Promise(resolve => setTimeout(resolve, 500));
+
+  const second = await launcherRun(workspace, ["demo", THREAD_ID, "--provider", "claude"]);
+
+  assert.equal(second.returncode, 1, second.stderr);
+  assert.match(second.stderr, new RegExp(`Refusing to start thread ${THREAD_ID}: listener process\\(es\\) already use .*${listener.pid}`));
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions[THREAD_TMUX], undefined);
+});
+
+test("on Windows the recorded runtime_pid is the Claude process, stored with its start time", platformGate("win32", "only Windows records a start time"), async () => {
+  const workspace = threadWorkspace();
+  await supervised(workspace);
+  await liveThread(workspace);
+  const store = path.join(supervisorStateDir(workspace), "threads.sqlite3");
+  const row = () => JSON.parse(execFileSync(PYTHON, ["-c",
+    `import json, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+print(json.dumps(db.execute("SELECT runtime_pid, runtime_tmux, provider_home FROM threads WHERE thread_id = ?", (sys.argv[2],)).fetchone()))`,
+    store, THREAD_ID], { encoding: "utf8" }));
+  await waitFor(() => row()[0] != null, () => "the launcher's result on the row");
+  const [pid, tmux, home] = row();
+  assert.equal(tmux, THREAD_TMUX);
+  assert.equal(pid, readState(workspace.stateDir).fixtures.claude.invocations[0].pid);
+  assert.ok(fs.existsSync(path.join(home, "sessions", `${pid}.json`)), `${home}/sessions/${pid}.json`);
+  const runtime = JSON.parse(fs.readFileSync(path.join(launchDir(workspace), "runtime.json"), "utf8"));
+  assert.equal(runtime.pid, pid);
+  assert.match(runtime.pid_started_at, /^\d+$/);
 });

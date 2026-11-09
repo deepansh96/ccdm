@@ -172,7 +172,8 @@ for (const language of LANGUAGES) {
 
   test(`${language} fake host: attachHint names a command that attaches`, async () => {
     const { ok } = await world(language);
-    assert.match(await ok("attachHint", ["seam-i", "demo"]), /^Attach with: .*seam-i$/);
+    assert.equal(await ok("attachHint", ["seam-i", "demo"]), "Attach with: scripts/ccdm attach demo");
+    assert.equal(await ok("attachHint", ["seam-i"]), "Attach with: scripts/ccdm attach seam-i");
   });
 
   test(`${language} fake host: runDetached passes cwd and env, never the session name, and the helper is outside every session`, async () => {

@@ -27,6 +27,8 @@ import sys
 import threading
 import time
 
+from ccdmlib.platform import session_host
+
 from . import registry, reminders, store
 from .link import LinkError
 from .paths import router_state_dir
@@ -84,6 +86,8 @@ def _is_listener(command: str) -> bool:
 
 def _listener_pids(key_file: Path) -> list[int]:
     """The thread's listener processes: those whose environment carries exactly its key path."""
+    if sys.platform == "win32":
+        return []  # No environment to read there; the session host stops the whole session.
     target = os.path.normpath(str(key_file))
     try:
         ps = subprocess.check_output(["ps", "axeww", "-o", "pid=,command="], text=True, stderr=subprocess.DEVNULL)
@@ -106,7 +110,7 @@ def session_running(thread_id: str) -> bool:
 
 def stop_session(context, row) -> None:
     """Stop a thread's session by its `.thread-<id>.key` path, never by name
-    patterns a project or sibling session could match; then its own tmux
+    patterns a project or sibling session could match; then its own
     session and key go."""
     from . import boot  # boot imports capacity, which imports this module.
 
@@ -114,7 +118,10 @@ def stop_session(context, row) -> None:
     boot.drop(context, thread_id)
     kill_listeners(key_path(thread_id))
     if row["runtime_tmux"]:
-        subprocess.run(["tmux", "kill-session", "-t", f"={row['runtime_tmux']}"], capture_output=True)
+        try:
+            session_host.stop(row["runtime_tmux"])
+        except session_host.SessionHostError as error:
+            _log(f"thread {thread_id}: its session could not be stopped: {error}")
     key_path(thread_id).unlink(missing_ok=True)
     store.update(context.db, thread_id, runtime_pid=None, runtime_tmux=None)
 

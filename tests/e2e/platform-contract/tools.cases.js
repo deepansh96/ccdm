@@ -324,6 +324,13 @@ export default [
     value: ctx => plain(path.join(ctx.dir, "c.exe")),
   },
   {
+    name: "win32 runs a codex.js override with node",
+    only: "win32",
+    ...tool("codex"),
+    env: ctx => ({ CCDM_CODEX_PATH: path.join(ctx.dir, "codex.js"), PATH: NODE_DIR }),
+    value: ctx => ({ command: process.execPath, args: [path.join(ctx.dir, "codex.js")], env: {} }),
+  },
+  {
     name: "win32 finds codex.exe in a platform package beside the npm package",
     only: "win32",
     ...tool("codex"),

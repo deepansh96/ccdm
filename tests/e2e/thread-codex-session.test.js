@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
@@ -8,11 +8,11 @@ import test from "node:test";
 import { injectDiscordMessage, startFakeCodexServer } from "./support/bridge.js";
 import { PYTHON, assertPrivate } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
-import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerEnv, routerRegistry, routerWithWebhooks,
+import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerRegistry, routerWithWebhooks,
   runRouterCli, waitFor } from "./support/router.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
-import { startThreadSupervisor, supervisorStateDir, supervisorStatus, waitForThreadIdle } from "./support/thread-supervisor.js";
+import { startThreadHost, startThreadSupervisor, supervisorEnv, supervisorStateDir, supervisorStatus, waitForThreadIdle } from "./support/thread-supervisor.js";
 
 test.afterEach(cleanup);
 
@@ -195,7 +195,15 @@ test("no Discord credential reaches the Codex thread's environment, launch files
   const state = readState(workspace.stateDir);
   const session = state.fixtures.tmux.sessions[THREAD_TMUX];
   assert.ok(session, JSON.stringify(Object.keys(state.fixtures.tmux.sessions)));
-  assert.deepEqual(session.command.slice(0, 2), ["zsh", "-ic"]);
+  if (process.platform === "win32") {
+    // A no-PTY host session running the bridge, whose key path is on its command line.
+    const launch = state.fixtures.sessionHost.launches.find(entry => entry.name === THREAD_TMUX);
+    assert.deepEqual([launch.kind, launch.pty], ["thread", false]);
+    const keyFile = path.join(workspace.routerStateDir, "keys", `.thread-${THREAD_ID}.key`);
+    assert.deepEqual(launch.argv.slice(1), ["scripts/codex-bridge.js", "--ccdm-key-file", keyFile]);
+  } else {
+    assert.deepEqual(session.command.slice(0, 2), ["zsh", "-ic"]);
+  }
   assert.equal(session.env.CCDM_ROUTER_KEY_FILE, path.join(workspace.routerStateDir, "keys", `.thread-${THREAD_ID}.key`));
   assert.equal(session.env.CHANNEL_ID, THREAD_ID);
   assert.equal(session.env.PROJECT_DIR, workspace.tmpDir);
@@ -233,7 +241,7 @@ test("a project session and a Codex thread sharing one Codex Home each load only
   const { listenWhenAllocated } = await threadCodex(workspace, 29420, { bootstrapPlan: { mcpReplyText: "on it" } });
   await supervised(workspace, 29420);
   const started = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["demo"], env: routerEnv(workspace), timeoutMs: 30000,
+    args: ["demo"], env: supervisorEnv(workspace), timeoutMs: 30000,
   });
   assert.equal(started.exitCode, 0, started.stderr || started.stdout);
 
@@ -269,4 +277,120 @@ test("an unknown Codex account alias fails the start with a one-line reason", as
   assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", `.thread-${THREAD_ID}.key`)), false);
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions[THREAD_TMUX], undefined);
   assert.deepEqual(readState(workspace.stateDir).fixtures.codex.bridgeInvocations, []);
+});
+
+// ---- the launcher's in-process contract ----
+
+// Two launches at once in one process, as the worker's launch threads make them.
+// Any `ps` or `tmux` run, or `os.kill(pid, 0)`, is reported (Windows must make none).
+const RUN_CONCURRENTLY = `
+import json, os, subprocess, sys, threading
+sys.dont_write_bytecode = True
+sys.path.insert(0, sys.argv[1])
+from ccdmlib.cli import start_thread_session as launcher
+
+launches = json.loads(sys.argv[2])
+forbidden = []
+real = {name: getattr(subprocess, name) for name in ("run", "check_output", "Popen")}
+def watching(name):
+    def call(args, *rest, **options):
+        program = os.path.basename(str(args[0] if isinstance(args, (list, tuple)) else args)).lower()
+        if program in ("ps", "ps.exe", "tmux", "tmux.exe"):
+            forbidden.append(str(args))
+        return real[name](args, *rest, **options)
+    return call
+for name in real:
+    setattr(subprocess, name, watching(name))
+real_kill = os.kill
+def kill(pid, sig):
+    if sig == 0:
+        forbidden.append(f"os.kill({pid}, 0)")
+    return real_kill(pid, sig)
+os.kill = kill
+
+before = (dict(os.environ), os.getcwd())
+results = [None] * len(launches)
+def launch(index, item):
+    results[index] = launcher.run(item["argv"], {**os.environ, **item["env"]}, os.getcwd())
+threads = [threading.Thread(target=launch, args=(index, item)) for index, item in enumerate(launches)]
+for thread in threads: thread.start()
+for thread in threads: thread.join()
+print(json.dumps({"unchanged": before == (dict(os.environ), os.getcwd()), "forbidden": forbidden, "results": results}))
+`;
+
+function runConcurrently(workspace, launches, env = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(PYTHON, ["-c", RUN_CONCURRENTLY, path.join(workspace.repoDir, "scripts"), JSON.stringify(launches)], {
+      cwd: workspace.tmpRoot, env: supervisorEnv(workspace, env), encoding: "utf8", windowsHide: true, maxBuffer: 1 << 22,
+    }, (error, stdout, stderr) => {
+      if (error) return reject(new Error(`${error.message}: ${stderr}`));
+      resolve(JSON.parse(stdout.trim().split("\n").at(-1)));
+    });
+  });
+}
+
+test("two launches running at once each get their own bootstrap file and port, and leave the process's environment and cwd alone", async () => {
+  const workspace = threadWorkspace();
+  await routerWithWebhooks(workspace, ["demo"]);
+  await startThreadHost(workspace);
+  const threads = [{ id: THREAD_ID, port: 29440, uuid: CODEX_THREAD_UUID },
+    { id: "1700000000000654322", port: 29441, uuid: "0199a5c4-7e1b-7c3d-9f2a-4b8e6d1c3a58" }];
+  for (const thread of threads) {
+    await startFakeCodexServer(workspace, { port: thread.port, codexHome: codexHome(workspace), channelId: thread.id,
+      threadId: thread.uuid, bootstrapPlan: { mcpReplyText: "on it" } });
+    updateState(workspace.stateDir, state => {
+      (state.fixtures.discord.injectedThreads ||= []).push({ id: thread.id, type: 11, parentId: "demo-channel",
+        name: "Fix flaky test", ownerId: OWNER_ID, autoArchiveDuration: 1440, event: "create" });
+    });
+    await waitFor(() => discord(workspace).threads?.[thread.id], () => `thread ${thread.id} in Discord`);
+  }
+
+  const bootstrap = id => path.join(workspace.tmpRoot, `bootstrap-${id}.json`);
+  const { unchanged, forbidden, results } = await runConcurrently(workspace, threads.map(thread => ({
+    argv: ["demo", thread.id, "--provider", "codex"],
+    env: { CCDM_THREAD_BOOTSTRAP_FILE: bootstrap(thread.id), CCDM_THREAD_WS_PORT: String(thread.port), CCDM_THREAD_BOOT_TIMEOUT_S: "30" },
+  })));
+
+  assert.equal(unchanged, true, "os.environ or the cwd changed");
+  if (process.platform === "win32") assert.deepEqual(forbidden, []);
+  for (const [index, thread] of threads.entries()) {
+    const [returncode, stdout, stderr] = results[index];
+    assert.equal(returncode, 0, stderr);
+    const result = JSON.parse(stdout.trim().split(/\r?\n/).at(-1));
+    assert.equal(result.ws_port, thread.port);
+    assert.equal(result.tmux, `demo_claude-t-${thread.id}`);
+    assert.equal(result.provider_conversation_id, thread.uuid);
+    assert.ok(Number.isInteger(result.pid));
+    if (process.platform === "win32") assert.match(result.pid_started_at, /^\d+$/);
+    const launch = readState(workspace.stateDir).fixtures.sessionHost.launches.find(entry => entry.name === result.tmux);
+    assert.deepEqual([launch.kind, launch.pty], ["thread", false]);
+    assert.equal(launch.env.CCDM_THREAD_BOOTSTRAP_FILE, bootstrap(thread.id));
+    assert.equal(launch.env.WS_PORT, String(thread.port));
+    assert.equal(launch.env.CHANNEL_ID, thread.id);
+    assert.equal(launch.env.CCDM_THREAD_ID, thread.id);
+  }
+});
+
+test("a caller's own thread identity does not reach a new bridge on ccdm-host", async () => {
+  const workspace = threadWorkspace();
+  await routerWithWebhooks(workspace, ["demo"]);
+  await startThreadHost(workspace);
+  const { codex } = await threadCodex(workspace, 29445, { bootstrapPlan: { mcpReplyText: "on it" } });
+  await codex.listen();
+  updateState(workspace.stateDir, state => {
+    (state.fixtures.discord.injectedThreads ||= []).push({ id: THREAD_ID, type: 11, parentId: "demo-channel",
+      name: "Fix flaky test", ownerId: OWNER_ID, autoArchiveDuration: 1440, event: "create" });
+  });
+  await waitFor(() => discord(workspace).threads?.[THREAD_ID], () => "the thread in Discord");
+  const result = await runScript(workspace, "scripts/start-thread-session.sh", {
+    args: ["demo", THREAD_ID, "--provider", "codex"],
+    env: supervisorEnv(workspace, { CCDM_THREAD_WS_PORT: "29445", CCDM_ROUTER_ROLE: "root", CCDM_THREAD_ID: "someone-elses-thread",
+      CCDM_THREAD_BOOT_TIMEOUT_S: "30" }),
+    timeoutMs: 60000,
+  });
+  assert.equal(result.exitCode, 0, result.stderr);
+  const launch = readState(workspace.stateDir).fixtures.sessionHost.launches.find(entry => entry.name === THREAD_TMUX);
+  assert.equal(launch.env.CCDM_THREAD_ID, THREAD_ID);
+  assert.equal("CCDM_ROUTER_ROLE" in launch.env, false);
+  assert.equal(launch.env.CCDM_SESSION_HOST, "ccdm-host");
 });

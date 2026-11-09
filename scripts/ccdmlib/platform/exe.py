@@ -208,6 +208,8 @@ def _vendored_codex(package_dir: str) -> Optional[str]:
 def codex() -> Dict[str, Any]:
     configured = _override("CCDM_CODEX_PATH")
     if configured:
+        if WIN32 and configured.lower().endswith(".js"):
+            return {"command": node()["command"], "args": [configured], "env": {}}
         return _plain(configured)
     if not WIN32:
         return _plain("codex")

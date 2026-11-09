@@ -83,7 +83,7 @@ const replies = (workspace, thread) => posts(workspace, thread).filter(post => p
 const notices = (workspace, thread) => posts(workspace, thread).filter(post => !post.webhookId).map(post => post.content);
 const stopHooks = workspace => (claude(workspace).hookRuns ?? []).filter(run => run.event === "Stop").length;
 const invocationsFor = (workspace, thread) =>
-  claude(workspace).invocations.filter(invocation => invocation.args.some(arg => arg.includes(`/threads/${thread.id}/`)));
+  claude(workspace).invocations.filter(invocation => invocation.args.some(arg => arg.replaceAll("\\", "/").includes(`/threads/${thread.id}/`)));
 const resumeArg = invocation => {
   const index = invocation.args.indexOf("--resume");
   return index < 0 ? null : invocation.args[index + 1].replace(/^'|'$/g, "");
@@ -167,7 +167,7 @@ test("with no caps entry the defaults apply, and an invalid cap falls back to it
 test("a session mid-turn or without activity.json is never evicted: new threads queue, and drain FIFO as slots free", async () => {
   const workspace = capacityWorkspace(capsRegistry({ claude: 2 }));
   await supervised(workspace);
-  holdTurns(workspace, THREADS.a);
+  holdTurns(workspace, THREADS.a, THREADS.c);  // An idle C could be evicted for D, the queue head.
   await liveClaudeThread(workspace, THREADS.a);
   await idleClaudeThread(workspace, THREADS.b);
   // B's turn ended, but with its activity file lost it counts as busy.

@@ -170,6 +170,7 @@ function vendoredCodex(packageDir) {
 
 function codexCommand() {
   const configured = override("CCDM_CODEX_PATH");
+  if (configured && WIN32 && /\.js$/i.test(configured)) return { command: resolveCommand("node").command, args: [configured], env: {} };
   if (configured) return plain(configured);
   if (!WIN32) return plain("codex");
   // The npm shim is a .cmd, so it only says where the package is.

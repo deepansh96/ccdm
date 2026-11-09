@@ -60,6 +60,8 @@ async function restartWorld(backend, { type = "claude", screen = "demo_session",
   ]) {
     if (!real.includes(name)) replaceModule(workspace, file, standIn(name, variable));
   }
+  // The thread launcher imports names from the Codex launcher, which is a stand-in here.
+  fs.rmSync(path.join(workspace.repoDir, "scripts", "ccdmlib", "cli", "start_thread_session.py"));
   const baseEnv = {
     ...(fake?.env ?? { CCDM_STATE_ROOT: stateRoot, CCDM_SESSION_HOST: "tmux" }),
     CCDM_ROUTER_STATE_DIR: routerState,

@@ -80,7 +80,7 @@ const repoAsLaunched = workspace => (WIN ? fs.realpathSync.native(workspace.repo
 const DEFAULT_BACKEND = WIN ? "ccdm-host" : "tmux";
 const BACKENDS = WIN ? ["ccdm-host"] : ["tmux", "ccdm-host"];
 const SESSION_WORD = WIN ? "session" : "tmux session";
-const ATTACH_HINT = WIN ? "Attach with: node scripts/ccdm-host\\.js attach -t" : "Attach with: tmux attach -t";
+const ATTACH_HINT = WIN ? "Attach with: scripts/ccdm attach alpha" : "Attach with: tmux attach -t alpha_session";
 const LAUNCH_TIMEOUT_MS = WIN ? 30000 : undefined;
 
 const fakeHosts = new WeakMap();
@@ -190,7 +190,7 @@ test("a Claude project with no transport field starts through the Router and rec
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.match(result.stdout, new RegExp(`Started Claude Router session in ${SESSION_WORD} 'alpha_session'`));
   assert.match(result.stdout, /Channel server connected to the Router \(scope channel-1\)/);
-  assert.match(result.stdout, new RegExp(`${ATTACH_HINT} alpha_session`));
+  assert.match(result.stdout, new RegExp(ATTACH_HINT));
   assert.match(result.stdout, /Recorded PID \d+ and session fixture-session-\d+/);
 
   const registry = readRegistry(workspace);
