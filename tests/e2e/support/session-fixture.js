@@ -327,7 +327,8 @@ export function createSessionFixture(context) {
     const program = path.basename(argv[0]).replace(/\.(exe|cmd)$/i, "");
     if (program === "claude") return { kind: "claude-listener", cwd, env, claudeArgs: argv.slice(1) };
     if (program === "node" && argv.some(arg => path.basename(arg) === "codex-bridge.js")) {
-      return { kind: "codex-bridge", cwd, env, bridgeCommand: "node scripts/codex-bridge.js" };
+      const script = argv.findIndex(arg => path.basename(arg) === "codex-bridge.js");
+      return { kind: "codex-bridge", cwd, env, bridgeCommand: "node scripts/codex-bridge.js", bridgeArgs: argv.slice(script + 1) };
     }
     return { kind: "generic", cwd, env };
   }
@@ -506,7 +507,7 @@ export function createSessionFixture(context) {
 
 // Starts the fake ccdm-host for a workspace. `env` is what a seam call needs to
 // find it. The fixture runtime is the same one the fixture commands run.
-export async function startFakeHost(workspace, { badProof = false, env = workspace.env } = {}) {
+export async function startFakeHost(workspace, { badProof = false, env: extraEnv = {} } = {}) {
   const { registerTeardownCallback } = await import("./teardown.js");
   const stateRoot = path.join(workspace.tmpRoot, "fake-host-state");
   const hostDir = path.join(stateRoot, "host");
@@ -514,7 +515,8 @@ export async function startFakeHost(workspace, { badProof = false, env = workspa
   const child = spawn(process.execPath, [runtime, "ccdm-host-fake", workspace.tmpRoot], {
     cwd: workspace.tmpRoot,
     env: {
-      ...env,
+      ...workspace.env,
+      ...extraEnv,
       CCDM_FAKE_HOST_DIR: hostDir,
       ...(badProof ? { CCDM_FAKE_HOST_BAD_PROOF: "1" } : {}),
     },

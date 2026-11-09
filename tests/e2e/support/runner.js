@@ -426,16 +426,21 @@ function parseClaudeLaunch(shellCommand) {
   };
 }
 
+// A quoted launch-string value, as the shell would read it.
+function unescapeSingleQuotes(value) {
+  return value === undefined ? undefined : value.replace(/'\\\\''/g, "'");
+}
+
 function parseCodexBridgeLaunch(shellCommand) {
-  const match = /^cd '([^']*)' && ([\\s\\S]+) node scripts\\/codex-bridge\\.js$/.exec(shellCommand);
+  const match = /^cd '((?:[^']|'\\\\'')*)' && ([\\s\\S]+) node scripts\\/codex-bridge\\.js$/.exec(shellCommand);
   if (!match) {
     throw new Error(\`unsupported tmux launch command: \${shellCommand}\`);
   }
   const env = {};
   const envText = match[2];
-  const envRe = /([A-Z_]+)=(?:'([^']*)'|([^\\s]+))/g;
+  const envRe = /([A-Z_]+)=(?:'((?:[^']|'\\\\'')*)'|([^\\s]+))/g;
   for (const envMatch of envText.matchAll(envRe)) {
-    env[envMatch[1]] = envMatch[2] ?? envMatch[3];
+    env[envMatch[1]] = unescapeSingleQuotes(envMatch[2]) ?? envMatch[3];
   }
   // Every Codex launch is a Router launch: it carries the launch key file path
   // instead of any bot identity; root's names no project.
@@ -450,7 +455,7 @@ function parseCodexBridgeLaunch(shellCommand) {
     }
   }
   return {
-    cwd: match[1],
+    cwd: unescapeSingleQuotes(match[1]),
     env,
     bridgeCommand: "node scripts/codex-bridge.js",
   };
@@ -525,7 +530,7 @@ function spawnRouterClaude(name, launch) {
 // process, against the fake Codex app-server registered for its port.
 function spawnRouterBridge(launch) {
   const logFile = fs.openSync(path.join(stateDir, \`codex-bridge-\${Date.now()}.log\`), "a");
-  const child = spawn(process.execPath, [path.join(launch.cwd, "scripts/codex-bridge.js"), workspaceMarker], {
+  const child = spawn(process.execPath, [path.join(launch.cwd, "scripts/codex-bridge.js"), ...(launch.bridgeArgs ?? []), workspaceMarker], {
     cwd: launch.cwd,
     detached: true,
     // A tmux fixture has no stdin to hold open, so this bridge gets NUL and stops
@@ -1709,7 +1714,7 @@ export const createWorkspace = Object.freeze(function createWorkspace(options = 
   // tests/run-e2e.mjs reads this line to remove workspaces a killed file left behind.
   process.stderr.write(`ccdm-e2e-workspace ${tmpRoot}\n`);
   stateDir = path.join(tmpRoot, "state");
-  const repoDir = path.join(tmpRoot, "repo");
+  const repoDir = path.join(tmpRoot, options.repoDirName ?? "repo");
   const homeDir = path.join(tmpRoot, "home");
   const tmpDir = path.join(tmpRoot, "tmp");
   const fixtureDir = path.join(tmpRoot, "fixtures");
@@ -1719,6 +1724,8 @@ export const createWorkspace = Object.freeze(function createWorkspace(options = 
   }
 
   copySourceFiles(root, repoDir, files);
+  // The fixture runtime finds the checkout at <tmpRoot>/repo.
+  if (options.repoDirName) fs.symlinkSync(repoDir, path.join(tmpRoot, "repo"), "junction");
   assertWorkspaceClean(repoDir);
   createFixtures(fixtureDir, options);
   if (WIN) {
