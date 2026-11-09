@@ -389,12 +389,14 @@ test("on Windows, a stopped session leaves nothing from its Job and no process c
   const root = spawnWithArgs(["--mcp-config", world.files.mcp]);
   const child = spawnWithArgs(["--ccdm-key-file", world.files.key]);
   world.registry.projects.alpha.pid = root;
+  world.registry.projects.alpha.pid_started_at = "133000000000000000";
   seedRegistry(world.workspace, world.registry);
   seedTmuxSession("alpha_session", { pid: root, job: [root, child] }, { stateDir: world.workspace.stateDir });
 
   const result = await world.stop();
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.equal(readRegistry(world.workspace).projects.alpha.pid_started_at, null);
   assert.match(result.stdout, new RegExp(`Stopping recorded process tree for 'alpha' \\(pid ${root}\\)`));
   assert.match(result.stdout, /Stopped session 'alpha_session'/);
   assert.doesNotMatch(result.stdout, /tmux/);

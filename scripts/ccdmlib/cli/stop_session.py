@@ -557,8 +557,10 @@ def _remove_claude_state(session: _Session) -> None:
 
 def _clear_registry(project: str) -> int:
     registry_update = importlib.import_module("registry-update")
-    fields = '{"session_id": null, "pid": null}'
-    return int(registry_update.main(["set-project-fields", str(ROOT_DIR / "registry.json"), project, fields]))
+    fields = {"session_id": None, "pid": None}
+    if proc.WIN32:  # Only the Windows launchers record the PID's start time.
+        fields["pid_started_at"] = None
+    return int(registry_update.main(["set-project-fields", str(ROOT_DIR / "registry.json"), project, json.dumps(fields)]))
 
 
 def _stop_channel(project: str) -> int:
