@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import test from "node:test";
 
@@ -19,6 +20,10 @@ import { readState, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 
 test.afterEach(async () => { await cleanup(); });
+
+const require = createRequire(import.meta.url);
+const { hookCommand } = require("../../scripts/platform/hooks.js");
+const { ensurePrivateDirSync } = require("../../scripts/platform/privacy.js");
 
 // Conversation Reminder events of a Claude project session. Every Claude
 // session is served through the Router, and its CCDM channel server records
@@ -64,9 +69,12 @@ let launchCounter = 0;
 // connected to the Router. `root` runs it in root's role.
 async function startChannel(workspace, options = {}) {
   launchCounter += 1;
-  const hookSettings = path.join(workspace.tmpDir, `claude-reminder-hooks-${launchCounter}.json`);
+  // The server trusts the hook settings only from a private directory.
+  const hookDir = path.join(workspace.tmpDir, "claude-hook-settings");
+  ensurePrivateDirSync(hookDir);
+  const hookSettings = path.join(hookDir, `claude-reminder-hooks-${launchCounter}.json`);
   if (!options.noHooksConfig) {
-    const command = `node '${path.join(workspace.repoDir, "scripts", "claude-reminder-hook.js")}'`;
+    const command = hookCommand(path.join(workspace.repoDir, "scripts", "claude-reminder-hook.js"));
     fs.writeFileSync(hookSettings, JSON.stringify({
       ...(options.noSingleListenerConfig ? {} : { enabledPlugins: { "discord@claude-plugins-official": false } }),
       hooks: Object.fromEntries(
@@ -569,8 +577,11 @@ test("shared receiver rejects a Claude owner event after provider reassignment",
   assert.equal(JSON.parse(result.stdout).status, "rejected");
 });
 
+// The Bash launchers read UTF-8 pane text through Python, which on Windows defaults to the ANSI code page.
+const WINDOWS_LAUNCHER_ENV = process.platform === "win32" ? { PYTHONUTF8: "1" } : {};
+
 function startSession(workspace) {
-  return runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace), timeoutMs: 30000 });
+  return runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace, WINDOWS_LAUNCHER_ENV), timeoutMs: 30000 });
 }
 
 test("Claude launcher, channel server, command hooks and readiness share one launch identity", async () => {

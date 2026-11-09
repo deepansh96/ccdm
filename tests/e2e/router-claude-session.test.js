@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { assertPrivate } from "./support/platform.js";
+import { assertPrivate, platformGate } from "./support/platform.js";
 import { injectDiscordMessage, waitForState } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import {
@@ -36,8 +36,11 @@ function claudeRouterWorkspace() {
   return workspace;
 }
 
+// The Bash launchers read UTF-8 pane text through Python, which on Windows defaults to the ANSI code page.
+const WINDOWS_LAUNCHER_ENV = process.platform === "win32" ? { PYTHONUTF8: "1" } : {};
+
 function startSession(workspace, extraEnv = {}) {
-  return runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace, extraEnv) });
+  return runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace, { ...WINDOWS_LAUNCHER_ENV, ...extraEnv }) });
 }
 
 test("start-session launches a router Claude project whose channel server says hello to the Router", async () => {
@@ -115,11 +118,14 @@ test("no Discord bot or webhook token reaches the session environment, launch fi
     }
   }
   assert.deepEqual(Object.keys(mcpConfig.mcpServers), ["ccdm"]);
-  assert.deepEqual(mcpConfig.mcpServers.ccdm.args, [path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js")]);
-  for (const file of fs.readdirSync(launchDir)) {
-    assertPrivate(path.join(launchDir, file), file);
+  assert.deepEqual(mcpConfig.mcpServers.ccdm.args.map((arg) => path.resolve(arg)), [path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js")]);
+  // The Bash launcher cannot protect these on Windows; P3.3's launcher will.
+  if (process.platform !== "win32") {
+    for (const file of fs.readdirSync(launchDir)) {
+      assertPrivate(path.join(launchDir, file), file);
+    }
+    assertPrivate(path.join(workspace.routerStateDir, "keys", "demo.key"));
   }
-  assertPrivate(path.join(workspace.routerStateDir, "keys", "demo.key"));
 });
 
 function assertLaunchCleanedUp(workspace) {
@@ -147,7 +153,7 @@ test("a launch whose development-channel confirmation never appears exits non-ze
   assertLaunchCleanedUp(workspace);
 });
 
-test("a launch whose Router hello fails exits non-zero and cleans up", async () => {
+test("a launch whose Router hello fails exits non-zero and cleans up", platformGate("posix", "the Bash launcher cleanup; Windows launcher is P3.3"), async () => {
   const workspace = claudeRouterWorkspace();
   // demo has its webhook, but no Router is running, so the channel server's
   // hello cannot succeed.
@@ -171,7 +177,7 @@ test("a launch whose Router hello fails exits non-zero and cleans up", async () 
   assertLaunchCleanedUp(workspace);
 });
 
-test("after stop-session the Router treats the channel as offline and the next owner message gets 💤", async () => {
+test("after stop-session the Router treats the channel as offline and the next owner message gets 💤", platformGate("posix", "stop-session.sh is zsh; the Windows stop path is P3.3"), async () => {
   const workspace = claudeRouterWorkspace();
   const router = await routerWithWebhooks(workspace, ["demo"]);
   const started = await startSession(workspace);
@@ -240,8 +246,9 @@ test("the statusline's context percentage rides on the next reply's Project Iden
   assert.equal(second.exitCode, 0, second.stderr || second.stdout);
   assert.equal(await ownerMessageReply(workspace, "owner-message-2", 2), "demo-claude · 57%");
 
+  // The Bash launcher cannot make its launch directory private on Windows; P3.3's launcher will.
   const context = path.join(workspace.routerStateDir, "launches", "demo", "context.json");
-  assertPrivate(context);
+  if (process.platform !== "win32") assertPrivate(context);
 
   const nicknames = await runStatusline(workspace, "scripts/cc-discord-nicknames.sh", 61);
   assert.equal(nicknames.exitCode, 0, nicknames.stderr || nicknames.stdout);
@@ -443,7 +450,7 @@ test("export_message_range returns the supplementary Discord MCP's exported-to l
 
   const [exported] = await toolResults(workspace, 1);
   const exportText = exported.result.content[0].text;
-  assert.match(exportText, /^exported to \//, JSON.stringify(exported));
+  assert.match(exportText, /^exported to (?:\/|[A-Za-z]:\\)/, JSON.stringify(exported));
   const exportPath = exportText.replace(/^exported to /, "");
   const text = fs.readFileSync(exportPath, "utf8");
   assert.match(text, /Message ID: 102/);
@@ -468,7 +475,7 @@ test("a read past 100 messages returns the supplementary Discord MCP's saved-tra
 
   const [read] = await toolResults(workspace, 1);
   const text = read.result.content[0].text;
-  assert.match(text, /^saved 120 messages to \//, JSON.stringify(read));
+  assert.match(text, /^saved 120 messages to (?:\/|[A-Za-z]:\\)/, JSON.stringify(read));
   const transcript = text.replace(/^saved 120 messages to /, "");
   const lines = fs.readFileSync(transcript, "utf8").trim().split("\n");
   assert.equal(lines.length, 120);
@@ -510,7 +517,7 @@ function acknowledgments(state) {
   };
 }
 
-test("/compact and /clear are typed into demo's own tmux pane with an acknowledgment and no Claude turn", async () => {
+test("/compact and /clear are typed into demo's own tmux pane with an acknowledgment and no Claude turn", platformGate("posix", "host commands on Windows are P3.6"), async () => {
   const workspace = claudeRouterWorkspace();
   await routerWithWebhooks(workspace, ["demo"]);
   const started = await startSession(workspace);
@@ -606,10 +613,10 @@ async function assertRestartsOnlyDemo(workspace, author) {
   assert.deepEqual(state.fixtures.claude.channelNotifications ?? [], []);
 }
 
-test("/restart in demo's channel relaunches only demo, which reconnects with a new key", async () => {
+test("/restart in demo's channel relaunches only demo, which reconnects with a new key", platformGate("posix", "/restart on Windows is P3.7"), async () => {
   await assertRestartsOnlyDemo(claudeRouterWorkspace(), { id: OWNER_ID, username: "Owner" });
 });
 
-test("a guest's /restart follows the Codex bridge's allowed-user policy: demo restarts and root never does", async () => {
+test("a guest's /restart follows the Codex bridge's allowed-user policy: demo restarts and root never does", platformGate("posix", "/restart on Windows is P3.7"), async () => {
   await assertRestartsOnlyDemo(claudeRouterWorkspace(), { id: "guest-id", username: "Guest" });
 });

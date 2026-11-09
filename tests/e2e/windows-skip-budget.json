@@ -1,5 +1,5 @@
 {
-  "budget": 104,
+  "budget": 112,
   "skips": [
     {
       "file": "harness-safety.test.js",
@@ -59,7 +59,7 @@
       "file": "platform-contract.test.js",
       "test": "only runs on posix",
       "tag": "posix",
-      "tests": 28,
+      "tests": 31,
       "reason": "contract cases for POSIX-only behaviour: file modes, Unix sockets and absolute POSIX paths"
     },
     {
@@ -73,6 +73,36 @@
       "test": "on POSIX, serve ignores stdin EOF and dies by signal on SIGHUP",
       "tag": "posix",
       "reason": "launchd's relaunch rule depends on POSIX signals"
+    },
+    {
+      "file": "router-claude-session.test.js",
+      "test": "a launch whose Router hello fails exits non-zero and cleans up",
+      "tag": "posix",
+      "reason": "the Bash launcher cleanup; Windows launcher is P3.3"
+    },
+    {
+      "file": "router-claude-session.test.js",
+      "test": "after stop-session the Router treats the channel as offline and the next owner message gets 💤",
+      "tag": "posix",
+      "reason": "stop-session.sh is zsh; the Windows stop path is P3.3"
+    },
+    {
+      "file": "router-claude-session.test.js",
+      "test": "/compact and /clear are typed into demo's own tmux pane with an acknowledgment and no Claude turn",
+      "tag": "posix",
+      "reason": "host commands on Windows are P3.6"
+    },
+    {
+      "file": "router-claude-session.test.js",
+      "test": "/restart in demo's channel relaunches only demo, which reconnects with a new key",
+      "tag": "posix",
+      "reason": "/restart on Windows is P3.7"
+    },
+    {
+      "file": "router-claude-session.test.js",
+      "test": "a guest's /restart follows the Codex bridge's allowed-user policy: demo restarts and root never does",
+      "tag": "posix",
+      "reason": "/restart on Windows is P3.7"
     }
   ]
 }

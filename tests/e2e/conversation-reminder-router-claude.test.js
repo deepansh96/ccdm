@@ -79,9 +79,12 @@ async function waitForStatus(context, predicate, attempts = 400) {
     `discord messages: ${JSON.stringify(discord.messages)}\nchannel server logs: ${channelLogs.join("\n---\n")}`);
 }
 
+// The Bash launchers read UTF-8 pane text through Python, which on Windows defaults to the ANSI code page.
+const WINDOWS_LAUNCHER_ENV = process.platform === "win32" ? { PYTHONUTF8: "1" } : {};
+
 function startSession(context) {
   return runScript(context.workspace, "scripts/start-session.sh", {
-    args: ["demo"], env: routerEnv(context.workspace), timeoutMs: 30000,
+    args: ["demo"], env: routerEnv(context.workspace, WINDOWS_LAUNCHER_ENV), timeoutMs: 30000,
   });
 }
 
