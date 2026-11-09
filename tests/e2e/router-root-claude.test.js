@@ -18,6 +18,7 @@ import {
   startRefusingRouter,
   waitFor,
 } from "./support/router.js";
+import { startFakeHost } from "./support/session-fixture.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -36,8 +37,29 @@ function rootWorkspace() {
   });
 }
 
-function restartRoot(workspace, extraEnv = {}) {
-  return runScript(workspace, "restart-root-agent.sh", { env: routerEnv(workspace, extraEnv), timeoutMs: 20000 });
+// On Windows the launcher goes through the fake ccdm-host, sharing the fixture's session table.
+const WIN = process.platform === "win32";
+const fakeHosts = new WeakMap();
+async function launcherEnv(workspace) {
+  if (!WIN) return {};
+  if (!fakeHosts.has(workspace)) fakeHosts.set(workspace, await startFakeHost(workspace, { env: routerEnv(workspace) }));
+  return fakeHosts.get(workspace).env;
+}
+
+// A Windows temp folder can carry a short (8.3) name; the `ccdm` entry starts Python from the long one.
+const repoAsLaunched = workspace => (WIN ? fs.realpathSync.native(workspace.repoDir) : workspace.repoDir);
+
+// Where a restart helper would write its log: `<stateRoot>/logs`.
+async function logsDir(workspace) {
+  const stateRoot = WIN ? (await launcherEnv(workspace)).CCDM_STATE_ROOT : path.join(workspace.homeDir, ".local", "state", "ccdm");
+  return path.join(stateRoot, "logs");
+}
+
+async function restartRoot(workspace, extraEnv = {}) {
+  return runScript(workspace, "restart-root-agent.sh", {
+    env: routerEnv(workspace, { ...(await launcherEnv(workspace)), ...extraEnv }),
+    timeoutMs: 20000,
+  });
 }
 
 test("restart-root-agent launches root Claude whose channel server says hello to the Router as root", async () => {
@@ -51,7 +73,7 @@ test("restart-root-agent launches root Claude whose channel server says hello to
   assert.equal(status.exitCode, 0, status.stderr);
   assert.match(status.stdout, /sessions: 1\n  root root scope=/);
   const session = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
-  assert.equal(session.cwd, workspace.repoDir);
+  assert.equal(session.cwd, repoAsLaunched(workspace));
   assert.deepEqual(session.sendKeys, [["Enter"]]);
 });
 
@@ -126,7 +148,10 @@ test("no Discord token reaches the root Claude session environment, launch files
     }
   }
   assert.deepEqual(Object.keys(mcpConfig.mcpServers), ["ccdm"]);
-  assert.deepEqual(mcpConfig.mcpServers.ccdm.args, [path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js")]);
+  const channelServer = path.join(repoAsLaunched(workspace), "scripts", "ccdm-channel-server.js");
+  const rootKey = path.join(workspace.routerStateDir, "keys", ".root.key");
+  // Windows names the key file on the command line: another process's environment is not readable there.
+  assert.deepEqual(mcpConfig.mcpServers.ccdm.args, WIN ? [channelServer, "--ccdm-key-file", rootKey] : [channelServer]);
   assert.equal(mcpConfig.mcpServers.ccdm.env.CCDM_ROUTER_ROLE, "root");
   for (const file of fs.readdirSync(launchDir)) {
     assertPrivate(path.join(launchDir, file), file);
@@ -174,7 +199,8 @@ test("a Claude root offers no /restart: its session stays and no restart helper 
   const done = await waitForState(workspace, (next) => next.fixtures.claude.channelNotifications?.some(({ meta }) => meta.message_id === "after"), 10000);
   assert.equal(done.fixtures.tmux.sessions.root_agent.pid, before.pid);
   assert.equal(done.fixtures.tmux.lastKilledSessions?.root_agent?.killAttempts ?? 0, before.killAttempts ?? 0);
-  assert.equal(fs.existsSync(path.join(workspace.homeDir, ".local", "state", "ccdm", "logs", "restart-root_agent.log")), false);
+  const logs = await logsDir(workspace);
+  assert.deepEqual(fs.existsSync(logs) ? fs.readdirSync(logs).filter((name) => name.startsWith("restart-")) : [], []);
   assert.deepEqual(done.fixtures.discord.messages, []);
 });
 
@@ -195,8 +221,9 @@ test("/model in a root channel is answered by root Claude's channel server from 
     next.fixtures.claude.channelNotifications?.length >= 1, 10000);
   assert.deepEqual(done.fixtures.discord.messages.map(({ channelId, content, authorization }) =>
     ({ channelId, content, authorization })), [
+    // The home is shown the way the platform writes paths.
     { channelId: "root-channel", authorization: `Bot ${ROOT_TOKEN}`, content:
-      "Root's session:\nProvider: claude\nModel: account default\nThinking: high (home config)\nAccount: ~/.claude" },
+      `Root's session:\nProvider: claude\nModel: account default\nThinking: high (home config)\nAccount: ${path.join("~", ".claude")}` },
   ]);
   assert.deepEqual(done.fixtures.claude.channelNotifications.map(({ meta }) => meta.message_id), ["after"]);
 });
