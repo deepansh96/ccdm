@@ -218,6 +218,9 @@ test("send-claude-command's refusals read as they did, with this OS's word for a
   assert.deepEqual(await refusal(["unnamed", "/compact"]), [2, "", "Project unnamed has no screen_name in registry.json\n"]);
   assert.deepEqual(await refusal(["--channel", "channel-alpha", "/compact"]), [2, "", "Channel channel-alpha matches multiple projects: alpha, shared\n"]);
   assert.deepEqual(await refusal(["--project", "nowhere", "/compact"]), [2, "", "Unknown project: nowhere\n"]);
+  const [code, stdout, stderr] = await refusal(["no-such-thread", "/compact"]);
+  assert.deepEqual([code, stdout], [2, ""]);
+  assert.match(stderr, /^conversation-resolver: [^\n]+\n$/, "the resolver's reason, alone");
 });
 
 test("send-claude-command says when the registry cannot be read", async () => {
