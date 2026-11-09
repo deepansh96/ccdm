@@ -59,26 +59,32 @@ Determine which action the user wants based on their message:
 
 #### 1. List sessions (`list`, `status`, `what's running`)
 
-Run `tmux list-sessions` and cross-reference with the registry. Report which projects have active sessions and which don't.
+Run `scripts/ccdm list`. It prints each registered project with its type, its session name, `live` or `stopped`, and the pid. For one project, `scripts/ccdm status <project>` adds the conversation id. Report which projects have live sessions and which don't.
+
+Every `scripts/ccdm` command is the same on macOS and Windows. Run it with the Bash tool from the CCDM checkout. `scripts/ccdm --help` lists them all.
 
 #### 2. Start a session (`start <project>`)
 
 Run the launcher for the project's `type`:
 
 ```sh
-scripts/start-session.sh <project>        # Claude
-scripts/start-codex-session.sh <project>  # Codex
+scripts/ccdm start-session <project>        # Claude
+scripts/ccdm start-codex-session <project>  # Codex
 ```
 
-The launcher rejects a duplicate listener, writes a fresh per-launch Router key (which disconnects any previous listener for the project), starts the session in tmux through `zsh -ic`, accepts the Claude development-channel confirmation, and records `pid`/`session_id` only after the session has connected to the Router. A failed launch cleans up and exits non-zero; report its error. Confirm with `node scripts/router.js status` that the project is connected in its channel.
+The launcher rejects a duplicate listener, writes a fresh per-launch Router key (which disconnects any previous listener for the project), starts the session in the session host (tmux on macOS, `ccdm-host` on Windows), accepts the Claude development-channel confirmation and, on the first launch in the project's folder, Claude's folder-trust dialog, and records `pid`/`session_id` only after the session has connected to the Router. A failed launch cleans up and exits non-zero; report its error. Confirm with `node scripts/router.js status` that the project is connected in its channel.
 
 #### 3. Stop a session (`stop <project>`)
 
-Run `scripts/stop-session.sh <project>`. It kills the recorded process tree and tmux session, sweeps orphan listeners, removes the launch key, and clears `pid` and `session_id`. Never use only `tmux kill-session`. Messages to the channel now get 💤.
+Run `scripts/ccdm stop-session <project>`. It kills the recorded process tree and the session, sweeps orphan listeners, removes the launch key, and clears `pid` and `session_id`. Messages to the channel now get 💤.
+
+Never stop a session any other way:
+- macOS: never use only `tmux kill-session`.
+- Windows: never use only `scripts/ccdm session kill`.
 
 #### 4. Restart a session (`restart <project>`)
 
-Stop then start. A restart request from or naming a project channel restarts that project, never you.
+Run `scripts/ccdm restart-session <project>`. It stops the session fully, then starts it again. If it fails, read `~/.local/state/ccdm/logs/restart-<project>.log`; after a failed stop nothing is started. A restart request from or naming a project channel restarts that project, never you.
 
 #### 5. Register a project (`register`, `setup`)
 
@@ -107,32 +113,34 @@ This connects a new project to a Discord channel. There is no bot to create, ass
    This finds or creates `ccdm-<project_name>` in the channel, records `webhook_id` in the registry, and keeps the webhook token only in private Router state. Never copy the token anywhere.
 4. Issue a fresh Conversation Reminder assignment:
    ```sh
-   scripts/conversation-reminder-service.py assignment-changed --project <project_name>
+   scripts/ccdm reminders assignment-changed --project <project_name>
    ```
-5. Start the session (see Start above) and check `node scripts/router.js status`. If root is missing channel permissions there, `router status` names them.
+5. Start the session (see Start above) and check `node scripts/router.js status`. The first launch in a newly registered folder accepts Claude's folder-trust dialog, so that folder's project hooks and MCP servers run; register only a folder the user asked for. If root is missing channel permissions there, `router status` names them.
 6. Tell the user which channel the project serves and that the session is running.
 
 The Router reloads the registry itself; no Router or root restart is needed.
 
 #### 6. Deregister a project (`deregister`, `remove`, `unregister`)
 
-1. Stop the session fully with `scripts/stop-session.sh <project_name>`.
+1. Stop the session fully with `scripts/ccdm stop-session <project_name>`.
 2. Delete its Project Identity webhook, which also removes the private token and clears `webhook_id`:
    ```sh
    node scripts/router.js delete-webhook <project_name>
    ```
    Running it again is a no-op.
-3. Revoke any guests with `scripts/guest-access.js revoke <project_name> <user_id>`.
-4. Remove the project entry from `registry.json`, then run `scripts/conversation-reminder-service.py assignment-changed --project <project_name>`.
+3. Revoke any guests with `node scripts/guest-access.js revoke <project_name> <user_id>`.
+4. Remove the project entry from `registry.json`, then run `scripts/ccdm reminders assignment-changed --project <project_name>`.
 5. Confirm the removal. The Discord channel still exists (not deleted).
 
 #### 7. Router status (`router status`, `is the router up`)
 
 Run `node scripts/router.js status`. It shows the gateway state, the registry's last load and any load error, connected sessions with role, project, scope, and connect time, webhook presence and missing root permissions per project, and recent scope violations. It exits non-zero when the Router is unreachable. Use `--json` when you need to parse it.
 
-If the Router is down, launchd restarts it (`com.ccdm.router`, logs in `~/.local/state/ccdm/router/router.err`). To reinstall it, run `scripts/install-router-service.sh`; its read-only preflight names any blocker.
+If the Router is down, its service restarts it:
+- macOS: launchd restarts it (`com.ccdm.router`, logs in `~/.local/state/ccdm/router/router.err`). To reinstall it, run `scripts/install-router-service.sh`; its read-only preflight names any blocker.
+- Windows: the `\CCDM\Router` scheduled task restarts it (logs in `~/.local/state/ccdm/services/router.err`). `scripts/ccdm service-status router` shows its state. To reinstall it, run `scripts/ccdm install-service router`; its read-only preflight names any blocker. `scripts/ccdm uninstall-service router` stops and removes it.
 
-**Emergency fallback:** if the Router stays unreachable for about 2 minutes, you open an emergency direct gateway connection with the root token for root channels only (owner and `root_allowed_user_ids`) and post a one-line notice in the primary root channel. You can still reply, react, and edit your own messages in root channels; project channels, reads, and attachments are not served until the Router returns. Use that window to diagnose and restart the Router, not root: the root restart scripts refuse to run while the Router is down. When it is back, you drop the emergency connection before reconnecting.
+**Emergency fallback:** if the Router stays unreachable for about 2 minutes, you open an emergency direct gateway connection with the root token for root channels only (owner and `root_allowed_user_ids`) and post a one-line notice in the primary root channel. You can still reply, react, and edit your own messages in root channels; project channels, reads, and attachments are not served until the Router returns. Use that window to diagnose and restart the Router, not root: `scripts/ccdm restart-root` does not restart you while the Router is down. When it is back, you drop the emergency connection before reconnecting.
 
 #### 8. Probe a project (`probe <project>`)
 
@@ -140,36 +148,34 @@ If the Router is down, launchd restarts it (`com.ccdm.router`, logs in `~/.local
 
 #### 9. Cutover and retirement
 
-For an install that still has Bot Pool fields in `registry.json`, cut over in this order:
-1. Stop every pool session with `scripts/stop-session.sh <project>` (it also sweeps a project's leftover pool-bot listener while the project still names its `bot_id`).
-2. Move root's configuration: `node scripts/router.js migrate-root-config`, `scripts/install-router-service.sh`, `node scripts/router.js status`, then restart root.
-3. Migrate each project with `scripts/migrate-to-router.sh <project>`: a preflight, per-step `ok`/`failed` output, a `router status` plus `probe` round-trip check, and automatic rollback to the project's previous registry state on failure. `--rollback` refuses, since no pool bot remains. Launchers refuse a project without `webhook_id`, so an unmigrated project comes back only this way.
-4. Retire the pool with `scripts/retire-pool.sh`, a dry run by default. It refuses while a project still tied to a pool bot is not on the Router; projects registered after the cutover need no `transport`. With `--apply` it removes the old pool bots from the server, backs up their state directories privately, deletes the obsolete `project-bot` role, and strips the pool fields from the registry after a private backup; an interrupted run finishes on a rerun. It never deletes bot applications. Run it only when the user asks, and show them the dry run first.
+This entry is macOS only: a Windows install starts on the Router and has no Bot Pool. For an install that still has Bot Pool fields in `registry.json`, cut over in this order:
+1. macOS: stop every pool session with `scripts/ccdm stop-session <project>` (it also sweeps a project's leftover pool-bot listener while the project still names its `bot_id`).
+2. macOS: move root's configuration: `node scripts/router.js migrate-root-config`, `scripts/install-router-service.sh`, `node scripts/router.js status`, then restart root.
+3. macOS: migrate each project with `scripts/migrate-to-router.sh <project>`: a preflight, per-step `ok`/`failed` output, a `router status` plus `probe` round-trip check, and automatic rollback to the project's previous registry state on failure. `--rollback` refuses, since no pool bot remains. Launchers refuse a project without `webhook_id`, so an unmigrated project comes back only this way.
+4. macOS: retire the pool with `scripts/retire-pool.sh`, a dry run by default. It refuses while a project still tied to a pool bot is not on the Router; projects registered after the cutover need no `transport`. With `--apply` it removes the old pool bots from the server, backs up their state directories privately, deletes the obsolete `project-bot` role, and strips the pool fields from the registry after a private backup; an interrupted run finishes on a rerun. It never deletes bot applications. Run it only when the user asks, and show them the dry run first.
 
 #### 10. Context report (`context report`, `context for all`)
 
-Get the context usage for all running sessions by sending `/context` to each tmux session and capturing the pane output:
+Get the context usage for every live Claude project session:
 
-1. **Send `/context` to each session:**
+1. **Run the report:**
    ```sh
-   tmux send-keys -t <screen_name> '/context' Enter
+   scripts/ccdm context report
    ```
+   It sends `/context` to each live local Claude project session, waits for the context screen, and prints it.
 
-2. **Wait ~1 second**, then capture the output:
-   ```sh
-   tmux capture-pane -t <screen_name> -p
-   ```
+2. **Parse the output** — for each session look for the tokens line (e.g., `20k/1m tokens (2%)`) and the category breakdown.
 
-3. **Parse the output** — look for the tokens line (e.g., `20k/1m tokens (2%)`) and the category breakdown.
-
-- Run all sessions in parallel for speed — send `/context` to all sessions first, wait, then capture all panes.
-- This approach works for ALL running sessions, including freshly started ones that haven't received any Discord messages yet. Unlike `claude -r --fork-session`, it does not depend on `.jsonl` conversation files existing on disk.
-- Skip remote sessions (path starts with `remote:`) — they can't be checked from here.
+- This works for every live Claude project session, including freshly started ones that haven't received any Discord messages yet. Unlike `claude -r --fork-session`, it does not depend on `.jsonl` conversation files existing on disk.
+- It skips remote sessions (path starts with `remote:`), Codex projects, Thread Conversations and you.
+- For one session, run `scripts/ccdm session context <screen_name>`. Never run it on your own session: you are busy running the command, so it times out.
 - Report the key stats: tokens used / total, percentage, free space.
 
 #### 11. Usage report (`usage`, `limits`, `how much usage left`, `check usage`)
 
-Run the usage report script to show live rate limits, account profile, and historical usage stats:
+Windows: pending (#244). `scripts/ccdm` has no `usage` command yet, so this entry is macOS only until then.
+
+macOS: run the usage report script to show live rate limits, account profile, and historical usage stats:
 
 ```sh
 scripts/claude-usage.sh
@@ -209,18 +215,22 @@ The user may ask things like "how much usage do I have left", "what are my limit
 
 #### 12. Self-restart (`restart yourself`, `restart root`, `restart self`)
 
-You can restart yourself by running the restart script in the background with `nohup`, which survives your own process being killed:
+You restart yourself with `scripts/ccdm restart-root`. It detaches itself, so it survives your own process being stopped. Never use `nohup` or a background `&`, and never wrap it in another launcher.
 
 1. Tell the user you're restarting.
-2. Run:
+2. Run it as a normal foreground command:
    ```sh
-   nohup ./restart-root-agent.sh &
+   scripts/ccdm restart-root
    ```
-3. The script kills your current process, waits 2 seconds, and starts a fresh instance in the `root_agent` tmux session.
+   If you are root Codex, run `scripts/ccdm restart-root --provider codex` instead, and add the root channel id as the last argument when the registry lists more than one root channel.
+3. The command hands the restart to a detached copy, prints that copy's log path and exits 0. The copy checks the Router, stops your current process, and starts a fresh instance in the `root_agent` session. If the Router does not answer, it stops nothing and you keep running.
+
+- macOS: from a terminal, `./restart-root-agent.sh` and `./restart-root-codex-agent.sh [<channel_id>]` run the same command.
+- Windows: root Codex is not supported yet, so `--provider codex` is refused.
 
 ### Discord Polls
 
-Create native Discord polls using the API directly with the root bot token (read from root's `.env` in the same shell command):
+Create native Discord polls using the API directly with the root bot token (read from root's `.env` in the same shell command). The command is the same on macOS and Windows; run it with the Bash tool:
 
 ```sh
 curl -s -X POST "https://discord.com/api/v10/channels/<channel_id>/messages" \
@@ -248,6 +258,8 @@ curl -s -X POST "https://discord.com/api/v10/channels/<channel_id>/messages" \
 - The `poll_media` object can also include an `emoji` field: `{"id": null, "name": "🎉"}` for custom option emojis
 
 ### Voice Messages
+
+Windows: pending (#246). `scripts/ccdm` has no `transcribe` command yet, so the steps below are macOS only until then.
 
 When the user sends a voice message (`.ogg` audio attachment), transcribe it using Whisper:
 
