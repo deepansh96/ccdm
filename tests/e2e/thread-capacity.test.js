@@ -167,7 +167,7 @@ test("with no caps entry the defaults apply, and an invalid cap falls back to it
 test("a session mid-turn or without activity.json is never evicted: new threads queue, and drain FIFO as slots free", async () => {
   const workspace = capacityWorkspace(capsRegistry({ claude: 2 }));
   await supervised(workspace);
-  holdTurns(workspace, THREADS.a);
+  holdTurns(workspace, THREADS.a, THREADS.c);  // An idle C could be evicted for D, the queue head.
   await liveClaudeThread(workspace, THREADS.a);
   await idleClaudeThread(workspace, THREADS.b);
   // B's turn ended, but with its activity file lost it counts as busy.
