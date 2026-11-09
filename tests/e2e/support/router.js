@@ -170,7 +170,7 @@ export async function rawRouterSocket(workspace) {
 export async function waitFor(predicate, describe, timeoutMs = 5000) {
   const deadline = Date.now() + scaledTimeout(timeoutMs);
   while (Date.now() < deadline) {
-    const value = predicate();
+    const value = await predicate();
     if (value) return value;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
