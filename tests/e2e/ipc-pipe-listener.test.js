@@ -255,8 +255,10 @@ test("many idle clients hold no pool threads, so file I/O stays quick", onlyWind
 test("the pipe is the current user's alone", onlyWindows, async () => {
   const { endpoint } = await startListener(stream => stream.on("error", () => {}));
   const sid = createRequire(import.meta.url)("../../scripts/platform/privacy.js").currentUserSid();
+  // SDDL prints the machine's built-in Administrator (RID 500) as LA.
+  const trustee = sid.endsWith("-500") ? "LA" : sid;
 
-  assert.match(ipc().readPipeSddl(endpoint), new RegExp(`D:P\\(A;;FA;;;${sid}\\)$`));
+  assert.match(ipc().readPipeSddl(endpoint), new RegExp(`D:P\\(A;;FA;;;${trustee}\\)$`));
 });
 
 test("a name already taken is refused and the error names the pipe DACL", onlyWindows, async () => {

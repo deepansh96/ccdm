@@ -68,8 +68,10 @@ test("on Windows the Router pipe grants only the owner, on every instance", only
 
   for (const sddl of sddls) {
     const { flags, entries } = daclEntries(sddl);
+    // SDDL prints the machine's built-in Administrator (RID 500) as LA.
+    const trustee = owner.endsWith("-500") ? "LA" : owner;
     assert.equal(flags, "P");
-    assert.deepEqual(entries, [["A", "", "FA", "", "", owner]]);
+    assert.deepEqual(entries, [["A", "", "FA", "", "", trustee]]);
   }
 });
 
