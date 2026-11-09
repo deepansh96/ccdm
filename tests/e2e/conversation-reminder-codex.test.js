@@ -11,10 +11,12 @@ import { createWorkspace, runScript } from "./support/runner.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 import { bridgeChildEnv, createBridgeWorkspace, injectDiscordMessage, injectDiscordReaction, startFakeCodexServer, waitForState } from "./support/bridge.js";
-import { routerEnv, runRouterCli, startBridge } from "./support/router.js";
+import { routerEnv, runRouterCli, startBridge, waitFor } from "./support/router.js";
 
 const { processAlive } = createRequire(import.meta.url)("../../scripts/platform/process.js");
 const WIN32 = process.platform === "win32";
+// Bridge work runs in separate processes, and a loaded runner can take many seconds.
+const WAIT_MS = 30000;
 
 test.afterEach(async () => {
   await cleanup();
@@ -302,7 +304,7 @@ test("a successful scoped Codex reply produces a progress receipt and a complete
   await waitForState(workspace, (state) => state.fixtures.discord.deliveredMessages.some((message) => message.id === "owner-message-1"));
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
-  for (let attempt = 0; attempt < 100 && !fs.existsSync(contextFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+  await waitFor(() => fs.existsSync(contextFile), () => `${bridge.stdout}\n${bridge.stderr}\n${JSON.stringify(codex.clientMessages.filter((message) => message.method === "turn/start"))}`, WAIT_MS);
   assert.ok(fs.existsSync(contextFile), `${bridge.stdout}\n${bridge.stderr}\n${JSON.stringify(codex.clientMessages.filter((message) => message.method === "turn/start"))}`);
   const reply = await runMcp(workspace, {
     env: bridgeChildEnv(workspace, config.params.value.env),
@@ -311,9 +313,8 @@ test("a successful scoped Codex reply produces a progress receipt and a complete
   assert.ok(reply.stdout.trim(), JSON.stringify({ exitCode: reply.exitCode, stderr: reply.stderr, stdout: reply.stdout }));
   assert.equal(JSON.parse(reply.stdout).result.content[0].text, "sent (id: fake-message-1)");
   codex.releaseTurn("answer-turn");
-  await new Promise((resolve) => setTimeout(resolve, 200));
-  const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  const events = JSON.parse(result.stdout).events;
+  // Each event is a Python run; a loaded machine outlasts any fixed delay.
+  const events = await waitForEvents(workspace, (rows) => rows.some((event) => event.event_type === "turn_completed"));
   assert.deepEqual(events.map((event) => event.event_type), ["owner_activity", "response_delivered", "turn_completed"]);
   assert.equal(events[0].provider_session_id, "thread-1");
   assert.equal(events[1].message_id, "fake-message-1");
@@ -331,7 +332,7 @@ test("an input-needed reply during active work pauses when the owner resumes", a
   injectDiscordMessage(workspace, { id: "first-message", content: "work on this" });
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
-  for (let attempt = 0; attempt < 100 && !fs.existsSync(contextFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+  await waitForContextFile(contextFile, bridge);
   assert.ok(fs.existsSync(contextFile));
   const reply = await runMcp(workspace, {
     env: bridgeChildEnv(workspace, config.params.value.env),
@@ -361,7 +362,7 @@ test("a failed Discord reply and tool start cannot qualify Codex completion", as
   injectDiscordMessage(workspace, { id: "failed-reply-owner", content: "hello" });
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
-  for (let attempt = 0; attempt < 100 && !fs.existsSync(contextFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+  await waitForContextFile(contextFile, bridge);
   assert.ok(fs.existsSync(contextFile));
   // The Router's execute of the project's webhook fails.
   // The fake webhook token is spelled in parts because router.test.js
@@ -378,6 +379,8 @@ test("a failed Discord reply and tool start cannot qualify Codex completion", as
   assert.equal(JSON.parse(reply.stdout).result.isError, true);
   assert.deepEqual(readState(workspace.stateDir).fixtures.discord.restFailureUses, [{ method: "POST", path: execute, status: 503 }]);
   codex.releaseTurn("failed-reply-turn");
+  // Wait for the owner's event, then settle so a wrongly recorded receipt or completion would show up.
+  await waitForEvents(workspace, (rows) => rows.some((event) => event.event_type === "owner_activity"));
   await new Promise((resolve) => setTimeout(resolve, 200));
   const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
   assert.deepEqual(JSON.parse(result.stdout).events.map((event) => event.event_type), ["owner_activity"]);
@@ -392,6 +395,8 @@ test("failed Codex turns do not send or record optional fallback text", async ()
   await bridge.waitForOutput(/Listening in #demo/, 7000);
   injectDiscordMessage(workspace, { id: "failed-turn-owner", content: "try this" });
   await waitForState(workspace, (state) => state.fixtures.discord.deliveredMessages.some((message) => message.id === "failed-turn-owner"));
+  // Wait for the owner's event, then settle so wrongly sent or recorded fallback text would show up.
+  await waitForEvents(workspace, (rows) => rows.some((event) => event.event_type === "owner_activity"));
   await new Promise((resolve) => setTimeout(resolve, 200));
   const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
   assert.deepEqual(JSON.parse(result.stdout).events.map((event) => event.event_type), ["owner_activity"]);
@@ -449,7 +454,7 @@ test("a steered owner message gets a new response correlation within the active 
   injectDiscordMessage(workspace, { id: "first-owner", content: "first task" });
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
-  for (let attempt = 0; attempt < 100 && !fs.existsSync(contextFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+  await waitForContextFile(contextFile, bridge);
   assert.ok(fs.existsSync(contextFile));
   const send = (text) => runMcp(workspace, {
     env: bridgeChildEnv(workspace, config.params.value.env),
@@ -457,15 +462,13 @@ test("a steered owner message gets a new response correlation within the active 
   });
   assert.equal(JSON.parse((await send("first answer")).stdout).result.isError, undefined);
   injectDiscordMessage(workspace, { id: "second-owner", content: "change task" });
-  for (let attempt = 0; attempt < 100 && !readState(workspace.stateDir).fixtures.discord.deliveredMessages.some((message) => message.id === "second-owner"); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+  await waitFor(() => readState(workspace.stateDir).fixtures.discord.deliveredMessages.some((message) => message.id === "second-owner"), () => `${bridge.stdout}\n${bridge.stderr}\n${JSON.stringify(readState(workspace.stateDir).fixtures.discord.injectedMessages)}`, WAIT_MS);
   assert.ok(readState(workspace.stateDir).fixtures.discord.deliveredMessages.some((message) => message.id === "second-owner"), `${bridge.stdout}\n${bridge.stderr}\n${JSON.stringify(readState(workspace.stateDir).fixtures.discord.injectedMessages)}`);
-  for (let attempt = 0; attempt < 100 && JSON.parse(fs.readFileSync(contextFile, "utf8")).interaction_id !== "second-owner"; attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+  await waitFor(() => JSON.parse(fs.readFileSync(contextFile, "utf8")).interaction_id === "second-owner", () => `second-owner in the reminder context, which holds ${JSON.parse(fs.readFileSync(contextFile, "utf8")).interaction_id}`, WAIT_MS);
   assert.equal(JSON.parse(fs.readFileSync(contextFile, "utf8")).interaction_id, "second-owner");
   assert.equal(JSON.parse((await send("second answer")).stdout).result.isError, undefined);
   codex.releaseTurn("steer-turn");
-  await new Promise((resolve) => setTimeout(resolve, 200));
-  const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  const events = JSON.parse(result.stdout).events;
+  const events = await waitForEvents(workspace, (rows) => rows.some((event) => event.event_type === "turn_completed"));
   assert.deepEqual(events.filter((event) => event.event_type === "response_delivered").map((event) => event.interaction_id), ["first-owner", "second-owner"]);
   assert.deepEqual(events.find((event) => event.event_type === "turn_completed").delivered_message_ids, ["fake-message-2"]);
   await bridge.stop();
@@ -528,7 +531,7 @@ test("attachment replies and successful optional text fallback produce confirmed
   injectDiscordMessage(workspace, { id: "upload-owner", content: "send file" });
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
-  for (let attempt = 0; attempt < 100 && !fs.existsSync(contextFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+  await waitForContextFile(contextFile, bridge);
   const file = path.join(workspace.tmpDir, "reply.txt");
   fs.writeFileSync(file, "attachment fixture");
   const upload = await runMcp(workspace, {
@@ -595,9 +598,7 @@ test("a Codex root consumes a root-mention /close in a Claude project channel wi
   injectDiscordMessage(workspace, { id: "root-close", channelId: "project-channel", content: "<@fixture-bot-user-id> /close" });
   // A later root-management request proves the close was consumed rather than queued.
   injectDiscordMessage(workspace, { id: "root-status", channelId: "project-channel", content: "<@fixture-bot-user-id> status" });
-  for (let attempt = 0; attempt < 200 && userTurns().length === 0; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
+  await waitFor(() => userTurns().length > 0, () => `a user turn; bridge stdout:\n${bridge.stdout}\nbridge stderr:\n${bridge.stderr}`, WAIT_MS);
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert.equal(userTurns().length, 1);
   assert.doesNotMatch(JSON.stringify(userTurns()[0].params.input), /\/close/);
@@ -609,11 +610,8 @@ test("a Codex root consumes a root-mention /close in a Claude project channel wi
     assert.equal(status.exitCode, 0, status.stderr);
     return JSON.parse(status.stdout).events.filter((event) => event.event_type === "close_requested");
   };
-  let requests = await closeRequests();
-  for (let attempt = 0; attempt < 100 && requests.length === 0; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    requests = await closeRequests();
-  }
+  let requests = [];
+  await waitFor(async () => (requests = await closeRequests()).length > 0, () => `the root close request; bridge stderr:\n${bridge.stderr}`, WAIT_MS);
   assert.deepEqual(requests.map((event) => [event.source_message_id, event.provider]), [["root-close", "ccdm-root"]]);
   await bridge.stop();
 });
@@ -661,9 +659,7 @@ test("new Codex work after a completed input-needed turn emits a resumption paus
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
   // The question turn's reply needs its reminder context, written as the turn starts.
-  for (const deadline = Date.now() + 10000; Date.now() < deadline && !fs.existsSync(contextFile);) {
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
+  await waitForContextFile(contextFile, bridge);
   assert.ok(fs.existsSync(contextFile), "the question turn's reminder context");
   const reply = await runMcp(workspace, {
     env: bridgeChildEnv(workspace, config.params.value.env),
@@ -709,13 +705,15 @@ test("a Codex completion without confirmed success status cannot qualify a respo
   injectDiscordMessage(workspace, { id: "unknown-status-owner", content: "hello" });
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
-  for (let attempt = 0; attempt < 100 && !fs.existsSync(contextFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+  await waitForContextFile(contextFile, bridge);
   const reply = await runMcp(workspace, {
     env: bridgeChildEnv(workspace, config.params.value.env),
     input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "reply", arguments: { text: "visible", scope_token: config.params.value.env.DISCORD_REPLY_TOKEN } } }) + "\n",
   });
   assert.equal(JSON.parse(reply.stdout).result.isError, undefined);
   codex.releaseTurn("unknown-status-turn");
+  // Wait for both events, then settle so a wrongly qualified completion would show up.
+  await waitForEvents(workspace, (rows) => ["owner_activity", "response_delivered"].every((type) => rows.some((event) => event.event_type === type)));
   await new Promise((resolve) => setTimeout(resolve, 150));
   const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
   assert.deepEqual(JSON.parse(result.stdout).events.map((event) => event.event_type), ["owner_activity", "response_delivered"]);
@@ -731,7 +729,7 @@ test("clearing an active Codex turn removes its stale scoped reply context", asy
   injectDiscordMessage(workspace, { id: "old-owner", content: "old task" });
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
-  for (let attempt = 0; attempt < 100 && !fs.existsSync(contextFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+  await waitForContextFile(contextFile, bridge);
   assert.ok(fs.existsSync(contextFile));
   injectDiscordMessage(workspace, { id: "clear-owner", content: "/clear" });
   await bridge.waitForOutput(/New thread after \/clear/, 7000);
@@ -754,7 +752,7 @@ test("a completion notification without a turn ID cannot end the active Codex ex
   await waitForState(workspace, (state) => state.fixtures.discord.deliveredMessages.some((message) => message.id === "identified-owner"));
   // The bridge writes the grant once turn/start returns; a loaded machine can
   // take longer than a fixed delay to get there.
-  for (let attempt = 0; attempt < 250 && !fs.existsSync(contextFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+  await waitForContextFile(contextFile, bridge);
   // The unidentified completion follows the turn/start reply; let it land.
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert.ok(fs.existsSync(contextFile), "unidentified completion must leave the active reply grant intact");
@@ -782,22 +780,12 @@ test("an owner reaction that starts a Codex turn keeps its reminder correlation"
   await bridge.waitForOutput(/Listening in #demo/, 7000);
   injectDiscordMessage(workspace, { id: "owner-question", content: "answer this" });
   await waitForState(workspace, (state) => state.fixtures.discord.messages?.some((row) => row.content === "first answer" && row.webhookId === "fake-webhook-1"));
-  for (let attempt = 0; attempt < 50; attempt++) {
-    const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-    if (JSON.parse(result.stdout).events.some((event) => event.event_type === "turn_completed")) break;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
+  await waitForEvents(workspace, (rows) => rows.some((event) => event.event_type === "turn_completed"));
   // The first answer is the project's own webhook message.
   injectDiscordReaction(workspace, { id: "owner-thumbs", emoji: "👍", messageId: "fake-message-1",
     message: { author: { bot: true, id: "fake-webhook-1" }, webhookId: "fake-webhook-1", content: "first answer" } });
   await waitForState(workspace, (state) => state.fixtures.discord.messages?.some((row) => row.content === "reaction answer" && row.webhookId === "fake-webhook-1"));
-  let events = [];
-  for (let attempt = 0; attempt < 50; attempt++) {
-    const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-    events = JSON.parse(result.stdout).events;
-    if (events.some((event) => event.event_type === "turn_completed" && event.provider_turn_id === "reaction-turn")) break;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
+  const events = await waitForEvents(workspace, (rows) => rows.some((event) => event.event_type === "turn_completed" && event.provider_turn_id === "reaction-turn"));
   const reaction = events.find((event) => event.event_type === "owner_activity" && event.activity_kind === "reaction");
   assert.deepEqual([reaction.source_message_id, reaction.reaction_emoji], ["fake-message-1", "👍"]);
   // The reaction-started turn continues the owner's current interaction, so its
@@ -824,13 +812,7 @@ test("the automatic terminal retry keeps the owner's reminder correlation on its
   injectDiscordMessage(workspace, { id: "owner-retry", content: "recover this turn" });
   await waitForState(workspace, (state) => state.fixtures.discord.messages?.some((row) => row.content === "Recovered response" && row.webhookId === "fake-webhook-1"));
   await bridge.waitForOutput(/Retrying terminal response\.failed turn once/, 5000);
-  let events = [];
-  for (let attempt = 0; attempt < 50; attempt++) {
-    const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-    events = JSON.parse(result.stdout).events;
-    if (events.some((event) => event.event_type === "turn_completed")) break;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
+  const events = await waitForEvents(workspace, (rows) => rows.some((event) => event.event_type === "turn_completed"));
   const receipt = events.find((event) => event.event_type === "response_delivered");
   assert.deepEqual([receipt?.provider_turn_id, receipt?.interaction_id], ["retry-turn", "owner-retry"]);
   const completed = events.find((event) => event.event_type === "turn_completed");
@@ -851,7 +833,7 @@ test("a delivered scoped reply stays successful when its reminder receipt cannot
   injectDiscordMessage(workspace, { id: "owner-message-1", content: "answer this" });
   const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
   const contextFile = config.params.value.env.CCDM_REMINDER_CONTEXT_FILE;
-  for (let attempt = 0; attempt < 100 && !fs.existsSync(contextFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+  await waitForContextFile(contextFile, bridge);
   assert.ok(fs.existsSync(contextFile));
   // Receipt storage fails locally after Discord has accepted the reply.
   const blocked = path.join(workspace.tmpDir, "receipts-are-a-file");
@@ -893,20 +875,11 @@ function portFree(port) {
   });
 }
 
-async function eventually(check, message, timeoutMs = 10000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await check()) return;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  assert.fail(message);
-}
-
 // On Windows the PID, paired with its start time. A POSIX orphan can linger as a
 // zombie in a container with no init, so there the freed port is the evidence.
 async function assertAppServerGone(appServer, heldPort = null) {
-  if (WIN32) await eventually(() => !processAlive(appServer.pid, appServer.startedAt), `app-server ${appServer.pid} is still running`);
-  if (heldPort) await eventually(() => portFree(heldPort), `port ${heldPort} is still held`);
+  if (WIN32) await waitFor(() => !processAlive(appServer.pid, appServer.startedAt), () => `app-server ${appServer.pid} to exit`, WAIT_MS);
+  if (heldPort) await waitFor(() => portFree(heldPort), () => `port ${heldPort} to be released`, WAIT_MS);
 }
 
 function serverRecord(workspace, port) {
@@ -935,14 +908,14 @@ async function bridgeDuringTurn(workspace, { bridgeOptions = {}, turns = [] } = 
   await bridge.waitForOutput(/Listening in #demo/, 7000);
   const state = await waitForState(workspace, (snapshot) => snapshot.fixtures.codex.appServerInvocations.length > 0);
   injectDiscordMessage(workspace, { id: "held-owner", content: "work on this" });
-  const contextFile = await waitForContextFile(codex);
+  const contextFile = registeredConfig(codex).params.value.env.CCDM_REMINDER_CONTEXT_FILE;
+  await waitForContextFile(contextFile, bridge);
   return { appServer: state.fixtures.codex.appServerInvocations[0], bridge, codex, contextFile, heldPort };
 }
 
-async function waitForContextFile(codex) {
-  const contextFile = registeredConfig(codex).params.value.env.CCDM_REMINDER_CONTEXT_FILE;
-  await eventually(() => fs.existsSync(contextFile), `${contextFile} never appeared`);
-  return contextFile;
+async function waitForContextFile(contextFile, bridge) {
+  await waitFor(() => fs.existsSync(contextFile),
+    () => `the reminder context ${contextFile}; bridge stdout:\n${bridge.stdout}\nbridge stderr:\n${bridge.stderr}`, WAIT_MS);
 }
 
 // Runs one stop request against a bridge in the middle of a turn.

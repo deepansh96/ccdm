@@ -325,6 +325,46 @@ async function ensurePrivateDir(dir) {
   checkRepaired(target);
 }
 
+// The icacls arguments that leave a file's own DACL naming only this user.
+function fileRepairs(sddl, userSid) {
+  const { protected: isProtected, nullDacl, aces } = parseSddl(sddl);
+  const repairs = [];
+  const userEntry = aces.some(ace => ace.sid === userSid && ace.type === "A" && FULL_CONTROL.has(ace.rights));
+  if (nullDacl || !isProtected || !userEntry) repairs.push(["/inheritance:r", "/grant:r", `*${userSid}:F`]);
+  const seen = new Set();
+  for (const ace of aces) {
+    if (ace.sid === userSid || ace.sid === SYSTEM_SID || (!isProtected && hasFlag(ace.flags, "ID"))) continue;
+    const change = ace.type !== "A" && ace.type.includes("D") ? "/remove:d" : "/remove:g";
+    if (seen.has(`${change}:${ace.sid}`)) continue;
+    seen.add(`${change}:${ace.sid}`);
+    repairs.push([change, `*${ace.sid}`]);
+  }
+  return repairs;
+}
+
+// Windows: gives an existing file a protected DACL naming only this user,
+// whatever its directory would pass on. POSIX: nothing, the mode decides.
+async function makeFilePrivate(file) {
+  if (!WIN32) return;
+  const target = path.resolve(file);
+  const userSid = currentUserSid();
+  const run = promisify(execFile);
+  for (let round = 0; round < MAX_REPAIR_ROUNDS; round += 1) {
+    const repairs = fileRepairs(readSddl(target), userSid);
+    if (repairs.length === 0) return;
+    for (const args of repairs) {
+      try {
+        await run(icaclsPath(), [target, ...args], { windowsHide: true });
+      } catch (error) {
+        throw repairFailed(target, `icacls ${args[0]} exited with ${error.code}`);
+      }
+    }
+  }
+  if (fileRepairs(readSddl(target), userSid).length > 0) {
+    throw repairFailed(target, "its access entries could not be removed");
+  }
+}
+
 // Nothing else cleans <stateRoot>/tmp. A directory still in use can be held open,
 // so a failed removal is left for the next sweep.
 function sweepOldTmpDirs(root, prefix) {
@@ -356,6 +396,7 @@ module.exports = {
   ensurePrivateDir,
   ensurePrivateDirSync,
   isPrivateFile,
+  makeFilePrivate,
   privateDirBlockers,
   privateTmpDir,
 };
