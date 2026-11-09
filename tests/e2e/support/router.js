@@ -11,6 +11,8 @@ import { runNodeEntrypoint, scaledTimeout } from "./runner.js";
 import { seedRegistry, updateState } from "./state.js";
 import { registerTeardownCallback } from "./teardown.js";
 
+const WIN32 = process.platform === "win32";
+
 export const OWNER_ID = "owner-id";
 export const ROOT_TOKEN = "root-bot-token";
 
@@ -344,18 +346,41 @@ export async function startBridge(workspace, options = {}) {
     ...(options.botAppId ? { BOT_APP_ID: options.botAppId } : {}),
     ROOT_BOT_APP_ID: options.rootBotAppId ?? "root-bot-app-id",
     WS_PORT: String(options.port),
+    // On Windows a fixture on PATH is not a candidate for the Codex resolver.
+    ...(WIN32 ? { CCDM_CODEX_PATH: path.join(workspace.fixtureDir, "codex.exe") } : {}),
     ...(options.env ?? {}),
   });
-  const command = [process.execPath, path.join(workspace.repoDir, "scripts/codex-bridge.js")];
-  const child = spawn(command[0], [command[1]], {
-    cwd: workspace.repoDir,
-    detached: true,
-    env,
-    stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: true,
-  });
+  const command = [process.execPath, path.join(workspace.repoDir, "scripts/codex-bridge.js"), ...(options.args ?? [])];
+  // Windows: stdin is a pipe to close, unless the bridge is to get Ctrl+Break,
+  // whose launcher keeps its stdin for itself (see spawnWithCtrlBreak).
+  const child = WIN32 && options.ctrlBreak
+    ? spawnWithCtrlBreak(command[0], command.slice(1), { cwd: workspace.repoDir, env, stdio: ["pipe", "pipe", "pipe"] })
+    : spawn(command[0], command.slice(1), {
+      cwd: workspace.repoDir,
+      detached: true,
+      env,
+      stdio: [options.stdin ?? (WIN32 ? "pipe" : "ignore"), "pipe", "pipe"],
+      windowsHide: true,
+    });
   const running = collectProcess(child, { command, cwd: workspace.repoDir, detached: true, env }, workspace);
+  if (WIN32 && !options.ctrlBreak) stopByClosingStdin(running);
   registerTeardownCallback(() => running.stop());
   running.router = router;
   return running;
+}
+
+// Windows has no SIGTERM, so `stop` asks as a launcher would: stdin closes. A
+// bridge that does not go in time is then killed.
+function stopByClosingStdin(running) {
+  const kill = running.stop;
+  running.stop = async () => {
+    const { child, closed } = running;
+    if (child.exitCode !== null || child.signalCode) return closed;
+    child.stdin.end();
+    let timer;
+    const timedOut = new Promise((resolve) => { timer = setTimeout(() => resolve(true), scaledTimeout(10000)); });
+    const late = await Promise.race([closed.then(() => false), timedOut]);
+    clearTimeout(timer);
+    return late ? kill() : closed;
+  };
 }

@@ -1,5 +1,5 @@
 {
-  "budget": 112,
+  "budget": 117,
   "skips": [
     {
       "file": "harness-safety.test.js",
@@ -103,6 +103,36 @@
       "test": "a guest's /restart follows the Codex bridge's allowed-user policy: demo restarts and root never does",
       "tag": "posix",
       "reason": "/restart on Windows is P3.7"
+    },
+    {
+      "file": "bridge-basic-turn.test.js",
+      "test": "bridge restarts its own Codex session from slash command",
+      "tag": "posix",
+      "reason": "the channel /restart still runs /bin/sh and tmux; the Windows port of it is its own ticket"
+    },
+    {
+      "file": "bridge-basic-turn.test.js",
+      "test": "the POSIX stop is one SIGTERM to the child, however many paths ask",
+      "tag": "posix",
+      "reason": "Windows stops a tree with taskkill"
+    },
+    {
+      "file": "conversation-reminder-codex.test.js",
+      "test": "SIGINT ends the POSIX bridge cleanly with one SIGTERM to the app-server",
+      "tag": "posix",
+      "reason": "Windows has no signal to send a detached process"
+    },
+    {
+      "file": "conversation-reminder-codex.test.js",
+      "test": "SIGTERM ends the POSIX bridge cleanly with one SIGTERM to the app-server",
+      "tag": "posix",
+      "reason": "Windows never delivers SIGTERM"
+    },
+    {
+      "file": "conversation-reminder-codex.test.js",
+      "test": "the POSIX bridge ignores stdin EOF",
+      "tag": "posix",
+      "reason": "on Windows stdin EOF is the stop request"
     }
   ]
 }
