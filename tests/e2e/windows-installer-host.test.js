@@ -168,7 +168,9 @@ test("install-service host registers a logon task, ccdm-host runs under it with 
   // What the service host runs: the daemon, allowed inside the task's Job, with
   // the state root and keep-awake passed on explicitly.
   const config = readJson(serviceFile(workspace, ".json"));
-  assert.deepEqual(config.command.slice(1), [path.join(workspace.repoDir, "scripts", "ccdm-host.js"), "serve", "--allow-in-job"]);
+  // Python reports the long form of a temp folder that the runner names in its 8.3 form.
+  assert.equal(fs.realpathSync.native(config.command[1]), fs.realpathSync.native(path.join(workspace.repoDir, "scripts", "ccdm-host.js")));
+  assert.deepEqual(config.command.slice(2), ["serve", "--allow-in-job"]);
   assert.deepEqual(Object.keys(config.env).sort(), ["CCDM_HOST_KEEP_AWAKE", "CCDM_STATE_ROOT", "PATH"]);
   assert.equal(config.env.CCDM_HOST_KEEP_AWAKE, "1");
   assert.equal(fs.realpathSync.native(config.env.CCDM_STATE_ROOT), fs.realpathSync.native(workspace.stateRoot));
