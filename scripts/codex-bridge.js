@@ -4,18 +4,33 @@ const { spawn } = require("child_process");
 const { createHmac, randomBytes } = require("crypto");
 const { writeFile, mkdir, mkdtemp, readFile, rm } = require("fs/promises");
 const { renameSync, rmSync, writeFileSync } = require("fs");
+const net = require("net");
 const os = require("os");
 const path = require("path");
 const WebSocket = require("ws");
 const { writeFileAtomic } = require("./platform/atomic.js");
-const { stateRoot } = require("./platform/paths.js");
+const { safeFileName, samePath, stateRoot } = require("./platform/paths.js");
 const { privateTmpDir } = require("./platform/privacy.js");
+const { killTree, killTreeSync, onShutdown, rememberSpawn } = require("./platform/process.js");
+const { resolveCommand } = require("./platform/tools.js");
+
+const WIN32 = process.platform === "win32";
+// Ctrl+Break also reaches the app-server, which may exit first. Its exit counts
+// as a lost runtime only if no stop request follows within this time.
+const WIN32_RUNTIME_LOSS_GRACE_MS = 500;
 
 const MCP_SERVER_SCRIPT = path.resolve(__dirname, "discord-mcp-server.js");
 const ROOT_DIR = path.resolve(__dirname, "..");
 const REGISTRY_PATH = path.join(ROOT_DIR, "registry.json");
 const REMINDER_STATE_DIR = process.env.CCDM_REMINDER_STATE_DIR || path.join(stateRoot(), "conversation-reminders");
-const REMINDER_CONTEXT_FILE = path.join(REMINDER_STATE_DIR, `active-codex-${process.pid}.json`);
+// Named for the launch, not this process, so the next start of the same launch
+// can remove what a hard kill left behind.
+function reminderContextFileName() {
+  if (process.env.CCDM_ROUTER_ROLE === "root") return "active-codex-.root.json";
+  const thread = process.env.CCDM_THREAD_ID ? `.thread.${process.env.CCDM_THREAD_ID}` : "";
+  return safeFileName(`active-codex-${process.env.CCDM_CODEX_PROJECT || ""}${thread}.json`);
+}
+const REMINDER_CONTEXT_FILE = path.join(REMINDER_STATE_DIR, reminderContextFileName());
 const REMINDER_RECEIPTS_DIR = path.join(REMINDER_STATE_DIR, "receipts");
 process.env.CCDM_REMINDER_PROJECT_ROOT = ROOT_DIR;
 process.env.CCDM_REMINDER_STATE_DIR = REMINDER_STATE_DIR;
@@ -98,6 +113,17 @@ const LAUNCH_READY_FILE = process.env.CCDM_CHANNEL_READY_FILE || "";
 if (!ROUTER_KEY_FILE || (!ROUTER_ROOT && !ROUTER_PROJECT) || !CHANNEL_ID || !PROJECT_DIR) {
   console.error("Missing required env vars: CCDM_ROUTER_KEY_FILE, CCDM_CODEX_PROJECT, CHANNEL_ID, PROJECT_DIR");
   process.exit(1);
+}
+
+// A marker for stop and restart, which on Windows find a bridge by its command
+// line. The key is still read from CCDM_ROUTER_KEY_FILE.
+const keyFileFlag = process.argv.indexOf("--ccdm-key-file", 2);
+if (keyFileFlag !== -1) {
+  const flagged = process.argv[keyFileFlag + 1];
+  if (!flagged || !samePath(flagged, ROUTER_KEY_FILE)) {
+    console.error(`--ccdm-key-file names ${flagged || "no file"}, but CCDM_ROUTER_KEY_FILE names ${ROUTER_KEY_FILE}`);
+    process.exit(1);
+  }
 }
 
 let ws = null;
@@ -586,9 +612,11 @@ function startCodexServer() {
       (CODEX_REASONING_EFFORT ? ` reasoning=${CODEX_REASONING_EFFORT}` : "") +
       (CODEX_SERVICE_TIER ? ` service_tier=${CODEX_SERVICE_TIER}` : "")
   );
+  const codex = resolveCommand("codex");
   codexProcess = spawn(
-    "codex",
+    codex.command,
     [
+      ...codex.args,
       "app-server",
       ...configArgs,
       "--listen",
@@ -597,9 +625,11 @@ function startCodexServer() {
     {
       cwd: PROJECT_DIR,
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env },
+      env: { ...process.env, ...codex.env },
+      windowsHide: true,
     }
   );
+  rememberSpawn(codexProcess);
 
   codexProcess.stdout.on("data", (data) => {
     console.log(`[codex stdout] ${data.toString().trim()}`);
@@ -610,14 +640,16 @@ function startCodexServer() {
   });
 
   codexProcess.on("exit", (code) => {
-    void exitAfterRuntimeLoss(`Codex app-server exited with code ${code}`);
+    const reportLoss = () => void exitAfterRuntimeLoss(`Codex app-server exited with code ${code}`);
+    if (WIN32) setTimeout(reportLoss, WIN32_RUNTIME_LOSS_GRACE_MS);
+    else reportLoss();
   });
 }
 
 // Every exit (a failed hello, a lost Router, a fatal error) takes the
 // app-server with it, so none is left holding the port.
 process.on("exit", () => {
-  if (codexProcess && codexProcess.exitCode === null && codexProcess.signalCode === null) codexProcess.kill();
+  if (codexProcess) killTreeSync(codexProcess);
 });
 
 async function connectWebSocket() {
@@ -1461,7 +1493,7 @@ async function writeDiscordMcpConfig(mcpName) {
     keyPath: `mcp_servers.${mcpName}`,
     mergeStrategy: "replace",
     value: {
-      command: "node",
+      command: process.execPath,
       args: [MCP_SERVER_SCRIPT],
       // Codex stops waiting for a tool after 60 s by default; large reads and
       // exports may take up to the Router's longest per-op deadline.
@@ -1857,19 +1889,26 @@ function startDiscordBot() {
     await reminderAdapter.clearActiveContext().catch(() => {});
     discordTransport.destroy();
     if (ws) ws.close();
-    if (codexProcess) codexProcess.kill();
+    if (codexProcess) await killTree(codexProcess);
     if (discordChannelScopeDir) {
       rmSync(discordChannelScopeDir, { recursive: true, force: true });
     }
     process.exit(0);
   }
 
-  process.on("SIGTERM", cleanup);
-  process.on("SIGINT", cleanup);
-  process.on("SIGHUP", cleanup);
+  // Windows has no SIGTERM to send, so a launcher stops the bridge by closing
+  // its stdin. NUL, or no stdin at all, reads as EOF at once and is no request.
+  onShutdown(cleanup, { stdinEof: WIN32 && stdinIsPipe() });
+}
+
+// Node reports a Windows named pipe as neither FIFO nor file, so fs.fstat cannot tell.
+function stdinIsPipe() {
+  return process.stdin instanceof net.Socket && !process.stdin.isTTY;
 }
 
 async function main() {
+  // A hard kill skips clearActiveContext; its file must not outlive that turn.
+  await reminderAdapter.clearActiveContext();
   await loadRootAccess();
   await reminderAdapter.drainOutbox();
   await initializeDiscordChannelScope();
