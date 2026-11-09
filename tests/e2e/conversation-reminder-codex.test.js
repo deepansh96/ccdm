@@ -411,9 +411,10 @@ test("owner reactions, including one on a recorded reminder, are activity but re
   injectDiscordReaction(workspace, { id: "ordinary-reaction", emoji: "custom_emoji", messageId: "ordinary-message" });
   injectDiscordReaction(workspace, { id: "reminder-reaction", emoji: "👍", messageId: "reminder-1" });
   await waitForState(workspace, (state) => state.fixtures.discord.deliveredReactions.length === 2);
+  // Each event is a Python run; a loaded machine outlasts any fixed delay.
+  const events = await waitForEvents(workspace, (rows) => rows.length >= 2);
+  // Settle so a wrongly started turn would show up.
   await new Promise((resolve) => setTimeout(resolve, 150));
-  const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  const events = JSON.parse(result.stdout).events;
   assert.deepEqual(events.map((event) => [event.event_type, event.activity_kind, event.source_message_id]), [
     ["owner_activity", "reaction", "ordinary-message"], ["owner_activity", "reaction", "reminder-1"]]);
   assert.equal(codex.clientMessages.filter((message) => message.method === "turn/start").length, 1);
@@ -600,14 +601,20 @@ test("a Codex root consumes a root-mention /close in a Claude project channel wi
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert.equal(userTurns().length, 1);
   assert.doesNotMatch(JSON.stringify(userTurns()[0].params.input), /\/close/);
-  const status = await runScript(workspace, "scripts/conversation-reminder-events.py", {
-    args: ["status", "--project", "claude-demo", "--state-dir",
-      path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders")],
-  });
-  assert.equal(status.exitCode, 0, status.stderr);
-  const events = JSON.parse(status.stdout).events;
-  assert.deepEqual(events.filter((event) => event.event_type === "close_requested")
-    .map((event) => [event.source_message_id, event.provider]), [["root-close", "ccdm-root"]]);
+  const closeRequests = async () => {
+    const status = await runScript(workspace, "scripts/conversation-reminder-events.py", {
+      args: ["status", "--project", "claude-demo", "--state-dir",
+        path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders")],
+    });
+    assert.equal(status.exitCode, 0, status.stderr);
+    return JSON.parse(status.stdout).events.filter((event) => event.event_type === "close_requested");
+  };
+  let requests = await closeRequests();
+  for (let attempt = 0; attempt < 100 && requests.length === 0; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    requests = await closeRequests();
+  }
+  assert.deepEqual(requests.map((event) => [event.source_message_id, event.provider]), [["root-close", "ccdm-root"]]);
   await bridge.stop();
 });
 
@@ -757,9 +764,8 @@ test("a completion notification without a turn ID cannot end the active Codex ex
   });
   assert.equal(JSON.parse(reply.stdout).result.isError, undefined);
   codex.releaseTurn("identified-turn");
-  await new Promise((resolve) => setTimeout(resolve, 150));
-  const result = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo", "--json"] });
-  assert.deepEqual(JSON.parse(result.stdout).events.map((event) => event.event_type), ["owner_activity", "response_delivered", "turn_completed"]);
+  const events = await waitForEvents(workspace, (rows) => rows.length >= 3);
+  assert.deepEqual(events.map((event) => event.event_type), ["owner_activity", "response_delivered", "turn_completed"]);
   await bridge.stop();
 });
 

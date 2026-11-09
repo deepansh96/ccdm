@@ -1931,6 +1931,8 @@ test("root's channel scope file is private and each rewrite replaces it whole un
   assert.equal(grants.length, TURNS);
   for (const value of seen) assert.ok(value === "" || grants.includes(value), `torn scope read: ${value}`);
   assert.ok(inodes.size > 1, "the scope file was rewritten in place");
+  // The rewrite after the last turn may still be finishing its rename.
+  for (let attempt = 0; attempt < 100 && fs.readdirSync(scopeDir).length > 1; attempt++) await new Promise((resolve) => setTimeout(resolve, 50));
   assert.deepEqual(fs.readdirSync(scopeDir), ["active"]);
   assertPrivate(scopeFile);
   await bridge.stop();
