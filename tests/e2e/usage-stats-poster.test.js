@@ -579,9 +579,13 @@ test("history store preserves shared parents and rejects unsupported schemas and
   assert.match(atomicInitialization.stdout, /unable to initialize usage history schema atomically/);
   assert.match(atomicInitialization.stdout, /\r?\n0\r?\n0\s*$/);
 
+  // Made ahead: on Windows protecting a new directory starts icacls, which needs os.open.
+  const permissionDir = path.join(workspace.tmpDir, "permission");
+  fs.mkdirSync(permissionDir, 0o700);
+  protectDir(permissionDir);
   const deniedOpen = probe(
     "def denied(*args, **kwargs):\n raise PermissionError('fixture lock permission denied')\nposter.os.open = denied\ntry:\n with poster.HistoryStore(sys.argv[2]).locked(): pass\nexcept poster.PosterError as error:\n print(error); raise SystemExit(1)",
-    path.join(workspace.tmpDir, "permission", "history.sqlite3"),
+    path.join(permissionDir, "history.sqlite3"),
   );
   assert.equal(deniedOpen.status, 1);
   assert.match(deniedOpen.stdout, /unable to open usage history lock/);
