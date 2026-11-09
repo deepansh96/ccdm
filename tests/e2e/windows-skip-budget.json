@@ -1,5 +1,5 @@
 {
-  "budget": 125,
+  "budget": 128,
   "skips": [
     {
       "file": "harness-safety.test.js",
@@ -76,15 +76,33 @@
     },
     {
       "file": "router-claude-session.test.js",
-      "test": "a launch whose Router hello fails exits non-zero and cleans up",
-      "tag": "posix",
-      "reason": "the Bash launcher cleanup; Windows launcher is P3.3"
-    },
-    {
-      "file": "router-claude-session.test.js",
       "test": "after stop-session the Router treats the channel as offline and the next owner message gets 💤",
       "tag": "posix",
-      "reason": "stop-session.sh is zsh; the Windows stop path is P3.3"
+      "reason": "stop-session.sh is zsh until the Windows stop path lands in P3.5"
+    },
+    {
+      "file": "claude-start.test.js",
+      "test": "tmux and process fixtures expose Claude Router sessions without host PID leakage",
+      "tag": "posix",
+      "reason": "the fixture tmux and ps exist on POSIX; Windows has the fake ccdm-host"
+    },
+    {
+      "file": "claude-start.test.js",
+      "test": "the tmux fixture rejects a Claude launch through the official Discord plugin",
+      "tag": "posix",
+      "reason": "the fixture tmux exists on POSIX; Windows has the fake ccdm-host"
+    },
+    {
+      "file": "claude-start.test.js",
+      "test": "start-session refuses to launch when a Claude Router listener already holds the project's key file",
+      "tag": "posix",
+      "reason": "POSIX finds listeners by their environment; the Windows case is below it"
+    },
+    {
+      "file": "claude-start.test.js",
+      "test": "on POSIX the launch settings carry no statusLine and the channel server args stay one script path",
+      "tag": "posix",
+      "reason": "the POSIX launch files; Windows gets statusLine and --ccdm-key-file"
     },
     {
       "file": "router-claude-session.test.js",

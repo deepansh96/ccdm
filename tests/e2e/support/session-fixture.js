@@ -10,6 +10,7 @@
 //
 // Switches a test sets in `fixtures.claude`, without editing this harness:
 //   trustPrompt: the fake claude shows the folder-trust prompt before the channel prompt.
+//   autoModeOffer: it shows the one-time auto-mode offer until it gets Escape.
 //   contextScreen: `/context` then Enter shows this grid (true: a standard one).
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
@@ -23,6 +24,7 @@ const WAIT_POLL_MS = 25;
 const PROTOCOL_VERSION = 1;
 
 export const TRUST_PROMPT = "Do you trust the files in this folder?\n\nIs this a project you created or one you trust?\n\n❯ 1. Yes, proceed\n  2. No, exit\n";
+export const AUTO_MODE_OFFER = "Make auto mode your default permission mode?\n\n1. Yes\n2. Not now\n";
 export const CONTEXT_SCREEN = "Context Usage\n⛁ ⛁ ⛁ ⛀ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   claude-fixture · 45k/200k tokens (22%)\n⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Messages: 30k tokens (15%)\n";
 
 // One line per call, in order: `{front, args}` for a tool, `{front, op, ...}` for a pipe op.
@@ -104,6 +106,7 @@ export function createSessionFixture(context) {
         : record.argv.join(" ");
     const devChannelPrompt = routerChannel ? (tmuxState.devChannelPrompt === "never" ? "never" : "pending") : undefined;
     const trustPrompt = launch.kind === "claude-listener" && readState().fixtures.claude.trustPrompt ? "pending" : undefined;
+    const autoModeOffer = launch.kind === "claude-listener" && readState().fixtures.claude.autoModeOffer ? "pending" : undefined;
     const launchedScreen =
       launch.kind === "codex-bridge"
         ? "Codex-Discord bridge running\nListening in #channel-id\n"
@@ -114,7 +117,8 @@ export function createSessionFixture(context) {
             : devChannelPrompt === "never"
               ? "Starting Claude Code\n"
               : "Listening for channel messages\n";
-    const paneOutput = trustPrompt ? TRUST_PROMPT : launchedScreen;
+    const afterTrustScreen = autoModeOffer ? AUTO_MODE_OFFER : launchedScreen;
+    const paneOutput = trustPrompt ? TRUST_PROMPT : afterTrustScreen;
 
     updateState((state) => {
       if (state.fixtures.tmux.sessions[name]) {
@@ -131,7 +135,8 @@ export function createSessionFixture(context) {
         bridgeCommand: launch.bridgeCommand,
         paneOutput,
         ...(devChannelPrompt ? { devChannelPrompt } : {}),
-        ...(trustPrompt ? { trustPrompt, afterTrustScreen: launchedScreen } : {}),
+        ...(trustPrompt ? { trustPrompt, afterTrustScreen } : {}),
+        ...(autoModeOffer ? { autoModeOffer, afterOfferScreen: launchedScreen } : {}),
         pid,
         killAttempts: priorKillAttempts,
         shellCommand,
@@ -182,6 +187,9 @@ export function createSessionFixture(context) {
       } else if (keys[0] === "Enter" && session.trustPrompt === "pending") {
         session.trustPrompt = "accepted";
         session.paneOutput = session.afterTrustScreen;
+      } else if (keys[0] === "Escape" && session.autoModeOffer === "pending") {
+        session.autoModeOffer = "dismissed";
+        session.paneOutput = session.afterOfferScreen;
       } else if (keys[0] === "Enter" && session.typedText === "/context" && contextScreen) {
         session.typedText = undefined;
         session.paneOutput = contextScreen === true ? CONTEXT_SCREEN : contextScreen;

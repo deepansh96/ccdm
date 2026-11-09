@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { assertPrivate } from "./support/platform.js";
+import { PYTHON, assertPrivate, platformGate } from "./support/platform.js";
 import { createWorkspace, runScript } from "./support/runner.js";
 import { OWNER_ID, createRouterWorkspace, routerEnv, routerWithWebhooks, runRouterCli } from "./support/router.js";
+import { startFakeHost } from "./support/session-fixture.js";
 import { readState, seedFixtureProcess, seedRegistry, seedTmuxSession, updateState } from "./support/state.js";
-import { cleanup } from "./support/teardown.js";
+import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 
 test.afterEach(async () => {
   await cleanup();
@@ -71,15 +72,40 @@ async function claudeRouterWorkspace(options = {}) {
   return { workspace, registry: readRegistry(workspace) };
 }
 
-function startSession(workspace, extraEnv = {}) {
-  return runScript(workspace, "scripts/start-session.sh", { args: ["alpha"], env: routerEnv(workspace, extraEnv) });
+// Windows has no tmux, so a launch there goes through the fake ccdm-host. POSIX
+// runs the launcher on tmux and, for the cases that matter on both, on the host too.
+const WIN = process.platform === "win32";
+const DEFAULT_BACKEND = WIN ? "ccdm-host" : "tmux";
+const BACKENDS = WIN ? ["ccdm-host"] : ["tmux", "ccdm-host"];
+const SESSION_WORD = WIN ? "session" : "tmux session";
+const ATTACH_HINT = WIN ? "Attach with: node scripts/ccdm-host\\.js attach -t" : "Attach with: tmux attach -t";
+const LAUNCH_TIMEOUT_MS = WIN ? 30000 : undefined;
+
+const fakeHosts = new WeakMap();
+async function backendEnv(workspace, backend = DEFAULT_BACKEND) {
+  if (backend === "tmux") return { CCDM_SESSION_HOST: "tmux" };
+  if (!fakeHosts.has(workspace)) fakeHosts.set(workspace, await startFakeHost(workspace));
+  return fakeHosts.get(workspace).env;
 }
+
+async function startSession(workspace, extraEnv = {}, backend = DEFAULT_BACKEND) {
+  return runScript(workspace, "scripts/start-session.sh", {
+    args: ["alpha"],
+    env: routerEnv(workspace, { ...(await backendEnv(workspace, backend)), ...extraEnv }),
+    timeoutMs: LAUNCH_TIMEOUT_MS,
+  });
+}
+
+// What a launch ran: the tmux string, or the argv the fake host received.
+const launchText = session => session.shellCommand ?? session.command.join(" ");
+// A value in `launchText`: quoted in the tmux string, plain in an argv.
+const launched = (session, value) => (session.shellCommand ? `'${value}'` : value);
 
 function launchDir(workspace) {
   return path.join(workspace.routerStateDir, "launches", "alpha");
 }
 
-test("tmux and process fixtures expose Claude Router sessions without host PID leakage", () => {
+test("tmux and process fixtures expose Claude Router sessions without host PID leakage", platformGate("posix", "the fixture tmux and ps exist on POSIX; Windows has the fake ccdm-host"), () => {
   const workspace = createWorkspace();
   const projectPath = path.join(workspace.tmpDir, "project with spaces");
   fs.mkdirSync(projectPath, { recursive: true });
@@ -141,7 +167,7 @@ test("tmux and process fixtures expose Claude Router sessions without host PID l
   assert.equal(state.fixtures.claude.invocations[0].env.CCDM_ROUTER_KEY_FILE, keyFile);
 });
 
-test("the tmux fixture rejects a Claude launch through the official Discord plugin", () => {
+test("the tmux fixture rejects a Claude launch through the official Discord plugin", platformGate("posix", "the fixture tmux exists on POSIX; Windows has the fake ccdm-host"), () => {
   const workspace = createWorkspace();
   const stateDir = path.join(workspace.homeDir, ".claude", "channels", "discord2");
   const started = runFixture(workspace, "tmux", [
@@ -160,9 +186,9 @@ test("a Claude project with no transport field starts through the Router and rec
   const result = await startSession(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  assert.match(result.stdout, /Started Claude Router session in tmux session 'alpha_session'/);
+  assert.match(result.stdout, new RegExp(`Started Claude Router session in ${SESSION_WORD} 'alpha_session'`));
   assert.match(result.stdout, /Channel server connected to the Router \(scope channel-1\)/);
-  assert.match(result.stdout, /Attach with: tmux attach -t alpha_session/);
+  assert.match(result.stdout, new RegExp(`${ATTACH_HINT} alpha_session`));
   assert.match(result.stdout, /Recorded PID \d+ and session fixture-session-\d+/);
 
   const registry = readRegistry(workspace);
@@ -178,10 +204,12 @@ test("a Claude project with no transport field starts through the Router and rec
   const mcpConfigPath = path.join(launchDir(workspace), "mcp.json");
   const mcpConfig = JSON.parse(fs.readFileSync(mcpConfigPath, "utf8"));
   assert.deepEqual(Object.keys(mcpConfig.mcpServers), ["ccdm"]);
-  assert.deepEqual(mcpConfig.mcpServers.ccdm.args, [path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js")]);
+  const serverScript = path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js");
+  const keyFile = path.join(workspace.routerStateDir, "keys", "alpha.key");
+  assert.deepEqual(mcpConfig.mcpServers.ccdm.args, WIN ? [serverScript, "--ccdm-key-file", keyFile] : [serverScript]);
   assert.equal(mcpConfig.mcpServers.ccdm.env.CCDM_CLAUDE_CHANNEL_ID, "channel-1");
   assertPrivate(mcpConfigPath);
-  assert.match(session.shellCommand, /--mcp-config/);
+  assert.match(launchText(session), /--mcp-config/);
   assert.equal(fs.existsSync(path.join(workspace.homeDir, ".claude", ".claude.json")), false);
 });
 
@@ -215,9 +243,9 @@ test("no Claude launch passes a Discord token, DISCORD_STATE_DIR, the official p
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const state = readState(workspace.stateDir);
   const session = state.fixtures.tmux.sessions.alpha_session;
-  assert.match(session.shellCommand, /--dangerously-load-development-channels server:ccdm/);
+  assert.match(launchText(session), /--dangerously-load-development-channels server:ccdm/);
   const surfaces = [
-    session.shellCommand,
+    launchText(session),
     JSON.stringify(state.fixtures.claude.invocations),
     JSON.stringify(state.fixtures.claude.sessionEnvironments),
     ...fs.readdirSync(launchDir(workspace)).map((file) => fs.readFileSync(path.join(launchDir(workspace), file), "utf8")),
@@ -244,11 +272,8 @@ test("start-session honors Claude model and effort overrides", async () => {
   const result = await startSession(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  const state = readState(workspace.stateDir);
-  assert.match(
-    state.fixtures.tmux.sessions.alpha_session.shellCommand,
-    /--model 'claude-fable-5' --effort 'high'/,
-  );
+  const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session;
+  assert.ok(launchText(session).includes(`--model ${launched(session, "claude-fable-5")} --effort ${launched(session, "high")}`));
 });
 
 for (const effort of ["invalid", "high\tbad", "high\nbad", "__NONE__", false, 0, 1, [], {}]) {
@@ -283,8 +308,8 @@ for (const effort of [undefined, null, "", "low", "medium", "high", "xhigh", "ma
     assert.equal(result.exitCode, 0, result.stderr || result.stdout);
     const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session;
     assert.equal(session.env.CLAUDE_CONFIG_DIR, path.join(workspace.homeDir, ".claude-work"));
-    if (effort) assert.ok(session.shellCommand.includes(`--effort '${effort}'`));
-    else assert.doesNotMatch(session.shellCommand, /--effort/);
+    if (effort) assert.ok(launchText(session).includes(`--effort ${launched(session, effort)}`));
+    else assert.doesNotMatch(launchText(session), /--effort/);
     const mcpConfig = JSON.parse(fs.readFileSync(path.join(launchDir(workspace), "mcp.json"), "utf8"));
     assert.equal(mcpConfig.mcpServers.ccdm.env.CCDM_CLAUDE_CHANNEL_ID, registry.projects.alpha.channel_id);
   });
@@ -299,7 +324,7 @@ test("start-session honors claude_home: launches with CLAUDE_CONFIG_DIR and reco
   const result = await startSession(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  assert.match(result.stdout, /Started Claude Router session in tmux session 'alpha_session'/);
+  assert.match(result.stdout, new RegExp(`Started Claude Router session in ${SESSION_WORD} 'alpha_session'`));
   assert.match(result.stdout, /Recorded PID \d+ and session fixture-session-\d+/);
 
   const registry = readRegistry(workspace);
@@ -323,8 +348,12 @@ function writeTranscript(claudeHome, projectPath, sessionId = RESUME_ID) {
   fs.writeFileSync(path.join(dir, `${sessionId}.jsonl`), "{}\n");
 }
 
-function startResume(workspace, id = RESUME_ID, extraEnv = {}) {
-  return runScript(workspace, "scripts/start-session.sh", { args: ["alpha", "--resume", id], env: routerEnv(workspace, extraEnv) });
+async function startResume(workspace, id = RESUME_ID, extraEnv = {}) {
+  return runScript(workspace, "scripts/start-session.sh", {
+    args: ["alpha", "--resume", id],
+    env: routerEnv(workspace, { ...(await backendEnv(workspace)), ...extraEnv }),
+    timeoutMs: LAUNCH_TIMEOUT_MS,
+  });
 }
 
 function assertNothingLaunched(workspace, registryBefore) {
@@ -345,11 +374,12 @@ test("start-session --resume launches claude --resume <id> from the project's cl
   const result = await startResume(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  assert.match(result.stdout, new RegExp(`Started Claude Router session in tmux session 'alpha_session' \\(resuming ${RESUME_ID}\\)`));
+  assert.match(result.stdout, new RegExp(`Started Claude Router session in ${SESSION_WORD} 'alpha_session' \\(resuming ${RESUME_ID}\\)`));
   assert.match(result.stdout, /Channel server connected to the Router/);
   const state = readState(workspace.stateDir);
   assert.equal(state.fixtures.claude.invocations.length, 1);
-  assert.match(state.fixtures.tmux.sessions.alpha_session.shellCommand, new RegExp(`--resume '${RESUME_ID}'`));
+  const session = state.fixtures.tmux.sessions.alpha_session;
+  assert.ok(launchText(session).includes(`--resume ${launched(session, RESUME_ID)}`));
   assert.equal(readRegistry(workspace).projects.alpha.session_id, RESUME_ID);
 });
 
@@ -375,7 +405,7 @@ for (const args of [["alpha", "--resume", "not-a-uuid"], ["alpha", "--resume", R
     const workspace = seededWorkspace({ mutate: (registry) => { registry.projects.alpha.webhook_id = "webhook-alpha"; } });
     const registryBefore = fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8");
 
-    const result = await runScript(workspace, "scripts/start-session.sh", { args, env: routerEnv(workspace) });
+    const result = await runScript(workspace, "scripts/start-session.sh", { args, env: routerEnv(workspace, await backendEnv(workspace)) });
 
     assert.equal(result.exitCode, 1, result.stdout);
     assert.match(result.stderr, /Resume session must be a canonical UUID|Usage: .* <project_name> \[--resume <session_id>\]/);
@@ -423,7 +453,7 @@ test("start-session exits successfully when the target tmux session is already r
   assert.equal(readRegistry(workspace).projects.alpha.pid, null);
 });
 
-test("start-session refuses to launch when a Claude Router listener already holds the project's key file", async () => {
+test("start-session refuses to launch when a Claude Router listener already holds the project's key file", platformGate("posix", "POSIX finds listeners by their environment; the Windows case is below"), async () => {
   const workspace = seededWorkspace();
   const keyFile = path.join(workspace.routerStateDir, "keys", "alpha.key");
 
@@ -493,4 +523,256 @@ test("start-session updates only the requested Claude project in a multi-project
   const state = readState(workspace.stateDir);
   assert.ok(state.fixtures.tmux.sessions.alpha_session);
   assert.equal(state.fixtures.tmux.sessions.beta_session, undefined);
+});
+
+// ---- what the launcher does on both backends ----
+
+function settledHome(workspace) {
+  return path.join(workspace.homeDir, ".claude");
+}
+
+function launchRecord(workspace, name = "alpha_session") {
+  return readState(workspace.stateDir).fixtures.sessionHost.launches.findLast(launch => launch.name === name);
+}
+
+// Runs `_launch.py` against the workspace's fixture session, as a launcher would.
+const LAUNCH_DRIVER = `
+import sys
+sys.dont_write_bytecode = True
+import json, time
+sys.path.insert(0, sys.argv[1])
+from ccdmlib.cli import _launch
+name, cwd, project_path, timeout = json.loads(sys.argv[2])
+try:
+    _launch.accept_dialogs(name, cwd, project_path, time.monotonic() + timeout)
+    print(json.dumps({"ok": True}))
+except _launch.LaunchFailed as error:
+    print(json.dumps({"ok": False, "message": str(error)}))
+`;
+
+async function runAcceptDialogs(workspace, name, cwd, projectPath, { backend = DEFAULT_BACKEND, timeout = 5 } = {}) {
+  const env = { ...workspace.env, PYTHONUTF8: "1", ...(await backendEnv(workspace, backend)) };
+  const child = spawn(PYTHON, ["-c", LAUNCH_DRIVER, path.join(workspace.repoDir, "scripts"), JSON.stringify([name, cwd, projectPath, timeout])],
+    { cwd: workspace.tmpRoot, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+  child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+  const exited = new Promise(resolve => child.once("close", resolve));
+  return { child, exited, output: () => ({ stdout, stderr }) };
+}
+
+async function acceptDialogsResult(workspace, ...rest) {
+  const run = await runAcceptDialogs(workspace, ...rest);
+  await run.exited;
+  const { stdout, stderr } = run.output();
+  try {
+    return JSON.parse(stdout.trim());
+  } catch {
+    throw new Error(`accept_dialogs driver printed no result: ${stderr}${stdout}`);
+  }
+}
+
+const PROMPT_SCREEN = "WARNING: Loading development channels\n\n--dangerously-load-development-channels is for local channel development only.\n";
+
+for (const backend of BACKENDS) {
+  test(`${backend}: a launch that shows the folder-trust prompt, then the channel prompt, is accepted and reaches the Router`, async () => {
+    const { workspace } = await claudeRouterWorkspace();
+    updateState(workspace.stateDir, (state) => { state.fixtures.claude.trustPrompt = true; });
+
+    const result = await startSession(workspace, {}, backend);
+
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /Channel server connected to the Router/);
+    const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session;
+    assert.deepEqual(session.sendKeys, [["Enter"], ["Enter"]]);
+    assert.equal(session.trustPrompt, "accepted");
+    assert.equal(session.devChannelPrompt, "accepted");
+    const status = await runRouterCli(workspace, ["status"]);
+    assert.match(status.stdout, /project alpha scope=channel-1 connected=/);
+  });
+
+  test(`${backend}: the auto-mode offer gets Esc once and the launch still reaches the Router`, async () => {
+    const { workspace } = await claudeRouterWorkspace();
+    updateState(workspace.stateDir, (state) => { state.fixtures.claude.autoModeOffer = true; });
+
+    const result = await startSession(workspace, {}, backend);
+
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /Channel server connected to the Router/);
+    assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session.sendKeys, [["Escape"], ["Enter"]]);
+  });
+
+  test(`${backend}: a channel prompt that never appears fails at the deadline with today's message`, async () => {
+    const { workspace } = await claudeRouterWorkspace();
+    updateState(workspace.stateDir, (state) => { state.fixtures.tmux.devChannelPrompt = "never"; });
+
+    const result = await startSession(workspace, { CCDM_CLAUDE_LAUNCH_TIMEOUT_S: "1" }, backend);
+
+    assert.equal(result.exitCode, 1, result.stdout);
+    assert.match(result.stderr, /The development-channel confirmation never appeared/);
+    assert.match(result.stderr, /Launch of 'alpha' failed; cleaning up/);
+    assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session, undefined);
+    assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", "alpha.key")), false);
+  });
+
+  test(`${backend}: a folder-trust prompt in a session outside the project's registry path is not accepted, naming both paths`, async () => {
+    const workspace = seededWorkspace();
+    const projectPath = readRegistry(workspace).projects.alpha.path;
+    const elsewhere = path.join(workspace.tmpDir, "somewhere else");
+    seedTmuxSession("alpha_session", { paneOutput: "Do you trust the files in this folder?\n\nIs this a project you created or one you trust?\n" }, { stateDir: workspace.stateDir });
+
+    const result = await acceptDialogsResult(workspace, "alpha_session", elsewhere, projectPath, { backend });
+
+    assert.equal(result.ok, false);
+    assert.ok(result.message.includes(elsewhere), result.message);
+    assert.ok(result.message.includes(projectPath), result.message);
+    assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session.sendKeys, undefined);
+  });
+
+  test(`${backend}: an already-trusted launch accepts the channel prompt within 1 s of it appearing`, async () => {
+    const workspace = seededWorkspace();
+    const projectPath = readRegistry(workspace).projects.alpha.path;
+    seedTmuxSession("alpha_session", { paneOutput: "Starting Claude Code\n" }, { stateDir: workspace.stateDir });
+
+    const run = await runAcceptDialogs(workspace, "alpha_session", projectPath, projectPath, { backend, timeout: 10 });
+    await new Promise(resolve => setTimeout(resolve, 800));
+    const appeared = performance.now();
+    updateState(workspace.stateDir, (state) => { state.fixtures.tmux.sessions.alpha_session.paneOutput = PROMPT_SCREEN; });
+
+    for (;;) {
+      if (readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session.sendKeys) break;
+      assert.ok(performance.now() - appeared < 1000, "Enter was not sent within 1 s of the channel prompt");
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    await run.exited;
+    assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session.sendKeys, [["Enter"]]);
+    assert.deepEqual(JSON.parse(run.output().stdout.trim()), { ok: true });
+  });
+
+  test(`${backend}: the recorded PID is the Claude process, with its session id`, async () => {
+    const { workspace } = await claudeRouterWorkspace();
+
+    const result = await startSession(workspace, {}, backend);
+
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+    const { pid, session_id: sessionId, pid_started_at: startedAt } = readRegistry(workspace).projects.alpha;
+    assert.equal(pid, launchRecord(workspace).pid);
+    assert.equal(sessionId, `fixture-session-${pid}`);
+    assert.ok(fs.existsSync(path.join(settledHome(workspace), "sessions", `${pid}.json`)));
+    if (WIN) assert.match(startedAt, /^\d+$/);
+    else assert.equal(startedAt, undefined);
+  });
+}
+
+test("the generated settings.json hook commands are hook_command()'s output", async () => {
+  const { workspace } = await claudeRouterWorkspace();
+
+  const result = await startSession(workspace);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const hookScript = path.join(workspace.repoDir, "scripts", "claude-reminder-hook.js");
+  const printed = spawnSync(PYTHON, ["-c", `import sys; sys.dont_write_bytecode = True; sys.path.insert(0, sys.argv[1]); from ccdmlib.platform.hooks import hook_command; print(hook_command(sys.argv[2]))`,
+    path.join(workspace.repoDir, "scripts"), hookScript], { encoding: "utf8", env: workspace.env, windowsHide: true });
+  assert.equal(printed.status, 0, printed.stderr);
+  const expected = printed.stdout.trim();
+  assert.match(expected, /^node '/);
+  const settings = JSON.parse(fs.readFileSync(path.join(launchDir(workspace), "settings.json"), "utf8"));
+  for (const event of ["SessionStart", "Stop", "StopFailure", "SessionEnd"]) {
+    assert.equal(settings.hooks[event][0].hooks[0].command, expected, event);
+  }
+});
+
+test("on POSIX the launch settings carry no statusLine and the channel server args stay one script path", platformGate("posix", "the POSIX launch files; Windows gets statusLine and --ccdm-key-file"), async () => {
+  const { workspace } = await claudeRouterWorkspace();
+
+  const result = await startSession(workspace);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const settings = JSON.parse(fs.readFileSync(path.join(launchDir(workspace), "settings.json"), "utf8"));
+  assert.equal("statusLine" in settings, false);
+  const mcpConfig = JSON.parse(fs.readFileSync(path.join(launchDir(workspace), "mcp.json"), "utf8"));
+  assert.deepEqual(mcpConfig.mcpServers.ccdm.args, [path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js")]);
+});
+
+const statusLineCommand = workspace => `node '${path.join(workspace.repoDir, "scripts", "statusline-context.js").replaceAll("\\", "/")}'`;
+
+test("on Windows settings.json has the statusLine command", platformGate("win32", "the per-launch statusLine is Windows-only"), async () => {
+  const { workspace } = await claudeRouterWorkspace();
+
+  const result = await startSession(workspace);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const settings = JSON.parse(fs.readFileSync(path.join(launchDir(workspace), "settings.json"), "utf8"));
+  assert.equal(settings.statusLine.type, "command");
+  assert.equal(settings.statusLine.command, statusLineCommand(workspace));
+  assert.match(settings.statusLine.command, /^node '[A-Za-z]:\//);
+  const mcpConfig = JSON.parse(fs.readFileSync(path.join(launchDir(workspace), "mcp.json"), "utf8"));
+  assert.deepEqual(mcpConfig.mcpServers.ccdm.args.slice(1), ["--ccdm-key-file", path.join(workspace.routerStateDir, "keys", "alpha.key")]);
+});
+
+test("on Windows a user's own statusLine command is kept with --chain, its quotes escaped", platformGate("win32", "the per-launch statusLine is Windows-only"), async () => {
+  const { workspace } = await claudeRouterWorkspace();
+  fs.mkdirSync(settledHome(workspace), { recursive: true });
+  fs.writeFileSync(path.join(settledHome(workspace), "settings.json"), JSON.stringify({ statusLine: { type: "command", command: "bash -c 'echo hi'", padding: 2 } }));
+
+  const result = await startSession(workspace);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const { statusLine } = JSON.parse(fs.readFileSync(path.join(launchDir(workspace), "settings.json"), "utf8"));
+  const chained = "bash -c 'echo hi'".replaceAll("'", "'\\''");
+  assert.equal(statusLine.command, `${statusLineCommand(workspace)} --chain '${chained}'`);
+  assert.equal(statusLine.padding, 2);
+});
+
+test("on Windows a registered Claude listener found by its command-line key file blocks a second launch", platformGate("win32", "POSIX finds listeners by their environment"), async () => {
+  const workspace = seededWorkspace({ mutate: (registry) => { registry.projects.alpha.webhook_id = "webhook-alpha"; } });
+  const keyFile = path.join(workspace.routerStateDir, "keys", "alpha.key");
+  const listener = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--ccdm-key-file", keyFile], { stdio: "ignore", windowsHide: true });
+  registerTeardownCallback(async () => {
+    const exited = new Promise(resolve => listener.once("exit", resolve));
+    listener.kill();
+    await exited;
+  });
+  await new Promise(resolve => setTimeout(resolve, 500));
+
+  const result = await startSession(workspace);
+
+  assert.equal(result.exitCode, 1, result.stdout);
+  assert.match(result.stdout, /Refusing to start 'alpha'/);
+  assert.match(result.stdout, new RegExp(`  ${listener.pid}`));
+  assert.match(result.stdout, /Run scripts\/ccdm stop-session 'alpha' first/);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session, undefined);
+});
+
+test("on Windows --resume finds a transcript kept under the drive-letter folder name", platformGate("win32", "Windows folder names"), async () => {
+  const { workspace, registry } = await claudeRouterWorkspace();
+  const projectPath = registry.projects.alpha.path;
+  assert.match(projectPath, /^[A-Za-z]:\\/);
+  const munged = projectPath.replace(/[^A-Za-z0-9]/g, "-");
+  assert.match(munged, /^[A-Za-z]--/);
+  // Claude takes the drive letter from its own process, so the case may differ.
+  const stored = munged[0] === munged[0].toUpperCase() ? munged[0].toLowerCase() + munged.slice(1) : munged[0].toUpperCase() + munged.slice(1);
+  const dir = path.join(settledHome(workspace), "projects", stored);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${RESUME_ID}.jsonl`), "{}\n");
+
+  const result = await startResume(workspace);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.equal(readRegistry(workspace).projects.alpha.session_id, RESUME_ID);
+});
+
+test("the shim and scripts/ccdm start-session print the same and exit the same", async () => {
+  const workspace = seededWorkspace();
+  const env = routerEnv(workspace, await backendEnv(workspace));
+
+  const shim = await runScript(workspace, "scripts/start-session.sh", { args: ["alpha"], env, timeoutMs: LAUNCH_TIMEOUT_MS });
+  const direct = await runScript(workspace, "scripts/ccdm", { args: ["start-session", "alpha"], env, timeoutMs: LAUNCH_TIMEOUT_MS });
+
+  assert.equal(shim.exitCode, 1, shim.stderr || shim.stdout);
+  assert.match(shim.stderr, /it has no webhook_id/);
+  assert.equal(direct.exitCode, shim.exitCode);
+  assert.equal(direct.stdout, shim.stdout);
+  assert.equal(direct.stderr, shim.stderr);
 });
