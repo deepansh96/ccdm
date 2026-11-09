@@ -8,11 +8,27 @@
 //
 // The caller's arguments are copied from the raw command line, never parsed and
 // quoted again, so the child parses exactly what the caller wrote.
+//
+// The child and everything under it run in a job object owned by this process.
+// If this process is killed, the kernel closes the job and kills the tree. If the
+// child exits on its own, the job is left running without the kill-on-close limit,
+// so a detached grandchild (a fixture tmux session) outlives the tool, as it would
+// on POSIX; a workspace's own job (below) still ends it at teardown.
+//
+// Ctrl+Break, or the workspace's stop event, is forwarded to the child's process
+// group. The child gets a grace period, then whatever is left of the tree is killed.
+//
+// A workspace's fixtures dir holds .job with one line, a kernel object name:
+//   <name>        a job the harness holds open; every child also joins it
+//   <name>-stop   an event the harness sets at teardown
+// and .live, which holds a delete-on-close file for each launcher still running.
+// A launcher with no .job beside it (a copy under test) simply has neither.
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 internal static class FixtureShim
 {
@@ -21,10 +37,67 @@ internal static class FixtureShim
     private const int StdError = -12;
     private const uint HandleFlagInherit = 1;
     private const uint StartfUseStdHandles = 0x100;
+    private const uint CreateSuspended = 0x4;
+    private const uint CreateNewProcessGroup = 0x200;
     private const uint CreateNoWindow = 0x08000000;
     private const uint ExtendedStartupInfoPresent = 0x00080000;
     private static readonly IntPtr AttributeHandleList = new IntPtr(0x00020002);
     private const uint Infinite = 0xFFFFFFFF;
+    private const uint CtrlBreakEvent = 1;
+    private const uint JobObjectAssignProcess = 0x0001;
+    private const int JobObjectExtendedLimitInformation = 9;
+    private const uint JobObjectLimitKillOnJobClose = 0x2000;
+    private const uint GraceMilliseconds = 2000;
+    private const uint ForcedExitCode = 1;
+
+    private const int Running = 0;
+    private const int Finished = 1;
+    private const int Stopping = 2;
+
+    private static int state = Running;
+    private static IntPtr treeJob;
+    private static ProcessInformation child;
+    private static bool sharesConsole;
+    private static ConsoleCtrlHandler ctrlHandler;
+    private static FileStream liveFile;
+
+    private delegate bool ConsoleCtrlHandler(uint ctrlType);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BasicLimitInformation
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IoCounters
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ExtendedLimitInformation
+    {
+        public BasicLimitInformation BasicLimitInformation;
+        public IoCounters IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct StartupInfo
@@ -72,7 +145,37 @@ internal static class FixtureShim
     private static extern uint GetModuleFileNameW(IntPtr module, StringBuilder name, uint size);
 
     [DllImport("kernel32.dll")]
-    private static extern IntPtr GetConsoleWindow();
+    private static extern uint GetConsoleCP();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AttachConsole(uint processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GenerateConsoleCtrlEvent(uint ctrlEvent, uint processGroupId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetConsoleCtrlHandler(ConsoleCtrlHandler handler, bool add);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateJobObjectW(IntPtr attributes, IntPtr name);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr OpenJobObjectW(uint access, bool inherit, string name);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref ExtendedLimitInformation info, int size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint ResumeThread(IntPtr thread);
+
+    [DllImport("kernel32.dll")]
+    private static extern void ExitProcess(uint exitCode);
 
     [DllImport("kernel32.dll")]
     private static extern IntPtr GetStdHandle(int which);
@@ -137,19 +240,131 @@ internal static class FixtureShim
         startup.StartupInfo.hStdError = Inheritable(GetStdHandle(StdError));
         bool inherit = LimitInheritanceToStdio(ref startup);
 
-        // A detached launcher has no console, and a console child would open a window.
-        uint flags = (GetConsoleWindow() == IntPtr.Zero ? CreateNoWindow : 0) | ExtendedStartupInfoPresent;
-        ProcessInformation child;
+        // Without a console of ours the child gets its own hidden one (a console child
+        // would otherwise open a window). AllocConsole here could show one on screen.
+        sharesConsole = GetConsoleCP() != 0;
+        uint flags = (sharesConsole ? 0 : CreateNoWindow) | ExtendedStartupInfoPresent | CreateSuspended | CreateNewProcessGroup;
         if (!CreateProcessW(lines[0], commandLine, IntPtr.Zero, IntPtr.Zero, inherit, flags, IntPtr.Zero, null,
                 ref startup, out child))
         {
             Console.Error.WriteLine("fixture launcher: cannot start " + lines[0] + ": error " + Marshal.GetLastWin32Error());
             return 126;
         }
+
+        string directory = Path.GetDirectoryName(shim);
+        string workspaceJob = WorkspaceJobName(directory);
+        // The outer job first: the tree job then nests inside it (Windows 8 and later).
+        if (workspaceJob != null) JoinWorkspaceJob(workspaceJob);
+        treeJob = NewTreeJob();
+        if (!AssignProcessToJobObject(treeJob, child.hProcess))
+        {
+            Console.Error.WriteLine("fixture launcher: cannot join the tree job: error " + Marshal.GetLastWin32Error());
+        }
+        ResumeThread(child.hThread);
+
+        if (workspaceJob != null) MarkLive(directory);
+        ctrlHandler = OnConsoleCtrl;
+        SetConsoleCtrlHandler(ctrlHandler, true);
+        if (workspaceJob != null) WatchStopEvent(workspaceJob + "-stop");
+
         WaitForSingleObject(child.hProcess, Infinite);
+        // A stop already under way owns the exit.
+        if (Interlocked.CompareExchange(ref state, Finished, Running) != Running) Thread.Sleep(Timeout.Infinite);
+        ClearKillOnClose();
         uint exitCode;
         GetExitCodeProcess(child.hProcess, out exitCode);
         return unchecked((int)exitCode);
+    }
+
+    private static bool OnConsoleCtrl(uint ctrlType)
+    {
+        if (ctrlType != CtrlBreakEvent) return false;
+        Stop();
+        return true;
+    }
+
+    private static void Stop()
+    {
+        if (Interlocked.CompareExchange(ref state, Stopping, Running) != Running) return;
+        BreakChild();
+        uint exitCode = ForcedExitCode;
+        if (WaitForSingleObject(child.hProcess, GraceMilliseconds) == 0) GetExitCodeProcess(child.hProcess, out exitCode);
+        TerminateJobObject(treeJob, ForcedExitCode);
+        ExitProcess(exitCode);
+    }
+
+    private static void BreakChild()
+    {
+        if (!sharesConsole && !AttachConsole(child.dwProcessId)) return;
+        GenerateConsoleCtrlEvent(CtrlBreakEvent, child.dwProcessId);
+    }
+
+    private static IntPtr NewTreeJob()
+    {
+        IntPtr job = CreateJobObjectW(IntPtr.Zero, IntPtr.Zero);
+        var limits = new ExtendedLimitInformation();
+        limits.BasicLimitInformation.LimitFlags = JobObjectLimitKillOnJobClose;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, ref limits,
+            Marshal.SizeOf(typeof(ExtendedLimitInformation)));
+        return job;
+    }
+
+    private static void ClearKillOnClose()
+    {
+        var limits = new ExtendedLimitInformation();
+        SetInformationJobObject(treeJob, JobObjectExtendedLimitInformation, ref limits,
+            Marshal.SizeOf(typeof(ExtendedLimitInformation)));
+    }
+
+    private static string WorkspaceJobName(string directory)
+    {
+        try
+        {
+            string[] lines = File.ReadAllLines(Path.Combine(directory, ".job"), new UTF8Encoding(false));
+            return lines.Length > 0 && lines[0].Length > 0 ? lines[0] : null;
+        }
+        catch (IOException) { return null; }
+        catch (UnauthorizedAccessException) { return null; }
+    }
+
+    private static void JoinWorkspaceJob(string name)
+    {
+        IntPtr job = OpenJobObjectW(JobObjectAssignProcess, false, name);
+        if (job == IntPtr.Zero || !AssignProcessToJobObject(job, child.hProcess))
+        {
+            Console.Error.WriteLine("fixture launcher: cannot join the workspace job: error " + Marshal.GetLastWin32Error());
+        }
+    }
+
+    // Tells the harness this launcher still runs. The kernel removes the file
+    // when the process ends, however it ends.
+    private static void MarkLive(string directory)
+    {
+        try
+        {
+            liveFile = new FileStream(Path.Combine(directory, ".live", Guid.NewGuid().ToString("N")), FileMode.CreateNew,
+                FileAccess.Write, FileShare.None, 1, FileOptions.DeleteOnClose);
+        }
+        catch (IOException) { /* The workspace is going away. */ }
+        catch (UnauthorizedAccessException) { /* The workspace is going away. */ }
+    }
+
+    private static void WatchStopEvent(string name)
+    {
+        EventWaitHandle stop;
+        try
+        {
+            stop = EventWaitHandle.OpenExisting(name);
+        }
+        catch (WaitHandleCannotBeOpenedException) { return; }
+        catch (UnauthorizedAccessException) { return; }
+        var watcher = new Thread(() =>
+        {
+            stop.WaitOne();
+            Stop();
+        });
+        watcher.IsBackground = true;
+        watcher.Start();
     }
 
     // The path this copy was started from, so a hard link finds the .shim beside it.

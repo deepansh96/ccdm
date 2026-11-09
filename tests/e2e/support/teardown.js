@@ -1,5 +1,7 @@
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 
 import { recordDiagnostic } from "./state.js";
@@ -8,6 +10,107 @@ const callbacks = [];
 const skips = [];
 let cleanupRunning = false;
 let handlersInstalled = false;
+
+const JOB_ACCOUNTING_INFORMATION = 1;
+const JOB_EXTENDED_LIMIT_INFORMATION = 9;
+const JOB_LIMIT_KILL_ON_CLOSE = 0x2000;
+// 64-bit layouts of JOBOBJECT_EXTENDED_LIMIT_INFORMATION and
+// JOBOBJECT_BASIC_ACCOUNTING_INFORMATION.
+const JOB_LIMITS_SIZE = 144;
+const JOB_LIMIT_FLAGS_OFFSET = 16;
+const JOB_ACCOUNTING_SIZE = 48;
+const JOB_ACTIVE_PROCESSES_OFFSET = 40;
+
+let kernel32 = null;
+
+// koffi is an optional dependency that exists for Windows; load it only here.
+function jobApi() {
+  if (kernel32) return kernel32;
+  const koffi = createRequire(import.meta.url)("koffi");
+  const library = koffi.load("kernel32.dll");
+  const HANDLE = koffi.pointer("CCDM_E2E_HANDLE", koffi.opaque());
+  kernel32 = {
+    CloseHandle: library.func("__stdcall", "CloseHandle", "int", [HANDLE]),
+    CreateEventW: library.func("__stdcall", "CreateEventW", HANDLE, ["void *", "int", "int", "str16"]),
+    CreateJobObjectW: library.func("__stdcall", "CreateJobObjectW", HANDLE, ["void *", "str16"]),
+    QueryInformationJobObject: library.func("__stdcall", "QueryInformationJobObject", "int",
+      [HANDLE, "int", "void *", "uint32_t", "void *"]),
+    SetEvent: library.func("__stdcall", "SetEvent", "int", [HANDLE]),
+    SetInformationJobObject: library.func("__stdcall", "SetInformationJobObject", "int",
+      [HANDLE, "int", "void *", "uint32_t"]),
+    TerminateJobObject: library.func("__stdcall", "TerminateJobObject", "int", [HANDLE, "uint32_t"]),
+  };
+  return kernel32;
+}
+
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// One job for everything a workspace's fixture launchers start. This process
+// holds the only handle, so if the test file dies the kernel ends the tree. A
+// process is in this job only because a launcher of this workspace put it there,
+// which is the proof of ownership: no PID lookup, no command line.
+export function createWorkspaceJob(fixtureDir, { launcherWaitMs, killWaitMs }) {
+  const api = jobApi();
+  const name = `Local\\ccdm-e2e-job-${process.pid}-${randomUUID()}`;
+  const job = api.CreateJobObjectW(null, name);
+  if (!job) throw new Error("CreateJobObjectW failed for a workspace job");
+  const limits = Buffer.alloc(JOB_LIMITS_SIZE);
+  limits.writeUInt32LE(JOB_LIMIT_KILL_ON_CLOSE, JOB_LIMIT_FLAGS_OFFSET);
+  if (!api.SetInformationJobObject(job, JOB_EXTENDED_LIMIT_INFORMATION, limits, JOB_LIMITS_SIZE)) {
+    api.CloseHandle(job);
+    throw new Error("SetInformationJobObject failed for a workspace job");
+  }
+  const stopEvent = api.CreateEventW(null, 1, 0, `${name}-stop`);
+  if (!stopEvent) {
+    api.CloseHandle(job);
+    throw new Error("CreateEventW failed for a workspace job");
+  }
+  const liveDir = path.join(fixtureDir, ".live");
+  fs.mkdirSync(liveDir);
+  fs.writeFileSync(path.join(fixtureDir, ".job"), `${name}\n`);
+
+  const launchersRunning = () => {
+    try {
+      return fs.readdirSync(liveDir).length > 0;
+    } catch {
+      return false;
+    }
+  };
+  const activeProcesses = () => {
+    const accounting = Buffer.alloc(JOB_ACCOUNTING_SIZE);
+    if (!api.QueryInformationJobObject(job, JOB_ACCOUNTING_INFORMATION, accounting, JOB_ACCOUNTING_SIZE, null)) return 0;
+    return accounting.readUInt32LE(JOB_ACTIVE_PROCESSES_OFFSET);
+  };
+  const close = () => {
+    api.CloseHandle(stopEvent);
+    api.CloseHandle(job);
+  };
+  const waitWhile = async (condition, timeoutMs) => {
+    const deadline = Date.now() + timeoutMs;
+    while (condition() && Date.now() < deadline) await pause(25);
+  };
+
+  let stopped = false;
+  return {
+    // Ctrl+Break through each running launcher, its grace period, then the kill.
+    // Returns null when nothing was running, so the exit path stays synchronous.
+    stop() {
+      if (stopped) return null;
+      stopped = true;
+      api.SetEvent(stopEvent);
+      if (!launchersRunning() && activeProcesses() === 0) {
+        close();
+        return null;
+      }
+      return (async () => {
+        await waitWhile(launchersRunning, launcherWaitMs);
+        api.TerminateJobObject(job, 1);
+        await waitWhile(() => launchersRunning() || activeProcesses() > 0, killWaitMs);
+        close();
+      })();
+    },
+  };
+}
 
 function windowsPowerShell() {
   // By absolute path, so nothing on PATH can stand in for it.
