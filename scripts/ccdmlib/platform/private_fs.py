@@ -338,6 +338,51 @@ def ensure_private_dir(path: PathLike) -> None:
         raise PermissionError(f"cannot make {target} private: " + "; ".join(_format_problems(target, remaining, DEFAULT_LABEL)))
 
 
+def _file_repairs(sddl: str, user_sid: str) -> List[List[str]]:
+    """The icacls arguments that leave a file's own DACL naming only this user."""
+    parsed = _parse_sddl(sddl)
+    is_protected = parsed["protected"]
+    aces = parsed["aces"]
+    repairs: List[List[str]] = []
+    user_entry = any(ace["sid"] == user_sid and ace["type"] == "A" and ace["rights"] in _FULL_CONTROL for ace in aces)
+    if parsed["null_dacl"] or not is_protected or not user_entry:
+        repairs.append(["/inheritance:r", "/grant:r", f"*{user_sid}:F"])
+    seen: Set[str] = set()
+    for ace in aces:
+        sid = ace["sid"]
+        if sid in (user_sid, _SYSTEM_SID) or (not is_protected and _has_flag(ace["flags"], "ID")):
+            continue
+        switch = "/remove:d" if ace["type"] != "A" and "D" in ace["type"] else "/remove:g"
+        if f"{switch}:{sid}" not in seen:
+            seen.add(f"{switch}:{sid}")
+            repairs.append([switch, f"*{sid}"])
+    return repairs
+
+
+def make_file_private(path: PathLike) -> None:
+    """Windows: give an existing file a protected DACL naming only this user,
+    whatever its directory would pass on. POSIX: nothing, the mode decides."""
+    if not WIN32:
+        return
+    target = os.path.abspath(path)
+    user_sid = current_user_sid() or ""
+    for _round in range(_MAX_REPAIR_ROUNDS):
+        repairs = _file_repairs(_read_sddl(target), user_sid)
+        if not repairs:
+            return
+        for args in repairs:
+            try:
+                completed = subprocess.run([_icacls(), target, *args], stdin=subprocess.DEVNULL,
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                           creationflags=subprocess.CREATE_NO_WINDOW, check=False)
+            except OSError as error:
+                raise PermissionError(f"cannot make {target} private: {error}") from None
+            if completed.returncode != 0:
+                raise PermissionError(f"cannot make {target} private: icacls {args[0]} exited with {completed.returncode}")
+    if _file_repairs(_read_sddl(target), user_sid):
+        raise PermissionError(f"cannot make {target} private: its access entries could not be removed")
+
+
 def write_private(path: PathLike, content: str) -> None:
     """Replace ``path`` atomically with a private file. Its directory decides the
     DACL on Windows. Never open with a write-less mode: Windows would make the

@@ -440,9 +440,7 @@ async function claudeTurn(workspace, context, { messageId }) {
   };
   registerTeardownCallback(() => stop("SIGKILL"));
   const until = async text => {
-    for (let attempt = 0; attempt < 200 && !output.includes(text); attempt++) {
-      await new Promise(resolve => setTimeout(resolve, 20));
-    }
+    await waitFor(() => output.includes(text), () => `Claude channel to produce ${text}: ${output}`, 30000);
     assert.ok(output.includes(text), `Claude channel never produced ${text}: ${output}`);
   };
   const send = value => child.stdin.write(JSON.stringify({ jsonrpc: "2.0", ...value }) + "\n");
@@ -509,15 +507,11 @@ async function runMcp(workspace, { env, input, timeoutMs = 10000 }) {
 async function codexTurn(workspace, { codex, bridge }, messageId) {
   injectDiscordMessage(workspace, { id: messageId, channelId: "codex-channel", author: { id: "owner-id" },
     content: "answer this" });
-  const config = await (async () => {
-    for (let attempt = 0; attempt < 200; attempt++) {
-      const found = codex.clientMessages.find(message => message.method === "config/value/write" &&
-        message.params.keyPath === "mcp_servers.discord-codex-channel");
-      if (found && fs.existsSync(found.params.value.env.CCDM_REMINDER_CONTEXT_FILE)) return found;
-      await new Promise(resolve => setTimeout(resolve, 25));
-    }
-    throw new Error(`Codex turn never started: ${bridge.stdout}\n${bridge.stderr}`);
-  })();
+  const config = await waitFor(() => {
+    const found = codex.clientMessages.find(message => message.method === "config/value/write" &&
+      message.params.keyPath === "mcp_servers.discord-codex-channel");
+    return found && fs.existsSync(found.params.value.env.CCDM_REMINDER_CONTEXT_FILE) ? found : null;
+  }, () => `the Codex turn to start: ${bridge.stdout}\n${bridge.stderr}`, 30000);
   const reply = await runMcp(workspace, {
     env: bridgeChildEnv(workspace, config.params.value.env),
     input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "reply",
