@@ -217,13 +217,13 @@ The user may ask things like "how much usage do I have left", "what are my limit
 
 You restart yourself with `scripts/ccdm restart-root`. It detaches itself, so it survives your own process being stopped. Never use `nohup` or a background `&`, and never wrap it in another launcher.
 
-1. Tell the user you're restarting.
+1. Tell the user you're restarting first. The command exits before the restart is done, and the restart stops you, so you cannot report afterwards.
 2. Run it as a normal foreground command:
    ```sh
    scripts/ccdm restart-root
    ```
-   If you are root Codex, run `scripts/ccdm restart-root --provider codex` instead, and add the root channel id as the last argument when the registry lists more than one root channel.
-3. The command hands the restart to a detached copy, prints that copy's log path and exits 0. The copy checks the Router, stops your current process, and starts a fresh instance in the `root_agent` session. If the Router does not answer, it stops nothing and you keep running.
+   If you are root Codex, run `scripts/ccdm restart-root --provider codex` instead, and add the root channel id as the last argument when the registry lists more than one root channel. A channel id without `--provider codex` is a usage error (exit 2).
+3. The command checks the Router first. If the Router does not answer, it prints the refusal at once, exits 1 and changes nothing, so you keep running. Otherwise it hands the restart to a detached copy, prints that copy's log path (`~/.local/state/ccdm/logs/restart-root-root_agent.log`) and exits 0. The copy stops your current process and starts a fresh instance in the `root_agent` session.
 
 - macOS: from a terminal, `./restart-root-agent.sh` and `./restart-root-codex-agent.sh [<channel_id>]` run the same command.
 - Windows: root Codex is not supported yet, so `--provider codex` is refused.

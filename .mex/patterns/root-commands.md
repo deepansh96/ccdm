@@ -92,13 +92,15 @@ For one session, run `scripts/ccdm session context <screen_name>`. Never run it 
 ### Restart yourself
 Triggers: `restart yourself`, `restart root`, `restart self`. Do this only when the user explicitly asks to restart root.
 
-1. Tell the user you are restarting.
-2. Run `scripts/ccdm restart-root` for root Claude. For root Codex, run `scripts/ccdm restart-root --provider codex`, and add the root channel id as the last argument when the registry lists more than one root channel.
-3. Run it as a normal foreground command and do nothing else. It detaches itself: it hands the restart to a detached copy, prints that copy's log path and exits 0. The copy then stops you and starts a fresh root in the `root_agent` session.
+1. Send the user your message that you are restarting first. The command exits before the restart is done, and the restart stops you, so you cannot report afterwards.
+2. Run `scripts/ccdm restart-root` for root Claude. For root Codex, run `scripts/ccdm restart-root --provider codex`, and add the root channel id as the last argument when the registry lists more than one root channel. A channel id without `--provider codex` is a usage error (exit 2).
+3. Run it as a normal foreground command and do nothing else. It detaches itself: it hands the restart to a detached copy, prints that copy's log path (`~/.local/state/ccdm/logs/restart-root-root_agent.log`) and exits 0. The copy then stops you and starts a fresh root in the `root_agent` session.
 
 Never put the command in the background yourself, and never wrap it in another launcher.
 
-The detached copy checks the Router first. If the Router does not answer, it stops nothing and you keep running. Fix the Router, then ask again.
+The command checks the Router before it hands off. If the Router does not answer, it prints the refusal at once, exits 1 and changes nothing, so you keep running. Tell the user what it printed, fix the Router, then ask again.
+
+If the new root does not come up, the user can read that log and watch the session from a terminal with `scripts/ccdm attach root`.
 
 - macOS: from a terminal, `./restart-root-agent.sh` and `./restart-root-codex-agent.sh [<channel_id>]` run the same command.
 - Windows: root Codex is not supported yet, so `--provider codex` is refused.
