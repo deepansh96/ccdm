@@ -486,7 +486,12 @@ open(host_dir + "/host.token", "w").write(token)
 def instance():
     return _winapi.CreateNamedPipe(pipe, _winapi.PIPE_ACCESS_DUPLEX, _winapi.PIPE_WAIT, 2, 4096, 4096, 0, _winapi.NULL)
 def serve(handle):
-    _winapi.ConnectNamedPipe(handle, False)
+    try:
+        _winapi.ConnectNamedPipe(handle, False)
+    except OSError as error:
+        # ERROR_PIPE_CONNECTED: the client got in first, which is just as good.
+        if error.winerror != 535:
+            raise
     def read():
         return json.loads(_winapi.ReadFile(handle, 4096)[0])
     def write(frame):
