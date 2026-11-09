@@ -316,7 +316,7 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
       const text = session.pty ? session.console.capture({ history, join: join === true }) : captureText(session, history);
       return okResponse(null, { text });
     },
-    async wait({ name, regex, timeoutMs = DEFAULT_WAIT_MS, thenSend = [] }, { abandons }) {
+    async wait({ name, regex, flags, timeoutMs = DEFAULT_WAIT_MS, thenSend = [] }, { abandons }) {
       const session = knownSession(name);
       if (session.released) throw unknownSession(name);
       if (!session.pty) throw new HostError(ERRORS.UNSUPPORTED_OP, "wait needs a PTY session");
@@ -324,7 +324,7 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
       if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new HostError(ERRORS.UNSUPPORTED_OP, "timeoutMs must be a number");
       let compiled;
       try {
-        compiled = new RegExp(regex, "m");
+        compiled = new RegExp(regex, flags === "i" ? "im" : "m");
       } catch (error) {
         throw new HostError(ERRORS.UNSUPPORTED_OP, `invalid regex: ${error.message}`);
       }

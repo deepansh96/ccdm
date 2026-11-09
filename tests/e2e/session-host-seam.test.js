@@ -433,6 +433,72 @@ session_host.run_detached([sys.argv[2], sys.argv[3], sys.argv[4], str(os.getpid(
 
 // ---- Windows only ----
 
+// The fake host was written from the protocol; this holds the seam to the real one.
+async function realHostWorld(language) {
+  const workspace = createWorkspace();
+  const stateRoot = path.join(workspace.tmpRoot, "real-host-state");
+  const env = { CCDM_STATE_ROOT: stateRoot, CCDM_SESSION_HOST: "ccdm-host" };
+  const script = path.join(workspace.repoDir, "scripts", "ccdm-host.js");
+  const options = { cwd: path.dirname(workspace.tmpRoot), env: { ...workspace.env, ...env }, windowsHide: true };
+  const host = spawn(process.execPath, [script, "serve", "--allow-in-job"], { ...options, stdio: ["ignore", "pipe", "pipe"] });
+  const exited = new Promise(resolve => host.once("exit", resolve));
+  registerTeardownCallback(async () => {
+    if (host.exitCode !== null) return;
+    await new Promise(resolve => spawn(process.execPath, [script, "shutdown"], { ...options, stdio: "ignore" }).once("close", resolve));
+    await Promise.race([exited, sleep(scaledTimeout(5000))]);
+    if (host.exitCode === null) host.kill();
+  });
+  let output = "";
+  host.stdout.setEncoding("utf8").on("data", (chunk) => { output += chunk; });
+  host.stderr.setEncoding("utf8").on("data", (chunk) => { output += chunk; });
+  await until(() => /ready/.test(output) || host.exitCode !== null, "the real host to be ready", 15000);
+  assert.match(output, /ready/);
+  const ok = async (verb, positional, options_) => {
+    const result = await callSeam(workspace, language, verb, { positional, options: options_, env, python: PYTHON });
+    assert.equal(result.ok, true, `${verb}: ${JSON.stringify(result)}`);
+    return result.value;
+  };
+  return { ok, workspace };
+}
+
+const ECHO_PROGRAM = `
+  process.stdout.write("READY\\n");
+  process.stdin.setEncoding("utf8").on("data", text => process.stdout.write("Got " + text.trim() + "\\n"));
+`;
+
+for (const language of LANGUAGES) {
+  test(`${language} seam drives every verb on the real ccdm-host`, onlyWindows, async () => {
+    const { ok, workspace } = await realHostWorld(language);
+    const name = "real-seam";
+    const started = await ok("start", [name], { argv: [process.execPath, "-e", ECHO_PROGRAM], cwd: workspace.tmpDir, kind: "adhoc" });
+    assert.equal(started.kind, "adhoc");
+    assert.equal(await ok("isLive", [name]), true);
+    assert.ok((await ok("list")).some(session => session.name === name && session.pid === started.pid));
+    assert.equal((await ok("waitFor", [name, "^READY", 15000])).matched, true);
+
+    await ok("sendText", [name, "first"]);
+    await ok("sendKey", [name, "Enter"]);
+    const found = await ok("waitFor", [name, { regexSource: "^GOT first", flags: "i" }, 15000, ["Enter"]]);
+    assert.equal(found.matched, true, "a case-insensitive pattern has to reach the host as one");
+    assert.equal((await ok("waitFor", [name, "^GOT first", 200])).matched, false, "and a plain pattern stays case-sensitive");
+    assert.match(await ok("capture", [name]), /Got first/);
+    assert.ok((await ok("pids", [name])).includes(started.pid));
+
+    const helper = [process.execPath, "-e", "console.log(JSON.stringify([process.cwd(), process.env.CCDM_SESSION_NAME ?? null]))"];
+    const relativeLog = "real-seam-helper.log";
+    await ok("runDetached", [helper], { env: { CCDM_SESSION_NAME: name }, log: relativeLog });
+    const log = path.join(workspace.tmpRoot, relativeLog);
+    await until(() => fs.existsSync(log) && fs.readFileSync(log, "utf8").includes("]"), "the helper's log");
+    const [cwd, sessionName] = JSON.parse(fs.readFileSync(log, "utf8"));
+    assert.equal(fs.realpathSync(cwd), fs.realpathSync(workspace.tmpRoot), "the helper starts where the caller is");
+    assert.equal(sessionName, null);
+
+    assert.deepEqual(await ok("stop", [name], { graceMs: 200 }), { stopped: true });
+    assert.equal(await ok("isLive", [name]), false);
+    assert.deepEqual(await ok("stop", [name]), { stopped: false });
+  });
+}
+
 test("spawnDetached throws on Windows, where runDetached goes through the host", onlyWindows, () => {
   const { spawnDetached } = require("../../scripts/platform/detached.js");
   assert.throws(() => spawnDetached(process.execPath, []), /POSIX only/);

@@ -8,6 +8,7 @@
 // Every verb returns a promise except attachHint. Durations are milliseconds.
 // A failure is a HostError with `.code`; with no host running it is `not_running`.
 const { execFile } = require("node:child_process");
+const path = require("node:path");
 
 const { spawnDetached } = require("../platform/detached.js");
 const { ERRORS, HostError, KINDS } = require("../host/protocol.js");
@@ -46,9 +47,10 @@ function launchRequest(name, { argv, cwd, env = {}, pty = true, kind } = {}) {
   return { name, argv, cwd, env: { ...withoutSessionName(env), [SESSION_NAME_VARIABLE]: name }, pty: Boolean(pty), kind };
 }
 
+// Multiline on both backends, because the host's own wait always is.
 function compiled(regex) {
-  if (regex instanceof RegExp) return new RegExp(regex.source, regex.flags.replace(/[gy]/g, ""));
-  return new RegExp(regex);
+  if (regex instanceof RegExp) return new RegExp(regex.source, `${regex.flags.replace(/[gym]/g, "")}m`);
+  return new RegExp(regex, "m");
 }
 
 function keyList(keys) {
@@ -248,7 +250,9 @@ const hostBackend = {
   // Until the owner-facing `scripts/ccdm attach` exists, the command that does attach.
   attachHint: name => `Attach with: node scripts/ccdm-host.js attach -t ${name}`,
   async runDetached(argv, { cwd, env, log } = {}) {
-    const { pid } = await call("run-detached", { argv, cwd, env: withoutSessionName(env), log });
+    // The host resolves neither against the caller, and it needs an absolute log.
+    const request = { argv, cwd: cwd ?? process.cwd(), env: withoutSessionName(env), log: log && path.resolve(log) };
+    const { pid } = await call("run-detached", request);
     return { pid };
   },
 };

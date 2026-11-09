@@ -79,8 +79,11 @@ def _launch_request(
     return {"name": name, "argv": list(argv), "cwd": cwd, "env": session_env, "pty": bool(pty), "kind": kind}
 
 
+# Multiline on both backends, because the host's own wait always is.
 def _compiled(regex: Regex) -> "Pattern[str]":
-    return re.compile(regex) if isinstance(regex, str) else regex
+    if isinstance(regex, str):
+        return re.compile(regex, re.MULTILINE)
+    return re.compile(regex.pattern, regex.flags | re.MULTILINE)
 
 
 def _key_list(keys: Union[None, str, Sequence[str]]) -> List[str]:
@@ -496,5 +499,12 @@ def run_detached(
 ) -> Dict[str, int]:
     if _is_tmux():
         return _spawn_detached(argv, cwd, env, log)
-    response = _call("run-detached", {"argv": list(argv), "cwd": cwd, "env": _without_session_name(env), "log": log})
+    # The host resolves neither against the caller, and it needs an absolute log.
+    request = {
+        "argv": list(argv),
+        "cwd": cwd or os.getcwd(),
+        "env": _without_session_name(env),
+        "log": os.path.abspath(log) if log else None,
+    }
+    response = _call("run-detached", request)
     return {"pid": response["pid"]}
