@@ -49,3 +49,6 @@ tests/e2e/codex-start.test.js
 tests/e2e/windows-installer-router.test.js
 tests/e2e/root-cli.test.js
 tests/e2e/windows-installer-usage-poster.test.js
+tests/e2e/thread-lifecycle.test.js
+tests/e2e/thread-project-changes.test.js
+tests/e2e/thread-reconcile.test.js
