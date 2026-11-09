@@ -124,7 +124,9 @@ test("no Discord bot or webhook token reaches the session environment, launch fi
     }
   }
   assert.deepEqual(Object.keys(mcpConfig.mcpServers), ["ccdm"]);
-  assert.equal(path.resolve(mcpConfig.mcpServers.ccdm.args[0]), path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js"));
+  // A Windows temp folder can carry a short (8.3) name; the `ccdm` entry starts Python from the long one.
+  const repoAsLaunched = process.platform === "win32" ? fs.realpathSync.native(workspace.repoDir) : workspace.repoDir;
+  assert.equal(path.resolve(mcpConfig.mcpServers.ccdm.args[0]), path.join(repoAsLaunched, "scripts", "ccdm-channel-server.js"));
   assert.deepEqual(mcpConfig.mcpServers.ccdm.args.slice(1), process.platform === "win32" ? ["--ccdm-key-file", path.join(workspace.routerStateDir, "keys", "demo.key")] : []);
   for (const file of fs.readdirSync(launchDir)) {
     assertPrivate(path.join(launchDir, file), file);

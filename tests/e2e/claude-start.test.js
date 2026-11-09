@@ -75,6 +75,8 @@ async function claudeRouterWorkspace(options = {}) {
 // Windows has no tmux, so a launch there goes through the fake ccdm-host. POSIX
 // runs the launcher on tmux and, for the cases that matter on both, on the host too.
 const WIN = process.platform === "win32";
+// A Windows temp folder can carry a short (8.3) name; the `ccdm` entry starts Python from the long one.
+const repoAsLaunched = workspace => (WIN ? fs.realpathSync.native(workspace.repoDir) : workspace.repoDir);
 const DEFAULT_BACKEND = WIN ? "ccdm-host" : "tmux";
 const BACKENDS = WIN ? ["ccdm-host"] : ["tmux", "ccdm-host"];
 const SESSION_WORD = WIN ? "session" : "tmux session";
@@ -204,7 +206,7 @@ test("a Claude project with no transport field starts through the Router and rec
   const mcpConfigPath = path.join(launchDir(workspace), "mcp.json");
   const mcpConfig = JSON.parse(fs.readFileSync(mcpConfigPath, "utf8"));
   assert.deepEqual(Object.keys(mcpConfig.mcpServers), ["ccdm"]);
-  const serverScript = path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js");
+  const serverScript = path.join(repoAsLaunched(workspace), "scripts", "ccdm-channel-server.js");
   const keyFile = path.join(workspace.routerStateDir, "keys", "alpha.key");
   assert.deepEqual(mcpConfig.mcpServers.ccdm.args, WIN ? [serverScript, "--ccdm-key-file", keyFile] : [serverScript]);
   assert.equal(mcpConfig.mcpServers.ccdm.env.CCDM_CLAUDE_CHANNEL_ID, "channel-1");
@@ -686,7 +688,7 @@ test("the generated settings.json hook commands are hook_command()'s output", as
   const result = await startSession(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  const hookScript = path.join(workspace.repoDir, "scripts", "claude-reminder-hook.js");
+  const hookScript = path.join(repoAsLaunched(workspace), "scripts", "claude-reminder-hook.js");
   const printed = spawnSync(PYTHON, ["-c", `import sys; sys.dont_write_bytecode = True; sys.path.insert(0, sys.argv[1]); from ccdmlib.platform.hooks import hook_command; print(hook_command(sys.argv[2]))`,
     path.join(workspace.repoDir, "scripts"), hookScript], { encoding: "utf8", env: workspace.env, windowsHide: true });
   assert.equal(printed.status, 0, printed.stderr);
@@ -710,7 +712,7 @@ test("on POSIX the launch settings carry no statusLine and the channel server ar
   assert.deepEqual(mcpConfig.mcpServers.ccdm.args, [path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js")]);
 });
 
-const statusLineCommand = workspace => `node '${path.join(workspace.repoDir, "scripts", "statusline-context.js").replaceAll("\\", "/")}'`;
+const statusLineCommand = workspace => `node '${path.join(repoAsLaunched(workspace), "scripts", "statusline-context.js").replaceAll("\\", "/")}'`;
 
 test("on Windows settings.json has the statusLine command", platformGate("win32", "the per-launch statusLine is Windows-only"), async () => {
   const { workspace } = await claudeRouterWorkspace();
