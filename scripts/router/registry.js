@@ -9,6 +9,7 @@ const { chmod, mkdir, open, readFile, rename, stat, unlink, writeFile } = requir
 const path = require("node:path");
 
 const { removeDirWithRetry, renameWithRetry } = require("../platform/atomic.js");
+const { makeFilePrivate } = require("../platform/privacy.js");
 const { processAlive, processIdentity } = require("../platform/process.js");
 
 // How long registry writes must settle before a reload.
@@ -379,6 +380,8 @@ async function commitRegistry(file, registry) {
       await handle.close();
     }
     await chmod(temporary, mode);
+    // Windows ignores the mode above; the new file would take its directory's access.
+    await makeFilePrivate(temporary);
     await testHold();
     await renameWithRetry(temporary, file, { budgetMs: COMMIT_BUDGET_MS });
   } catch (error) {

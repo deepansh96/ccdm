@@ -26,7 +26,7 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
-from ccdmlib.platform import atomic, proc  # noqa: E402
+from ccdmlib.platform import atomic, private_fs, proc  # noqa: E402
 
 # Lock protocol v2 matches scripts/router/registry.js exactly (see the comment
 # there). A lock directory holds `owner` (exactly "<pid>\n"), `nonce` (unique to
@@ -290,6 +290,8 @@ def _commit(registry_path: Path, registry: dict) -> None:
             target.flush()
             os.fsync(target.fileno())
         os.chmod(temporary, mode)
+        # Windows ignores the mode above; the new file would take its directory's access.
+        private_fs.make_file_private(temporary)
         _test_hold()
         atomic.replace_with_retry(temporary, registry_path, COMMIT_BUDGET_MS)
     except BaseException:
