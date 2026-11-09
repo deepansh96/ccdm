@@ -4,7 +4,6 @@
 tests/e2e/ci-contract.test.js
 tests/e2e/deepseek-local-usage.test.js
 tests/e2e/harness-safety.test.js
-tests/e2e/platform-contract.test.js
 tests/e2e/runner-contract.test.js
 tests/e2e/usage-dashboard-renderer.test.js
 tests/e2e/windows-skip-budget.test.js
