@@ -429,8 +429,9 @@ function relayInstructions(commands, ownSession) {
   return `Discord relays only ${commands} as commands; any other slash command the owner sends arrives as a plain message and does not run. When the owner sends one, or asks you to run one (such as a skill only they may invoke), type it into your own ${ownSession}. It runs when your current turn ends.`;
 }
 
+// realpathSync, as Node resolves the server's own path: a Windows temp folder's short (8.3) name stays.
 const windowsOwnSession = (workspace) =>
-  `session with the Bash tool: "${fs.realpathSync.native(workspace.repoDir).replace(/\\/g, "/")}/scripts/ccdm" session send "$CCDM_SESSION_NAME" --literal '/<command>' --enter`;
+  `session with the Bash tool: "${fs.realpathSync(workspace.repoDir).replace(/\\/g, "/")}/scripts/ccdm" session send "$CCDM_SESSION_NAME" --literal '/<command>' --enter`;
 const POSIX_OWN_SESSION = `tmux pane: tmux send-keys -t "$TMUX_PANE" -l '/<command>' && tmux send-keys -t "$TMUX_PANE" Enter`;
 
 test("RELAY_INSTRUCTIONS tells a session how to type into itself on this OS", async () => {
