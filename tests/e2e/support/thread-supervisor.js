@@ -3,6 +3,7 @@ import path from "node:path";
 
 import { routerEnv, runRouterCli, waitFor } from "./router.js";
 import { runScript } from "./runner.js";
+import { startFakeHost } from "./session-fixture.js";
 import { workspaceOwnsPid } from "./teardown.js";
 
 // The Thread Supervisor's private state, under the Test Workspace's home.
@@ -25,10 +26,23 @@ export async function waitForThreadIdle(workspace, project, threadId, timeoutMs 
   await waitFor(idle, () => `thread ${threadId}'s session to finish its turn`, timeoutMs);
 }
 
+// A workspace's thread sessions run on the fake ccdm-host: always on Windows, and
+// wherever a test asks. It is shared by the worker and anything that launches or
+// inspects a session for the same workspace. Its env moves CCDM_STATE_ROOT, so the
+// supervisor's own state is pinned where supervisorStateDir() says.
+const fakeHosts = new WeakMap();
+
+export async function startThreadHost(workspace) {
+  if (!fakeHosts.has(workspace)) fakeHosts.set(workspace, await startFakeHost(workspace, { env: routerEnv(workspace) }));
+  return fakeHosts.get(workspace);
+}
+
 // The worker launches its Node link through CCDM_ROUTER_NODE, as the session
 // launchers do, and finds the Router through CCDM_ROUTER_STATE_DIR.
 export function supervisorEnv(workspace, extraEnv = {}) {
-  return routerEnv(workspace, extraEnv);
+  const host = fakeHosts.get(workspace);
+  const hostEnv = host ? { ...host.env, CCDM_THREAD_SUPERVISOR_STATE_DIR: supervisorStateDir(workspace) } : {};
+  return routerEnv(workspace, { ...hostEnv, ...extraEnv });
 }
 
 // One supervisor CLI command; `json` is its parsed stdout, when it has any.
@@ -50,9 +64,14 @@ export async function supervisorStatus(workspace) {
 }
 
 // worker_pid comes from status on disk, so it may not be the worker any more.
-// Returns whether the worker was signalled.
+// Returns whether the worker was signalled. Windows has no SIGTERM to catch, so
+// there the worker is asked through the stop file, as a service manager would.
 export function signalSupervisorWorker(workspace, workerPid) {
   if (!workspaceOwnsPid(workerPid, workspace.tmpRoot)) return false;
+  if (process.platform === "win32" && fs.existsSync(supervisorStateDir(workspace))) {
+    fs.writeFileSync(path.join(supervisorStateDir(workspace), "stop"), "");
+    return true;
+  }
   try {
     process.kill(workerPid, "SIGTERM");
   } catch { /* Already gone. */ }
@@ -64,6 +83,7 @@ export function signalSupervisorWorker(workspace, workerPid) {
 // `supervisor` connection. `result` resolves with the worker's exit; `stop()`
 // sends the worker SIGTERM and resolves with that exit.
 export async function startThreadSupervisor(workspace, { env = {} } = {}) {
+  if (process.platform === "win32") await startThreadHost(workspace);
   const result = runScript(workspace, "scripts/thread-supervisor.py", {
     args: ["run"], env: supervisorEnv(workspace, env), timeoutMs: 60000,
   });

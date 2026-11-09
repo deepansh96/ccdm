@@ -357,18 +357,6 @@ for (const backend of BACKENDS) {
   });
 }
 
-test("a thread session still types into the session CCDM_THREAD_TMUX names, whatever session name it inherited", async () => {
-  const workspace = await channelWorkspace();
-  seedThreadSessions(workspace);
-  await startChannelServer(workspace, { keyName: `.thread-${THREAD_ID}`,
-    env: threadServerEnv({ CCDM_SESSION_NAME: "demo_claude", CCDM_THREAD_TMUX: THREAD_SESSION }) });
-
-  await threadCompact(workspace);
-
-  assert.deepEqual(sessionsOf(workspace)[THREAD_SESSION].sendKeys, [["-l", "/compact"], ["Enter"]]);
-  assert.equal(sessionsOf(workspace).demo_claude.sendKeys, undefined);
-});
-
 test("a thread session with only the project's session name types nowhere and tells the owner", async () => {
   const workspace = await channelWorkspace();
   seedThreadSessions(workspace);

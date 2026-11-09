@@ -2,7 +2,7 @@
 
 An owner or guest message in a registered or stopped thread, or an owner
 message in a closed one, gets 👀, sets the row `booting`, and launches
-start-thread-session.sh; a thread with a provider conversation resumes it
+the thread launcher; a thread with a provider conversation resumes it
 with `--resume`.
 Every owner or guest message the Router hands the supervisor while the thread
 boots is buffered. On `thread_session_live` the bootstrap, holding the
@@ -27,9 +27,10 @@ import json
 import os
 from pathlib import Path
 import re
-import subprocess
 import sys
 import threading
+
+from ccdmlib.cli import start_thread_session
 
 from . import capacity, lifecycle, ports, registry, store
 from .clock import now
@@ -42,7 +43,6 @@ DRIVERS = ("owner", "guest")
 # Thread commands are the supervisor's or the session's, never a boot trigger.
 COMMAND = re.compile(r"^/(?:close|config|model|restart|clear|compact|pause|unpause)(?:\s|$)")
 DEFAULT_BOOT_TIMEOUT_SECONDS = 120
-LAUNCHER = Path(__file__).resolve().parent.parent / "start-thread-session.sh"
 NOTICE_LIMIT = 300
 _boot_ids = itertools.count(1)
 
@@ -205,7 +205,7 @@ def start(context, row, trigger: dict | None, starter: str | None = None, backlo
             context, row, (trigger or {}).get("parent_channel_id") or row["parent_channel_id"])
     boot = Boot(next(_boot_ids), project, trigger_id, starter)
     context.boots[thread_id] = boot
-    args = [str(LAUNCHER), project, thread_id, "--provider", resolved["provider"]]
+    args = [project, thread_id, "--provider", resolved["provider"]]
     for field in ("account", "model", "effort"):
         if resolved[field]:
             args += [f"--{field}", resolved[field]]
@@ -224,10 +224,9 @@ def start(context, row, trigger: dict | None, starter: str | None = None, backlo
 
     def launch() -> None:
         try:
-            completed = subprocess.run(args, env=env, cwd=context.project_root, capture_output=True, text=True,
-                                       stdin=subprocess.DEVNULL)
-            result = {"returncode": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr}
-        except OSError as error:
+            returncode, stdout, stderr = start_thread_session.run(args, env, str(context.project_root))
+            result = {"returncode": returncode, "stdout": stdout, "stderr": stderr}
+        except Exception as error:  # The launch thread's frame must reach the worker whatever happens.
             result = {"returncode": 127, "stdout": "", "stderr": f"the thread launcher could not run: {error}"}
         context.link.post({"type": "internal", "event": "launch_exit", "thread_id": thread_id, "boot_id": boot.id,
                            **result})
