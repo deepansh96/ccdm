@@ -247,7 +247,7 @@ function initialState() {
       },
       network: { blocked: [] },
       launchctl: { invocations: [], loaded: [], loadFailuresRemaining: 0, unloadFailuresRemaining: 0 },
-      schtasks: { invocations: [], tasks: [] },
+      schtasks: { definitions: {}, failures: {}, invocations: [], running: {}, tasks: [] },
       npm: { invocations: [] },
       npx: { invocations: [] },
       processes: [],
@@ -332,7 +332,10 @@ function normalizeState(value) {
       },
       processes: value?.fixtures?.processes || [],
       schtasks: {
+        definitions: value?.fixtures?.schtasks?.definitions || {},
+        failures: value?.fixtures?.schtasks?.failures || {},
         invocations: value?.fixtures?.schtasks?.invocations || [],
+        running: value?.fixtures?.schtasks?.running || {},
         tasks: value?.fixtures?.schtasks?.tasks || [],
       },
       security: {
@@ -1292,19 +1295,70 @@ function watchBridge(onGone) {
   }, 500);
 }
 
-// Answers \`/query /tn <name>\` by exit code from the workspace's own state. It
-// is a fixture for a read: it refuses every other schtasks call.
+// Task Scheduler for one workspace. \`/create\` keeps the XML; \`/run\` only records
+// the call, because a task's process must outlive this launcher, so the test starts
+// it; \`/query\` reports Running while the pid in \`running\` is alive.
+function schtasksFlag(flag) {
+  const at = args.findIndex((arg) => arg.toLowerCase() === flag);
+  return at < 0 ? null : args[at + 1];
+}
+
 function runSchtasks() {
-  const [verb, flag, name] = args;
-  if (!/^\\/query$/i.test(verb || "") || !/^\\/tn$/i.test(flag || "") || !name) {
+  const verb = (args[0] || "").toLowerCase();
+  const name = schtasksFlag("/tn");
+  const asXml = args.some((arg) => arg.toLowerCase() === "/xml");
+  if (!name || !["/query", "/create", "/delete", "/run", "/end"].includes(verb)) {
     console.error("unsupported schtasks invocation");
     process.exit(2);
   }
   updateState((nextState) => {
-    nextState.fixtures.schtasks.invocations.push({ name });
+    nextState.fixtures.schtasks.invocations.push({ name, verb, args });
     return nextState;
   });
-  process.exit(readState().fixtures.schtasks.tasks.includes(name) ? 0 : 1);
+  const state = readState().fixtures.schtasks;
+  const failuresLeft = state.failures[verb] || 0;
+  if (failuresLeft > 0) {
+    updateState((nextState) => {
+      nextState.fixtures.schtasks.failures[verb] = failuresLeft - 1;
+      return nextState;
+    });
+    console.error("ERROR: The fixture was told to fail.");
+    process.exit(1);
+  }
+  const known = state.tasks.includes(name);
+  if (verb === "/query") {
+    if (!known) process.exit(1);
+    if (asXml) {
+      process.stdout.write(state.definitions[name] || "");
+    } else if ((schtasksFlag("/fo") || "").toLowerCase() === "csv") {
+      const running = state.running[name];
+      const status = running && isAlive(running) ? "Running" : "Ready";
+      process.stdout.write(\`"\${name}","N/A","\${status}"\n\`);
+    }
+    process.exit(0);
+  }
+  if (verb === "/create") {
+    const xmlFile = schtasksFlag("/xml");
+    const xml = fs.readFileSync(xmlFile).toString("utf16le").replace(/^\\uFEFF/, "");
+    updateState((nextState) => {
+      const fixture = nextState.fixtures.schtasks;
+      fixture.definitions[name] = xml;
+      if (!fixture.tasks.includes(name)) fixture.tasks.push(name);
+      return nextState;
+    });
+    process.exit(0);
+  }
+  if (verb === "/delete") {
+    updateState((nextState) => {
+      const fixture = nextState.fixtures.schtasks;
+      fixture.tasks = fixture.tasks.filter((task) => task !== name);
+      delete fixture.definitions[name];
+      delete fixture.running[name];
+      return nextState;
+    });
+    process.exit(known ? 0 : 1);
+  }
+  process.exit(known ? 0 : 1);
 }
 
 function runLaunchctl() {

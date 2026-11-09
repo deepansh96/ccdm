@@ -349,6 +349,18 @@
       "test": "fake tmux: from a PID in the target's pids it re-dispatches and exits 0",
       "tag": "posix",
       "reason": "the tmux front is POSIX; Windows goes through ccdm-host"
+    },
+    {
+      "file": "windows-installer-router.test.js",
+      "test": "install-service runs the existing launchd installer unchanged",
+      "tag": "posix",
+      "reason": "the .sh installers run through launchctl"
+    },
+    {
+      "file": "windows-installer-router.test.js",
+      "test": "uninstall-service and service-status point to launchctl on POSIX",
+      "tag": "posix",
+      "reason": "Task Scheduler subcommands exit 2 outside Windows"
     }
   ]
 }

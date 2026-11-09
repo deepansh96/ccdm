@@ -96,7 +96,10 @@ function initialState() {
         invocations: [],
       },
       schtasks: {
+        definitions: {},
+        failures: {},
         invocations: [],
+        running: {},
         tasks: [],
       },
       npx: {
@@ -211,7 +214,10 @@ function normalizeState(value) {
       },
       processes: value?.fixtures?.processes ?? [],
       schtasks: {
+        definitions: value?.fixtures?.schtasks?.definitions ?? {},
+        failures: value?.fixtures?.schtasks?.failures ?? {},
         invocations: value?.fixtures?.schtasks?.invocations ?? [],
+        running: value?.fixtures?.schtasks?.running ?? {},
         tasks: value?.fixtures?.schtasks?.tasks ?? [],
       },
       registry: value?.fixtures?.registry ?? null,
