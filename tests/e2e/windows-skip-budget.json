@@ -1,6 +1,24 @@
 {
-  "budget": 125,
+  "budget": 128,
   "skips": [
+    {
+      "file": "codex-start.test.js",
+      "test": "start-codex-session rejects an aliased Codex Home it cannot write",
+      "tag": "posix",
+      "reason": "a directory's mode bits do not limit writes on Windows"
+    },
+    {
+      "file": "codex-start.test.js",
+      "test": "start-codex-session rejects a non-writable Codex Home",
+      "tag": "posix",
+      "reason": "a directory's mode bits do not limit writes on Windows"
+    },
+    {
+      "file": "codex-start.test.js",
+      "test": "start-codex-session refuses duplicate bridge and app-server processes from fixture ps state",
+      "tag": "posix",
+      "reason": "reads the fixture ps; a Windows case uses real processes"
+    },
     {
       "file": "harness-safety.test.js",
       "test": "on POSIX, teardown still stops every process in a verified group",

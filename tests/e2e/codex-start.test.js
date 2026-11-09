@@ -1,19 +1,27 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import test from "node:test";
 
-import { assertPrivate } from "./support/platform.js";
-import { startFakeCodexServer } from "./support/bridge.js";
-import { createRouterWorkspace, routerEnv, routerWithWebhooks, runRouterCli } from "./support/router.js";
+import { assertPrivate, platformGate, PYTHON } from "./support/platform.js";
+import { createBridgeWorkspace, startFakeCodexServer } from "./support/bridge.js";
+import { createRouterWorkspace, routerEnv, routerWithWebhooks, runRouterCli, writeRootToken } from "./support/router.js";
 import { createWorkspace, runScript } from "./support/runner.js";
+import { startFakeHost } from "./support/session-fixture.js";
 import { readState, seedFixtureProcess, seedRegistry, seedTmuxSession, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
+
+const WIN = process.platform === "win32";
+const require = createRequire(import.meta.url);
 
 test.afterEach(async () => {
   await cleanup();
 });
+
+// The launch line names tmux only where tmux hosts the session.
+const startedLine = name => new RegExp(`Started Codex Router bridge in ${WIN ? "" : "tmux "}session '${name}'`);
 
 // Every Codex launch goes through the Router, so each scenario runs in a
 // Router Test Workspace (its private state under `routerStateDir`, root's
@@ -79,8 +87,16 @@ async function serveAlpha(workspace, registrySeed, { codex: codexOptions = {}, s
   return { codex, router };
 }
 
-function startCodex(workspace, { args = ["alpha"], env = {}, timeoutMs = 30000 } = {}) {
-  return runScript(workspace, "scripts/start-codex-session.sh", { args, env: routerEnv(workspace, env), timeoutMs });
+// On Windows the launcher needs a session host; each Workspace gets one fake host.
+const fakeHosts = new WeakMap();
+async function backendEnv(workspace) {
+  if (!WIN) return {};
+  if (!fakeHosts.has(workspace)) fakeHosts.set(workspace, await startFakeHost(workspace, { env: routerEnv(workspace) }));
+  return fakeHosts.get(workspace).env;
+}
+
+async function startCodex(workspace, { args = ["alpha"], env = {}, timeoutMs = 30000 } = {}) {
+  return runScript(workspace, "scripts/start-codex-session.sh", { args, env: routerEnv(workspace, { ...await backendEnv(workspace), ...env }), timeoutMs });
 }
 
 function alphaKeyFile(workspace) {
@@ -215,7 +231,7 @@ test("start-codex-session constructs a Router bridge tmux launch, removes stale 
   const afterInventory = listRelativeFiles(workspace.repoDir);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  assert.match(result.stdout, /Started Codex Router bridge in tmux session 'alpha_codex'/);
+  assert.match(result.stdout, startedLine("alpha_codex"));
   assert.match(result.stdout, /Bridge connected to the Router \(scope channel-id\)/);
   assert.match(result.stdout, /Recorded PID \d+/);
   assert.deepEqual(afterInventory, beforeInventory);
@@ -233,7 +249,7 @@ test("start-codex-session constructs a Router bridge tmux launch, removes stale 
   const session = state.fixtures.tmux.sessions.alpha_codex;
   assert.equal(session.cwd, workspace.repoDir);
   assert.equal(registry.projects.alpha.pid, session.pid);
-  assert.deepEqual(session.env, {
+  const expectedEnv = {
     ALLOWED_USER_IDS: "allowed-user-id",
     CCDM_CHANNEL_READY_FILE: path.join(workspace.routerStateDir, "launches", "alpha", "ready.json"),
     CCDM_CODEX_PROJECT: "alpha",
@@ -245,9 +261,16 @@ test("start-codex-session constructs a Router bridge tmux launch, removes stale 
     CODEX_RESUME_THREAD_ID: "",
     PROJECT_DIR: path.join(workspace.tmpDir, "project with spaces & 50% off!"),
     WS_PORT: String(codex.port),
-  });
-  for (const forbidden of ["BOT_TOKEN", "DISCORD_STATE_DIR"]) {
-    assert.equal(session.shellCommand.includes(forbidden), false, forbidden);
+    CCDM_SESSION_NAME: "alpha_codex",
+  };
+  if (WIN) {
+    // The host starts a session with none of the caller's CCDM names, so a few more are passed.
+    for (const [name, value] of Object.entries(expectedEnv)) assert.equal(session.env[name], value, name);
+  } else {
+    assert.deepEqual(session.env, expectedEnv);
+    for (const forbidden of ["BOT_TOKEN", "DISCORD_STATE_DIR"]) {
+      assert.equal(session.shellCommand.includes(forbidden), false, forbidden);
+    }
   }
   assert.equal(session.bridgeCommand, "node scripts/codex-bridge.js");
   assertPrivate(alphaKeyFile(workspace));
@@ -522,16 +545,6 @@ test("start-codex-session applies Codex Home validation to an aliased home", asy
       message: /Codex Account Alias 'selected'.*not a directory/,
     },
     {
-      name: "inaccessible",
-      setup(workspace) {
-        const selectedHome = path.join(workspace.homeDir, ".codex-account-read-only");
-        fs.mkdirSync(selectedHome, { recursive: true });
-        fs.chmodSync(selectedHome, 0o555);
-        return selectedHome;
-      },
-      message: /Codex Account Alias 'selected'.*not writable/,
-    },
-    {
       name: "unusable config",
       setup(workspace) {
         const selectedHome = path.join(workspace.homeDir, ".codex-account-config-directory");
@@ -563,6 +576,23 @@ test("start-codex-session applies Codex Home validation to an aliased home", asy
       assert.equal(fs.readFileSync(markerPath, "utf8"), "stale\n", invalidCase.name);
     }
   }
+});
+
+test("start-codex-session rejects an aliased Codex Home it cannot write", platformGate("posix", "a directory's mode bits do not limit writes on Windows"), async () => {
+  const workspace = createCodexWorkspace();
+  const selectedHome = path.join(workspace.homeDir, ".codex-account-read-only");
+  fs.mkdirSync(selectedHome, { recursive: true });
+  fs.chmodSync(selectedHome, 0o555);
+  const registrySeed = buildCodexRegistry(workspace);
+  registrySeed.codex_accounts = { selected: selectedHome };
+  registrySeed.projects.alpha.codex_account = "selected";
+  seedRegistry(workspace, registrySeed);
+
+  const result = await startCodex(workspace);
+
+  assert.notEqual(result.exitCode, 0);
+  assert.match(`${result.stdout}\n${result.stderr}`, /Codex Account Alias 'selected'.*not writable/);
+  assertNoLaunch(workspace);
 });
 
 test("start-codex-session ignores a broken Codex Account Alias on an unrelated project", async () => {
@@ -735,7 +765,7 @@ test("start-codex-session rejects a broken Codex Home symlink before lifecycle m
   assertNoLaunch(workspace);
 });
 
-test("start-codex-session rejects non-directory and non-writable Codex Homes", async () => {
+test("start-codex-session rejects a non-directory Codex Home", async () => {
   const nonDirectoryWorkspace = createCodexWorkspace();
   const nonDirectoryHome = path.join(nonDirectoryWorkspace.homeDir, "codex file");
   fs.writeFileSync(nonDirectoryHome, "not a directory\n");
@@ -750,7 +780,9 @@ test("start-codex-session rejects non-directory and non-writable Codex Homes", a
   assert.notEqual(nonDirectoryResult.exitCode, 0);
   assert.match(`${nonDirectoryResult.stdout}\n${nonDirectoryResult.stderr}`, /not a directory/);
   assert.deepEqual(readState(nonDirectoryWorkspace.stateDir).fixtures.tmux.sessions, {});
+});
 
+test("start-codex-session rejects a non-writable Codex Home", platformGate("posix", "a directory's mode bits do not limit writes on Windows"), async () => {
   const permissionWorkspace = createCodexWorkspace();
   const permissionHome = path.join(permissionWorkspace.homeDir, "codex read-only");
   seedRegistry(permissionWorkspace, buildCodexRegistry(permissionWorkspace, { globalCodexHome: permissionHome }));
@@ -827,7 +859,7 @@ test("start-codex-session expands home-relative selectors and rejects unresolved
     seedRegistry(workspace, registrySeed);
     const result = await startCodex(workspace);
     assert.notEqual(result.exitCode, 0);
-    assert.match(`${result.stdout}\n${result.stderr}`, /top-level codex_home.*must be absolute or use '~'/);
+    assert.match(`${result.stdout}\n${result.stderr}`, /top-level codex_home.*must be (absolute|a drive or UNC path).* use '~'/);
     assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {});
   }
 });
@@ -904,7 +936,7 @@ test("start-codex-session exits successfully when the target tmux session is alr
   assert.equal(fs.existsSync(alphaKeyFile(workspace)), false);
 });
 
-test("start-codex-session refuses duplicate bridge and app-server processes from fixture ps state", async () => {
+test("start-codex-session refuses duplicate bridge and app-server processes from fixture ps state", platformGate("posix", "reads the fixture ps; Windows has the case below with real processes"), async () => {
   const bridgeWorkspace = createCodexWorkspace();
   const bridgeRegistry = buildCodexRegistry(bridgeWorkspace);
   seedRegistry(bridgeWorkspace, bridgeRegistry);
@@ -962,7 +994,7 @@ test("start-codex-session reports current executable failures for registry looku
   const staleBotResult = await startCodex(staleBot, { env: { CCDM_CODEX_LAUNCH_TIMEOUT_S: "2" } });
   assert.notEqual(staleBotResult.exitCode, 0);
   assert.doesNotMatch(staleBotResult.stderr, /StopIteration|KeyError|Traceback/);
-  assert.match(staleBotResult.stdout, /Started Codex Router bridge in tmux session 'alpha_codex'/);
+  assert.match(staleBotResult.stdout, startedLine("alpha_codex"));
   assert.match(staleBotResult.stderr, /Codex Router launch failed/);
   assertNoLaunch(staleBot);
 });
@@ -1015,10 +1047,226 @@ test("project launch never reads a pool token or root .env and carries no bot id
   const state = readState(workspace.stateDir);
   const session = state.fixtures.tmux.sessions.alpha_codex;
   assert.equal(session.env.CCDM_ROUTER_KEY_FILE, alphaKeyFile(workspace));
-  const surfaces = [session.shellCommand, JSON.stringify(session.env), JSON.stringify(state.fixtures.codex.bridgeInvocations), result.stdout, result.stderr];
+  const surfaces = [session.shellCommand ?? "", JSON.stringify(session.env), JSON.stringify(state.fixtures.codex.bridgeInvocations), result.stdout, result.stderr];
   for (const text of surfaces) {
     for (const forbidden of ["pool-bot-token", "root-bot-token", "pool-app-id", "BOT_TOKEN", "BOT_APP_ID", "ROOT_BOT_APP_ID", "BOT_DISPLAY_NAME", "GUILD_ID", "DISCORD_STATE_DIR"]) {
       assert.equal(text.includes(forbidden), false, `${forbidden} in ${text.slice(0, 300)}`);
     }
   }
+});
+
+// ---- what only a hosted bridge shows ----
+
+function realProcess(args) {
+  const child = spawn(process.execPath, args, { stdio: "ignore", windowsHide: true });
+  registerTeardownCallback(() => child.kill());
+  return child;
+}
+
+test("on Windows the bridge starts as a no-PTY project session with the key file on its command line", platformGate("win32", "the win32 launch shape"), async () => {
+  const workspace = createCodexWorkspace();
+  const { codex } = await serveAlpha(workspace, buildCodexRegistry(workspace));
+
+  const result = await startCodex(workspace, { args: ["alpha", "--resume", "00000000-0000-4000-8000-000000000001"] });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /Bridge connected to the Router \(scope channel-id\)/);
+  assert.doesNotMatch(result.stdout, /tmux/);
+  assert.match(result.stdout, /Attach with: node scripts\/ccdm-host\.js attach -t alpha_codex/);
+
+  const state = readState(workspace.stateDir);
+  const [launch] = state.fixtures.sessionHost.launches;
+  assert.equal(launch.front, "ccdm-host");
+  assert.equal(launch.pty, false);
+  assert.equal(launch.kind, "project");
+  assert.equal(fs.realpathSync.native(launch.cwd), fs.realpathSync.native(workspace.repoDir));
+  assert.deepEqual(launch.argv.slice(1), ["scripts/codex-bridge.js", "--ccdm-key-file", alphaKeyFile(workspace)]);
+  assert.match(path.basename(launch.argv[0]), /^node(\.exe)?$/i);
+  assert.equal(launch.env.CCDM_ROUTER_KEY_FILE, alphaKeyFile(workspace));
+  assert.equal(launch.env.CODEX_RESUME_THREAD_ID, "00000000-0000-4000-8000-000000000001");
+  assert.equal(launch.env.WS_PORT, String(codex.port));
+
+  // The recorded PID is the bridge, not the other process in the session's Job.
+  const { processStartTime } = require("../../scripts/platform/process.js");
+  const entry = readRegistry(workspace).projects.alpha;
+  assert.equal(entry.pid, launch.pid);
+  assert.notEqual(state.fixtures.tmux.sessions.alpha_codex.job[1], entry.pid);
+  assert.equal(entry.pid_started_at, processStartTime(launch.pid));
+  assert.equal(entry.session_id, null);
+
+  const status = await runRouterCli(workspace, ["status"]);
+  assert.match(status.stdout, /sessions: 1\n  project alpha scope=channel-id connected=/);
+});
+
+// A real host hands a session only the launch's env, so the real bridge would
+// miss the Workspace's NODE_PATH. This stand-in shows what the host gives a bridge.
+function writeBridgeStandIn(workspace, report) {
+  fs.writeFileSync(path.join(workspace.repoDir, "scripts", "codex-bridge.js"), `
+    const fs = require("node:fs");
+    const net = require("node:net");
+    const note = entry => fs.appendFileSync(${JSON.stringify(report)}, JSON.stringify(entry) + "\\n");
+    note({ pid: process.pid, stdinIsPipe: process.stdin instanceof net.Socket && !process.stdin.isTTY, argv: process.argv.slice(2) });
+    fs.writeFileSync(process.env.CCDM_CHANNEL_READY_FILE, JSON.stringify({ ok: true, scope: { channel_id: process.env.CHANNEL_ID } }));
+    process.stdin.resume();
+    process.stdin.on("end", () => { note({ eof: true }); process.exit(0); });
+  `);
+}
+
+test("on Windows a real ccdm-host holds the bridge's stdin open until the session is stopped", platformGate("win32", "starts the real ccdm-host"), async () => {
+  const workspace = createCodexWorkspace();
+  const registrySeed = buildCodexRegistry(workspace);
+  registrySeed.projects.alpha.webhook_id = "webhook-alpha";
+  seedRegistry(workspace, registrySeed);
+  const report = path.join(workspace.tmpDir, "bridge-report.ndjson");
+  writeBridgeStandIn(workspace, report);
+  const notes = () => fs.readFileSync(report, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line));
+
+  const env = routerEnv(workspace, { CCDM_STATE_ROOT: path.join(workspace.tmpRoot, "real-host-state"), CCDM_SESSION_HOST: "ccdm-host" });
+  const hostScript = path.join(workspace.repoDir, "scripts", "ccdm-host.js");
+  const hostCli = args => new Promise((resolve) => {
+    const child = spawn(process.execPath, [hostScript, ...args], { cwd: workspace.repoDir, env, stdio: "ignore", windowsHide: true });
+    child.once("close", resolve);
+  });
+  const host = spawn(process.execPath, [hostScript, "serve", "--allow-in-job"], { cwd: workspace.repoDir, env, stdio: ["ignore", "pipe", "inherit"], windowsHide: true });
+  const hostClosed = new Promise(resolve => host.once("close", resolve));
+  registerTeardownCallback(async () => {
+    if (host.exitCode === null) await hostCli(["shutdown"]);
+    await Promise.race([hostClosed, new Promise(resolve => setTimeout(resolve, 5000))]);
+    if (host.exitCode === null) host.kill();
+  });
+  await new Promise((resolve, reject) => {
+    host.stdout.setEncoding("utf8").on("data", text => { if (/ready/.test(text)) resolve(); });
+    host.once("exit", code => reject(new Error(`ccdm-host exited with ${code}`)));
+  });
+
+  const result = await runScript(workspace, "scripts/start-codex-session.sh", { args: ["alpha"], env, timeoutMs: 30000 });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const [started] = notes();
+  assert.equal(started.stdinIsPipe, true);
+  assert.deepEqual(started.argv, ["--ccdm-key-file", alphaKeyFile(workspace)]);
+
+  const { processStartTime } = require("../../scripts/platform/process.js");
+  const entry = readRegistry(workspace).projects.alpha;
+  assert.equal(entry.pid, started.pid);
+  assert.equal(entry.pid_started_at, processStartTime(started.pid));
+
+  // The launcher has gone. The pipe must outlive it, or the bridge would have been told to stop.
+  await new Promise(resolve => setTimeout(resolve, 1500));
+  assert.equal(notes().some(note => note.eof), false, "the bridge saw its stdin close while the session was running");
+
+  assert.equal(await hostCli(["kill-session", "-t", "=alpha_codex", "--grace", "8000"]), 0);
+  assert.equal(notes().some(note => note.eof), true, "stopping the session did not close the bridge's stdin");
+  await waitForExit(started.pid);
+});
+
+test("on Windows a caller's own session identity does not reach the new bridge", platformGate("win32", "only the host starts a session from the launch's env alone"), async () => {
+  const workspace = createCodexWorkspace();
+  await serveAlpha(workspace, buildCodexRegistry(workspace));
+
+  const result = await startCodex(workspace, { env: {
+    CCDM_ROUTER_ROLE: "root", CCDM_THREAD_ID: "inherited-thread", CCDM_DETACHED: "1", CCDM_REMINDER_CONTEXT_FILE: "inherited",
+  } });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const [launch] = readState(workspace.stateDir).fixtures.sessionHost.launches;
+  for (const name of ["CCDM_ROUTER_ROLE", "CCDM_THREAD_ID", "CCDM_DETACHED", "CCDM_REMINDER_CONTEXT_FILE"]) {
+    assert.equal(launch.env[name], undefined, name);
+  }
+});
+
+test("on Windows a running bridge or app-server with this project's key file or port refuses the launch", platformGate("win32", "POSIX reads the fixture ps above"), async () => {
+  const keep = "setInterval(() => {}, 1000)";
+  for (const makeArgs of [
+    workspace => ["-e", keep, "--", "--ccdm-key-file", alphaKeyFile(workspace)],
+    () => ["-e", keep, "--", "app-server", "--listen", "ws://127.0.0.1:18342"],
+  ]) {
+    const workspace = createCodexWorkspace();
+    seedRegistry(workspace, buildCodexRegistry(workspace));
+    const child = realProcess(makeArgs(workspace));
+
+    const result = await startCodex(workspace);
+
+    assert.equal(result.exitCode, 1, result.stderr || result.stdout);
+    assert.match(result.stdout, /existing Codex Discord bridge process\(es\)/);
+    assert.match(result.stdout, new RegExp(`\\b${child.pid}\\b`));
+    assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex, undefined);
+    assert.equal(fs.existsSync(alphaKeyFile(workspace)), false);
+  }
+});
+
+test("a registry and project path containing a quote and spaces reach the session intact", async () => {
+  const workspace = createBridgeWorkspace({ repoDirName: "it's a repo" });
+  writeRootToken(workspace);
+  const projectPath = path.join(workspace.tmpDir, "o'neil's project");
+  const { codex } = await serveAlpha(workspace, buildCodexRegistry(workspace, { projectPath }));
+
+  const result = await startCodex(workspace);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex;
+  assert.equal(fs.realpathSync.native(session.cwd), fs.realpathSync.native(workspace.repoDir));
+  assert.equal(session.env.PROJECT_DIR, projectPath);
+  assert.equal(session.env.WS_PORT, String(codex.port));
+  assert.equal(readRegistry(workspace).projects.alpha.pid, session.pid);
+  if (!WIN) assert.match(session.shellCommand, /o'\\''neil'\\''s project/);
+});
+
+test("while config.toml.lock is held the cleanup waits, and a reader never sees a partial config.toml", async () => {
+  const workspace = createCodexWorkspace();
+  const registrySeed = buildCodexRegistry(workspace);
+  const codexHome = path.join(workspace.homeDir, ".codex");
+  const configPath = path.join(codexHome, "config.toml");
+  // Long enough that a write in place would be seen half done.
+  const kept = Array.from({ length: 20000 }, (_, index) => `# kept line ${index}`).join("\n");
+  const before = `[mcp_servers.discord-old]\ncommand = "node"\n\n[kept]\n${kept}\n`;
+  const after = `[kept]\n${kept}\n`;
+  fs.writeFileSync(configPath, before);
+  await serveAlpha(workspace, registrySeed);
+
+  const holder = spawn(PYTHON, ["-c", `
+import importlib.util, sys
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("registry_update", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+lock = module.acquire(sys.argv[2])
+print("held", flush=True)
+sys.stdin.readline()
+module.release(lock)
+`, path.join(workspace.repoDir, "scripts/registry-update.py"), configPath], { env: workspace.env, stdio: ["pipe", "pipe", "inherit"], windowsHide: true });
+  registerTeardownCallback(() => holder.kill());
+  await new Promise((resolve, reject) => {
+    holder.stdout.setEncoding("utf8").on("data", text => { if (text.includes("held")) resolve(); });
+    holder.once("exit", code => reject(new Error(`the lock holder exited with ${code}`)));
+  });
+
+  const torn = [];
+  let reading = true;
+  const reader = (async () => {
+    while (reading) {
+      try {
+        const seen = fs.readFileSync(configPath, "utf8");
+        if (seen !== before && seen !== after) torn.push(seen.length);
+      } catch (error) {
+        if (!["EBUSY", "EPERM", "EACCES", "ENOENT"].includes(error.code)) throw error;
+      }
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+  })();
+
+  const launching = startCodex(workspace);
+  await new Promise(resolve => setTimeout(resolve, 2500));
+  // Held for 2.5 s: nothing may have changed yet.
+  assert.equal(fs.readFileSync(configPath, "utf8"), before);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {});
+  holder.stdin.end("\n");
+
+  const result = await launching;
+  reading = false;
+  await reader;
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.equal(fs.readFileSync(configPath, "utf8"), after);
+  assert.deepEqual(torn, []);
 });

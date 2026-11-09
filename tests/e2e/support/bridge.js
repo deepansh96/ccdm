@@ -29,7 +29,8 @@ export function bridgeChildEnv(workspace, extraEnv = {}) {
   return {
     ...workspace.env,
     CCDM_TEST_ACCELERATE_TYPING: "1",
-    NODE_OPTIONS: `--require ${path.join(workspace.repoDir, "tests/e2e/support/preload.cjs")}`,
+    // Quoted, since a Workspace path may hold spaces; forward slashes, since a backslash escapes inside the quotes.
+    NODE_OPTIONS: `--require "${path.join(workspace.repoDir, "tests/e2e/support/preload.cjs").replaceAll("\\", "/")}"`,
     NODE_PATH: nodePath,
     ...extraEnv,
   };
