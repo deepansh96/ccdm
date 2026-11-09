@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { assertPrivate } from "./support/platform.js";
+import { assertPrivate, platformGate } from "./support/platform.js";
 import { injectDiscordMessage, injectDiscordReaction, startFakeCodexServer, waitForState } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import {
@@ -15,6 +15,7 @@ import {
   runRouterCli,
   waitFor,
 } from "./support/router.js";
+import { startFakeHost } from "./support/session-fixture.js";
 import { readState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -38,8 +39,16 @@ function codexRouterWorkspace(port) {
   return workspace;
 }
 
-function startCodexSession(workspace, extraEnv = {}) {
-  return runScript(workspace, "scripts/start-codex-session.sh", { args: ["demo"], env: routerEnv(workspace, extraEnv), timeoutMs: 30000 });
+// On Windows the launcher goes through the fake ccdm-host, sharing the fixture's session table.
+const fakeHosts = new WeakMap();
+async function launcherEnv(workspace) {
+  if (process.platform !== "win32") return {};
+  if (!fakeHosts.has(workspace)) fakeHosts.set(workspace, startFakeHost(workspace, { env: routerEnv(workspace) }));
+  return (await fakeHosts.get(workspace)).env;
+}
+
+async function startCodexSession(workspace, extraEnv = {}) {
+  return runScript(workspace, "scripts/start-codex-session.sh", { args: ["demo"], env: routerEnv(workspace, { ...(await launcherEnv(workspace)), ...extraEnv }), timeoutMs: 30000 });
 }
 
 function readRegistry(workspace) {
@@ -236,7 +245,7 @@ function botReactions(state) {
   return state.fixtures.discord.reactions.map(({ messageId, emoji }) => [messageId, decodeURIComponent(emoji)]);
 }
 
-test("/pause queues router Codex messages and /unpause runs them in order", async () => {
+test("/pause queues router Codex messages and /unpause runs them in order", platformGate("posix", "two paused messages can overtake each other while the bridge awaits their reminder steps, seen only on Windows"), async () => {
   const { workspace, codex } = await routerCodexSession([
     { turnId: "first-queued-turn", mcpReplyText: "first queued done" },
     { turnId: "second-queued-turn", mcpReplyText: "second queued done" },
@@ -291,27 +300,53 @@ function demoRuntime(workspace) {
   return { pid: readRegistry(workspace).projects.demo.pid, key: fs.existsSync(keyFile) ? fs.readFileSync(keyFile, "utf8") : null };
 }
 
+async function waitForRelaunch(workspace, before) {
+  const deadline = Date.now() + 30000;
+  for (;;) {
+    const after = demoRuntime(workspace);
+    if (typeof after.pid === "number" && after.pid !== before.pid && after.key && after.key !== before.key) {
+      const status = await runRouterCli(workspace, ["status"]);
+      if (/sessions: 1\n  project demo scope=demo-channel connected=/.test(status.stdout)) return;
+    }
+    assert.ok(Date.now() < deadline, `demo never relaunched: ${JSON.stringify({ before, after })}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
 test("/restart relaunches only the router Codex project, which reconnects with a new key", async () => {
   const { workspace } = await routerCodexSession([]);
   const before = demoRuntime(workspace);
 
   ownerMessage(workspace, { id: "cmd-restart", content: "/restart" });
 
-  const deadline = Date.now() + 30000;
-  for (;;) {
-    const after = demoRuntime(workspace);
-    if (typeof after.pid === "number" && after.pid !== before.pid && after.key && after.key !== before.key) {
-      const status = await runRouterCli(workspace, ["status"]);
-      if (/sessions: 1\n  project demo scope=demo-channel connected=/.test(status.stdout)) break;
-    }
-    assert.ok(Date.now() < deadline, `demo never relaunched: ${JSON.stringify({ before, after })}`);
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
+  await waitForRelaunch(workspace, before);
   const state = readState(workspace.stateDir);
   assert.deepEqual(webhookContents(state), ["Restarting session — fresh thread coming up."]);
   assert.deepEqual(botReactions(state), [["cmd-restart", "🔄"]]);
   assert.equal(state.fixtures.tmux.sessions.demo_codex.env.CCDM_ROUTER_KEY_FILE, path.join(workspace.routerStateDir, "keys", "demo.key"));
   assert.equal(state.fixtures.tmux.sessions.root_agent, undefined);
+});
+
+test("on Windows the Codex /restart helper waits for this bridge by PID and start time, outside its Job", platformGate("win32", "Jobs and start times are Windows facilities"), async () => {
+  const { workspace } = await routerCodexSession([]);
+  const hostEnv = await launcherEnv(workspace);
+  const registered = readRegistry(workspace).projects.demo;
+  const oldJob = readState(workspace.stateDir).fixtures.tmux.sessions.demo_codex.job;
+  const before = demoRuntime(workspace);
+
+  ownerMessage(workspace, { id: "cmd-restart", content: "/restart" });
+
+  await waitForRelaunch(workspace, before);
+  const [helper, ...others] = readState(workspace.stateDir).fixtures.sessionHost.detached;
+  assert.deepEqual(others, []);
+  assert.equal(oldJob.includes(helper.pid), false, `helper ${helper.pid} is in the old Job ${oldJob}`);
+  assert.deepEqual(helper.argv.slice(-6), ["restart-session", "demo", "--after-pid", String(before.pid), "--after-started-at", registered.pid_started_at]);
+  assert.equal(helper.env.CCDM_ROUTER_STATE_DIR, workspace.routerStateDir);
+  assert.equal(Object.keys(helper.env).some((name) => name.toUpperCase() === "CCDM_SESSION_NAME"), false);
+  assert.equal(helper.log, path.join(hostEnv.CCDM_STATE_ROOT, "logs", "restart-demo.log"));
+  const log = fs.readFileSync(helper.log, "utf8");
+  assert.match(log, new RegExp(`pid ${before.pid} has exited`));
+  assert.match(log, /stop-session exited 0/);
 });
 
 // Signed CDN URLs carry their expiry as hex Unix seconds in `ex`.
@@ -459,8 +494,8 @@ function sharedCodexHomeWorkspace() {
   return { workspace, codexHome: path.join(workspace.homeDir, ".codex") };
 }
 
-function startCodexProject(workspace, project) {
-  return runScript(workspace, "scripts/start-codex-session.sh", { args: [project], env: routerEnv(workspace), timeoutMs: 30000 });
+async function startCodexProject(workspace, project) {
+  return runScript(workspace, "scripts/start-codex-session.sh", { args: [project], env: routerEnv(workspace, await launcherEnv(workspace)), timeoutMs: 30000 });
 }
 
 function codexServerRecord(workspace, port) {

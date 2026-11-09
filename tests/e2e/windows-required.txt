@@ -47,5 +47,7 @@ tests/e2e/claude-start.test.js
 tests/e2e/stop-restart.test.js
 tests/e2e/codex-start.test.js
 tests/e2e/windows-installer-router.test.js
+tests/e2e/restart-session.test.js
+tests/e2e/router-codex-session.test.js
 tests/e2e/root-cli.test.js
 tests/e2e/windows-installer-usage-poster.test.js

@@ -522,7 +522,7 @@ function acknowledgments(state) {
   };
 }
 
-test("/compact and /clear are typed into demo's own tmux pane with an acknowledgment and no Claude turn", platformGate("posix", "host commands on Windows are P3.6"), async () => {
+test("/compact and /clear are typed into demo's own tmux pane with an acknowledgment and no Claude turn", async () => {
   const workspace = claudeRouterWorkspace();
   await routerWithWebhooks(workspace, ["demo"]);
   const started = await startSession(workspace);
@@ -585,8 +585,33 @@ function demoRuntime(workspace) {
   return { pid: registry.projects.demo.pid, key: fs.existsSync(keyFile) ? fs.readFileSync(keyFile, "utf8") : null };
 }
 
-// Restarts demo with `author`'s /restart and waits for the relaunched session
-// to hold a new PID record and a new key, with root's pane untouched.
+// Waits for the relaunched session to hold a new PID record and a new key and
+// to be connected to the Router again.
+async function waitForRelaunch(workspace, before) {
+  const deadline = Date.now() + 20000;
+  for (;;) {
+    const after = demoRuntime(workspace);
+    if (typeof after.pid === "number" && after.pid !== before.pid && after.key && after.key !== before.key) {
+      const status = await runRouterCli(workspace, ["status"]);
+      if (/sessions: 1\n  project demo scope=demo-channel connected=/.test(status.stdout)) return;
+    }
+    assert.ok(Date.now() < deadline, `demo never relaunched: ${JSON.stringify({ before, after })}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+async function waitForRestartLog(file) {
+  const deadline = Date.now() + 20000;
+  for (;;) {
+    const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+    if (/start-session exited 0/.test(text)) return text;
+    assert.ok(Date.now() < deadline, `the restart never finished: ${text}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+// Restarts demo with `author`'s /restart and waits for the relaunched session,
+// with root's pane untouched.
 async function assertRestartsOnlyDemo(workspace, author) {
   await routerWithWebhooks(workspace, ["demo"]);
   const started = await startSession(workspace);
@@ -596,16 +621,10 @@ async function assertRestartsOnlyDemo(workspace, author) {
 
   command(workspace, "cmd-restart", "/restart", author);
 
-  const deadline = Date.now() + 20000;
-  for (;;) {
-    const after = demoRuntime(workspace);
-    if (typeof after.pid === "number" && after.pid !== before.pid && after.key && after.key !== before.key) {
-      const status = await runRouterCli(workspace, ["status"]);
-      if (/sessions: 1\n  project demo scope=demo-channel connected=/.test(status.stdout)) break;
-    }
-    assert.ok(Date.now() < deadline, `demo never relaunched: ${JSON.stringify({ before, after })}`);
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
+  await waitForRelaunch(workspace, before);
+  const hostEnv = await launcherEnv(workspace);
+  const stateRoot = hostEnv.CCDM_STATE_ROOT ?? path.join(workspace.homeDir, ".local", "state", "ccdm");
+  assert.match(await waitForRestartLog(path.join(stateRoot, "logs", "restart-demo.log")), /stop-session exited 0/);
   const state = readState(workspace.stateDir);
   assert.equal(state.fixtures.tmux.lastKilledSessions.demo_claude.killAttempts, 1);
   assert.equal(state.fixtures.tmux.sessions.demo_claude.devChannelPrompt, "accepted");
@@ -618,10 +637,38 @@ async function assertRestartsOnlyDemo(workspace, author) {
   assert.deepEqual(state.fixtures.claude.channelNotifications ?? [], []);
 }
 
-test("/restart in demo's channel relaunches only demo, which reconnects with a new key", platformGate("posix", "/restart on Windows is P3.7"), async () => {
+test("/restart in demo's channel relaunches only demo, which reconnects with a new key", async () => {
   await assertRestartsOnlyDemo(claudeRouterWorkspace(), { id: OWNER_ID, username: "Owner" });
 });
 
-test("a guest's /restart follows the Codex bridge's allowed-user policy: demo restarts and root never does", platformGate("posix", "/restart on Windows is P3.7"), async () => {
+test("a guest's /restart follows the Codex bridge's allowed-user policy: demo restarts and root never does", async () => {
   await assertRestartsOnlyDemo(claudeRouterWorkspace(), { id: "guest-id", username: "Guest" });
+});
+
+test("on Windows the /restart helper is a host child outside the old session's Job and outlives it", platformGate("win32", "Jobs are a Windows facility"), async () => {
+  const workspace = claudeRouterWorkspace();
+  await routerWithWebhooks(workspace, ["demo"]);
+  const started = await startSession(workspace);
+  assert.equal(started.exitCode, 0, started.stderr || started.stdout);
+  const hostEnv = await launcherEnv(workspace);
+  const oldJob = readState(workspace.stateDir).fixtures.tmux.sessions.demo_claude.job;
+  assert.ok(oldJob.length > 0, "the fake host models the session's Job");
+  const before = demoRuntime(workspace);
+
+  command(workspace, "cmd-restart", "/restart", { id: OWNER_ID, username: "Owner" });
+
+  await waitForRelaunch(workspace, before);
+  const { detached } = readState(workspace.stateDir).fixtures.sessionHost;
+  assert.equal(detached.length, 1, JSON.stringify(detached));
+  const [helper] = detached;
+  assert.deepEqual(helper.argv.slice(-2), ["restart-session", "demo"]);
+  assert.equal(oldJob.includes(helper.pid), false, `helper ${helper.pid} is in the old Job ${oldJob}`);
+  assert.equal(helper.env.CCDM_ROUTER_STATE_DIR, workspace.routerStateDir);
+  assert.equal(helper.env.CCDM_STATE_ROOT, hostEnv.CCDM_STATE_ROOT);
+  assert.equal(helper.env.CCDM_DETACHED, "1");
+  assert.equal(Object.keys(helper.env).some((name) => name.toUpperCase() === "CCDM_SESSION_NAME"), false);
+  assert.equal(helper.log, path.join(hostEnv.CCDM_STATE_ROOT, "logs", "restart-demo.log"));
+  // The helper finished the start, which runs only after the old session ended.
+  const log = await waitForRestartLog(helper.log);
+  assert.ok(log.indexOf("stop-session exited 0") < log.indexOf("running start-session"), log);
 });

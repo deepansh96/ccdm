@@ -422,6 +422,7 @@ export function createSessionFixture(context) {
       return { killed: members };
     },
     "run-detached"({ argv, cwd, env = {}, log }) {
+      if (log) fs.mkdirSync(path.dirname(log), { recursive: true });
       const logFd = log ? fs.openSync(log, "a") : null;
       const child = spawn(argv[0], argv.slice(1), {
         cwd,
