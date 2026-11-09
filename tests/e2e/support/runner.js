@@ -1650,6 +1650,21 @@ function workspaceEnv({ root, homeDir, tmpDir, stateDir, fixtureDir, platform = 
   return env;
 }
 
+// On Windows a process killed a moment ago can keep the directory for a little
+// while longer, and rmSync does not retry that error itself.
+async function removeWorkspaceRoot(root) {
+  const deadline = Date.now() + scaledTimeout(1000);
+  for (;;) {
+    try {
+      fs.rmSync(root, { force: true, recursive: true });
+      return;
+    } catch (error) {
+      if (!WIN || Date.now() >= deadline || !["EBUSY", "EPERM", "ENOTEMPTY"].includes(error.code)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+}
+
 export const createWorkspace = Object.freeze(function createWorkspace(options = {}) {
   const root = sourceRoot();
   const files = gitSourceFiles(root);
@@ -1677,7 +1692,7 @@ export const createWorkspace = Object.freeze(function createWorkspace(options = 
       // Workspace removal should still proceed if fixture cleanup cannot read state.
     }
     // With CCDM_E2E_KEEP_FAILED=1 the runner decides, once it knows the file's result.
-    if (process.env.CCDM_E2E_KEEP_FAILED !== "1") fs.rmSync(tmpRoot, { force: true, recursive: true });
+    if (process.env.CCDM_E2E_KEEP_FAILED !== "1") await removeWorkspaceRoot(tmpRoot);
   });
 
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-e2e-"));
