@@ -247,7 +247,7 @@ test("start-codex-session constructs a Router bridge tmux launch, removes stale 
 
   const state = readState(workspace.stateDir);
   const session = state.fixtures.tmux.sessions.alpha_codex;
-  assert.equal(session.cwd, workspace.repoDir);
+  assert.equal(fs.realpathSync.native(session.cwd), fs.realpathSync.native(workspace.repoDir));
   assert.equal(registry.projects.alpha.pid, session.pid);
   const expectedEnv = {
     ALLOWED_USER_IDS: "allowed-user-id",

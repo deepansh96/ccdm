@@ -1724,6 +1724,8 @@ export const createWorkspace = Object.freeze(function createWorkspace(options = 
   }
 
   copySourceFiles(root, repoDir, files);
+  // The fixture runtime finds the checkout at <tmpRoot>/repo.
+  if (options.repoDirName) fs.symlinkSync(repoDir, path.join(tmpRoot, "repo"), "junction");
   assertWorkspaceClean(repoDir);
   createFixtures(fixtureDir, options);
   if (WIN) {
