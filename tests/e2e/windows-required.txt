@@ -1,0 +1,9 @@
+# Suites that must pass on Windows: the windows-required CI job runs exactly these.
+# One repo-relative test file per line. A slice that turns a suite green on
+# Windows appends it here; see "CI Behavior" in tests/e2e/README.md.
+tests/e2e/ci-contract.test.js
+tests/e2e/deepseek-local-usage.test.js
+tests/e2e/harness-safety.test.js
+tests/e2e/runner-contract.test.js
+tests/e2e/usage-dashboard-renderer.test.js
+tests/e2e/windows-skip-budget.test.js

@@ -22,7 +22,16 @@ jobs:
       - name: Install dashboard test dependency
         run: python3 -m pip install Pillow
 
-      - run: npm ci
+      - run: npm ci --omit=optional
+
+      - name: Assert native Windows packages are absent
+        run: |
+          for package in node_modules/koffi node_modules/node-pty node_modules/@xterm/* node_modules/@koromix/*; do
+            if [ -e "$package" ]; then
+              echo "$package is installed; Linux and macOS must not have it" >&2
+              exit 1
+            fi
+          done
 
       - name: Verify host tools
         run: |
@@ -30,6 +39,144 @@ jobs:
           sudo apt-get install -y zsh python3 jq
           command -v zsh
           command -v python3
+          command -v jq
+
+      - run: npm test
+
+  windows-e2e:
+    runs-on: windows-latest
+    # Informational until the Windows port is finished: a failure warns, it does not fail the PR.
+    continue-on-error: true
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        id: python
+        with:
+          python-version: '3.11'
+
+      - name: Install dashboard test dependency
+        run: python -m pip install Pillow
+
+      - run: npm ci
+
+      - name: Run the full suite
+        env:
+          CCDM_PYTHON: ${{ steps.python.outputs.python-path }}
+          CCDM_E2E_JOBS: 4
+          # Suites not ported yet can hang; do not let each use the 10 minute default.
+          CCDM_E2E_FILE_TIMEOUT_MS: 300000
+          # Outside the checkout: workspaces copy every untracked file in it.
+          CCDM_E2E_REPORT_DIR: ${{ runner.temp }}/e2e-report
+        run: npm test
+
+      - name: Upload the per-file report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-e2e-report-node-${{ matrix.node }}
+          path: ${{ runner.temp }}/e2e-report
+          if-no-files-found: warn
+
+  windows-required:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        id: python
+        with:
+          python-version: '3.11'
+
+      - name: Install dashboard test dependency
+        run: python -m pip install Pillow
+
+      - run: npm ci
+
+      - name: Run the suites in windows-required.txt
+        shell: bash
+        env:
+          CCDM_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: |
+          mapfile -t files < <(tr -d '\r' < tests/e2e/windows-required.txt | grep -Ev '^[[:space:]]*(#|$)')
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "tests/e2e/windows-required.txt lists no files" >&2
+            exit 1
+          fi
+          node tests/run-e2e.mjs "${files[@]}"
+
+  macos-e2e:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      CCDM_PYTHON: /usr/bin/python3
+      HOMEBREW_NO_AUTO_UPDATE: 1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Put the Mac's own Python first on PATH
+        run: echo /usr/bin >> "$GITHUB_PATH"
+
+      - name: Assert Python is 3.9
+        run: /usr/bin/python3 -c "import sys; assert sys.version_info[:2] == (3, 9), sys.version"
+
+      - name: Install dashboard test dependency and vermin
+        run: /usr/bin/python3 -m pip install --user Pillow vermin
+
+      - name: Python floor check
+        run: |
+          "$(/usr/bin/python3 -m site --user-base)/bin/vermin" --target=3.9- --eval-annotations --violations scripts/
+          /usr/bin/python3 tests/e2e/support/python_floor.py annotations scripts
+
+      - name: Import every ccdmlib module
+        run: /usr/bin/python3 tests/e2e/support/python_floor.py imports scripts
+
+      - name: Load the Python entry points
+        run: |
+          /usr/bin/python3 scripts/thread-supervisor.py --help > /dev/null
+          /usr/bin/python3 scripts/conversation-reminder-service.py --help > /dev/null
+          /usr/bin/python3 scripts/usage-stats-poster.py --help > /dev/null
+          /usr/bin/python3 -c "import runpy; runpy.run_path('scripts/resolve-codex-home.py', run_name='floor_check')"
+
+      - run: npm ci --omit=optional
+
+      - name: Assert native Windows packages are absent
+        run: |
+          for package in node_modules/koffi node_modules/node-pty node_modules/@xterm/* node_modules/@koromix/*; do
+            if [ -e "$package" ]; then
+              echo "$package is installed; Linux and macOS must not have it" >&2
+              exit 1
+            fi
+          done
+
+      - name: Install tmux for the real-tools suite
+        run: brew install tmux
+
+      - name: Verify host tools
+        run: |
+          command -v zsh
+          command -v tmux
           command -v jq
 
       - run: npm test

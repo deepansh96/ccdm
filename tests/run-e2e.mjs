@@ -14,7 +14,7 @@
 //   CCDM_E2E_REPORT_DIR       write one TAP file per test file and summary.json
 //   CCDM_E2E_KEEP_FAILED=1    keep the TAP output and workspaces of files that did not pass
 //   CCDM_E2E_NO_RERUN=1|0     skip (1) or do (0) the rerun-alone step (Windows default: skip)
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -78,15 +78,59 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const labelOf = file => path.relative(ROOT, file).split(path.sep).join("/");
 const sameFile = (a, b) => (WIN ? a.toLowerCase() === b.toLowerCase() : a === b);
 
+// The PIDs to stop for a file's process on Windows, which reuses PIDs and leaves
+// a dead parent's PID on its children, so `taskkill /T` could reach a stranger.
+// The root must have been created while the runner spawned it, and a process
+// counts as a child only if it is no older than its parent. Rows are
+// { pid, parent, created } with `created` in milliseconds.
+export function windowsTreeToStop(rootPid, processes, { earliest, latest }) {
+  const root = processes.find(process => process.pid === rootPid);
+  if (!root || root.created < earliest || root.created > latest) return [];
+  const tree = [root];
+  const seen = new Set([root.pid]);
+  for (const parent of tree) {
+    for (const candidate of processes) {
+      if (candidate.parent === parent.pid && !seen.has(candidate.pid) && candidate.created >= parent.created) {
+        seen.add(candidate.pid);
+        tree.push(candidate);
+      }
+    }
+  }
+  return tree.map(process => process.pid);
+}
+
+function windowsProcessSnapshot() {
+  const windows = process.env.SystemRoot ?? "C:\\Windows";
+  const powershell = path.join(windows, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const script = "Get-CimInstance Win32_Process | ForEach-Object { if ($_.CreationDate) { "
+    + "\"$($_.ProcessId) $($_.ParentProcessId) $(([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds())\" } }";
+  return new Promise(resolve => {
+    execFile(powershell, ["-NoProfile", "-NonInteractive", "-Command", script],
+      { encoding: "utf8", timeout: 30000, maxBuffer: 64 * 1024 * 1024, windowsHide: true },
+      (error, stdout) => {
+        if (error) return resolve(null);
+        resolve(stdout.split(/\r?\n/).filter(Boolean).map(line => {
+          const [pid, parent, created] = line.trim().split(" ").map(Number);
+          return { pid, parent, created };
+        }));
+      });
+  });
+}
+
 // Kill the process the runner spawned for one file, and its tree, and nothing else.
-async function killFileProcess(child) {
+async function killFileProcess(child, spawnWindow) {
   if (WIN) {
-    const taskkill = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe");
-    await new Promise(done => {
-      const kill = spawn(taskkill, ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
-      kill.on("error", done);
-      kill.on("exit", done);
-    });
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    const processes = await windowsProcessSnapshot();
+    const pids = processes ? windowsTreeToStop(child.pid, processes, spawnWindow) : [];
+    if (pids.length) {
+      const taskkill = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe");
+      await new Promise(done => {
+        const kill = spawn(taskkill, ["/F", ...pids.flatMap(pid => ["/PID", String(pid)])], { stdio: "ignore", windowsHide: true });
+        kill.on("error", done);
+        kill.on("exit", done);
+      });
+    }
     if (child.exitCode === null && child.signalCode === null) child.kill();
     return;
   }
@@ -155,6 +199,8 @@ function runFile(file, settings, live) {
       cwd: ROOT, env, stdio: ["ignore", "pipe", "pipe"],
       detached: deadline && !WIN, windowsHide: true,
     });
+    // One second either side covers the granularity of the two clocks.
+    const spawnWindow = { earliest: started - 1000, latest: Date.now() + 1000 };
     live.add(child);
     let output = "";
     let timedOut = false;
@@ -163,7 +209,7 @@ function runFile(file, settings, live) {
     let closeTimer = null;
     const timer = deadline ? setTimeout(() => {
       timedOut = true;
-      killing = killFileProcess(child);
+      killing = killFileProcess(child, spawnWindow);
     }, settings.fileTimeoutMs) : null;
     child.stdout.on("data", chunk => { output += chunk; });
     child.stderr.on("data", chunk => { output += chunk; });
