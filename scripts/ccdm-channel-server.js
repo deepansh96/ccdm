@@ -513,7 +513,11 @@ function scheduleRestart(project) {
     `./scripts/stop-session.sh ${shellQuote(project)}`,
     `./scripts/start-session.sh ${shellQuote(project)}`,
   ].join(" && ");
-  const child = spawn("/bin/sh", ["-c", `(${steps}) >> ${shellQuote(logPath)} 2>&1 &`], { detached: true, env: process.env, stdio: "ignore" });
+  // This chain has left the session. With the session's name, stop-session would
+  // hand off to another process and start-session would find the old session live.
+  const env = { ...process.env };
+  delete env.CCDM_SESSION_NAME;
+  const child = spawn("/bin/sh", ["-c", `(${steps}) >> ${shellQuote(logPath)} 2>&1 &`], { detached: true, env, stdio: "ignore" });
   child.unref();
   return logPath;
 }
