@@ -427,6 +427,28 @@ for (const language of ["node", "python"]) {
   });
 }
 
+// A rename on one volume keeps a file's DACL, so moving the committed file into a
+// private directory checks the DACL the commit gave it, not the repository's.
+for (const language of ["node", "python"]) {
+  test(`on Windows, a ${language} commit gives registry.json a DACL for this user alone in a directory that passes on more`, ON_WINDOWS, async () => {
+    const workspace = createRouterWorkspace(otherProject());
+    const file = registryFile(workspace);
+    if (language === "node") {
+      await registryModule(workspace).updateRegistry(file, registry => { registry.projects.other.committed = true; });
+    } else {
+      await runPython(workspace, "ru.set_project_fields(sys.argv[2], 'other', {'committed': True})", [file]);
+    }
+
+    const privateDir = path.join(workspace.tmpDir, "private-check");
+    createRequire(import.meta.url)(path.join(REPO_ROOT, "scripts/platform/privacy.js")).ensurePrivateDirSync(privateDir);
+    const moved = path.join(privateDir, "registry.json");
+    fs.renameSync(file, moved);
+    assertPrivate(moved);
+    assert.equal(JSON.parse(fs.readFileSync(moved, "utf8")).projects.other.committed, true);
+    assert.deepEqual(lockLitter(workspace), []);
+  });
+}
+
 test("on Windows, a live PID with the wrong start time is reclaimed by both, and one without started is honored", ON_WINDOWS, async () => {
   const workspace = createRouterWorkspace(otherProject());
   const file = registryFile(workspace);
