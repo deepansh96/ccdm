@@ -21,7 +21,20 @@ test.afterEach(cleanup);
 const THREAD_ID = "1700000000000123456";
 
 // `<NAME>` placeholders stand for the workspace's paths and port.
-const GOLDEN = {};
+const GOLDEN = {
+  "claude-project":
+    "cd '<PROJECT>' && CCDM_ROUTER_KEY_FILE='<ROUTER>/keys/demo.key' CCDM_REMINDER_PROJECT_ROOT='<REPO>' CCDM_REMINDER_STATE_DIR='<HOME>/.local/state/ccdm/conversation-reminders' CCDM_REMINDER_RECEIPTS_DIR='<HOME>/.local/state/ccdm/conversation-reminders/claude-receipts' CCDM_CLAUDE_PROJECT='demo' CCDM_CLAUDE_CHANNEL_ID='demo-channel' CCDM_CLAUDE_LAUNCH_ID='<LAUNCH_ID>' CCDM_CLAUDE_HOOK_SETTINGS='<ROUTER>/launches/demo/settings.json' claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions --mcp-config '<ROUTER>/launches/demo/mcp.json' --settings '<ROUTER>/launches/demo/settings.json'",
+  "codex-project":
+    "cd '<REPO>' && CODEX_HOME='<HOME>/.codex' CCDM_CODEX_PROJECT='codexdemo' CCDM_ROUTER_STATE_DIR='<ROUTER>' CCDM_ROUTER_KEY_FILE='<ROUTER>/keys/codexdemo.key' CCDM_CHANNEL_READY_FILE='<ROUTER>/launches/codexdemo/ready.json' CHANNEL_ID='codex-channel' PROJECT_DIR='<PROJECT>' WS_PORT='<PORT>' ALLOWED_USER_IDS='owner-id,guest-id' CODEX_SERVICE_TIER='default' CODEX_RESUME_THREAD_ID='' node scripts/codex-bridge.js",
+  "claude-thread":
+    "cd '<PROJECT>' && CCDM_ROUTER_KEY_FILE='<ROUTER>/keys/.thread-1700000000000123456.key' CCDM_REMINDER_PROJECT_ROOT='<REPO>' CCDM_REMINDER_STATE_DIR='<HOME>/.local/state/ccdm/conversation-reminders' CCDM_REMINDER_RECEIPTS_DIR='<HOME>/.local/state/ccdm/conversation-reminders/claude-receipts' CCDM_CLAUDE_PROJECT='demo' CCDM_CLAUDE_CHANNEL_ID='demo-channel' CCDM_CLAUDE_CONVERSATION_ID='1700000000000123456' CCDM_CLAUDE_LAUNCH_ID='<LAUNCH_ID>' claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions --mcp-config '<ROUTER>/launches/demo/threads/1700000000000123456/mcp.json' --settings '<ROUTER>/launches/demo/threads/1700000000000123456/settings.json'",
+  "codex-thread":
+    "cd '<REPO>' && CODEX_HOME='<HOME>/.codex' CCDM_CODEX_PROJECT='demo' CCDM_ROUTER_STATE_DIR='<ROUTER>' CCDM_ROUTER_KEY_FILE='<ROUTER>/keys/.thread-1700000000000123456.key' CCDM_CHANNEL_READY_FILE='<ROUTER>/launches/demo/threads/1700000000000123456/ready.json' CHANNEL_ID='1700000000000123456' PROJECT_DIR='<PROJECT>' WS_PORT='<PORT>' ALLOWED_USER_IDS='owner-id,guest-id' CCDM_THREAD_ID='1700000000000123456' CCDM_THREAD_PROVIDER='codex' CCDM_THREAD_BOOTSTRAP_FILE='<ROUTER>/launches/demo/threads/1700000000000123456/bootstrap.json' CCDM_THREAD_ACTIVITY_FILE='<ROUTER>/launches/demo/threads/1700000000000123456/activity.json' CODEX_SERVICE_TIER='default' node scripts/codex-bridge.js",
+  "claude-root":
+    "cd '<REPO>' && CCDM_ROUTER_KEY_FILE='<ROUTER>/keys/.root.key' claude --dangerously-load-development-channels server:ccdm --mcp-config '<ROUTER>/launches/.root/mcp.json' --settings '<ROUTER>/launches/.root/settings.json' --dangerously-skip-permissions",
+  "codex-root":
+    "cd '<REPO>' && CODEX_HOME='<HOME>/.codex' CCDM_ROUTER_ROLE='root' CCDM_ROUTER_STATE_DIR='<ROUTER>' CCDM_ROUTER_KEY_FILE='<ROUTER>/keys/.root.key' CCDM_CHANNEL_READY_FILE='<ROUTER>/launches/.root/ready.json' CHANNEL_ID='root-channel' PROJECT_DIR='<REPO>' WS_PORT='<PORT>' ALLOWED_USER_IDS='owner-id,helper-id' ROOT_BOT_APP_ID='' BOT_APP_ID='' node scripts/codex-bridge.js",
+};
 
 // Exactly one appended assignment may be present; it is removed before comparing.
 function withoutSessionName(command, name) {
@@ -94,22 +107,39 @@ test("the six launchers issue today's exact tmux new-session strings", platformG
     assert.deepEqual([calls[0][0], calls[0][1], calls[0][2], name, separator, shell, flag], ["new-session", "-d", "-s", launcher.session, "--", "zsh", "-ic"]);
     seen[launcher.key] = withoutSessionName(normalized(workspace, command), launcher.session);
   }
-  console.log(JSON.stringify(seen, null, 1));
-  assert.deepEqual(seen, Object.fromEntries(Object.entries(GOLDEN).map(([key, value]) => [key, value.shell])));
+  assert.deepEqual(seen, GOLDEN);
 });
+
+// A golden string back into what a launcher would hand the seam.
+function parsedLaunch(shell) {
+  const [, cwd, rest] = /^cd '([^']*)' && (.*)$/s.exec(shell);
+  const env = {};
+  let remaining = rest;
+  for (;;) {
+    const assignment = /^([A-Z_]+)='([^']*)' /.exec(remaining);
+    if (!assignment) break;
+    env[assignment[1]] = assignment[2];
+    remaining = remaining.slice(assignment[0].length);
+  }
+  const argv = [...remaining.matchAll(/'([^']*)'|(\S+)/g)].map(match => match[1] ?? match[2]);
+  return { argv, cwd, env };
+}
+
+const sessionOf = key => LAUNCHERS.find(launcher => launcher.key === key).session;
 
 for (const language of ["node", "python"]) {
   test(`${language} tmux seam builds each golden launch string byte for byte, with one appended CCDM_SESSION_NAME`, async () => {
     const workspace = createWorkspace();
-    for (const [key, golden] of Object.entries(GOLDEN)) {
+    for (const [key, shell] of Object.entries(GOLDEN)) {
+      const session = sessionOf(key);
+      const { argv, cwd, env } = parsedLaunch(shell);
       const positional = language === "node"
-        ? [golden.session, { argv: golden.argv, cwd: golden.cwd, env: golden.env, kind: "project" }]
-        : [golden.session, golden.argv, golden.cwd, golden.env];
+        ? [session, { argv, cwd, env, kind: "project" }]
+        : [session, argv, cwd, env];
       const result = await callSeam(workspace, language, "tmuxLaunchCommand", { positional, env: { CCDM_SESSION_HOST: "tmux" }, python: PYTHON });
       assert.equal(result.ok, true, JSON.stringify(result));
-      assert.equal(withoutSessionName(result.value, golden.session), golden.shell, key);
-      const assignments = result.value.match(/CCDM_SESSION_NAME='[^']*'/g);
-      assert.deepEqual(assignments, [`CCDM_SESSION_NAME='${golden.session}'`], key);
+      assert.equal(withoutSessionName(result.value, session), shell, key);
+      assert.deepEqual(result.value.match(/CCDM_SESSION_NAME='[^']*'/g), [`CCDM_SESSION_NAME='${session}'`], key);
     }
   });
 }
