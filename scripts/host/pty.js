@@ -34,6 +34,17 @@ function loadPackages() {
   }
 }
 
+function loadSerializer(term) {
+  try {
+    const { SerializeAddon } = require("@xterm/addon-serialize");
+    const addon = new SerializeAddon();
+    term.loadAddon(addon);
+    return addon;
+  } catch (error) {
+    throw new Error(`attach needs the optional package @xterm/addon-serialize, which did not load (${error.code ?? error.message}); run npm ci`);
+  }
+}
+
 function isFile(file) {
   return fs.statSync(file, { throwIfNoEntry: false })?.isFile() ?? false;
 }
@@ -116,6 +127,10 @@ function startConsole({ argv, cwd = process.cwd(), env, job, log, onEnd }) {
   const waits = new Set();
   // Set once the program has ended and the terminal has been let go.
   let frozen = null;
+  let finishing = false;
+  let serializer = null;
+  const views = new Set();
+  const afterFreeze = [];
 
   function slice(history) {
     const buffer = frozen ?? term.buffer.active;
@@ -168,6 +183,49 @@ function startConsole({ argv, cwd = process.cwd(), env, job, log, onEnd }) {
     return { promise, cancel: () => settle(waiter, false) };
   }
 
+  // An ended session has only its plain-text screen left to show.
+  function frozenView() {
+    return { snapshot: screen().replace(/\n+$/, "").replace(/\n/g, "\r\n"), cols: frozen.width, rows: frozen.height };
+  }
+
+  function resize(cols, rows) {
+    if (finishing) return;
+    try {
+      pty.resize(cols, rows);
+      term.resize(cols, rows);
+    } catch { /* The program ended meanwhile. */ }
+  }
+
+  // A live view: onStart gets the screen as of now and onOutput everything after
+  // it. Both follow the parser's order, so nothing is lost or shown twice.
+  function view({ size, onStart, onOutput, onError }) {
+    if (frozen) {
+      onStart(frozenView());
+      return () => {};
+    }
+    if (finishing) {
+      afterFreeze.push(() => onStart(frozenView()));
+      return () => {};
+    }
+    serializer ??= loadSerializer(term);
+    let open = true;
+    term.write("", () => {
+      if (!open) return;
+      try {
+        if (size) resize(...size);
+        const snapshot = serializer.serialize({ scrollback: 0 });
+        views.add(onOutput);
+        onStart({ snapshot, cols: term.cols, rows: term.rows });
+      } catch (error) {
+        onError(error);
+      }
+    });
+    return () => {
+      open = false;
+      views.delete(onOutput);
+    };
+  }
+
   let pending = 0;
   let paused = false;
   pty.onData(data => {
@@ -183,6 +241,7 @@ function startConsole({ argv, cwd = process.cwd(), env, job, log, onEnd }) {
         paused = false;
         pty.resume();
       }
+      for (const onOutput of views) onOutput(data);
       checkWaits();
     });
   });
@@ -190,7 +249,6 @@ function startConsole({ argv, cwd = process.cwd(), env, job, log, onEnd }) {
   // sends DA1 at startup and holds the program's first screen until it gets a reply.
   term.onData(reply => pty.write(reply));
 
-  let finishing = false;
   let watch = null;
   let fallback = null;
   function finish(code) {
@@ -204,11 +262,12 @@ function startConsole({ argv, cwd = process.cwd(), env, job, log, onEnd }) {
       const rows = readRows(buffer, 0, buffer.length);
       const top = buffer.baseY;
       for (const waiter of [...waits]) settle(waiter, endedMatch(waiter.regex, waiter.thenSend));
-      frozen = { rows, top };
+      frozen = { rows, top, width: term.cols, height: term.rows };
       stream?.end();
       release();
       term.dispose();
       onEnd(agent.exitCode ?? code);
+      for (const start of afterFreeze.splice(0)) start();
     });
   }
 
@@ -236,6 +295,9 @@ function startConsole({ argv, cwd = process.cwd(), env, job, log, onEnd }) {
     send,
     wait,
     capture: ({ history = false, join = false }) => renderRows(slice(history), join),
+    view,
+    resize,
+    resetSize: () => resize(COLS, ROWS),
     // The grace phase. Closing the input pipe makes OpenConsole shut down and
     // send its clients CTRL_CLOSE, which Node programs see as SIGHUP. pty.kill()
     // would call TerminateProcess on the program straight away.

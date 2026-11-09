@@ -19,9 +19,6 @@ const NOT_RUNNING_MESSAGE = "ccdm-host is not running; start it with `node scrip
 const MAX_HELLO_FRAME = 64 * 1024;
 const MAX_FRAME = 8 * 1024 * 1024;
 
-// Specified in v1 and answered once the named slice lands.
-const LATER_OPS = new Set(["attach", "run-detached", "subscribe"]);
-
 const KINDS = new Set(["project", "thread", "root", "adhoc"]);
 
 const okResponse = (id, result = {}) => ({ id: id ?? null, ok: true, ...result });
@@ -49,7 +46,6 @@ module.exports = {
   ERRORS,
   HostError,
   KINDS,
-  LATER_OPS,
   MAX_FRAME,
   MAX_HELLO_FRAME,
   MISMATCH_MESSAGE,

@@ -14,11 +14,14 @@ const { createIpcListener, publishPipe, serverProof, unpublishPipe } = require("
 const { safeFileName, stateRoot } = require("../platform/paths.js");
 const { ensurePrivateDirSync } = require("../platform/privacy.js");
 const { onShutdown, processAlive, processIdentity, processStartTime } = require("../platform/process.js");
+const { attachSession, endViewers } = require("./attach.js");
+const { runDetached } = require("./detached.js");
 const { sessionEnvironment } = require("./env.js");
+const { createEvents } = require("./events.js");
 const { createSessionJob, jobPolicyProblem } = require("./jobs.js");
 const { startConsole } = require("./pty.js");
 const {
-  ERRORS, HostError, KINDS, LATER_OPS, MAX_FRAME, MAX_HELLO_FRAME, MISMATCH_MESSAGE, PROTOCOL_VERSION,
+  ERRORS, HostError, KINDS, MAX_FRAME, MAX_HELLO_FRAME, MISMATCH_MESSAGE, PROTOCOL_VERSION,
   encode, errorResponse, okResponse, parseFrame,
 } = require("./protocol.js");
 
@@ -91,6 +94,7 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
   let token = null;
   let proofSecret = null;
   let stopping = null;
+  const events = createEvents();
 
   const journalPath = path.join(hostDir, "sessions.json");
 
@@ -132,6 +136,8 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
       } finally {
         job.close();
         session.job = null;
+        endViewers(session);
+        events.sessionEnded(session.name, session.exit);
         writeJournal();
         trimRetained();
         session.finished();
@@ -186,7 +192,7 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
 
     const session = {
       name, kind, pty: Boolean(pty), exit: null, released: false, pid: null, startedAt: null,
-      created: Math.floor(Date.now() / 1000), log: null, tail: "", job: null, child: null, console: null, finished: null,
+      created: Math.floor(Date.now() / 1000), log: null, tail: "", job: null, child: null, console: null, finished: null, viewers: [],
     };
     session.done = new Promise(resolve => { session.finished = resolve; });
     // Taken before the first await, so two racing requests cannot both start.
@@ -310,7 +316,7 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
       const text = session.pty ? session.console.capture({ history, join: join === true }) : captureText(session, history);
       return okResponse(null, { text });
     },
-    async wait({ name, regex, timeoutMs = DEFAULT_WAIT_MS, thenSend = [] }, abandons) {
+    async wait({ name, regex, timeoutMs = DEFAULT_WAIT_MS, thenSend = [] }, { abandons }) {
       const session = knownSession(name);
       if (session.released) throw unknownSession(name);
       if (!session.pty) throw new HostError(ERRORS.UNSUPPORTED_OP, "wait needs a PTY session");
@@ -338,6 +344,21 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
       if (session.released) throw unknownSession(name);
       return okResponse(null, { killed: await killSession(session, graceMs) });
     },
+    attach(frame, connection) {
+      const session = knownSession(frame.name);
+      if (session.released) throw unknownSession(frame.name);
+      if (!session.pty) throw new HostError(ERRORS.UNSUPPORTED_OP, "attach needs a PTY session");
+      if (connection.stream) throw new HostError(ERRORS.UNSUPPORTED_OP, "this connection is already attached");
+      return attachSession(session, frame, connection);
+    },
+    "run-detached"(frame) {
+      if (stopping) throw stoppingError();
+      return runDetached(frame, env);
+    },
+    subscribe({ id }, connection) {
+      events.subscribe(connection, id);
+      return null;
+    },
     ping() {
       return okResponse(null);
     },
@@ -348,14 +369,13 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
     },
   };
 
-  async function dispatch(frame, abandons) {
+  // Resolves to the response, or null when the op has answered for itself.
+  async function dispatch(frame, connection) {
     const handler = Object.hasOwn(OPS, frame.op) ? OPS[frame.op] : null;
-    if (!handler) {
-      const message = LATER_OPS.has(frame.op) ? `${frame.op} is not supported yet` : `unknown op: ${frame.op}`;
-      return errorResponse(frame.id, ERRORS.UNSUPPORTED_OP, message);
-    }
+    if (!handler) return errorResponse(frame.id, ERRORS.UNSUPPORTED_OP, `unknown op: ${frame.op}`);
     try {
-      return { ...await handler(frame, abandons), id: frame.id ?? null };
+      const result = await handler(frame, connection);
+      return result && { ...result, id: frame.id ?? null };
     } catch (error) {
       const code = error instanceof HostError ? error.code : ERRORS.UNSUPPORTED_OP;
       return errorResponse(frame.id, code, error.message);
@@ -371,6 +391,8 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
     const abandons = new Set();
     socket.on("close", () => { for (const abandon of abandons) abandon(); });
     const send = frame => { if (!socket.destroyed) socket.write(encode(frame)); };
+    // `stream` takes the frames of an attached client, which carry no op.
+    const connection = { socket, send, abandons, stream: null };
     const refuse = (id, code, message) => {
       send(errorResponse(id, code, message));
       refused = true;
@@ -401,8 +423,10 @@ function createHost({ hostDir, env = process.env, log = () => {} }) {
           beforeHello(frame);
         } else if (!frame) {
           send(errorResponse(null, ERRORS.UNSUPPORTED_OP, "malformed frame"));
+        } else if (connection.stream && frame.op === undefined) {
+          connection.stream(frame);
         } else {
-          dispatch(frame, abandons).then(send);
+          dispatch(frame, connection).then(response => { if (response) send(response); });
         }
       }
       if (buffer.length > (authenticated ? MAX_FRAME : MAX_HELLO_FRAME)) socket.destroy();

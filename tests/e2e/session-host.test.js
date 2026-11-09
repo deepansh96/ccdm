@@ -474,19 +474,18 @@ test("an ended session reports not live, keeps its output for capture, and frees
   await waitForCapture(workspace, "brief", /fixture-up/);
 });
 
-test("a command that cannot start gets spawn_failed, and later ops get unsupported_op", onlyWindows, async () => {
+test("a command that cannot start gets spawn_failed, and an unknown op gets unsupported_op", onlyWindows, async () => {
   const workspace = hostWorkspace();
   await startHost(workspace);
   const connection = await authenticated(workspace);
   const missing = await ask(connection, { id: 1, op: "new", name: "x", argv: ["no-such-program-p3-1a.exe"], cwd: workspace.fixtures, env: {}, pty: false, kind: "adhoc" });
   assert.equal(missing.error, "spawn_failed");
   assert.equal((await ask(connection, { id: 2, op: "has", name: "x" })).live, false);
-  for (const op of ["attach", "run-detached", "subscribe", "nonsense"]) {
-    assert.equal((await ask(connection, { id: op, op })).error, "unsupported_op", op);
-  }
+  assert.equal((await ask(connection, { id: "n", op: "nonsense" })).error, "unsupported_op");
   await newSession(workspace, "plain", echoSession(workspace));
   const noPty = await ask(connection, { id: 3, op: "wait", name: "plain", regex: "x", timeoutMs: 10 });
   assert.equal(noPty.error, "unsupported_op");
+  assert.equal((await ask(connection, { id: 4, op: "attach", name: "plain" })).error, "unsupported_op");
 });
 
 function userProfilePaths() {
@@ -695,6 +694,7 @@ test("with no host every subcommand fails fast with the start hint and starts no
     ["list-sessions"],
     ["display-message", "-t", "x", "-p", "#{pane_pid}"],
     ["pids", "-t", "x"],
+    ["run-detached", "--log", "x.log", "--", process.execPath],
     ["shutdown"],
   ];
   for (const args of subcommands) {
@@ -1068,4 +1068,339 @@ test("a PTY session is launched with its own environment and kept in its Job, an
   assert.ok((await cliOk(workspace, ["pids", "-t", "ptyenv"])).stdout.trim().split("\n").map(Number).includes(seen.pid));
   await cliOk(workspace, ["kill-session", "-t", "=ptyenv", "--grace", "0"]);
   assert.match(fs.readFileSync(log, "utf8"), /env-written/);
+});
+
+// Attach. The client runs under its own pseudo-console, standing in for a terminal tab.
+function attachClient(workspace, args) {
+  const job = lazy("host/jobs.js").createSessionJob();
+  let ended;
+  const exited = new Promise(resolve => { ended = resolve; });
+  const terminal = lazy("host/pty.js").startConsole({
+    argv: [process.execPath, workspace.script, "attach", ...args],
+    cwd: workspace.fixtures,
+    env: workspace.childEnv(),
+    job,
+    onEnd: code => {
+      job.close();
+      ended(code);
+    },
+  });
+  registerTeardownCallback(async () => {
+    try {
+      job.terminate(1);
+    } catch { /* It already ended. */ }
+    await Promise.race([exited, sleep(5000)]);
+  });
+  return { exited, screen: () => terminal.capture({}), type: text => terminal.send([text], true) };
+}
+
+// Prints a marker, then reports each piece of raw input and every window size it has.
+function attachFixture(workspace, sizeReport = path.join(workspace.fixtures, "p3.1c-size.txt")) {
+  const file = fixture(workspace, "p3.1c-attach.js", `
+    const fs = require("node:fs");
+    process.stdin.setRawMode(true);
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", chunk => {
+      if (chunk === "q") process.exit(3);
+      console.log("got:" + chunk);
+    });
+    let last = "";
+    setInterval(() => {
+      const size = process.stdout.getWindowSize().join("x");
+      if (size !== last) fs.appendFileSync(${JSON.stringify(sizeReport)}, size + "\\n");
+      last = size;
+    }, 25);
+    console.log("before-attach");
+  `);
+  const sizes = () => fs.existsSync(sizeReport) ? fs.readFileSync(sizeReport, "utf8").trim().split("\n") : [];
+  return { file, sizes, currentSize: () => sizes().at(-1) };
+}
+
+const plainText = text => text.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+
+// Reads stream frames until their output contains `text`.
+async function readOutputUntil(connection, text) {
+  let seen = "";
+  while (!plainText(seen).includes(text)) {
+    const frame = await connection.next();
+    assert.ok(frame, `the connection closed before ${text}; saw ${JSON.stringify(seen)}`);
+    if (frame.out) seen += frame.out;
+  }
+}
+
+async function attachFrames(workspace, name, options = {}) {
+  const connection = await authenticated(workspace);
+  const reply = await ask(connection, { id: "attach", op: "attach", name, ...options });
+  assert.equal(reply.ok, true, JSON.stringify(reply));
+  assert.equal(reply.id, "attach");
+  return { connection, reply };
+}
+
+test("attach shows what the session already printed, typed input reaches it, and Ctrl-] exits 0 with the session still live", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  await ptySession(workspace, "live", attachFixture(workspace).file);
+  await waitForCapture(workspace, "live", /before-attach/);
+
+  const client = attachClient(workspace, ["-t", "=live"]);
+  await waitUntil(() => client.screen().includes("before-attach"), () => `the replayed screen; saw ${client.screen()}`, 10000);
+
+  client.type("hello");
+  await waitForCapture(workspace, "live", /got:hello/);
+  await waitUntil(() => client.screen().includes("got:hello"), () => `live output in the client; saw ${client.screen()}`);
+
+  client.type("\x1d");
+  assert.equal(await client.exited, 0);
+  assert.equal((await cli(workspace, ["has-session", "-t", "=live"])).code, 0);
+  assert.doesNotMatch(await capture(workspace, "live"), /got:\x1d/);
+  await cliOk(workspace, ["send-keys", "-t", "=live", "-l", "after"]);
+  await waitForCapture(workspace, "live", /got:after/);
+});
+
+for (const flag of ["-r", "--read-only"]) {
+  test(`attach ${flag} shows the screen, drops input and still leaves with Ctrl-]`, onlyWindows, async () => {
+    const workspace = hostWorkspace();
+    await startHost(workspace);
+    const { file, currentSize } = attachFixture(workspace);
+    await ptySession(workspace, "watched", file);
+    await waitForCapture(workspace, "watched", /before-attach/);
+
+    const client = attachClient(workspace, ["-t", "=watched", flag]);
+    await waitUntil(() => client.screen().includes("before-attach"), () => `the replayed screen; saw ${client.screen()}`, 10000);
+    client.type("dropped");
+    await sleep(500);
+    assert.doesNotMatch(await capture(workspace, "watched"), /got:/);
+    assert.equal(currentSize(), "200x50");
+
+    client.type("\x1d");
+    assert.equal(await client.exited, 0);
+    assert.equal((await cli(workspace, ["has-session", "-t", "=watched"])).code, 0);
+  });
+}
+
+test("a read-only attach never resizes, the last writer sets the size, and the fixed size comes back when writers leave", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  const { file, currentSize } = attachFixture(workspace);
+  await ptySession(workspace, "sized", file);
+  await waitForCapture(workspace, "sized", /before-attach/);
+  await waitUntil(() => currentSize() === "200x50", () => "the fixture's first size report");
+  const sizeIs = expected => waitUntil(() => currentSize() === expected, () => `size ${expected}; saw ${currentSize()}`);
+
+  const watcher = await attachFrames(workspace, "sized", { readOnly: true, size: [80, 24] });
+  assert.equal(watcher.reply.cols, 200);
+  assert.equal(watcher.reply.rows, 50);
+  assert.match(watcher.reply.snapshot, /before-attach/);
+  assert.equal(watcher.reply.exit, null);
+  watcher.connection.send({ resize: [90, 20] });
+  watcher.connection.send({ in: "dropped" });
+  await sleep(400);
+  assert.equal(currentSize(), "200x50");
+  assert.doesNotMatch(await capture(workspace, "sized"), /got:/);
+
+  const first = await attachFrames(workspace, "sized", { readOnly: false, size: [100, 30] });
+  assert.equal(first.reply.cols, 100);
+  assert.equal(first.reply.rows, 30);
+  await sizeIs("100x30");
+
+  const second = await attachFrames(workspace, "sized", { readOnly: false });
+  second.connection.send({ resize: [120, 40] });
+  await sizeIs("120x40");
+  second.connection.send({ resize: [0, 40] });
+
+  // Both clients and the read-only one see the same live output.
+  first.connection.send({ in: "shared" });
+  await Promise.all([first, second, watcher].map(({ connection }) => readOutputUntil(connection, "got:shared")));
+
+  second.connection.send({ detach: true });
+  await sizeIs("100x30");
+  // A client that goes away without saying so counts as leaving.
+  first.connection.destroy();
+  await sizeIs("200x50");
+  assert.equal((await cli(workspace, ["has-session", "-t", "=sized"])).code, 0);
+});
+
+test("output printed while attaching is neither lost nor shown twice", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  const counter = fixture(workspace, "p3.1c-counter.js", `
+    let i = 0;
+    const timer = setInterval(() => {
+      for (let n = 0; n < 5; n += 1) console.log("count-" + (i++) + "-end");
+      if (i >= 600) { clearInterval(timer); console.log("counter-done"); }
+    }, 5);
+    ${STAY_ALIVE}
+  `);
+  await ptySession(workspace, "counter", counter);
+  await waitForCapture(workspace, "counter", /count-20-end/);
+  const { connection, reply } = await attachFrames(workspace, "counter");
+  let stream = "";
+  while (!plainText(stream).includes("counter-done")) {
+    const frame = await connection.next();
+    assert.ok(frame, "the stream closed early");
+    if (frame.out) stream += frame.out;
+  }
+  const numbers = text => [...plainText(text).matchAll(/count-(\d+)-end/g)].map(match => Number(match[1]));
+  const before = numbers(reply.snapshot);
+  const after = numbers(stream);
+  assert.ok(before.length > 0, "the snapshot had no counter lines");
+  assert.ok(after.length > 0, "the stream had no counter lines");
+  // Joined, because a line can be split between the snapshot and the first chunk.
+  const combined = numbers(reply.snapshot + stream);
+  for (let index = 1; index < combined.length; index += 1) {
+    assert.equal(combined[index], combined[index - 1] + 1, `gap or repeat at ${index}: ${combined.slice(Math.max(0, index - 3), index + 2)}`);
+  }
+});
+
+test("attaching to an ended session shows its last screen and exit code, and a released one is unknown", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  const brief = fixture(workspace, "p3.1c-brief.js", `console.log("final-screen-line"); process.exit(7);`);
+  await ptySession(workspace, "over", brief);
+  await waitForHasSessionFalse(workspace, "over");
+
+  const { connection, reply } = await attachFrames(workspace, "over", { size: [80, 24] });
+  assert.match(reply.snapshot, /final-screen-line/);
+  assert.equal(reply.exit, 7);
+  assert.equal(reply.cols, 200);
+  assert.deepEqual(await connection.next(), { exit: 7 });
+
+  const client = attachClient(workspace, ["-t", "=over"]);
+  assert.equal(await client.exited, 0);
+  assert.match(client.screen(), /final-screen-line/);
+  assert.match(client.screen(), /\[session over ended with code 7\]/);
+
+  await cliOk(workspace, ["kill-session", "-t", "=over"]);
+  assert.equal((await ask(connection, { id: 2, op: "attach", name: "over" })).error, "unknown_session");
+  assert.equal((await ask(connection, { id: 3, op: "attach", name: "ghost" })).error, "unknown_session");
+});
+
+test("an attached client gets {exit} when the session ends, and the attach command then exits 0", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  await ptySession(workspace, "ending", attachFixture(workspace).file);
+  await waitForCapture(workspace, "ending", /before-attach/);
+  const { connection } = await attachFrames(workspace, "ending");
+  const client = attachClient(workspace, ["-t", "=ending"]);
+  await waitUntil(() => client.screen().includes("before-attach"), () => `the replayed screen; saw ${client.screen()}`, 10000);
+
+  client.type("q");
+  let frame;
+  do {
+    frame = await connection.next();
+    assert.ok(frame, "the stream closed without an exit frame");
+  } while (frame.exit === undefined);
+  assert.equal(frame.exit, 3);
+  assert.equal(await client.exited, 0);
+  assert.match(client.screen(), /\[session ending ended with code 3\]/);
+});
+
+test("attach needs a terminal, and without the serialize package it fails with a message that names it", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  const hide = fixture(workspace, "p3.1c-hide-serialize.cjs", `
+    const Module = require("node:module");
+    const resolve = Module._resolveFilename;
+    Module._resolveFilename = function (request, ...rest) {
+      if (request === "@xterm/addon-serialize") throw Object.assign(new Error("Cannot find module"), { code: "MODULE_NOT_FOUND" });
+      return resolve.call(this, request, ...rest);
+    };
+  `);
+  await startHost(workspace, { env: { NODE_OPTIONS: `--require ${hide.replace(/\\/g, "/")}` } });
+  await ptySession(workspace, "plain", attachFixture(workspace).file);
+  await waitForCapture(workspace, "plain", /before-attach/);
+  const notTerminal = await cli(workspace, ["attach", "-t", "=plain"]);
+  assert.equal(notTerminal.code, 1);
+  assert.match(notTerminal.stderr, /needs a terminal/);
+  const connection = await authenticated(workspace);
+  const reply = await ask(connection, { id: 1, op: "attach", name: "plain" });
+  assert.equal(reply.ok, false);
+  assert.match(reply.message, /@xterm\/addon-serialize/);
+  assert.equal((await ask(connection, { id: 2, op: "has", name: "plain" })).live, true);
+});
+
+test("a run-detached helper outlives the session that asked for it, logs to the requested file, and sees the request's env without CCDM_SESSION_NAME", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  const log = path.join(workspace.fixtures, "logs-p3.1c", "helper.log");
+  fs.mkdirSync(path.dirname(log));
+  fs.writeFileSync(log, "existing-line\n");
+  const report = path.join(workspace.fixtures, "p3.1c-helper.json");
+  const requested = path.join(workspace.fixtures, "p3.1c-requested.json");
+  const helper = fixture(workspace, "p3.1c-helper.js", `
+    require("node:fs").writeFileSync(${JSON.stringify(report)}, JSON.stringify({ env: process.env }));
+    console.log("helper-stdout");
+    console.error("helper-stderr");
+    ${STAY_ALIVE}
+  `);
+  const session = fixture(workspace, "p3.1c-asks.js", `
+    const { spawnSync } = require("node:child_process");
+    const result = spawnSync(process.execPath, [${JSON.stringify(workspace.script)}, "run-detached", "--log", ${JSON.stringify(log)},
+      "-e", "P31C_HELPER=from request", "-e", "CCDM_SESSION_NAME=passed-along", "--", process.execPath, ${JSON.stringify(helper)}], { encoding: "utf8", windowsHide: true });
+    require("node:fs").writeFileSync(${JSON.stringify(requested)}, JSON.stringify({ status: result.status, stdout: result.stdout, stderr: result.stderr }));
+    console.log("asked");
+    ${STAY_ALIVE}
+  `);
+  await ptySession(workspace, "asker", session, { extra: ["-e", `CCDM_STATE_ROOT=${workspace.stateRoot}`] });
+  await waitForCapture(workspace, "asker", /asked/);
+  const { status, stdout, stderr } = JSON.parse(fs.readFileSync(requested, "utf8"));
+  assert.equal(status, 0, stderr);
+  const started = trackPid(Number(stdout.trim()));
+  assert.ok(started.pid > 0 && isAlive(started), "the helper did not start");
+  await waitUntil(() => fs.existsSync(report), () => "the helper's report");
+  const jobPids = (await cliOk(workspace, ["pids", "-t", "=asker"])).stdout.trim().split("\n").map(Number);
+  assert.equal(jobPids.includes(started.pid), false, "the helper is in the session's Job");
+
+  await cliOk(workspace, ["kill-session", "-t", "=asker", "--grace", "300"]);
+  await sleep(500);
+  assert.equal(isAlive(started), true, "the helper died with the session");
+
+  await waitUntil(() => /helper-stderr/.test(fs.readFileSync(log, "utf8")), () => "the helper's stderr in its log");
+  const logged = fs.readFileSync(log, "utf8");
+  assert.match(logged, /^existing-line\r?\n/);
+  assert.match(logged, /helper-stdout/);
+  const { env } = JSON.parse(fs.readFileSync(report, "utf8"));
+  assert.equal(env.P31C_HELPER, "from request");
+  assert.equal(envValue(env, "CCDM_SESSION_NAME"), undefined);
+  assert.equal(envValue(env, "CCDM_STATE_ROOT"), undefined);
+  assert.ok(envValue(env, "USERPROFILE"), "the helper did not get the rebuilt profile");
+  process.kill(started.pid);
+  await waitUntil(() => !isAlive(started), () => "the helper to stop");
+});
+
+test("run-detached refuses a bad request with spawn_failed and needs --log on the command line", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  const connection = await authenticated(workspace);
+  const log = path.join(workspace.fixtures, "p3.1c-refused.log");
+  for (const [id, frame] of [
+    [1, { argv: ["no-such-program-p3-1c.exe"], cwd: workspace.fixtures, env: {}, log }],
+    [2, { argv: [], cwd: workspace.fixtures, env: {}, log }],
+    [3, { argv: [process.execPath], cwd: workspace.fixtures, env: {}, log: "relative.log" }],
+  ]) {
+    assert.equal((await ask(connection, { id, op: "run-detached", ...frame })).error, "spawn_failed", String(id));
+  }
+  const noLog = await cli(workspace, ["run-detached", "--", process.execPath]);
+  assert.equal(noLog.code, 2);
+  assert.match(noLog.stderr, /--log/);
+});
+
+test("a subscribe client gets one exit event with the code for each session that ends", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  const connection = await authenticated(workspace);
+  const subscribed = await ask(connection, { id: "sub", op: "subscribe" });
+  assert.equal(subscribed.ok, true);
+  assert.equal(subscribed.id, "sub");
+
+  const brief = fixture(workspace, "p3.1c-exits.js", `console.log("leaving"); process.exit(4);`);
+  await ptySession(workspace, "pty-end", brief);
+  assert.deepEqual(await connection.next(), { event: "exit", name: "pty-end", code: 4 });
+  // Releasing an ended session is not a second end: the next event is for another session.
+  await cliOk(workspace, ["kill-session", "-t", "=pty-end"]);
+  await newSession(workspace, "plain-end", brief);
+  assert.deepEqual(await connection.next(), { event: "exit", name: "plain-end", code: 4 });
+
+  connection.destroy();
+  await newSession(workspace, "unheard", brief);
+  await waitForHasSessionFalse(workspace, "unheard");
 });
