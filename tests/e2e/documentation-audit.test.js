@@ -352,10 +352,17 @@ const POSIX_ONLY = /^(?:tmux |zsh -ic|launchctl |nohup |python3 |\.\/)|[\w-]\.sh
 const LIST_ITEM = /^(\s*)(?:[-*+]|\d+[.)])\s+(.*)$/;
 const MACOS = /^(?:\*\*)?macOS:/;
 
+// The POSIX-only commands a line names: in a fenced block the line itself, elsewhere its backticked spans.
+const posixOnlyCommands = (line, fenced) => (fenced ? [line.trim()] : [...line.matchAll(/`([^`\n]+)`/g)].map(([, command]) => command))
+  .filter(command => POSIX_ONLY.test(command));
+// `threads.sh` wherever a line names it, backticked or not.
+const threadsShNames = line => (/(?<![\w-])threads\.sh(?![\w-])/.test(line) ? ["threads.sh"] : []);
+
 // Every POSIX-only command that does not sit under "macOS:". A paragraph or list
 // item is under it when its first line starts with `macOS:`; so are its
-// continuation lines and any fenced block it introduces.
-function posixOnlyOutsideMacos({ file, lines, audited }) {
+// continuation lines and any fenced block it introduces. `commandsIn(line, fenced)`
+// picks what counts as a command on a line.
+function posixOnlyOutsideMacos({ file, lines, audited }, commandsIn = posixOnlyCommands) {
   const problems = [];
   const report = (index, command) => problems.push(`${file}:${index + 1} \`${command}\` is not under "macOS:"`);
   let block = { indent: 0, macos: false };
@@ -367,8 +374,7 @@ function posixOnlyOutsideMacos({ file, lines, audited }) {
       continue;
     }
     if (fenced) {
-      const command = line.trim();
-      if (audited(index) && !block.macos && POSIX_ONLY.test(command)) report(index, command);
+      if (audited(index) && !block.macos) for (const command of commandsIn(line, true)) report(index, command);
       continue;
     }
     if (!line.trim()) {
@@ -381,9 +387,7 @@ function posixOnlyOutsideMacos({ file, lines, audited }) {
     else if (headingLevel(line) || (blank && indent <= block.indent)) block = { indent, macos: MACOS.test(line.trim()) };
     blank = false;
     if (!audited(index) || block.macos) continue;
-    for (const [, command] of line.matchAll(/`([^`\n]+)`/g)) {
-      if (POSIX_ONLY.test(command)) report(index, command);
-    }
+    for (const command of commandsIn(line, false)) report(index, command);
   }
   return problems;
 }
@@ -431,8 +435,62 @@ test("the macOS rule finds POSIX-only commands outside macOS: and accepts them u
 });
 
 test("root's runbook names POSIX-only commands only under macOS:", () => {
-  const problems = runbookSources().flatMap(posixOnlyOutsideMacos);
+  const problems = runbookSources().flatMap(source => posixOnlyOutsideMacos(source));
   assert.deepEqual(problems, [], `\n${problems.join("\n")}\n`);
+});
+
+// The thread operator doc is not root's runbook, but an operator on Windows follows its thread steps.
+const THREAD_OPERATOR_DOC = "docs/thread-supervisor.md";
+
+// A file's front matter holds search phrases, not steps.
+function afterFrontMatter({ file, lines, audited }) {
+  const end = lines[0] === "---" ? lines.indexOf("---", 1) : -1;
+  return { file, lines, audited: index => index > end && audited(index) };
+}
+
+test("threads.sh is named only under macOS:, in root's runbook and the thread operator doc", () => {
+  const audit = text => posixOnlyOutsideMacos({ file: "sample.md", lines: text.split("\n"), audited: () => true }, threadsShNames)
+    .map(problem => problem.replace(/^sample\.md:(\d+) .*$/, "$1"));
+  assert.deepEqual(audit([
+    "- macOS: `scripts/threads.sh list`, or plain threads.sh in words.",
+    "- Windows: `scripts/ccdm threads list`.",
+    "",
+    "macOS: run it:",
+    "",
+    "```sh",
+    "scripts/threads.sh list",
+    "```",
+    "",
+    "Other names are not it: `thread-supervisor.py`, `old-threads.sh`, `threads.shell`.",
+  ].join("\n")), []);
+  assert.deepEqual(audit([
+    "Run `scripts/threads.sh list`.",
+    "",
+    "The control socket used by threads.sh, with no backticks.",
+    "",
+    "- Windows: `scripts/threads.sh list`",
+    "",
+    "```sh",
+    "./scripts/threads.sh stop x",
+    "```",
+  ].join("\n")), ["1", "3", "5", "8"]);
+
+  const doc = { file: THREAD_OPERATOR_DOC, lines: fs.readFileSync(THREAD_OPERATOR_DOC, "utf8").split(/\r?\n/), audited: () => true };
+  const problems = [...runbookSources(), doc].flatMap(source => posixOnlyOutsideMacos(afterFrontMatter(source), threadsShNames));
+  assert.deepEqual(problems, [], `\n${problems.join("\n")}\n`);
+  // Wherever a step names it, the Windows form stands beside it.
+  for (const file of ["AGENTS.md", ".mex/context/architecture.md", ".mex/context/session-management.md",
+    ".mex/patterns/operate-thread-supervisor.md", ".mex/patterns/register-project.md", THREAD_OPERATOR_DOC]) {
+    const source = fs.readFileSync(file, "utf8");
+    assert.match(source, /macOS: [^\n]*`scripts\/threads\.sh/, `${file} lost its macOS thread command`);
+    assert.match(source, /Windows: [^\n]*`scripts\/ccdm threads/, `${file} has no Windows thread command`);
+    assert.doesNotMatch(source, /#241\b/, `${file} still waits for the thread command`);
+  }
+  // A first message never travels as an argument on Windows.
+  for (const file of [".mex/context/session-management.md", ".mex/patterns/operate-thread-supervisor.md", THREAD_OPERATOR_DOC]) {
+    assert.match(fs.readFileSync(file, "utf8"), /Windows: [^\n]*--message-stdin[^\n]*--message-file <path>[^\n]*as arguments/,
+      `${file} does not say how Windows gives a thread its first message`);
+  }
 });
 
 // The subcommands a `--help` screen lists.
@@ -521,7 +579,7 @@ test("the runbook carries the launch, restart, capture and trust rules and marks
 
   // Each line that waits for a later slice names its issue.
   for (const [file, issues] of Object.entries({
-    ".mex/patterns/operate-thread-supervisor.md": ["#241", "#249"],
+    ".mex/patterns/operate-thread-supervisor.md": ["#249"],
     ".mex/patterns/operate-conversation-reminders.md": ["#242", "#249"],
   })) {
     for (const issue of issues) {

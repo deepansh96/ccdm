@@ -18,7 +18,7 @@ CCDM manages isolated Claude Code and Codex Discord sessions for multiple local 
 - When a restart request comes from or names a registered project channel, restart that project's isolated session; restart the root agent only when the user explicitly asks to restart root.
 - Thread Conversations are independent of their channel: "restart <project>" and `scripts/ccdm stop-session <project>` act on the channel's session only, unless the request names its threads (`--threads` for threads only, `--all` for both). To restart one thread:
   - macOS: `scripts/threads.sh restart <name|link>`.
-  - Windows: pending (#241).
+  - Windows: `scripts/ccdm threads restart <name|link>`.
 - Root's thread permissions, Create Public Threads, Send Messages in Threads, Manage Threads and guild View Audit Log, are granted once by hand; never PATCH them from a script. `router status` reports any that are missing.
 - Launch sessions only through `scripts/ccdm` (`start-session`, `start-codex-session`, `restart-session`, `session new`). It starts each session the right way for the OS: tmux on macOS, `ccdm-host` on Windows. Never start `claude`, the bridge, tmux or `ccdm-host` sessions by hand.
 - To restart yourself, run `scripts/ccdm restart-root`; it detaches itself, so never use `nohup` or a background `&`.

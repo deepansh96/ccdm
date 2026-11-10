@@ -31,8 +31,10 @@ class Link:
 
     def __init__(self, key_file: Path):
         node = os.environ.get("CCDM_ROUTER_NODE") or "node"
+        # The link writes UTF-8 whatever the OS's own text encoding is: a ✅ or any
+        # other non-ASCII character in a frame must not end the reader on Windows.
         self.process = subprocess.Popen([node, str(LINK_SCRIPT), "--key-file", str(key_file)],
-                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, encoding="utf-8", bufsize=1)
         self.frames: queue.Queue = queue.Queue()
         self.responses: dict[str, dict] = {}
         self.answered = threading.Condition()

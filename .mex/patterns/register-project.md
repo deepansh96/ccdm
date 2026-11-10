@@ -35,7 +35,7 @@ The steps are the same on macOS and Windows unless one says otherwise. Run the c
 3. Revoke guests with `node scripts/guest-access.js revoke <project> <user_id>`, remove the entry, then run `scripts/ccdm reminders assignment-changed --project <project>`.
 4. The Thread Supervisor sets the project's threads `closed/deregistered` without a Discord call. Confirm it:
    - macOS: `scripts/threads.sh list` (unfiltered, since the project is no longer registered).
-   - Windows: pending (#241).
+   - Windows: `scripts/ccdm threads list` (unfiltered, for the same reason).
 
 ## Gotchas
 - Changing a registered project's `channel_id` closes its threads (`closed/project-moved`); they do not follow the channel.
