@@ -13,6 +13,7 @@ import {
   injectDiscordReaction,
   runPreloadProbe,
   startFakeCodexServer,
+  waitForFinishedTurns,
   waitForState,
 } from "./support/bridge.js";
 import { assertPrivate, platformGate, privateTempRoot } from "./support/platform.js";
@@ -1161,7 +1162,9 @@ test("bridge forwards thumbs-up and thumbs-down reactions on its own messages", 
     (state) => replyContents(state).includes("up received"),
     5000,
   );
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  // The reply posts before the turn ends; the second reaction must start its own
+  // turn. Two turns: the bootstrap, then the thumbs-up.
+  await waitForFinishedTurns(bridge, 2);
 
   const state = await injectReactionUntil(
     workspace,
@@ -1821,15 +1824,6 @@ async function waitFor(predicate, timeoutMs = 1000) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error("Timed out waiting for condition");
-}
-
-// The bridge logs each turn's end once it is idle and will start, not steer, a turn.
-async function waitForFinishedTurns(bridge, count, timeoutMs = 10000) {
-  const deadline = Date.now() + timeoutMs;
-  while ((bridge.stdout.match(/\[turn\] Finished /g) ?? []).length < count) {
-    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${count} finished turn(s); stdout:\n${bridge.stdout}`);
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
 }
 
 async function injectMessageUntil(workspace, message, predicate, timeoutMs = 5000) {

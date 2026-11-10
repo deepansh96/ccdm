@@ -173,19 +173,18 @@ Get the context usage for every live Claude project session:
 
 #### 11. Usage report (`usage`, `limits`, `how much usage left`, `check usage`)
 
-Windows: pending (#244). `scripts/ccdm` has no `usage` command yet, so this entry is macOS only until then.
+Run the usage report to show live rate limits, account profile, and historical usage stats. Both commands print the same report, section for section:
 
-macOS: run the usage report script to show live rate limits, account profile, and historical usage stats:
+- macOS: `scripts/claude-usage.sh`
+- Windows: `scripts/ccdm usage`
 
-```sh
-scripts/claude-usage.sh
-```
-
-This script does two things:
-1. **Live API data** — Calls `api.anthropic.com/api/oauth/{usage,profile}` using the OAuth token from macOS Keychain. Shows 5-hour session limits, 7-day limits (all models + sonnet), extra usage billing, account profile, and plan details.
+The report has two parts:
+1. **Live API data** — Calls `api.anthropic.com/api/oauth/{usage,profile}` with Claude's OAuth login, which it only reads: from the Keychain on macOS, from `~/.claude/.credentials.json` on Windows. Shows 5-hour session limits, 7-day limits (all models + sonnet), extra usage billing, account profile, and plan details.
 2. **Local historical data** — Parses `~/.claude/stats-cache.json` and `~/.claude/history.jsonl` for lifetime totals, monthly breakdowns, busiest days, day-of-week distribution, top projects, active sessions, and streaks.
 
-The user may ask things like "how much usage do I have left", "what are my limits", "check my rate limits", "show usage" — all should trigger this script.
+If the live part prints "Could not fetch profile" or "Could not fetch live usage", the login is missing or stale. The command still exits 0 and prints the local part: report that, and say the live limits are unavailable. Never refresh or edit the login yourself; Claude Code refreshes its own login while it runs.
+
+The user may ask things like "how much usage do I have left", "what are my limits", "check my rate limits", "show usage" — all should trigger this report.
 
 **Formatting:** Use emoji progress bars (20 squares: 🟩 used, ⬜ free — no mixed colors) and organize the full report like this:
 

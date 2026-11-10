@@ -4,7 +4,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { assertPrivate, platformGate } from "./support/platform.js";
-import { injectDiscordMessage, injectDiscordReaction, startFakeCodexServer, waitForState } from "./support/bridge.js";
+import { injectDiscordMessage, injectDiscordReaction, startFakeCodexServer, waitForFinishedTurns, waitForState } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import {
   OWNER_ID,
@@ -326,6 +326,19 @@ test("/compact and /clear compact and replace the router Codex thread with webho
   assert.deepEqual(userTurnInputs(codex), []);
 });
 
+// With real Codex a compaction takes seconds. Here it is over before the
+// app-server has even answered the request to start it.
+test("a compaction that completes at once still posts its start before its completion", async () => {
+  const { workspace, codex } = await routerCodexSession([], { compactComplete: "before-reply" });
+
+  ownerMessage(workspace, { id: "cmd-compact", content: "/compact" });
+  const done = await waitForState(workspace, (next) =>
+    ["Compaction started.", "Compaction complete."].every((content) => webhookContents(next).includes(content)), 15000);
+
+  assert.deepEqual(webhookContents(done), ["Compaction started.", "Compaction complete."]);
+  assert.equal(clientMessages(codex, "thread/compact/start").length, 1);
+});
+
 function demoRuntime(workspace) {
   const keyFile = path.join(workspace.routerStateDir, "keys", "demo.key");
   return { pid: readRegistry(workspace).projects.demo.pid, key: fs.existsSync(keyFile) ? fs.readFileSync(keyFile, "utf8") : null };
@@ -494,6 +507,9 @@ test("a guest granted after a router Codex launch reaches the thread without a r
   injectDiscordMessage(workspace, { id: "guest-message", channelId: "demo-channel", content: "can you help?", author: guest });
   const replied = await waitForState(workspace, (next) => webhookContents(next).includes("hello guest"), 15000);
   const [reply] = replied.fixtures.discord.messages;
+  // The reply is visible before its turn ends, and a reaction sent before the
+  // bridge is idle would steer that turn. Two turns: the bootstrap, then this one.
+  await waitForFinishedTurns(workspace, 2);
   injectDiscordReaction(workspace, {
     id: "guest-thumbs-up", channelId: "demo-channel", emoji: "👍", messageId: reply.id, user: guest,
     message: { author: { bot: true, id: "fake-webhook-1", username: "demo-codex" }, webhookId: "fake-webhook-1", content: "hello guest" },
