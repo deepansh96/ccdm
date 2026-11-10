@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import test from "node:test";
@@ -18,6 +17,7 @@ import {
   writeRootKey,
 } from "./support/router.js";
 import { runNodeEntrypoint } from "./support/runner.js";
+import { replaceFile } from "./support/platform.js";
 import { readState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 
@@ -30,8 +30,7 @@ test.afterEach(async () => {
 // Atomic replace, the way editors and structured rewrites land a registry.
 function replaceRegistry(workspace, registry) {
   const file = path.join(workspace.repoDir, "registry.json");
-  fs.writeFileSync(`${file}.edit`, `${JSON.stringify(registry, null, 2)}\n`);
-  fs.renameSync(`${file}.edit`, file);
+  replaceFile(file, `${JSON.stringify(registry, null, 2)}\n`);
 }
 
 // Runs a registry change and waits for the reload it causes. Earlier writes
@@ -90,8 +89,7 @@ test("an invalid registry keeps the last good routing table and shows in router 
   const loadedBefore = (await runRouterCli(workspace, ["status"])).stdout.match(/registry loaded: (\S+)/)[1];
   const file = path.join(workspace.repoDir, "registry.json");
 
-  fs.writeFileSync(`${file}.edit`, "{ not json");
-  fs.renameSync(`${file}.edit`, file);
+  replaceFile(file, "{ not json");
   await router.waitForOutput(/registry_reload_failed error=/);
   injectMessage(workspace, "while-invalid", { id: OWNER_ID, username: "Owner" });
   await waitFor(() => demo.events.length > 0, () => `owner message while invalid:\n${router.stdout}`);

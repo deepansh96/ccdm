@@ -198,6 +198,28 @@ const NO_COMPILER = "The E2E fixtures need the .NET Framework compiler csc.exe, 
   + "and it was not found under %SystemRoot%\\Microsoft.NET\\Framework64\\v4.0.30319. "
   + "Enable .NET Framework 4, or set CCDM_E2E_CSC to a csc.exe.";
 
+// Writes `text` beside `target` and renames it over `target`, the atomic replace
+// editors and structured rewrites make. On Windows a rename over a file another
+// process has open for a moment (the Router or worker reading it after the last
+// change) is refused with EPERM, EACCES or EBUSY until that reader closes it;
+// scripts/platform/atomic.js waits out the same refusal for the same 2 s budget.
+// Any other error, or a refusal that lasts past the budget, is thrown.
+export function replaceFile(target, text, platform = process.platform) {
+  const staged = `${target}.edit`;
+  fs.writeFileSync(staged, text);
+  const deadline = Date.now() + 2000;
+  for (let backoff = 1; ; backoff = Math.min(backoff * 2, 50)) {
+    try {
+      fs.renameSync(staged, target);
+      return;
+    } catch (error) {
+      const left = deadline - Date.now();
+      if (platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes(error.code) || left <= 0) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(backoff, left));
+    }
+  }
+}
+
 // The launcher compiled from fixture-shim.cs. Built once per content hash and
 // published by rename, so parallel test files can race for it safely.
 export function fixtureLauncher(env = process.env) {

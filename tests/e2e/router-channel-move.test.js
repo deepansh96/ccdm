@@ -20,6 +20,7 @@ import {
   waitFor,
 } from "./support/router.js";
 import { startFakeHost } from "./support/session-fixture.js";
+import { replaceFile } from "./support/platform.js";
 import { readState, updateState } from "./support/state.js";
 import { registerTeardownCallback } from "./support/teardown.js";
 import { cleanup } from "./support/teardown.js";
@@ -45,8 +46,7 @@ async function moveChannel(workspace, router, project, channelId) {
   const next = readRegistry(workspace);
   next.projects[project].channel_id = channelId;
   const file = path.join(workspace.repoDir, "registry.json");
-  fs.writeFileSync(`${file}.edit`, `${JSON.stringify(next, null, 2)}\n`);
-  fs.renameSync(`${file}.edit`, file);
+  replaceFile(file, `${JSON.stringify(next, null, 2)}\n`);
   await waitFor(() => reloads() > before, () => `registry reload:\n${router.stdout}\n${router.stderr}`);
 }
 
