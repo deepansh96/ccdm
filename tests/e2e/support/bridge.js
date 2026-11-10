@@ -513,19 +513,24 @@ export async function startFakeCodexServer(workspace, options = {}) {
           }
           break;
         }
-        case "thread/compact/start":
+        case "thread/compact/start": {
+          const completeCompaction = () => {
+            const threadId = message.params?.threadId ?? options.threadId ?? "thread-1";
+            const turnId = options.compactTurnId ?? "compact-turn";
+            notify("turn/started", { threadId, turn: { id: turnId } });
+            notify("thread/compacted", { threadId, turnId });
+            notify("item/completed", { threadId, turnId, item: { type: "contextCompaction" } });
+            notify("turn/completed", { threadId, turn: { id: turnId } });
+          };
+          // `compactComplete: "before-reply"` sends the completion ahead of the
+          // answer. A client that reads the answer and a completion right behind
+          // it in one go runs the completion's handler before whatever awaited
+          // the answer; this is that case made certain.
+          if (options.compactComplete === "before-reply") completeCompaction();
           reply({});
-          if (options.compactComplete) {
-            setTimeout(() => {
-              const threadId = message.params?.threadId ?? options.threadId ?? "thread-1";
-              const turnId = options.compactTurnId ?? "compact-turn";
-              notify("turn/started", { threadId, turn: { id: turnId } });
-              notify("thread/compacted", { threadId, turnId });
-              notify("item/completed", { threadId, turnId, item: { type: "contextCompaction" } });
-              notify("turn/completed", { threadId, turn: { id: turnId } });
-            }, 5);
-          }
+          if (options.compactComplete === true) setTimeout(completeCompaction, 5);
           break;
+        }
         case "thread/archive":
           reply({});
           break;

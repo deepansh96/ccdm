@@ -326,6 +326,19 @@ test("/compact and /clear compact and replace the router Codex thread with webho
   assert.deepEqual(userTurnInputs(codex), []);
 });
 
+// With real Codex a compaction takes seconds. Here it is over before the
+// app-server has even answered the request to start it.
+test("a compaction that completes at once still posts its start before its completion", async () => {
+  const { workspace, codex } = await routerCodexSession([], { compactComplete: "before-reply" });
+
+  ownerMessage(workspace, { id: "cmd-compact", content: "/compact" });
+  const done = await waitForState(workspace, (next) =>
+    ["Compaction started.", "Compaction complete."].every((content) => webhookContents(next).includes(content)), 15000);
+
+  assert.deepEqual(webhookContents(done), ["Compaction started.", "Compaction complete."]);
+  assert.equal(clientMessages(codex, "thread/compact/start").length, 1);
+});
+
 function demoRuntime(workspace) {
   const keyFile = path.join(workspace.routerStateDir, "keys", "demo.key");
   return { pid: readRegistry(workspace).projects.demo.pid, key: fs.existsSync(keyFile) ? fs.readFileSync(keyFile, "utf8") : null };
