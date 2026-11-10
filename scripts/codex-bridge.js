@@ -2,7 +2,7 @@
 
 const { spawn } = require("child_process");
 const { createHmac, randomBytes } = require("crypto");
-const { writeFile, mkdir, mkdtemp, readFile, rm } = require("fs/promises");
+const { writeFile, mkdir, readFile, rm } = require("fs/promises");
 const { renameSync, rmSync, writeFileSync } = require("fs");
 const net = require("net");
 const os = require("os");
@@ -72,8 +72,6 @@ const AUDIO_TRANSCRIPTION_ENABLED = envFlag(
   "CODEX_BRIDGE_TRANSCRIBE_AUDIO",
   "USE_AUDIO_TRANSCRIPTION_IN_BRIDGE"
 );
-const AUDIO_TRANSCRIPTION_COMMAND =
-  process.env.CODEX_BRIDGE_AUDIO_TRANSCRIPTION_COMMAND || "whisper";
 const AUDIO_TRANSCRIPTION_MODEL =
   process.env.CODEX_BRIDGE_AUDIO_TRANSCRIPTION_MODEL || "turbo";
 const AUDIO_TRANSCRIPTION_LANGUAGE =
@@ -1221,7 +1219,8 @@ async function downloadAttachment(url, filename) {
 }
 
 async function downloadTempAttachment(url, filename) {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "codex-bridge-audio-"));
+  // The temp directory on POSIX; on Windows a protected one under the state root.
+  const dir = privateTmpDir("codex-bridge-audio-");
   const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_") || "audio";
   const filePath = path.join(dir, safeName);
   const res = await fetch(url);
@@ -1236,7 +1235,7 @@ async function downloadTempAttachment(url, filename) {
 
 function runCommand(command, args) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8");
@@ -1280,7 +1279,10 @@ async function transcribeAudioAttachment(att) {
     if (AUDIO_TRANSCRIPTION_LANGUAGE) {
       args.push("--language", AUDIO_TRANSCRIPTION_LANGUAGE);
     }
-    await runCommand(AUDIO_TRANSCRIPTION_COMMAND, args);
+    // CODEX_BRIDGE_AUDIO_TRANSCRIPTION_COMMAND, or whisper. On Windows a missing
+    // whisper.exe throws here, and the turn gets the "could not be transcribed" text.
+    const whisper = resolveCommand("whisper");
+    await runCommand(whisper.command, [...whisper.args, ...args]);
     const transcriptPath = path.join(
       outputDir,
       `${path.parse(downloaded.filePath).name}.txt`

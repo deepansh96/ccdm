@@ -1696,6 +1696,15 @@ test("bridge transcribes audio attachments by default", async () => {
   assert.match(userTurns[0][2].text, /--- File: notes\.txt ---\ntext attachment/);
   assert.equal(userTurns[0].some((part) => part.text?.includes(".discord-attachments")), false);
   assert.equal(state.fixtures.whisper.invocations[0].inputExists, true);
+  // The audio and whisper's output sat in one private temp directory, gone after the turn.
+  const whisperArgs = state.fixtures.whisper.invocations[0].args;
+  const audioDir = path.dirname(whisperArgs[0]);
+  assert.equal(path.dirname(audioDir), privateTempRoot(workspace));
+  assert.match(path.basename(audioDir), /^codex-bridge-audio-/);
+  assert.equal(whisperArgs[whisperArgs.indexOf("--output_dir") + 1], path.join(audioDir, "out"));
+  assert.equal(fs.existsSync(audioDir), false);
+  assert.deepEqual(fs.readdirSync(privateTempRoot(workspace)).filter((name) => name.startsWith("codex-bridge-audio-")), []);
+  if (process.platform === "win32") assertPrivate(privateTempRoot(workspace));
   assert.deepEqual(
     state.fixtures.discord.attachmentFetches.map((entry) => entry.url).sort(),
     [
@@ -1703,6 +1712,53 @@ test("bridge transcribes audio attachments by default", async () => {
       "https://cdn.discordapp.com/attachments/channel/message/voice-message.ogg",
     ],
   );
+  await bridge.stop();
+});
+
+test("with no whisper the turn says the audio could not be transcribed, and the bridge keeps serving", async () => {
+  const workspace = createBridgeWorkspace({ excludeFixtures: ["whisper"] });
+  const voiceUrl = "https://cdn.discordapp.com/attachments/channel/message/voice-message.ogg";
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.attachments[voiceUrl] = { body: "fixture audio body", contentType: "audio/ogg" };
+  writeState(seed, workspace.stateDir);
+
+  const codex = await startFakeCodexServer(workspace, {
+    turns: [{ delta: "could not hear it" }, { delta: "still here" }],
+  });
+  const bridge = await startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
+
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
+  await injectMessageUntil(
+    workspace,
+    {
+      id: "voice-message",
+      content: "",
+      attachments: [{ id: "voice-att", contentType: "audio/ogg", name: "voice-message.ogg", size: 18, url: voiceUrl }],
+    },
+    (nextState) => replyContents(nextState).includes("could not hear it"),
+    15000,
+  );
+  // The reply is posted just before the turn ends, and a message sent before the
+  // bridge is idle would steer that turn. Idle twice: the bootstrap, then this turn.
+  await bridge.waitForOutput(/(?:bridge idle[^]*){2}/, 15000);
+  await injectMessageUntil(
+    workspace,
+    { id: "typed-message", content: "typed instead" },
+    (nextState) => replyContents(nextState).includes("still here"),
+    15000,
+  );
+
+  const userTurns = codex.clientMessages.filter((message) => message.method === "turn/start").map((message) => message.params.input)
+    .filter((input) => !input[0]?.text?.startsWith("You are communicating with the user via Discord"));
+  assert.equal(userTurns.length, 2);
+  assert.equal(userTurns[0].length, 1);
+  assert.ok(userTurns[0][0].text.startsWith("[Audio attachment could not be transcribed: voice-message.ogg ("), userTurns[0][0].text);
+  assert.equal(userTurns[1][0].text, "typed instead");
+  // The downloaded audio is removed even though nothing transcribed it.
+  assert.deepEqual(fs.readdirSync(privateTempRoot(workspace)).filter((name) => name.startsWith("codex-bridge-audio-")), []);
   await bridge.stop();
 });
 

@@ -55,3 +55,6 @@ tests/e2e/arrival-order.test.js
 tests/e2e/router-root-claude.test.js
 tests/e2e/windows-installer-host.test.js
 tests/e2e/windows-installer-root-at-logon.test.js
+tests/e2e/ccdm-transcribe.test.js
+tests/e2e/deepseek-setup.test.js
+tests/e2e/mimo-setup.test.js
