@@ -142,6 +142,8 @@ def database_path(state_dir: Path) -> Path:
 
 
 DATABASE_BUSY_TIMEOUT_SECONDS = 2
+# How long a status read waits for the writer of the first event to create the table.
+SCHEMA_WAIT_SECONDS = 2
 
 
 def _enable_wal(connection: sqlite3.Connection) -> None:
@@ -447,14 +449,26 @@ def status_for(state_dir: Path, project_name: str) -> dict:
     try:
         if not is_private(db_path):
             return {"available": False, "reason": "event database permissions are not private", "event_count": 0, "pending_count": pending_count, "events": []}
-        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1)
-        connection.row_factory = sqlite3.Row
-        rows = connection.execute(
-            "SELECT * FROM events WHERE project = ? ORDER BY commit_order DESC LIMIT 100",
-            (project_name,),
-        ).fetchall()
-        count = connection.execute("SELECT COUNT(*) FROM events WHERE project = ?", (project_name,)).fetchone()[0]
-        connection.close()
+        # The first event creates the database file just before its table. A
+        # reader in that gap waits for the table; a file that still has none
+        # after the wait is unsupported, as before.
+        deadline = time.monotonic() + SCHEMA_WAIT_SECONDS
+        while True:
+            connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1)
+            try:
+                connection.row_factory = sqlite3.Row
+                rows = connection.execute(
+                    "SELECT * FROM events WHERE project = ? ORDER BY commit_order DESC LIMIT 100",
+                    (project_name,),
+                ).fetchall()
+                count = connection.execute("SELECT COUNT(*) FROM events WHERE project = ?", (project_name,)).fetchone()[0]
+                break
+            except sqlite3.OperationalError as error:
+                if str(error) != "no such table: events" or time.monotonic() >= deadline:
+                    raise
+            finally:
+                connection.close()
+            time.sleep(0.05)
         return {
             "available": True,
             "event_count": count,
