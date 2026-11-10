@@ -38,6 +38,7 @@ process.env.CCDM_REMINDER_CONTEXT_FILE = REMINDER_CONTEXT_FILE;
 process.env.CCDM_REMINDER_RECEIPTS_DIR = REMINDER_RECEIPTS_DIR;
 const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { createRouterTransport } = require("./codex-bridge-transport.js");
+const { arrivalOrder } = require("./lib/arrival-order.js");
 const { scheduleProjectRestart, scheduleRootRestart: scheduleRootRestartHelper } = require("./lib/restart-helper.js");
 const { markTurn } = require("./thread-activity.js");
 const modelInfo = require("./model-info.js");
@@ -1572,10 +1573,22 @@ function threadBootstrapText(bootstrap) {
 
 // Live events held until the bootstrap is sent, as [kind, handler, event].
 let heldThreadEvents = THREAD_MODE ? [] : null;
-const holdUntilBootstrap = (kind, handler) => async (event) => {
+const holdUntilBootstrap = (kind, handler) => async (event, next) => {
   if (heldThreadEvents) heldThreadEvents.push([kind, handler, event]);
-  else await handler(event);
+  else await handler(event, next);
 };
+
+// The transport delivers each Discord event without waiting for the handler of
+// the one before it, and a handler awaits several steps (attachments, reminder
+// events) before it acts. So each event waits here for the previous one: it
+// starts once that one has finished, or has called `next()` because what it
+// decided is in place and only app-server work remains. Messages and commands
+// then take effect in arrival order, and a stuck turn holds back no later one.
+// A handler that hangs before that point stops holding the others after the
+// limit, so a stuck download or helper cannot make the bridge deaf.
+const inArrivalOrder = arrivalOrder({
+  timeoutMs: Number(process.env.CCDM_CODEX_EVENT_ORDER_TIMEOUT_MS) || 30000,
+});
 
 async function startThreadConversation() {
   const bootstrap = await awaitThreadBootstrap();
@@ -1595,12 +1608,13 @@ async function startThreadConversation() {
   const included = new Set(bootstrap?.included_message_ids ?? []);
   const pending = heldThreadEvents.filter(([kind, , event]) => !(kind === "message" && included.has(event.id)));
   heldThreadEvents = null;
-  for (const [, handler, event] of pending) await handler(event);
+  // Lined up in one go, so a live event that arrives meanwhile runs after them.
+  await Promise.all(pending.map(([kind, handler, event]) => inArrivalOrder(kind, handler)(event)));
 }
 
 function startDiscordBot() {
   discordTransport.onScopeChange(applyProjectScope);
-  discordTransport.onReaction(holdUntilBootstrap("reaction", async (event) => {
+  discordTransport.onReaction(inArrivalOrder("reaction", holdUntilBootstrap("reaction", async (event, next = () => {}) => {
     if (!(await shouldHandleDiscordReaction(event.channelId, event.user))) return;
     let reaction;
     try {
@@ -1640,10 +1654,12 @@ function startDiscordBot() {
       lastOwnerInteraction?.assignment_generation === assignment.assignment_generation
       ? { id: lastOwnerInteraction.id, author: user, reminderAssignment: assignment, synthetic: true }
       : null;
-    await routeInput(input, reactionSource, channelId, channelScopeToken);
-  }));
+    const routed = routeInput(input, reactionSource, channelId, channelScopeToken);
+    next();
+    await routed;
+  })));
 
-  discordTransport.onMessage(holdUntilBootstrap("message", async (msg) => {
+  discordTransport.onMessage(inArrivalOrder("message", holdUntilBootstrap("message", async (msg, next = () => {}) => {
     if (!msg.author.bot && isCloseCommand(msg.content)) {
       // Root management routing reserves /close in every registered project
       // channel, whichever provider serves it; a project bridge only its own.
@@ -1711,7 +1727,9 @@ function startDiscordBot() {
         pendingCompactionChannelId = channelId;
         await sendToDiscord("Compaction queued.", channelId);
       } else {
-        await startCompaction(channelId);
+        const compaction = startCompaction(channelId);
+        next();
+        await compaction;
       }
       return;
     }
@@ -1726,6 +1744,8 @@ function startDiscordBot() {
       try {
         messageQueue = [];
         pendingCompactionChannelId = null;
+        // From here later messages queue for the new thread.
+        next();
         if (previousThreadId && (previousTurnId || turnActive)) {
           try {
             const interruptParams = { threadId: previousThreadId };
@@ -1832,8 +1852,10 @@ function startDiscordBot() {
 
     console.log(`[discord] ${msg.author.username}: ${text || "(attachment)"} [${input.length} part(s)]`);
 
-    await routeInput(input, msg, channelId, channelScopeToken);
-  }));
+    const routed = routeInput(input, msg, channelId, channelScopeToken);
+    next();
+    await routed;
+  })));
 
   void (async () => {
     try {

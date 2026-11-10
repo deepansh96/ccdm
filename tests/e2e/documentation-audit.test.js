@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
+
+import { PYTHON } from "./support/platform.js";
 
 const readme = fs.readFileSync("tests/e2e/README.md", "utf8");
 const operatorReadme = fs.readFileSync("README.md", "utf8");
@@ -245,14 +249,14 @@ const threadDocs = {
   ],
   ".mex/ROUTER.md": ["Thread Conversation", "scripts/threads.sh", "install-thread-supervisor.sh",
     "thread-conversation-journey.test.js"],
-  ".mex/context/architecture.md": ["Thread Supervisor", "start-thread-session.sh", "thread role"],
-  ".mex/context/session-management.md": ["Thread Conversation", "start-thread-session.sh", "--threads", "--all",
+  ".mex/context/architecture.md": ["Thread Supervisor", "scripts/ccdm start-thread-session", "thread role"],
+  ".mex/context/session-management.md": ["Thread Conversation", "scripts/ccdm start-thread-session", "--threads", "--all",
     "restart <project>"],
   ".mex/context/discord-security.md": ["## Thread Conversations", "thread alone", "holds no Discord credential",
     ...ROOT_THREAD_PERMISSIONS, "granted once by hand"],
   ".mex/patterns/operate-thread-supervisor.md": ["scripts/install-thread-supervisor.sh", "preflight",
     "scripts/thread-supervisor.py status", "scripts/threads.sh list", ...ROOT_THREAD_PERMISSIONS],
-  ".mex/patterns/register-project.md": ["Thread Conversations", "closed/deregistered", "stop-session.sh <project> --all"],
+  ".mex/patterns/register-project.md": ["Thread Conversations", "closed/deregistered", "scripts/ccdm stop-session <project> --all"],
   ".mex/patterns/INDEX.md": ["operate-thread-supervisor.md"],
   "tests/e2e/README.md": ["## Thread Conversations", "thread-conversation-journey.test.js",
     "Thread Supervisor", "Live Smoke Suite"],
@@ -268,4 +272,278 @@ test("thread docs describe Thread Conversations, the Thread Supervisor and root'
   for (const workflow of ["Thread Conversations", "Thread Supervisor", "Thread journey"]) {
     assert.match(matrix, new RegExp(`\\| ${workflow} \\|`), `SCENARIO_MATRIX.md is missing a ${workflow} row`);
   }
+});
+
+// Root's runbook: the files root follows, word for word, to act on either OS.
+const runbookFiles = [
+  "AGENTS.md",
+  ".mex/ROUTER.md",
+  ".mex/context/architecture.md",
+  ".mex/context/conventions.md",
+  ".mex/context/decisions.md",
+  ".mex/context/discord-security.md",
+  ".mex/context/session-management.md",
+  ".mex/context/setup.md",
+  ".mex/context/stack.md",
+  ".mex/patterns/debug-discord-session.md",
+  ".mex/patterns/manage-claude-home-login.md",
+  ".mex/patterns/manage-session.md",
+  ".mex/patterns/operate-conversation-reminders.md",
+  ".mex/patterns/operate-thread-supervisor.md",
+  ".mex/patterns/register-project.md",
+  ".mex/patterns/root-commands.md",
+  ".mex/patterns/setup-chatgpt-codex-account.md",
+  ".mex/patterns/setup-deepseek-codex.md",
+  ".mex/patterns/setup-mimo-codex.md",
+];
+
+// Descriptive history, which records what was built and decided and is never
+// followed as steps. A whole file, or one section named by its heading line.
+const descriptiveHistory = [
+  { file: ".mex/context/decisions.md" },
+  { file: ".mex/ROUTER.md", section: "## Current Project State" },
+];
+
+// Root's command entries in CLAUDE.md.example: "Commands" up to "Voice Messages",
+// which takes in "Discord Polls". The usage entry is P4.4b's and the rest of the
+// file is P5.7b's, so they carry a pending marker or are left alone.
+const ROOT_ENTRIES = { file: "CLAUDE.md.example", from: "### Commands", to: "### Voice Messages", skip: "#### 11. " };
+
+const headingLevel = line => /^#{1,6} /.test(line) ? line.indexOf(" ") : 0;
+
+// The lines of a section: from its heading to the next heading of the same or a
+// higher level. Lines inside a fenced block are never headings.
+function sectionRange(lines, heading) {
+  const start = lines.findIndex(line => line.startsWith(heading));
+  if (start < 0) return null;
+  const level = headingLevel(lines[start]);
+  let fenced = false;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^\s*(```|~~~)/.test(lines[index])) fenced = !fenced;
+    if (!fenced && headingLevel(lines[index]) && headingLevel(lines[index]) <= level) return [start, index];
+  }
+  return [start, lines.length];
+}
+
+// The audited lines of each runbook file, as { file, lines, audited(index) }.
+function runbookSources() {
+  const sources = runbookFiles.map(file => {
+    const lines = fs.readFileSync(file, "utf8").split(/\r?\n/);
+    const history = descriptiveHistory.filter(entry => entry.file === file);
+    if (history.some(entry => !entry.section)) return { file, lines, audited: () => false };
+    const skipped = history.map(entry => {
+      const range = sectionRange(lines, entry.section);
+      assert.ok(range, `${file} has no "${entry.section}" section; fix the descriptive-history allowlist`);
+      return range;
+    });
+    return { file, lines, audited: index => !skipped.some(([start, end]) => index >= start && index < end) };
+  });
+  const lines = fs.readFileSync(ROOT_ENTRIES.file, "utf8").split(/\r?\n/);
+  const start = lines.findIndex(line => line.startsWith(ROOT_ENTRIES.from));
+  const end = lines.findIndex(line => line.startsWith(ROOT_ENTRIES.to));
+  const skipped = sectionRange(lines, ROOT_ENTRIES.skip);
+  assert.ok(start >= 0 && end > start && skipped, `${ROOT_ENTRIES.file} lost one of root's command headings`);
+  sources.push({
+    file: ROOT_ENTRIES.file,
+    lines,
+    audited: index => index >= start && index < end && !(index >= skipped[0] && index < skipped[1]),
+  });
+  return sources;
+}
+
+// A command only macOS can run: tmux, a zsh launch, launchd, nohup, a bare
+// python3, a ./ path, or any .sh script.
+const POSIX_ONLY = /^(?:tmux |zsh -ic|launchctl |nohup |python3 |\.\/)|[\w-]\.sh(?![\w-])/;
+const LIST_ITEM = /^(\s*)(?:[-*+]|\d+[.)])\s+(.*)$/;
+const MACOS = /^(?:\*\*)?macOS:/;
+
+// Every POSIX-only command that does not sit under "macOS:". A paragraph or list
+// item is under it when its first line starts with `macOS:`; so are its
+// continuation lines and any fenced block it introduces.
+function posixOnlyOutsideMacos({ file, lines, audited }) {
+  const problems = [];
+  const report = (index, command) => problems.push(`${file}:${index + 1} \`${command}\` is not under "macOS:"`);
+  let block = { indent: 0, macos: false };
+  let blank = true;
+  let fenced = false;
+  for (const [index, line] of lines.entries()) {
+    if (/^\s*(```|~~~)/.test(line)) {
+      fenced = !fenced;
+      continue;
+    }
+    if (fenced) {
+      const command = line.trim();
+      if (audited(index) && !block.macos && POSIX_ONLY.test(command)) report(index, command);
+      continue;
+    }
+    if (!line.trim()) {
+      blank = true;
+      continue;
+    }
+    const indent = line.length - line.trimStart().length;
+    const item = LIST_ITEM.exec(line);
+    if (item) block = { indent: item[1].length, macos: MACOS.test(item[2]) };
+    else if (headingLevel(line) || (blank && indent <= block.indent)) block = { indent, macos: MACOS.test(line.trim()) };
+    blank = false;
+    if (!audited(index) || block.macos) continue;
+    for (const [, command] of line.matchAll(/`([^`\n]+)`/g)) {
+      if (POSIX_ONLY.test(command)) report(index, command);
+    }
+  }
+  return problems;
+}
+
+test("the macOS rule finds POSIX-only commands outside macOS: and accepts them under it", () => {
+  const audit = text => posixOnlyOutsideMacos({ file: "sample.md", lines: text.split("\n"), audited: () => true });
+  assert.deepEqual(audit([
+    "1. macOS: run `tmux ls`, then `scripts/threads.sh list`.",
+    "   Still the same item: `./setup.sh`.",
+    "",
+    "   ```sh",
+    "   nohup ./restart-root-agent.sh &",
+    "   ```",
+    "2. Windows: run `scripts/ccdm list`.",
+    "- **macOS:** `launchctl list`",
+    "",
+    "macOS: `python3 scripts/x.py` and `zsh -ic \"claude\"`.",
+    "",
+    "Run `scripts/ccdm start-session <project>` and read `skills/x.md`, `a.sha`, `~/.zshrc`.",
+  ].join("\n")), []);
+  assert.deepEqual(audit([
+    "1. Run `scripts/stop-session.sh <project>`.",
+    "2. Windows: `tmux ls`",
+    "",
+    "A paragraph with `zsh -ic`, `launchctl load x`, `nohup x &`, `python3 x.py` and `./setup.sh`.",
+    "",
+    "macOS: fine `tmux ls`.",
+    "",
+    "Not fine again: `install-router-service.sh`.",
+    "",
+    "```sh",
+    "tmux kill-session -t x",
+    "```",
+    "- macOS: fine",
+    "",
+    "Outdented paragraph `threads.sh`.",
+  ].join("\n")).map(problem => problem.replace(/^sample\.md:(\d+) `(.*)` is not.*$/, "$1 $2")), [
+    "1 scripts/stop-session.sh <project>",
+    "2 tmux ls",
+    "4 zsh -ic", "4 launchctl load x", "4 nohup x &", "4 python3 x.py", "4 ./setup.sh",
+    "8 install-router-service.sh",
+    "11 tmux kill-session -t x",
+    "15 threads.sh",
+  ]);
+});
+
+test("root's runbook names POSIX-only commands only under macOS:", () => {
+  const problems = runbookSources().flatMap(posixOnlyOutsideMacos);
+  assert.deepEqual(problems, [], `\n${problems.join("\n")}\n`);
+});
+
+// The subcommands a `--help` screen lists.
+function listedCommands(...args) {
+  const result = spawnSync(PYTHON, [path.join("scripts", "ccdm.py"), ...args, "--help"], {
+    encoding: "utf8",
+    env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1", PYTHONUTF8: "1" },
+    windowsHide: true,
+  });
+  assert.equal(result.status, 0, `ccdm ${args.join(" ")} --help failed: ${result.stderr}`);
+  const listing = result.stdout.split(/\r?\n/);
+  return new Set(listing.slice(listing.findIndex(line => /^commands:/.test(line)) + 1)
+    .map(line => /^ {4}([a-z][a-z0-9-]*)(?:\s|$)/.exec(line)?.[1])
+    .filter(Boolean));
+}
+
+test("every scripts/ccdm command in root's runbook exists, and so does every .sh under macOS:", () => {
+  const commands = listedCommands();
+  assert.ok(commands.has("start-session") && commands.has("list"), "could not read scripts/ccdm --help");
+  const nested = new Map();
+  const scripts = new Set(spawnSync("git", ["ls-files", "*.sh"], { encoding: "utf8" }).stdout.split(/\r?\n/)
+    .filter(Boolean).map(file => path.posix.basename(file)));
+  assert.ok(scripts.has("start-session.sh"), "could not list the tracked .sh scripts");
+  const problems = [];
+  let named = 0;
+  for (const { file, lines, audited } of runbookSources()) {
+    for (const [index, line] of lines.entries()) {
+      if (!audited(index)) continue;
+      for (const [, sub, verb] of line.matchAll(/scripts\/ccdm"?\s+([a-z][a-z0-9-]*)(?:\s+([a-z][a-z0-9-]*))?/g)) {
+        named += 1;
+        if (!commands.has(sub)) {
+          problems.push(`${file}:${index + 1} scripts/ccdm ${sub} is not in scripts/ccdm --help`);
+          continue;
+        }
+        if (!verb) continue;
+        if (!nested.has(sub)) nested.set(sub, listedCommands(sub));
+        if (nested.get(sub).size && !nested.get(sub).has(verb)) {
+          problems.push(`${file}:${index + 1} scripts/ccdm ${sub} ${verb} is not in scripts/ccdm ${sub} --help`);
+        }
+      }
+      for (const [, script] of line.matchAll(/([\w-]+\.sh)(?![\w-])/g)) {
+        if (!scripts.has(script)) problems.push(`${file}:${index + 1} ${script} is not a tracked script`);
+      }
+    }
+  }
+  assert.ok(named > 20, `only ${named} scripts/ccdm commands were found in the runbook`);
+  assert.deepEqual(problems, [], `\n${problems.join("\n")}\n`);
+});
+
+test("root-commands.md covers root's commands and restarts root without nohup", () => {
+  const source = fs.readFileSync(".mex/patterns/root-commands.md", "utf8");
+  for (const phrase of [
+    "scripts/ccdm list",
+    "scripts/ccdm status",
+    "scripts/ccdm start-session <project>",
+    "scripts/ccdm start-codex-session <project>",
+    "scripts/ccdm stop-session <project>",
+    "scripts/ccdm restart-session <project>",
+    "scripts/ccdm context report",
+    "scripts/ccdm restart-root",
+    "poll",
+    "macOS:",
+    "Windows:",
+  ]) {
+    assert.match(source, new RegExp(escape(phrase)), `root-commands.md is missing "${phrase}"`);
+  }
+  assert.doesNotMatch(source, /nohup/);
+  assert.match(fs.readFileSync(".mex/patterns/INDEX.md", "utf8"), /\[root-commands\.md\]\(root-commands\.md\)/);
+  assert.match(fs.readFileSync(".mex/ROUTER.md", "utf8"), /\| .* \| `patterns\/root-commands\.md` \|/);
+});
+
+test("the runbook carries the launch, restart, capture and trust rules and marks what Windows still lacks", () => {
+  const read = file => fs.readFileSync(file, "utf8");
+  const agents = read("AGENTS.md");
+  assert.match(agents, /[Ll]aunch sessions only through `scripts\/ccdm`/);
+  assert.doesNotMatch(agents, /zsh -ic/);
+  assert.match(agents, /`scripts\/ccdm restart-root`[^\n]*detaches itself[^\n]*never use `nohup`/);
+
+  assert.match(read(".mex/patterns/debug-discord-session.md"), /scripts\/ccdm session capture/);
+  assert.match(read(".mex/patterns/debug-discord-session.md"), /node scripts\/ccdm-host\.js pids -t <screen_name>/);
+  const login = read(".mex/patterns/manage-claude-home-login.md");
+  assert.match(login, /scripts\/ccdm session capture ccdm_claude_login --join/);
+  assert.doesNotMatch(login, /tmux capture-pane/);
+  assert.match(read(".mex/patterns/register-project.md"), /first launch[^\n]*folder-trust dialog[^\n]*#191[^\n]*hooks and MCP servers/);
+
+  // Each line that waits for a later slice names its issue.
+  for (const [file, issues] of Object.entries({
+    ".mex/patterns/operate-thread-supervisor.md": ["#241", "#249"],
+    ".mex/patterns/operate-conversation-reminders.md": ["#242", "#249"],
+    ".mex/patterns/setup-deepseek-codex.md": ["#246"],
+    ".mex/patterns/setup-mimo-codex.md": ["#246"],
+  })) {
+    for (const issue of issues) {
+      assert.match(read(file), new RegExp(`Windows: pending[^\\n]*${issue}\\b`), `${file} has no "Windows: pending" line for ${issue}`);
+    }
+  }
+  const example = read(ROOT_ENTRIES.file).split(/\r?\n/);
+  for (const [heading, issue] of [["#### 11. ", "#244"], ["### Voice Messages", "#246"]]) {
+    const [start, end] = sectionRange(example, heading);
+    assert.match(example.slice(start, end).join("\n"), new RegExp(`Windows: pending[^\\n]*${issue}\\b`),
+      `${ROOT_ENTRIES.file} "${heading.trim()}" has no "Windows: pending" marker for ${issue}`);
+  }
+});
+
+test("CLAUDE.md and .mex/AGENTS.md stay symlinks to AGENTS.md", () => {
+  const listed = spawnSync("git", ["ls-files", "-s", "CLAUDE.md", ".mex/AGENTS.md"], { encoding: "utf8" }).stdout;
+  assert.match(listed, /^120000 \S+ 0\tCLAUDE\.md$/m);
+  assert.match(listed, /^120000 \S+ 0\t\.mex\/AGENTS\.md$/m);
 });
