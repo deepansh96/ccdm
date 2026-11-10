@@ -9,18 +9,20 @@ edges:
     condition: when selecting the home on a registered project
   - target: context/discord-security.md
     condition: when handling credentials or testing Discord integration
-last_updated: 2026-09-23
+last_updated: 2026-11-10
 ---
 
 # Set Up DeepSeek For Codex
 
 ## Steps
 1. Verify the requested model's API name against DeepSeek's current model reference. V4.1 Flash uses `deepseek-flash` as of 2026-09-22.
-2. Run `python3 scripts/setup-codex-deepseek.py --home <external-home>`. Supply the key through the hidden prompt, environment, or stdin. Existing homes and checkout paths are refused.
+2. Run the helper. Supply the key through the hidden prompt, environment, or stdin. Existing homes and checkout paths are refused.
+   - macOS: `python3 scripts/setup-codex-deepseek.py --home <external-home>`.
+   - Windows: pending (#246). The helper does not yet write an auth command or a private home that work on Windows.
 3. Optionally add `--with-exa` for hosted keyless search/page reading. For existing homes add `[mcp_servers.exa]` with `url = "https://mcp.exa.ai/mcp"` to the home configuration, then start a new session. Exa has free rate limits and receives search queries/page URLs; provider-native `web_search` remains disabled.
 4. Test strict Codex configuration, a short answer, file editing/shell execution, image input, and app-server MCP tools in a disposable directory. Test agents must not use Discord tools and must return only to their parent.
 5. For computer-use testing, read the installed skill and use a public page or local fixture. Image support alone does not configure GUI tools. Stop at permission or website barriers; do not claim success for a blocked page.
-6. Add a named account using structured JSON in ignored `registry.json`, preserving defaults and unrelated projects. Select/restart only requested projects using the existing lifecycle scripts.
+6. Add a named account using structured JSON in ignored `registry.json`, preserving defaults and unrelated projects. Select/restart only requested projects, with `scripts/ccdm stop-session <project>` and `scripts/ccdm start-codex-session <project>`.
 7. Replace keys with `--rotate-key`, then restart affected sessions. Restore the previous project selector to roll back.
 
 ## Gotchas
@@ -34,7 +36,7 @@ last_updated: 2026-09-23
 - The helper is scoped to Flash. Other DeepSeek models and provider quota reporting require separate work and validation.
 
 ## Verify
-- [ ] Generated home/files use `0700`/`0600`; no credentials reach source, logs, or tmux arguments.
+- [ ] Generated home/files use `0700`/`0600`; no credentials reach source, logs, or command arguments.
 - [ ] Local-fake setup, catalog rejection, rotation, and named-account launch tests pass.
 - [ ] Live model, file, vision, and tool checks match the capabilities being reported.
 - [ ] Existing defaults, unrelated projects, and Discord listeners are unchanged.

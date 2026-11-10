@@ -15,7 +15,7 @@ edges:
     condition: when code changes permissions, credentials, or message routing
   - target: context/session-management.md
     condition: when changing lifecycle scripts or registry runtime state
-last_updated: 2026-09-30
+last_updated: 2026-11-10
 ---
 
 # Conventions
@@ -31,13 +31,17 @@ last_updated: 2026-09-30
 - E2E tests live in `tests/e2e/`; shared local fakes and harness helpers live in `tests/e2e/support/`.
 - `registry.example.json` is public structure; `registry.json` is local runtime configuration and ignored.
 - Shell entry points resolve `SCRIPT_DIR` and `ROOT_DIR` instead of assuming the caller's working directory.
+- A lifecycle command is a `scripts/ccdm` subcommand: one module in `scripts/ccdmlib/cli/` with `register(subparsers)`, importable on Python 3.9 and on both OSes. A shell script of the same name is only a shim that runs the subcommand.
+- Lifecycle code reaches a session through the session-host API (tmux on macOS, `ccdm-host` on Windows), never through a tmux command of its own.
 - Keep changes scoped; do not replace existing shell/Node helpers with a new framework.
 
 ## Patterns
 - Parse and rewrite JSON structurally with `JSON.parse`/`JSON.stringify` or Python's `json` module; never edit registry/access JSON with regex.
 - Rewrite `registry.json` only through the shared registry lock: `updateRegistry` (`scripts/router/registry.js`) from Node, `scripts/registry-update.py` from shell and Python. Change only the fields you own inside the updater; never write back a copy read before the lock.
-- Before launching, check both the exact tmux session and listener processes tied to the project's Router launch key, channel, or WebSocket port.
-- Stop descendants before parents, terminate tmux, sweep remaining listeners, then clear registry PID/session state.
+- Before launching, check both the exact session and listener processes tied to the project's Router launch key, channel, or WebSocket port.
+- Stop descendants before parents, end the session, sweep remaining listeners, then clear registry PID/session state.
+- Runbook text (`AGENTS.md`, `.mex/`, and root's command entries in `CLAUDE.md.example`) names `scripts/ccdm` commands. A command only macOS can run (tmux, a zsh launch, launchd, a shell script) goes on a line or list item that starts with `macOS:`, with a `Windows:` line beside it. A Windows step that does not exist yet reads `Windows: pending (#<issue>)`. `tests/e2e/documentation-audit.test.js` enforces this and checks each named command against `scripts/ccdm --help`.
+- Free text never goes to a session as a command argument; use `scripts/ccdm session send <name> --stdin` or `--file <path>`.
 - Discord writes from Codex require the bridge-issued scope token; delegated agents never receive it.
 
 ## Verify Checklist
@@ -46,4 +50,5 @@ last_updated: 2026-09-30
 - [ ] Start/stop changes preserve duplicate-listener detection and cleanup.
 - [ ] Every project session stays within its Session Scope (one channel), enforced by the Router.
 - [ ] Registry and access files are handled with structured JSON parsing, and registry writes hold the registry lock.
+- [ ] Runbook steps name `scripts/ccdm` commands that `scripts/ccdm --help` lists, with macOS-only commands under `macOS:`.
 - [ ] Relevant mex context or patterns were updated when behavior changed.
