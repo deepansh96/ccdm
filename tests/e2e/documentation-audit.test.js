@@ -305,9 +305,9 @@ const descriptiveHistory = [
 ];
 
 // Root's command entries in CLAUDE.md.example: "Commands" up to "Voice Messages",
-// which takes in "Discord Polls". The usage entry is P4.4b's and the rest of the
-// file is P5.7b's, so they carry a pending marker or are left alone.
-const ROOT_ENTRIES = { file: "CLAUDE.md.example", from: "### Commands", to: "### Voice Messages", skip: "#### 11. " };
+// which takes in "Discord Polls". The rest of the file is P5.7b's, so it carries
+// a pending marker or is left alone.
+const ROOT_ENTRIES = { file: "CLAUDE.md.example", from: "### Commands", to: "### Voice Messages" };
 
 const headingLevel = line => /^#{1,6} /.test(line) ? line.indexOf(" ") : 0;
 
@@ -341,13 +341,8 @@ function runbookSources() {
   const lines = fs.readFileSync(ROOT_ENTRIES.file, "utf8").split(/\r?\n/);
   const start = lines.findIndex(line => line.startsWith(ROOT_ENTRIES.from));
   const end = lines.findIndex(line => line.startsWith(ROOT_ENTRIES.to));
-  const skipped = sectionRange(lines, ROOT_ENTRIES.skip);
-  assert.ok(start >= 0 && end > start && skipped, `${ROOT_ENTRIES.file} lost one of root's command headings`);
-  sources.push({
-    file: ROOT_ENTRIES.file,
-    lines,
-    audited: index => index >= start && index < end && !(index >= skipped[0] && index < skipped[1]),
-  });
+  assert.ok(start >= 0 && end > start, `${ROOT_ENTRIES.file} lost one of root's command headings`);
+  sources.push({ file: ROOT_ENTRIES.file, lines, audited: index => index >= start && index < end });
   return sources;
 }
 
@@ -535,11 +530,30 @@ test("the runbook carries the launch, restart, capture and trust rules and marks
     }
   }
   const example = read(ROOT_ENTRIES.file).split(/\r?\n/);
-  for (const [heading, issue] of [["#### 11. ", "#244"], ["### Voice Messages", "#246"]]) {
+  for (const [heading, issue] of [["### Voice Messages", "#246"]]) {
     const [start, end] = sectionRange(example, heading);
     assert.match(example.slice(start, end).join("\n"), new RegExp(`Windows: pending[^\\n]*${issue}\\b`),
       `${ROOT_ENTRIES.file} "${heading.trim()}" has no "Windows: pending" marker for ${issue}`);
   }
+});
+
+test("root's usage entry names the script on macOS and scripts/ccdm usage on Windows", () => {
+  const example = fs.readFileSync(ROOT_ENTRIES.file, "utf8").split(/\r?\n/);
+  const [start, end] = sectionRange(example, "#### 11. ");
+  const pattern = fs.readFileSync(".mex/patterns/root-commands.md", "utf8").split(/\r?\n/);
+  const [patternStart, patternEnd] = sectionRange(pattern, "### Usage report");
+  for (const [name, entry] of [
+    [`${ROOT_ENTRIES.file} entry 11`, example.slice(start, end).join("\n")],
+    ["root-commands.md \"Usage report\"", pattern.slice(patternStart, patternEnd).join("\n")],
+  ]) {
+    assert.match(entry, /^\s*- macOS: `scripts\/claude-usage\.sh`$/m, `${name} does not give the macOS command`);
+    assert.match(entry, /^\s*- Windows: `scripts\/ccdm usage`$/m, `${name} does not give the Windows command`);
+    assert.doesNotMatch(entry, /pending/i, `${name} still carries a pending marker`);
+    assert.match(entry, /`~\/\.claude\/\.credentials\.json` on Windows/, `${name} does not say where Windows keeps the login`);
+    assert.match(entry, /Could not fetch profile[^\n]*Could not fetch live usage[^\n]*exits 0/, `${name} does not say what a missing or stale login prints`);
+    assert.match(entry, /Never refresh or edit the login yourself/, `${name} lost the rule against refreshing the login`);
+  }
+  assert.match(pattern.slice(0, pattern.indexOf("---", 1)).join("\n"), /^ {2}- "usage"$/m, "root-commands.md has no usage trigger");
 });
 
 test("CLAUDE.md and .mex/AGENTS.md stay symlinks to AGENTS.md", () => {
