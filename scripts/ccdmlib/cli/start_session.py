@@ -210,7 +210,7 @@ def _record(registry: Path, project_name: str, name: str, launch: _Launch, proje
     on_tmux = session_host.backend_name() == "tmux"
     # Today's rule on tmux: ~/.claude unless the project sets claude_home.
     home = (project.claude_home or "~/.claude") if on_tmux else _launch.effective_claude_home(project.claude_home)
-    pid, started_at = _launch.find_claude_process(name, launch.key_file, home)
+    pid, started_at = _launch.find_claude_process(name, launch.key_file, home, launch.launch_dir)
     if not pid:
         print("Warning: started session, but could not find Claude listener PID to record", flush=True)
         return
