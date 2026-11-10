@@ -20,6 +20,11 @@ from . import ROOT_DIR, SCRIPTS_DIR, Context, Plan, require_absolute
 from . import _worker
 
 TEMPLATE = "reminders.task.xml.in"
+HELP = (
+    "The task runs the Conversation Reminder worker. Reminders are opt-in: the worker sends nothing",
+    "until scripts/ccdm reminders enable.",
+    "The install runs the reminder preflight first, which needs the Router running. It takes no options.",
+)
 
 _WHAT = "Conversation Reminder"
 _SERVICE = SCRIPTS_DIR / "conversation-reminder-service.py"

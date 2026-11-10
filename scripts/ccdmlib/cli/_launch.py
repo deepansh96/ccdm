@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from ..platform import paths, proc, session_host
+from ..platform import commands, paths, proc, session_host
 from ..platform.atomic import remove_dir_with_retry
 
 WIN32 = sys.platform == "win32"
@@ -73,7 +73,7 @@ def repo_root() -> Path:
 
 def script_ref(name: str) -> str:
     """How a message names a lifecycle command: ``stop-session`` as the user would type it."""
-    return f"scripts/ccdm {name}" if WIN32 else f"scripts/{name}.sh"
+    return commands.script_ref(name)
 
 
 def session_word() -> str:

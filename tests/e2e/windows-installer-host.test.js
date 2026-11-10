@@ -215,10 +215,18 @@ test("with live sessions install-service host exits 1, names each one, prints th
   assert.match(refused.stderr, /ccdm-host has 2 live sessions/);
   assert.match(refused.stderr, new RegExp(`^  - alpha_session \\(project, project alpha, id ${SESSION_ID}\\)$`, "m"));
   assert.match(refused.stderr, /^  - root_agent \(root\)$/m);
-  for (const step of [/scripts\/ccdm status/, /scripts\/ccdm stop-session <project>/, /scripts\/ccdm install-service host$/m,
-    /scripts\/ccdm start-session <project> --resume <id>/, /install-service host --force/]) {
-    assert.match(refused.stderr, step);
-  }
+  // Every live session has a step: the projects and their threads, root, which --force ends, and Codex projects.
+  const printed = [...refused.stderr.matchAll(/^ {2}\d\. .*: scripts\/ccdm (.+?)\r?$/gm)].map(match => match[1]);
+  assert.deepEqual(printed, ["status", "stop-session <project> --all", "install-service host --force", "restart-root",
+    "start-session <project> --resume <id>"]);
+  assert.match(refused.stderr, /^ {5}A Codex project starts with scripts\/ccdm start-codex-session <project>; status shows no id for it\./m);
+  assert.match(refused.stderr, /^ {5}A thread resumes its conversation at your next message in it\./m);
+  assert.match(refused.stderr, /^To install now and end these sessions, run step 3 alone\./m);
+  // The README's upgrade procedure gives the same commands in the same order.
+  const readme = fs.readFileSync(path.join(REPO, "README.md"), "utf8");
+  const procedure = readme.slice(readme.indexOf("**Upgrading `ccdm-host` while sessions are live.**"),
+    readme.indexOf("If `ccdm-host` ends cleanly"));
+  assert.deepEqual([...procedure.matchAll(/^ +scripts\\ccdm (.+?)\r?$/gm)].map(match => match[1]), printed);
   assert.equal(invocations(workspace).length, before, "schtasks was not called");
   assert.equal(fs.readFileSync(serviceFile(workspace, ".json"), "utf8"), configBefore);
   assert.ok(project.alive() && root.alive(), "the sessions were left running");

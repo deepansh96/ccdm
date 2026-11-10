@@ -360,6 +360,12 @@ test("bad usage exits 2 with the usage text, and every message names threads.sh 
   const help = await threadsCli(workspace, "--help");
   printed.push(help);
   assert.deepEqual([help.exitCode, help.stdout, help.stderr], [0, USAGE, ""]);
+  // The same after a verb: `--help` is not taken for a thread, a project or a name, and nothing is asked.
+  for (const args of [["create", "--help"], ["list", "--help"], ["stop", "--help"], ["restart", "-h"], ["close", "--help"]]) {
+    const verbHelp = await threadsCli(workspace, ...args);
+    printed.push(verbHelp);
+    assert.deepEqual([verbHelp.exitCode, verbHelp.stdout, verbHelp.stderr], [0, USAGE, ""], args.join(" "));
+  }
 
   if (WIN) {
     for (const { stdout, stderr } of printed) assert.doesNotMatch(stdout + stderr, /threads\.sh/);
@@ -373,7 +379,7 @@ test("the shim and scripts/ccdm threads give the same output and exit codes", as
   await supervised(workspace);
   const env = supervisorEnv(workspace);
   // No thread is bound, so `list` prints its header alone and no idle time can tick between the two runs.
-  for (const args of [[], ["--help"], ["list"], ["list", "nowhere"], ["stop", "no-such-thread"],
+  for (const args of [[], ["--help"], ["stop", "--help"], ["list"], ["list", "nowhere"], ["stop", "no-such-thread"],
     ["create", "demo", "x", "--colour", "red"]]) {
     const shim = await runScript(workspace, "scripts/threads.sh", { args, env });
     const direct = await runScript(workspace, "scripts/ccdm", { args: ["threads", ...args], env });
