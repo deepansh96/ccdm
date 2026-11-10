@@ -1218,9 +1218,12 @@ test("on Windows a running bridge or app-server with this project's key file or 
 
     const result = await startCodex(workspace);
 
-    assert.equal(result.exitCode, 1, result.stderr || result.stdout);
-    assert.match(result.stdout, /existing Codex Discord bridge process\(es\)/);
-    assert.match(result.stdout, new RegExp(`\\b${child.pid}\\b`));
+    // A launch that ends some other way says why on stderr, and one that did not
+    // see the process goes on to refuse for the missing webhook.
+    const said = `process ${child.pid} (exit ${child.exitCode}, signal ${child.signalCode})\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
+    assert.equal(result.exitCode, 1, said);
+    assert.match(result.stdout, /existing Codex Discord bridge process\(es\)/, said);
+    assert.match(result.stdout, new RegExp(`\\b${child.pid}\\b`), said);
     // The command as Windows has it: there is no stop-session.sh to run.
     assert.match(result.stdout, /^Run scripts\/ccdm stop-session 'alpha' first, then retry\.\r?$/m);
     assert.doesNotMatch(result.stdout, /\.sh\b/);
