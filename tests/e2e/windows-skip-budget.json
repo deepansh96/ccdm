@@ -1,5 +1,5 @@
 {
-  "budget": 136,
+  "budget": 138,
   "skips": [
     {
       "file": "codex-start.test.js",
@@ -343,6 +343,18 @@
       "test": "a resumed Claude session whose session id cannot be read keeps the known conversation id",
       "tag": "posix",
       "reason": "on ccdm-host the launcher finds Claude by its session file, so a launch without one fails"
+    },
+    {
+      "file": "conversation-reminder-service.test.js",
+      "test": "recovery deletes the prior reminder after a crash following local send confirmation",
+      "tag": "posix",
+      "reason": "the crash is injected by a shell script standing in for Python; on Windows that must be a real program"
+    },
+    {
+      "file": "conversation-reminder-service.test.js",
+      "test": "a crash after durable claim but before the Discord request is released without resending during recovery",
+      "tag": "posix",
+      "reason": "the crash is injected by a shell script standing in for Python; on Windows that must be a real program"
     }
   ]
 }
