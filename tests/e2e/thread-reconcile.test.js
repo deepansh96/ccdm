@@ -86,18 +86,48 @@ async function threadRows(workspace) {
   return (await supervisorStatus(workspace)).projects?.demo?.threads ?? {};
 }
 
-async function threadRow(workspace, threadId, predicate = () => true, timeoutMs = 15000) {
+const settle = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// The worker's own account of itself: whether it runs, its Router link, its rows.
+const account = status => JSON.stringify({ running: status?.running, router: status?.router,
+  threads: status?.projects?.demo?.threads ?? {} });
+
+// `explain`, when given, adds what else a failed wait should show.
+async function threadRow(workspace, threadId, predicate = () => true, timeoutMs = 15000, explain = null) {
   const deadline = Date.now() + timeoutMs;
   let last;
   while (Date.now() < deadline) {
-    last = await threadRows(workspace);
-    if (last[threadId] && predicate(last[threadId])) return last[threadId];
-    await new Promise(resolve => setTimeout(resolve, 50));
+    last = await supervisorStatus(workspace);
+    const row = last.projects?.demo?.threads?.[threadId];
+    if (row && predicate(row)) return row;
+    await settle(50);
   }
-  throw new Error(`thread ${threadId} never matched: ${JSON.stringify(last)}`);
+  throw new Error(`thread ${threadId} never matched: ${account(last)}${explain ? `\n${await explain()}` : ""}`);
 }
 
-const settle = ms => new Promise(resolve => setTimeout(resolve, ms));
+// Waits until the worker reports its Router link as `wanted` ("connected" or "disconnected").
+async function linkReports(workspace, wanted, explain, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  let last;
+  while (Date.now() < deadline) {
+    last = await supervisorStatus(workspace);
+    if (last.running && last.router === wanted) return;
+    await settle(50);
+  }
+  throw new Error(`the worker never reported its Router link as ${wanted}: ${account(last)}\n${await explain()}`);
+}
+
+// What a failed wait on a Router restart saw besides the rows: the Router's view of
+// its connections, each Router's log, and what the worker wrote, which it gives
+// up only when it ends, so the worker is stopped here.
+async function restartEvidence(workspace, supervisor, routers) {
+  const parts = [`router status:\n${(await runRouterCli(workspace, ["status"])).stdout}`];
+  routers.forEach((router, index) => parts.push(`router ${index + 1} log:\n${router.stdout}${router.stderr}`));
+  const ended = await Promise.race([supervisor.stop(), settle(10000).then(() => null)]);
+  parts.push(ended ? `worker exit ${ended.exitCode}, stderr:\n${ended.stderr}` : "the worker did not stop within 10 s");
+  return parts.join("\n");
+}
+
 const discord = workspace => readState(workspace.stateDir).fixtures.discord;
 const claude = workspace => readState(workspace.stateDir).fixtures.claude;
 const notifications = (workspace, threadId) => (claude(workspace).channelNotifications ?? [])
@@ -125,7 +155,13 @@ function killSession(workspace, threadId) {
   const session = readState(workspace.stateDir).fixtures.tmux.sessions[tmuxName(threadId)];
   if (process.platform !== "win32") return process.kill(-session.pid, "SIGKILL");
   for (const pid of session.job ?? [session.pid]) {
-    if (workspaceOwnsPid(pid, workspace.tmpRoot)) process.kill(pid, "SIGKILL");
+    if (!workspaceOwnsPid(pid, workspace.tmpRoot)) continue;
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch (error) {
+      // Ending one process of the session can end another before its own turn comes.
+      if (error.code !== "ESRCH") throw error;
+    }
   }
 }
 
@@ -320,17 +356,22 @@ test("an injected shardResume (gateway_resumed) runs the same reconcile", async 
 
 test("a Router restart (link reconnect) runs the same reconcile", async () => {
   const workspace = reconcileWorkspace();
-  const { router } = await supervised(workspace);
+  const { router, supervisor } = await supervised(workspace);
+  const routers = [router];
+  const evidence = () => restartEvidence(workspace, supervisor, routers);
   if (process.platform === "win32") router.child.kill("SIGKILL");
   else process.kill(-router.child.pid, "SIGKILL");
   await router.closed;
+  // The reconcile under test runs on the link's next hello, so the link must have lost this one.
+  await linkReports(workspace, "disconnected", evidence);
   const missed = thread("1700000000000370001");
   seedThreads(workspace, { [missed.id]: missed });
   seedHistory(workspace, missed.id, [["missed-owner-1", owner, "look at the flaky test"]]);
 
-  await startRouter(workspace);
+  routers.push(await startRouter(workspace));
 
-  await threadRow(workspace, missed.id, row => row.state === "live");
+  await linkReports(workspace, "connected", evidence);
+  await threadRow(workspace, missed.id, row => row.state === "live", 15000, evidence);
   await waitFor(() => notifications(workspace, missed.id).length === 1, () => "the bootstrap", 15000);
   assert.equal(occurrences(notifications(workspace, missed.id)[0].content, "look at the flaky test"), 1);
 });

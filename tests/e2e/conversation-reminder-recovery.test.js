@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import test from "node:test";
 
-import { platformGate } from "./support/platform.js";
+import { PYTHON, fixtureLauncher } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import { createBridgeWorkspace, waitForState } from "./support/bridge.js";
 import { routerEnv } from "./support/router.js";
@@ -15,10 +16,61 @@ import {
 
 test.afterEach(async () => cleanup());
 
-// The crash tests put a POSIX shell script in Python's place, which kills the
-// observer that called it.
-const shellCrashInjector = platformGate("posix",
-  "the crash is injected by a shell script standing in for Python; on Windows that must be a real program");
+// The crash tests put a stand-in in Python's place (CCDM_REMINDER_PYTHON): it runs
+// the real Python and then, after a successful `subcommand`, kills the observer
+// that called it. With a `marker` file the first such call only leaves the marker
+// and the second one kills. POSIX takes the shell script it is given. Windows
+// starts only real programs, so there the stand-in is the fixture launcher running
+// a Node script; the observer is the launcher's parent, and it is still waiting
+// for this call when it is killed.
+function crashInjector(workspace, name, shellScript, subcommand, marker = null) {
+  if (process.platform !== "win32") {
+    const wrapper = path.join(workspace.tmpDir, `${name}.sh`);
+    fs.writeFileSync(wrapper, shellScript, { mode: 0o700 });
+    return wrapper;
+  }
+  const script = path.join(workspace.tmpDir, `${name}.cjs`);
+  fs.writeFileSync(script, `
+const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const koffi = require(${JSON.stringify(createRequire(import.meta.url).resolve("koffi"))});
+const [subcommand, marker, ...args] = process.argv.slice(2);
+
+function parentPidOf(pid) {
+  const HANDLE = koffi.pointer(koffi.opaque());
+  const kernel32 = koffi.load("kernel32.dll");
+  const OpenProcess = kernel32.func("__stdcall", "OpenProcess", HANDLE, ["uint32_t", "int", "uint32_t"]);
+  const CloseHandle = kernel32.func("__stdcall", "CloseHandle", "int", [HANDLE]);
+  const BasicInformation = koffi.struct({
+    exitStatus: "uintptr_t", peb: "uintptr_t", affinity: "uintptr_t", priority: "uintptr_t", pid: "uintptr_t", parent: "uintptr_t",
+  });
+  const NtQueryInformationProcess = koffi.load("ntdll.dll").func("__stdcall", "NtQueryInformationProcess", "int32_t",
+    [HANDLE, "int32_t", koffi.out(koffi.pointer(BasicInformation)), "uint32_t", koffi.pointer("uint32_t")]);
+  const handle = OpenProcess(0x1000, 0, pid);
+  if (!handle) throw new Error("cannot open process " + pid);
+  try {
+    const information = {};
+    if (NtQueryInformationProcess(handle, 0, information, koffi.sizeof(BasicInformation), null) !== 0) {
+      throw new Error("cannot read the parent of process " + pid);
+    }
+    return Number(information.parent);
+  } finally {
+    CloseHandle(handle);
+  }
+}
+
+const status = spawnSync(${JSON.stringify(PYTHON)}, args, { stdio: "inherit", windowsHide: true }).status ?? 1;
+if (status === 0 && args[1] === subcommand) {
+  if (marker === "-" || fs.existsSync(marker)) process.kill(parentPidOf(process.ppid), "SIGKILL");
+  else fs.writeFileSync(marker, "");
+}
+process.exit(status);
+`);
+  const program = path.join(workspace.tmpDir, `${name}.exe`);
+  fs.copyFileSync(fixtureLauncher(), program);
+  fs.writeFileSync(path.join(workspace.tmpDir, `${name}.shim`), `${[process.execPath, script, subcommand, marker ?? "-"].join("\n")}\n`);
+  return program;
+}
 
 test("a lost send response is resolved with the same nonce instead of risking a duplicate", async () => {
   const workspace = createBridgeWorkspace();
@@ -447,7 +499,7 @@ test("recovery completes cleanup after Discord deleted the prior reminder but th
   assert.deepEqual(discord.deletes.map(row => row.messageId), ["fake-message-1", "fake-message-1"]);
 });
 
-test("recovery deletes the prior reminder after a crash following local send confirmation", shellCrashInjector, async () => {
+test("recovery deletes the prior reminder after a crash following local send confirmation", async () => {
   const workspace = createBridgeWorkspace();
   const stateDir = setup(workspace);
   await reconciledExchange(workspace, stateDir);
@@ -455,8 +507,9 @@ test("recovery deletes the prior reminder after a crash following local send con
   const clockFile = path.join(workspace.tmpDir, "reminder-clock");
   fs.writeFileSync(clockFile, "2026-09-24T11:00:00Z");
   const marker = path.join(workspace.tmpDir, "first-confirmation");
-  const wrapper = path.join(workspace.tmpDir, "crash-after-confirmation.sh");
-  fs.writeFileSync(wrapper, `#!/bin/sh\npython3 "$@"\nresult=$?\nif [ "$result" -eq 0 ] && [ "$2" = result ]; then\n  if [ -f '${marker}' ]; then kill -KILL "$PPID"; else : > '${marker}'; fi\nfi\nexit "$result"\n`, { mode: 0o700 });
+  const wrapper = crashInjector(workspace, "crash-after-confirmation",
+    `#!/bin/sh\npython3 "$@"\nresult=$?\nif [ "$result" -eq 0 ] && [ "$2" = result ]; then\n  if [ -f '${marker}' ]; then kill -KILL "$PPID"; else : > '${marker}'; fi\nfi\nexit "$result"\n`,
+    "result", marker);
   const env = routerEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
     CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile,
     CCDM_REMINDER_PYTHON: wrapper });
@@ -478,15 +531,16 @@ test("recovery deletes the prior reminder after a crash following local send con
   assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 2);
 });
 
-test("a crash after durable claim but before the Discord request is released without resending during recovery", shellCrashInjector, async () => {
+test("a crash after durable claim but before the Discord request is released without resending during recovery", async () => {
   const workspace = createBridgeWorkspace();
   const stateDir = setup(workspace);
   await reconciledExchange(workspace, stateDir);
   const rootState = await rootRouter(workspace);
   const clockFile = path.join(workspace.tmpDir, "reminder-clock");
   fs.writeFileSync(clockFile, "2026-09-24T11:00:00Z");
-  const wrapper = path.join(workspace.tmpDir, "crash-after-claim.sh");
-  fs.writeFileSync(wrapper, "#!/bin/sh\npython3 \"$@\"\nresult=$?\nif [ \"$result\" -eq 0 ] && [ \"$2\" = validate ]; then kill -KILL \"$PPID\"; fi\nexit \"$result\"\n", { mode: 0o700 });
+  const wrapper = crashInjector(workspace, "crash-after-claim",
+    "#!/bin/sh\npython3 \"$@\"\nresult=$?\nif [ \"$result\" -eq 0 ] && [ \"$2\" = validate ]; then kill -KILL \"$PPID\"; fi\nexit \"$result\"\n",
+    "validate");
   const env = routerEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState,
     CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile,
     CCDM_REMINDER_PYTHON: wrapper });
