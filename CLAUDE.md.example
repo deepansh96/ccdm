@@ -259,14 +259,14 @@ curl -s -X POST "https://discord.com/api/v10/channels/<channel_id>/messages" \
 
 ### Voice Messages
 
-Windows: pending (#246). `scripts/ccdm` has no `transcribe` command yet, so the steps below are macOS only until then.
-
-When the user sends a voice message (`.ogg` audio attachment), transcribe it using Whisper:
+When the user sends a voice message (`.ogg` audio attachment), transcribe it using Whisper. The steps are the same on macOS and Windows:
 
 1. Download the attachment using `download_attachment`.
-2. Run: `whisper "<path>" --model turbo --language en --output_format txt --output_dir /tmp/whisper_out`
-3. Read the resulting `.txt` file and respond to its content.
+2. Run: `scripts/ccdm transcribe "<path>"`. Keep the quotes around the path. It prints the transcript.
+3. Respond to the transcript's content.
 4. Quote the transcription in your reply so the user can confirm accuracy.
+
+If the command exits 3, Whisper is not installed: say so and ask the user to type the message.
 
 ### Channel Routing Rules
 
