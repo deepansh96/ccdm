@@ -24,6 +24,7 @@ from ccdmlib.platform import filelock  # noqa: E402
 from ccdmlib.platform.paths import state_root  # noqa: E402
 from ccdmlib.platform.private_fs import fix_hint, is_private  # noqa: E402
 from ccdmlib.platform.services import service_installed  # noqa: E402
+from ccdmlib.platform import commands  # noqa: E402
 
 
 EVENTS_PATH = Path(__file__).with_name("conversation-reminder-events.py")
@@ -871,15 +872,15 @@ def router_prerequisites(registry: dict) -> dict:
         blockers = []
         row = reported.get(name)
         if router is None:
-            blockers.append("the Router is not reachable; start the Router "
-                            "(scripts/install-router-service.sh, or scripts/router.js serve)")
+            blockers.append(f"the Router is not reachable; start the Router ({commands.start_router_hint()})")
         if not projects[name].get("webhook_id") or (row is not None and not row.get("webhook")):
-            blockers.append(f"the project's webhook is missing; run scripts/router.js ensure-webhook {name}")
+            blockers.append("the project's webhook is missing; run "
+                            f"{commands.node_script_ref('router.js')} ensure-webhook {name}")
         if router is not None and row is not None:
             missing = row.get("missing_permissions")
             if missing is None:
                 blockers.append("the Router is not connected to Discord yet; retry once "
-                                "scripts/router.js status shows the gateway ready")
+                                f"{commands.node_script_ref('router.js')} status shows the gateway ready")
             for flag in missing or []:
                 label = ROOT_PERMISSION_NAMES.get(flag, flag)
                 blockers.append(f"root lacks {label} in the project channel; grant root permission {label} in "
@@ -987,13 +988,13 @@ def readiness_report(project_root: Path, state_dir: Path, db: sqlite3.Connection
             blockers.append("adapter: " + "; ".join(issues))
         if not running:
             blockers.append("foreground worker is not running; start `run` or rerun "
-                            "scripts/install-conversation-reminder-service.sh to relaunch the LaunchAgent")
+                            f"{commands.installer_ref('reminders')} to {commands.relaunch_service()}")
         elif observation != "ready-observe-only":
             blockers.append("observation: " + observation)
         if not conversation:
             blockers.append("history: untracked; no conversation state exists for this project yet. Clear the "
                             "adapter and assignment blockers, then start the worker (`run`, or rerun "
-                            "scripts/install-conversation-reminder-service.sh) so it records and discovers the "
+                            f"{commands.installer_ref('reminders')}) so it records and discovers the "
                             "channel; after a registration change run assignment-changed --project " + name)
         elif history != "ready":
             reason = (conversation.get("discovery") or {}).get("reason")
@@ -1123,7 +1124,7 @@ def status(state_dir: Path, project_root: Path | None = None) -> dict:
                 "conversations": conversations, "unresolved_intents": unresolved,
                 "pending_actions": pending, "retired_assignments": retired,
                 "assignment_guidance": ("Blocked projects reuse a retired assignment generation. After confirming "
-                                        "the registration, run scripts/conversation-reminder-service.py "
+                                        f"the registration, run {commands.reminders_ref()} "
                                         "assignment-changed --project " + ", ".join(sorted(blocked)) + "."
                                         if blocked else None),
                 "recovery_guidance": ("Run recover after restoring root's channel access. Recovery identifies a lost "

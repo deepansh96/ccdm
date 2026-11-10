@@ -1301,7 +1301,7 @@ test("root's launch settings carry the statusLine command on Windows and are unc
   assert.deepEqual(JSON.parse(fs.readFileSync(files.mcp, "utf8")).mcpServers.ccdm.args, channelServerArgs(workspace));
 });
 
-test("on Windows, restart-root --provider codex is refused with a message naming the pending decision, and nothing changes", platformGate("win32", "the refusal is Windows-only; root Codex runs on Linux and macOS"), async () => {
+test("on Windows, restart-root --provider codex is refused in plain words that name the command for root Claude, and nothing changes", platformGate("win32", "the refusal is Windows-only; root Codex runs on Linux and macOS"), async () => {
   const workspace = createRouterWorkspace();
   await startRouter(workspace);
   seedRootCodexFiles(workspace);
@@ -1317,7 +1317,10 @@ test("on Windows, restart-root --provider codex is refused with a message naming
     const result = await restartRoot(workspace, { script, args });
 
     assert.equal(result.exitCode, 1, `${script}: ${result.stdout}`);
-    assert.match(result.stderr, /^Root Codex is not available on Windows yet: the Windows root is Claude-only until the owner's decision on a Codex root there \(D2\) is made\./);
+    // In plain words, with the command that does work, and no label of a decision record.
+    assert.equal(result.stderr.trim(), "Root Codex is not available on Windows yet: the Windows root is Claude only for now. " +
+      "Run scripts/ccdm restart-root for root Claude.");
+    assert.doesNotMatch(result.stderr, /\bD\d\b|owner's decision/);
     assert.equal(result.stdout, "");
   }
   assert.deepEqual(changes(workspace), []);

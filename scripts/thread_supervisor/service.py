@@ -16,6 +16,7 @@ import subprocess
 import sys
 
 from ccdmlib.platform.private_fs import fix_hint, is_private
+from ccdmlib.platform.commands import start_router_hint
 
 from . import registry, store
 from .paths import private_directory, write_private
@@ -84,8 +85,7 @@ def _router_blockers() -> list[str]:
         reachable = completed.returncode == 0 and isinstance(json.loads(completed.stdout), dict)
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         reachable = False
-    return [] if reachable else ["the Router is not reachable; start the Router "
-                                 "(scripts/install-router-service.sh, or scripts/router.js serve)"]
+    return [] if reachable else [f"the Router is not reachable; start the Router ({start_router_hint()})"]
 
 
 def preflight(project_root: Path, state_dir: Path) -> dict:

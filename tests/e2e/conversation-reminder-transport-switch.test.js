@@ -191,13 +191,28 @@ test("status and preflight name each missing router prerequisite with its fix, a
   };
   await service(context, "enable");
 
-  // No Router and no webhook yet.
-  const missing = [
+  // No Router and no webhook yet. Each fix is a command this OS has: Windows has
+  // no .sh installer, and runs a Node script through node.
+  const missing = process.platform === "win32" ? [
+    "demo: the Router is not reachable; start the Router (scripts/ccdm install-service router, or node scripts/router.js serve)",
+    "demo: the project's webhook is missing; run node scripts/router.js ensure-webhook demo",
+  ] : [
     "demo: the Router is not reachable; start the Router (scripts/install-router-service.sh, or scripts/router.js serve)",
     "demo: the project's webhook is missing; run scripts/router.js ensure-webhook demo",
   ];
-  assert.deepEqual(routerBlockers(await service(context, "status")),
+  const unstarted = await service(context, "status");
+  assert.deepEqual(routerBlockers(unstarted),
     { ready: false, blockers: missing.map((line) => line.slice("demo: ".length)) });
+  // No worker has run yet: both fixes name the installer this OS has, and what it supervises.
+  const [installer, relaunch] = process.platform === "win32"
+    ? ["scripts/ccdm install-service reminders", "start the scheduled task again"]
+    : ["scripts/install-conversation-reminder-service.sh", "relaunch the LaunchAgent"];
+  const unstartedBlockers = unstarted.readiness.projects.demo.blockers;
+  assert.ok(unstartedBlockers.includes(`foreground worker is not running; start \`run\` or rerun ${installer} to ${relaunch}`),
+    unstartedBlockers.join("\n"));
+  assert.ok(unstartedBlockers.some((line) => line.startsWith("history: untracked; ")
+    && line.includes(`then start the worker (\`run\`, or rerun ${installer}) so it records and discovers the channel`)),
+  unstartedBlockers.join("\n"));
   const blocked = await preflight();
   assert.equal(blocked.exitCode, 2);
   assert.equal(blocked.status, "blocked");

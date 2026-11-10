@@ -104,11 +104,14 @@ const webhookMessages = (workspace) => (readState(workspace.stateDir).fixtures.d
   .filter((message) => message.webhookId)
   .map(({ channelId, webhookId }) => ({ channelId, webhookId }));
 
-// Refused before any runtime change: no key, tmux session, or PID. The Claude
-// launcher names the command the way this OS's lifecycle commands are typed.
+// Refused before any runtime change: no key, tmux session, or PID. Both
+// launchers name the migration on macOS and Linux, and only the webhook command
+// on Windows, which has no migration command.
 function assertRefusedWithoutWebhook(workspace, result, project, screen) {
   assert.equal(result.exitCode, 1, result.stderr || result.stdout);
-  assert.match(result.stderr, new RegExp(`Refusing to start '${project}': it has no webhook_id.*Run scripts/(?:migrate-to-router\\.sh|ccdm migrate-to-router) ${project}`));
+  const fix = process.platform === "win32" ? `Run node scripts/router\\.js ensure-webhook ${project}, then retry`
+    : `Run scripts/migrate-to-router\\.sh ${project} \\(or node scripts/router\\.js ensure-webhook ${project}\\), then retry`;
+  assert.match(result.stderr, new RegExp(`Refusing to start '${project}': it has no webhook_id.*\\. ${fix}`));
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions[screen], undefined);
   assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", `${project}.key`)), false);
   assert.equal(readRegistry(workspace).projects[project].pid, null);
