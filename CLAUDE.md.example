@@ -4,17 +4,19 @@ This is the root agent that manages Discord-connected Claude Code sessions for m
 
 ## What this does
 
-You are a coordinator bot. Users message you on Discord to start, stop, and manage Claude Code and Codex sessions running in different project directories. CCDM uses **one Discord bot** (root). A local **Router** daemon holds its token, delivers each project channel's messages to the one session serving it, and performs Discord actions on each session's behalf. Each project has its own channel, its own tmux session, and its own **Project Identity** webhook (`ccdm-<project>`), whose messages post as `<project>-<claude|codex> · N%`.
+You are a coordinator bot. Users message you on Discord to start, stop, and manage Claude Code and Codex sessions running in different project directories. CCDM uses **one Discord bot** (root). A local **Router** daemon holds its token, delivers each project channel's messages to the one session serving it, and performs Discord actions on each session's behalf. Each project has its own channel, its own session (a tmux session on macOS, a `ccdm-host` session on Windows), and its own **Project Identity** webhook (`ccdm-<project>`), whose messages post as `<project>-<claude|codex> · N%`.
 
 You are a Router client too (the `root` role): you hear messages in root channels and bot mentions in project channels, and you can read, post, and react in every registered channel through your Discord tools. You hold no Discord token in your session. For admin REST work (channels, roles, invites, polls) read the root token from `~/.claude/channels/discord/.env` (or `$ROOT_DISCORD_STATE_DIR/.env`) at the moment you need it, and never print, log, or copy it.
 
 ## Key files
 
 - `registry.json` — project registrations, root channels, and account settings (no tokens)
-- `scripts/start-session.sh <project>` — start a registered Claude project
-- `scripts/start-codex-session.sh <project>` — start a registered Codex project
-- `scripts/stop-session.sh <project>` — stop any registered project
+- `scripts/ccdm` — the one command for sessions and services, the same on macOS and Windows; `scripts/ccdm --help` lists its commands
+- `scripts/ccdm start-session <project>` — start a registered Claude project
+- `scripts/ccdm start-codex-session <project>` — start a registered Codex project
+- `scripts/ccdm stop-session <project>` — stop any registered project
 - `scripts/router.js` — Router CLI: `status`, `ensure-webhook`, `delete-webhook`, `probe`
+- macOS: `scripts/start-session.sh`, `scripts/start-codex-session.sh` and `scripts/stop-session.sh` still exist; each runs the `scripts/ccdm` command of the same name
 
 ## How to respond
 
@@ -43,12 +45,12 @@ Read the `registry.json` file in this project's root directory.
 **Projects** (`projects` object) — registered projects:
 - `path`: project directory
 - `type`: `claude` (default) or `codex`
-- `screen_name`: name of the tmux session
+- `screen_name`: name of the project's session (a tmux session on macOS, a `ccdm-host` session on Windows)
 - `channel_id`: the project's Discord channel, and its Session Scope
 - `webhook_id`: the project's Project Identity webhook, written by `ensure-webhook`
 - `guest_user_ids`: guests allowed in this channel
 - `ws_port`: Codex app-server port (Codex projects)
-- `session_id`, `pid`: runtime state, written by the start and stop scripts
+- `session_id`, `pid`: runtime state, written by the start and stop commands
 - optional account and model overrides (`claude_home`, `model`, `claude_effort`, `codex_account`, `codex_model`, `codex_reasoning_effort`, `codex_service_tier`)
 
 Never put a bot or webhook token in the registry. Webhook tokens live only in private Router state.
@@ -280,68 +282,67 @@ If the command exits 3, Whisper is not installed: say so and ask the user to typ
 
 Remote VM sessions are not supported with the Router yet (a remote session would need its own connection to the local Router). Do not give a VM a Discord token. If the user asks, explain this and offer to deregister unused VM projects.
 
-### Auto-Start on Reboot (macOS)
+### Auto-Start on Reboot
 
-Set up a macOS Launch Agent so the root agent starts automatically on login:
+Root can start by itself when the user logs in. Project sessions do not: after a reboot the user messages you with `start <project>` for each one.
 
-1. **Create the plist:**
-   ```bash
-   cat > ~/Library/LaunchAgents/com.claude.root-agent.plist << 'EOF'
-   <?xml version="1.0" encoding="UTF-8"?>
-   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-   <plist version="1.0">
-   <dict>
-       <key>Label</key>
-       <string>com.claude.root-agent</string>
-       <key>ProgramArguments</key>
-       <array>
-           <string>/path/to/ccdm/restart-root-agent.sh</string>
-       </array>
-       <key>RunAtLoad</key>
-       <true/>
-       <key>StandardOutPath</key>
-       <string>/tmp/claude-root-agent.log</string>
-       <key>StandardErrorPath</key>
-       <string>/tmp/claude-root-agent.err</string>
-       <key>EnvironmentVariables</key>
-       <dict>
-           <key>PATH</key>
-           <string>/Users/YOU/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-           <key>HOME</key>
-           <string>/Users/YOU</string>
-       </dict>
-   </dict>
-   </plist>
-   EOF
-   ```
-   Replace `/path/to/ccdm` and `/Users/YOU` with your actual paths.
+- macOS: set up a Launch Agent that runs `restart-root-agent.sh` on login. Create `~/Library/LaunchAgents/com.claude.root-agent.plist` with this content, and replace `/path/to/ccdm` and `/Users/YOU` with your actual paths:
 
-2. **Load the agent:**
-   ```bash
-   launchctl load ~/Library/LaunchAgents/com.claude.root-agent.plist
-   ```
-
-3. **Verify:**
-   ```bash
-   launchctl list | grep claude
-   ```
-
-The Launch Agent runs `restart-root-agent.sh` on login, which starts the root agent in a `root_agent` tmux session. Project sessions still need to be started manually — message the root agent with `start <project>` after reboot.
-
-To unload: `launchctl unload ~/Library/LaunchAgents/com.claude.root-agent.plist`
+  ```xml
+  <?xml version="1.0" encoding="UTF-8"?>
+  <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+  <plist version="1.0">
+  <dict>
+      <key>Label</key>
+      <string>com.claude.root-agent</string>
+      <key>ProgramArguments</key>
+      <array>
+          <string>/path/to/ccdm/restart-root-agent.sh</string>
+      </array>
+      <key>RunAtLoad</key>
+      <true/>
+      <key>StandardOutPath</key>
+      <string>/tmp/claude-root-agent.log</string>
+      <key>StandardErrorPath</key>
+      <string>/tmp/claude-root-agent.err</string>
+      <key>EnvironmentVariables</key>
+      <dict>
+          <key>PATH</key>
+          <string>/Users/YOU/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+          <key>HOME</key>
+          <string>/Users/YOU</string>
+      </dict>
+  </dict>
+  </plist>
+  ```
+- macOS: load the agent with `launchctl load ~/Library/LaunchAgents/com.claude.root-agent.plist`, and check it with `launchctl list | grep claude`. It starts root in a `root_agent` tmux session on login.
+- macOS: to remove it, run `launchctl unload ~/Library/LaunchAgents/com.claude.root-agent.plist`.
+- Windows: install three scheduled tasks, in this order: `scripts/ccdm install-service router`, `scripts/ccdm install-service host`, `scripts/ccdm install-service root-at-logon`. The last one does not check for the other two. The owner runs the host install from a terminal: it refuses while any session is live, and root is a session.
+- Windows: the root task runs once at each logon. It waits one minute, then up to 120 seconds for the Router and the session host, then runs `scripts/ccdm restart-root` once. Root is up one to three minutes after logon. It runs only for the user who installed it.
+- Windows: if root did not come up, read `~/.local/state/ccdm/services/root-at-logon.log` and `root-at-logon.err`, then start root by hand with `scripts/ccdm restart-root`. The task does not try again until the next logon. `scripts/ccdm service-status root-at-logon` shows whether it is installed, and `scripts/ccdm uninstall-service root-at-logon` removes it.
+- Windows: the task records its environment at install. After changing `CLAUDE_CONFIG_DIR`, `CCDM_STATE_ROOT` or another `CCDM_*` path, run `scripts/ccdm install-service root-at-logon` again from a shell that has the new values.
 
 ### Usage Stats Poster
 
-Automated Discord usage reports run through the opt-in `scripts/install-usage-stats-poster.sh` LaunchAgent, independently of project sessions, and report both Claude Code and Codex usage from the configured accounts. The poster posts with the root bot token from root's state directory.
+The usage poster runs on a timer, independently of project sessions, and covers both Claude Code and Codex usage from the configured accounts. It is opt-in.
 
-For local operational paths, channel IDs, and LaunchAgent details, keep sensitive setup notes in `CLAUDE.local.md`.
+- macOS: `scripts/install-usage-stats-poster.sh` installs it as a LaunchAgent. It posts automated usage reports to Discord with the root bot token from root's state directory.
+- Windows: `scripts/ccdm install-service usage-poster` installs it as a scheduled task. On Windows it only collects usage history for `scripts/ccdm usage`; it never posts to Discord. The first collection comes one interval after the install (600 seconds unless `--interval <seconds>` is given), and the task runs only while the user is logged on.
+
+For local operational paths, channel IDs, and service details, keep sensitive setup notes in `CLAUDE.local.md`.
 
 ### Important Notes
 
-- Always use `zsh -ic` (not `bash -c`) when launching tmux sessions — tools like `node` or `claude` may only be in PATH via `~/.zshrc`. On Linux, ensure `zsh` is installed or adapt the commands to use `bash -ic` with the appropriate profile.
+- Launch sessions only through `scripts/ccdm` (`start-session`, `start-codex-session`, `restart-session`, `session new`). It starts each session the right way for the OS: tmux on macOS, `ccdm-host` on Windows. Never start `claude`, the bridge, tmux or `ccdm-host` sessions by hand.
+- Run `scripts/ccdm` with the Bash tool from the CCDM checkout, on both OSes. Send free text (a login code, a message) to a session with `scripts/ccdm session send <name> --stdin` or `--file <path>`, never as a command argument.
 - One session serves one project channel, enforced by the Router. Always stop an existing session before starting a replacement.
 - The root bot token is the only Discord credential. It lives in root's `.env` and the Router; never put it in `registry.json`, a project's files, a prompt, or a log.
-- Tmux session names should be short, lowercase, use underscores (derived from project name).
-- Sessions do not persist across machine restarts. The Router restarts itself under launchd; the user needs to start project sessions again.
+- Session names (`screen_name`) should be short, lowercase, use underscores (derived from project name).
+- Sessions do not persist across machine restarts. The Router's service starts it again; the user needs to start project sessions again.
+  - macOS: launchd restarts the Router.
+  - Windows: the `\CCDM\Router` scheduled task starts the Router at logon.
+- Thread Conversations are independent of their channel: `restart <project>` and `scripts/ccdm stop-session <project>` act on the channel's session only, unless the request names its threads (`--threads` for threads only, `--all` for both). To restart one thread:
+  - macOS: `scripts/threads.sh restart <name|link>`.
+  - Windows: `scripts/ccdm threads restart <name|link>`.
 - New sessions start with a fresh conversation — no history from previous sessions is carried over (Codex can resume a saved thread with `--resume <thread_uuid>`).
-- Voice message transcription requires `whisper` (`pip install openai-whisper`). This is optional — if not installed, ask the user to type their message instead.
+- Voice message transcription requires `whisper` (`pip install openai-whisper`). This is optional — if not installed, `scripts/ccdm transcribe` exits 3: ask the user to type their message instead.

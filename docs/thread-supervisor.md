@@ -36,7 +36,8 @@ Created threads use a one-week archive duration (`auto_archive_duration: 10080`)
 The session starts on the first owner or guest message, or at once when a first message was given:
 
 1. 👀 shows on the triggering message while the session boots.
-2. The supervisor runs `scripts/start-thread-session.sh <project> <thread_id> --provider …` with a fresh `keys/.thread-<thread_id>.key`, the launch dir `launches/<project>/threads/<thread_id>/`, and the session `<screen>-t-<thread_id>` (a tmux session on macOS, a `ccdm-host` session on Windows).
+2. The supervisor runs the thread launcher, the code behind `scripts/ccdm start-thread-session <project> <thread_id> --provider …`, in its own process, with a fresh `keys/.thread-<thread_id>.key`, the launch dir `launches/<project>/threads/<thread_id>/`, and the session `<screen>-t-<thread_id>` (a tmux session on macOS, a `ccdm-host` session on Windows).
+   - macOS: `scripts/start-thread-session.sh` runs the same launcher from a terminal.
 3. Every message sent during boot is delivered exactly once, in the first prompt, together with the starter. The starter goes only into a conversation's first boot; a resume does not repeat it.
 4. 👀 is removed when the session is live. A failed start posts a one-line reason and is not retried automatically; the next eligible message retries.
 
@@ -89,7 +90,8 @@ A live session that dies while the supervisor runs is marked `crashed` as soon a
 - **Channel move:** closes the threads (`closed/project-moved`), because the moved webhook cannot post into the old channel's threads. Each thread remembers the channel it was bound under, so a move made while the supervisor was down closes them on its next start.
 - **Path set to `remote:`:** the project now runs on another machine, which has no thread sessions, so its threads close the same way (`closed/project-moved`).
 - **Guest changes:** apply on the next message.
-- **Channel maintenance:** `restart <project>`, `start-session.sh <project>`, `stop-session.sh <project>` and a project key rotation act on the Channel Conversation only. `stop-session.sh <project> --threads` stops the thread sessions only, and `--all` stops both.
+- **Channel maintenance:** `restart <project>`, `scripts/ccdm start-session <project>`, `scripts/ccdm stop-session <project>` and a project key rotation act on the Channel Conversation only. `scripts/ccdm stop-session <project> --threads` stops the thread sessions only, and `--all` stops both. The commands are the same on macOS and Windows.
+  - macOS: `scripts/start-session.sh <project>` and `scripts/stop-session.sh <project> --threads` (or `--all`) run the same commands.
 
 ## Conversation Reminders
 
@@ -119,9 +121,10 @@ The worker writes a fresh `keys/.supervisor.key` in the Router state on each sta
 - **Inspect** with `scripts/thread-supervisor.py status`. It shows the worker, the caps (and any invalid value) and every bound thread with its state.
 - **Disable / enable** with `scripts/thread-supervisor.py disable` and `enable`. While disabled, the supervised worker exits and launchd does not relaunch it. `enable` only clears the disabled marker; it does not start the worker. Rerun `scripts/install-thread-supervisor.sh` afterwards to relaunch the LaunchAgent.
 - **Debug in the foreground** with `scripts/thread-supervisor.py disable`, then `scripts/thread-supervisor.py run`. A second worker exits with status 2 while the lock is held.
-- **Operate threads** with the operator's thread command: `list [<project>]` prints each bound thread, and `stop|restart|close [<project>] <name|link|id>` acts on one. The output and exit codes are the same on both OSes. `send-claude-command.sh`, guest access (which acts on the parent project) and `export-discord-range.js` also accept a thread id.
+- **Operate threads** with the operator's thread command: `list [<project>]` prints each bound thread, and `stop|restart|close [<project>] <name|link|id>` acts on one. The output and exit codes are the same on both OSes. `scripts/ccdm send-claude-command`, guest access (which acts on the parent project) and `export-discord-range.js` also accept a thread id.
   - macOS: `scripts/threads.sh list [<project>]` and `scripts/threads.sh stop|restart|close [<project>] <name|link|id>`.
   - Windows: `scripts/ccdm threads list [<project>]` and `scripts/ccdm threads stop|restart|close [<project>] <name|link|id>`.
+  - macOS: `scripts/send-claude-command.sh` runs `scripts/ccdm send-claude-command`.
 - **Router view:** `node scripts/router.js status` lists each `thread` connection, the supervisor line, and root's missing thread permissions while threads are enabled.
 - **Windows:** the service is the scheduled task `\CCDM\ThreadSupervisor`, which runs the same `run --supervised` worker and restarts it after a failure.
   - Install with `scripts/ccdm install-service thread-supervisor`. It runs the same read-only `preflight` first; on a blocker it prints each one, exits 2 and changes nothing. It also refuses while a worker started by hand holds the lock.
