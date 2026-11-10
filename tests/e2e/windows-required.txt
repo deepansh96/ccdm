@@ -69,3 +69,5 @@ tests/e2e/mimo-setup.test.js
 tests/e2e/ccdm-usage.test.js
 tests/e2e/thread-commands.test.js
 tests/e2e/thread-operations.test.js
+tests/e2e/windows-installer-thread-supervisor.test.js
+tests/e2e/windows-installer-reminders.test.js
