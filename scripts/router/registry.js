@@ -32,6 +32,14 @@ async function readRegistry(file) {
 const isObject = value => value !== null && typeof value === "object" && !Array.isArray(value);
 const isId = value => (typeof value === "string" && value.trim() !== "") || (Number.isInteger(value) && value > 0);
 
+// How scripts/guest-access.js lets a guest into a project channel, set by the
+// top-level `guest_mode`. Absent or "roles": one guest role per project.
+// "member-overwrites": per-member channel overwrites and no role, for a bot
+// without server-wide Manage Roles. "none": no new guests on this registry.
+const GUEST_MODES = ["roles", "member-overwrites", "none"];
+const guestModeProblem = value => (value == null || GUEST_MODES.includes(value) ? null
+  : 'guest_mode must be "roles", "member-overwrites" or "none"');
+
 // Rejects a registry the Router cannot route safely, so a reload keeps the
 // last good table instead of publishing (and revoking sessions over) a
 // half-understood one: the owner, collection types, each project's channel,
@@ -41,6 +49,7 @@ function validateRegistry(registry) {
   if (!isObject(registry)) throw new Error("invalid registry: the top level must be a JSON object");
   if (!isId(registry.discord_user_id)) problems.push("discord_user_id (the owner) must be a Discord ID");
   if (registry.guild_id != null && !isId(registry.guild_id)) problems.push("guild_id must be a Discord ID");
+  if (guestModeProblem(registry.guest_mode)) problems.push(guestModeProblem(registry.guest_mode));
   for (const field of ["root_channels", "root_allowed_user_ids"]) {
     if (registry[field] != null && !(Array.isArray(registry[field]) && registry[field].every(isId))) {
       problems.push(`${field} must be a list of Discord IDs`);
@@ -402,8 +411,8 @@ async function updateRegistry(file, updater) {
 }
 
 module.exports = {
-  DEFAULT_RELOAD_DEBOUNCE_MS, buildRoutingTable, loadRoutingTable, readRegistry, updateRegistry, validateRegistry, watchRegistry,
-  withRegistryLock,
+  DEFAULT_RELOAD_DEBOUNCE_MS, GUEST_MODES, buildRoutingTable, guestModeProblem, loadRoutingTable, readRegistry, updateRegistry,
+  validateRegistry, watchRegistry, withRegistryLock,
   // For the E2E suite's stale-lock race checks.
   _lockInternals: { deadKey, reclaim },
 };

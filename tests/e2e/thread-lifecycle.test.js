@@ -337,7 +337,7 @@ db = sqlite3.connect(sys.argv[1], timeout=5)
 print(json.dumps(db.execute("SELECT runtime_pid FROM threads WHERE thread_id = ?", (sys.argv[2],)).fetchone()[0]))`,
 path.join(supervisorStateDir(workspace), "threads.sqlite3"), THREAD_ID], { encoding: "utf8" }));
 
-test("a resumed Claude session whose session id cannot be read keeps the known conversation id", platformGate("posix", "on ccdm-host the launcher finds Claude by its session file, so a launch without one fails"), async () => {
+test("a resumed Claude session whose session id cannot be read keeps the known conversation id", async () => {
   const workspace = threadWorkspace();
   await supervised(workspace);
   const conversationId = await stoppedThread(workspace);

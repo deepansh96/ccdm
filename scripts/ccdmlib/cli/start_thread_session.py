@@ -458,7 +458,7 @@ class _ThreadLaunch:
             return self._give_up(template.format(f"{self.timeout:g}") if template else reason)
 
         # The Claude listener's PID, and its session id from <claude_home>/sessions/<pid>.json.
-        pid, started_at = _launch.find_claude_process(self.name, self.key_file, self.claude_home)
+        pid, started_at = _launch.find_claude_process(self.name, self.key_file, self.claude_home, self.launch_dir)
         if not pid:
             return self._give_up("The thread session's Claude process could not be found")
         session_id = _launch.read_session_id(self.claude_home, pid)
