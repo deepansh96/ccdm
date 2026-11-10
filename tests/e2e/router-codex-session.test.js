@@ -4,7 +4,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { assertPrivate, platformGate } from "./support/platform.js";
-import { injectDiscordMessage, injectDiscordReaction, startFakeCodexServer, waitForState } from "./support/bridge.js";
+import { injectDiscordMessage, injectDiscordReaction, startFakeCodexServer, waitForFinishedTurns, waitForState } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import {
   OWNER_ID,
@@ -494,6 +494,9 @@ test("a guest granted after a router Codex launch reaches the thread without a r
   injectDiscordMessage(workspace, { id: "guest-message", channelId: "demo-channel", content: "can you help?", author: guest });
   const replied = await waitForState(workspace, (next) => webhookContents(next).includes("hello guest"), 15000);
   const [reply] = replied.fixtures.discord.messages;
+  // The reply is visible before its turn ends, and a reaction sent before the
+  // bridge is idle would steer that turn. Two turns: the bootstrap, then this one.
+  await waitForFinishedTurns(workspace, 2);
   injectDiscordReaction(workspace, {
     id: "guest-thumbs-up", channelId: "demo-channel", emoji: "👍", messageId: reply.id, user: guest,
     message: { author: { bot: true, id: "fake-webhook-1", username: "demo-codex" }, webhookId: "fake-webhook-1", content: "hello guest" },
