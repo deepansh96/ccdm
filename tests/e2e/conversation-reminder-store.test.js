@@ -21,6 +21,14 @@ test.afterEach(async () => cleanup());
 
 const windowsOnly = platformGate("win32", "Windows access lists and scheduled tasks; POSIX modes and the plist are checked elsewhere");
 
+// A Python snippet run by the harness Python on every OS; its stdout parsed as JSON.
+function pythonJson(lines, args) {
+  const script = ["import json, sys", "sys.dont_write_bytecode = True", ...lines].join("\n");
+  const probe = spawnSync(PYTHON, ["-c", script, ...args], { encoding: "utf8" });
+  assert.equal(probe.status, 0, probe.stderr);
+  return JSON.parse(probe.stdout);
+}
+
 test("the worker reads a ledger with no events table as empty, and still surfaces other database errors", async () => {
   const workspace = createBridgeWorkspace();
   const script = path.join(workspace.repoDir, "scripts", "conversation-reminder-service.py");
@@ -53,12 +61,12 @@ print(json.dumps([empty, error(lambda: service.event_rows(state)), error(lambda:
 
 test("a status read waits for the first event's table, and a ledger that never gets one stays unavailable", async () => {
   const workspace = createBridgeWorkspace();
-  const result = await pythonProbe(workspace, "first-event-window.py", [
+  const result = pythonJson([
     "import importlib.util, os, threading, time",
     "from pathlib import Path",
-    "spec = importlib.util.spec_from_file_location('events', sys.argv[2])",
+    "spec = importlib.util.spec_from_file_location('events', sys.argv[1])",
     "events = importlib.util.module_from_spec(spec); spec.loader.exec_module(events)",
-    "state = Path(sys.argv[3]); events.private_directory(state)",
+    "state = Path(sys.argv[2]); events.private_directory(state)",
     // The moment after the first event has created the file and before it has created the table.
     "os.close(os.open(events.database_path(state), os.O_WRONLY | os.O_CREAT, 0o600))",
     "started = time.monotonic()",
@@ -84,12 +92,12 @@ test("a status read waits for the first event's table, and a ledger that never g
 
 test("a command waits out another process's store write that lasts four seconds", async () => {
   const workspace = createBridgeWorkspace();
-  const result = await pythonProbe(workspace, "slow-store-write.py", [
+  const result = pythonJson([
     "import importlib.util, sqlite3, threading, time",
     "from pathlib import Path",
-    "spec = importlib.util.spec_from_file_location('service', sys.argv[2])",
+    "spec = importlib.util.spec_from_file_location('service', sys.argv[1])",
     "service = importlib.util.module_from_spec(spec); spec.loader.exec_module(service)",
-    "state = Path(sys.argv[3])",
+    "state = Path(sys.argv[2])",
     "service.connect(state, create=True).close()",
     "held = threading.Event()",
     // Another reminder process whose write section is slow to reach the disk.
