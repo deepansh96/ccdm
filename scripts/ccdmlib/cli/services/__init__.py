@@ -43,21 +43,13 @@ from xml.sax.saxutils import escape
 from ...platform import exe, private_fs, proc
 from ...platform.atomic import replace_with_retry
 from ...platform.paths import is_abs, state_root
+from ...platform.services import SERVICE_TASKS  # the one table; services.js holds its twin
 
 WIN32 = sys.platform == "win32"
 ROOT_DIR = Path(__file__).resolve().parents[4]
 SCRIPTS_DIR = ROOT_DIR / "scripts"
 WIN_DIR = SCRIPTS_DIR / "win"
 
-# scripts/platform/services.js holds the same table; a test compares them.
-SERVICE_TASKS: Dict[str, str] = {
-    "router": "Router",
-    "host": "Host",
-    "thread-supervisor": "ThreadSupervisor",
-    "reminders": "Reminders",
-    "usage-poster": "UsagePoster",
-    "root-at-logon": "RootAtLogon",
-}
 _POSIX_INSTALLERS = {
     "router": "install-router-service.sh",
     "thread-supervisor": "install-thread-supervisor.sh",
