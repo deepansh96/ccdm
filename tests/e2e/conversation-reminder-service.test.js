@@ -1082,12 +1082,13 @@ test("connection failures that never reached Discord back off with a finite incr
     timeoutMs: 10000,
   });
   await waitForState(workspace, state => state.fixtures.discord.connectFailureUses === 1);
-  await new Promise(resolve => setTimeout(resolve, 250));
+  // Each retry time counts from the clock when its failure is recorded.
+  await waitFor(() => refusalsWithRetryTime(stateDir).length === 1, () => "the first failure to be recorded", 15000);
   // A refused connection is a definite failure, never an uncertain send.
   assert.equal((await command(workspace, stateDir, "status")).conversations.demo.reconciliation_status, "ready");
   fs.writeFileSync(clockFile, "2026-09-24T11:00:05Z");
   await waitForState(workspace, state => state.fixtures.discord.connectFailureUses === 2);
-  await new Promise(resolve => setTimeout(resolve, 250));
+  await waitFor(() => refusalsWithRetryTime(stateDir).length === 2, () => "the second failure to be recorded", 15000);
   fs.writeFileSync(clockFile, "2026-09-24T11:00:14Z");
   await new Promise(resolve => setTimeout(resolve, 600));
   assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 0);

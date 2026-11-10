@@ -218,12 +218,17 @@ test("a router Claude launch loads the hooks but no reminder proxy", async () =>
   ];
   for (const text of surfaces) assert.equal(text.includes("claude-reminder-channel"), false, text.slice(0, 200));
   const settings = JSON.parse(fs.readFileSync(path.join(launchDir, "settings.json"), "utf8"));
-  // Claude Code runs hooks through Git Bash on Windows, so the path has forward slashes there.
-  const hookScript = path.join(workspace.repoDir, "scripts", "claude-reminder-hook.js");
-  const hook = `node '${process.platform === "win32" ? hookScript.replaceAll("\\", "/") : hookScript}'`;
+  // Claude Code runs commands through Git Bash on Windows, so paths have forward slashes there.
+  const windows = process.platform === "win32";
+  const run = (script) => {
+    const file = path.join(workspace.repoDir, "scripts", script);
+    return `node '${windows ? file.replaceAll("\\", "/") : file}'`;
+  };
   assert.deepEqual(settings, {
     enabledPlugins: { "discord@claude-plugins-official": false },
     hooks: Object.fromEntries(["SessionStart", "Stop", "StopFailure", "SessionEnd"].map((event) =>
-      [event, [{ hooks: [{ type: "command", command: hook }] }]])),
+      [event, [{ hooks: [{ type: "command", command: run("claude-reminder-hook.js") }] }]])),
+    // A Windows launch also carries its context status line.
+    ...(windows ? { statusLine: { type: "command", command: run("statusline-context.js") } } : {}),
   });
 });
