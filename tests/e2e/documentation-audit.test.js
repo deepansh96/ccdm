@@ -836,3 +836,199 @@ test("the thread operator doc and the e2e README name the launcher and shims as 
   }
   assert.match(readme, /`thread-operations\.test\.js`[^\n]*`scripts\/threads\.sh` on macOS and Linux, `scripts\/ccdm threads` on Windows/);
 });
+
+// --- The README's Windows section --------------------------------------------
+// A Windows user sets CCDM up from this section alone, so it is checked against
+// the commands the code registers.
+
+const WINDOWS_SECTION = "## Running on Windows";
+
+function windowsSection() {
+  const lines = operatorReadme.split(/\r?\n/);
+  const range = sectionRange(lines, WINDOWS_SECTION);
+  assert.ok(range, `README.md has no "${WINDOWS_SECTION}" section`);
+  return lines.slice(range[0], range[1]);
+}
+
+// The service names `install-service` knows, as the command itself lists them
+// when it refuses an unknown one. Nothing is installed, read or changed.
+function knownServices() {
+  const result = spawnSync(PYTHON, [path.join("scripts", "ccdm.py"), "service-status", "no-such-service"], {
+    encoding: "utf8",
+    env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1", PYTHONUTF8: "1" },
+    windowsHide: true,
+  });
+  assert.equal(result.status, 2, `ccdm service-status no-such-service should refuse: ${result.stderr}`);
+  const listed = /known: ([a-z, -]+)/.exec(result.stderr);
+  assert.ok(listed, `could not read the service names: ${result.stderr}`);
+  return new Set(listed[1].split(",").map(name => name.trim()).filter(Boolean));
+}
+
+test("the README has a Windows section that covers setup, services, guests, sleep, limits and two machines", () => {
+  const lines = windowsSection();
+  const section = lines.join("\n");
+  for (const heading of [
+    "### Step 1: Install the tools",
+    "### Step 2: Turn on symlinks, then clone",
+    "### Step 3: Create the Windows bot and its category",
+    "### Step 4: Run setup",
+    "### Step 5: Install the services",
+    "### Step 6: Start root and register a project",
+    "### Everyday commands",
+    "### Guests on Windows",
+    "### Context % on Windows",
+    "### Preventing sleep on Windows",
+    "### Auto-start on Windows",
+    "### Troubleshooting on Windows",
+    "### Limitations on Windows",
+    "### Multiple machines",
+  ]) {
+    assert.ok(lines.includes(heading), `the Windows section has no "${heading}"`);
+  }
+  for (const phrase of [
+    // Prerequisites and the clone.
+    "Node.js 22.5", "Python 3.11", "py -3", "Git for Windows", "ffmpeg", "Windows Terminal", "openai-whisper",
+    "Developer Mode", "git config --global core.symlinks true", "OneDrive", "npm ci",
+    // Setup and the bot.
+    "pwsh -NoProfile -File setup.ps1", "Win+V", "Message Content Intent", "View Audit Log", "Manage Permissions",
+    "deny View Channel", "CLAUDE.local.md",
+    // Services.
+    "scripts\\ccdm install-service router", "scripts\\ccdm install-service host",
+    "scripts\\ccdm install-service thread-supervisor", "scripts\\ccdm install-service root-at-logon",
+    "scripts\\ccdm install-service reminders", "scripts\\ccdm install-service usage-poster", "--collect-only",
+    "never posts to Discord", "scripts\\ccdm service-status", "scripts\\ccdm uninstall-service",
+    "records its environment", "CLAUDE_CONFIG_DIR", "CCDM_CODEX_PATH", "scripts\\ccdm restart-root",
+    // Everyday commands.
+    "scripts\\ccdm threads", "--message-stdin", "--message-file <path>", "scripts\\ccdm usage",
+    "scripts\\ccdm transcribe", "code 3",
+    // Guests.
+    "guest_mode", "\"roles\"", "\"none\"", "\"member-overwrites\"", "what `@everyone` sees",
+    "Revoke every guest before you change `guest_mode`",
+    // Context, sleep and auto-start.
+    "statusLine", "--chain", "AC power", "On battery", "only while you are signed in",
+    "Use my sign-in info to automatically finish setting up after an update", "one to three minutes",
+    // Troubleshooting and limits.
+    "node scripts\\router.js status", "crashloop", "<name>.disabled", "preflight", "<stateRoot>\\services\\<name>.log",
+    "scripts\\ccdm install-service host --force", "--resume <id>", "Signing out of Windows stops",
+    "Root on Windows is Claude only", "-win",
+  ]) {
+    assert.ok(section.includes(phrase), `the Windows section is missing "${phrase}"`);
+  }
+  // Git must be able to make symlinks before the clone is made.
+  const symlinks = section.indexOf("git config --global core.symlinks true");
+  const developerMode = section.indexOf("Turn on Developer Mode");
+  const clone = section.indexOf("git clone ");
+  assert.ok(developerMode >= 0 && developerMode < clone, "Developer Mode must come before the clone");
+  assert.ok(symlinks >= 0 && symlinks < clone, "the symlink setting must come before the clone");
+  assert.ok(clone < section.indexOf("-File setup.ps1"), "the clone must come before setup");
+  // The macOS Quick Start is not for Windows: a line above it points at the section.
+  assert.match(operatorReadme.slice(0, operatorReadme.indexOf("## Prerequisites")), /\[Running on Windows\]\(#running-on-windows\)/);
+});
+
+test("every scripts\\ccdm command in the README's Windows section is registered", () => {
+  const commands = listedCommands();
+  const services = knownServices();
+  const nested = new Map([["threads", threadVerbs()]]);
+  const takesService = new Set(["install-service", "uninstall-service", "service-status"]);
+  assert.ok(commands.has("install-service") && services.has("router"), "could not read the commands or the services");
+  const problems = [];
+  const named = new Set();
+  for (const [index, line] of windowsSection().entries()) {
+    for (const [, sub, word] of line.matchAll(/scripts[\\/]ccdm(?:\.cmd)?\s+([a-z][a-z0-9-]*)(?:\s+([a-z][a-z0-9-]*))?/g)) {
+      named.add(sub);
+      if (!commands.has(sub)) {
+        problems.push(`Windows section line ${index + 1}: scripts\\ccdm ${sub} is not in scripts/ccdm --help`);
+        continue;
+      }
+      if (!word) continue;
+      if (takesService.has(sub)) {
+        if (!services.has(word)) problems.push(`Windows section line ${index + 1}: ${word} is not a service of scripts\\ccdm ${sub}`);
+        continue;
+      }
+      if (!nested.has(sub)) nested.set(sub, listedCommands(sub));
+      if (nested.get(sub).size && !nested.get(sub).has(word)) {
+        problems.push(`Windows section line ${index + 1}: scripts\\ccdm ${sub} ${word} is not a verb of scripts/ccdm ${sub}`);
+      }
+    }
+  }
+  for (const sub of ["install-service", "uninstall-service", "service-status", "restart-root", "start-session",
+    "start-codex-session", "stop-session", "restart-session", "list", "status", "attach", "threads", "reminders", "usage",
+    "transcribe"]) {
+    assert.ok(named.has(sub), `the Windows section never names scripts\\ccdm ${sub}`);
+  }
+  assert.deepEqual(problems, [], `\n${problems.join("\n")}\n`);
+  // Every service the section installs, and every thread verb it uses, is one the code knows.
+  for (const service of ["router", "host", "thread-supervisor", "root-at-logon", "reminders", "usage-poster"]) {
+    assert.ok(services.has(service), `scripts/ccdm does not know the service ${service}`);
+  }
+  for (const verb of ["list", "create", "stop", "restart", "close"]) {
+    assert.ok(nested.get("threads").has(verb), `scripts/ccdm threads has no ${verb}`);
+  }
+});
+
+test("the README's Windows section never offers server-wide Manage Roles and documents the three guest modes", () => {
+  const lines = windowsSection();
+  const naming = lines.filter(line => /Manage Roles/.test(line));
+  assert.ok(naming.length > 0, "the Windows section must say that the bot never gets Manage Roles");
+  for (const line of naming) assert.match(line, /\bnever\b/i, `this line offers Manage Roles: ${line}`);
+  const table = lines.filter(line => /^\| /.test(line)).join("\n");
+  for (const mode of ["\"roles\"", "\"none\"", "\"member-overwrites\""]) {
+    assert.ok(table.includes(`\`${mode}\``), `the guest mode table has no row for ${mode}`);
+  }
+  const section = lines.join("\n");
+  assert.match(section, /`"roles"`[^\n]*never used on Windows/);
+  assert.match(section, /`"none"`[^\n]*Setup writes this value/);
+  assert.match(section, /Keep `"none"` until you have tried `"member-overwrites"` on your server/);
+});
+
+test("the README's Windows section holds no local path, account name, ID or token, and one command per line", () => {
+  const lines = windowsSection();
+  for (const [index, line] of lines.entries()) {
+    const where = `Windows section line ${index + 1}: ${line}`;
+    assert.doesNotMatch(line, /[A-Za-z]:[\\/]Users[\\/]|\/c\/Users\/|\/(?:home|Users)\/[A-Za-z]/, where);
+    assert.doesNotMatch(line, /\b\d{17,20}\b/, where);
+    assert.doesNotMatch(line, /[\w-]{24,}\.[\w-]{6}\.[\w-]{27,}|DISCORD_BOT_TOKEN=\S/, where);
+  }
+  for (const command of fencedLines(lines)) {
+    assert.doesNotMatch(command, /&&|;\s*\S|\|\s*\S/, `more than one command on a line: ${command}`);
+  }
+});
+
+test("the README's Multiple machines part states the mention and resume limits", () => {
+  const lines = windowsSection();
+  const [start, end] = sectionRange(lines, "### Multiple machines");
+  const part = lines.slice(start, end).join("\n");
+  for (const phrase of [
+    "Each machine has its own bot",
+    "Windows project names end in `-win`",
+    "An `@mention` reaches only the bot that can see the channel",
+    "`--resume` works only on that machine",
+    "Only the Mac posts the usage report",
+  ]) {
+    assert.ok(part.includes(phrase), `"Multiple machines" is missing "${phrase}"`);
+  }
+});
+
+test("the README describes the two skills as they work now and installs them on both OSes", () => {
+  const lines = operatorReadme.split(/\r?\n/);
+  const [start, end] = sectionRange(lines, "## Global Skills");
+  const skills = lines.slice(start, end).join("\n");
+  assert.doesNotMatch(skills, /tmux|nohup/);
+  assert.match(skills, /`\/restart-self`[^\n]*`restart-session`[^\n]*`threads restart`[^\n]*`restart-root`/);
+  assert.match(skills, /`\/check-context`[^\n]*`context\.json`/);
+  assert.ok(skills.includes("cp skills/*.md ~/.claude/commands/"), "the macOS install line is gone");
+  assert.ok(skills.includes("Copy-Item skills\\*.md \"$HOME\\.claude\\commands\\\""), "there is no Windows install line");
+  assert.match(skills, /`CLAUDE_CONFIG_DIR`[^\n]*`commands` folder/);
+});
+
+test("the macOS sections of the README are still there", () => {
+  const lines = operatorReadme.split(/\r?\n/);
+  for (const heading of ["## Prerequisites", "## Quick Start", "## Manual Setup", "## Creating the root bot", "## The Router",
+    "## Preventing Sleep", "## Auto-Start on Reboot (macOS)", "## Troubleshooting", "## Limitations"]) {
+    assert.ok(lines.includes(heading), `README.md lost "${heading}"`);
+  }
+  for (const phrase of ["./setup.sh", "scripts/install-router-service.sh", "./restart-root-agent.sh", "brew install tmux",
+    "launchctl load ~/Library/LaunchAgents/com.claude.root-agent.plist"]) {
+    assert.ok(operatorReadme.includes(phrase), `README.md lost "${phrase}"`);
+  }
+});
