@@ -64,7 +64,9 @@ async function threadRow(workspace, threadId, predicate = () => true, timeoutMs 
     if (row && predicate(row)) return row;
     await new Promise(resolve => setTimeout(resolve, 50));
   }
-  throw new Error(`thread ${threadId} never matched: ${JSON.stringify(last)}`);
+  // A failed start posts its reason in the thread, so the thread's posts say why.
+  throw new Error(`thread ${threadId} never matched: ${JSON.stringify(last)}\nposts in the thread: `
+    + JSON.stringify(posts(workspace, threadId).map(({ content, webhookId }) => ({ webhook: Boolean(webhookId), content }))));
 }
 
 const discord = workspace => readState(workspace.stateDir).fixtures.discord;
@@ -622,7 +624,11 @@ test("/compact in a Codex thread reaches only that thread's bridge", async () =>
   await threadRow(workspace, CREATED_THREAD_ID, row => row.ws_port === 29600);
   await codex.listen();
   await threadRow(workspace, CREATED_THREAD_ID, row => row.state === "live" &&
-    row.provider_conversation_id === CODEX_THREAD_UUID);
+    row.provider_conversation_id === CODEX_THREAD_UUID).catch(error => {
+    // What the fake app-server heard tells a launch that never reached it from one it failed.
+    throw new Error(`${error.message}\nfake app-server received: ${JSON.stringify(codex.clientMessages.map(message =>
+      message.method ?? `answer to ${message.id}`))}`);
+  });
   await waitFor(() => replies(workspace, CREATED_THREAD_ID).length === 1, () => "the bootstrap reply", 20000);
 
   threadMessage(workspace, CREATED_THREAD_ID, "compact-1", "/compact");

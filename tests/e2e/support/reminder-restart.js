@@ -96,13 +96,33 @@ export async function stopWorker(workspace, context, running) {
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
 }
 
-export async function waitForStatus(workspace, context, predicate, attempts = 200) {
+// `worker`, when given, is the running service's result promise. A timeout then
+// also says when the wait began and ended, whether the worker had ended by then,
+// and the worker's log (it is asked to stop for it) and the Router's.
+export async function waitForStatus(workspace, context, predicate, attempts = 200, worker = null) {
+  const began = new Date().toISOString();
+  let ended = null;
+  worker?.then(result => { ended = { at: new Date().toISOString(), result }; });
   for (let attempt = 0; attempt < attempts; attempt++) {
     const current = await command(workspace, context, "status");
     if (predicate(current)) return current;
     await new Promise(resolve => setTimeout(resolve, 50));
   }
-  throw new Error(`Timed out waiting for status: ${JSON.stringify(await command(workspace, context, "status"))}`);
+  const last = JSON.stringify(await command(workspace, context, "status"));
+  if (!worker) throw new Error(`Timed out waiting for status: ${last}`);
+  const lines = [`Timed out waiting for status (wait began ${began}, ended ${new Date().toISOString()}): ${last}`];
+  if (ended) {
+    lines.push(`the worker had ended at ${ended.at}: exit ${ended.result.exitCode}, signal ${ended.result.signal}`);
+  } else {
+    await command(workspace, context, "disable");
+    const stopped = await Promise.race([worker, settle(10000).then(() => null)]);
+    lines.push(stopped ? `the worker was still running; asked to stop, it exited ${stopped.exitCode}`
+      : "the worker was still running and did not stop within 10 s");
+    ended = stopped ? { result: stopped } : null;
+  }
+  if (ended) lines.push(`worker stderr:\n${ended.result.stderr}`);
+  if (context.router) lines.push(`Router output:\n${context.router.stdout ?? ""}${context.router.stderr ?? ""}`);
+  throw new Error(lines.join("\n"));
 }
 
 export const reminders = state => (state.fixtures.discord.messages ?? []).filter(row => row.content === "👀");

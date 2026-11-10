@@ -16,6 +16,7 @@ import {
   writeProjectKey,
 } from "./support/router.js";
 import { createWorkspace, runNodeEntrypoint } from "./support/runner.js";
+import { replaceFile } from "./support/platform.js";
 import { readState, seedRegistry, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -955,8 +956,7 @@ test("registry validation accepts the three guest modes or none, and names guest
 // Atomic replace, the way editors and structured rewrites land a registry.
 function replaceRegistry(workspace, registry) {
   const file = path.join(workspace.repoDir, "registry.json");
-  fs.writeFileSync(`${file}.edit`, `${JSON.stringify(registry, null, 2)}\n`);
-  fs.renameSync(`${file}.edit`, file);
+  replaceFile(file, `${JSON.stringify(registry, null, 2)}\n`);
 }
 
 test("an invalid guest_mode keeps the Router's last good table and shows in router status until fixed", async () => {

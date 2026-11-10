@@ -73,13 +73,20 @@ export async function event(workspace, stateDir, type, id, time, fields = {}) {
   assert.equal(JSON.parse(result.stdout).status, "committed");
 }
 
-export async function waitForConversation(workspace, stateDir, predicate) {
+// `worker`, when given, is the running service's result promise: a timeout then
+// says whether it had ended, and with what, beside the last state seen.
+export async function waitForConversation(workspace, stateDir, predicate, worker = null) {
+  let ended = null;
+  worker?.then(result => { ended = result; });
+  let current;
   for (let attempt = 0; attempt < 80; attempt++) {
-    const current = await command(workspace, stateDir, "status");
+    current = await command(workspace, stateDir, "status");
     if (predicate(current.conversations.demo)) return current;
     await new Promise(resolve => setTimeout(resolve, 50));
   }
-  throw new Error("Timed out waiting for conversation state");
+  const service = !worker ? "" : ended
+    ? `\nthe service had ended: exit ${ended.exitCode}, stderr:\n${ended.stderr}` : "\nthe service was still running";
+  throw new Error(`Timed out waiting for conversation state; last: ${JSON.stringify(current?.conversations?.demo)}${service}`);
 }
 
 export async function reconciledExchange(workspace, stateDir) {

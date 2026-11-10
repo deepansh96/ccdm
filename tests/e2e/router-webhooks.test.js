@@ -11,7 +11,7 @@ import {
   runRouterCli,
   waitFor,
 } from "./support/router.js";
-import { assertPrivate } from "./support/platform.js";
+import { assertPrivate, replaceFile } from "./support/platform.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -39,8 +39,7 @@ async function moveChannel(workspace, router, project, channelId) {
   const next = registry(workspace);
   next.projects[project].channel_id = channelId;
   const file = path.join(workspace.repoDir, "registry.json");
-  fs.writeFileSync(`${file}.edit`, `${JSON.stringify(next, null, 2)}\n`);
-  fs.renameSync(`${file}.edit`, file);
+  replaceFile(file, `${JSON.stringify(next, null, 2)}\n`);
   await waitFor(() => reloads() > before, () => `registry reload:\n${router.stdout}\n${router.stderr}`);
 }
 
@@ -150,7 +149,17 @@ for (const [name, loseToken] of [["", false], [" and its private token is lost",
     const secretFile = path.join(workspace.routerStateDir, "webhooks", "demo.json");
     if (loseToken) fs.rmSync(secretFile);
 
-    const result = await demo.client.request("reply", { channel_id: "moved-channel", text: "over here now" });
+    const asked = Date.now();
+    const result = await demo.client.request("reply", { channel_id: "moved-channel", text: "over here now" })
+      .catch(error => {
+        // How far the reply got (a webhook made, the registry rewritten, a post) and
+        // what the Router logged, so a reply that timed out says where it waited.
+        const fake = readState(workspace.stateDir).fixtures.discord;
+        throw new Error(`${error.message} after ${Date.now() - asked} ms; webhooks created: `
+          + `${JSON.stringify((fake.webhookCreates ?? []).map(({ channelId }) => channelId))}, registry webhook_id: `
+          + `${registry(workspace).projects.demo.webhook_id}, posts: ${JSON.stringify(webhookMessages(workspace)
+            .map(({ content, channelId }) => ({ content, channelId })))}\nRouter output:\n${router.stdout}\n${router.stderr}`);
+      });
 
     assert.deepEqual(result, { message_id: "fake-message-1", message_ids: ["fake-message-1"] });
     assert.deepEqual(webhookMessages(workspace).map(({ content, channelId, webhookId }) => ({ content, channelId, webhookId })),

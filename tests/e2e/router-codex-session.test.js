@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { assertPrivate, platformGate } from "./support/platform.js";
+import { assertPrivate, platformGate, replaceFile } from "./support/platform.js";
 import { injectDiscordMessage, injectDiscordReaction, startFakeCodexServer, waitForFinishedTurns, waitForState } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import {
@@ -99,8 +99,7 @@ function updateRegistry(workspace, change) {
   const registryFile = path.join(workspace.repoDir, "registry.json");
   const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
   change(registry);
-  fs.writeFileSync(`${registryFile}.edit`, `${JSON.stringify(registry, null, 2)}\n`);
-  fs.renameSync(`${registryFile}.edit`, registryFile);
+  replaceFile(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
 }
 
 function setPort(workspace, port, fields = {}) {

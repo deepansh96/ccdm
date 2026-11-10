@@ -63,7 +63,7 @@ test("an owner reaction on a recorded Conversation Reminder acknowledges without
       CCDM_REMINDER_NODE: process.execPath, CCDM_REMINDER_CLOCK_FILE: clockFile }),
     timeoutMs: 10000,
   });
-  await waitForConversation(workspace, stateDir, current => current?.reminder_message_id === "fake-message-1");
+  await waitForConversation(workspace, stateDir, current => current?.reminder_message_id === "fake-message-1", running);
   const excluded = JSON.parse(fs.readFileSync(path.join(stateDir, "recorded-reminder-message-ids.json"), "utf8"));
   assert.deepEqual(excluded.message_ids, ["fake-message-1"]);
   injectDiscordReaction(workspace, { channelId: "channel", id: "reaction-on-reminder",
@@ -71,7 +71,7 @@ test("an owner reaction on a recorded Conversation Reminder acknowledges without
   await waitForState(workspace, state => state.fixtures.discord.deliveredReactions.some(row =>
     row.id === "reaction-on-reminder"));
   const current = (await waitForConversation(workspace, stateDir, row =>
-    row?.state === "open-paused" && row.cleanup_message_ids.length === 0)).conversations.demo;
+    row?.state === "open-paused" && row.cleanup_message_ids.length === 0, running)).conversations.demo;
   assert.equal(current.reminder_message_id, null);
   assert.equal(current.due_at, null);
   assert.equal(current.last_ack_message_id, "fake-message-1");

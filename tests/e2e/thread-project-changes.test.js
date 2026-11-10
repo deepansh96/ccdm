@@ -6,13 +6,13 @@ import test from "node:test";
 
 import { injectDiscordMessage } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
-import { PYTHON, platformGate } from "./support/platform.js";
+import { PYTHON, platformGate, replaceFile } from "./support/platform.js";
 import { OWNER_ID, createRouterWorkspace, routerRegistry, routerWithWebhooks, runRouterCli,
   waitFor } from "./support/router.js";
 import { hostOps, tmuxCalls } from "./support/session-fixture.js";
 import { readState, seedTmuxSession, updateState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
-import { startThreadHost, startThreadSupervisor, supervisorEnv, supervisorStateDir,
+import { assertSupervisorStops, startThreadHost, startThreadSupervisor, supervisorEnv, supervisorStateDir,
   supervisorStatus } from "./support/thread-supervisor.js";
 
 test.afterEach(cleanup);
@@ -46,8 +46,7 @@ const readRegistry = workspace => JSON.parse(fs.readFileSync(registryFile(worksp
 function editRegistry(workspace, change) {
   const next = readRegistry(workspace);
   change(next);
-  fs.writeFileSync(`${registryFile(workspace)}.edit`, `${JSON.stringify(next, null, 2)}\n`);
-  fs.renameSync(`${registryFile(workspace)}.edit`, registryFile(workspace));
+  replaceFile(registryFile(workspace), `${JSON.stringify(next, null, 2)}\n`);
 }
 
 // An atomic registry replace, as router-channel-move.test.js makes, once the
@@ -171,7 +170,7 @@ test("a channel move while the supervisor was down closes the project's threads 
       name: "idle sibling", ownerId: OWNER_ID, autoArchiveDuration: 10080, event: "create" });
   });
   await threadRow(workspace, SIBLING_ID);
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
 
   await changeRegistry(workspace, router, registry => {
     registry.projects.demo.channel_id = "moved-channel";
@@ -274,7 +273,7 @@ test("--threads stops only the project's thread sessions as stopped/operator, an
   assert.equal(tmuxSessions(workspace)[CHANNEL_TMUX].pid, channelPid);
   assert.equal(readRegistry(workspace).projects.demo.pid, channelPid);
 
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
   await startThreadSupervisor(workspace);
   await settle(1500);
   for (const threadId of [THREAD_ID, SIBLING_ID]) {
@@ -326,7 +325,7 @@ test("--all still stops the thread sessions when the channel stop fails, and exi
 test("with the supervisor down and a thread store that cannot be read, --threads says so under the command's own name", async () => {
   const workspace = changesWorkspace();
   const { supervisor } = await supervised(workspace);
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
   fs.writeFileSync(path.join(supervisorStateDir(workspace), "threads.sqlite3"), "not a database ".repeat(400));
 
   const stopped = await stopSession(workspace, "--threads");
@@ -345,7 +344,7 @@ test("with the supervisor down, --threads still stops the thread sessions by the
   const channelPid = await startChannel(workspace);
   const threadPid = await liveThread(workspace, THREAD_ID);
   const siblingPid = await liveThread(workspace, SIBLING_ID);
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
   assert.ok(alive(threadPid) && alive(siblingPid), "thread sessions outlive the supervisor");
 
   const stopped = await stopSession(workspace, "--threads");

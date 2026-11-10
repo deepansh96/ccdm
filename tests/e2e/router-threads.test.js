@@ -7,6 +7,7 @@ import test from "node:test";
 import { injectDiscordMessage, injectDiscordReaction } from "./support/bridge.js";
 import { OWNER_ID, connectRoot, connectSession, connectThread, createRouterWorkspace, rawRouterSocket,
   routerEnv, routerRegistry, routerWithWebhooks, runRouterCli, seedThreads, waitFor, writeRootKey } from "./support/router.js";
+import { replaceFile } from "./support/platform.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -307,8 +308,7 @@ async function setGuests(workspace, router, guests) {
   registry.projects.demo.guest_user_ids = guests;
   const reloads = () => router.stdout.split("registry reloaded").length - 1;
   const before = reloads();
-  fs.writeFileSync(`${file}.edit`, `${JSON.stringify(registry, null, 2)}\n`);
-  fs.renameSync(`${file}.edit`, file);
+  replaceFile(file, `${JSON.stringify(registry, null, 2)}\n`);
   await waitFor(() => reloads() > before, () => `registry reload:\n${router.stdout}`);
 }
 
