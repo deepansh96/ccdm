@@ -704,8 +704,15 @@ function runRouterClaudeHost() {
             }
             if (toolScript) await runToolScript(toolScript, meta);
             // \`fixtures.claude.holdTurnsIn\` keeps a thread's turns running until its id leaves the list.
-            while ((readState().fixtures.claude.holdTurnsIn || []).includes(serverEnv.CCDM_THREAD_ID)) {
-              await new Promise((done) => setTimeout(done, 50));
+            // A held turn records its release and whether a second read still lists it, so a
+            // release that came from a misread of the state shows in the test's failure text.
+            const held = () => (readState().fixtures.claude.holdTurnsIn || []).includes(serverEnv.CCDM_THREAD_ID);
+            if (held()) {
+              while (held()) {
+                await new Promise((done) => setTimeout(done, 50));
+              }
+              record("turnHolds", { threadId: serverEnv.CCDM_THREAD_ID, releasedAt: new Date().toISOString(),
+                stillListed: held() });
             }
             await runHooks("Stop", { stop_hook_active: false, background_tasks: [], session_crons: [] });
           });
