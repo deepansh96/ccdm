@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { injectDiscordMessage, startFakeCodexServer, waitForState } from "./support/bridge.js";
+import { platformGate } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import {
   OWNER_ID,
@@ -18,6 +19,7 @@ import {
   startRouter,
   waitFor,
 } from "./support/router.js";
+import { startFakeHost } from "./support/session-fixture.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -61,11 +63,30 @@ async function rootSessionAfterRestart(workspace, timeoutMs = 15000) {
   throw new Error("Timed out waiting for root's hello after the Router restart");
 }
 
+// On Windows the launcher goes through the fake ccdm-host, sharing the fixture's session table.
+// A host session gets the host's environment, not the launcher's as on tmux, so
+// the shortened fallback settings go to the host.
+const fakeHosts = new WeakMap();
+async function launcherEnv(workspace) {
+  if (process.platform !== "win32") return {};
+  if (!fakeHosts.has(workspace)) {
+    fakeHosts.set(workspace, await startFakeHost(workspace, { env: routerEnv(workspace, FALLBACK_ENV) }));
+  }
+  return fakeHosts.get(workspace).env;
+}
+
+async function restartRootClaude(workspace) {
+  return runScript(workspace, "restart-root-agent.sh",
+    { env: routerEnv(workspace, { ...(await launcherEnv(workspace)), ...FALLBACK_ENV }), timeoutMs: 20000 });
+}
+
+const ROOT_CODEX = platformGate("posix", "root Codex stays on Linux and macOS until the owner's decision on a Windows Codex root (D2)");
+
 const MODES = {
   claude: {
-    restart: (workspace) => runScript(workspace, "restart-root-agent.sh", { env: routerEnv(workspace, FALLBACK_ENV), timeoutMs: 20000 }),
+    restart: restartRootClaude,
     async launch(workspace) {
-      const restarted = await runScript(workspace, "restart-root-agent.sh", { env: routerEnv(workspace, FALLBACK_ENV), timeoutMs: 20000 });
+      const restarted = await restartRootClaude(workspace);
       assert.equal(restarted.exitCode, 0, restarted.stderr || restarted.stdout);
       return {
         delivered: () => (readState(workspace.stateDir).fixtures.claude.channelNotifications ?? [])
@@ -96,81 +117,83 @@ const MODES = {
   },
 };
 
-for (const [mode, { launch, restart }] of Object.entries(MODES)) {
-  test(`root ${mode} falls back to a direct gateway for root channels while the Router is down, and hands back before rejoining`, async () => {
-    const workspace = rootWorkspace();
-    const router = await routerWithWebhooks(workspace, ["demo"]);
-    const root = await launch(workspace);
-    // Nothing reaches Discord directly while the Router serves root.
-    assert.deepEqual(readState(workspace.stateDir).fixtures.discord.logins ?? [], [{ token: ROOT_TOKEN }]);
+async function fallsBackAndHandsBack({ launch }) {
+  const workspace = rootWorkspace();
+  const router = await routerWithWebhooks(workspace, ["demo"]);
+  const root = await launch(workspace);
+  // Nothing reaches Discord directly while the Router serves root.
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.logins ?? [], [{ token: ROOT_TOKEN }]);
 
-    killRouter(router);
-    await router.closed;
+  killRouter(router);
+  await router.closed;
 
-    // After the threshold root logs in with its own token and says so in the primary root channel.
-    const engaged = await waitForState(workspace, (next) => next.fixtures.discord.messages.length > 0, 15000);
-    assert.deepEqual(engaged.fixtures.discord.logins, [{ token: ROOT_TOKEN }, { token: ROOT_TOKEN }]);
-    assert.deepEqual(engaged.fixtures.discord.messages.map(({ channelId, content, authorization, webhookId }) =>
-      ({ channelId, content, authorization, webhookId })), [
-      { channelId: "root-channel", content: NOTICE, authorization: `Bot ${ROOT_TOKEN}`, webhookId: undefined },
-    ]);
+  // After the threshold root logs in with its own token and says so in the primary root channel.
+  const engaged = await waitForState(workspace, (next) => next.fixtures.discord.messages.length > 0, 15000);
+  assert.deepEqual(engaged.fixtures.discord.logins, [{ token: ROOT_TOKEN }, { token: ROOT_TOKEN }]);
+  assert.deepEqual(engaged.fixtures.discord.messages.map(({ channelId, content, authorization, webhookId }) =>
+    ({ channelId, content, authorization, webhookId })), [
+    { channelId: "root-channel", content: NOTICE, authorization: `Bot ${ROOT_TOKEN}`, webhookId: undefined },
+  ]);
 
-    // Only root channels, and only the owner and root's allowed users, reach root.
-    owner(workspace, { id: "project-mention", channelId: "demo-channel", content: `<@${BOT_ID}> restart demo` });
-    owner(workspace, { id: "project-plain", channelId: "demo-channel", content: "hello demo" });
-    injectDiscordMessage(workspace, { id: "stranger", channelId: "root-channel", content: "let me in",
-      author: { id: "stranger-id", username: "Stranger" } });
-    owner(workspace, { id: "in-fallback", channelId: "root-channel", content: "status?" });
-    injectDiscordMessage(workspace, { id: "helper-fallback", channelId: "other-root-channel", content: "and here?",
-      author: { id: "helper-id", username: "Helper" } });
-    await waitFor(() => root.delivered().length >= 2, () => `the fallback deliveries; delivered ${JSON.stringify(root.delivered())}` +
-      (root.codex ? `; Codex requests ${JSON.stringify(root.codex.clientMessages.map((message) => message.method ?? `response:${message.id}`))}` : "") +
-      `; discord ${JSON.stringify(readState(workspace.stateDir).fixtures.discord.injectedMessages.map(({ id, delivered }) => [id, delivered]))}`, 15000);
-    assert.deepEqual(root.delivered(), ["in-fallback", "helper-fallback"]);
+  // Only root channels, and only the owner and root's allowed users, reach root.
+  owner(workspace, { id: "project-mention", channelId: "demo-channel", content: `<@${BOT_ID}> restart demo` });
+  owner(workspace, { id: "project-plain", channelId: "demo-channel", content: "hello demo" });
+  injectDiscordMessage(workspace, { id: "stranger", channelId: "root-channel", content: "let me in",
+    author: { id: "stranger-id", username: "Stranger" } });
+  owner(workspace, { id: "in-fallback", channelId: "root-channel", content: "status?" });
+  injectDiscordMessage(workspace, { id: "helper-fallback", channelId: "other-root-channel", content: "and here?",
+    author: { id: "helper-id", username: "Helper" } });
+  await waitFor(() => root.delivered().length >= 2, () => `the fallback deliveries; delivered ${JSON.stringify(root.delivered())}` +
+    (root.codex ? `; Codex requests ${JSON.stringify(root.codex.clientMessages.map((message) => message.method ?? `response:${message.id}`))}` : "") +
+    `; discord ${JSON.stringify(readState(workspace.stateDir).fixtures.discord.injectedMessages.map(({ id, delivered }) => [id, delivered]))}`, 15000);
+  assert.deepEqual(root.delivered(), ["in-fallback", "helper-fallback"]);
 
-    // A message sent while the Router comes back is delivered once, and the
-    // direct client is gone before root's hello succeeds.
-    owner(workspace, { id: "during-switch", channelId: "root-channel", content: "switching?" });
-    await startRouter(workspace);
-    const rejoined = await rootSessionAfterRestart(workspace);
-    owner(workspace, { id: "after-switch", channelId: "root-channel", content: "back?" });
-    await waitFor(() => root.delivered().includes("after-switch"), () => "the message after the switch", 15000);
+  // A message sent while the Router comes back is delivered once, and the
+  // direct client is gone before root's hello succeeds.
+  owner(workspace, { id: "during-switch", channelId: "root-channel", content: "switching?" });
+  await startRouter(workspace);
+  const rejoined = await rootSessionAfterRestart(workspace);
+  owner(workspace, { id: "after-switch", channelId: "root-channel", content: "back?" });
+  await waitFor(() => root.delivered().includes("after-switch"), () => "the message after the switch", 15000);
 
-    assert.deepEqual(root.delivered(), ["in-fallback", "helper-fallback", "during-switch", "after-switch"]);
-    const { destroys } = readState(workspace.stateDir).fixtures.discord;
-    assert.equal(destroys.length, 1, JSON.stringify(destroys));
-    assert.ok(Date.parse(destroys[0].at) <= Date.parse(rejoined.connected_at),
-      `direct client destroyed at ${destroys[0].at}, root hello_ok at ${rejoined.connected_at}`);
-    // The notice is posted once, by the fallback alone.
-    assert.equal(readState(workspace.stateDir).fixtures.discord.messages.filter((m) => m.content === NOTICE).length, 1);
-  });
+  assert.deepEqual(root.delivered(), ["in-fallback", "helper-fallback", "during-switch", "after-switch"]);
+  const { destroys } = readState(workspace.stateDir).fixtures.discord;
+  assert.equal(destroys.length, 1, JSON.stringify(destroys));
+  assert.ok(Date.parse(destroys[0].at) <= Date.parse(rejoined.connected_at),
+    `direct client destroyed at ${destroys[0].at}, root hello_ok at ${rejoined.connected_at}`);
+  // The notice is posted once, by the fallback alone.
+  assert.equal(readState(workspace.stateDir).fixtures.discord.messages.filter((m) => m.content === NOTICE).length, 1);
 }
 
-for (const [mode, { launch, restart }] of Object.entries(MODES)) {
-  test(`restarting root ${mode} while the Router is down fails and leaves the emergency root running with its key`, async () => {
-    const workspace = rootWorkspace();
-    const router = await routerWithWebhooks(workspace, ["demo"]);
-    const root = await launch(workspace);
-    killRouter(router);
-    await router.closed;
-    await waitForState(workspace, (next) => next.fixtures.discord.messages.some((m) => m.content === NOTICE), 15000);
-    const keyFile = path.join(workspace.routerStateDir, "keys", ".root.key");
-    const key = fs.readFileSync(keyFile, "utf8");
-    const session = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
+test("root claude falls back to a direct gateway for root channels while the Router is down, and hands back before rejoining", () => fallsBackAndHandsBack(MODES.claude));
+test("root codex falls back to a direct gateway for root channels while the Router is down, and hands back before rejoining", ROOT_CODEX, () => fallsBackAndHandsBack(MODES.codex));
 
-    const restarted = await restart(workspace);
+async function restartWhileDownIsRefused({ launch, restart }) {
+  const workspace = rootWorkspace();
+  const router = await routerWithWebhooks(workspace, ["demo"]);
+  const root = await launch(workspace);
+  killRouter(router);
+  await router.closed;
+  await waitForState(workspace, (next) => next.fixtures.discord.messages.some((m) => m.content === NOTICE), 15000);
+  const keyFile = path.join(workspace.routerStateDir, "keys", ".root.key");
+  const key = fs.readFileSync(keyFile, "utf8");
+  const session = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
 
-    assert.notEqual(restarted.exitCode, 0, restarted.stdout);
-    assert.match(restarted.stderr, /Router is not answering/);
-    const after = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
-    assert.equal(after?.pid, session.pid);
-    assert.equal(after.killAttempts, session.killAttempts);
-    process.kill(session.pid, 0);
-    assert.equal(fs.readFileSync(keyFile, "utf8"), key);
-    owner(workspace, { id: "after-restart", channelId: "root-channel", content: "still there?" });
-    await waitFor(() => root.delivered().includes("after-restart"), () => "the message after the refused restart", 15000);
-  });
+  const restarted = await restart(workspace);
+
+  assert.notEqual(restarted.exitCode, 0, restarted.stdout);
+  assert.match(restarted.stderr, /Router is not answering/);
+  const after = readState(workspace.stateDir).fixtures.tmux.sessions.root_agent;
+  assert.equal(after?.pid, session.pid);
+  assert.equal(after.killAttempts, session.killAttempts);
+  process.kill(session.pid, 0);
+  assert.equal(fs.readFileSync(keyFile, "utf8"), key);
+  owner(workspace, { id: "after-restart", channelId: "root-channel", content: "still there?" });
+  await waitFor(() => root.delivered().includes("after-restart"), () => "the message after the refused restart", 15000);
 }
+
+test("restarting root claude while the Router is down fails and leaves the emergency root running with its key", () => restartWhileDownIsRefused(MODES.claude));
+test("restarting root codex while the Router is down fails and leaves the emergency root running with its key", ROOT_CODEX, () => restartWhileDownIsRefused(MODES.codex));
 
 // Stops the Router and waits for root's fallback notice.
 async function routerDown(workspace, router) {
@@ -234,7 +257,7 @@ test("root claude replies, edits, reacts, and types in root channels through the
     { channelId: "demo-channel", content: "back through the Router", authorization: BOT, webhookId: undefined });
 });
 
-test("root codex replies, edits, reacts, and types in root channels through the fallback, and goes back to the Router once it returns", async () => {
+test("root codex replies, edits, reacts, and types in root channels through the fallback, and goes back to the Router once it returns", ROOT_CODEX, async () => {
   const workspace = rootWorkspace();
   const router = await routerWithWebhooks(workspace, ["demo"]);
   const grant = (input) => input[0].text.match(/channel_scope_token: (\S+)/)[1];
