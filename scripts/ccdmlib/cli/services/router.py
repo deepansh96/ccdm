@@ -8,6 +8,10 @@ from pathlib import Path
 from . import ROOT_DIR, SCRIPTS_DIR, Context, Plan, require_absolute, require_node, run_preflight
 
 TEMPLATE = "router.task.xml.in"
+HELP = (
+    "The task runs the Router, which holds the bot token and the connection to Discord.",
+    "The install runs the Router's preflight first and starts the task. It takes no options.",
+)
 
 # Only non-secret paths: the root token stays in root's state directory.
 ALLOWED_ENV = frozenset(("CCDM_ROUTER_STATE_DIR", "PATH", "ROOT_DISCORD_STATE_DIR"))

@@ -17,7 +17,7 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
-from ccdmlib.platform import proc  # noqa: E402
+from ccdmlib.platform import commands, proc  # noqa: E402
 
 _EVENTS_PATH = Path(__file__).with_name("conversation-reminder-events.py")
 _SPEC = importlib.util.spec_from_file_location("ccdm_conversation_reminder_events", _EVENTS_PATH)
@@ -112,7 +112,7 @@ def build_readiness(project_name: str, project_root: Path, state_dir: Path) -> d
                 and capability.get("hooks_configured") is True
                 and capability.get("reply_tool_verified") is True
             )
-            relaunch = f"; restart the session with scripts/start-session.sh {project_name}"
+            relaunch = f"; restart the session with {commands.script_ref('start-session')} {project_name}"
             if not verified:
                 unsupported_capabilities.append(
                     "Claude launch-scoped transport is not verified for this assignment" + relaunch)
@@ -180,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{readiness['provider'].capitalize()} Conversation Reminder adapter: {readiness['status']}")
         print(f"Project: {readiness['project']}")
         print(f"Event receiver: {'available' if readiness['event_receiver']['available'] else 'unavailable'}")
-        print("Reminder delivery: see scripts/conversation-reminder-service.py status")
+        print(f"Reminder delivery: see {commands.reminders_ref()} status")
         if readiness["missing_credentials"]:
             print("Missing credentials: " + ", ".join(readiness["missing_credentials"]))
         if readiness["assignment_mismatches"]:

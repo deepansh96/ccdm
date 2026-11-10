@@ -271,6 +271,20 @@ test("status answers with no worker, and reads an existing store in a protected 
   assert.deepEqual([after.running, after.store], [false, { user_version: 1 }]);
 });
 
+test("--help says whose mode --supervised is: the LaunchAgent's, and on Windows the scheduled task's", async () => {
+  const workspace = createRouterWorkspace({ ...routerRegistry(), root_channels: ["root-channel"] });
+
+  const help = await supervisorCli(workspace, "--help");
+
+  assert.equal(help.exitCode, 0, help.stderr);
+  const text = help.stdout.replace(/\s+/g, " ");
+  const service = process.platform === "win32" ? "scheduled task" : "LaunchAgent";
+  assert.ok(text.includes(`\`run --supervised\` is the ${service}'s, which exits while \`disable\` is in force`), text);
+  assert.ok(text.includes(`exit while the supervisor is disabled (the ${service}'s mode)`), text);
+  if (process.platform === "win32") assert.doesNotMatch(text, /LaunchAgent/);
+  assert.equal(fs.existsSync(supervisorStateDir(workspace)), false, "help creates no state");
+});
+
 test("a status racing the store's creation never sees a half-made store", () => {
   const scripts = path.join(process.cwd(), "scripts");
   const base = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "ccdm-e2e-store-race-"));

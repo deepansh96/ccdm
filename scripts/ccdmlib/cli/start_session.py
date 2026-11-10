@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence
 from uuid import uuid4
 
-from ..platform import hooks, private_fs, session_host
+from ..platform import commands, hooks, private_fs, session_host
 from . import _launch
 
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -255,8 +255,7 @@ def _start(project_name: str, resume: str, project: _Project, root: Path, regist
     if not project.webhook_id:
         print(
             f"Refusing to start '{project_name}': it has no webhook_id, so its replies could not be posted. "
-            f"Run {_launch.script_ref('migrate-to-router')} {project_name} "
-            f"(or node scripts/router.js ensure-webhook {project_name}), then retry.",
+            f"{commands.webhook_fix(project_name)}, then retry.",
             file=sys.stderr,
         )
         return 1

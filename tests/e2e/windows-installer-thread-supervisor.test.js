@@ -240,7 +240,10 @@ test("with the Router unreachable the installer prints the blockers, exits 2 and
 
   assert.equal(result.exitCode, 2, result.stderr || result.stdout);
   assert.match(result.stderr, /Thread Supervisor preflight failed; the existing task was left unchanged/);
-  assert.match(result.stderr, /^ {2}- the Router is not reachable/m);
+  // The printed fix is a command Windows has: no .sh installer, and Node scripts through node.
+  assert.match(result.stderr,
+    /^ {2}- the Router is not reachable; start the Router \(scripts\/ccdm install-service router, or node scripts\/router\.js serve\)\r?$/m);
+  assert.doesNotMatch(result.stderr, /install-[a-z-]+\.sh|LaunchAgent/);
   assert.deepEqual(schtasks(workspace).invocations, []);
   assert.equal(fs.existsSync(serviceFile(workspace, ".json")), false);
   assert.equal(fs.existsSync(supervisorStateDir(workspace)), false, "the preflight created nothing");

@@ -323,6 +323,22 @@ test("--all still stops the thread sessions when the channel stop fails, and exi
   assert.deepEqual([row.state, row.stop_reason], ["stopped", "operator"]);
 });
 
+test("with the supervisor down and a thread store that cannot be read, --threads says so under the command's own name", async () => {
+  const workspace = changesWorkspace();
+  const { supervisor } = await supervised(workspace);
+  assert.equal((await supervisor.stop()).exitCode, 0);
+  fs.writeFileSync(path.join(supervisorStateDir(workspace), "threads.sqlite3"), "not a database ".repeat(400));
+
+  const stopped = await stopSession(workspace, "--threads");
+
+  // The shim's name on macOS and Linux, the subcommand on Windows, where there is no stop-session.sh to run.
+  const prefix = process.platform === "win32" ? "ccdm stop-session: " : "stop-session.sh: ";
+  const errors = stopped.stderr.split(/\r?\n/).filter(Boolean);
+  assert.ok(errors.length > 0 && errors.every(line => line.startsWith(prefix)), stopped.stderr);
+  assert.ok(errors[0].startsWith(`${prefix}the thread store could not be read: `), stopped.stderr);
+  assert.match(stopped.stdout, /swept 0 thread session\(s\) for 'demo' by key path/);
+});
+
 test("with the supervisor down, --threads still stops the thread sessions by their key paths", async () => {
   const workspace = changesWorkspace();
   const { supervisor } = await supervised(workspace);

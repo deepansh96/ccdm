@@ -865,7 +865,25 @@ test("member-overwrites guest access exits 2 for a target it cannot name, before
   assert.deepEqual(discordCalls(workspace), []);
 });
 
-test('guest_mode "none" refuses invite, grant and sync, naming D4, with no Discord request', async () => {
+test("with no or bad arguments the usage names the command as this OS runs it, and nothing is read or sent", async () => {
+  const workspace = guestWorkspace("none");
+  // Windows does not honour the shebang, so the command there starts with node.
+  const command = process.platform === "win32" ? "node scripts/guest-access.js" : "scripts/guest-access.js";
+
+  for (const args of [[], ["bogus"], ["invite", "alpha"], ["list", "alpha", GUEST_ID]]) {
+    const result = await guestAccess(workspace, ...args);
+    assert.equal(result.exitCode, 2, `${args.join(" ")}: ${result.stdout}`);
+    assert.equal(result.stderr, "Usage:\n" +
+      `  ${command} invite <project|channel_id|thread_id|link> <user_id>\n` +
+      `  ${command} grant <project|channel_id|thread_id|link> <user_id>\n` +
+      `  ${command} revoke <project|channel_id|thread_id|link> <user_id>\n` +
+      `  ${command} sync [project|channel_id|thread_id|link]\n` +
+      `  ${command} list [project|channel_id|thread_id|link]\n`);
+  }
+  assert.deepEqual(discordCalls(workspace), []);
+});
+
+test('guest_mode "none" refuses invite, grant and sync with a reason in plain words, and no Discord request', async () => {
   const workspace = guestWorkspace("none", (registry) => {
     registry.projects.alpha.guest_user_ids = [SECOND_ID];
   });
@@ -875,8 +893,10 @@ test('guest_mode "none" refuses invite, grant and sync, naming D4, with no Disco
     const result = await guestAccess(workspace, ...args);
     assert.equal(result.exitCode, 1, `${args.join(" ")}: ${result.stdout}`);
     assert.equal(result.stdout, "");
-    assert.equal(result.stderr, `Error: guest ${args[0]} is off for this registry: guest_mode is "none" (owner decision D4: ` +
-      "no guests where the bot would need server-wide Manage Roles). revoke and list still work.\n");
+    assert.equal(result.stderr, `Error: guest ${args[0]} is off for this registry: guest_mode is "none" ` +
+      "(no guests where the bot would need server-wide Manage Roles). revoke and list still work.\n");
+    // No label of a decision record: a user cannot look one up.
+    assert.doesNotMatch(result.stderr, /\bD\d\b|owner decision/);
   }
   assert.equal(registryText(workspace), before);
   assert.deepEqual(discordCalls(workspace), []);

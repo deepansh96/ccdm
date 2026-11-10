@@ -15,12 +15,16 @@ from __future__ import annotations
 import argparse
 from typing import Any, List
 
+_VERBS = ("create", "list", "stop", "restart", "close")
+
 
 def _run(args: argparse.Namespace) -> int:
     from thread_supervisor import threads_cli
 
     argv: List[str] = list(args.argv)
-    if argv in (["--help"], ["-h"]):
+    # Help is `--help` alone, or alone after a verb. Anywhere else the word may be a name or part of a message.
+    asked = argv[1:] if len(argv) == 2 and argv[0] in _VERBS else argv
+    if asked in (["--help"], ["-h"]):
         print(threads_cli.USAGE, flush=True)
         return 0
     return int(threads_cli.main(argv))
