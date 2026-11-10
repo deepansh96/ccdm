@@ -513,19 +513,24 @@ export async function startFakeCodexServer(workspace, options = {}) {
           }
           break;
         }
-        case "thread/compact/start":
+        case "thread/compact/start": {
+          const completeCompaction = () => {
+            const threadId = message.params?.threadId ?? options.threadId ?? "thread-1";
+            const turnId = options.compactTurnId ?? "compact-turn";
+            notify("turn/started", { threadId, turn: { id: turnId } });
+            notify("thread/compacted", { threadId, turnId });
+            notify("item/completed", { threadId, turnId, item: { type: "contextCompaction" } });
+            notify("turn/completed", { threadId, turn: { id: turnId } });
+          };
+          // `compactComplete: "before-reply"` sends the completion ahead of the
+          // answer. A client that reads the answer and a completion right behind
+          // it in one go runs the completion's handler before whatever awaited
+          // the answer; this is that case made certain.
+          if (options.compactComplete === "before-reply") completeCompaction();
           reply({});
-          if (options.compactComplete) {
-            setTimeout(() => {
-              const threadId = message.params?.threadId ?? options.threadId ?? "thread-1";
-              const turnId = options.compactTurnId ?? "compact-turn";
-              notify("turn/started", { threadId, turn: { id: turnId } });
-              notify("thread/compacted", { threadId, turnId });
-              notify("item/completed", { threadId, turnId, item: { type: "contextCompaction" } });
-              notify("turn/completed", { threadId, turn: { id: turnId } });
-            }, 5);
-          }
+          if (options.compactComplete === true) setTimeout(completeCompaction, 5);
           break;
+        }
         case "thread/archive":
           reply({});
           break;
@@ -607,6 +612,33 @@ export function injectDiscordReaction(workspace, reaction = {}) {
       },
     });
   });
+}
+
+// A bridge's output so far: what a bridge the test started has printed, or the
+// logs of every bridge a launcher started in the Test Workspace.
+function bridgeOutput(source) {
+  if (typeof source.stdout === "string") return source.stdout;
+  return fs.readdirSync(source.stateDir).filter((name) => /^codex-bridge-\d+\.log$/.test(name)).sort()
+    .map((name) => fs.readFileSync(path.join(source.stateDir, name), "utf8")).join("");
+}
+
+// Waits until the bridge has finished `count` turns, counting its startup
+// bootstrap turn. `source` is a bridge from `startBridge`, or the Test
+// Workspace of a bridge launched by start-codex-session.sh.
+//
+// A reply is visible in Discord before its turn has ended, and the bridge
+// steers a message or reaction that arrives during a turn into that turn. It
+// logs a turn's end only once it is idle, so what a test sends after this wait
+// starts a turn of its own.
+export async function waitForFinishedTurns(source, count, timeoutMs = 10000) {
+  const finished = () => (bridgeOutput(source).match(/\[turn\] Finished /g) ?? []).length;
+  const deadline = Date.now() + scaledTimeout(timeoutMs);
+  while (finished() < count) {
+    if (Date.now() > deadline) {
+      throw new Error(`Timed out waiting for ${count} finished turn(s), saw ${finished()}; bridge output:\n${bridgeOutput(source)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
 }
 
 export async function waitForState(workspace, predicate, timeoutMs = 5000) {

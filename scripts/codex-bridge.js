@@ -1136,13 +1136,23 @@ async function sendBootstrapInstructionTurn(reason, { required = false } = {}) {
   }
 }
 
+// Settles once the latest `startCompaction` has posted its outcome: "Compaction
+// started.", or the error if it could not start. Settled while none is starting.
+let compactionStartPosted = Promise.resolve();
+
 async function onContextCompactionCompleted() {
   if (turnActive) {
     pendingBootstrapInstructionReason = "compact";
   } else {
     await sendBootstrapInstructionTurn("compact");
   }
-  await sendToDiscord("Compaction complete.");
+  // The channel as it is now: the compaction's turn can end during the wait.
+  const channelId = activeOutputChannelId || projectChannelId;
+  // "Compaction started." is posted only after the app-server has answered the
+  // request, and the completion can arrive together with that answer. Posting
+  // this only once that post has settled keeps the two in order.
+  await compactionStartPosted;
+  await sendToDiscord("Compaction complete.", channelId);
   activeOutputChannelId = null;
 }
 
@@ -1151,6 +1161,8 @@ async function startCompaction(channelId) {
   suppressTurnOutput = true;
   activeOutputChannelId = channelId;
   resetActiveTurnId();
+  let posted;
+  compactionStartPosted = new Promise((resolve) => { posted = resolve; });
   try {
     await sendRequest("thread/compact/start", { threadId });
     await sendToDiscord("Compaction started.", channelId);
@@ -1161,6 +1173,8 @@ async function startCompaction(channelId) {
     await sendToDiscord(`**Error:** Failed to compact — ${err.message || err}`, channelId);
     activeOutputChannelId = null;
     processQueue();
+  } finally {
+    posted();
   }
 }
 
