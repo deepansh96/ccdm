@@ -290,8 +290,26 @@ export function seedTmuxSession(name, session = {}, options = {}) {
   });
 }
 
+// State directories of Test Workspaces the harness has removed, or is removing.
+const retiredStateDirs = new Set();
+
+// Called by a Test Workspace's teardown just before it removes its files.
+export function retireStateDir(explicitStateDir) {
+  retiredStateDirs.add(path.resolve(explicitStateDir));
+}
+
+// For records of what happened: commands, events, snapshots. One can arrive
+// after its Test Workspace was torn down, since a child's `close` waits for
+// every holder of its pipes. Nothing reads it then, and writing it would bring
+// the removed state directory back, so it is dropped. While the workspace is
+// live a failure to record still throws.
+export function recordState(explicitStateDir, updater) {
+  if (retiredStateDirs.has(path.resolve(stateDir(explicitStateDir)))) return null;
+  return updateState(explicitStateDir, updater);
+}
+
 export function recordCommandInvocation(invocation, options = {}) {
-  return updateState(options.stateDir, (state) => {
+  return recordState(options.stateDir, (state) => {
     state.commands.push({
       at: new Date().toISOString(),
       ...invocation,
@@ -329,7 +347,7 @@ export function snapshotFiles(root, files, options = {}) {
         return [file, { bytes: content.byteLength, sha256: sha256(content) }];
       }),
   );
-  updateState(options.stateDir, (state) => {
+  recordState(options.stateDir, (state) => {
     state.snapshots.push({
       at: new Date().toISOString(),
       root,
@@ -340,6 +358,8 @@ export function snapshotFiles(root, files, options = {}) {
   return snapshot;
 }
 
+// Not through recordState: cleanup() records its failures after the workspace
+// has gone, for the test to read.
 export function recordDiagnostic(kind, value, options = {}) {
   return updateState(options.stateDir, (state) => {
     if (!Array.isArray(state.diagnostics[kind])) {
