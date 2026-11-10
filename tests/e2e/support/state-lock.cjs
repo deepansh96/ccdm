@@ -10,10 +10,20 @@ const pause = new Int32Array(new SharedArrayBuffer(4));
 // holding it.
 const STALE_LOCK_MS = 10000;
 
+// What a directory holds, or why that cannot be told.
+function listing(dir) {
+  try {
+    return fs.readdirSync(dir);
+  } catch (error) {
+    return error.code;
+  }
+}
+
 function withStateLock(stateDir, action) {
   if (!stateDir) return action();
   fs.mkdirSync(stateDir, { recursive: true });
   const lock = path.join(stateDir, "state.lock");
+  const started = Date.now();
   let refusedSince = null;
   for (;;) {
     try {
@@ -29,7 +39,11 @@ function withStateLock(stateDir, action) {
         refusedSince = null;
       } else if (error.code === "EPERM" || error.code === "EACCES") {
         refusedSince ??= Date.now();
-        if (Date.now() - refusedSince >= STALE_LOCK_MS) throw error;
+        if (Date.now() - refusedSince >= STALE_LOCK_MS) {
+          // Node prints these with an uncaught error.
+          error.stateLock = { refusedMs: Date.now() - refusedSince, waitedMs: Date.now() - started, stateDir: listing(stateDir) };
+          throw error;
+        }
       } else {
         throw error;
       }

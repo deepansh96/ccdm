@@ -1113,8 +1113,8 @@ test("the state lock retries a refusal that follows a long wait, and gives up on
 
   // A lock directory that only ever refuses is a real failure.
   answers = Array.from({ length: 30 }, () => ({ code: "EPERM", ms: 1000 }));
-  assert.throws(() => withStateLock(stateDir, () => assert.fail("took a lock that was refused")), { code: "EPERM" });
-  assert.ok(answers.length > 0 && answers.length <= 20, `gave up after ${30 - answers.length} refusals`);
+  assert.throws(() => withStateLock(stateDir, () => assert.fail("took a lock that was refused")),
+    { code: "EPERM", stateLock: { refusedMs: 10000, waitedMs: 11000, stateDir: [] } });
 });
 
 test("failure diagnostics include command details and redact secrets", async () => {
