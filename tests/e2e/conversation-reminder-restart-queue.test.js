@@ -75,11 +75,11 @@ test("a Router reconnect gap is reconciled from history before the next reminder
   context.setClock("2026-09-20T08:30:00Z");
   const worker = startWorker(workspace, context);
   await waitForStatus(workspace, context, current => ["alpha", "beta"].every(name =>
-    current.conversations[name]?.reconciliation_status === "ready"));
+    current.conversations[name]?.reconciliation_status === "ready"), undefined, worker);
 
   await context.router.stop();
   const gap = await waitForStatus(workspace, context, current => ["alpha", "beta"].every(name =>
-    current.conversations[name].reconciliation_status === "suspended-observation-access"));
+    current.conversations[name].reconciliation_status === "suspended-observation-access"), undefined, worker);
   assert.match(gap.readiness.projects.alpha.blockers.join("\n"), /history: suspended-observation-access/);
   // While the Router is down, the owner answers alpha; the observer never sees it.
   missed(workspace, "alpha-channel", message("alpha-3", "2026-09-20T08:40:00Z", "owner", "Thanks, looks good"));
@@ -91,7 +91,7 @@ test("a Router reconnect gap is reconciled from history before the next reminder
   // thirty seconds later) resumes the projects through restart reconciliation.
   context.router = await startRouter(workspace);
   const reconciled = await waitForStatus(workspace, context, current => ["alpha", "beta"].every(name =>
-    current.conversations[name].reconciliation_status === "ready"), 600);
+    current.conversations[name].reconciliation_status === "ready"), 600, worker);
   assert.deepEqual([reconciled.conversations.alpha.state, reconciled.conversations.alpha.last_ack_message_id],
     ["open-paused", "alpha-3"]);
   const sent = await waitForState(workspace, state => reminders(state).length === 1, 20000);
