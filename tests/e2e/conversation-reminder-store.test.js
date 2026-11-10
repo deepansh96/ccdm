@@ -51,6 +51,37 @@ print(json.dumps([empty, error(lambda: service.event_rows(state)), error(lambda:
   assert.match(rowsMatchingError, /no such column/);
 });
 
+test("a status read waits for the first event's table, and a ledger that never gets one stays unavailable", async () => {
+  const workspace = createBridgeWorkspace();
+  const result = await pythonProbe(workspace, "first-event-window.py", [
+    "import importlib.util, os, threading, time",
+    "from pathlib import Path",
+    "spec = importlib.util.spec_from_file_location('events', sys.argv[2])",
+    "events = importlib.util.module_from_spec(spec); spec.loader.exec_module(events)",
+    "state = Path(sys.argv[3]); events.private_directory(state)",
+    // The moment after the first event has created the file and before it has created the table.
+    "os.close(os.open(events.database_path(state), os.O_WRONLY | os.O_CREAT, 0o600))",
+    "started = time.monotonic()",
+    "never = events.status_for(state, 'demo')",
+    "waited = time.monotonic() - started",
+    "def first_event():",
+    "    time.sleep(0.4)",
+    "    events.connect_database(state, create=True).close()",
+    "writer = threading.Thread(target=first_event); writer.start()",
+    "arrived = events.status_for(state, 'demo')",
+    "writer.join()",
+    "print(json.dumps({'never': never, 'waited': waited, 'limit': events.SCHEMA_WAIT_SECONDS, 'arrived': arrived}))",
+  ], [path.join(workspace.repoDir, "scripts", "conversation-reminder-events.py"),
+    path.join(workspace.tmpDir, "first-event-state")]);
+  // With no writer the read gives up after its wait, with the answer it always gave.
+  assert.deepEqual([result.never.available, result.never.reason],
+    [false, "event database is unavailable or unsupported"]);
+  assert.ok(result.waited >= result.limit, `waited ${result.waited} s`);
+  // With a writer the read can only answer once the table exists: no table, no event count.
+  assert.deepEqual([result.arrived.available, result.arrived.event_count, result.arrived.events],
+    [true, 0, []]);
+});
+
 test("the reminder gap follows 1h, then 2h per ignored reminder, capped at 24h", async () => {
   const workspace = createBridgeWorkspace();
   const script = path.join(workspace.repoDir, "scripts", "conversation-reminder-service.py");

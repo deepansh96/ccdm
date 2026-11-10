@@ -245,8 +245,9 @@ test("Claude project channel forwards normal owner input", async () => {
   const { workspace } = await claudeWorkspace();
   const channel = await startChannel(workspace);
   await deliver(workspace, channel, { id: "owner-message-1", content: "please continue" }, { notified: true });
-  // This is the store's first event. While the receiver creates the database,
-  // readiness finds a file with no events table yet and reports it unavailable.
+  // This is the store's first event. Readiness asked while the receiver is still
+  // creating the database waits for the events table, not for the event itself,
+  // so wait until the event is recorded.
   await recorded(workspace, 1);
   const { exitCode, report } = await readiness(workspace);
   await channel.stop();
