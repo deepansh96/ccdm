@@ -159,7 +159,10 @@ test("another member's archive stops the session as auto-archive", async () => {
   archive(workspace);
 
   await assertStopped(workspace);
-  const row = await threadRow(workspace);
+  // The supervisor writes the row only after the whole stop: on Windows that is
+  // after it has also swept the thread's listeners and removed its key, which can
+  // take a few seconds after the session itself is gone. So the row is waited for.
+  const row = await threadRow(workspace, current => current.state !== "live");
   assert.deepEqual([row.state, row.stop_reason], ["stopped", "auto-archive"]);
 });
 
