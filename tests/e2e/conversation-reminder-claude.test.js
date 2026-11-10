@@ -245,9 +245,12 @@ test("Claude project channel forwards normal owner input", async () => {
   const { workspace } = await claudeWorkspace();
   const channel = await startChannel(workspace);
   await deliver(workspace, channel, { id: "owner-message-1", content: "please continue" }, { notified: true });
-  const { exitCode, stderr, report } = await readiness(workspace);
+  // This is the store's first event. While the receiver creates the database,
+  // readiness finds a file with no events table yet and reports it unavailable.
+  await recorded(workspace, 1);
+  const { exitCode, report } = await readiness(workspace);
   await channel.stop();
-  assert.equal(exitCode, 0, stderr);
+  assert.equal(exitCode, 0, JSON.stringify(report));
   assert.deepEqual(eventTypes(report), ["owner_activity"]);
 });
 
