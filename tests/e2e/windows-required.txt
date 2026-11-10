@@ -78,3 +78,4 @@ tests/e2e/usage-report.test.js
 tests/e2e/usage-stats-poster.test.js
 tests/e2e/windows-installer-thread-supervisor.test.js
 tests/e2e/windows-installer-reminders.test.js
+tests/e2e/setup.test.js

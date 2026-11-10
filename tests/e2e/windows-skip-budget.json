@@ -1,5 +1,5 @@
 {
-  "budget": 144,
+  "budget": 141,
   "skips": [
     {
       "file": "codex-start.test.js",
@@ -57,9 +57,57 @@
     },
     {
       "file": "setup.test.js",
-      "test": "*",
+      "test": "setup creates a first-run registry, state files, and executable scripts",
       "tag": "posix",
-      "reason": "drives zsh scripts, which the Windows port replaces"
+      "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
+    },
+    {
+      "file": "setup.test.js",
+      "test": "setup reports missing required fixture tools before prompting",
+      "tag": "posix",
+      "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
+    },
+    {
+      "file": "setup.test.js",
+      "test": "setup keeps an existing registry when overwrite is declined",
+      "tag": "posix",
+      "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
+    },
+    {
+      "file": "setup.test.js",
+      "test": "setup overwrites an existing registry when requested",
+      "tag": "posix",
+      "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
+    },
+    {
+      "file": "setup.test.js",
+      "test": "setup uses the next state directory when the default env is kept",
+      "tag": "posix",
+      "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
+    },
+    {
+      "file": "setup.test.js",
+      "test": "setup overwrites the default state directory when requested",
+      "tag": "posix",
+      "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
+    },
+    {
+      "file": "setup.test.js",
+      "test": "setup validates required prompts",
+      "tag": "posix",
+      "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
+    },
+    {
+      "file": "setup.test.js",
+      "test": "setup reruns without corrupting existing state",
+      "tag": "posix",
+      "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
+    },
+    {
+      "file": "setup.test.js",
+      "test": "ccdm setup points macOS and Linux at setup.sh and exits 2",
+      "tag": "posix",
+      "reason": "on Windows ccdm setup is the setup itself"
     },
     {
       "file": "stop-restart.test.js",
