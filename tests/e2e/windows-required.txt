@@ -61,6 +61,11 @@ tests/e2e/thread-project-changes.test.js
 tests/e2e/thread-reconcile.test.js
 tests/e2e/arrival-order.test.js
 tests/e2e/router-root-claude.test.js
+tests/e2e/router-root-fallback.test.js
+tests/e2e/router-channel-move.test.js
+tests/e2e/router-migration.test.js
+tests/e2e/pool-retirement.test.js
+tests/e2e/registry-lock.test.js
 tests/e2e/windows-installer-host.test.js
 tests/e2e/windows-installer-root-at-logon.test.js
 tests/e2e/ccdm-transcribe.test.js
@@ -69,6 +74,8 @@ tests/e2e/mimo-setup.test.js
 tests/e2e/ccdm-usage.test.js
 tests/e2e/thread-commands.test.js
 tests/e2e/thread-operations.test.js
+tests/e2e/usage-report.test.js
+tests/e2e/usage-stats-poster.test.js
 tests/e2e/windows-installer-thread-supervisor.test.js
 tests/e2e/windows-installer-reminders.test.js
 tests/e2e/setup.test.js

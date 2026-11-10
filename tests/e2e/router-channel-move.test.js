@@ -19,6 +19,7 @@ import {
   runRouterCli,
   waitFor,
 } from "./support/router.js";
+import { startFakeHost } from "./support/session-fixture.js";
 import { readState, updateState } from "./support/state.js";
 import { registerTeardownCallback } from "./support/teardown.js";
 import { cleanup } from "./support/teardown.js";
@@ -81,6 +82,13 @@ function projectWorkspace(type) {
 function seedHistories(workspace) {
   seedHistory(workspace, "demo-channel", history("demo-channel", "1001", "in the old channel"));
   seedHistory(workspace, "moved-channel", history("moved-channel", "2001", "in the new channel"));
+}
+
+// On Windows the launcher goes through the fake ccdm-host, sharing the fixture's session table.
+async function launcherEnv(workspace) {
+  if (process.platform !== "win32") return routerEnv(workspace);
+  const host = await startFakeHost(workspace, { env: routerEnv(workspace) });
+  return routerEnv(workspace, host.env);
 }
 
 test("a connected listener and an op-only connection both adopt the moved channel from the Router", async () => {
@@ -165,7 +173,8 @@ test("after a registry channel move, a Claude session hears the new channel and 
       { name: "export_message_range", arguments: { start_message_id: "2001" } },
     ];
   });
-  const started = await runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace) });
+  const started = await runScript(workspace, "scripts/start-session.sh",
+    { args: ["demo"], env: await launcherEnv(workspace), timeoutMs: 30000 });
   assert.equal(started.exitCode, 0, started.stderr || started.stdout);
 
   await moveChannel(workspace, router, "demo", "moved-channel");
@@ -203,7 +212,7 @@ test("after a registry channel move, a Codex bridge hears the new channel and it
   fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
   const router = await routerWithWebhooks(workspace, ["demo"]);
   const started = await runScript(workspace, "scripts/start-codex-session.sh",
-    { args: ["demo"], env: routerEnv(workspace), timeoutMs: 30000 });
+    { args: ["demo"], env: await launcherEnv(workspace), timeoutMs: 30000 });
   assert.equal(started.exitCode, 0, started.stderr || started.stdout);
 
   await moveChannel(workspace, router, "demo", "moved-channel");
