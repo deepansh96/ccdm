@@ -66,3 +66,6 @@ tests/e2e/windows-installer-root-at-logon.test.js
 tests/e2e/ccdm-transcribe.test.js
 tests/e2e/deepseek-setup.test.js
 tests/e2e/mimo-setup.test.js
+tests/e2e/ccdm-usage.test.js
+tests/e2e/thread-commands.test.js
+tests/e2e/thread-operations.test.js
