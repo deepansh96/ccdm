@@ -386,6 +386,15 @@ test("an image, a file, and a voice attachment reach the router Codex turn throu
   assert.equal(fs.readFileSync(saved[1], "utf8"), "binary body");
   assert.equal(input[3].text, "--- Audio transcription: voice-message.ogg ---\nplease add audio support\n--- End audio transcription ---");
   assert.equal(done.fixtures.whisper.invocations.length, 1);
+  // whisper read the audio from the private temp root, and the directory is gone after the turn.
+  const audioDir = path.dirname(done.fixtures.whisper.invocations[0].args[0]);
+  const tempRoot = process.platform === "win32"
+    ? path.join((await launcherEnv(workspace)).CCDM_STATE_ROOT, "tmp")
+    : workspace.tmpDir;
+  assert.equal(path.dirname(audioDir), tempRoot);
+  assert.match(path.basename(audioDir), /^codex-bridge-audio-/);
+  assert.equal(fs.existsSync(audioDir), false);
+  if (process.platform === "win32") assertPrivate(tempRoot);
   assert.deepEqual(done.fixtures.discord.attachmentFetches.map(({ url }) => url).sort(), [archive, shot, voice].sort());
   assert.deepEqual(done.fixtures.discord.messageFetches.map(({ authorization, messageId }) => [authorization, messageId]),
     [["Bot root-bot-token", "2001"]]);
