@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { routerEnv, runRouterCli, waitFor } from "./router.js";
-import { runScript } from "./runner.js";
+import { runScript, scaledTimeout } from "./runner.js";
 import { fakeHostEnv, startFakeHost } from "./session-fixture.js";
 import { workspaceOwnsPid } from "./teardown.js";
 
@@ -93,8 +93,9 @@ export function signalSupervisorWorker(workspace, workerPid) {
 // sends the worker SIGTERM and resolves with that exit.
 export async function startThreadSupervisor(workspace, { env = {} } = {}) {
   if (process.platform === "win32" && !lateHosts.has(workspace)) await startThreadHost(workspace);
+  fs.mkdirSync(workspace.tmpDir, { recursive: true });
   const result = runScript(workspace, "scripts/thread-supervisor.py", {
-    args: ["run"], env: supervisorEnv(workspace, env), timeoutMs: 60000,
+    args: ["run"], env: supervisorEnv(workspace, { CCDM_E2E_STACK_DUMP_DIR: workspace.tmpDir, ...env }), timeoutMs: 60000,
   });
   let exited = null;
   result.then(value => { exited = value; });
@@ -112,8 +113,74 @@ export async function startThreadSupervisor(workspace, { env = {} } = {}) {
     workerPid: current.worker_pid,
     linkPid: current.link_pid,
     async stop() {
-      signalSupervisorWorker(workspace, current.worker_pid);
-      return result;
+      const asked = signalSupervisorWorker(workspace, current.worker_pid);
+      const ended = await Promise.race([result, delay(scaledTimeout(STOP_WAIT_MS)).then(() => null)]);
+      if (ended) return ended;
+      // The worker did not end when asked. What it was doing goes into
+      // `stopEvidence`, and it is ended here so the test fails now, not at the
+      // worker's own time limit.
+      const seen = stopAccount(workspace, current, asked);
+      fs.writeFileSync(path.join(workspace.tmpDir, `dump-${current.worker_pid}`), "");
+      await delay(STACK_DUMP_WAIT_MS);
+      if (workspaceOwnsPid(current.worker_pid, workspace.tmpRoot)) {
+        try {
+          process.kill(current.worker_pid, "SIGKILL");
+        } catch { /* Gone meanwhile. */ }
+      }
+      const killed = await Promise.race([result, delay(scaledTimeout(5000)).then(() => null)]);
+      if (!killed) return { exitCode: null, signal: null, stdout: "", stderr: "", stopEvidence: `${seen}\n`
+        + "the worker's output did not close even after it was ended: another process holds it" };
+      return { ...killed, stopEvidence: `${seen}\nworker exit ${killed.exitCode} after it was ended; its stderr `
+        + `(with each thread's stack, when it could still print one):\n${killed.stderr}` };
     },
   };
+}
+
+// How long a worker gets to end after it is asked (scaled), and how long it then
+// gets to print its stacks before it is ended.
+const STOP_WAIT_MS = 10000;
+const STACK_DUMP_WAIT_MS = 3000;
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+function readOr(file) {
+  try {
+    return fs.readFileSync(file, "utf8").trim() || "(empty)";
+  } catch (error) {
+    return error.code ?? error.message;
+  }
+}
+
+// What a worker that did not stop left to see: whether it was asked, whether the
+// stop file is still there, and its health file, which it removes only once its
+// loop and its link and control channel have closed.
+function stopAccount(workspace, current, asked) {
+  const dir = supervisorStateDir(workspace);
+  return [
+    `the worker (pid ${current.worker_pid}) did not end within ${scaledTimeout(STOP_WAIT_MS) / 1000} s of the stop request`,
+    `asked: ${asked ? (process.platform === "win32" ? "stop file written" : "SIGTERM sent")
+      : "no (its pid failed the ownership check)"}`,
+    // Alive but with its output closed would mean a child still holds the worker's stdio.
+    `worker process: ${processAlive(current.worker_pid) ? "still running" : "gone (its output pipes are still open)"}`,
+    `stop file: ${fs.existsSync(path.join(dir, "stop")) ? "present" : "absent"}`,
+    `worker.json: ${readOr(path.join(dir, "worker.json"))}`,
+  ].join("\n");
+}
+
+// Asserts the worker ended by itself when asked, with what was seen when it did not.
+export async function assertSupervisorStops(supervisor) {
+  const stopped = await supervisor.stop();
+  if (stopped.exitCode !== 0) {
+    throw new Error(`the thread supervisor did not stop cleanly (exit ${stopped.exitCode}):\n`
+      + `${stopped.stopEvidence ?? `stderr:\n${stopped.stderr}`}`);
+  }
+  return stopped;
 }

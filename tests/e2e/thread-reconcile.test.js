@@ -10,8 +10,8 @@ import { PYTHON, platformGate } from "./support/platform.js";
 import { callSeam } from "./support/session-fixture.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup, workspaceOwnsPid } from "./support/teardown.js";
-import { expectLateThreadHost, startThreadHost, startThreadSupervisor, supervisorEnv, supervisorStatus }
-  from "./support/thread-supervisor.js";
+import { assertSupervisorStops, expectLateThreadHost, startThreadHost, startThreadSupervisor, supervisorEnv,
+  supervisorStatus } from "./support/thread-supervisor.js";
 
 test.afterEach(cleanup);
 
@@ -186,7 +186,7 @@ test("with the supervisor stopped, an owner message in a thread with no session 
   const raw = thread("1700000000000310001");
   threadEvent(workspace, raw, "create");
   await threadRow(workspace, raw.id);
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
 
   threadMessage(workspace, raw.id, "while-down", "anyone there?");
 
@@ -197,7 +197,7 @@ test("with the supervisor stopped, an owner message in a thread with no session 
 test("on restart, a thread created during the downtime binds, and a stranger's does not", async () => {
   const workspace = reconcileWorkspace();
   const { supervisor } = await supervised(workspace);
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
   const created = thread("1700000000000320001");
   const stranger = thread("1700000000000320002", { ownerId: "stranger-id" });
   threadEvent(workspace, created, "create");
@@ -218,7 +218,7 @@ test("on restart, an owner archive during the downtime is classified as owner-ar
   const { supervisor } = await supervised(workspace);
   const raw = thread("1700000000000330001");
   await liveThread(workspace, raw);
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
 
   const snowflake = String((BigInt(Date.now()) - 1420070400000n) << 22n);
   updateState(workspace.stateDir, state => {
@@ -244,7 +244,7 @@ test("on restart, a killed session's row becomes stopped/crashed and is not rest
   const { supervisor } = await supervised(workspace);
   const raw = thread("1700000000000340001");
   await liveThread(workspace, raw);
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
 
   killSession(workspace, raw.id);
   await disconnected(workspace, raw.id);
@@ -270,7 +270,7 @@ test("stopping the supervisor leaves a live thread session running, and a restar
   await liveThread(workspace, raw);
   const conversationId = (await threadRows(workspace))[raw.id].provider_conversation_id;
 
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
 
   assert.ok((await hostSessions(workspace)).includes(tmuxName(raw.id)), "the session host still lists the session");
   assert.equal(await threadConnected(workspace, raw.id), true);
@@ -297,7 +297,7 @@ test("on restart, only a thread whose newest owner message is newer than the las
   const guestOnly = thread("1700000000000350003");
   for (const raw of [waiting, answered, guestOnly]) threadEvent(workspace, raw, "create");
   for (const raw of [waiting, answered, guestOnly]) await threadRow(workspace, raw.id);
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
 
   // The owner's last message reached nobody, so the Router marked it.
   threadMessage(workspace, waiting.id, "waiting-owner-2", "and update the docs too");
@@ -410,7 +410,7 @@ test("on restart, an owner's native reply to a root-bot message is root's and st
   const raw = thread("1700000000000380001");
   threadEvent(workspace, raw, "create");
   await threadRow(workspace, raw.id);
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
 
   // Newest first, as Discord returns it: the owner replied to root's message after the agent's reply.
   const root = { id: "fixture-bot-user-id", username: "root", bot: true };
@@ -455,7 +455,7 @@ async function unansweredWithNoHost(workspace, raw) {
   const first = await startThreadSupervisor(workspace, { env: ENV });
   threadEvent(workspace, raw, "create");
   await threadRow(workspace, raw.id);
-  assert.equal((await first.stop()).exitCode, 0);
+  await assertSupervisorStops(first);
   threadMessage(workspace, raw.id, "before-host", "is the build green?");
   await waitFor(() => reactions(workspace, raw.id).length === 1, () => "the 💤 mark");
   seedHistory(workspace, raw.id, [["before-host", owner, "is the build green?"]]);

@@ -10,7 +10,7 @@ import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerRegistry, routerWith
   waitFor } from "./support/router.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
-import { startThreadSupervisor, supervisorEnv, supervisorStatus } from "./support/thread-supervisor.js";
+import { assertSupervisorStops, startThreadSupervisor, supervisorEnv, supervisorStatus } from "./support/thread-supervisor.js";
 
 test.afterEach(cleanup);
 
@@ -312,7 +312,7 @@ test("every threads.sh subcommand fails clearly when the supervisor is down", as
   const workspace = operationsWorkspace();
   const supervisor = await supervised(workspace);
   await boundThread(workspace, THREAD_ID, "fix-login");
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
 
   for (const args of [["list"], ["list", "demo"], ["stop", "fix-login"], ["restart", link(THREAD_ID)],
     ["close", "demo", THREAD_ID], ["create", "demo", "x"]]) {
