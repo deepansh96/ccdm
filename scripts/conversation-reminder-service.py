@@ -20,7 +20,7 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
-from ccdmlib.platform import filelock  # noqa: E402
+from ccdmlib.platform import exe, filelock  # noqa: E402
 from ccdmlib.platform.paths import state_root  # noqa: E402
 from ccdmlib.platform.private_fs import fix_hint, is_private  # noqa: E402
 from ccdmlib.platform.services import service_installed  # noqa: E402
@@ -802,7 +802,8 @@ def cleanup_retired_now(project_root: Path, state_dir: Path, name: str) -> dict:
                                     str(Path(__file__).with_name("conversation-reminder-observer.js")),
                                     "--project-root", str(project_root), "--state-dir", str(state_dir),
                                     "--cleanup-retired-once", "--project", name],
-                                   env=env, capture_output=True, text=True, timeout=120)
+                                   env=env, capture_output=True, text=True, timeout=120,
+                                   creationflags=exe.child_console_flags())
         if completed.returncode == 0:
             outcome = json.loads(completed.stdout)
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
@@ -861,7 +862,8 @@ def router_prerequisites(registry: dict) -> dict:
     try:
         completed = subprocess.run([os.environ.get("CCDM_REMINDER_NODE", "node"),
                                     str(Path(__file__).with_name("router.js")), "status", "--json"],
-                                   capture_output=True, text=True, timeout=15)
+                                   capture_output=True, text=True, timeout=15,
+                                   creationflags=exe.child_console_flags())
         router = json.loads(completed.stdout) if completed.returncode == 0 else None
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         router = None
@@ -1727,7 +1729,8 @@ OBSERVER_STOP_SECONDS = 15
 
 def start_observer(observer_args: list, observer_env: dict) -> subprocess.Popen:
     """Start the Node observer holding its stdin, which is how it is asked to stop."""
-    return subprocess.Popen([*observer_args, "--stop-on-stdin-end"], env=observer_env, stdin=subprocess.PIPE)
+    return subprocess.Popen([*observer_args, "--stop-on-stdin-end"], env=observer_env, stdin=subprocess.PIPE,
+                            creationflags=exe.child_console_flags())
 
 
 def stop_observer(observer: subprocess.Popen, wait_seconds: float = OBSERVER_STOP_SECONDS) -> int:
@@ -1854,7 +1857,8 @@ def main() -> int:
                     sync(args.project_root, args.state_dir)
                     try:
                         completed = subprocess.run([*observer_args, "--recover-once"], env=observer_env,
-                                                   capture_output=True, text=True, timeout=30)
+                                                   capture_output=True, text=True, timeout=30,
+                                                   creationflags=exe.child_console_flags())
                     except subprocess.TimeoutExpired as error:
                         raise ValueError("recovery timed out; retry after checking Discord access") from error
                     if completed.returncode:

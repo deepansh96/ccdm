@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 
+from ccdmlib.platform import exe
 from ccdmlib.platform.private_fs import fix_hint, is_private
 from ccdmlib.platform.commands import start_router_hint
 
@@ -46,7 +47,7 @@ def _interpreter_blockers() -> list[str]:
         blockers.append(f"python {'.'.join(map(str, MINIMUM_PYTHON))} or newer is required")
     try:
         completed = subprocess.run([_node(), "-p", "process.versions.node.split('.')[0]"], capture_output=True,
-                                   text=True, timeout=15)
+                                   text=True, timeout=15, creationflags=exe.child_console_flags())
         major = int(completed.stdout.strip()) if completed.returncode == 0 else 0
     except (OSError, subprocess.TimeoutExpired, ValueError):
         major = 0
@@ -81,7 +82,7 @@ def _configuration_blockers(project_root: Path, state_dir: Path) -> list[str]:
 def _router_blockers() -> list[str]:
     try:
         completed = subprocess.run([_node(), str(ROUTER_SCRIPT), "status", "--json"], capture_output=True,
-                                   text=True, timeout=15)
+                                   text=True, timeout=15, creationflags=exe.child_console_flags())
         reachable = completed.returncode == 0 and isinstance(json.loads(completed.stdout), dict)
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         reachable = False

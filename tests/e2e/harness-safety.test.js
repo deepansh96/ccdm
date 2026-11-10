@@ -19,6 +19,7 @@ import {
   resolvePython,
   sendCtrlBreak,
   spawnWithCtrlBreak,
+  withoutGitBashTmpWarning,
 } from "./support/platform.js";
 import { createWorkspace, runNodeEntrypoint, runnerInternals, runScript } from "./support/runner.js";
 import {
@@ -87,6 +88,22 @@ test("command runner injects isolated environment and allowlisted PATH", platfor
   assert.equal(result.env.CCDM_TEST_STATE, workspace.stateDir);
   assert.equal(result.env.NODE_PATH, path.join(workspace.sourceRoot, "node_modules"));
   assert.ok(Object.hasOwn(result.env, "NODE_OPTIONS"));
+});
+
+test("the command runner drops Git Bash's missing /tmp warning from stderr on Windows, and nothing else", async () => {
+  const warning = "bash.exe: warning: could not find /tmp, please create!\n";
+  const kept = "bash.exe: warning: something else\nfound /tmp, please create!\n";
+  assert.equal(withoutGitBashTmpWarning(`${warning}${kept}${warning}`, "win32"), kept);
+  assert.equal(withoutGitBashTmpWarning(`sh: warning: could not find /tmp, please create!\r\n${kept}`, "win32"), kept);
+  assert.equal(withoutGitBashTmpWarning(`${warning}${kept}`, "linux"), `${warning}${kept}`);
+
+  const workspace = createWorkspace({ excludeFixtures: ["sleep"] });
+  fs.writeFileSync(path.join(workspace.repoDir, "scripts", "warns.sh"),
+    "#!/bin/sh\nprintf '%s\\n' 'bash.exe: warning: could not find /tmp, please create!' 'bash.exe: warning: something else' >&2\n",
+    { mode: 0o755 });
+  const result = await runScript(workspace, "scripts/warns.sh");
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stderr, `${process.platform === "win32" ? "" : warning}bash.exe: warning: something else\n`);
 });
 
 test("missing fixture tools fail fast without falling through to the host PATH", async () => {

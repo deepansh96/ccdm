@@ -104,6 +104,27 @@ def _override(variable: str, reject_store_stub: bool = False) -> Optional[str]:
     return value
 
 
+def child_console_flags() -> int:
+    """Creation flags for a console program started by a process that may have no console.
+
+    A Windows process with no console (a worker started detached, or under a
+    windowless host) that starts a console program makes Windows open a new
+    console for it: a window on screen, and seconds of waiting on a busy machine.
+    Then, and only then, the child is given a console with no window. A process
+    that has a console passes nothing, so its child shares that console as before.
+    Always 0 on macOS and Linux."""
+    if not WIN32:
+        return 0
+    try:
+        import ctypes
+
+        # The console's code page; 0 means this process has no console.
+        has_console = bool(ctypes.windll.kernel32.GetConsoleCP())  # type: ignore[attr-defined]
+    except (ImportError, AttributeError, OSError):
+        return 0
+    return 0 if has_console else subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+
+
 def _probe(command: str, args: List[str], env: Optional[Dict[str, str]] = None) -> Optional[str]:
     """The stripped output of a successful run, or None; only a success is remembered."""
     key = repr((command, args))
