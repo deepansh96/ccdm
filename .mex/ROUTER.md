@@ -90,7 +90,7 @@ Load the relevant file based on the current task. Always load `context/architect
 | Making a design decision | `context/decisions.md` |
 | Setting up or running the project | `context/setup.md` |
 | Starting, stopping, or registering sessions | `context/session-management.md` |
-| Root's everyday commands: list, status, start, stop, restart, context report, restart yourself, create a poll | `patterns/root-commands.md` |
+| Root's everyday commands: list, status, start, stop, restart, context report, usage report, restart yourself, create a poll, transcribe a voice message | `patterns/root-commands.md` |
 | Permissions, guests, routing, or credentials | `context/discord-security.md` |
 | Thread Conversations or the Thread Supervisor | `context/session-management.md`, then `patterns/operate-thread-supervisor.md` |
 | Any specific task | Check `patterns/INDEX.md` for a matching pattern |

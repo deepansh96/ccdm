@@ -271,7 +271,7 @@ Tests drive only Discord inputs and executable surfaces, and assert recorded Dis
 - `router-threads.test.js` and `router-thread-scope.test.js`: classification, the `thread_session_live` exactly-once ordering, the type-18 drop, and thread `scope_violation`s.
 - `thread-supervisor.test.js`, `thread-claude-session.test.js` and `thread-codex-session.test.js`: binding, the boot handoff with 👀, replies with `thread_id`, start failures, and no token in any launch file.
 - `thread-commands.test.js`, `thread-lifecycle.test.js`, `thread-capacity.test.js`, `thread-reconcile.test.js` and `thread-project-changes.test.js`: commands, archive and resume, caps, reconcile and registry changes.
-- `thread-operations.test.js` and `thread-supervisor-launchagent.test.js`: `threads.sh`, the resolver, thread ids in operator tools, `router status`, and the installer.
+- `thread-operations.test.js` and `thread-supervisor-launchagent.test.js`: the operator's thread command (`scripts/threads.sh` on macOS and Linux, `scripts/ccdm threads` on Windows), the resolver, thread ids in operator tools, `router status`, and the installer.
 - `conversation-reminder-threads.test.js`: the v8 reminder store and per-thread reminders.
 - `thread-conversation-journey.test.js` is the one cross-component test. With the Router, the Thread Supervisor, a Claude thread session and the Conversation Reminder worker all running, the owner creates a thread and gets a reply, the reminder fires in the thread after the turn, the owner's reply acknowledges it, `/close` archives the thread, closes its reminders and stops the session, and the next owner message reopens it with the same Claude conversation.
 

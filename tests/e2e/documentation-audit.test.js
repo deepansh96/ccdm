@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -639,4 +640,200 @@ test("CLAUDE.md and .mex/AGENTS.md stay symlinks to AGENTS.md", () => {
   const listed = spawnSync("git", ["ls-files", "-s", "CLAUDE.md", ".mex/AGENTS.md"], { encoding: "utf8" }).stdout;
   assert.match(listed, /^120000 \S+ 0\tCLAUDE\.md$/m);
   assert.match(listed, /^120000 \S+ 0\t\.mex\/AGENTS\.md$/m);
+});
+
+// --- The session skills and the rest of root's template ---------------------
+// A session follows skills/restart-self.md and skills/check-context.md word for
+// word, on either OS. CLAUDE.md.example is audited here as a whole file.
+
+const RESTART_SKILL = "skills/restart-self.md";
+const CONTEXT_SKILL = "skills/check-context.md";
+const SESSION_DOCS = [RESTART_SKILL, CONTEXT_SKILL, ROOT_ENTRIES.file];
+const wholeFile = file => ({ file, lines: fs.readFileSync(file, "utf8").split(/\r?\n/), audited: () => true });
+
+// The lines inside fenced blocks: the commands a session copies.
+function fencedLines(lines) {
+  const found = [];
+  let fenced = false;
+  for (const line of lines) {
+    if (/^\s*(```|~~~)/.test(line)) fenced = !fenced;
+    else if (fenced && line.trim()) found.push(line.trim());
+  }
+  return found;
+}
+
+// The verbs `scripts/ccdm threads` takes. Its help is a usage text, not a command list.
+function threadVerbs() {
+  const result = spawnSync(PYTHON, [path.join("scripts", "ccdm.py"), "threads", "--help"], {
+    encoding: "utf8",
+    env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1", PYTHONUTF8: "1" },
+    windowsHide: true,
+  });
+  assert.equal(result.status, 0, `ccdm threads --help failed: ${result.stderr}`);
+  return new Set([...result.stdout.matchAll(/(?:threads\.sh|ccdm threads) ([a-z|]+)/g)].flatMap(([, verbs]) => verbs.split("|")));
+}
+
+test("the restart-self skill restarts each kind of session with its own scripts/ccdm command", () => {
+  const source = fs.readFileSync(RESTART_SKILL, "utf8");
+  assert.doesNotMatch(source, /nohup|pstree|tmux|DISCORD_STATE_DIR|zsh -ic|launchctl|\.sh\b/i);
+  assert.deepEqual(posixOnlyOutsideMacos(wholeFile(RESTART_SKILL)), []);
+  // Every command it gives to copy is a scripts/ccdm command, or the line that prints who the session is.
+  const commands = fencedLines(source.split(/\r?\n/));
+  assert.ok(commands.length >= 4, "the skill lost its commands");
+  for (const command of commands) assert.match(command, /^(?:scripts\/ccdm |echo "session=\$CCDM_SESSION_NAME )/, command);
+
+  const section = (from, to) => {
+    const start = source.indexOf(from);
+    const end = source.indexOf(to, start + from.length);
+    assert.ok(start >= 0 && end > start, `${RESTART_SKILL} lost "${from}" or "${to}"`);
+    return source.slice(start, end);
+  };
+  const project = section("**Project session:**", "**Thread session:**");
+  const thread = section("**Thread session:**", "**Root:**");
+  const root = section("**Root:**", "\n4. ");
+  assert.match(project, /^\s+scripts\/ccdm restart-session <project>$/m);
+  assert.match(thread, /^\s+scripts\/ccdm threads restart <project> <thread id>$/m);
+  assert.doesNotMatch(thread, /restart-session|restart-root/);
+  assert.match(root, /^\s+scripts\/ccdm restart-root$/m);
+  assert.match(root, /Windows: root Codex is not supported/);
+  assert.doesNotMatch(root, /restart-session|threads restart/);
+
+  // The message goes out before the command: the command ends the session.
+  const tell = source.indexOf("**Tell the user you are restarting.**");
+  assert.ok(tell >= 0 && tell < source.indexOf("scripts/ccdm restart-session <project>"), "the skill must post before it restarts");
+  assert.match(source, /Do not put it in the background and do not wrap it in another command/);
+  // A session finds the checkout and itself without a path of its own.
+  assert.match(source, /"\$CCDM_REMINDER_PROJECT_ROOT\/scripts\/ccdm" <command>/);
+  assert.match(source, /"\$env:CCDM_REMINDER_PROJECT_ROOT\\scripts\\ccdm\.cmd" <command>/);
+  assert.match(source, /sends `\/restart` in the thread/);
+});
+
+test("the check-context skill reads context.json and never waits on its own session", () => {
+  const source = fs.readFileSync(CONTEXT_SKILL, "utf8");
+  assert.doesNotMatch(source, /Nickname updated|nohup|pstree|pgrep|tmux|capture-pane|zsh -ic|\.sh\b/i);
+  assert.deepEqual(posixOnlyOutsideMacos(wholeFile(CONTEXT_SKILL)), []);
+  for (const phrase of [
+    "launches/<project>/context.json",
+    "launches/<project>/threads/<thread id>/context.json",
+    "launches/.root/context.json",
+    "`context_pct`",
+    "Do not make up a number",
+    "after your next message",
+  ]) {
+    assert.match(source, new RegExp(escape(phrase)), `${CONTEXT_SKILL} is missing "${phrase}"`);
+  }
+  // The breakdown is typed into the session; nothing waits for it.
+  const commands = fencedLines(source.split(/\r?\n/));
+  assert.deepEqual(commands.filter(command => command.startsWith("scripts/ccdm")),
+    ["scripts/ccdm session send \"$CCDM_SESSION_NAME\" --literal /context --enter"]);
+  const waits = source.split(/\r?\n/).filter(line => /session context/.test(line));
+  assert.equal(waits.length, 1, "only the rule against it may name `session context`");
+  assert.match(waits[0], /^\s*Never run `scripts\/ccdm session context` on your own session\./);
+  assert.doesNotMatch(source, /session context[^\n]*CCDM_SESSION_NAME|context report/);
+});
+
+test("CLAUDE.md.example names POSIX-only commands only under macOS:, in the whole file", () => {
+  const template = wholeFile(ROOT_ENTRIES.file);
+  const problems = posixOnlyOutsideMacos(template);
+  assert.deepEqual(problems, [], `\n${problems.join("\n")}\n`);
+  const source = template.lines.join("\n");
+  assert.doesNotMatch(source, /zsh -ic|bash -i?c/);
+  // `nohup` appears only where root is told never to use it.
+  for (const line of template.lines.filter(line => /nohup/.test(line))) assert.match(line, /Never use `nohup`/, line);
+  // tmux is named as the session host on macOS, or under macOS:, never as a command for both OSes.
+  const tmuxCommands = posixOnlyOutsideMacos(template, (line, fenced) =>
+    (fenced ? [line.trim()] : [...line.matchAll(/`([^`\n]+)`/g)].map(([, span]) => span)).filter(span => /^tmux\b/.test(span)));
+  assert.deepEqual(tmuxCommands, []);
+  for (const phrase of [
+    "scripts/ccdm start-session <project>",
+    "- macOS: load the agent with `launchctl load",
+    "- Windows: install three scheduled tasks, in this order: `scripts/ccdm install-service router`, `scripts/ccdm install-service host`, `scripts/ccdm install-service root-at-logon`",
+    "- macOS: `scripts/install-usage-stats-poster.sh`",
+    "- Windows: `scripts/ccdm install-service usage-poster`",
+    "Launch sessions only through `scripts/ccdm`",
+    "- Windows: `scripts/ccdm threads restart <name|link>`.",
+  ]) {
+    assert.match(source, new RegExp(escape(phrase)), `${ROOT_ENTRIES.file} is missing "${phrase}"`);
+  }
+});
+
+// Root's command entries, with the usage entry, "Discord Polls" and "Voice
+// Messages": the lines from "Commands" up to "Channel Routing Rules". They are
+// final. A change that rewrites one on purpose updates this hash with it.
+const ROOT_ENTRIES_SHA256 = "c72c7c826bfe7f5ac617a67fe0f256add115422e5a88cb82b769c68682c394cb";
+
+test("root's command, usage and voice entries in CLAUDE.md.example are unchanged", () => {
+  const { lines } = wholeFile(ROOT_ENTRIES.file);
+  const start = lines.findIndex(line => line.startsWith(ROOT_ENTRIES.from));
+  const end = lines.findIndex(line => line.startsWith(ROOT_ENTRIES.to));
+  assert.ok(start >= 0 && end > start, `${ROOT_ENTRIES.file} lost one of root's command headings`);
+  const entries = lines.slice(start, end);
+  for (const heading of ["#### 11. Usage report", "#### 12. Self-restart", "### Discord Polls", "### Voice Messages"]) {
+    assert.ok(entries.some(line => line.startsWith(heading)), `"${heading}" is no longer among root's entries`);
+  }
+  assert.equal(createHash("sha256").update(entries.join("\n")).digest("hex"), ROOT_ENTRIES_SHA256,
+    "root's entries changed; they are final, so restore them or update the hash on purpose");
+});
+
+test("every scripts/ccdm command in the skills and CLAUDE.md.example exists, with the variables the skills read", () => {
+  const commands = listedCommands();
+  const nested = new Map([["threads", threadVerbs()]]);
+  assert.ok(nested.get("threads").has("restart") && nested.get("threads").has("list"), "could not read the thread verbs");
+  const scripts = new Set(spawnSync("git", ["ls-files", "*.sh"], { encoding: "utf8" }).stdout.split(/\r?\n/)
+    .filter(Boolean).map(file => path.posix.basename(file)));
+  assert.ok(scripts.has("start-session.sh"), "could not list the tracked .sh scripts");
+  const problems = [];
+  const named = new Set();
+  for (const file of SESSION_DOCS) {
+    for (const [index, line] of fs.readFileSync(file, "utf8").split(/\r?\n/).entries()) {
+      for (const [, sub, verb] of line.matchAll(/scripts[\\/]ccdm(?:\.cmd)?"?\s+([a-z][a-z0-9-]*)(?:\s+([a-z][a-z0-9-]*))?/g)) {
+        named.add(sub);
+        if (!commands.has(sub)) {
+          problems.push(`${file}:${index + 1} scripts/ccdm ${sub} is not in scripts/ccdm --help`);
+          continue;
+        }
+        if (!verb) continue;
+        if (!nested.has(sub)) nested.set(sub, listedCommands(sub));
+        if (nested.get(sub).size && !nested.get(sub).has(verb)) {
+          problems.push(`${file}:${index + 1} scripts/ccdm ${sub} ${verb} is not a verb of scripts/ccdm ${sub}`);
+        }
+      }
+      for (const [, script] of line.matchAll(/([\w-]+\.sh)(?![\w-])/g)) {
+        if (!scripts.has(script)) problems.push(`${file}:${index + 1} ${script} is not a tracked script`);
+      }
+    }
+  }
+  for (const sub of ["restart-session", "restart-root", "threads", "session", "install-service", "usage", "transcribe"]) {
+    assert.ok(named.has(sub), `scripts/ccdm ${sub} was not found in the skills or the template`);
+  }
+  assert.deepEqual(problems, [], `\n${problems.join("\n")}\n`);
+
+  // Each variable a skill tells a session to read is one the launchers give a session.
+  const launchers = ["scripts/ccdmlib/cli/start_session.py", "scripts/ccdmlib/cli/start_thread_session.py",
+    "scripts/ccdmlib/cli/start_codex_session.py", "scripts/ccdmlib/cli/_launch.py", "scripts/ccdmlib/platform/session_host.py",
+    "scripts/ccdmlib/platform/paths.py", "scripts/codex-bridge.js"].map(file => fs.readFileSync(file, "utf8")).join("\n");
+  for (const file of [RESTART_SKILL, CONTEXT_SKILL]) {
+    const variables = new Set(fs.readFileSync(file, "utf8").match(/CCDM_[A-Z_]+/g));
+    assert.ok(variables.has("CCDM_SESSION_NAME"), `${file} does not read CCDM_SESSION_NAME`);
+    for (const variable of variables) {
+      assert.ok(launchers.includes(variable), `${file} reads ${variable}, which no launcher sets`);
+    }
+  }
+});
+
+test("the thread operator doc and the e2e README name the launcher and shims as the code runs them", () => {
+  const shims = line => [...line.matchAll(/(?<![\w-])(?:start-thread-session|start-session|stop-session|send-claude-command)\.sh(?![\w-])/g)]
+    .map(([name]) => name);
+  const doc = wholeFile(THREAD_OPERATOR_DOC);
+  const problems = posixOnlyOutsideMacos(afterFrontMatter(doc), shims);
+  assert.deepEqual(problems, [], `\n${problems.join("\n")}\n`);
+  const source = doc.lines.join("\n");
+  for (const phrase of [
+    "`scripts/ccdm start-thread-session <project> <thread_id> --provider …`",
+    "`scripts/ccdm stop-session <project> --threads`",
+    "`scripts/ccdm send-claude-command`",
+  ]) {
+    assert.match(source, new RegExp(escape(phrase)), `${THREAD_OPERATOR_DOC} is missing "${phrase}"`);
+  }
+  assert.match(readme, /`thread-operations\.test\.js`[^\n]*`scripts\/threads\.sh` on macOS and Linux, `scripts\/ccdm threads` on Windows/);
 });
