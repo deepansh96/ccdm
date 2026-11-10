@@ -18,6 +18,9 @@ const TMUX_ROOT = "drives tmux's kill retry and the fixture pkill; the fake-host
 const TMUX_INHERITS = "a tmux session inherits its creator's environment; ccdm-host passes a session only what it is given";
 // Owner decision D2: the Windows root is Claude-only, so `restart-root --provider codex` is refused there.
 const CODEX_ROOT = "root Codex stays POSIX until D2";
+// The POSIX fixture is a link to `true`. The Windows one is a launcher that has to
+// start first, so its limit only shows that the 8 seconds asked for were not slept.
+const SLEEP_FIXTURE_LIMIT_MS = process.platform === "win32" ? 4000 : 100;
 const NO_ACTIVE_SESSION = process.platform === "win32" ? "No active session" : "No active tmux session";
 
 test.afterEach(async () => {
@@ -145,14 +148,15 @@ async function stopProject(workspace) {
   return runScript(workspace, "scripts/stop-session.sh", { args: ["alpha"], timeoutMs: 30000 });
 }
 
-test("sleep fixture resolves fixture-mode delays quickly", platformGate("posix", POSIX_STOP), () => {
+test("sleep fixture resolves fixture-mode delays quickly", () => {
   const workspace = createWorkspace();
   const started = performance.now();
 
   const result = runFixture(workspace, "sleep", ["8"]);
 
   assert.equal(result.status, 0, result.stderr);
-  assert.ok(performance.now() - started < 100);
+  const took = performance.now() - started;
+  assert.ok(took < SLEEP_FIXTURE_LIMIT_MS, `the sleep fixture took ${Math.round(took)} ms`);
 });
 
 test("stop-session stops a Claude session and clears registry metadata", platformGate("posix", POSIX_STOP), async () => {
