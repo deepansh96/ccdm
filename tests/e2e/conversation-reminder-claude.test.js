@@ -176,12 +176,12 @@ const windowsOnly = platformGate("win32", "POSIX readiness keeps os.kill and ps,
 
 // The channel server records its events one after another, each through a
 // Python child, and stopping it discards any it has not written yet. Wait for
-// them, committed or spooled, before a stop.
-async function recorded(workspace, count) {
+// them to be committed before a stop; with the receiver out, for them to be spooled.
+async function recorded(workspace, count, { spooled = false } = {}) {
   await waitFor(async () => {
     const { report } = await readiness(workspace);
-    return report.events.length + report.event_receiver.pending_count >= count;
-  }, () => `${count} recorded reminder events`, 15000);
+    return (spooled ? report.event_receiver.pending_count : report.events.length) >= count;
+  }, () => `${count} ${spooled ? "spooled" : "committed"} reminder events`, 15000);
 }
 
 async function runHook(workspace, hook_event_name, fields = {}, extraEnv = {}) {
@@ -488,7 +488,7 @@ test("Claude event outbox replays after a receiver outage", async () => {
   const { workspace } = await claudeWorkspace();
   const channel = await startChannel(workspace, { receiverOutage: true });
   await deliver(workspace, channel, { id: "owner-message-1", content: "hello" }, { notified: true });
-  await recorded(workspace, 1);
+  await recorded(workspace, 1, { spooled: true });
   await channel.stop();
   const before = await readiness(workspace);
   assert.equal(before.report.event_receiver.pending_count, 1);
@@ -505,7 +505,7 @@ test("Claude channel startup replays an outbox event without new conversation in
   const { workspace } = await claudeWorkspace();
   const outage = await startChannel(workspace, { receiverOutage: true });
   await deliver(workspace, outage, { id: "owner-message-1", content: "hello" }, { notified: true });
-  await recorded(workspace, 1);
+  await recorded(workspace, 1, { spooled: true });
   await outage.stop();
   const relaunched = await startChannel(workspace);
   await waitFor(() => fs.readdirSync(path.join(reminderStateDir(workspace), "outbox"), { recursive: true })
