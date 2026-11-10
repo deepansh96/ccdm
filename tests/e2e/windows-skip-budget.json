@@ -5,409 +5,838 @@
       "file": "codex-start.test.js",
       "test": "start-codex-session rejects an aliased Codex Home it cannot write",
       "tag": "posix",
+      "category": "posix-file-modes",
       "reason": "a directory's mode bits do not limit writes on Windows"
     },
     {
       "file": "codex-start.test.js",
       "test": "start-codex-session rejects a non-writable Codex Home",
       "tag": "posix",
+      "category": "posix-file-modes",
       "reason": "a directory's mode bits do not limit writes on Windows"
     },
     {
       "file": "codex-start.test.js",
       "test": "start-codex-session refuses duplicate bridge and app-server processes from fixture ps state",
       "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "codex-start.test.js",
+        "test": "on Windows a running bridge or app-server with this project's key file or port refuses the launch"
+      },
       "reason": "reads the fixture ps; a Windows case uses real processes"
     },
     {
       "file": "harness-safety.test.js",
       "test": "on POSIX, teardown still stops every process in a verified group",
       "tag": "posix",
-      "reason": "Windows has no process groups to signal"
+      "category": "posix-signals",
+      "reason": "signals a POSIX process group; Windows has none, and its job teardown has its own cases in this file"
     },
     {
       "file": "harness-safety.test.js",
       "test": "command runner injects isolated environment and allowlisted PATH",
       "tag": "posix",
-      "reason": "drives setup.sh, a zsh script"
+      "category": "posix-pair",
+      "windows_test": [
+        {
+          "file": "harness-safety.test.js",
+          "test": "the workspace env on win32 isolates the profile and temp dirs and keeps what Windows needs to start"
+        },
+        {
+          "file": "harness-safety.test.js",
+          "test": "inside a workspace, Node and the host Python see the workspace home and temp dir"
+        }
+      ],
+      "reason": "drives setup.sh, a zsh script, and expects the POSIX workspace env; the Windows workspace env has its own cases"
     },
     {
       "file": "conversation-reminder-launchagent.test.js",
       "test": "*",
       "tag": "posix",
+      "category": "darwin-only",
       "reason": "installs through launchd and a zsh script; Windows installers have their own suites"
     },
     {
       "file": "router-installer.test.js",
       "test": "*",
       "tag": "posix",
+      "category": "darwin-only",
       "reason": "installs through launchd and a zsh script; Windows installers have their own suites"
     },
     {
       "file": "thread-supervisor-launchagent.test.js",
       "test": "*",
       "tag": "posix",
+      "category": "darwin-only",
       "reason": "installs through launchd and a zsh script; Windows installers have their own suites"
     },
     {
       "file": "usage-stats-installer.test.js",
       "test": "*",
       "tag": "posix",
+      "category": "darwin-only",
       "reason": "installs through launchd and a zsh script; Windows installers have their own suites"
     },
     {
       "file": "setup.test.js",
       "test": "setup creates a first-run registry, state files, and executable scripts",
       "tag": "posix",
+      "category": "darwin-only",
       "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
     },
     {
       "file": "setup.test.js",
       "test": "setup reports missing required fixture tools before prompting",
       "tag": "posix",
+      "category": "darwin-only",
       "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
     },
     {
       "file": "setup.test.js",
       "test": "setup keeps an existing registry when overwrite is declined",
       "tag": "posix",
+      "category": "darwin-only",
       "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
     },
     {
       "file": "setup.test.js",
       "test": "setup overwrites an existing registry when requested",
       "tag": "posix",
+      "category": "darwin-only",
       "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
     },
     {
       "file": "setup.test.js",
       "test": "setup uses the next state directory when the default env is kept",
       "tag": "posix",
+      "category": "darwin-only",
       "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
     },
     {
       "file": "setup.test.js",
       "test": "setup overwrites the default state directory when requested",
       "tag": "posix",
+      "category": "darwin-only",
       "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
     },
     {
       "file": "setup.test.js",
       "test": "setup validates required prompts",
       "tag": "posix",
+      "category": "darwin-only",
       "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
     },
     {
       "file": "setup.test.js",
       "test": "setup reruns without corrupting existing state",
       "tag": "posix",
+      "category": "darwin-only",
       "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
     },
     {
       "file": "setup.test.js",
       "test": "ccdm setup points macOS and Linux at setup.sh and exits 2",
       "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "setup.test.js",
+        "test": "setup.ps1 writes a registry the Router accepts, with every field and the category in category_ids"
+      },
       "reason": "on Windows ccdm setup is the setup itself"
     },
     {
       "file": "stop-restart.test.js",
       "test": "stop-session stops a Claude session and clears registry metadata",
       "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "stop-restart.test.js",
+        "test": "on Windows, a stopped session leaves nothing from its Job and no process carrying its key-file argument"
+      },
       "reason": "reads listeners from the fixture ps and sends POSIX signals; Windows has its own cases in this file"
     },
     {
       "file": "stop-restart.test.js",
       "test": "stop-session stops a Codex bridge session from seeded registry and process state",
       "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "stop-restart.test.js",
+        "test": "on Windows, a Codex stop leaves no app-server on the bridge's port and keeps other ports"
+      },
       "reason": "reads listeners from the fixture ps and sends POSIX signals; Windows has its own cases in this file"
     },
     {
       "file": "stop-restart.test.js",
       "test": "stop-session sweeps orphan Claude and Codex listener processes",
       "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": [
+        {
+          "file": "stop-restart.test.js",
+          "test": "on Windows, an orphan listener outside the Job is found by its key-file argument and killed"
+        },
+        {
+          "file": "stop-restart.test.js",
+          "test": "on Windows, a Codex stop leaves no app-server on the bridge's port and keeps other ports"
+        }
+      ],
       "reason": "reads listeners from the fixture ps and sends POSIX signals; Windows has its own cases in this file"
     },
     {
       "file": "stop-restart.test.js",
       "test": "during cutover, stop-session also sweeps a legacy pool Claude listener for the project's former pool bot",
       "tag": "posix",
-      "reason": "reads listeners from the fixture ps and sends POSIX signals; Windows has its own cases in this file"
+      "category": "posix-file-modes",
+      "reason": "sweeps listeners left from the pool bots that came before the Router; a Windows install never had them, so the Windows stop has no such sweep"
     },
     {
       "file": "stop-restart.test.js",
       "test": "stop-session sweeps an orphaned CCDM channel server and removes the launch key",
       "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "stop-restart.test.js",
+        "test": "on Windows, an orphan listener outside the Job is found by its key-file argument and killed"
+      },
       "reason": "reads listeners from the fixture ps and sends POSIX signals; Windows has its own cases in this file"
     },
     {
       "file": "stop-restart.test.js",
       "test": "stop-session escalates SIGTERM-resistant child processes to SIGKILL",
       "tag": "posix",
-      "reason": "reads listeners from the fixture ps and sends POSIX signals; Windows has its own cases in this file"
+      "category": "posix-signals",
+      "reason": "sends SIGTERM, then SIGKILL to a child that ignores it; Windows ends the session's Job instead"
     },
     {
       "file": "stop-restart.test.js",
       "test": "restart-root-agent simulates root_agent cleanup, retry, fresh launch, and development-channel send-key",
       "tag": "posix",
+      "category": "tmux-backend",
       "reason": "drives tmux's kill retry and the fixture pkill; the fake-host root cases in this file run on Windows"
     },
     {
       "file": "stop-restart.test.js",
       "test": "restart-root-codex-agent starts the root bot through the Codex bridge in Router root mode",
       "tag": "posix",
+      "category": "windows-refused-d2",
       "reason": "root Codex stays POSIX until D2"
     },
     {
       "file": "stop-restart.test.js",
       "test": "restart-root-codex-agent uses the Default Codex Account when no emergency override is set",
       "tag": "posix",
+      "category": "windows-refused-d2",
       "reason": "root Codex stays POSIX until D2"
     },
     {
       "file": "stop-restart.test.js",
       "test": "restart-root-codex-agent rejects malformed global named-account selectors before teardown",
       "tag": "posix",
+      "category": "windows-refused-d2",
       "reason": "root Codex stays POSIX until D2"
     },
     {
       "file": "stop-restart.test.js",
       "test": "restart-root-codex-agent rejects an unknown Default Codex Account before root teardown",
       "tag": "posix",
+      "category": "windows-refused-d2",
       "reason": "root Codex stays POSIX until D2"
     },
     {
       "file": "stop-restart.test.js",
       "test": "restart-root-codex-agent rejects a Default Codex Account and Legacy Codex Home conflict",
       "tag": "posix",
+      "category": "windows-refused-d2",
       "reason": "root Codex stays POSIX until D2"
     },
     {
       "file": "stop-restart.test.js",
       "test": "restart-root-codex-agent keeps ROOT_CODEX_HOME above the shared home",
       "tag": "posix",
+      "category": "windows-refused-d2",
       "reason": "root Codex stays POSIX until D2"
     },
     {
       "file": "stop-restart.test.js",
       "test": "restart-root-codex-agent validates the selected home before tearing down root_agent",
       "tag": "posix",
+      "category": "windows-refused-d2",
       "reason": "root Codex stays POSIX until D2"
     },
     {
       "file": "stop-restart.test.js",
       "test": "restart-root-codex-agent rejects every invalid selected home before root teardown",
       "tag": "posix",
+      "category": "windows-refused-d2",
       "reason": "root Codex stays POSIX until D2"
     },
     {
       "file": "stop-restart.test.js",
       "test": "restart-root-codex-agent uses ambient CODEX_HOME when the registry has no home",
       "tag": "posix",
+      "category": "windows-refused-d2",
       "reason": "root Codex stays POSIX until D2"
     },
     {
       "file": "stop-restart.test.js",
       "test": "restart-root-codex-agent lets ROOT_CODEX_HOME recover from a broken registry home",
       "tag": "posix",
+      "category": "windows-refused-d2",
       "reason": "root Codex stays POSIX until D2"
     },
     {
       "file": "stop-restart.test.js",
       "test": "restart-root-codex-agent re-reads the registry home on every restart",
       "tag": "posix",
+      "category": "windows-refused-d2",
       "reason": "root Codex stays POSIX until D2"
     },
     {
       "file": "stop-restart.test.js",
       "test": "restart-root-codex-agent keeps the legacy default without home overrides",
       "tag": "posix",
+      "category": "windows-refused-d2",
       "reason": "root Codex stays POSIX until D2"
     },
     {
       "file": "stop-restart.test.js",
       "test": "restart-root-codex-agent rejects a channel missing from the registry's root channels before stopping the current root",
       "tag": "posix",
+      "category": "windows-refused-d2",
       "reason": "root Codex stays POSIX until D2"
     },
     {
       "file": "stop-restart.test.js",
       "test": "a root restart run as the detached copy starts root without CCDM_DETACHED",
       "tag": "posix",
+      "category": "tmux-backend",
       "reason": "a tmux session inherits its creator's environment; ccdm-host passes a session only what it is given"
     },
     {
       "file": "router-root-codex.test.js",
       "test": "*",
       "tag": "posix",
+      "category": "windows-refused-d2",
       "reason": "root Codex stays on Linux and macOS until the owner's decision on a Windows Codex root (D2)"
     },
     {
       "file": "router-root-fallback.test.js",
       "test": "root codex falls back to a direct gateway for root channels while the Router is down, and hands back before rejoining",
       "tag": "posix",
+      "category": "windows-refused-d2",
       "reason": "root Codex stays on Linux and macOS until the owner's decision on a Windows Codex root (D2)"
     },
     {
       "file": "router-root-fallback.test.js",
       "test": "restarting root codex while the Router is down fails and leaves the emergency root running with its key",
       "tag": "posix",
+      "category": "windows-refused-d2",
       "reason": "root Codex stays on Linux and macOS until the owner's decision on a Windows Codex root (D2)"
     },
     {
       "file": "router-root-fallback.test.js",
       "test": "root codex replies, edits, reacts, and types in root channels through the fallback, and goes back to the Router once it returns",
       "tag": "posix",
+      "category": "windows-refused-d2",
       "reason": "root Codex stays on Linux and macOS until the owner's decision on a Windows Codex root (D2)"
     },
     {
       "file": "macos-real-tools.test.js",
       "test": "*",
       "tag": "darwin",
+      "category": "darwin-only",
       "reason": "drives real Homebrew tmux and zsh on macOS"
     },
     {
       "file": "platform-contract.test.js",
-      "test": "only runs on posix",
+      "test": "atomic: writeFileAtomic gives a new target mode 0600 by default",
       "tag": "posix",
-      "tests": 31,
-      "reason": "contract cases for POSIX-only behaviour: file modes, Unix sockets and absolute POSIX paths"
+      "category": "posix-file-modes",
+      "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "atomic: writeFileAtomic sets exactly the given mode over an existing file",
+      "tag": "posix",
+      "category": "posix-file-modes",
+      "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "atomic: writeFileAtomicSync gives a new target mode 0600 by default",
+      "tag": "posix",
+      "category": "posix-file-modes",
+      "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "atomic: writeFileAtomicSync sets exactly the given mode over an existing file",
+      "tag": "posix",
+      "category": "posix-file-modes",
+      "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "atomic: write_file_atomic gives a new target mode 0600 by default",
+      "tag": "posix",
+      "category": "posix-file-modes",
+      "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "atomic: write_file_atomic sets exactly the given mode over an existing file",
+      "tag": "posix",
+      "category": "posix-file-modes",
+      "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "hooks: POSIX: the reminder hook is byte-identical to the launchers' string",
+      "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "platform-contract/hooks.cases.js",
+        "test": "Windows: the reminder hook uses forward slashes"
+      },
+      "reason": "the POSIX form of the hook command; the Windows form has its own case"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "hooks: POSIX: the activity hook with its argument is byte-identical to the launcher's string",
+      "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "platform-contract/hooks.cases.js",
+        "test": "Windows: the activity hook converts its argument too"
+      },
+      "reason": "the POSIX form of the hook command; the Windows form has its own case"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "hooks: POSIX: a backslash in a path is left alone",
+      "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "platform-contract/hooks.cases.js",
+        "test": "Windows: the reminder hook uses forward slashes"
+      },
+      "reason": "on POSIX a backslash is part of a name; on Windows it is a separator the hook converts"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "ipc: ipcEndpoint on POSIX is exactly today's router.sock path",
+      "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "platform-contract/ipc.cases.js",
+        "test": "a name with no override reads its published pipe on Windows"
+      },
+      "reason": "the POSIX endpoint is a Unix socket path; the Windows endpoint is a published pipe name"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "ipc: POSIX ignores the endpoint overrides",
+      "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "platform-contract/ipc.cases.js",
+        "test": "with both overrides set, router and host get different pipes on Windows"
+      },
+      "reason": "the endpoint overrides name pipes and mean nothing for a Unix socket"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "ipc: prepareIpcListen removes a stale socket file on POSIX",
+      "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "platform-contract/ipc.cases.js",
+        "test": "prepareIpcListen does nothing on Windows"
+      },
+      "reason": "a Unix socket leaves a file to clear; a named pipe leaves none"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "ipc: prepareIpcListen accepts a missing socket file on POSIX",
+      "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "platform-contract/ipc.cases.js",
+        "test": "prepareIpcListen does nothing on Windows"
+      },
+      "reason": "a Unix socket leaves a file to clear; a named pipe leaves none"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "ipc: connect on POSIX uses the socket and sends no proof",
+      "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "platform-contract/ipc.cases.js",
+        "test": "connect on Windows requires the proof, then hands over the stream"
+      },
+      "reason": "a Unix socket is guarded by its directory; a named pipe needs the server proof"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "ipc: connect defaults to <stateRoot>/<name>",
+      "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "platform-contract/ipc.cases.js",
+        "test": "a name with no override reads its published pipe on Windows"
+      },
+      "reason": "the default POSIX endpoint is a socket path under the state root; Windows reads the published pipe name"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "paths: is_abs of \"/x\" on posix",
+      "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "platform-contract/paths.cases.js",
+        "test": "is_abs of \"C:\\\\x\" on win32"
+      },
+      "reason": "POSIX rules for an absolute path; the Windows rules have their own cases"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "paths: is_abs of \"x\" on posix",
+      "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "platform-contract/paths.cases.js",
+        "test": "is_abs of \"x\" on win32"
+      },
+      "reason": "POSIX rules for an absolute path; the Windows rules have their own cases"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "paths: is_abs of \"\" on posix",
+      "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "platform-contract/paths.cases.js",
+        "test": "is_abs of \"\" on win32"
+      },
+      "reason": "POSIX rules for an absolute path; the Windows rules have their own cases"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "paths: is_abs of \"C:\\\\x\" on posix",
+      "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "platform-contract/paths.cases.js",
+        "test": "is_abs of \"C:\\\\x\" on win32"
+      },
+      "reason": "POSIX rules for an absolute path; the Windows rules have their own cases"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "privacy: a 0700 directory has no blockers",
+      "tag": "posix",
+      "category": "posix-file-modes",
+      "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "privacy: a 0755 directory blocks with the chmod text",
+      "tag": "posix",
+      "category": "posix-file-modes",
+      "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "privacy: ensure leaves a 0700 directory",
+      "tag": "posix",
+      "category": "posix-file-modes",
+      "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "privacy: a 0600 file is private",
+      "tag": "posix",
+      "category": "posix-file-modes",
+      "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "privacy: a 0644 file is not private",
+      "tag": "posix",
+      "category": "posix-file-modes",
+      "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "privacy: write_private leaves a 0600 file",
+      "tag": "posix",
+      "category": "posix-file-modes",
+      "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "process: a start time is ignored on POSIX",
+      "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "platform-contract/process.cases.js",
+        "test": "a wrong start time reads as dead on Windows"
+      },
+      "reason": "POSIX has no start time to compare; Windows compares it, in its own case"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "process: using the process helpers on POSIX does not load koffi",
+      "tag": "posix",
+      "category": "posix-file-modes",
+      "reason": "the native library is loaded only on Windows, where the process helpers need it; there is nothing to assert there"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "tools: POSIX runs python3 from PATH",
+      "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "platform-contract/tools.cases.js",
+        "test": "win32 uses the interpreter py -3 runs"
+      },
+      "reason": "how POSIX finds the tool; the Windows search has its own cases"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "tools: POSIX runs codex from PATH",
+      "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "platform-contract/tools.cases.js",
+        "test": "win32 finds codex.exe in a platform package beside the npm package"
+      },
+      "reason": "how POSIX finds the tool; the Windows search has its own cases"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "tools: POSIX runs whisper from PATH",
+      "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "platform-contract/tools.cases.js",
+        "test": "win32 finds whisper.exe on PATH"
+      },
+      "reason": "how POSIX finds the tool; the Windows search has its own cases"
+    },
+    {
+      "file": "platform-contract.test.js",
+      "test": "tools: resolve-codex-home on POSIX keeps the error for an unset HOME",
+      "tag": "posix",
+      "category": "posix-file-modes",
+      "reason": "the error names HOME, which POSIX uses for '~'; Windows takes '~' from the user profile and has no HOME to be unset"
     },
     {
       "file": "router-pipe.test.js",
       "test": "a live Unix socket blocks serve when no lock exists",
       "tag": "posix",
-      "reason": "a Unix socket path can be held by a live listener; named pipes have no such path"
+      "category": "posix-file-modes",
+      "reason": "a Unix socket is a path a live listener can hold; a named pipe gets a new name on every serve, so there is nothing to find held"
     },
     {
       "file": "router-pipe.test.js",
       "test": "on POSIX, serve ignores stdin EOF and dies by signal on SIGHUP",
       "tag": "posix",
+      "category": "posix-signals",
       "reason": "launchd's relaunch rule depends on POSIX signals"
     },
     {
       "file": "claude-start.test.js",
       "test": "start-session refuses to launch when a Claude Router listener already holds the project's key file",
       "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "claude-start.test.js",
+        "test": "on Windows a registered Claude listener found by its command-line key file blocks a second launch"
+      },
       "reason": "POSIX finds listeners by their environment; the Windows case is below it"
     },
     {
       "file": "claude-start.test.js",
       "test": "on POSIX the launch settings carry no statusLine and the channel server args stay one script path",
       "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "claude-start.test.js",
+        "test": "on Windows settings.json has the statusLine command"
+      },
       "reason": "the POSIX launch files; Windows gets statusLine and --ccdm-key-file"
     },
     {
       "file": "bridge-basic-turn.test.js",
       "test": "the POSIX stop is one SIGTERM to the child, however many paths ask",
       "tag": "posix",
+      "category": "posix-signals",
       "reason": "Windows stops a tree with taskkill"
     },
     {
       "file": "conversation-reminder-codex.test.js",
       "test": "SIGINT ends the POSIX bridge cleanly with one SIGTERM to the app-server",
       "tag": "posix",
+      "category": "posix-signals",
       "reason": "Windows has no signal to send a detached process"
     },
     {
       "file": "conversation-reminder-codex.test.js",
       "test": "SIGTERM ends the POSIX bridge cleanly with one SIGTERM to the app-server",
       "tag": "posix",
+      "category": "posix-signals",
       "reason": "Windows never delivers SIGTERM"
     },
     {
       "file": "conversation-reminder-codex.test.js",
       "test": "the POSIX bridge ignores stdin EOF",
       "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "conversation-reminder-codex.test.js",
+        "test": "stdin EOF ends the Windows bridge cleanly and leaves no app-server"
+      },
       "reason": "on Windows stdin EOF is the stop request"
     },
     {
       "file": "tmux-golden.test.js",
       "test": "the six launchers issue today's exact tmux new-session strings",
       "tag": "posix",
-      "reason": "the launchers are zsh scripts until their port slices land"
+      "category": "tmux-backend",
+      "reason": "compares the six launchers' tmux new-session strings with the golden ones; a Windows launch goes through ccdm-host and has no tmux string"
     },
     {
       "file": "session-host-seam.test.js",
       "test": "node runDetached on POSIX outlives its caller and carries no session name",
       "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "session-host-seam.test.js",
+        "test": "${language} seam drives every verb on the real ccdm-host"
+      },
       "reason": "POSIX detaches with a new session; Windows goes through ccdm-host"
     },
     {
       "file": "session-host-seam.test.js",
       "test": "python run_detached on POSIX outlives its caller and carries no session name",
       "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "session-host-seam.test.js",
+        "test": "${language} seam drives every verb on the real ccdm-host"
+      },
       "reason": "POSIX detaches with a new session; Windows goes through ccdm-host"
     },
     {
       "file": "ccdm-cli.test.js",
       "test": "--help lists a registered subcommand in zsh",
       "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "ccdm-cli.test.js",
+        "test": "--help lists a registered subcommand in Git Bash, PowerShell and cmd"
+      },
       "reason": "zsh is the owner's shell on macOS"
     },
     {
       "file": "ccdm-cli.test.js",
       "test": "a shim run by absolute path from / under env -i gives the same output as from the repo root",
       "tag": "posix",
+      "category": "darwin-only",
       "reason": "emulates the bare environment of a macOS LaunchAgent"
     },
     {
       "file": "ccdm-cli.test.js",
       "test": "fake tmux: a lifecycle command against another session runs in the foreground",
       "tag": "posix",
+      "category": "tmux-backend",
       "reason": "the tmux front is POSIX; Windows goes through ccdm-host"
     },
     {
       "file": "ccdm-cli.test.js",
       "test": "fake tmux: from the target's own session name it re-dispatches and exits 0",
       "tag": "posix",
+      "category": "tmux-backend",
       "reason": "the tmux front is POSIX; Windows goes through ccdm-host"
     },
     {
       "file": "ccdm-cli.test.js",
       "test": "fake tmux: from a PID in the target's pids it re-dispatches and exits 0",
       "tag": "posix",
+      "category": "tmux-backend",
       "reason": "the tmux front is POSIX; Windows goes through ccdm-host"
     },
     {
       "file": "windows-installer-router.test.js",
       "test": "install-service runs the existing launchd installer unchanged",
       "tag": "posix",
+      "category": "darwin-only",
       "reason": "the .sh installers run through launchctl"
     },
     {
       "file": "windows-installer-router.test.js",
       "test": "uninstall-service and service-status point to launchctl on POSIX",
       "tag": "posix",
-      "reason": "Task Scheduler subcommands exit 2 outside Windows"
+      "category": "darwin-only",
+      "reason": "on macOS these two verbs only point to launchctl; the Task Scheduler forms are Windows-only and have their own cases in this file"
     },
     {
       "file": "windows-installer-root-at-logon.test.js",
       "test": "on macOS and Linux install-service root-at-logon is refused and reaches no installer",
       "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "windows-installer-root-at-logon.test.js",
+        "test": "install-service root-at-logon creates a task that runs once, one minute after logon, and does not start it"
+      },
       "reason": "root-at-logon is a Windows task; macOS keeps its LaunchAgent"
     },
     {
       "file": "ccdm-usage.test.js",
       "test": "ccdm usage matches claude-usage.sh line for line on the same fixture home",
       "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "ccdm-usage.test.js",
+        "test": "ccdm usage prints every section of the report in order, from the live API and the local Claude home"
+      },
       "reason": "runs claude-usage.sh, a bash script that needs python3 and curl; the same expected text is checked on Windows"
     },
     {
       "file": "usage-report.test.js",
       "test": "claude usage report reads live OAuth data and local history from fixtures",
       "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "ccdm-usage.test.js",
+        "test": "ccdm usage prints every section of the report in order, from the live API and the local Claude home"
+      },
       "reason": "claude-usage.sh reads the Keychain and passes $HOME paths to python3, which a native Windows Python cannot open; ccdm-usage.test.js checks every section of `ccdm usage` on Windows"
     },
     {
       "file": "usage-report.test.js",
       "test": "claude usage report falls back to the other Keychain item when the API rejects a token",
       "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "ccdm-usage.test.js",
+        "test": "ccdm usage falls back to the other Keychain item when the API rejects a token"
+      },
       "reason": "claude-usage.sh reads two Keychain items line by line, and a native Windows Python ends each with a carriage return; ccdm-usage.test.js runs the same fallback on `ccdm usage` on Windows"
     },
     {
       "file": "usage-report.test.js",
       "test": "usage report tolerates corrupt session JSON while preserving stats and project output",
       "tag": "posix",
+      "category": "posix-pair",
+      "windows_test": {
+        "file": "ccdm-usage.test.js",
+        "test": "ccdm usage tolerates corrupt session JSON and counts recent activity"
+      },
       "reason": "claude-usage.sh passes $HOME paths to python3, which a native Windows Python cannot open; ccdm-usage.test.js runs the corrupt-session case on `ccdm usage` on Windows"
     }
   ]
