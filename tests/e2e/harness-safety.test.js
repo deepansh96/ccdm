@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { bridgeChildEnv, createBridgeWorkspace } from "./support/bridge.js";
+import { bridgeChildEnv, collectProcess, createBridgeWorkspace } from "./support/bridge.js";
 import { assertFixtureExecutable, assertIsolatedPath, redactSecrets } from "./support/diagnostics.js";
 import {
   fixtureLauncher,
@@ -32,6 +33,8 @@ import {
 } from "./support/state.js";
 import { cleanup, registerTeardownCallback, teardownSkips, workspaceOwnsPid } from "./support/teardown.js";
 import { signalSupervisorWorker } from "./support/thread-supervisor.js";
+
+const { withStateLock } = createRequire(import.meta.url)("./support/state-lock.cjs");
 
 const WINDOWS_ONLY = platformGate("win32", "this case only means anything on Windows");
 
@@ -1068,6 +1071,67 @@ test("teardown callbacks run in LIFO order and cleanup failures are diagnostic r
     JSON.stringify(readState(workspace.stateDir).diagnostics.cleanupFailures),
     /cleanup-token-failure/,
   );
+});
+
+test("a command that ends after its workspace was removed is not recorded and brings no directory back", async () => {
+  const keepFailed = process.env.CCDM_E2E_KEEP_FAILED;
+  delete process.env.CCDM_E2E_KEEP_FAILED;
+  try {
+    // A child the harness collects, which outlives teardown: nothing stops it, and
+    // it runs outside the workspace so that the removal has nothing to wait for.
+    const workspace = probeWorkspace();
+    const child = spawn(process.execPath, ["-e", "process.stdin.resume()"],
+      { cwd: os.tmpdir(), stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    const late = collectProcess(child, { command: ["late"] }, workspace);
+    try {
+      recordCommandInvocation({ command: ["in time"] }, { stateDir: workspace.stateDir });
+      assert.deepEqual(readState(workspace.stateDir).commands.map((row) => row.command), [["in time"]]);
+      await cleanup();
+      assert.equal(fs.existsSync(workspace.tmpRoot), false);
+    } finally {
+      child.stdin.end();
+    }
+    assert.equal((await late.closed).exitCode, 0);
+    assert.equal(fs.existsSync(workspace.tmpRoot), false, "the late record brought the workspace back");
+
+    // The command runner's own children: on POSIX one stopped by teardown closes after it.
+    const held = probeWorkspace();
+    fs.writeFileSync(path.join(held.repoDir, "hold.js"), "setInterval(() => {}, 1000);\n");
+    const running = runNodeEntrypoint(held, "hold.js", { timeoutMs: 120000 });
+    await cleanup();
+    assert.notEqual((await running).exitCode, 0);
+    assert.equal(fs.existsSync(held.tmpRoot), false, "the late record brought the workspace back");
+  } finally {
+    if (keepFailed !== undefined) process.env.CCDM_E2E_KEEP_FAILED = keepFailed;
+  }
+});
+
+// The clock and the lock directory's answers are scripted; nothing waits ten seconds.
+test("the state lock retries a refusal that follows a long wait, and gives up on an unbroken run of refusals", (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-state-lock-"));
+  t.after(() => fs.rmSync(stateDir, { force: true, recursive: true }));
+  const lock = path.join(stateDir, "state.lock");
+  let now = Date.now();
+  let answers = [];
+  const mkdirSync = fs.mkdirSync;
+  t.mock.method(Date, "now", () => now);
+  t.mock.method(fs, "mkdirSync", (target, ...rest) => {
+    const answer = target === lock ? answers.shift() : null;
+    if (!answer) return mkdirSync(target, ...rest);
+    now += answer.ms;
+    throw Object.assign(new Error(`${answer.code}: scripted`), { code: answer.code });
+  });
+
+  // A holder that died keeps the lock until it counts as stale. The waiter that
+  // clears it then meets one refusal, as from another waiter still removing it.
+  answers = [{ code: "EEXIST", ms: 11000 }, { code: "EPERM", ms: 1 }];
+  assert.equal(withStateLock(stateDir, () => "ran"), "ran");
+  assert.equal(fs.existsSync(lock), false);
+
+  // A lock directory that only ever refuses is a real failure.
+  answers = Array.from({ length: 30 }, () => ({ code: "EPERM", ms: 1000 }));
+  assert.throws(() => withStateLock(stateDir, () => assert.fail("took a lock that was refused")),
+    { code: "EPERM", stateLock: { refusedMs: 10000, waitedMs: 11000, stateDir: [] } });
 });
 
 test("failure diagnostics include command details and redact secrets", async () => {

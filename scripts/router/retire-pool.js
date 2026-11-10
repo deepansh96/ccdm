@@ -8,9 +8,10 @@
 //   scripts/retire-pool.sh            dry run: print the actions, change nothing
 //   scripts/retire-pool.sh --apply    take them
 const { existsSync } = require("node:fs");
-const { chmod, copyFile, mkdir, rename } = require("node:fs/promises");
+const { chmod, copyFile, rename } = require("node:fs/promises");
 const path = require("node:path");
 const { stateRoot } = require("../platform/paths.js");
+const { ensurePrivateDir, makeFilePrivate } = require("../platform/privacy.js");
 const { discordRequest } = require("./discord-rest.js");
 const { expandHome, registryPath, rootToken } = require("./paths.js");
 const { readRegistry, updateRegistry } = require("./registry.js");
@@ -20,11 +21,6 @@ const PROJECT_FIELDS = ["bot_id", "bot_display_name", "transport"];
 
 function backupDir() {
   return expandHome(process.env.CCDM_POOL_BACKUP_DIR) || path.join(stateRoot(), "pool-retirement");
-}
-
-async function privateDir(dir) {
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  await chmod(dir, 0o700);
 }
 
 // A 404 means the member or role is already gone.
@@ -77,9 +73,10 @@ function plan(registry, file) {
       describe: `move state directory ${source} to ${target}`,
       run: async () => {
         if (existsSync(target)) throw new Error(`${target} already exists; not overwriting it`);
-        await privateDir(path.dirname(target));
+        await ensurePrivateDir(path.dirname(target));
         await rename(source, target);
-        await chmod(target, 0o700);
+        // The moved directory keeps the access it had; the backup holds bot tokens.
+        await ensurePrivateDir(target);
       },
     });
   }
@@ -101,9 +98,11 @@ function plan(registry, file) {
       // A backup left by an interrupted run already holds the older registry.
       run: async () => {
         if (existsSync(target)) return;
-        await privateDir(backup);
+        await ensurePrivateDir(backup);
         await copyFile(file, target);
         await chmod(target, 0o600);
+        // Windows ignores the mode above.
+        await makeFilePrivate(target);
       },
     });
   }

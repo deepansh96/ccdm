@@ -8,6 +8,7 @@ import { assertIsolatedPath, buildCommandDiagnostics } from "./diagnostics.js";
 import { fixtureLauncher, gitBashTool, hookShell, interpreterFor, PYTHON, withoutGitBashTmpWarning } from "./platform.js";
 import { readState, recordCommandInvocation, writeState } from "./state.js";
 import { createWorkspaceJob, registerTeardownCallback, workspaceOwnsPid } from "./teardown.js";
+import { retireStateDir } from "./state.js";
 
 // Deadlines are upper bounds that a passing test never waits out, so they
 // scale with load: parallel files on a busy machine run slower than one file
@@ -1781,7 +1782,11 @@ export const createWorkspace = Object.freeze(function createWorkspace(options = 
       // Workspace removal should still proceed if fixture cleanup cannot read state.
     }
     // With CCDM_E2E_KEEP_FAILED=1 the runner decides, once it knows the file's result.
-    if (process.env.CCDM_E2E_KEEP_FAILED !== "1") await removeWorkspaceRoot(tmpRoot);
+    if (process.env.CCDM_E2E_KEEP_FAILED !== "1") {
+      // From here a child that ends late has nowhere to record itself.
+      retireStateDir(stateDir);
+      await removeWorkspaceRoot(tmpRoot);
+    }
   });
 
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-e2e-"));

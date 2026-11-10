@@ -33,8 +33,8 @@ last_updated: 2026-11-10
 1. Run `npm install`.
 2. Create the registry and the root token file.
    - macOS: run `./setup.sh` and provide the Discord user ID, guild ID, and root bot token it requests. It writes `registry.json` (with empty `root_channels` and `root_allowed_user_ids`) and `~/.claude/channels/discord/.env`, the only token file.
-   - Windows: pending (#252). There is no Windows setup command yet.
-3. Add the root channel's ID to `root_channels` in `registry.json`.
+   - Windows: run `pwsh -NoProfile -File setup.ps1` from Windows Terminal. It finds Python and runs `scripts/ccdm setup`, which checks the tools and installs nothing, then asks for the Discord user ID, server ID, root channel ID, the category for this machine's project channels, a machine id and label, the guest mode, and the root bot token at a hidden prompt. It writes `registry.json` (the root channel in `root_channels`, the category in `category_ids`), the token file `~/.claude/channels/discord/.env` in a directory only this user can open, and `CLAUDE.local.md` when that is absent. An existing `registry.json` or token file is kept unless the operator answers `y`.
+3. macOS: add the root channel's ID to `root_channels` in `registry.json`. The Windows setup has already written it.
 4. Run `npm test`.
 5. Install the Router as a service, then check it with `node scripts/router.js status`.
    - macOS: `scripts/install-router-service.sh`.

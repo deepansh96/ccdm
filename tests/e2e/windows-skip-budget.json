@@ -57,9 +57,57 @@
     },
     {
       "file": "setup.test.js",
-      "test": "*",
+      "test": "setup creates a first-run registry, state files, and executable scripts",
       "tag": "posix",
-      "reason": "drives zsh scripts, which the Windows port replaces"
+      "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
+    },
+    {
+      "file": "setup.test.js",
+      "test": "setup reports missing required fixture tools before prompting",
+      "tag": "posix",
+      "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
+    },
+    {
+      "file": "setup.test.js",
+      "test": "setup keeps an existing registry when overwrite is declined",
+      "tag": "posix",
+      "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
+    },
+    {
+      "file": "setup.test.js",
+      "test": "setup overwrites an existing registry when requested",
+      "tag": "posix",
+      "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
+    },
+    {
+      "file": "setup.test.js",
+      "test": "setup uses the next state directory when the default env is kept",
+      "tag": "posix",
+      "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
+    },
+    {
+      "file": "setup.test.js",
+      "test": "setup overwrites the default state directory when requested",
+      "tag": "posix",
+      "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
+    },
+    {
+      "file": "setup.test.js",
+      "test": "setup validates required prompts",
+      "tag": "posix",
+      "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
+    },
+    {
+      "file": "setup.test.js",
+      "test": "setup reruns without corrupting existing state",
+      "tag": "posix",
+      "reason": "drives setup.sh, a zsh script; setup.ps1 and ccdm setup have their own cases"
+    },
+    {
+      "file": "setup.test.js",
+      "test": "ccdm setup points macOS and Linux at setup.sh and exits 2",
+      "tag": "posix",
+      "reason": "on Windows ccdm setup is the setup itself"
     },
     {
       "file": "stop-restart.test.js",
@@ -196,6 +244,24 @@
     {
       "file": "router-root-codex.test.js",
       "test": "*",
+      "tag": "posix",
+      "reason": "root Codex stays on Linux and macOS until the owner's decision on a Windows Codex root (D2)"
+    },
+    {
+      "file": "router-root-fallback.test.js",
+      "test": "root codex falls back to a direct gateway for root channels while the Router is down, and hands back before rejoining",
+      "tag": "posix",
+      "reason": "root Codex stays on Linux and macOS until the owner's decision on a Windows Codex root (D2)"
+    },
+    {
+      "file": "router-root-fallback.test.js",
+      "test": "restarting root codex while the Router is down fails and leaves the emergency root running with its key",
+      "tag": "posix",
+      "reason": "root Codex stays on Linux and macOS until the owner's decision on a Windows Codex root (D2)"
+    },
+    {
+      "file": "router-root-fallback.test.js",
+      "test": "root codex replies, edits, reacts, and types in root channels through the fallback, and goes back to the Router once it returns",
       "tag": "posix",
       "reason": "root Codex stays on Linux and macOS until the owner's decision on a Windows Codex root (D2)"
     },
