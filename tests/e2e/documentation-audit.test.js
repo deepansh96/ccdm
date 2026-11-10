@@ -577,14 +577,13 @@ test("the runbook carries the launch, restart, capture and trust rules and marks
   assert.doesNotMatch(login, /tmux capture-pane/);
   assert.match(read(".mex/patterns/register-project.md"), /first launch[^\n]*folder-trust dialog[^\n]*#191[^\n]*hooks and MCP servers/);
 
-  // Each line that waits for a later slice names its issue.
-  for (const [file, issues] of Object.entries({
-    ".mex/patterns/operate-thread-supervisor.md": ["#249"],
-    ".mex/patterns/operate-conversation-reminders.md": ["#249"],
+  // Both services install on Windows now, so neither runbook waits for a later slice.
+  for (const [file, service] of Object.entries({
+    ".mex/patterns/operate-thread-supervisor.md": "thread-supervisor",
+    ".mex/patterns/operate-conversation-reminders.md": "reminders",
   })) {
-    for (const issue of issues) {
-      assert.match(read(file), new RegExp(`Windows: pending[^\\n]*${issue}\\b`), `${file} has no "Windows: pending" line for ${issue}`);
-    }
+    assert.doesNotMatch(read(file), /Windows: pending/, `${file} still has a "Windows: pending" line`);
+    assert.match(read(file), new RegExp(`Windows: run \`scripts/ccdm install-service ${service}\``), `${file} does not name the Windows install`);
   }
 });
 

@@ -123,6 +123,12 @@ The worker writes a fresh `keys/.supervisor.key` in the Router state on each sta
   - macOS: `scripts/threads.sh list [<project>]` and `scripts/threads.sh stop|restart|close [<project>] <name|link|id>`.
   - Windows: `scripts/ccdm threads list [<project>]` and `scripts/ccdm threads stop|restart|close [<project>] <name|link|id>`.
 - **Router view:** `node scripts/router.js status` lists each `thread` connection, the supervisor line, and root's missing thread permissions while threads are enabled.
+- **Windows:** the service is the scheduled task `\CCDM\ThreadSupervisor`, which runs the same `run --supervised` worker and restarts it after a failure.
+  - Install with `scripts/ccdm install-service thread-supervisor`. It runs the same read-only `preflight` first; on a blocker it prints each one, exits 2 and changes nothing. It also refuses while a worker started by hand holds the lock.
+  - Inspect with `py -3 scripts\thread-supervisor.py status` and `scripts/ccdm service-status thread-supervisor`. The logs are `~/.local/state/ccdm/services/thread-supervisor.log` and `.err`.
+  - `py -3 scripts\thread-supervisor.py disable` makes the worker exit 0, and the task does not restart it. `enable` only clears the marker; run `scripts/ccdm install-service thread-supervisor` again to start the worker. An install while disabled registers the task and starts nothing.
+  - `scripts/ccdm uninstall-service thread-supervisor` stops the worker and removes the task. Thread sessions live in the session host: stopping, reinstalling or removing this task leaves them running, and the next start keeps them bound. To stop them, run `scripts/ccdm stop-session <project> --threads`.
+  - The task records its settings at install: the state root, the Router state directory, node and Python, and, when they are set, `CLAUDE_CONFIG_DIR` and the installation's other `CCDM_*` paths. After changing one, run the install again from a shell that has the new value.
 
 ## Root permissions
 
@@ -143,6 +149,7 @@ These steps run once after the thread work is merged and deployed. They touch re
 
 - [ ] Grant root Create Public Threads, Send Messages in Threads and Manage Threads on the project channels, and View Audit Log on the guild.
 - [ ] Run `scripts/install-thread-supervisor.sh`. Confirm that `scripts/thread-supervisor.py status` shows the worker running.
+  - Windows: run `scripts\ccdm install-service thread-supervisor`. Confirm that `py -3 scripts\thread-supervisor.py status` shows the worker running.
 - [ ] In `node scripts/router.js status`, confirm `supervisor: connected`, `thread_permissions=ok` for each project, and `guild permissions: ok`.
 
 **Live smoke:**
@@ -151,7 +158,7 @@ These steps run once after the thread work is merged and deployed. They touch re
 - [ ] **thread → Codex reply:** repeat in a Codex project channel, or use `/thread smoke --provider codex hello` in a Claude one. Expect a reply in the thread as `<project>-codex · N%`.
 - [ ] **`/close`:** send `/close` in one smoke thread. Expect the root-bot acknowledgement and the thread archived. The thread list shows it `closed/close-command`, and its session `<screen>-t-<thread_id>` is gone.
   - macOS: `scripts/threads.sh list`, then `tmux ls`.
-  - Windows: `scripts/ccdm threads list`. Its session no longer answers `scripts/ccdm session capture <screen>-t-<thread_id>`.
+  - Windows: `scripts\ccdm threads list`. The closed thread's session is absent from `scripts\ccdm list`, and it no longer answers `scripts\ccdm session capture <screen>-t-<thread_id>`.
 - [ ] Optionally send another owner message in the closed thread. It should reopen and answer with the same conversation.
 
 **Clean up:**
