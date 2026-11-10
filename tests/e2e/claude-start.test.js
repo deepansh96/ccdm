@@ -107,7 +107,7 @@ function launchDir(workspace) {
   return path.join(workspace.routerStateDir, "launches", "alpha");
 }
 
-test("tmux and process fixtures expose Claude Router sessions without host PID leakage", platformGate("posix", "the fixture tmux and ps exist on POSIX; Windows has the fake ccdm-host"), () => {
+test("tmux and process fixtures expose Claude Router sessions without host PID leakage", () => {
   const workspace = createWorkspace();
   const projectPath = path.join(workspace.tmpDir, "project with spaces");
   fs.mkdirSync(projectPath, { recursive: true });
@@ -169,7 +169,7 @@ test("tmux and process fixtures expose Claude Router sessions without host PID l
   assert.equal(state.fixtures.claude.invocations[0].env.CCDM_ROUTER_KEY_FILE, keyFile);
 });
 
-test("the tmux fixture rejects a Claude launch through the official Discord plugin", platformGate("posix", "the fixture tmux exists on POSIX; Windows has the fake ccdm-host"), () => {
+test("the tmux fixture rejects a Claude launch through the official Discord plugin", () => {
   const workspace = createWorkspace();
   const stateDir = path.join(workspace.homeDir, ".claude", "channels", "discord2");
   const started = runFixture(workspace, "tmux", [
