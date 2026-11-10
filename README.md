@@ -37,6 +37,8 @@ Each project has its own channel, its own session, and its own **Project Identit
 
 Each session has a **Session Scope**: the one channel it may read and act in. The Router rejects anything outside it with `scope_violation` and logs the attempt. A new launch writes a new key, which disconnects the previous listener, so two sessions never answer the same channel. Messages to a channel with no live session get 💤 and are not replayed later (a project not yet migrated, with no `webhook_id`, gets no 💤).
 
+> **Windows:** the sections below describe macOS and Linux. To set up CCDM on a Windows PC, follow [Running on Windows](#running-on-windows).
+
 ## Prerequisites
 
 | Tool | Required | Install |
@@ -903,6 +905,416 @@ the bridge after startup. A successful launchd exit therefore does not prove
 root is still connected. Check `node scripts/router.js status` for a live root
 listener when Discord is online but messages receive 💤.
 
+## Running on Windows
+
+CCDM runs on Windows 11 without WSL and without tmux. A Windows PC runs its own complete CCDM: its own Discord bot, its own Router, its own sessions and its own services. It shares nothing with a Mac that runs CCDM in the same Discord server; see [Multiple machines](#multiple-machines).
+
+The parts that differ from macOS:
+
+| macOS | Windows |
+|-------|---------|
+| tmux holds the sessions | `ccdm-host`, a background program, holds the sessions |
+| launchd LaunchAgents | scheduled tasks for your Windows user, in the Task Scheduler folder `\CCDM\` |
+| the `.sh` scripts | one command, `scripts\ccdm` (`scripts\ccdm --help` lists what it can do) |
+| `./setup.sh` | `setup.ps1` |
+
+Type the commands of this section in PowerShell, in Windows Terminal, from the CCDM folder. Git Bash takes the same commands written as `scripts/ccdm`, except setup, which needs Windows Terminal.
+
+`<stateRoot>` in this section is the folder `%USERPROFILE%\.local\state\ccdm`. Set `CCDM_STATE_ROOT` to use another folder.
+
+Do the steps in this order.
+
+### Step 1: Install the tools
+
+| Tool | Needed | Install |
+|------|--------|---------|
+| Node.js 22.5 or newer | Yes | `winget install OpenJS.NodeJS.LTS` |
+| Python 3.11 or newer | Yes | `winget install Python.Python.3.12` |
+| Git for Windows | Yes | `winget install Git.Git` |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | Yes | See its docs. CCDM looks for `claude.exe` in `.local\bin` in your user folder, then on `PATH` |
+| Codex CLI | Yes | `npm install -g @openai/codex` |
+| `ffmpeg` | Yes | `winget install Gyan.FFmpeg` |
+| Windows Terminal | Yes | Part of Windows 11 |
+| PowerShell 7 | Recommended | `winget install Microsoft.PowerShell` (Windows PowerShell 5.1 also works, see step 4) |
+| `whisper` | Optional | `py -3 -m pip install openai-whisper` (for voice messages) |
+
+- Python must be a real install. The `python` that opens the Microsoft Store does not count. Check it with `py -3 --version`.
+- If Python is installed in an unusual place, set `CCDM_PYTHON` to the full path of its `python.exe`.
+- Open a new terminal after you install a tool, so the terminal can find it.
+- Start `claude` once and sign in. Run `codex login` once if you will use Codex.
+
+### Step 2: Turn on symlinks, then clone
+
+Two files in the repository, `CLAUDE.md` and `.mex/AGENTS.md`, are symlinks. If git cannot make symlinks, it writes small text files in their place, and root then loads none of its instructions. Setup checks this and stops. So do these two things **before** you clone:
+
+1. Turn on Developer Mode: Windows Settings > System > For developers > Developer Mode.
+2. Tell git to make symlinks:
+
+   ```powershell
+   git config --global core.symlinks true
+   ```
+
+Now clone. Choose a folder that OneDrive does not sync. Desktop and Documents are often synced.
+
+```powershell
+git clone https://github.com/<owner>/ccdm.git
+cd ccdm
+npm ci
+```
+
+### Step 3: Create the Windows bot and its category
+
+The Windows PC needs its own Discord bot. Never use another machine's bot token on this PC.
+
+1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and click **New Application**. Name it, for example, "CCDM Win".
+2. Open **Bot**. Under **Privileged Gateway Intents**, turn on **Message Content Intent**.
+3. Do not copy the token yet. You fetch it during setup in step 4, when setup asks for it.
+4. Open **OAuth2** > **URL Generator**. Select the `bot` scope. Under **Bot Permissions** select only **View Audit Log**. Set Integration type to **Guild Install**. Open the generated URL and add the bot to your server.
+5. Never give this bot Manage Roles for the whole server. With it the bot could hand out roles that belong to another machine's guests.
+6. In Discord, create a category for this PC, for example "Windows". Edit the category's permissions:
+   - `@everyone`: deny View Channel.
+   - Add the bot and allow it:
+     - View Channels, Send Messages, Send Messages in Threads, Read Message History
+     - Attach Files, Add Reactions, Manage Messages
+     - Manage Webhooks (Project Identity webhooks)
+     - Manage Channels, Create Instant Invite, Manage Permissions (registration and guest access)
+     - Create Public Threads, Manage Threads (Thread Conversations)
+7. On every other category of the server, add the bot and deny it View Channel. The bot then sees only its own category.
+8. Create the root channel inside the new category, for example `#root-win`. Keep its permissions synced with the category.
+9. In Discord, turn on Settings > Advanced > Developer Mode. Then right-click and choose Copy ID to get four IDs: your own user ID, the server ID, the root channel ID and the category ID. Note them down. Setup asks for them.
+
+### Step 4: Run setup
+
+In Windows Terminal, in the CCDM folder:
+
+```powershell
+pwsh -NoProfile -File setup.ps1
+```
+
+Setup does this, in order:
+
+1. It checks the tools from step 1. For a missing tool it prints the line that installs it, and stops. Setup installs nothing itself.
+2. It checks the symlinks from step 2. If they are missing it stops and prints the fix.
+3. It asks for your Discord user ID, the server ID, the root channel ID and the category ID.
+4. It asks for a machine id and a machine label. Press Enter to keep `win` and `Windows`.
+5. It asks for the guest mode. Press Enter to keep `none`. [Guests on Windows](#guests-on-windows) explains the choice.
+6. It asks for the bot token. Now open the bot's **Bot** page in the Developer Portal, click **Reset Token** and copy the token. Paste it into the prompt and press Enter. The prompt is hidden: nothing appears while you paste. Do not save the token anywhere else.
+7. It writes three files and prints the next steps:
+   - `registry.json` in the CCDM folder, with the root channel in `root_channels`, the category in `category_ids`, and the two fields `machine` and `guest_mode`.
+   - The token file `.claude\channels\discord\.env` in your user folder. Setup first makes that folder private to your Windows account.
+   - `CLAUDE.local.md` in the CCDM folder, from `CLAUDE.local.md.example`. It holds notes about this machine for root. Fill in its placeholders. Never write a token in it.
+
+After you have pasted the token, clear the clipboard history: press Win+V, then choose **Clear all**.
+
+- Do not run setup in the Git Bash window. That window cannot hide the token, so setup refuses there and asks nothing.
+- Without PowerShell 7, or if PowerShell refuses to run the script, use Windows PowerShell:
+
+  ```powershell
+  powershell -NoProfile -ExecutionPolicy Bypass -File setup.ps1
+  ```
+
+- You can run setup again. At each `Overwrite it? (y/N)` question, press Enter to keep the file you have.
+- Setup does not change your Claude settings.
+
+The two Windows fields at the end of `registry.json` look like this:
+
+```json
+"machine": { "id": "win", "label": "Windows" },
+"guest_mode": "none"
+```
+
+`registry.example.json` is the macOS template and does not show them.
+
+### Step 5: Install the services
+
+Each service is a scheduled task for your Windows user. Install these four, in this order:
+
+```powershell
+scripts\ccdm install-service router
+scripts\ccdm install-service host
+scripts\ccdm install-service thread-supervisor
+scripts\ccdm install-service root-at-logon
+```
+
+| Service | What it runs |
+|---------|--------------|
+| `router` | The Router. It holds the bot token and the connection to Discord |
+| `host` | `ccdm-host`, which holds every session |
+| `thread-supervisor` | The Thread Supervisor, which starts and stops the sessions of [Thread Conversations](#thread-conversations) |
+| `root-at-logon` | One run after you sign in to Windows, which starts root |
+
+- Install `router` first. The `thread-supervisor` install asks the Router whether it is ready, and stops if the Router is not running.
+- Install `host` from a terminal while no session is live. Installing it restarts `ccdm-host`, and that ends every session. If a session is live, the install refuses and lists the sessions.
+- `root-at-logon` does not check that the other tasks exist. It needs `router` and `host`.
+- Each task records its environment when you install it: where Node, Python, Claude and Codex are, the state folder, `CLAUDE_CONFIG_DIR` and the `CCDM_*` variables. After you change one of these, or move the CCDM folder, install that service again from a terminal that has the new value.
+- For Codex threads, install `thread-supervisor` from a terminal where `codex` is found, or where `CCDM_CODEX_PATH` is set.
+
+Check the services, and check the Router's connection to Discord:
+
+```powershell
+scripts\ccdm service-status
+node scripts\router.js status
+```
+
+To stop and remove a service:
+
+```powershell
+scripts\ccdm uninstall-service <name>
+```
+
+Removing `host` ends every session. Removing `thread-supervisor` leaves the thread sessions running.
+
+Two more services are optional. Install them only if you want them.
+
+**Conversation reminders** (see [Project Conversation state](#project-conversation-state)):
+
+```powershell
+scripts\ccdm install-service reminders
+scripts\ccdm reminders enable
+scripts\ccdm reminders status
+```
+
+The Router must be running. The first command starts the worker, which watches but sends nothing. The second turns reminders on. If you later run `scripts\ccdm reminders disable` and then `enable`, run the install again to start the worker.
+
+**Usage collection:**
+
+1. Copy the example config:
+
+   ```powershell
+   Copy-Item .usage-stats-poster.example.json .usage-stats-poster.json
+   ```
+
+2. Open `.usage-stats-poster.json`. Delete the `history_db_path` line, which is a macOS path. The history then goes to `<stateRoot>\usage-stats\history.sqlite3`. Set `claude_api_accounts` to `[]` unless you have such an account.
+3. Install the service:
+
+   ```powershell
+   scripts\ccdm install-service usage-poster
+   ```
+
+- On Windows the poster only collects. The task runs `usage-stats-poster.py --collect-only`, and it never posts to Discord.
+- It collects every 600 seconds. `scripts\ccdm install-service usage-poster --interval <seconds>` changes that.
+- The first collection comes one interval after the install.
+
+### Step 6: Start root and register a project
+
+```powershell
+scripts\ccdm restart-root
+```
+
+The command checks the Router first. It finishes when root has connected to the Router. Then write to root in your root channel:
+
+```
+register
+```
+
+Root asks for the channel, the project folder and the provider. Give this PC's projects a name that ends in `-win`, for example `my-app-win`. The project's channel must be inside the Windows category, because the bot sees no other.
+
+### Everyday commands
+
+The commands in the [Commands](#commands) table work the same when you send them to root on Discord. From a terminal:
+
+```powershell
+scripts\ccdm list
+scripts\ccdm status
+scripts\ccdm start-session <project>
+scripts\ccdm start-codex-session <project>
+scripts\ccdm stop-session <project>
+scripts\ccdm restart-session <project>
+scripts\ccdm restart-root
+scripts\ccdm attach <project>
+scripts\ccdm attach root
+```
+
+`attach` shows a live session in your terminal. Press Ctrl-] to leave; the session keeps running.
+
+**Threads.** `scripts\ccdm threads` takes the place of `scripts/threads.sh`:
+
+```powershell
+scripts\ccdm threads list
+scripts\ccdm threads create <project> <name> --message-file <path>
+scripts\ccdm threads stop <name>
+scripts\ccdm threads restart <name>
+scripts\ccdm threads close <name>
+```
+
+Give `create` its first message in a UTF-8 file with `--message-file <path>`, or on standard input with `--message-stdin`. Never type the message as arguments. The first thread that starts after you sign in waits up to 90 seconds for `ccdm-host`.
+
+**Usage report.**
+
+```powershell
+scripts\ccdm usage
+```
+
+It prints the same report as `scripts/claude-usage.sh` on macOS. It reads your Claude login from `.claude\.credentials.json` in your user folder and never changes it. Without a usable login it prints `Could not fetch profile` and `Could not fetch live usage`, and the local sections still print.
+
+**Voice messages.**
+
+```powershell
+scripts\ccdm transcribe <audio path>
+```
+
+It prints the transcript made by `whisper`. It exits with code 3 when `whisper` is not installed. `whisper.exe` must be on `PATH`, or `CODEX_BRIDGE_AUDIO_TRANSCRIPTION_COMMAND` must name it.
+
+**Codex provider homes.** The MiMo and DeepSeek helpers in [Codex Accounts](#codex-accounts) take the same options on Windows:
+
+```powershell
+py -3 scripts\setup-codex-mimo.py --home ~/.codex-mimo --billing payg
+py -3 scripts\setup-codex-deepseek.py --home ~/.codex-deepseek
+```
+
+A session that uses such a home needs `node` on `PATH`.
+
+### Guests on Windows
+
+The top-level `guest_mode` in `registry.json` decides how guests are let into one project channel. It has three values:
+
+| `guest_mode` | What it means |
+|--------------|---------------|
+| absent, or `"roles"` | The macOS mode described in [Project Guests](#project-guests): one guest role per project. It is never used on Windows, because the Windows bot never gets Manage Roles for the whole server |
+| `"none"` | No new guests from this machine. `invite`, `grant` and `sync` refuse and make no Discord call. `revoke` and `list` still work. Setup writes this value |
+| `"member-overwrites"` | No role. Each guest gets permissions of their own: allowed on the one project channel, denied View Channel on this machine's category and its other project channels. The bot only needs Manage Permissions on its own category |
+
+Keep `"none"` until you have tried `"member-overwrites"` on your server:
+
+1. Set `"guest_mode": "member-overwrites"` in `registry.json`.
+2. With a test account and a test project, run `invite`, `sync` and `revoke` from the block below.
+3. If Discord refuses one of them, revoke the test guest and set `"guest_mode": "none"` again. This machine then takes no guests.
+
+```powershell
+node scripts\guest-access.js invite <project> <discord-user-id>
+node scripts\guest-access.js grant <project> <discord-user-id>
+node scripts\guest-access.js sync <project>
+node scripts\guest-access.js revoke <project> <discord-user-id>
+node scripts\guest-access.js list
+```
+
+- `invite` is for someone who is not in the server yet. It makes a one-use invite. After they join, run `sync <project>`; the command tells you when this is needed.
+- `grant` is for someone who is already in the server.
+- In `"member-overwrites"` mode CCDM only touches the channels the registry names: the project channels and the categories in `category_ids`. Everywhere else in the server a guest sees what `@everyone` sees.
+- Revoke every guest before you change `guest_mode`. One mode does not clean up what another mode wrote.
+- Never give the bot Manage Roles for the whole server to make guests work.
+- Guests can never reach root.
+
+### Context % on Windows
+
+Nothing to configure. The launchers write Claude's `statusLine` setting for each launch, so every reply shows the context percentage. If you already have a `statusLine` command of your own, it keeps running: CCDM passes it on with `--chain`. Your Claude settings file is not changed. Skip the `statusLine` step in [Context Usage in the Project Identity](#context-usage-in-the-project-identity).
+
+### Preventing sleep on Windows
+
+If the PC sleeps, the Router and every session go offline.
+
+- CCDM asks Windows not to go to sleep from idleness while a project session or a thread session runs **and** the PC is on AC power.
+- Only the installed `host` service does this. A `ccdm-host` that you start by hand does not.
+- Root alone does not count. With no project or thread session running, the PC may sleep.
+- On battery CCDM holds nothing. A laptop on battery goes to sleep as usual, and sleep drops the network. Keep the laptop plugged in.
+- CCDM checks the power source every 30 seconds.
+- It does not keep the screen on. It does not stop the sleep that follows closing the lid, pressing the power button or choosing Sleep in the Start menu.
+- To see the request, run `powercfg /requests` in an administrator terminal. Its reason reads `CCDM: <n> sessions`.
+
+### Auto-start on Windows
+
+- The tasks start when you sign in to Windows. They run only while you are signed in.
+- `router`, `host`, `thread-supervisor` and `reminders` start at sign-in. Task Scheduler also looks every 5 minutes and starts one that is not running, unless it is `disabled`.
+- `root-at-logon` runs once for each sign-in. It waits one minute, then waits up to 120 seconds for the Router and `ccdm-host` to answer, then starts root. So root is up one to three minutes after you sign in.
+- If that run fails, it does not try again until the next sign-in. Start root yourself with `scripts\ccdm restart-root`.
+- Its log is `<stateRoot>\services\root-at-logon.log`. Look for `root is up`, `router not reachable after 120 s` or `ccdm-host not reachable after 120 s`.
+- Project sessions do not start by themselves. Send `start <project>` to root.
+- After a restart for a Windows update, nothing runs until you sign in. The Windows setting "Use my sign-in info to automatically finish setting up after an update" (Settings > Accounts > Sign-in options) signs you in again after such a restart. Turn it on, so that you do not have to sign in by hand.
+
+### Troubleshooting on Windows
+
+Start with these two commands:
+
+```powershell
+node scripts\router.js status
+scripts\ccdm service-status
+```
+
+`router status` shows the gateway, the connected sessions and any channel permission the bot is missing. If the Router does not answer and its service is installed, it also prints a line `service: <state>`.
+
+`service-status` prints one line per service:
+
+| State | Meaning | What to do |
+|-------|---------|------------|
+| `running` | The service is up | Nothing |
+| `backoff` | It failed and starts again after a short wait | Read its `.err` log |
+| `crashloop` | It failed six times within ten minutes. The waits grow, up to ten minutes. The state ends after it has stayed up for 30 minutes | Read its `.err` log and fix the cause |
+| `disabled` | It was stopped on purpose, or its program ended cleanly. A marker file `<name>.disabled` in `<stateRoot>\services` keeps it stopped | Run `scripts\ccdm install-service <name>` again |
+| `stopped` | The task exists but nothing runs | Wait up to 5 minutes for the next start, or run `scripts\ccdm install-service <name>` again |
+| `installed` | The task exists and has not written a state. `root-at-logon` and `usage-poster` always show this | Nothing |
+| `not installed` | There is no task | Install it |
+
+**Logs.** Each service writes `<stateRoot>\services\<name>.log` and `<name>.err`. Older logs end in `.1`, `.2` and `.3`.
+
+**A service will not install.** The install runs a `preflight` first and prints what blocks it. You can run the checks alone; they change nothing:
+
+```powershell
+node scripts\router.js preflight
+py -3 scripts\thread-supervisor.py preflight
+scripts\ccdm reminders preflight
+```
+
+Some of the printed fixes still name a macOS `.sh` installer. On Windows, run `scripts\ccdm install-service <name>` for the same service.
+
+**A service stays stopped after `enable`.** After `py -3 scripts\thread-supervisor.py enable` or `scripts\ccdm reminders enable`, run `scripts\ccdm install-service <name>` again. `enable` alone starts nothing.
+
+**The install says a worker is already running outside the service.** A Thread Supervisor or reminder worker that you started by hand blocks the install. Stop it with Ctrl+C in its terminal, then install again.
+
+**Setup stops and names `CLAUDE.md` or `.mex/AGENTS.md`.** The clone was made without symlinks. Do step 2, clone again, and run setup in the new clone.
+
+**Setup says the terminal cannot hide input.** Run setup from Windows Terminal, not from the Git Bash window.
+
+**Upgrading `ccdm-host` while sessions are live.** `scripts\ccdm install-service host` refuses while any session is live, and root is a session. To upgrade and keep the conversations, use a terminal outside CCDM:
+
+1. Note each project's conversation id:
+
+   ```powershell
+   scripts\ccdm status
+   ```
+
+2. Stop each project and its threads:
+
+   ```powershell
+   scripts\ccdm stop-session <project> --all
+   ```
+
+3. Install the host. `--force` ends the sessions that are left, such as root:
+
+   ```powershell
+   scripts\ccdm install-service host --force
+   ```
+
+4. Start root, then each Claude project with its id:
+
+   ```powershell
+   scripts\ccdm restart-root
+   scripts\ccdm start-session <project> --resume <id>
+   ```
+
+A Codex project starts with `scripts\ccdm start-codex-session <project>`; [Resuming a Codex conversation](#resuming-a-codex-conversation) says how to find its id. A thread resumes its conversation at your next message in it.
+
+If `ccdm-host` ends cleanly, for example after `node scripts\ccdm-host.js shutdown`, the `host` service shows `disabled`. Run `scripts\ccdm install-service host` to start it again.
+
+### Limitations on Windows
+
+- Signing out of Windows stops the Router, `ccdm-host` and every session. Nothing runs before you sign in.
+- Root on Windows is Claude only for now. `scripts\ccdm restart-root --provider codex` is refused. Codex projects and Codex threads work.
+- The usage poster never posts on Windows; it only collects.
+- No guests until you choose `"member-overwrites"`; see [Guests on Windows](#guests-on-windows).
+- The tools in [Cutover and retirement](#cutover-and-retirement) are for older macOS installs. A Windows install starts on the Router and does not need them.
+
+### Multiple machines
+
+A Mac and a Windows PC can run CCDM in the same Discord server.
+
+- **Two bots.** Each machine has its own bot, its own token, its own Router, its own `registry.json` and its own services. Never copy a token or a `registry.json` from one machine to the other.
+- **Two categories.** Each machine has its own private category and its own root channel. To talk to a machine's root, write in that machine's root channel.
+- **Names.** Windows project names end in `-win`, so no channel or session has the name of a Mac project.
+- **Mentions.** Each bot sees only its own category. An `@mention` reaches only the bot that can see the channel. Mentioning the Mac's bot in a Windows channel does nothing, and the other way round.
+- **Resume.** A conversation is stored on the machine that ran it. `--resume` works only on that machine. You cannot continue a Mac conversation on Windows, or a Windows conversation on the Mac.
+- **Each machine works alone.** One machine keeps working while the other sleeps or is off. You set up, upgrade and restart each one by itself.
+- **Usage.** Both machines can use the same accounts. Only the Mac posts the usage report; Windows only collects.
+- **What the Windows bot can still do in the server.** Whatever `@everyone` may do, and read the audit log.
 
 ## Security Note
 
@@ -918,15 +1330,26 @@ CCDM includes reusable skills (custom slash commands) that any Claude Code agent
 
 | Skill | File | Description |
 |-------|------|-------------|
-| `/restart-self` | `skills/restart-self.md` | Agent restarts its own session — detects its tmux session name, state dir, and project path automatically, then runs a `nohup` restart that survives its own process being killed |
-| `/check-context` | `skills/check-context.md` | Agent checks its own context window usage — finds its tmux session, sends `/context`, and reports token usage breakdown |
+| `/restart-self` | `skills/restart-self.md` | Agent restarts its own session. It tells the user first, then runs the one `scripts/ccdm` command for its kind of session: `restart-session` for a project, `threads restart` for a thread, `restart-root` for root. It works for Claude and Codex sessions, on macOS and Windows |
+| `/check-context` | `skills/check-context.md` | Agent reports its own context window usage. It reads the percentage from its launch record (`context.json`). A Claude session can also type `/context` into itself for the breakdown by category |
 
 ### Installing skills
 
 **On your local machine (all agents get them automatically):**
+
+macOS and Linux:
 ```bash
+mkdir -p ~/.claude/commands
 cp skills/*.md ~/.claude/commands/
 ```
+
+Windows (PowerShell):
+```powershell
+New-Item -ItemType Directory -Force "$HOME\.claude\commands"
+Copy-Item skills\*.md "$HOME\.claude\commands\"
+```
+
+A session that runs with another Claude home (`CLAUDE_CONFIG_DIR`, or a project's `claude_home`) reads its skills from that home's `commands` folder. Copy them there too.
 
 **On a remote VM:**
 ```bash
