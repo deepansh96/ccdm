@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { assertIsolatedPath, buildCommandDiagnostics } from "./diagnostics.js";
-import { fixtureLauncher, gitBashTool, hookShell, interpreterFor, PYTHON } from "./platform.js";
+import { fixtureLauncher, gitBashTool, hookShell, interpreterFor, PYTHON, withoutGitBashTmpWarning } from "./platform.js";
 import { readState, recordCommandInvocation, writeState } from "./state.js";
 import { createWorkspaceJob, registerTeardownCallback, workspaceOwnsPid } from "./teardown.js";
 
@@ -779,9 +779,10 @@ function commandLinesOf(pids) {
   if (process.platform === "win32" && pids.length > 0) {
     const powershell = path.join(process.env.SystemRoot || "C:\\\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
     const filter = pids.map((pid) => \`ProcessId=\${pid}\`).join(" OR ");
-    const script = \`[Console]::OutputEncoding=[Text.Encoding]::UTF8;Get-CimInstance Win32_Process -Filter '\${filter}' | ForEach-Object { [string]$_.ProcessId + ' ' + $_.CommandLine }\`;
-    // PowerShell has no module cache under a workspace's empty profile, and on a
-    // CI runner that first start alone can take more than 15 seconds.
+    // A WMI query by type name, not Get-CimInstance. Under a workspace's empty
+    // profile PowerShell has no module cache, and on a CI runner finding that
+    // cmdlet's module outlasted the 60 seconds below, so nothing was signalled.
+    const script = \`[Console]::OutputEncoding=[Text.Encoding]::UTF8;foreach ($row in ([wmisearcher]'SELECT ProcessId, CommandLine FROM Win32_Process WHERE \${filter}').Get()) { [string]$row.ProcessId + ' ' + $row.CommandLine }\`;
     const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 60000, windowsHide: true });
     for (const line of String(result.stdout || "").split(/\\r?\\n/)) {
       const match = /^(\\d+) (.*)$/.exec(line);
@@ -1880,7 +1881,7 @@ function runProcess(workspace, command, args, options = {}) {
         env,
         exitCode,
         signal,
-        stderr,
+        stderr: withoutGitBashTmpWarning(stderr),
         stdout,
       };
       recordCommandInvocation(result, { stateDir: workspace.stateDir });

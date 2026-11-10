@@ -110,6 +110,18 @@ export function interpreterFor(script, platform = process.platform) {
   return [script];
 }
 
+// Git Bash takes /tmp from the TEMP of the oldest process of its runtime that is
+// still running, not from its own. Every workspace has its own TEMP, so once the
+// workspace that process came from is removed, each bash start prints this line
+// until the runtime has no process left. A shim starts bash twice and the command
+// behind it once, so the line count differs between two calls that behave the same.
+const GIT_BASH_TMP_WARNING = /^(?:ba)?sh(?:\.exe)?: warning: could not find \/tmp, please create!\r?\n/gm;
+
+// `stderr` without that line on Windows; unchanged elsewhere.
+export function withoutGitBashTmpWarning(stderr, platform = process.platform) {
+  return platform === "win32" ? stderr.replace(GIT_BASH_TMP_WARNING, "") : stderr;
+}
+
 // Test options for an OS tag: `test(name, platformGate("posix", "why"), body)`.
 // `posix` is Linux and macOS; `darwin` only for a real macOS facility, never for
 // a test that passes on Linux with fixtures; `win32` for a Windows-only case.

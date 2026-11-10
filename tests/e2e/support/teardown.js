@@ -121,7 +121,8 @@ function windowsPowerShell() {
 
 function commandLineLookup(pid) {
   if (process.platform === "win32") {
-    const script = `[Console]::OutputEncoding=[Text.Encoding]::UTF8;(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine`;
+    // A WMI query by type name: Get-CimInstance must first find its module, which is slow with no module cache.
+    const script = `[Console]::OutputEncoding=[Text.Encoding]::UTF8;foreach ($row in ([wmisearcher]'SELECT CommandLine FROM Win32_Process WHERE ProcessId=${pid}').Get()) { $row.CommandLine }`;
     return [windowsPowerShell(), ["-NoProfile", "-NonInteractive", "-Command", script]];
   }
   return [fs.existsSync("/bin/ps") ? "/bin/ps" : "ps", ["-ww", "-o", "command=", "-p", String(pid)]];
