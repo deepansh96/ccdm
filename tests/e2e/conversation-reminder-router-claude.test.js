@@ -188,8 +188,11 @@ test("the router Claude capability marker lives with the channel server and is g
   await waitForState(workspace, () => !fs.existsSync(context.markerPath));
   const blocked = await readiness(context);
   assert.equal(blocked.exitCode, 2);
-  assert.match(JSON.parse(blocked.stdout).unsupported_capabilities.join(" "),
-    /Claude launch-scoped transport is not verified for this assignment; restart the session with scripts\/start-session.sh demo/);
+  // The launcher as this OS has it: the script on macOS and Linux, the subcommand on Windows.
+  const launcher = process.platform === "win32" ? "scripts/ccdm start-session" : "scripts/start-session.sh";
+  assert.ok(JSON.parse(blocked.stdout).unsupported_capabilities.join(" ").includes(
+    `Claude launch-scoped transport is not verified for this assignment; restart the session with ${launcher} demo`),
+  blocked.stdout);
 
   // A relaunch replaces the marker with its own channel server's.
   const relaunched = await startSession(context);

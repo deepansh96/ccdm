@@ -448,6 +448,41 @@ test("a service that takes no options refuses them before any schtasks call", on
   assert.deepEqual(invocations(workspace), []);
 });
 
+test("install-service <name> --help prints that service's usage, exits 0 and checks or changes nothing", onlyWindows, async () => {
+  const workspace = createRouterWorkspace();
+  const services = {
+    router: ["Router", ""],
+    host: ["Host", " [--force]"],
+    "thread-supervisor": ["ThreadSupervisor", ""],
+    reminders: ["Reminders", ""],
+    "usage-poster": ["UsagePoster", " [--interval <seconds>]"],
+    "root-at-logon": ["RootAtLogon", ""],
+  };
+
+  for (const [name, [task, options]] of Object.entries(services)) {
+    for (const flags of [["--help"], ["-h"]]) {
+      const result = await ccdm(workspace, ["install-service", name, ...flags]);
+      const lines = result.stdout.split(/\r?\n/);
+      assert.deepEqual([result.exitCode, result.stderr], [0, ""], `${name} ${flags}: ${result.stderr || result.stdout}`);
+      assert.equal(lines[0], `usage: scripts/ccdm install-service ${name}${options}`);
+      assert.equal(lines[1], `Installs the scheduled task \\CCDM\\${task} for this Windows user.`);
+      assert.ok(lines.length > 3, `${name}: the help says what the task runs`);
+      assert.doesNotMatch(result.stdout, /\.sh\b|LaunchAgent/, name);
+    }
+  }
+  // Also after an option the service takes, where the install would otherwise go ahead.
+  const forced = await ccdm(workspace, ["install-service", "host", "--force", "--help"]);
+  assert.deepEqual([forced.exitCode, forced.stderr], [0, ""]);
+  assert.match(forced.stdout, /^usage: scripts\/ccdm install-service host \[--force\]/);
+
+  const all = await ccdm(workspace, ["install-service", "--help"]);
+  assert.equal(all.exitCode, 0, all.stderr);
+  assert.match(all.stdout, /^names: router, host, thread-supervisor, reminders, usage-poster, root-at-logon$/m);
+
+  assert.deepEqual(invocations(workspace), [], "schtasks was not called");
+  assert.equal(fs.existsSync(serviceDir(workspace)), false, "no service state was written");
+});
+
 test("a later service adds only its module and template: options, template values, no start, its own subcommand", onlyWindows, async () => {
   const workspace = createRouterWorkspace();
   const winDir = path.join(workspace.repoDir, "scripts", "win");

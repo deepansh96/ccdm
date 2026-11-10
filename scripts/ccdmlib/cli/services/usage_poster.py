@@ -1,7 +1,8 @@
 """Usage collection on a timer: ``usage-stats-poster.py --collect-only``.
 
-Windows only collects, for ``ccdm usage``. Both machines use the same accounts and
-the Mac stays the only poster, so the command below is fixed and no option changes it.
+Windows only collects the usage history; ``ccdm usage`` does not read it. Both
+machines use the same accounts and the Mac stays the only poster, so the command
+below is fixed and no option changes it.
 """
 
 from __future__ import annotations
@@ -25,6 +26,14 @@ _CONFIG_CHECK_TIMEOUT_SECONDS = 60
 
 _POSTER = SCRIPTS_DIR / "usage-stats-poster.py"
 _COLLECT_ONLY = "--collect-only"
+
+OPTIONS = "[--interval <seconds>]"
+HELP = (
+    "The task collects usage history on a timer and never posts to Discord.",
+    "The install does not start it: the first collection comes one interval after the install.",
+    f"  --interval <seconds>  how often to collect, from {_MINIMUM_INTERVAL_SECONDS} to "
+    f"{_MAXIMUM_INTERVAL_SECONDS} (default {_DEFAULT_INTERVAL_SECONDS})",
+)
 
 # The host drops every CCDM_* name it inherits, so the state root is passed on
 # explicitly; collection and `ccdm usage` must agree on it.

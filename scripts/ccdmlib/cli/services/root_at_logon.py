@@ -27,6 +27,10 @@ from ...platform import exe, session_host
 from ..restart_root import _FORWARDED_TO_HOST_SESSION
 
 TEMPLATE = "root-at-logon.task.xml.in"
+HELP = (
+    "The task runs once a minute after each sign-in: it waits for the Router and ccdm-host, then starts root.",
+    "The install does not start it; scripts/ccdm restart-root starts root now. It takes no options.",
+)
 
 _SUBCOMMAND = "root-at-logon"
 _DEFAULT_WAIT_SECONDS = 120.0

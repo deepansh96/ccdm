@@ -12,6 +12,9 @@ this file changes. A service module defines:
     ACCEPTS_OPTIONS = True                 # optional; `context.options` holds the
                                            # words after the name, refused otherwise
     def register(subparsers) -> None       # optional, for a subcommand of its own
+    OPTIONS = "[--force]"                  # optional; the options, as the usage line of
+                                           # `install-service <name> --help` shows them
+    HELP = ("one line", "another")         # optional; what that help says after the usage
 
 macOS and Linux keep their ``.sh`` installers, which ``install-service`` runs.
 
@@ -42,6 +45,7 @@ from xml.sax.saxutils import escape
 
 from ...platform import exe, private_fs, proc
 from ...platform.atomic import replace_with_retry
+from ...platform.commands import POSIX_INSTALLERS
 from ...platform.paths import is_abs, state_root
 from ...platform.services import SERVICE_TASKS  # the one table; services.js holds its twin
 
@@ -50,12 +54,7 @@ ROOT_DIR = Path(__file__).resolve().parents[4]
 SCRIPTS_DIR = ROOT_DIR / "scripts"
 WIN_DIR = SCRIPTS_DIR / "win"
 
-_POSIX_INSTALLERS = {
-    "router": "install-router-service.sh",
-    "thread-supervisor": "install-thread-supervisor.sh",
-    "reminders": "install-conversation-reminder-service.sh",
-    "usage-poster": "install-usage-stats-poster.sh",
-}
+_HELP_FLAGS = ("--help", "-h")
 
 _TASK_NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 _MINIMUM_NODE_MAJOR = 22
@@ -572,12 +571,27 @@ def _handle(run):
         return 1
 
 
+def _help_windows(name: str) -> int:
+    """`install-service <name> --help`: the usage and what the install does. Nothing is checked or changed."""
+    module = _module_for(name)
+    if module is None:
+        return _not_available(name)
+    options = getattr(module, "OPTIONS", "")
+    print(f"usage: scripts/ccdm install-service {name}{' ' + options if options else ''}")
+    print(f"Installs the scheduled task \\CCDM\\{SERVICE_TASKS[name]} for this Windows user.")
+    for line in getattr(module, "HELP", ()):
+        print(line)
+    return 0
+
+
 def install_service(args: argparse.Namespace) -> int:
     if not _known(args.name):
         return 2
     if WIN32:
+        if any(option in _HELP_FLAGS for option in args.options):
+            return _help_windows(args.name)
         return _handle(lambda: _install_windows(args.name, args.options))
-    installer = _POSIX_INSTALLERS.get(args.name)
+    installer = POSIX_INSTALLERS.get(args.name)
     if installer is None:
         return _not_available(args.name)
     return subprocess.call([str(SCRIPTS_DIR / installer), *args.options])
@@ -600,7 +614,13 @@ def service_status(args: argparse.Namespace) -> int:
 
 
 def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
-    install = subparsers.add_parser("install-service", help="install a CCDM background service and start it")
+    # Windows only: on macOS and Linux each installer script prints its own help.
+    names = {
+        "epilog": f"names: {', '.join(SERVICE_TASKS)}\n"
+                  "scripts/ccdm install-service <name> --help says what one installs.",
+        "formatter_class": argparse.RawDescriptionHelpFormatter,
+    } if WIN32 else {}
+    install = subparsers.add_parser("install-service", help="install a CCDM background service and start it", **names)
     install.add_argument("name", metavar="<name>")
     install.add_argument("options", metavar="[options]", nargs=argparse.REMAINDER,
                          help="passed to the service's installer")

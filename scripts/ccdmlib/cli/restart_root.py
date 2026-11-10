@@ -31,7 +31,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
-from ..platform import private_fs, proc, session_host
+from ..platform import commands, private_fs, proc, session_host
 from . import _launch
 from ._detach import detach_if_self
 
@@ -87,8 +87,8 @@ _FORWARDED_TO_HOST_SESSION = (
 )
 
 _CODEX_ON_WINDOWS = (
-    "Root Codex is not available on Windows yet: the Windows root is Claude-only until the owner's "
-    "decision on a Codex root there (D2) is made. Run scripts/ccdm restart-root for root Claude."
+    "Root Codex is not available on Windows yet: the Windows root is Claude only for now. "
+    "Run scripts/ccdm restart-root for root Claude."
 )
 
 
@@ -181,10 +181,9 @@ def _router_answers(root: Path) -> bool:
     if problem is None:
         return True
     _complain(problem)
-    installer = "scripts/ccdm install-service router" if WIN32 else "scripts/install-router-service.sh"
     _complain(
         "The Router is not answering, so root was not restarted: the running root and its key are unchanged. "
-        f"Start the Router ({installer}, or node scripts/router.js serve) and retry."
+        f"Start the Router ({commands.installer_ref('router')}, or node scripts/router.js serve) and retry."
     )
     return False
 

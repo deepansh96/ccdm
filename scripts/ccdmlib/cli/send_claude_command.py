@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, NamedTuple, NoReturn, Optional, Sequence, Tuple
 
-from ..platform import exe, proc, session_host
+from ..platform import commands, exe, proc, session_host
 from ..platform.session_host import SessionHostError
 
 ROOT_DIR = Path(__file__).resolve().parents[3]
@@ -55,7 +55,7 @@ def _session_word() -> str:
 
 
 def _usage() -> str:
-    script = f"scripts/ccdm {_NAME}" if proc.WIN32 else f"scripts/{_NAME}.sh"
+    script = commands.script_ref(_NAME)
     return "\n".join((
         "Usage:",
         f"  {script} <project|channel_id|thread_id|link> <compact|clear|/compact|/clear>",

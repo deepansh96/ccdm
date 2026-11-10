@@ -19,13 +19,16 @@ const GUEST_ALLOW =
   (1n << 16n) |
   (1n << 38n);
 
+// How the operator runs this file: Windows does not honour the shebang.
+const COMMAND = process.platform === "win32" ? "node scripts/guest-access.js" : "scripts/guest-access.js";
+
 function usage() {
   console.error(`Usage:
-  scripts/guest-access.js invite <project|channel_id|thread_id|link> <user_id>
-  scripts/guest-access.js grant <project|channel_id|thread_id|link> <user_id>
-  scripts/guest-access.js revoke <project|channel_id|thread_id|link> <user_id>
-  scripts/guest-access.js sync [project|channel_id|thread_id|link]
-  scripts/guest-access.js list [project|channel_id|thread_id|link]`);
+  ${COMMAND} invite <project|channel_id|thread_id|link> <user_id>
+  ${COMMAND} grant <project|channel_id|thread_id|link> <user_id>
+  ${COMMAND} revoke <project|channel_id|thread_id|link> <user_id>
+  ${COMMAND} sync [project|channel_id|thread_id|link]
+  ${COMMAND} list [project|channel_id|thread_id|link]`);
   process.exit(2);
 }
 
@@ -379,8 +382,8 @@ async function main() {
 
   const registry = loadRegistry();
   if (guestMode(registry) === "none" && ["invite", "grant", "sync"].includes(action)) {
-    console.error(`Error: guest ${action} is off for this registry: guest_mode is "none" (owner decision D4: ` +
-      "no guests where the bot would need server-wide Manage Roles). revoke and list still work.");
+    console.error(`Error: guest ${action} is off for this registry: guest_mode is "none" ` +
+      "(no guests where the bot would need server-wide Manage Roles). revoke and list still work.");
     process.exit(1);
   }
   try {

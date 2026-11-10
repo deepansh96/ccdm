@@ -767,7 +767,12 @@ test("the next steps name the service installs in a working order, restart-root,
     assert.ok(index >= 0, `the next steps do not say "${text}":\n${steps}`);
     return index;
   };
-  // The Router first: the installs after it check that it is running.
+  // The Router first: two of the installs after it check that it is running, and the steps name those two.
+  at("The Router goes first: thread-supervisor and reminders check that it is running.");
+  assert.doesNotMatch(steps, /the others check/);
+  // The poster's history is not what `ccdm usage` reads.
+  at("scripts\\ccdm install-service usage-poster   (collects usage history on a timer)");
+  assert.doesNotMatch(steps, /for `ccdm usage`/);
   const order = ["router", "host", "thread-supervisor", "root-at-logon", "reminders", "usage-poster"]
     .map(service => at(`scripts\\ccdm install-service ${service}`));
   assert.deepEqual(order, [...order].sort((a, b) => a - b));

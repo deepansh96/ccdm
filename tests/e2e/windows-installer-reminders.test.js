@@ -214,6 +214,10 @@ test("with the Router unreachable and root's credentials missing the installer p
   assert.match(result.stderr, /Conversation Reminder preflight failed; the existing task was left unchanged/);
   assert.match(result.stderr, /^ {2}- .*root Discord credentials are unavailable/m);
   assert.match(result.stderr, /^ {2}- .*Router/m);
+  // The printed fix is a command Windows has: no .sh installer, and Node scripts through node.
+  assert.match(result.stderr,
+    /the Router is not reachable; start the Router \(scripts\/ccdm install-service router, or node scripts\/router\.js serve\)/);
+  assert.doesNotMatch(result.stderr, /install-[a-z-]+\.sh|LaunchAgent/);
   assert.deepEqual(changes(workspace), []);
   assert.equal(fs.existsSync(serviceFile(workspace, ".json")), false);
   assert.equal(fs.existsSync(reminderStateDir(workspace)), false, "the preflight created nothing");
