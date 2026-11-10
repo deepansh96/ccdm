@@ -82,6 +82,40 @@ test("a status read waits for the first event's table, and a ledger that never g
     [true, 0, []]);
 });
 
+test("a command waits out another process's store write that lasts four seconds", async () => {
+  const workspace = createBridgeWorkspace();
+  const result = await pythonProbe(workspace, "slow-store-write.py", [
+    "import importlib.util, sqlite3, threading, time",
+    "from pathlib import Path",
+    "spec = importlib.util.spec_from_file_location('service', sys.argv[2])",
+    "service = importlib.util.module_from_spec(spec); spec.loader.exec_module(service)",
+    "state = Path(sys.argv[3])",
+    "service.connect(state, create=True).close()",
+    "held = threading.Event()",
+    // Another reminder process whose write section is slow to reach the disk.
+    "def slow_write():",
+    "    other = sqlite3.connect(service.store_path(state), isolation_level=None)",
+    "    other.execute('BEGIN IMMEDIATE')",
+    "    other.execute(\"INSERT OR REPLACE INTO settings VALUES ('probe','1')\")",
+    "    held.set(); time.sleep(4)",
+    "    other.execute('COMMIT'); other.close()",
+    "writer = threading.Thread(target=slow_write); writer.start()",
+    "held.wait()",
+    "started = time.monotonic()",
+    "db = service.connect(state)",
+    "db.execute('BEGIN IMMEDIATE')",
+    "waited = time.monotonic() - started",
+    "seen = db.execute(\"SELECT value FROM settings WHERE key='probe'\").fetchone()[0]",
+    "db.execute('COMMIT'); db.close(); writer.join()",
+    "print(json.dumps({'waited': waited, 'seen': seen, 'limit': service.STORE_BUSY_SECONDS}))",
+  ], [path.join(workspace.repoDir, "scripts", "conversation-reminder-service.py"),
+    path.join(workspace.tmpDir, "slow-write-state")]);
+  // The command got the store only after the slow write ended, and it saw that write.
+  assert.equal(result.seen, "1");
+  assert.ok(result.waited >= 3, `waited ${result.waited} s`);
+  assert.ok(result.limit > 4, `store wait is ${result.limit} s`);
+});
+
 test("the reminder gap follows 1h, then 2h per ignored reminder, capped at 24h", async () => {
   const workspace = createBridgeWorkspace();
   const script = path.join(workspace.repoDir, "scripts", "conversation-reminder-service.py");
