@@ -155,7 +155,13 @@ function killSession(workspace, threadId) {
   const session = readState(workspace.stateDir).fixtures.tmux.sessions[tmuxName(threadId)];
   if (process.platform !== "win32") return process.kill(-session.pid, "SIGKILL");
   for (const pid of session.job ?? [session.pid]) {
-    if (workspaceOwnsPid(pid, workspace.tmpRoot)) process.kill(pid, "SIGKILL");
+    if (!workspaceOwnsPid(pid, workspace.tmpRoot)) continue;
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch (error) {
+      // Ending one process of the session can end another before its own turn comes.
+      if (error.code !== "ESRCH") throw error;
+    }
   }
 }
 
