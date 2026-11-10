@@ -43,7 +43,7 @@ Harness deadlines (`waitFor`, `waitForState`, the `runProcess` kill timer) are m
 
 ### Runner Settings and Reports
 
-`tests/run-e2e.mjs` reads these environment variables. On macOS and Linux the defaults keep the behaviour above; Windows gets a deadline, fewer jobs and no rerun by default.
+`tests/run-e2e.mjs` reads these environment variables. On macOS and Linux the defaults keep the behaviour above; Windows gets a deadline, fewer jobs and no rerun by default (the `windows-required` CI job sets `CCDM_E2E_NO_RERUN=0`; see CI Behavior).
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -335,10 +335,12 @@ GitHub Actions runs on `push` and `pull_request`. Port PRs target the `windows-p
 | --- | --- | --- | --- |
 | `local-fake-e2e` | Linux, Node 22, Python 3.11 | Full suite, with `npm ci --omit=optional` | Yes |
 | `windows-e2e` | Windows, Node 22 and 24, Python 3.11 | Full suite; uploads the per-file report from `CCDM_E2E_REPORT_DIR` | No, it only warns (`continue-on-error`) |
-| `windows-required` | Windows, Node 22, Python 3.11 | Only the files in `tests/e2e/windows-required.txt` | Yes |
+| `windows-required` | Windows, Node 22, Python 3.11 | Only the files in `tests/e2e/windows-required.txt`, with `CCDM_E2E_NO_RERUN=0` so a failed file is rerun alone once | Yes |
 | `macos-e2e` | macOS, Node 22, `/usr/bin/python3` 3.9 | Python floor checks, then the full suite, with `npm ci --omit=optional` | Yes |
 
 The Linux and macOS jobs fail if `koffi` or another native Windows package is installed.
+
+`windows-required` turns the rerun-alone step on (`CCDM_E2E_NO_RERUN=0`), so it handles an intermittent failure the way the Linux and macOS jobs do: a file that fails in the parallel pass is rerun once, alone, and one that then passes is printed as `=== FLAKY` and recorded with `flaky: true` in `summary.json`, and the job stays green. Reruns run one after another after the parallel pass, each with the per-file deadline again (10 minutes by default on Windows), and the runner has no cap on how many files it reruns. A file that timed out is not rerun. `windows-e2e` (informational) leaves the rerun off on purpose, so it shows every intermittent failure.
 
 `macos-e2e` is the main Mac regression guard during the port. `CCDM_PYTHON` and the front of `PATH` select the Mac's own Python. `tmux`, `zsh`, `launchctl`, `security`, `ps` and `curl` stay fake in the Local Fake suite; no test runs the real `launchctl` or `security`. The one exception for real tools is `macos-real-tools.test.js`, which runs today's tmux command shapes against Homebrew tmux and real zsh, with `TMUX` unset and `TMUX_TMPDIR` inside its workspace, so it cannot reach your own tmux server.
 
