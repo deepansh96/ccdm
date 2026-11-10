@@ -10,6 +10,8 @@ import queue
 import subprocess
 import threading
 
+from ccdmlib.platform import exe
+
 
 LINK_SCRIPT = Path(__file__).resolve().parent.parent / "thread-supervisor-link.js"
 # Longer than the RouterClient's own 10-second op deadline, which answers first.
@@ -34,7 +36,8 @@ class Link:
         # The link writes UTF-8 whatever the OS's own text encoding is: a ✅ or any
         # other non-ASCII character in a frame must not end the reader on Windows.
         self.process = subprocess.Popen([node, str(LINK_SCRIPT), "--key-file", str(key_file)],
-                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, encoding="utf-8", bufsize=1)
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, encoding="utf-8", bufsize=1,
+                                        creationflags=exe.child_console_flags())
         self.frames: queue.Queue = queue.Queue()
         self.responses: dict[str, dict] = {}
         self.answered = threading.Condition()
