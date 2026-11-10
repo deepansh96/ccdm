@@ -1,6 +1,6 @@
 # Project Conversation state service
 
-This service records owner acknowledgment, `/close`, reopening, and qualifying Claude or Codex responses, and sends Conversation Reminders that back off while they are ignored. Run it in the foreground, or supervise the same worker with the opt-in macOS LaunchAgent described below. It runs independently of coding sessions: stopping or restarting a project or root agent does not stop it or change conversation state. Reminders are opt-in. A registered channel reports `suspended-incomplete-discovery` and sends nothing until `enable` has run and discovery marks it `ready`.
+This service records owner acknowledgment, `/close`, reopening, and qualifying Claude or Codex responses, and sends Conversation Reminders that back off while they are ignored. Run it in the foreground, or supervise the same worker with the opt-in macOS LaunchAgent described below. On Windows it runs in the foreground only; see [Windows](#windows). It runs independently of coding sessions: stopping or restarting a project or root agent does not stop it or change conversation state. Reminders are opt-in. A registered channel reports `suspended-incomplete-discovery` and sends nothing until `enable` has run and discovery marks it `ready`.
 
 ## Requirements
 
@@ -21,6 +21,32 @@ scripts/conversation-reminder-service.py run
 ```
 
 `enable` is the manual opt-in. It checks the provider prerequisites, the registry owner, and that root Discord credentials are present. Each blocker names its fix; for example, missing root credentials ask for `DISCORD_BOT_TOKEN` in `ROOT_DISCORD_STATE_DIR/.env`. If a check fails, it exits with status 2, lists the blockers under `preflight`, and changes nothing: it does not create the state directory or change its permissions. Only after every check passes does it create the private state directory, or reset its mode to `0700`. It never prints tokens. On success it clears `disabled`, requests discovery of older conversations, and sends every previously ready channel back through restart reconciliation. `run` starts the foreground worker. The worker verifies each channel's Discord permissions when it connects and records failures per channel.
+
+Windows: run the same commands as `scripts/ccdm reminders enable` and `scripts/ccdm reminders run`. See [Windows](#windows).
+
+## Windows
+
+Windows: every operator command goes through `scripts/ccdm reminders`, which also works on macOS and Linux:
+
+```sh
+scripts/ccdm reminders preflight
+scripts/ccdm reminders enable
+scripts/ccdm reminders run
+scripts/ccdm reminders status
+scripts/ccdm reminders disable
+scripts/ccdm reminders discover
+scripts/ccdm reminders recover
+scripts/ccdm reminders assignment-changed --project <project>
+```
+
+Each one runs `conversation-reminder-service.py` with the Python that CCDM resolves, and passes through its JSON and its exit status. Everything in this document applies on Windows, with these differences:
+
+- **No supervised worker yet.** No scheduled task runs the worker, so nothing starts it at logon or restarts it. Keep `scripts/ccdm reminders run` running in a terminal. The LaunchAgent section below is macOS only.
+- **Stopping.** Run `scripts/ccdm reminders disable` from another terminal. The worker then asks its Node observer to stop by closing the observer's standard input, waits up to 15 seconds for a Discord request in flight to finish and be recorded, and exits with status 0. Only an observer that is still there after that is ended by force. If the worker itself is ended some other way, the observer sees its input close, finishes the same way, and exits; no observer is left behind. The worker stops its observer the same way on macOS and Linux, where the observer also still stops on `SIGTERM` and `SIGINT`.
+- **Claude readiness.** A Claude channel is ready only while the channel server named in its capability marker is running. Windows proves that from the process table: the marker records the server's process ID and start time, and both must match a live `ccdm-channel-server.js` process. A process ID that now belongs to another program, or to a process with another start time, is not ready. A marker without a start time is judged by its process ID and command line alone.
+- **Blockers that name a shell script.** Where `status` names a `.sh` script as the fix, run the `scripts/ccdm` command of the same name, for example `scripts/ccdm start-session <project>`.
+- **Private state.** The state directory is private by its access list, not a mode: it takes no permissions from its parent folder and gives access only to your account and SYSTEM. `enable` creates it that way. If the directory inherits permissions again, `status` and the worker refuse the conversation store, the event database, and the observer's health file with a `permissions are not private` reason.
+- **Thread permissions.** `status` reports root's missing thread permissions once Thread Conversations are enabled: when `thread_session_caps` is configured, when the Thread Supervisor is connected to the Router, or when its scheduled task exists (`\CCDM\ThreadSupervisor`, or `CCDM-ThreadSupervisor`). On macOS the third signal is the supervisor's LaunchAgent plist, as before.
 
 ## Supervised LaunchAgent (macOS)
 

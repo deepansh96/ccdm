@@ -337,6 +337,13 @@ test("reminders assignment-changed runs the script with the resolved Python and 
   assert.deepEqual(seen.argv, ["assignment-changed", "--project", "alpha"]);
   if (WIN) assert.equal(fs.realpathSync(seen.python).toLowerCase(), fs.realpathSync(PYTHON).toLowerCase());
   else assert.equal(fs.readFileSync(wrapperLog, "utf8").trim().split("\n").at(-1), fs.realpathSync(service));
+
+  // The operator's other verbs reach the script as they are.
+  for (const verb of ["preflight", "enable", "status", "run", "disable", "discover", "recover"]) {
+    const plain = await ccdm(["reminders", verb], { env });
+    assert.equal(plain.exitCode, 7, plain.stderr);
+    assert.deepEqual(JSON.parse(plain.stdout.trim()).argv, [verb]);
+  }
 });
 
 test("on Windows, the pinned RELAY_INSTRUCTIONS command types /foo and then Enter into the caller's own session", onlyWindows, async () => {

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import test from "node:test";
 
@@ -10,9 +11,12 @@ import { createBridgeWorkspace, injectDiscordMessage, injectDiscordReaction, sta
 import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerEnv, routerWithWebhooks, waitFor } from "./support/router.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
-import { startThreadSupervisor, supervisorStatus } from "./support/thread-supervisor.js";
+import { startThreadHost, startThreadSupervisor, supervisorEnv, supervisorStatus } from "./support/thread-supervisor.js";
 
 test.afterEach(async () => cleanup());
+
+const WIN = process.platform === "win32";
+const { ensurePrivateDirSync } = createRequire(import.meta.url)("../../scripts/platform/privacy.js");
 
 // demo and quiet are Router projects; demo also left a retired assignment from
 // its old channel.
@@ -109,6 +113,8 @@ db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()`, dat
 function seedV7(workspace) {
   const stateDir = setup(workspace);
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  // Mode bits mean nothing on Windows: the store must sit in a protected directory.
+  if (WIN) ensurePrivateDirSync(stateDir);
   const database = path.join(stateDir, "conversations.sqlite3");
   sql(database, V7_SCHEMA + V7_ROWS);
   fs.chmodSync(database, 0o600);
@@ -350,10 +356,16 @@ function threadReminderWorkspace(type = "claude") {
   };
 }
 
+// What the services and launchers run with. On Windows sessions run on the fake
+// ccdm-host, whose env moves the state root, so the reminder state is named.
+const servicesEnv = (context, extra = {}) => (WIN
+  ? supervisorEnv(context.workspace, { CCDM_REMINDER_STATE_DIR: context.stateDir, PYTHONUTF8: "1", ...extra })
+  : routerEnv(context.workspace, extra));
+
 async function reminderService(context, name) {
   const result = await runScript(context.workspace, "scripts/conversation-reminder-service.py", {
     args: [name, "--project-root", context.workspace.repoDir, "--state-dir", context.stateDir],
-    env: routerEnv(context.workspace, context.env),
+    env: servicesEnv(context, context.env),
   });
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   return JSON.parse(result.stdout);
@@ -365,26 +377,28 @@ const ANSWER = [{ name: "reply", arguments: { chat_id: "{{chat_id}}", text: "Her
 
 // The Router with demo's webhook, the supervisor, demo's channel session when
 // it is a Claude project, and the enabled reminder worker, ready for demo.
-async function threadReminders(context, { channelSession = true, supervisorEnv = {}, beforeEnable } = {}) {
+async function threadReminders(context, { channelSession = true, supervisorEnv: workerEnv = {}, beforeEnable } = {}) {
   const { workspace } = context;
   updateState(workspace.stateDir, state => {
     state.fixtures.discord.history = { "demo-channel": [] };
     state.fixtures.claude.toolScript = ANSWER;
   });
   await routerWithWebhooks(workspace, ["demo"]);
+  if (WIN) await startThreadHost(workspace);
   if (channelSession) {
     const started = await runScript(workspace, "scripts/start-session.sh", {
-      args: ["demo"], env: routerEnv(workspace), timeoutMs: 30000,
+      args: ["demo"], env: servicesEnv(context), timeoutMs: 30000,
     });
     assert.equal(started.exitCode, 0, started.stderr || started.stdout);
   }
-  await startThreadSupervisor(workspace, { env: supervisorEnv });
+  await startThreadSupervisor(workspace, {
+    env: { ...(WIN ? { CCDM_REMINDER_STATE_DIR: context.stateDir } : {}), ...workerEnv } });
   await beforeEnable?.();
   await reminderService(context, "enable");
   context.setClock(0);
   const running = runScript(workspace, "scripts/conversation-reminder-service.py", {
     args: ["run", "--project-root", workspace.repoDir, "--state-dir", context.stateDir],
-    env: routerEnv(workspace, context.env), timeoutMs: 120000,
+    env: servicesEnv(context, context.env), timeoutMs: 120000,
   });
   const deadline = Date.now() + 20000;
   while ((await reminderService(context, "status")).conversations.demo?.reconciliation_status !== "ready") {
@@ -733,7 +747,7 @@ test("readiness reports root's missing thread permissions only while threads are
     fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
   };
 
-  // Threads are not enabled: no supervisor plist, no caps, no supervisor.
+  // Threads are not enabled: no installed supervisor, no caps, no supervisor.
   assert.deepEqual(await routerBlockers(), []);
 
   // `thread_session_caps` in the registry enables them.
@@ -742,11 +756,24 @@ test("readiness reports root's missing thread permissions only while threads are
   editRegistry(registry => { delete registry.thread_session_caps; });
   assert.deepEqual(await routerBlockers(), []);
 
-  // So does the supervisor's LaunchAgent plist.
+  // So does the installed supervisor: its LaunchAgent plist, or on Windows its
+  // scheduled task under either name, as the fixture schtasks reports it.
   const plist = path.join(workspace.homeDir, "Library", "LaunchAgents", "com.ccdm.thread-supervisor.plist");
   fs.mkdirSync(path.dirname(plist), { recursive: true });
   fs.writeFileSync(plist, "<plist/>\n");
-  assert.deepEqual(await routerBlockers(), THREAD_BLOCKERS);
+  if (WIN) {
+    // A plist means nothing on Windows, and the service asked for both task names.
+    assert.deepEqual(await routerBlockers(), []);
+    const asked = new Set(readState(workspace.stateDir).fixtures.schtasks.invocations.map(entry => entry.name));
+    assert.deepEqual([...asked].sort(), ["CCDM-ThreadSupervisor", String.raw`\CCDM\ThreadSupervisor`]);
+    for (const task of [String.raw`\CCDM\ThreadSupervisor`, "CCDM-ThreadSupervisor"]) {
+      updateState(workspace.stateDir, state => { state.fixtures.schtasks.tasks = [task]; });
+      assert.deepEqual(await routerBlockers(), THREAD_BLOCKERS, task);
+    }
+    updateState(workspace.stateDir, state => { state.fixtures.schtasks.tasks = []; });
+  } else {
+    assert.deepEqual(await routerBlockers(), THREAD_BLOCKERS);
+  }
   fs.rmSync(plist);
   assert.deepEqual(await routerBlockers(), []);
 

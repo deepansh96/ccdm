@@ -581,7 +581,7 @@ test("the runbook carries the launch, restart, capture and trust rules and marks
   // Each line that waits for a later slice names its issue.
   for (const [file, issues] of Object.entries({
     ".mex/patterns/operate-thread-supervisor.md": ["#249"],
-    ".mex/patterns/operate-conversation-reminders.md": ["#242", "#249"],
+    ".mex/patterns/operate-conversation-reminders.md": ["#249"],
   })) {
     for (const issue of issues) {
       assert.match(read(file), new RegExp(`Windows: pending[^\\n]*${issue}\\b`), `${file} has no "Windows: pending" line for ${issue}`);

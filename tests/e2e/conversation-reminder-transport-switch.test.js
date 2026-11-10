@@ -149,7 +149,10 @@ test("switching a pool conversation to the Router carries it to the webhook iden
   assert.notEqual(changed.assignment_generation, "gen-1");
   assert.equal(readRegistry(context).projects.demo.assignment_generation, changed.assignment_generation);
   // Either the change workflow or the running worker deletes it, always as root.
-  assert.deepEqual([...changed.retired_cleanup.completed, ...changed.retired_cleanup.inaccessible], ["pool-reminder"]);
+  // The workflow lists it only when it got there first, and leaves nothing pending.
+  const byWorkflow = [...changed.retired_cleanup.completed, ...changed.retired_cleanup.inaccessible];
+  if (byWorkflow.length) assert.deepEqual(byWorkflow, ["pool-reminder"]);
+  assert.deepEqual(changed.retired_cleanup.pending, []);
   await waitForStatus(context, (current) => current.retired_assignments?.find((row) =>
     row.assignment_generation === "gen-1")?.cleanup.completed.includes("pool-reminder"));
   assert.deepEqual([...new Set(deletes(context).map(String))], [["pool-reminder", `Bot ${ROOT_TOKEN}`]].map(String));

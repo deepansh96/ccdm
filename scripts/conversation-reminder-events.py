@@ -519,8 +519,10 @@ def main(argv: list[str] | None = None) -> int:
     state_dir = args.state_dir.expanduser()
     if args.command == "ingest":
         try:
-            raw_event = json.load(sys.stdin)
-        except (json.JSONDecodeError, OSError):
+            # Bytes, which json reads as UTF-8: the console's own encoding would
+            # mangle an emoji on Windows.
+            raw_event = json.load(sys.stdin.buffer)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             result = {"status": "rejected", "reason": "input is not valid JSON"}
         else:
             result = ingest_event(args.project_root.resolve(), state_dir, raw_event)
