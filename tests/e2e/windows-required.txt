@@ -71,3 +71,5 @@ tests/e2e/thread-commands.test.js
 tests/e2e/thread-operations.test.js
 tests/e2e/usage-report.test.js
 tests/e2e/usage-stats-poster.test.js
+tests/e2e/windows-installer-thread-supervisor.test.js
+tests/e2e/windows-installer-reminders.test.js
