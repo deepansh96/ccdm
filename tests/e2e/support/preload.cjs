@@ -115,6 +115,34 @@ function formBodyFields(body) {
   return fields;
 }
 
+// Opt-in log of every Discord REST request, in order. A test that seeds
+// `requestLog: []` gets one `{ method, path, authorization, body }` per request,
+// where `body` is the JSON text or, for a multipart form, its fields.
+function recordRequest(method, url, init = {}) {
+  if (!Array.isArray(readState().fixtures?.discord?.requestLog)) return;
+  updateState((state) => {
+    state.fixtures.discord.requestLog.push({
+      method,
+      path: `${url.pathname}${url.search}`,
+      authorization: headerValue(init.headers, "Authorization"),
+      body: typeof init.body === "string" ? init.body : formBodyFields(init.body),
+    });
+  });
+}
+
+// A channel's permission overwrites by id: the ones seeded on its `channels`
+// entry, then every overwrite written or deleted since.
+function channelOverwrites(discord, channelId) {
+  const channels = Array.isArray(discord.channels) ? discord.channels : [];
+  const seeded = channels.find(channel => channel.id === channelId)?.permission_overwrites ?? [];
+  const overwrites = new Map(seeded.map(overwrite => [overwrite.id, overwrite]));
+  for (const [id, overwrite] of Object.entries(discord.overwriteChanges?.[channelId] ?? {})) {
+    if (overwrite) overwrites.set(id, overwrite);
+    else overwrites.delete(id);
+  }
+  return overwrites;
+}
+
 function takeRestFailure(method, url, init = {}) {
   const state = readState();
   const failures = state.fixtures?.discord?.restFailures;
@@ -427,6 +455,7 @@ function threadChannel(thread) {
 function routeDiscordApi(url, init = {}) {
   const method = (init.method || "GET").toUpperCase();
   if (url.hostname === "discord.com") {
+    recordRequest(method, url, init);
     const limited = takeRateLimit(method, url);
     if (limited) return limited;
     const failure = takeRestFailure(method, url, init);
@@ -554,8 +583,31 @@ function routeDiscordApi(url, init = {}) {
         overwriteId: channelPermissionMatch[2],
         type: parsedBody.type,
       });
+      ((state.fixtures.discord.overwriteChanges ||= {})[channelPermissionMatch[1]] ||= {})[channelPermissionMatch[2]] =
+        { id: channelPermissionMatch[2], type: parsedBody.type, allow: parsedBody.allow, deny: parsedBody.deny };
     });
     return response("", { status: 204 });
+  }
+
+  // Delete Channel Permission: recorded in `permissionOverwriteDeletes`; 404
+  // when the channel has no such overwrite.
+  if (url.hostname === "discord.com" && channelPermissionMatch && method === "DELETE") {
+    const [, channelId, overwriteId] = channelPermissionMatch;
+    const known = channelOverwrites(readState().fixtures?.discord ?? {}, channelId).has(overwriteId);
+    updateState((state) => {
+      state.fixtures.discord.permissionOverwriteDeletes ||= [];
+      state.fixtures.discord.permissionOverwriteDeletes.push({
+        authorization: headerValue(init.headers, "Authorization"),
+        channelId,
+        overwriteId,
+      });
+      ((state.fixtures.discord.overwriteChanges ||= {})[channelId] ||= {})[overwriteId] = null;
+    });
+    if (known) return response("", { status: 204 });
+    return response(JSON.stringify({ code: 10009, message: "Unknown Overwrite" }), {
+      headers: { "content-type": "application/json" },
+      status: 404,
+    });
   }
 
   const memberRoleMatch = /^\/api\/v10\/guilds\/([^/]+)\/members\/([^/]+)\/roles\/([^/]+)$/.exec(url.pathname);
@@ -949,8 +1001,20 @@ function routeDiscordApi(url, init = {}) {
     });
   }
 
-  // Modify a thread channel and emit the matching Gateway update.
+  // Get Channel for a guild channel seeded in `channels`, with its current
+  // permission overwrites.
   const threadMatch = /^\/api\/v10\/channels\/([^/]+)$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && threadMatch && method === "GET") {
+    const discord = readState().fixtures?.discord ?? {};
+    const channel = (Array.isArray(discord.channels) ? discord.channels : []).find(entry => entry.id === threadMatch[1]);
+    return response(JSON.stringify(channel
+      ? { ...channel, permission_overwrites: [...channelOverwrites(discord, channel.id).values()] }
+      : { code: 10003, message: "Unknown Channel" }), {
+      headers: { "content-type": "application/json" }, status: channel ? 200 : 404,
+    });
+  }
+
+  // Modify a thread channel and emit the matching Gateway update.
   if (url.hostname === "discord.com" && threadMatch && method === "PATCH") {
     const authorization = headerValue(init.headers, "Authorization");
     const body = init.body ? JSON.parse(String(init.body)) : {};
