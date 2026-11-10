@@ -21,6 +21,14 @@ test.afterEach(async () => cleanup());
 
 const windowsOnly = platformGate("win32", "Windows access lists and scheduled tasks; POSIX modes and the plist are checked elsewhere");
 
+// A Python snippet run by the harness Python on every OS; its stdout parsed as JSON.
+function pythonJson(lines, args) {
+  const script = ["import json, sys", "sys.dont_write_bytecode = True", ...lines].join("\n");
+  const probe = spawnSync(PYTHON, ["-c", script, ...args], { encoding: "utf8" });
+  assert.equal(probe.status, 0, probe.stderr);
+  return JSON.parse(probe.stdout);
+}
+
 test("the worker reads a ledger with no events table as empty, and still surfaces other database errors", async () => {
   const workspace = createBridgeWorkspace();
   const script = path.join(workspace.repoDir, "scripts", "conversation-reminder-service.py");
@@ -49,6 +57,71 @@ print(json.dumps([empty, error(lambda: service.event_rows(state)), error(lambda:
   assert.deepEqual(empty, [0, 0]);
   assert.match(eventRowsError, /no such column/);
   assert.match(rowsMatchingError, /no such column/);
+});
+
+test("a status read waits for the first event's table, and a ledger that never gets one stays unavailable", async () => {
+  const workspace = createBridgeWorkspace();
+  const result = pythonJson([
+    "import importlib.util, os, threading, time",
+    "from pathlib import Path",
+    "spec = importlib.util.spec_from_file_location('events', sys.argv[1])",
+    "events = importlib.util.module_from_spec(spec); spec.loader.exec_module(events)",
+    "state = Path(sys.argv[2]); events.private_directory(state)",
+    // The moment after the first event has created the file and before it has created the table.
+    "os.close(os.open(events.database_path(state), os.O_WRONLY | os.O_CREAT, 0o600))",
+    "started = time.monotonic()",
+    "never = events.status_for(state, 'demo')",
+    "waited = time.monotonic() - started",
+    "def first_event():",
+    "    time.sleep(0.4)",
+    "    events.connect_database(state, create=True).close()",
+    "writer = threading.Thread(target=first_event); writer.start()",
+    "arrived = events.status_for(state, 'demo')",
+    "writer.join()",
+    "print(json.dumps({'never': never, 'waited': waited, 'limit': events.SCHEMA_WAIT_SECONDS, 'arrived': arrived}))",
+  ], [path.join(workspace.repoDir, "scripts", "conversation-reminder-events.py"),
+    path.join(workspace.tmpDir, "first-event-state")]);
+  // With no writer the read gives up after its wait, with the answer it always gave.
+  assert.deepEqual([result.never.available, result.never.reason],
+    [false, "event database is unavailable or unsupported"]);
+  assert.ok(result.waited >= result.limit, `waited ${result.waited} s`);
+  // With a writer the read can only answer once the table exists: no table, no event count.
+  assert.deepEqual([result.arrived.available, result.arrived.event_count, result.arrived.events],
+    [true, 0, []]);
+});
+
+test("a command waits out another process's store write that lasts four seconds", async () => {
+  const workspace = createBridgeWorkspace();
+  const result = pythonJson([
+    "import importlib.util, sqlite3, threading, time",
+    "from pathlib import Path",
+    "spec = importlib.util.spec_from_file_location('service', sys.argv[1])",
+    "service = importlib.util.module_from_spec(spec); spec.loader.exec_module(service)",
+    "state = Path(sys.argv[2])",
+    "service.connect(state, create=True).close()",
+    "held = threading.Event()",
+    // Another reminder process whose write section is slow to reach the disk.
+    "def slow_write():",
+    "    other = sqlite3.connect(service.store_path(state), isolation_level=None)",
+    "    other.execute('BEGIN IMMEDIATE')",
+    "    other.execute(\"INSERT OR REPLACE INTO settings VALUES ('probe','1')\")",
+    "    held.set(); time.sleep(4)",
+    "    other.execute('COMMIT'); other.close()",
+    "writer = threading.Thread(target=slow_write); writer.start()",
+    "held.wait()",
+    "started = time.monotonic()",
+    "db = service.connect(state)",
+    "db.execute('BEGIN IMMEDIATE')",
+    "waited = time.monotonic() - started",
+    "seen = db.execute(\"SELECT value FROM settings WHERE key='probe'\").fetchone()[0]",
+    "db.execute('COMMIT'); db.close(); writer.join()",
+    "print(json.dumps({'waited': waited, 'seen': seen, 'limit': service.STORE_BUSY_SECONDS}))",
+  ], [path.join(workspace.repoDir, "scripts", "conversation-reminder-service.py"),
+    path.join(workspace.tmpDir, "slow-write-state")]);
+  // The command got the store only after the slow write ended, and it saw that write.
+  assert.equal(result.seen, "1");
+  assert.ok(result.waited >= 3, `waited ${result.waited} s`);
+  assert.ok(result.limit > 4, `store wait is ${result.limit} s`);
 });
 
 test("the reminder gap follows 1h, then 2h per ignored reminder, capped at 24h", async () => {

@@ -202,6 +202,33 @@ test("an assignment change before commit discards the old scan and rescans the n
   await stop(workspace, stateDir, worker);
 });
 
+test("an assignment change while a pass is still reading is rescanned in that pass, not after the denied-history wait", async () => {
+  const workspace = createBridgeWorkspace();
+  const stateDir = await setup(workspace);
+  // Every page takes long enough that the change lands while the first pass is still reading.
+  seedHistory(workspace, { channel: longHistory(1150) }, { historyPageDelayMs: 1500 });
+  await command(workspace, stateDir, "discover");
+  const worker = startWorker(workspace, stateDir, "2026-09-24T12:00:00Z");
+  await waitForFixture(workspace, state => fetchCount(state, "channel") >= 1);
+  const changed = await command(workspace, stateDir, "assignment-changed", { args: ["assignment-changed",
+    "--project-root", workspace.repoDir, "--state-dir", stateDir, "--project", "demo"] });
+  assert.ok(fetchCount(readState(workspace.stateDir), "channel") < 10,
+    "the change landed before the first pass had read its ten pages");
+  updateState(workspace.stateDir, (seed) => { seed.fixtures.discord.historyPageDelayMs = 0; });
+  // The clock never moves, so a scan held back for the denied-history wait would never read a page.
+  const rescanned = await waitForStatus(workspace, stateDir, current =>
+    current.conversations.demo?.assignment_generation === changed.assignment_generation &&
+    current.conversations.demo?.discovery?.pages_scanned === 10);
+  assert.deepEqual([rescanned.conversations.demo.reconciliation_status, rescanned.conversations.demo.discovery.reason],
+    ["discovering", null]);
+  worker.setClock("2026-09-24T12:00:30Z");
+  const ready = await waitForStatus(workspace, stateDir, current =>
+    current.conversations.demo?.reconciliation_status === "ready");
+  assert.equal(ready.conversations.demo.assignment_generation, changed.assignment_generation);
+  assert.equal(ready.conversations.demo.response_message_id, "101149");
+  await stop(workspace, stateDir, worker);
+});
+
 test("history keeps a persisted closure unless it shows a later normal owner message", async () => {
   const workspace = createBridgeWorkspace();
   const stateDir = await setup(workspace, { kept: "kept-channel", reopened: "reopened-channel" });
