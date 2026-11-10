@@ -245,7 +245,7 @@ function botReactions(state) {
   return state.fixtures.discord.reactions.map(({ messageId, emoji }) => [messageId, decodeURIComponent(emoji)]);
 }
 
-test("/pause queues router Codex messages and /unpause runs them in order", platformGate("posix", "two paused messages can overtake each other while the bridge awaits their reminder steps, seen only on Windows"), async () => {
+test("/pause queues router Codex messages and /unpause runs them in order", async () => {
   const { workspace, codex } = await routerCodexSession([
     { turnId: "first-queued-turn", mcpReplyText: "first queued done" },
     { turnId: "second-queued-turn", mcpReplyText: "second queued done" },
@@ -275,6 +275,37 @@ test("/pause queues router Codex messages and /unpause runs them in order", plat
     ["Bot root-bot-token", "demo-channel", "first-queued", "⏳"],
     ["Bot root-bot-token", "demo-channel", "second-queued", "⏳"],
   ]);
+});
+
+test("a paused voice message keeps its place ahead of a text message sent after it", async () => {
+  const voice = signedUrl("voice-message.ogg", "ffffffff");
+  const { workspace, codex } = await routerCodexSession([
+    { turnId: "voice-turn", mcpReplyText: "voice done" },
+    { turnId: "text-turn", mcpReplyText: "text done" },
+  ]);
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.attachments[voice] = { body: "fixture audio body", contentType: "audio/ogg" };
+  seed.fixtures.whisper.transcriptions["voice-message.ogg"] = "spoken first";
+  writeState(seed, workspace.stateDir);
+
+  ownerMessage(workspace, { id: "cmd-pause", content: "/pause" });
+  await waitForState(workspace, (next) => webhookContents(next).includes("Bridge paused. New messages will be queued."), 15000);
+  // The bridge downloads and transcribes the voice message, so it is ready later than the text.
+  ownerMessage(workspace, {
+    id: "2001", content: "listen",
+    attachments: [{ id: "att-voice", name: "voice-message.ogg", contentType: "audio/ogg", size: 18, url: voice }],
+  });
+  ownerMessage(workspace, { id: "typed-second", content: "typed second" });
+  await waitForState(workspace, (next) => botReactions(next).filter(([, emoji]) => emoji === "⏳").length === 2, 15000);
+
+  ownerMessage(workspace, { id: "cmd-unpause", content: "/unpause" });
+  const done = await waitForState(workspace, (next) => webhookContents(next).includes("text done"), 15000);
+
+  assert.deepEqual(userTurnInputs(codex).map((input) => input.map((part) => part.text)), [
+    ["listen", "--- Audio transcription: voice-message.ogg ---\nspoken first\n--- End audio transcription ---"],
+    ["typed second"],
+  ]);
+  assert.deepEqual(botReactions(done).filter(([, emoji]) => emoji === "⏳"), [["2001", "⏳"], ["typed-second", "⏳"]]);
 });
 
 test("/compact and /clear compact and replace the router Codex thread with webhook acknowledgments", async () => {

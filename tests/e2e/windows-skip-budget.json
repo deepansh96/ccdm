@@ -1,5 +1,5 @@
 {
-  "budget": 136,
+  "budget": 135,
   "skips": [
     {
       "file": "codex-start.test.js",
@@ -331,12 +331,6 @@
       "test": "uninstall-service and service-status point to launchctl on POSIX",
       "tag": "posix",
       "reason": "Task Scheduler subcommands exit 2 outside Windows"
-    },
-    {
-      "file": "router-codex-session.test.js",
-      "test": "/pause queues router Codex messages and /unpause runs them in order",
-      "tag": "posix",
-      "reason": "two paused messages can overtake each other while the bridge awaits their reminder steps, seen only on Windows"
     }
   ]
 }
