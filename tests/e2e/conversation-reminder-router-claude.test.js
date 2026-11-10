@@ -219,9 +219,11 @@ test("a router Claude launch loads the hooks but no reminder proxy", async () =>
   for (const text of surfaces) assert.equal(text.includes("claude-reminder-channel"), false, text.slice(0, 200));
   const settings = JSON.parse(fs.readFileSync(path.join(launchDir, "settings.json"), "utf8"));
   // Claude Code runs commands through Git Bash on Windows, so paths have forward slashes there.
+  // A Windows temp folder can carry a short (8.3) name; the `ccdm` entry starts Python from the long one.
   const windows = process.platform === "win32";
+  const repoAsLaunched = windows ? fs.realpathSync.native(workspace.repoDir) : workspace.repoDir;
   const run = (script) => {
-    const file = path.join(workspace.repoDir, "scripts", script);
+    const file = path.join(repoAsLaunched, "scripts", script);
     return `node '${windows ? file.replaceAll("\\", "/") : file}'`;
   };
   assert.deepEqual(settings, {

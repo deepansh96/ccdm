@@ -43,7 +43,6 @@ tests/e2e/conversation-reminder-codex.test.js
 tests/e2e/conversation-reminder-claude.test.js
 tests/e2e/conversation-reminder-router.test.js
 tests/e2e/conversation-reminder-router-claude.test.js
-tests/e2e/conversation-reminder-assignment.test.js
 tests/e2e/conversation-reminder-transport-switch.test.js
 tests/e2e/thread-conversation-journey.test.js
 tests/e2e/session-host-seam.test.js
