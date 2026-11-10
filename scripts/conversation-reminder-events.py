@@ -170,6 +170,11 @@ def connect_database(state_dir: Path, *, create: bool) -> sqlite3.Connection | N
     if not db_path.exists() and not create:
         return None
     private_directory(state_dir)
+    # Private from the moment the file exists. SQLite would create it with the
+    # default mode, and until the chmod below a reader saw a ledger that was
+    # not private: readiness refused it and the worker stopped.
+    if not db_path.exists():
+        os.close(os.open(db_path, os.O_WRONLY | os.O_CREAT, 0o600))
     connection = sqlite3.connect(db_path, timeout=DATABASE_BUSY_TIMEOUT_SECONDS, isolation_level=None)
     connection.row_factory = sqlite3.Row
     _enable_wal(connection)

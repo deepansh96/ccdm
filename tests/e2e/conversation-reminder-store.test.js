@@ -90,6 +90,44 @@ test("a status read waits for the first event's table, and a ledger that never g
     [true, 0, []]);
 });
 
+test("the ledger file is private from the moment the first event creates it, so a read then waits and is not refused", async () => {
+  const workspace = createBridgeWorkspace();
+  const result = pythonJson([
+    "import importlib.util, os, sqlite3, threading, time",
+    "from pathlib import Path",
+    "spec = importlib.util.spec_from_file_location('events', sys.argv[1])",
+    "events = importlib.util.module_from_spec(spec); spec.loader.exec_module(events)",
+    "state = Path(sys.argv[2]); events.private_directory(state)",
+    // The usual default, so the case means the same on a machine with a stricter one.
+    "os.umask(0o022)",
+    "real_connect = sqlite3.connect",
+    // What SQLite does on its own when it creates a database file.
+    "bare = state / 'bare.sqlite3'; real_connect(bare).close()",
+    "opened = threading.Event()",
+    // The first event's writer, held for half a second right after SQLite has opened its file.
+    "def slow_connect(*args, **kwargs):",
+    "    connection = real_connect(*args, **kwargs)",
+    "    if not kwargs.get('uri'):",
+    "        opened.set(); time.sleep(0.5)",
+    "    return connection",
+    "sqlite3.connect = slow_connect",
+    "writer = threading.Thread(target=lambda: events.connect_database(state, create=True).close()); writer.start()",
+    "opened.wait()",
+    "private = events.is_private(events.database_path(state))",
+    "during = events.status_for(state, 'demo')",
+    "writer.join()",
+    "print(json.dumps({'private': private, 'during': during, 'bare': events.is_private(bare)}))",
+  ], [path.join(workspace.repoDir, "scripts", "conversation-reminder-events.py"),
+    path.join(workspace.tmpDir, "private-from-start-state")]);
+  // Left to SQLite, the file is readable by others on macOS and Linux until it is set private.
+  assert.equal(result.bare, process.platform === "win32");
+  assert.equal(result.private, true);
+  // A reader that met a file that was not yet private was told so at once, and the
+  // observer then dropped the owner message it was handling.
+  assert.deepEqual([result.during.available, result.during.reason, result.during.event_count],
+    [true, undefined, 0]);
+});
+
 test("a command waits out another process's store write that lasts four seconds", async () => {
   const workspace = createBridgeWorkspace();
   const result = pythonJson([
