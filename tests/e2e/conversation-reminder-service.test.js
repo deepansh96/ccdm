@@ -1,17 +1,24 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import test from "node:test";
 
-import { PYTHON, assertPrivate } from "./support/platform.js";
+import { PYTHON, assertPrivate, platformGate } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import { createBridgeWorkspace, injectDiscordMessage, injectDiscordReaction, waitForState } from "./support/bridge.js";
-import { routerEnv, startRouter } from "./support/router.js";
+import { routerEnv, startRouter, waitFor } from "./support/router.js";
 import { readState, writeState } from "./support/state.js";
-import { cleanup } from "./support/teardown.js";
+import { cleanup, registerTeardownCallback, workspaceOwnsPid } from "./support/teardown.js";
 
 test.afterEach(async () => cleanup());
+
+const { ensurePrivateDirSync } = createRequire(import.meta.url)("../../scripts/platform/privacy.js");
+// The crash tests put a POSIX shell script in Python's place, which kills the
+// observer that called it.
+const shellCrashInjector = platformGate("posix",
+  "the crash is injected by a shell script standing in for Python; on Windows that must be a real program");
 
 // Every project is served through the Router and speaks through its webhook,
 // so demo's reminder identity is `router:webhook`. No pool bot exists: root
@@ -358,6 +365,15 @@ test("cleanup waits for Discord's full 429 retry window before deleting by ID", 
   assert.equal((await running).exitCode, 0);
 });
 
+// Failed delivery intents that carry a retry time, read from the store itself.
+function refusalsWithRetryTime(stateDir) {
+  const result = spawnSync(PYTHON, ["-c", "import json,sqlite3,sys; db=sqlite3.connect(sys.argv[1]); "
+    + "print(json.dumps(db.execute(\"SELECT nonce FROM delivery_intents WHERE state='failed' AND retry_at IS NOT NULL\").fetchall()))",
+  path.join(stateDir, "conversations.sqlite3")], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  return JSON.parse(result.stdout);
+}
+
 test("Discord 429 preserves the prior reminder and waits for the advertised retry time", async () => {
   const workspace = createBridgeWorkspace();
   const stateDir = setup(workspace);
@@ -377,6 +393,9 @@ test("Discord 429 preserves the prior reminder and waits for the advertised retr
   writeState(seed, workspace.stateDir);
   fs.writeFileSync(clockFile, "2026-09-24T13:00:00Z");
   await waitForState(workspace, state => state.fixtures.discord.restFailureUses.length === 1);
+  // The retry time counts from the clock when the refusal is recorded, so the
+  // clock moves on only after that.
+  await waitFor(() => refusalsWithRetryTime(stateDir).length === 1, () => "the 429 to be recorded with its retry time", 15000);
   assert.equal((await command(workspace, stateDir, "status")).conversations.demo.reminder_message_id,
     "fake-message-1");
   assert.equal(readState(workspace.stateDir).fixtures.discord.deletes?.length || 0, 0);
@@ -847,7 +866,7 @@ test("recovery completes cleanup after Discord deleted the prior reminder but th
   assert.deepEqual(discord.deletes.map(row => row.messageId), ["fake-message-1", "fake-message-1"]);
 });
 
-test("recovery deletes the prior reminder after a crash following local send confirmation", async () => {
+test("recovery deletes the prior reminder after a crash following local send confirmation", shellCrashInjector, async () => {
   const workspace = createBridgeWorkspace();
   const stateDir = setup(workspace);
   await reconciledExchange(workspace, stateDir);
@@ -878,7 +897,7 @@ test("recovery deletes the prior reminder after a crash following local send con
   assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 2);
 });
 
-test("a crash after durable claim but before the Discord request is released without resending during recovery", async () => {
+test("a crash after durable claim but before the Discord request is released without resending during recovery", shellCrashInjector, async () => {
   const workspace = createBridgeWorkspace();
   const stateDir = setup(workspace);
   await reconciledExchange(workspace, stateDir);
@@ -1063,12 +1082,13 @@ test("connection failures that never reached Discord back off with a finite incr
     timeoutMs: 10000,
   });
   await waitForState(workspace, state => state.fixtures.discord.connectFailureUses === 1);
-  await new Promise(resolve => setTimeout(resolve, 250));
+  // Each retry time counts from the clock when its failure is recorded.
+  await waitFor(() => refusalsWithRetryTime(stateDir).length === 1, () => "the first failure to be recorded", 15000);
   // A refused connection is a definite failure, never an uncertain send.
   assert.equal((await command(workspace, stateDir, "status")).conversations.demo.reconciliation_status, "ready");
   fs.writeFileSync(clockFile, "2026-09-24T11:00:05Z");
   await waitForState(workspace, state => state.fixtures.discord.connectFailureUses === 2);
-  await new Promise(resolve => setTimeout(resolve, 250));
+  await waitFor(() => refusalsWithRetryTime(stateDir).length === 2, () => "the second failure to be recorded", 15000);
   fs.writeFileSync(clockFile, "2026-09-24T11:00:14Z");
   await new Promise(resolve => setTimeout(resolve, 600));
   assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 0);
@@ -1859,6 +1879,8 @@ PRAGMA user_version=6;
 function seedV6(workspace) {
   const stateDir = setup(workspace);
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  // Mode bits mean nothing on Windows: the store must sit in a protected directory.
+  if (process.platform === "win32") ensurePrivateDirSync(stateDir);
   const database = path.join(stateDir, "conversations.sqlite3");
   sql(database, V6_STORE);
   fs.chmodSync(database, 0o600);
@@ -1945,4 +1967,229 @@ test("a failed v7 migration leaves the v6 store usable", async () => {
   await cli(workspace, stateDir, "status");
   assert.deepEqual(storeRows(database),
     { version: 8, conversations: [V8_CONVERSATION], retired_assignments: [V8_RETIRED] });
+});
+
+// ---- Stopping the observer ----
+// The worker holds its Node observer's stdin and closes it to ask for a stop:
+// Windows has no SIGTERM a process can catch, and a closed pipe reaches every OS.
+
+const SERVICE_SCRIPT = "scripts/conversation-reminder-service.py";
+const OBSERVER_SCRIPT = "scripts/conversation-reminder-observer.js";
+
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+// The observer is observing demo's channel once its health file says so.
+const observerReady = stateDir => waitFor(() => {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(stateDir, "observer-health.json"), "utf8"))
+      .channels?.demo === "ready-observe-only";
+  } catch {
+    return false;
+  }
+}, () => "the observer to observe demo's channel", 20000);
+
+const observerEnv = (workspace, stateDir, rootState) => routerEnv(workspace, {
+  ROOT_DISCORD_STATE_DIR: rootState, CCDM_REMINDER_NODE: process.execPath,
+  CCDM_REMINDER_PROJECT_ROOT: workspace.repoDir, CCDM_REMINDER_STATE_DIR: stateDir,
+});
+
+// The service's own start_observer and stop_observer, driven from outside: it
+// prints the observer's PID, waits for a line on stdin, stops the observer and
+// prints the exit code and how long the stop took.
+const OBSERVER_DRIVER = [
+  "import importlib.util, json, os, sys, time",
+  "spec = importlib.util.spec_from_file_location('reminder_service', sys.argv[1])",
+  "service = importlib.util.module_from_spec(spec)",
+  "sys.modules['reminder_service'] = service",
+  "spec.loader.exec_module(service)",
+  "project_root, state_dir = sys.argv[2], sys.argv[3]",
+  "observer = service.start_observer(",
+  "    [os.environ['CCDM_REMINDER_NODE'], sys.argv[4], '--project-root', project_root, '--state-dir', state_dir],",
+  "    dict(os.environ))",
+  "print(json.dumps({'pid': observer.pid}), flush=True)",
+  "sys.stdin.readline()",
+  "started = time.monotonic()",
+  "code = service.stop_observer(observer)",
+  "print(json.dumps({'code': code, 'seconds': round(time.monotonic() - started, 2)}), flush=True)",
+  "",
+].join("\n");
+
+async function startObserverDriver(workspace, stateDir, rootState) {
+  const driver = path.join(workspace.tmpDir, "observer-driver.py");
+  fs.writeFileSync(driver, OBSERVER_DRIVER);
+  const child = spawn(PYTHON, [driver, path.join(workspace.repoDir, SERVICE_SCRIPT), workspace.repoDir, stateDir,
+    path.join(workspace.repoDir, OBSERVER_SCRIPT)], {
+    cwd: workspace.repoDir, env: observerEnv(workspace, stateDir, rootState), stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  let output = "";
+  let errors = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", chunk => { output += chunk; });
+  child.stderr.on("data", chunk => { errors += chunk; });
+  const exited = new Promise(resolve => child.once("exit", resolve));
+  const lines = () => output.split("\n").filter(line => line.trim()).map(line => JSON.parse(line));
+  registerTeardownCallback(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await exited;
+    const pid = lines()[0]?.pid;
+    if (pid && alive(pid) && workspaceOwnsPid(pid, workspace.tmpRoot)) process.kill(pid, "SIGKILL");
+  });
+  const { pid } = await waitFor(() => lines()[0], () => `the observer's PID; stderr:\n${errors}`, 15000);
+  await observerReady(stateDir);
+  assert.equal(alive(pid), true);
+  return { child, exited, lines, pid };
+}
+
+async function observerWorkspace() {
+  const workspace = createBridgeWorkspace();
+  const stateDir = setup(workspace);
+  await command(workspace, stateDir, "sync");
+  return { workspace, stateDir, rootState: await rootRouter(workspace) };
+}
+
+test("the worker stops its observer by closing its stdin: it exits 0 well inside 15 s and no observer remains", async () => {
+  const { workspace, stateDir, rootState } = await observerWorkspace();
+  const driver = await startObserverDriver(workspace, stateDir, rootState);
+  driver.child.stdin.write("stop\n");
+  const stopped = await waitFor(() => driver.lines()[1], () => "the observer to stop", 40000);
+  assert.equal(stopped.code, 0);
+  assert.ok(stopped.seconds < 15, `the stop took ${stopped.seconds} s`);
+  assert.equal(alive(driver.pid), false, "the observer is still running");
+  assert.equal(await driver.exited, 0);
+});
+
+test("an observer whose worker is killed sees its stdin close and exits by itself", async () => {
+  const { workspace, stateDir, rootState } = await observerWorkspace();
+  const driver = await startObserverDriver(workspace, stateDir, rootState);
+  driver.child.kill("SIGKILL");
+  await driver.exited;
+  await waitFor(() => !alive(driver.pid), () => "the orphaned observer to exit", 15000);
+});
+
+// An observer started the old way has no stop flag: its stdin is nothing, or a
+// pipe that has already ended, and neither may stop it.
+for (const [name, stdin] of [["no stdin", "ignore"], ["an ended stdin pipe", "pipe"]]) {
+  test(`an observer started without the stop flag keeps observing with ${name}, and SIGTERM still stops it`, async () => {
+    const { workspace, stateDir, rootState } = await observerWorkspace();
+    const child = spawn(process.execPath, [path.join(workspace.repoDir, OBSERVER_SCRIPT),
+      "--project-root", workspace.repoDir, "--state-dir", stateDir], {
+      cwd: workspace.repoDir, env: observerEnv(workspace, stateDir, rootState), stdio: [stdin, "ignore", "pipe"],
+      windowsHide: true,
+    });
+    child.stdin?.end();
+    child.stderr.resume();
+    const exited = new Promise(resolve => child.once("exit", (code, signal) => resolve({ code, signal })));
+    registerTeardownCallback(async () => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await exited;
+    });
+    // It reaches the channel after its stdin ended, and stays.
+    await observerReady(stateDir);
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    assert.deepEqual([child.exitCode, child.signalCode], [null, null]);
+    child.kill("SIGTERM");
+    const stopped = await exited;
+    // A caught SIGTERM is a clean exit; on Windows the same call is a hard kill.
+    if (process.platform !== "win32") assert.deepEqual(stopped, { code: 0, signal: null });
+  });
+}
+
+// ---- Windows ----
+
+const windowsOnly = platformGate("win32", "Windows access lists and scheduled tasks; POSIX modes and the plist are checked elsewhere");
+const ICACLS = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "icacls.exe");
+const SCRIPTS_DIR = workspace => path.join(workspace.repoDir, "scripts");
+
+// A Python snippet with ccdmlib importable; its stdout parsed as JSON.
+async function pythonProbe(workspace, name, lines, args) {
+  const probe = path.join(workspace.tmpDir, name);
+  fs.writeFileSync(probe, ["import json, sys", "sys.dont_write_bytecode = True", "sys.path.insert(0, sys.argv[1])",
+    ...lines, ""].join("\n"));
+  const result = await runScript(workspace, path.relative(workspace.repoDir, probe), {
+    args: [SCRIPTS_DIR(workspace), ...args],
+  });
+  assert.equal(result.exitCode, 0, result.stderr);
+  return JSON.parse(result.stdout);
+}
+
+test("on Windows the events, store and health files are private in a protected state dir and refused in an inherited one", windowsOnly, async () => {
+  const workspace = createBridgeWorkspace();
+  const stateDir = setup(workspace);
+  await reconciledExchange(workspace, stateDir);
+  const rootState = await rootRouter(workspace);
+  const running = runScript(workspace, SERVICE_SCRIPT, {
+    args: ["run", "--project-root", workspace.repoDir, "--state-dir", stateDir],
+    env: routerEnv(workspace, { ROOT_DISCORD_STATE_DIR: rootState, CCDM_REMINDER_NODE: process.execPath }),
+    timeoutMs: 60000,
+  });
+  // status reads the observer's health file, and accepts it.
+  await waitForObserver(workspace, stateDir);
+  await command(workspace, stateDir, "disable");
+  assert.equal((await running).exitCode, 0);
+
+  const files = ["events.sqlite3", "conversations.sqlite3", "observer-health.json"];
+  const isPrivate = () => pythonProbe(workspace, "privacy-probe.py", [
+    "import os",
+    "from ccdmlib.platform.private_fs import is_private",
+    "print(json.dumps({name: is_private(os.path.join(sys.argv[2], name)) for name in sys.argv[3:]}))",
+  ], [stateDir, ...files]);
+  assertPrivate(stateDir);
+  for (const name of files) assertPrivate(path.join(stateDir, name), name);
+  assert.deepEqual(await isPrivate(), Object.fromEntries(files.map(name => [name, true])));
+
+  // The directory takes its parent's permissions again: nothing in it is trusted.
+  const inherited = spawnSync(ICACLS, [stateDir, "/inheritance:e"], { encoding: "utf8", windowsHide: true });
+  assert.equal(inherited.status, 0, inherited.stdout + inherited.stderr);
+  assert.deepEqual(await isPrivate(), Object.fromEntries(files.map(name => [name, false])));
+  const refused = await runScript(workspace, SERVICE_SCRIPT, {
+    args: ["status", "--project-root", workspace.repoDir, "--state-dir", stateDir],
+  });
+  assert.equal(refused.exitCode, 2, refused.stdout);
+  assert.match(JSON.parse(refused.stdout).reason, /permissions are not private/);
+  const events = await runScript(workspace, "scripts/conversation-reminder-events.py", {
+    args: ["status", "--project", "demo", "--state-dir", stateDir],
+  });
+  assert.deepEqual([JSON.parse(events.stdout).available, JSON.parse(events.stdout).reason],
+    [false, "event database permissions are not private"]);
+});
+
+test("service_installed asks schtasks for a service's task under both of its names", windowsOnly, async () => {
+  const workspace = createBridgeWorkspace();
+  const installed = name => pythonProbe(workspace, "service-installed.py", [
+    "from ccdmlib.platform.services import service_installed",
+    "try:",
+    "    print(json.dumps(service_installed(sys.argv[2])))",
+    "except ValueError as error:",
+    "    print(json.dumps(str(error)))",
+  ], [name]);
+  const fixture = () => readState(workspace.stateDir).fixtures.schtasks;
+  const setTasks = tasks => {
+    const state = readState(workspace.stateDir);
+    state.fixtures.schtasks.tasks = tasks;
+    state.fixtures.schtasks.invocations = [];
+    writeState(state, workspace.stateDir);
+  };
+  const folder = String.raw`\CCDM\ThreadSupervisor`;
+
+  // No task: both names are asked, with a query and nothing else.
+  assert.equal(await installed("thread-supervisor"), false);
+  assert.deepEqual(fixture().invocations.map(({ name, verb }) => [verb, name]),
+    [["/query", folder], ["/query", "CCDM-ThreadSupervisor"]]);
+  for (const task of [folder, "CCDM-ThreadSupervisor"]) {
+    setTasks([task]);
+    assert.equal(await installed("thread-supervisor"), true, task);
+  }
+  // Another service's task is not this one's.
+  setTasks([String.raw`\CCDM\Router`]);
+  assert.equal(await installed("thread-supervisor"), false);
+  assert.equal(await installed("router"), true);
+  assert.equal(await installed("no-such-service"), "unknown service: no-such-service");
 });

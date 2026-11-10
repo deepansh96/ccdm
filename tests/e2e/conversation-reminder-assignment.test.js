@@ -8,6 +8,7 @@ import { PYTHON, posixMode } from "./support/platform.js";
 import { createWorkspace, runScript } from "./support/runner.js";
 import { waitForState } from "./support/bridge.js";
 import { routerEnv, startRouter } from "./support/router.js";
+import { startFakeHost } from "./support/session-fixture.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -485,10 +486,14 @@ test("project stop and root restart keep the independent service and closed stat
   await waitForStatus(workspace, context.stateDir, current =>
     current.worker_running && current.conversations.demo?.state === "closed");
 
-  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"] });
+  // On Windows the launchers go through the fake ccdm-host.
+  const hostEnv = process.platform === "win32"
+    ? (await startFakeHost(workspace, { env: routerEnv(context.router) })).env : {};
+  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"], env: hostEnv });
   assert.equal(stopped.exitCode, 0, stopped.stderr || stopped.stdout);
   // Root Claude launches as a client of the Router the worker already observes through.
-  const restarted = await runScript(workspace, "restart-root-agent.sh", { env: routerEnv(context.router), timeoutMs: 20000 });
+  const restarted = await runScript(workspace, "restart-root-agent.sh", {
+    env: routerEnv(context.router, hostEnv), timeoutMs: 20000 });
   assert.equal(restarted.exitCode, 0, restarted.stderr || restarted.stdout);
 
   const current = await command(workspace, context.stateDir, "status");

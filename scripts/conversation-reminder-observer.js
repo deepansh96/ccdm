@@ -712,6 +712,16 @@ function shutdown() {
 }
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
+// The service holds this process's stdin and closes it to ask for a stop: the
+// one request that reaches a Windows process, where SIGTERM is a hard kill. It
+// also arrives when the service itself dies. Only with the flag, so an observer
+// whose stdin is a terminal, a file or already ended keeps running.
+if (process.argv.includes("--stop-on-stdin-end")) {
+  process.stdin.on("end", shutdown);
+  process.stdin.on("close", shutdown);
+  process.stdin.on("error", shutdown);
+  process.stdin.resume();
+}
 if (cleanupRetiredOnce) {
   cleanupRetired(cleanupProject).then(result => {
     process.stdout.write(`${JSON.stringify(result)}\n`);

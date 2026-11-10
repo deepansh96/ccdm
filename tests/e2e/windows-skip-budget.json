@@ -1,5 +1,5 @@
 {
-  "budget": 137,
+  "budget": 139,
   "skips": [
     {
       "file": "codex-start.test.js",
@@ -349,6 +349,18 @@
       "test": "ccdm usage matches claude-usage.sh line for line on the same fixture home",
       "tag": "posix",
       "reason": "runs claude-usage.sh, a bash script that needs python3 and curl; the same expected text is checked on Windows"
+    },
+    {
+      "file": "conversation-reminder-service.test.js",
+      "test": "recovery deletes the prior reminder after a crash following local send confirmation",
+      "tag": "posix",
+      "reason": "the crash is injected by a shell script standing in for Python; on Windows that must be a real program"
+    },
+    {
+      "file": "conversation-reminder-service.test.js",
+      "test": "a crash after durable claim but before the Discord request is released without resending during recovery",
+      "tag": "posix",
+      "reason": "the crash is injected by a shell script standing in for Python; on Windows that must be a real program"
     }
   ]
 }
