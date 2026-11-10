@@ -90,7 +90,8 @@ jobs:
 
   windows-required:
     runs-on: windows-latest
-    timeout-minutes: 30
+    # The list grows with every ported suite; the run took 18 to 30 minutes at 64 files.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -113,6 +114,8 @@ jobs:
         shell: bash
         env:
           CCDM_PYTHON: ${{ steps.python.outputs.python-path }}
+          # Outside the checkout: workspaces copy every untracked file in it.
+          CCDM_E2E_REPORT_DIR: ${{ runner.temp }}/e2e-required-report
         run: |
           mapfile -t files < <(tr -d '\r' < tests/e2e/windows-required.txt | grep -Ev '^[[:space:]]*(#|$)')
           if [ "${#files[@]}" -eq 0 ]; then
@@ -120,6 +123,15 @@ jobs:
             exit 1
           fi
           node tests/run-e2e.mjs "${files[@]}"
+
+      # Also after a failure or the time limit, so the files that did finish can be read.
+      - name: Upload the per-file report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-required-report
+          path: ${{ runner.temp }}/e2e-required-report
+          if-no-files-found: warn
 
   macos-e2e:
     runs-on: macos-latest

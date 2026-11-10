@@ -149,7 +149,7 @@ const BREAKS = {
   "windows uploads the report": [WINDOWS, "actions/upload-artifact@v4", "actions/cache@v4"],
 
   "required list runs on windows": [REQUIRED, "windows-latest", "ubuntu-latest"],
-  "required list can fail the PR": [REQUIRED, "    timeout-minutes: 30", "    timeout-minutes: 30\n    continue-on-error: true"],
+  "required list can fail the PR": [REQUIRED, "    timeout-minutes: 60", "    timeout-minutes: 60\n    continue-on-error: true"],
   "required list reads windows-required.txt": [REQUIRED, "tests/e2e/windows-required.txt", "tests/e2e/other.txt"],
   "required list runs only the listed files": [REQUIRED, 'node tests/run-e2e.mjs "${files[@]}"', "npm test"],
   "required list refuses an empty list": [REQUIRED, "lists no files", "is fine"],
