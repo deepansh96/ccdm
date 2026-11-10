@@ -1741,6 +1741,9 @@ test("with no whisper the turn says the audio could not be transcribed, and the 
     (nextState) => replyContents(nextState).includes("could not hear it"),
     15000,
   );
+  // The reply is posted just before the turn ends, and a message sent before the
+  // bridge is idle would steer that turn. Idle twice: the bootstrap, then this turn.
+  await bridge.waitForOutput(/(?:bridge idle[^]*){2}/, 15000);
   await injectMessageUntil(
     workspace,
     { id: "typed-message", content: "typed instead" },
