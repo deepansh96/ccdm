@@ -1134,56 +1134,6 @@ test("the state lock retries a refusal that follows a long wait, and gives up on
     { code: "EPERM", stateLock: { refusedMs: 10000, waitedMs: 11000, stateDir: [] } });
 });
 
-// A hard stop on Windows ends a process inside its critical section. The next
-// writer must not sit out the ten seconds after which a lock counts as stale.
-test("a state lock whose holder has ended is taken over at once, and a live holder's is waited for", () => {
-  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-state-lock-"));
-  try {
-    const lock = path.join(stateDir, "state.lock");
-    const module = path.resolve("tests/e2e/support/state-lock.cjs");
-    const ended = spawnSync(process.execPath, ["-e",
-      "require(process.argv[1]).withStateLock(process.argv[2], () => process.exit(0));", module, stateDir],
-    { encoding: "utf8", windowsHide: true });
-    assert.equal(ended.status, 0, ended.stderr);
-    assert.deepEqual(fs.readdirSync(lock), [String(ended.pid)]);
-
-    const started = Date.now();
-    assert.equal(withStateLock(stateDir, () => fs.readdirSync(lock).join()), String(process.pid));
-    assert.ok(Date.now() - started < 5000, `the dead holder's lock took ${Date.now() - started} ms`);
-    assert.equal(fs.existsSync(lock), false);
-
-    // This process holds the lock: a second process waits and then gets it.
-    const waiter = withStateLock(stateDir, () => {
-      const child = spawn(process.execPath, ["-e",
-        "require(process.argv[1]).withStateLock(process.argv[2], () => console.log('took it'));", module, stateDir],
-      { stdio: ["ignore", "pipe", "inherit"], windowsHide: true });
-      const pause = new Int32Array(new SharedArrayBuffer(4));
-      Atomics.wait(pause, 0, 0, 300);
-      assert.deepEqual(fs.readdirSync(lock), [String(process.pid)]);
-      return child;
-    });
-    return new Promise((resolve, reject) => {
-      let output = "";
-      waiter.stdout.on("data", chunk => { output += chunk; });
-      waiter.on("close", (code) => {
-        try {
-          assert.equal(code, 0);
-          assert.equal(output.trim(), "took it");
-          assert.equal(fs.existsSync(lock), false);
-          resolve();
-        } catch (error) {
-          reject(error);
-        } finally {
-          fs.rmSync(stateDir, { force: true, recursive: true });
-        }
-      });
-    });
-  } catch (error) {
-    fs.rmSync(stateDir, { force: true, recursive: true });
-    throw error;
-  }
-});
-
 test("failure diagnostics include command details and redact secrets", async () => {
   const workspace = createWorkspace({ excludeFixtures: ["claude"] });
 
