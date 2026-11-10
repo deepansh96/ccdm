@@ -1,7 +1,7 @@
 ---
 name: pattern-index
 description: Task routing index for CCDM patterns.
-last_updated: 2026-10-01
+last_updated: 2026-11-10
 ---
 
 # Pattern Index
@@ -13,6 +13,7 @@ Lookup table for all pattern files in this directory. Check here before starting
 | [analyze-codex-usage.md](analyze-codex-usage.md) | Investigating historical Codex usage across homes while excluding copied and inherited token history |
 | [create-issue-slices.md](create-issue-slices.md) | Publishing or refreshing AFK implementation sub-issues and native blockers from a Ralph PRD |
 | [refresh-issue-prd.md](refresh-issue-prd.md) | Refreshing an existing Ralph issue into a code-grounded PRD |
+| [root-commands.md](root-commands.md) | Root's everyday commands on macOS and Windows: list, status, start, stop, restart, context report, restart yourself, create a poll |
 | [debug-discord-session.md](debug-discord-session.md) | Diagnosing missing, duplicate, or misrouted project session responses |
 | [manage-claude-home-login.md](manage-claude-home-login.md) | Checking, restoring, or remotely completing a Claude home login |
 | [manage-guest-access.md](manage-guest-access.md) | Granting, syncing, listing, or revoking one project's guest access |
@@ -22,5 +23,5 @@ Lookup table for all pattern files in this directory. Check here before starting
 | [setup-chatgpt-codex-account.md](setup-chatgpt-codex-account.md) | Adding or authenticating another ChatGPT subscription Codex Account Alias |
 | [setup-mimo-codex.md](setup-mimo-codex.md) | Preparing or rotating an isolated MiMo home for Codex sessions |
 | [setup-deepseek-codex.md](setup-deepseek-codex.md) | Preparing or rotating an isolated DeepSeek Flash home for Codex sessions |
-| [operate-conversation-reminders.md](operate-conversation-reminders.md) | Installing, enabling, inspecting, disabling, or recovering the Conversation Reminder service and its LaunchAgent |
-| [operate-thread-supervisor.md](operate-thread-supervisor.md) | Installing, inspecting, debugging, or operating the Thread Supervisor, its LaunchAgent, and Thread Conversations |
+| [operate-conversation-reminders.md](operate-conversation-reminders.md) | Installing, enabling, inspecting, disabling, or recovering the Conversation Reminder service and its macOS LaunchAgent |
+| [operate-thread-supervisor.md](operate-thread-supervisor.md) | Installing, inspecting, debugging, or operating the Thread Supervisor, its macOS LaunchAgent, and Thread Conversations |

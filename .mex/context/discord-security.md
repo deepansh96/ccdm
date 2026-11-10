@@ -17,7 +17,7 @@ edges:
     condition: when granting, syncing, listing, or revoking guest access
   - target: patterns/debug-discord-session.md
     condition: when a session cannot read or reply in its channel
-last_updated: 2026-10-02
+last_updated: 2026-11-10
 ---
 
 # Discord Security
@@ -28,7 +28,7 @@ The Router enforces isolation in software. Every operation names a `channel_id`:
 
 Project replies post through the project's own webhook, and a project may edit only its own webhook messages; reactions and typing show as the root bot. Provenance is `webhook_id` only, never an application ID or display name.
 
-The `project-bot` role and per-channel override model is obsolete: Discord permissions are no longer the isolation boundary, and `scripts/retire-pool.sh` deletes the role. The root bot needs Send Messages, Read Message History, Add Reactions, and Manage Messages in every project channel, plus Manage Webhooks; `router status` and reminder readiness name each missing permission. Isolation between local sessions is software-enforced, not an OS sandbox (ADR 0004).
+The `project-bot` role and per-channel override model is obsolete: Discord permissions are no longer the isolation boundary, and the pool retirement script deletes the role. The root bot needs Send Messages, Read Message History, Add Reactions, and Manage Messages in every project channel, plus Manage Webhooks; `router status` and reminder readiness name each missing permission. Isolation between local sessions is software-enforced, not an OS sandbox (ADR 0004).
 
 ## Thread Conversations
 
@@ -45,7 +45,7 @@ Root needs four permissions for threads, granted once by hand; no script PATCHes
 
 ## Credentials
 
-The root bot token is CCDM's only Discord credential. It lives in `ROOT_DISCORD_STATE_DIR/.env` (default `~/.claude/channels/discord/.env`) and is read by the Router, root's emergency fallback, and root admin tools (guest access, registration REST work, operator exports, the usage poster). Missing or invalid root credentials fail before Discord requests. No session environment, file, or MCP config holds a Discord token: sessions get only a per-launch key file path. Webhook tokens live only in private Router state (0600) and never in `registry.json`, logs, or `router status` output. Claude and Codex auth live under their configured account homes. Never include token values, `auth.json`, Keychain data, launch keys, or the current bridge scope token in logs, docs, tests, or delegated prompts.
+The root bot token is CCDM's only Discord credential. It lives in `ROOT_DISCORD_STATE_DIR/.env` (default `~/.claude/channels/discord/.env`) and is read by the Router, root's emergency fallback, and root admin tools (guest access, registration REST work, operator exports, the usage poster). Missing or invalid root credentials fail before Discord requests. No session environment, file, or MCP config holds a Discord token: sessions get only a per-launch key file path. Webhook tokens live only in private Router state (0600) and never in `registry.json`, logs, or `router status` output. On Windows, where this scaffold says mode 0600 or 0700, the file or folder instead carries a protected access list for the current user only. Claude and Codex auth live under their configured account homes. Never include token values, `auth.json`, Keychain data, launch keys, or the current bridge scope token in logs, docs, tests, or delegated prompts.
 
 ## Codex Replies
 
@@ -53,7 +53,7 @@ The bridge dynamically registers one Discord MCP server for its channel, backed 
 
 ## Guests
 
-Use `scripts/guest-access.js`; do not create generic server invites. `invite` or `grant` creates/synchronizes the project role, denies other managed locations, allows the target channel, and updates the registry's `guest_user_ids`. The Router reloads guests from the registry, so a grant or revoke applies to the next message without a restart. `revoke` removes the role, the registry entry, and outstanding invites. Guests can never reach root: their bot mentions are dropped.
+Use `node scripts/guest-access.js`; do not create generic server invites. `invite` or `grant` creates/synchronizes the project role, denies other managed locations, allows the target channel, and updates the registry's `guest_user_ids`. The Router reloads guests from the registry, so a grant or revoke applies to the next message without a restart. `revoke` removes the role, the registry entry, and outstanding invites. Guests can never reach root: their bot mentions are dropped.
 
 Project-specific user and channel access exceptions live in ignored `CLAUDE.local.md`. Apply those rules without copying local IDs into tracked files.
 

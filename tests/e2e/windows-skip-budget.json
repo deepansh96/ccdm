@@ -1,5 +1,5 @@
 {
-  "budget": 137,
+  "budget": 136,
   "skips": [
     {
       "file": "codex-start.test.js",
@@ -337,12 +337,6 @@
       "test": "on macOS and Linux install-service root-at-logon is refused and reaches no installer",
       "tag": "posix",
       "reason": "root-at-logon is a Windows task; macOS keeps its LaunchAgent"
-    },
-    {
-      "file": "router-codex-session.test.js",
-      "test": "/pause queues router Codex messages and /unpause runs them in order",
-      "tag": "posix",
-      "reason": "two paused messages can overtake each other while the bridge awaits their reminder steps, seen only on Windows"
     }
   ]
 }

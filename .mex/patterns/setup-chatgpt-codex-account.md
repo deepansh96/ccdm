@@ -10,7 +10,7 @@ edges:
     condition: when selecting the new home on a registered project
   - target: context/discord-security.md
     condition: when handling credentials or testing Discord integration
-last_updated: 2026-09-23
+last_updated: 2026-11-10
 ---
 
 # Add A ChatGPT Codex Account
@@ -21,15 +21,20 @@ provider. API-key providers have their own patterns (`setup-mimo-codex`,
 
 ## Steps
 1. Confirm the target alias and an external home path. Never create a home inside the checkout, and never reuse an existing home for a second account.
-2. Create the private home and select file-backed credentials:
-   `mkdir -m 700 -p <home>` then write `cli_auth_credentials_store = "file"` to `<home>/config.toml` (mode `0600`).
-3. Authenticate the account. In a Discord-mediated session prefer `CODEX_HOME=<home> codex login --device-auth`, which prints a URL and a one-time code and keeps polling; a plain `codex login` needs a local browser. Run it through `zsh -ic` in a detached tmux session so it survives between messages, then read the code from the pane.
+2. Create the private home, then write `cli_auth_credentials_store = "file"` to `<home>/config.toml` to select file-backed credentials.
+   - macOS: create it with `mkdir -m 700 -p <home>` and give `config.toml` mode `0600`.
+   - Windows: create it with `mkdir -p <home>` inside the user profile folder. POSIX modes do not apply there.
+3. Authenticate the account. In a Discord-mediated session use `codex login --device-auth`, which prints a URL and a one-time code and keeps polling; a plain `codex login` needs a local browser. Park it in an ad-hoc session so it survives between messages: `scripts/ccdm session new ccdm_codex_login --env CODEX_HOME=<home> -- codex login --device-auth`. Then read the URL and the code with `scripts/ccdm session capture ccdm_codex_login --join`.
 4. Send the user only the public device URL and the one-time code. Codes expire in 15 minutes; regenerate rather than guessing when one lapses.
 5. Poll `CODEX_HOME=<home> codex login status` until it reports `Logged in using ChatGPT`. Do not treat a still-pending login as success.
 6. Add the alias to the existing `codex_accounts` object in ignored `registry.json`, preserving every other entry and `default_codex_account`.
-7. Validate without starting anything: `python3 scripts/resolve-codex-home.py registry.json --root` must still return the previous default, and the new alias must resolve for a probe project.
-8. Assign the alias to a project only when asked, then stop and start that project through the standard lifecycle scripts. Sessions already running keep their old `CODEX_HOME` until restarted.
-9. To move an already-running project to the alias **with its history**, identify the live rollout from the running app-server (`lsof -p <app-server-pid> | grep sessions/.*jsonl`), stop the project, copy that rollout into the target home's matching `sessions/` path without overwriting, change the project's `codex_account`, then start with `scripts/start-codex-session.sh <project> --resume <thread_uuid>` using the UUID from the rollout filename.
+7. Validate without starting anything. The resolver must still return the previous default, and the new alias must resolve for a probe project.
+   - macOS: `python3 scripts/resolve-codex-home.py registry.json --root`.
+   - Windows: `py -3 scripts/resolve-codex-home.py registry.json --root`.
+8. Assign the alias to a project only when asked, then run `scripts/ccdm stop-session <project>` and `scripts/ccdm start-codex-session <project>`. Sessions already running keep their old `CODEX_HOME` until restarted.
+9. To move an already-running project to the alias **with its history**, identify the live rollout first, stop the project, copy that rollout into the target home's matching `sessions/` path without overwriting, change the project's `codex_account`, then start with `scripts/ccdm start-codex-session <project> --resume <thread_uuid>` using the UUID from the rollout filename.
+   - macOS: read the live rollout from the running app-server with `lsof -p <app-server-pid> | grep sessions/.*jsonl`.
+   - Windows: pick the newest rollout by the rule in Gotchas.
 
 ## Gotchas
 - `codex login --device-auth` is the only flow that works without a browser on this machine; `--with-api-key` is wrong for a subscription account and silently produces a non-subscription home.
@@ -42,15 +47,16 @@ provider. API-key providers have their own patterns (`setup-mimo-codex`,
 - Capture the live rollout *before* stopping the old session. Once the listener is down, recover the thread by picking the newest `sessions/**/rollout-*.jsonl` under the old home whose `session_meta.cwd` matches the project path (cross-check that the file mentions the channel ID), because the bridge does not record the thread ID in `registry.json`. A restart launched without `--resume` also leaves a small throwaway rollout in the new home; ignore it.
 
 ## Verify
-- [ ] Home is `0700`, `config.toml` is `0600`, and no credential contents were printed or copied.
+- [ ] No credential contents were printed or copied.
+- [ ] macOS: the home is `0700` and `config.toml` is `0600`.
 - [ ] `codex login status` for the new home reports ChatGPT, and the account is the intended one.
 - [ ] `registry.json` stays valid JSON with the previous `default_codex_account` and all other aliases intact.
-- [ ] `resolve-codex-home.py registry.json --root` is unchanged and the new alias resolves to the new home.
+- [ ] The step-7 resolver output for `--root` is unchanged and the new alias resolves to the new home.
 - [ ] Any assigned project starts, and its process `CODEX_HOME` matches the alias.
 - [ ] Other projects and Discord listeners are untouched.
 
 ## Debug
-- Login still pending after the code expires: regenerate with `--device-auth`; check the tmux pane for `expired` or `denied` output.
+- Login still pending after the code expires: regenerate with `--device-auth`; read the login session's screen (step 3) for `expired` or `denied` output.
 - Alias rejected at start: confirm the alias exists in `codex_accounts`, the home exists, and the project does not also set `codex_home`.
 - Session runs the wrong account: the bridge receives a resolved absolute `CODEX_HOME`, so restart the session after any selector change.
 
