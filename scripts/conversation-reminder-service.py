@@ -119,6 +119,12 @@ def store_path(state_dir: Path) -> Path:
     return state_dir / "conversations.sqlite3"
 
 
+# How long a command waits for another reminder process to let go of the store.
+# A write section ends in one flush to disk: hundredths of a second on macOS and
+# Linux, but up to three seconds measured on a loaded Windows machine.
+STORE_BUSY_SECONDS = 10
+
+
 def pool_bot_id(identity: str) -> str | None:
     """Return the pool bot a `pool:<botId>` identity sends as, if it is one."""
     return identity[len("pool:"):] if identity.startswith("pool:") else None
@@ -164,7 +170,7 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
     if existed and path.stat().st_size == 0:
         raise ValueError("conversation store schema is unsupported")
     EVENTS.private_directory(state_dir)
-    db = sqlite3.connect(path, timeout=2, isolation_level=None)
+    db = sqlite3.connect(path, timeout=STORE_BUSY_SECONDS, isolation_level=None)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=FULL")
