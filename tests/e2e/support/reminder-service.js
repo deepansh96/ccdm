@@ -98,7 +98,7 @@ export async function reconciledExchange(workspace, stateDir) {
   // A later discovery slice will establish this state through reconciliation.
   // Seed only the prerequisite; drive and assert delivery through executable surfaces.
   const database = path.join(stateDir, "conversations.sqlite3");
-  const seeded = spawnSync(PYTHON, ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute(\"UPDATE conversations SET reconciliation_status='ready' WHERE project='demo'\"); db.commit()", database], { encoding: "utf8" });
+  const seeded = spawnSync(PYTHON, ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute(\"UPDATE conversations SET reconciliation_status='ready' WHERE project='demo'\"); db.commit()", database], { encoding: "utf8", windowsHide: true });
   assert.equal(seeded.status, 0, seeded.stderr);
 }
 
@@ -106,7 +106,7 @@ export async function reconciledExchange(workspace, stateDir) {
 export function refusalsWithRetryTime(stateDir) {
   const result = spawnSync(PYTHON, ["-c", "import json,sqlite3,sys; db=sqlite3.connect(sys.argv[1]); "
     + "print(json.dumps(db.execute(\"SELECT nonce FROM delivery_intents WHERE state='failed' AND retry_at IS NOT NULL\").fetchall()))",
-  path.join(stateDir, "conversations.sqlite3")], { encoding: "utf8" });
+  path.join(stateDir, "conversations.sqlite3")], { encoding: "utf8", windowsHide: true });
   assert.equal(result.status, 0, result.stderr);
   return JSON.parse(result.stdout);
 }
@@ -156,7 +156,7 @@ export function streak(row) {
 
 export function sql(database, script) {
   const result = spawnSync(PYTHON, ["-c", `import sqlite3,sys
-db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()`, database, script], { encoding: "utf8" });
+db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()`, database, script], { encoding: "utf8", windowsHide: true });
   assert.equal(result.status, 0, result.stderr);
 }
 
@@ -173,7 +173,7 @@ for table in ("conversations","owner_sources","qualifications","pending_actions"
     db.execute(f"ALTER TABLE {table}_v7 RENAME TO {table}")
 db.execute("""CREATE UNIQUE INDEX active_delivery_intent ON delivery_intents(project,assignment_generation)
     WHERE state IN ('sending','uncertain')""")
-db.execute("PRAGMA user_version=7"); db.commit(); db.close()`, database], { encoding: "utf8" });
+db.execute("PRAGMA user_version=7"); db.commit(); db.close()`, database], { encoding: "utf8", windowsHide: true });
   assert.equal(result.status, 0, result.stderr);
 }
 
@@ -248,7 +248,7 @@ db=sqlite3.connect(sys.argv[1]); db.row_factory=sqlite3.Row
 print(json.dumps({"version": db.execute('PRAGMA user_version').fetchone()[0],
   "conversations": [dict(r) for r in db.execute('SELECT * FROM conversations ORDER BY project')],
   "retired_assignments": [dict(r) for r in db.execute('SELECT * FROM retired_assignments')]}))`, database],
-  { encoding: "utf8" });
+  { encoding: "utf8", windowsHide: true });
   assert.equal(result.status, 0, result.stderr);
   return JSON.parse(result.stdout);
 }

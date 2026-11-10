@@ -106,7 +106,7 @@ PRAGMA user_version=7;
 
 export function sql(database, script) {
   const result = spawnSync(PYTHON, ["-c", `import sqlite3,sys
-db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()`, database, script], { encoding: "utf8" });
+db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.close()`, database, script], { encoding: "utf8", windowsHide: true });
   assert.equal(result.status, 0, result.stderr);
 }
 
@@ -130,7 +130,7 @@ tables=["conversations","owner_sources","qualifications","pending_actions","deli
 rows={t: sorted((dict(r) for r in db.execute(f"SELECT * FROM {t}")), key=lambda r: json.dumps(r, sort_keys=True))
       for t in tables}
 print(json.dumps({"version": db.execute('PRAGMA user_version').fetchone()[0], **rows}))`, database],
-  { encoding: "utf8" });
+  { encoding: "utf8", windowsHide: true });
   assert.equal(result.status, 0, result.stderr);
   return JSON.parse(result.stdout);
 }
