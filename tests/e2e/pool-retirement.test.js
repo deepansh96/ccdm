@@ -36,7 +36,8 @@ function poolWorkspace({ transports = {} } = {}) {
   });
   const registry = readRegistry(workspace);
   for (const bot of registry.pool) {
-    bot.state_dir = bot.state_dir.replace("__HOME__", workspace.homeDir);
+    // In this OS's own path form, as the script prints it.
+    bot.state_dir = path.normalize(bot.state_dir.replace("__HOME__", workspace.homeDir));
     fs.mkdirSync(bot.state_dir, { recursive: true });
     fs.writeFileSync(path.join(bot.state_dir, ".env"), `DISCORD_BOT_TOKEN=${bot.token}\n`);
   }
@@ -52,6 +53,7 @@ const readRegistry = (workspace) => JSON.parse(fs.readFileSync(registryFile(work
 const writeRegistry = (workspace, registry) =>
   fs.writeFileSync(registryFile(workspace), `${JSON.stringify(registry, null, 2)}\n`);
 const stateDirOf = (workspace, n) => path.join(workspace.homeDir, ".claude/channels", `discord${n}`);
+const backupDirOf = (workspace) => path.join(workspace.homeDir, ".local/state/ccdm/pool-retirement");
 
 function retire(workspace, args = [], extraEnv = {}) {
   return runScript(workspace, "scripts/retire-pool.sh", {
@@ -90,17 +92,14 @@ for (const args of [[], ["--apply"]]) {
 
 // The actions for poolWorkspace(), written out by hand.
 function expectedActions(workspace) {
-  const home = workspace.homeDir;
-  const backup = `${home}/.local/state/ccdm/pool-retirement`;
+  const backup = backupDirOf(workspace);
   return [
     "remove member bot2 (app-2) from guild guild-id",
     "remove member bot3 (app-3) from guild guild-id",
     "remove member bot9 (app-9) from guild guild-id",
-    `move state directory ${home}/.claude/channels/discord2 to ${backup}/state/bot2`,
-    `move state directory ${home}/.claude/channels/discord3 to ${backup}/state/bot3`,
-    `move state directory ${home}/.claude/channels/discord9 to ${backup}/state/bot9`,
+    ...[2, 3, 9].map(n => `move state directory ${stateDirOf(workspace, n)} to ${path.join(backup, "state", `bot${n}`)}`),
     "delete role project-bot (project-bot-role) in guild guild-id",
-    `back up the registry to ${backup}/registry.json`,
+    `back up the registry to ${path.join(backup, "registry.json")}`,
     "strip pool, max_pool_size, project_bot_role_id from the registry",
     "strip bot_id, bot_display_name, transport from project demo",
     "strip bot_id, transport from project beta",
@@ -121,13 +120,13 @@ test("a dry run lists every member removal, state move, role delete, and registr
   assert.deepEqual(discordMutations(workspace), NO_MUTATIONS);
   assert.equal(fs.readFileSync(registryFile(workspace), "utf8"), before);
   for (const n of [2, 3, 9]) assert.ok(fs.existsSync(stateDirOf(workspace, n)), `discord${n} was moved`);
-  assert.equal(fs.existsSync(path.join(workspace.homeDir, ".local/state/ccdm/pool-retirement")), false);
+  assert.equal(fs.existsSync(backupDirOf(workspace)), false);
 });
 
 test("--apply removes every pool bot, deletes the role, backs up state and registry privately, and strips the pool fields", async () => {
   const workspace = poolWorkspace();
   const before = fs.readFileSync(registryFile(workspace), "utf8");
-  const backup = path.join(workspace.homeDir, ".local/state/ccdm/pool-retirement");
+  const backup = backupDirOf(workspace);
 
   const result = await retire(workspace, ["--apply"]);
 
@@ -199,14 +198,26 @@ test("a freshly registered project with no transport or pool markers does not bl
 test("a retirement interrupted between project strips finishes on the rerun, and a further rerun is a no-op", async () => {
   const workspace = poolWorkspace();
   const hold = path.join(workspace.tmpDir, "registry-hold");
+  // The writer's PID once it is paused at a write. The marker of the pause
+  // before goes away a moment after its release is taken, so a pause counts
+  // only once the next one has been claimed (`armed` is gone).
+  const pausedPid = () => {
+    if (fs.existsSync(`${hold}.release`) || fs.existsSync(`${hold}.armed`)) return null;
+    try {
+      return /^(\d+)\n$/.exec(fs.readFileSync(`${hold}.waiting`, "utf8"))?.[1] ?? null;
+    } catch (error) {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    }
+  };
   const waitForPause = async () => {
     const deadline = Date.now() + 20000;
-    while (!fs.existsSync(`${hold}.waiting`) || fs.existsSync(`${hold}.release`)
-      || !/^\d+\n$/.test(fs.readFileSync(`${hold}.waiting`, "utf8"))) {
+    for (;;) {
+      const pid = pausedPid();
+      if (pid) return Number(pid);
       assert.ok(Date.now() < deadline, "retirement never paused at its next registry write");
       await new Promise(resolve => setTimeout(resolve, 10));
     }
-    return Number(fs.readFileSync(`${hold}.waiting`, "utf8"));
   };
   // Pause at the top-level strip, then at demo's strip, then at beta's, and
   // kill the run there: demo is stripped, beta is not.
@@ -229,16 +240,16 @@ test("a retirement interrupted between project strips finishes on the rerun, and
   const rerun = await retire(workspace, ["--apply"]);
 
   assert.equal(rerun.exitCode, 0, rerun.stderr || rerun.stdout);
-  const backup = `${workspace.homeDir}/.local/state/ccdm/pool-retirement`;
+  const backup = backupDirOf(workspace);
   assert.deepEqual(rerun.stdout.trim().split("\n"), [
-    `done: back up the registry to ${backup}/registry.json`,
+    `done: back up the registry to ${path.join(backup, "registry.json")}`,
     "done: strip bot_id, transport from project beta",
   ]);
   const retired = fs.readFileSync(registryFile(workspace), "utf8");
   assert.deepEqual(JSON.parse(retired).projects.beta,
     { channel_id: "beta-channel", type: "codex", webhook_id: "webhook-beta", ws_port: 4501 });
   // The first run's backup, made before anything was stripped, is kept.
-  assert.equal(JSON.parse(fs.readFileSync(`${backup}/registry.json`, "utf8")).pool.length, 3);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(backup, "registry.json"), "utf8")).pool.length, 3);
 
   const again = await retire(workspace, ["--apply"]);
 
@@ -261,7 +272,7 @@ test("state directories written with a leading ~ are expanded and moved, not ski
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.deepEqual(result.stdout.trim().split("\n"), expectedActions(workspace).map(action => `done: ${action}`));
-  const backup = path.join(workspace.homeDir, ".local/state/ccdm/pool-retirement");
+  const backup = backupDirOf(workspace);
   for (const n of [2, 3, 9]) {
     assert.equal(fs.existsSync(stateDirOf(workspace, n)), false, `discord${n} is still in place`);
     assert.equal(fs.readFileSync(path.join(backup, "state", `bot${n}`, ".env"), "utf8"), `DISCORD_BOT_TOKEN=bot${n}-token\n`);
@@ -275,10 +286,9 @@ test("a state directory that cannot be retired is reported as skipped and the ru
   registry.pool[1].state_dir = "~/.claude/channels/missing3"; // expanded, but absent
   delete registry.pool[2].state_dir;
   writeRegistry(workspace, registry);
-  const home = workspace.homeDir;
   const skips = [
     "move state directory channels/discord2 of bot2: not an absolute path",
-    `move state directory ${home}/.claude/channels/missing3 of bot3: it does not exist`,
+    `move state directory ${path.join(workspace.homeDir, ".claude/channels/missing3")} of bot3: it does not exist`,
     "move the state directory of bot9: the registry names none",
   ];
 
