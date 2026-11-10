@@ -8,7 +8,7 @@ import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerEnv, routerWithWebho
 import { runScript } from "./support/runner.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
-import { startThreadSupervisor, supervisorStatus } from "./support/thread-supervisor.js";
+import { startThreadHost, startThreadSupervisor, supervisorEnv, supervisorStatus } from "./support/thread-supervisor.js";
 
 test.afterEach(cleanup);
 
@@ -44,10 +44,17 @@ function journeyWorkspace() {
   };
 }
 
+// What the services and launchers run with. On Windows sessions run on the fake
+// ccdm-host, whose env moves the state root, so the reminder state is named.
+const WIN = process.platform === "win32";
+const servicesEnv = (context, extra = {}) => (WIN
+  ? supervisorEnv(context.workspace, { CCDM_REMINDER_STATE_DIR: context.stateDir, PYTHONUTF8: "1", ...extra })
+  : routerEnv(context.workspace, extra));
+
 async function reminderService(context, name) {
   const result = await runScript(context.workspace, "scripts/conversation-reminder-service.py", {
     args: [name, "--project-root", context.workspace.repoDir, "--state-dir", context.stateDir],
-    env: routerEnv(context.workspace, context.env),
+    env: servicesEnv(context, context.env),
   });
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   return JSON.parse(result.stdout);
@@ -67,16 +74,17 @@ async function journeyServices(context) {
     state.fixtures.claude.toolScript = ANSWER;
   });
   await routerWithWebhooks(workspace, ["demo"]);
+  if (WIN) await startThreadHost(workspace);
   const started = await runScript(workspace, "scripts/start-session.sh", {
-    args: ["demo"], env: routerEnv(workspace), timeoutMs: 30000,
+    args: ["demo"], env: servicesEnv(context), timeoutMs: 30000,
   });
   assert.equal(started.exitCode, 0, started.stderr || started.stdout);
-  await startThreadSupervisor(workspace);
+  await startThreadSupervisor(workspace, WIN ? { env: { CCDM_REMINDER_STATE_DIR: context.stateDir } } : {});
   await reminderService(context, "enable");
   context.setClock(0);
   const running = runScript(workspace, "scripts/conversation-reminder-service.py", {
     args: ["run", "--project-root", workspace.repoDir, "--state-dir", context.stateDir],
-    env: routerEnv(workspace, context.env), timeoutMs: 120000,
+    env: servicesEnv(context, context.env), timeoutMs: 120000,
   });
   const deadline = Date.now() + 20000;
   while ((await reminderService(context, "status")).conversations.demo?.reconciliation_status !== "ready") {
@@ -132,7 +140,7 @@ const stopHooks = workspace => (claude(workspace).hookRuns ?? []).filter(run => 
 const settle = () => new Promise(resolve => setTimeout(resolve, 1500));
 // Thread sessions, not the channel's, run with the thread's own key.
 const threadInvocations = workspace => claude(workspace).invocations
-  .filter(invocation => invocation.env.CCDM_ROUTER_KEY_FILE?.endsWith(`/.thread-${THREAD_ID}.key`));
+  .filter(invocation => path.basename(invocation.env.CCDM_ROUTER_KEY_FILE ?? "") === `.thread-${THREAD_ID}.key`);
 const resumeArgs = invocation => {
   const index = invocation.args.indexOf("--resume");
   return index < 0 ? null : invocation.args[index + 1].replace(/^'|'$/g, "");
