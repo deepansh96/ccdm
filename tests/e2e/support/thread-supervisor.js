@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { routerEnv, runRouterCli, waitFor } from "./router.js";
 import { runScript } from "./runner.js";
-import { startFakeHost } from "./session-fixture.js";
+import { fakeHostEnv, startFakeHost } from "./session-fixture.js";
 import { workspaceOwnsPid } from "./teardown.js";
 
 // The Thread Supervisor's private state, under the Test Workspace's home.
@@ -37,11 +37,20 @@ export async function startThreadHost(workspace) {
   return fakeHosts.get(workspace);
 }
 
+// For a worker that starts before its host, as at logon: the worker and every
+// supervisor command get the fake host's environment now, and
+// startThreadSupervisor starts no host. The test starts it with startThreadHost.
+const lateHosts = new WeakSet();
+
+export function expectLateThreadHost(workspace) {
+  lateHosts.add(workspace);
+}
+
 // The worker launches its Node link through CCDM_ROUTER_NODE, as the session
 // launchers do, and finds the Router through CCDM_ROUTER_STATE_DIR.
 export function supervisorEnv(workspace, extraEnv = {}) {
-  const host = fakeHosts.get(workspace);
-  const hostEnv = host ? { ...host.env, CCDM_THREAD_SUPERVISOR_STATE_DIR: supervisorStateDir(workspace) } : {};
+  const host = fakeHosts.get(workspace)?.env ?? (lateHosts.has(workspace) ? fakeHostEnv(workspace) : null);
+  const hostEnv = host ? { ...host, CCDM_THREAD_SUPERVISOR_STATE_DIR: supervisorStateDir(workspace) } : {};
   return routerEnv(workspace, { ...hostEnv, ...extraEnv });
 }
 
@@ -83,7 +92,7 @@ export function signalSupervisorWorker(workspace, workerPid) {
 // `supervisor` connection. `result` resolves with the worker's exit; `stop()`
 // sends the worker SIGTERM and resolves with that exit.
 export async function startThreadSupervisor(workspace, { env = {} } = {}) {
-  if (process.platform === "win32") await startThreadHost(workspace);
+  if (process.platform === "win32" && !lateHosts.has(workspace)) await startThreadHost(workspace);
   const result = runScript(workspace, "scripts/thread-supervisor.py", {
     args: ["run"], env: supervisorEnv(workspace, env), timeoutMs: 60000,
   });

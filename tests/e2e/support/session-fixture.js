@@ -510,9 +510,14 @@ export function createSessionFixture(context) {
 
 // Starts the fake ccdm-host for a workspace. `env` is what a seam call needs to
 // find it. The fixture runtime is the same one the fixture commands run.
+// What a client of the workspace's fake ccdm-host runs with, whether the host is up yet or not.
+export function fakeHostEnv(workspace) {
+  return { CCDM_STATE_ROOT: path.join(workspace.tmpRoot, "fake-host-state"), CCDM_SESSION_HOST: "ccdm-host" };
+}
+
 export async function startFakeHost(workspace, { badProof = false, env: extraEnv = {} } = {}) {
   const { registerTeardownCallback } = await import("./teardown.js");
-  const stateRoot = path.join(workspace.tmpRoot, "fake-host-state");
+  const stateRoot = fakeHostEnv(workspace).CCDM_STATE_ROOT;
   const hostDir = path.join(stateRoot, "host");
   const runtime = path.join(workspace.fixtureDir, "fixture-runtime.cjs");
   const child = spawn(process.execPath, [runtime, "ccdm-host-fake", workspace.tmpRoot], {
@@ -541,7 +546,7 @@ export async function startFakeHost(workspace, { badProof = false, env: extraEnv
     });
     child.once("exit", code => reject(new Error(`fake ccdm-host exited with ${code}: ${stderr}`)));
   });
-  return { child, hostDir, stateRoot, env: { CCDM_STATE_ROOT: stateRoot, CCDM_SESSION_HOST: "ccdm-host" } };
+  return { child, hostDir, stateRoot, env: fakeHostEnv(workspace) };
 }
 
 // Every call the fronts saw, in order: tmux argv and pipe ops.

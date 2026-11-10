@@ -38,6 +38,7 @@ The session starts on the first owner or guest message, or at once when a first 
 1. 👀 shows on the triggering message while the session boots.
 2. The supervisor runs the thread launcher, the code behind `scripts/ccdm start-thread-session <project> <thread_id> --provider …`, in its own process, with a fresh `keys/.thread-<thread_id>.key`, the launch dir `launches/<project>/threads/<thread_id>/`, and the session `<screen>-t-<thread_id>` (a tmux session on macOS, a `ccdm-host` session on Windows).
    - macOS: `scripts/start-thread-session.sh` runs the same launcher from a terminal.
+   - Windows: the worker and `ccdm-host` both start at logon, in no fixed order. The worker's first launch waits until `ccdm-host` answers, 90 seconds at most. If the host still does not answer, the launch goes ahead and fails with the usual notice.
 3. Every message sent during boot is delivered exactly once, in the first prompt, together with the starter. The starter goes only into a conversation's first boot; a resume does not repeat it.
 4. 👀 is removed when the session is live. A failed start posts a one-line reason and is not retried automatically; the next eligible message retries.
 
