@@ -27,14 +27,16 @@ Create a thread in any of four ways. All four become one supervisor creation req
 - by hand in Discord;
 - `/thread <name> [--provider claude|codex] [--account <alias>] [--model <model>] [--effort <effort>] [first message…]` in the project channel;
 - the Channel Conversation's `create_thread` tool, for its own channel only;
-- `scripts/threads.sh create <project> <name> [flags] [message]`.
+- the operator's thread command, which takes the same flags:
+  - macOS: `scripts/threads.sh create <project> <name> [flags] [message]`.
+  - Windows: `scripts/ccdm threads create <project> <name> [flags] --message-stdin`, with the first message on stdin, or `--message-file <path>` for a UTF-8 file. Never give the message as arguments there. Leave both out to create the thread with no first message. macOS accepts the same two flags.
 
-Created threads use a one-week archive duration (`auto_archive_duration: 10080`). Bot-created threads are made with it, and owner-created ones are PATCHed to it. A bad flag creates nothing: `/thread` answers `Thread not created: <reason>`, the tool returns an op error, and `threads.sh` exits 2.
+Created threads use a one-week archive duration (`auto_archive_duration: 10080`). Bot-created threads are made with it, and owner-created ones are PATCHed to it. A bad flag creates nothing: `/thread` answers `Thread not created: <reason>`, the tool returns an op error, and the operator's thread command exits 2.
 
 The session starts on the first owner or guest message, or at once when a first message was given:
 
 1. 👀 shows on the triggering message while the session boots.
-2. The supervisor runs `scripts/start-thread-session.sh <project> <thread_id> --provider …` with a fresh `keys/.thread-<thread_id>.key`, the launch dir `launches/<project>/threads/<thread_id>/`, and tmux `<screen>-t-<thread_id>`.
+2. The supervisor runs `scripts/start-thread-session.sh <project> <thread_id> --provider …` with a fresh `keys/.thread-<thread_id>.key`, the launch dir `launches/<project>/threads/<thread_id>/`, and the session `<screen>-t-<thread_id>` (a tmux session on macOS, a `ccdm-host` session on Windows).
 3. Every message sent during boot is delivered exactly once, in the first prompt, together with the starter. The starter goes only into a conversation's first boot; a resume does not repeat it.
 4. 👀 is removed when the session is live. A failed start posts a one-line reason and is not retried automatically; the next eligible message retries.
 
@@ -108,7 +110,7 @@ The supervisor is a Python worker, which owns the store, capacity, lifecycle and
 
 - the SQLite store `threads.sqlite3`;
 - `worker.lock`;
-- the `control.sock` used by `threads.sh` and `stop-session.sh --threads`;
+- the control channel used by the operator's thread command and by a project's `--threads` stop: the socket `control.sock` on macOS, and on Windows a named pipe whose name and key are in `supervisor.pipe` and `supervisor.secret`;
 - the LaunchAgent logs `service.log` and `service.err`.
 
 The worker writes a fresh `keys/.supervisor.key` in the Router state on each start.
@@ -117,7 +119,9 @@ The worker writes a fresh `keys/.supervisor.key` in the Router state on each sta
 - **Inspect** with `scripts/thread-supervisor.py status`. It shows the worker, the caps (and any invalid value) and every bound thread with its state.
 - **Disable / enable** with `scripts/thread-supervisor.py disable` and `enable`. While disabled, the supervised worker exits and launchd does not relaunch it. `enable` only clears the disabled marker; it does not start the worker. Rerun `scripts/install-thread-supervisor.sh` afterwards to relaunch the LaunchAgent.
 - **Debug in the foreground** with `scripts/thread-supervisor.py disable`, then `scripts/thread-supervisor.py run`. A second worker exits with status 2 while the lock is held.
-- **Operate threads** with `scripts/threads.sh list [<project>]` and `scripts/threads.sh stop|restart|close [<project>] <name|link|id>`. `send-claude-command.sh`, guest access (which acts on the parent project) and `export-discord-range.js` also accept a thread id.
+- **Operate threads** with the operator's thread command: `list [<project>]` prints each bound thread, and `stop|restart|close [<project>] <name|link|id>` acts on one. The output and exit codes are the same on both OSes. `send-claude-command.sh`, guest access (which acts on the parent project) and `export-discord-range.js` also accept a thread id.
+  - macOS: `scripts/threads.sh list [<project>]` and `scripts/threads.sh stop|restart|close [<project>] <name|link|id>`.
+  - Windows: `scripts/ccdm threads list [<project>]` and `scripts/ccdm threads stop|restart|close [<project>] <name|link|id>`.
 - **Router view:** `node scripts/router.js status` lists each `thread` connection, the supervisor line, and root's missing thread permissions while threads are enabled.
 
 ## Root permissions
@@ -145,7 +149,9 @@ These steps run once after the thread work is merged and deployed. They touch re
 
 - [ ] **thread → Claude reply:** in a Claude project channel, open a public thread and type a task. Expect 👀 during boot, then a reply in the thread as `<project>-claude · N%`. The Channel Conversation receives nothing.
 - [ ] **thread → Codex reply:** repeat in a Codex project channel, or use `/thread smoke --provider codex hello` in a Claude one. Expect a reply in the thread as `<project>-codex · N%`.
-- [ ] **`/close`:** send `/close` in one smoke thread. Expect the root-bot acknowledgement and the thread archived. `scripts/threads.sh list` shows it `closed/close-command`, and its tmux session is gone.
+- [ ] **`/close`:** send `/close` in one smoke thread. Expect the root-bot acknowledgement and the thread archived. The thread list shows it `closed/close-command`, and its session `<screen>-t-<thread_id>` is gone.
+  - macOS: `scripts/threads.sh list`, then `tmux ls`.
+  - Windows: `scripts/ccdm threads list`. Its session no longer answers `scripts/ccdm session capture <screen>-t-<thread_id>`.
 - [ ] Optionally send another owner message in the closed thread. It should reopen and answer with the same conversation.
 
 **Clean up:**

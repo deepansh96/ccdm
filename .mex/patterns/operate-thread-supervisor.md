@@ -5,6 +5,7 @@ triggers:
   - "thread supervisor"
   - "thread conversation"
   - "threads.sh"
+  - "ccdm threads"
   - "thread permissions"
 edges:
   - target: context/session-management.md
@@ -21,7 +22,7 @@ last_updated: 2026-11-10
 ## Context
 Read `docs/thread-supervisor.md`. The supervisor is a Router client (`supervisor` role) with no Discord credential. It owns Thread Conversation lifecycle; the Router routes thread traffic. Its private state is `~/.local/state/ccdm/thread-supervisor/`.
 
-Thread sessions launch on both OSes. The operator commands for threads and the supervisor's service exist on macOS only today; each Windows line below names the issue that adds it.
+Thread sessions launch on both OSes, and the operator's thread commands run on both. The supervisor's service exists on macOS only today; each Windows line below that says pending names the issue that adds it.
 
 ## Steps
 1. Make sure root has Create Public Threads, Send Messages in Threads and Manage Threads in the project channels, and View Audit Log on the guild. These are granted once by hand in Discord, never by a script.
@@ -34,7 +35,8 @@ Thread sessions launch on both OSes. The operator commands for threads and the s
    - Both: `node scripts/router.js status` shows the `thread` lines, the `supervisor:` line, `thread_permissions=` per project and `guild permissions:`.
 4. Operate threads.
    - macOS: `scripts/threads.sh list [<project>]`, `scripts/threads.sh create <project> <name> [flags] [message]`, and `scripts/threads.sh stop|restart|close [<project>] <name|link|id>`.
-   - Windows: pending (#241). `scripts/ccdm` has no `threads` command yet.
+   - Windows: `scripts/ccdm threads list [<project>]`, `scripts/ccdm threads create <project> <name> [flags]`, and `scripts/ccdm threads stop|restart|close [<project>] <name|link|id>`. Give `create` its first message on stdin with `--message-stdin`, or from a UTF-8 file with `--message-file <path>`, never as arguments; with neither, the thread is created and its session starts on the first owner or guest message.
+   - Both: the output and exit codes are the same. Exit 2 means nothing was done (bad usage, a bad flag or setting, or a thread nobody can name); exit 1 means no supervisor answered. A `stop`, `restart` or `close` run from inside the thread it names still takes effect, because the supervisor carries it out; the command itself ends with the session and prints nothing.
 5. To stop a project's thread sessions, run `scripts/ccdm stop-session <project> --threads`; `--all` also stops the channel. A plain `scripts/ccdm stop-session <project>` or "restart <project>" touches the channel only.
 6. Debug in the foreground.
    - macOS: run `scripts/thread-supervisor.py disable`, then `scripts/thread-supervisor.py run`; `enable` clears the disabled marker but starts nothing, so rerun `scripts/install-thread-supervisor.sh` after it to relaunch the LaunchAgent.
