@@ -997,7 +997,7 @@ Setup does this, in order:
 2. It checks the symlinks from step 2. If they are missing it stops and prints the fix.
 3. It asks for your Discord user ID, the server ID, the root channel ID and the category ID.
 4. It asks for a machine id and a machine label. Press Enter to keep `win` and `Windows`.
-5. It asks for the guest mode. Press Enter to keep `none`. [Guests on Windows](#guests-on-windows) explains the choice.
+5. It asks for the guest mode. Press Enter to keep `member-overwrites`, or type `none` for no guests. [Guests on Windows](#guests-on-windows) explains the choice.
 6. It asks for the bot token. Now open the bot's **Bot** page in the Developer Portal, click **Reset Token** and copy the token. Paste it into the prompt and press Enter. The prompt is hidden: nothing appears while you paste. Do not save the token anywhere else.
 7. It writes three files and prints the next steps:
    - `registry.json` in the CCDM folder, with the root channel in `root_channels`, the category in `category_ids`, and the two fields `machine` and `guest_mode`.
@@ -1020,7 +1020,7 @@ The two Windows fields at the end of `registry.json` look like this:
 
 ```json
 "machine": { "id": "win", "label": "Windows" },
-"guest_mode": "none"
+"guest_mode": "member-overwrites"
 ```
 
 `registry.example.json` is the macOS template and does not show them.
@@ -1171,14 +1171,15 @@ The top-level `guest_mode` in `registry.json` decides how guests are let into on
 | `guest_mode` | What it means |
 |--------------|---------------|
 | absent, or `"roles"` | The macOS mode described in [Project Guests](#project-guests): one guest role per project. It is never used on Windows, because the Windows bot never gets Manage Roles for the whole server |
-| `"none"` | No new guests from this machine. `invite`, `grant` and `sync` refuse and make no Discord call. `revoke` and `list` still work. Setup writes this value |
-| `"member-overwrites"` | No role. Each guest gets permissions of their own: allowed on the one project channel, denied View Channel on this machine's category and its other project channels. The bot only needs Manage Permissions on its own category |
+| `"none"` | No new guests from this machine. `invite`, `grant` and `sync` refuse and make no Discord call. `revoke` and `list` still work. Answer `none` at the setup prompt to get this |
+| `"member-overwrites"` | No role. Each guest gets permissions of their own: allowed on the one project channel, denied View Channel on this machine's category and its other project channels. The bot only needs Manage Permissions on its own category, never Manage Roles for the whole server. Setup offers this value by default |
 
-Keep `"none"` until you have tried `"member-overwrites"` on your server:
+Setup offers `"member-overwrites"` by default. For it the bot needs Manage Permissions on its own category, and never Manage Roles for the whole server. Answer `none` at the setup prompt, or set `"guest_mode": "none"` in `registry.json`, and this machine takes no guests.
 
-1. Set `"guest_mode": "member-overwrites"` in `registry.json`.
-2. With a test account and a test project, run `invite`, `sync` and `revoke` from the block below.
-3. If Discord refuses one of them, revoke the test guest and set `"guest_mode": "none"` again. This machine then takes no guests.
+After setup, check it on your own server with one invite:
+
+1. With a test account and a test project, run `invite`, `sync` and `revoke` from the block below.
+2. If Discord refuses one of them, revoke the test guest and set `"guest_mode": "none"`. This machine then takes no guests.
 
 ```powershell
 node scripts\guest-access.js invite <project> <discord-user-id>
@@ -1298,7 +1299,7 @@ If `ccdm-host` ends cleanly, for example after `node scripts\ccdm-host.js shutdo
 - Signing out of Windows stops the Router, `ccdm-host` and every session. Nothing runs before you sign in.
 - Root on Windows is Claude only for now. `scripts\ccdm restart-root --provider codex` is refused. Codex projects and Codex threads work.
 - The usage poster never posts on Windows; it only collects.
-- No guests until you choose `"member-overwrites"`; see [Guests on Windows](#guests-on-windows).
+- Guests use `"member-overwrites"`, the setup default; answer `none` at the setup prompt for no guests. See [Guests on Windows](#guests-on-windows).
 - The tools in [Cutover and retirement](#cutover-and-retirement) are for older macOS installs. A Windows install starts on the Router and does not need them.
 
 ### Multiple machines

@@ -45,9 +45,10 @@ _MINIMUM_NODE = (22, 5)
 _PROBE_TIMEOUT_SECONDS = 20
 _RUNBOOK_LINKS = ("CLAUDE.md", ".mex/AGENTS.md")
 _GUEST_MODES = ("member-overwrites", "none")
-# "none" until the guest calls of member-overwrites mode are recorded as working
-# against real Discord for every one of them; then this becomes "member-overwrites".
-_DEFAULT_GUEST_MODE = "none"
+# Every guest call of member-overwrites mode is recorded as working against real
+# Discord with a bot that has no server-wide Manage Roles, so it is the default;
+# "none" stays available for an owner who wants no guests.
+_DEFAULT_GUEST_MODE = "member-overwrites"
 _DEFAULT_MACHINE_ID = "win"
 _DEFAULT_MACHINE_LABEL = "Windows"
 _MACHINE_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
@@ -219,9 +220,9 @@ def _ask_registry() -> Dict[str, Any]:
         raise SetupError(f"Error: the machine label is at most {_MAX_LABEL_CHARS} printable characters.")
     print()
     print("Guest mode: how people you invite are let into one project channel.")
-    print("  none               no new guests can be added from this machine")
     print("  member-overwrites  each guest gets their own permission on the project channel;")
-    print("                     choose it only once those calls are known to work on your server")
+    print("                     the bot needs Manage Permissions on its own category")
+    print("  none               no new guests can be added from this machine")
     guest_mode = _ask_default("Guest mode", _DEFAULT_GUEST_MODE)
     if guest_mode not in _GUEST_MODES:
         raise SetupError("Error: guest mode must be member-overwrites or none.")

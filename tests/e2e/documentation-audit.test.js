@@ -977,8 +977,11 @@ test("the README's Windows section never offers server-wide Manage Roles and doc
   }
   const section = lines.join("\n");
   assert.match(section, /`"roles"`[^\n]*never used on Windows/);
-  assert.match(section, /`"none"`[^\n]*Setup writes this value/);
-  assert.match(section, /Keep `"none"` until you have tried `"member-overwrites"` on your server/);
+  assert.match(section, /`"none"`[^\n]*Answer `none` at the setup prompt/);
+  assert.match(section, /Setup offers `"member-overwrites"` by default/);
+  assert.match(section, /Manage Permissions on its own category, and never Manage Roles for the whole server/);
+  assert.match(section, /After setup, check it on your own server with one invite/);
+  assert.doesNotMatch(section, /Keep `"none"` until/);
 });
 
 test("the README's Windows section holds no local path, account name, ID or token, and one command per line", () => {

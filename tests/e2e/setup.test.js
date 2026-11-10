@@ -367,7 +367,7 @@ const expectedRegistry = (overrides = {}) => ({
   category_ids: [CATEGORY],
   projects: {},
   machine: { id: "win", label: "Windows" },
-  guest_mode: "none",
+  guest_mode: "member-overwrites",
   ...overrides,
 });
 
@@ -503,16 +503,31 @@ test("setup.ps1 writes a registry the Router accepts, with every field and the c
   }
 });
 
+test("setup offers member-overwrites as the default guest mode, and answering none turns guests off", WINDOWS_SETUP, async () => {
+  const byDefault = windowsWorkspace();
+  const accepted = await ccdmSetup(byDefault, { env: SEAM, input: promptInput(...REGISTRY_ANSWERS, TOKEN) });
+  assert.equal(accepted.exitCode, 0, accepted.stderr || accepted.stdout);
+  assert.match(accepted.stdout, /Guest mode \[member-overwrites\]: /);
+  assert.equal(JSON.parse(fs.readFileSync(registryFile(byDefault), "utf8")).guest_mode, "member-overwrites");
+
+  const off = windowsWorkspace();
+  const declined = await ccdmSetup(off, {
+    env: SEAM, input: promptInput(OWNER, GUILD, ROOT_CHANNEL, CATEGORY, "", "", "none", TOKEN),
+  });
+  assert.equal(declined.exitCode, 0, declined.stderr || declined.stdout);
+  assert.equal(JSON.parse(fs.readFileSync(registryFile(off), "utf8")).guest_mode, "none");
+});
+
 test("the machine names and the guest mode can be answered, and the registry file gets its own private access list", WINDOWS_SETUP, async () => {
   const workspace = windowsWorkspace();
 
   const result = await ccdmSetup(workspace, {
-    env: SEAM, input: promptInput(OWNER, GUILD, ROOT_CHANNEL, CATEGORY, "studio-pc", "Studio PC", "member-overwrites", TOKEN),
+    env: SEAM, input: promptInput(OWNER, GUILD, ROOT_CHANNEL, CATEGORY, "studio-pc", "Studio PC", "none", TOKEN),
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   assert.deepEqual(JSON.parse(fs.readFileSync(registryFile(workspace), "utf8")),
-    expectedRegistry({ machine: { id: "studio-pc", label: "Studio PC" }, guest_mode: "member-overwrites" }));
+    expectedRegistry({ machine: { id: "studio-pc", label: "Studio PC" }, guest_mode: "none" }));
   // A file is private only inside a private directory, and a rename on one volume keeps its access list.
   const moved = path.join(tokenDir(workspace), "registry-moved.json");
   fs.renameSync(registryFile(workspace), moved);
@@ -523,10 +538,9 @@ test("no prompt or output offers server-wide Manage Roles, and guest_mode is mem
   const workspace = windowsWorkspace();
   const finished = await ccdmSetup(workspace, { env: SEAM, input: promptInput(...REGISTRY_ANSWERS, TOKEN) });
   assert.equal(finished.exitCode, 0, finished.stderr || finished.stdout);
-  assert.match(finished.stdout, /Guest mode \[none\]: /);
-  assert.match(finished.stdout, /member-overwrites/);
+  assert.match(finished.stdout, /Guest mode \[member-overwrites\]: /);
   assert.doesNotMatch(finished.stdout + finished.stderr, /manage roles|manage_roles|\broles\b/i);
-  assert.equal(JSON.parse(fs.readFileSync(registryFile(workspace), "utf8")).guest_mode, "none");
+  assert.equal(JSON.parse(fs.readFileSync(registryFile(workspace), "utf8")).guest_mode, "member-overwrites");
 
   for (const answer of ["roles", "manage-roles", "NONE"]) {
     const refusing = windowsWorkspace();
