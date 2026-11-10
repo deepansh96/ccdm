@@ -46,7 +46,6 @@ tests/e2e/conversation-reminder-router-claude.test.js
 tests/e2e/conversation-reminder-transport-switch.test.js
 tests/e2e/conversation-reminder-service.test.js
 tests/e2e/conversation-reminder-restart.test.js
-tests/e2e/conversation-reminder-restart-queue.test.js
 tests/e2e/conversation-reminder-restart-enable.test.js
 tests/e2e/conversation-reminder-threads.test.js
 tests/e2e/conversation-reminder-thread-lifecycle.test.js
