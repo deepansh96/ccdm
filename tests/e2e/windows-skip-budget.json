@@ -337,6 +337,12 @@
       "test": "/pause queues router Codex messages and /unpause runs them in order",
       "tag": "posix",
       "reason": "two paused messages can overtake each other while the bridge awaits their reminder steps, seen only on Windows"
+    },
+    {
+      "file": "ccdm-usage.test.js",
+      "test": "ccdm usage matches claude-usage.sh line for line on the same fixture home",
+      "tag": "posix",
+      "reason": "runs claude-usage.sh, a bash script that needs python3 and curl; the same expected text is checked on Windows"
     }
   ]
 }
