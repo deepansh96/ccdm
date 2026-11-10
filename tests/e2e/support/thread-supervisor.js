@@ -107,7 +107,17 @@ export async function startThreadSupervisor(workspace, { env = {} } = {}) {
     if (Date.now() > deadline) throw new Error(`the supervisor never connected: ${output.stdout}`);
     await new Promise(resolve => setTimeout(resolve, 50));
   }
-  const current = await supervisorStatus(workspace);
+  // `status` reads the worker's pid from its health file, which the worker
+  // replaces as its link connects; a read that meets the replace reports no pid.
+  // stop() needs the pid to ask the worker to end, so it is waited for here.
+  let current;
+  const pidDeadline = Date.now() + 15000;
+  for (;;) {
+    current = await supervisorStatus(workspace);
+    if (Number.isInteger(current.worker_pid) && Number.isInteger(current.link_pid)) break;
+    if (Date.now() > pidDeadline) throw new Error(`the supervisor never reported its pid: ${JSON.stringify(current)}`);
+    await delay(50);
+  }
   return {
     result,
     workerPid: current.worker_pid,

@@ -478,8 +478,7 @@ test("a worker that starts before ccdm-host holds its first launch until the hos
   assert.deepEqual(notices(workspace, raw.id), []);
   assert.deepEqual(notifications(workspace, raw.id).map(notification => notification.meta.message_id), ["before-host"]);
   assert.deepEqual(await hostSessions(workspace), [tmuxName(raw.id)]);
-  const { exitCode, stderr } = await supervisor.stop();
-  assert.equal(exitCode, 0);
+  const { stderr } = await assertSupervisorStops(supervisor);
   assert.equal(occurrences(stderr, "ccdm-host does not answer yet; waiting up to 90 s"), 1, stderr);
   assert.equal(occurrences(stderr, "ccdm-host answers; launching"), 1, stderr);
 });
@@ -496,7 +495,6 @@ test("when ccdm-host never answers, the first launch goes ahead after the bounde
   await waitFor(() => notices(workspace, raw.id).length === 1, () => "the start-failure notice", 15000);
   assert.match(notices(workspace, raw.id)[0], /^Thread session failed to start: /);
   assert.deepEqual(claude(workspace).invocations ?? [], []);
-  const { exitCode, stderr } = await supervisor.stop();
-  assert.equal(exitCode, 0);
+  const { stderr } = await assertSupervisorStops(supervisor);
   assert.equal(occurrences(stderr, "ccdm-host did not answer after 90 s; launching anyway"), 1, stderr);
 });
