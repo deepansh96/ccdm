@@ -14,15 +14,25 @@ function withStateLock(stateDir, action) {
   if (!stateDir) return action();
   fs.mkdirSync(stateDir, { recursive: true });
   const lock = path.join(stateDir, "state.lock");
-  const deadline = Date.now() + STALE_LOCK_MS;
+  let refusedSince = null;
   for (;;) {
     try {
       fs.mkdirSync(lock);
       break;
     } catch (error) {
-      // On Windows a lock directory still being removed refuses a new one with EPERM.
-      const transient = (error.code === "EPERM" || error.code === "EACCES") && Date.now() < deadline;
-      if (error.code !== "EEXIST" && !transient) throw error;
+      // On Windows a lock directory still being removed refuses a new one with
+      // EPERM. That passes in milliseconds, so only an unbroken run of refusals
+      // this long is a failure. The run is timed from its own first refusal: a
+      // wait for a stale lock has already used up this long when the lock is
+      // cleared, which is just when the next refusal comes.
+      if (error.code === "EEXIST") {
+        refusedSince = null;
+      } else if (error.code === "EPERM" || error.code === "EACCES") {
+        refusedSince ??= Date.now();
+        if (Date.now() - refusedSince >= STALE_LOCK_MS) throw error;
+      } else {
+        throw error;
+      }
       try {
         if (Date.now() - fs.statSync(lock).mtimeMs > STALE_LOCK_MS) fs.rmdirSync(lock);
       } catch { /* Another waiter already cleared or replaced it. */ }
