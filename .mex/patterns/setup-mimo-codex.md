@@ -18,7 +18,7 @@ last_updated: 2026-11-10
 1. Read the current vendor Codex integration guide and check the installed Codex version. Confirm pay-as-you-go versus Token Plan; keys and endpoints differ.
 2. Run the helper. Supply credentials through the hidden prompt, environment, or stdin, never command arguments. Existing homes are refused.
    - macOS: `python3 scripts/setup-codex-mimo.py --home <external-home> --billing payg|token-plan`.
-   - Windows: pending (#246). The helper does not yet write an auth command or a private home that work on Windows.
+   - Windows: `python scripts/setup-codex-mimo.py --home <external-home> --billing payg|token-plan`. Windows has no `/bin/cat`, so the helper writes `node` as the auth command, with the `api-key` path as its last argument. Node must be on `PATH` for a session that uses the home.
 3. Test `codex exec --strict-config` with that `CODEX_HOME`, first for a short answer, then a disposable file edit. Explicitly tell the test agent not to use Discord and to return only to the parent.
 4. Verify app-server/tool compatibility with a local test tool before claiming bridge compatibility. Default E2E tests must use local fixtures and no live provider or Discord credentials.
 5. Add an alias to ignored `registry.json` using structured JSON, preserving all defaults and unrelated project selectors. Assign/restart only explicitly requested projects, with `scripts/ccdm stop-session <project>` and `scripts/ccdm start-codex-session <project>`.
@@ -27,12 +27,14 @@ last_updated: 2026-11-10
 ## Gotchas
 - The vendor catalog's `use_responses_lite` is necessary for custom tools. Do not replace the catalog with only a model name.
 - Codex 0.153.4 rejects the guide's top-level `model_supports_reasoning_summaries`; the catalog supplies `supports_reasoning_summaries` instead.
-- Provider auth commands allow `/bin/cat` to read the private credential without exporting keys in shell startup files or command arguments. Do not copy OpenAI credentials or unrelated MCP configuration into the new home.
+- Provider auth commands allow `/bin/cat` (macOS) or `node` (Windows) to read the private credential without exporting keys in shell startup files or command arguments. Codex starts the command without a shell. Do not copy OpenAI credentials or unrelated MCP configuration into the new home.
 - Keep `api-key`, `ccdm-mimo.json`, catalog, sessions, and configuration outside the checkout. Rotation preserves MCP edits and does not depend on shell-exported credentials.
 - A successful inference does not establish remaining balance, and ChatGPT usage dashboards do not report MiMo quota.
 
 ## Verify
-- [ ] Home is private (`0700`) and generated files use `0600`.
+- [ ] The home and its generated files are private.
+  - macOS: the home is `0700` and the files are `0600`.
+  - Windows: the home's access list names only the current user (and SYSTEM) and inherits nothing. The helper sets this and stops if it cannot; `--rotate-key` sets it again before it writes the key.
 - [ ] Setup and rotation tests pass; existing homes and billing mismatches fail without overwrites.
 - [ ] Strict Codex configuration, inference, file tools, and local app-server tool tests pass for the selected provider.
 - [ ] Default account, unrelated projects, and Discord listeners are unchanged.

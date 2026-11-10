@@ -6,9 +6,11 @@ import test from "node:test";
 import { injectDiscordMessage } from "./support/bridge.js";
 import { OWNER_ID, createRouterWorkspace, routerRegistry, routerWithWebhooks, runRouterCli, seedThreads,
   startRouter, waitFor } from "./support/router.js";
+import { PYTHON } from "./support/platform.js";
+import { callSeam } from "./support/session-fixture.js";
 import { readState, updateState } from "./support/state.js";
-import { cleanup } from "./support/teardown.js";
-import { startThreadSupervisor, supervisorStatus } from "./support/thread-supervisor.js";
+import { cleanup, workspaceOwnsPid } from "./support/teardown.js";
+import { startThreadSupervisor, supervisorEnv, supervisorStatus } from "./support/thread-supervisor.js";
 
 test.afterEach(cleanup);
 
@@ -115,6 +117,24 @@ async function liveThread(workspace, raw) {
   await waitFor(() => threadPosts(workspace, raw.id).length === 1, () => "the bootstrap reply", 15000);
 }
 
+// Ends every process of a thread's session at once, as a crash does. POSIX signals
+// the session's process group. Windows has none, so each process in the session's
+// Job is ended, and only one this workspace started.
+function killSession(workspace, threadId) {
+  const session = readState(workspace.stateDir).fixtures.tmux.sessions[tmuxName(threadId)];
+  if (process.platform !== "win32") return process.kill(-session.pid, "SIGKILL");
+  for (const pid of session.job ?? [session.pid]) {
+    if (workspaceOwnsPid(pid, workspace.tmpRoot)) process.kill(pid, "SIGKILL");
+  }
+}
+
+// The live sessions the session host lists: tmux, or ccdm-host on Windows.
+async function hostSessions(workspace) {
+  const listed = await callSeam(workspace, "python", "list", { env: supervisorEnv(workspace), python: PYTHON });
+  assert.equal(listed.ok, true, listed.message);
+  return listed.value.map(session => session.name);
+}
+
 async function disconnected(workspace, threadId) {
   const deadline = Date.now() + 15000;
   while (await threadConnected(workspace, threadId)) {
@@ -189,8 +209,7 @@ test("on restart, a killed session's row becomes stopped/crashed and is not rest
   await liveThread(workspace, raw);
   assert.equal((await supervisor.stop()).exitCode, 0);
 
-  const { pid } = readState(workspace.stateDir).fixtures.tmux.sessions[tmuxName(raw.id)];
-  process.kill(-pid, "SIGKILL");
+  killSession(workspace, raw.id);
   await disconnected(workspace, raw.id);
   threadMessage(workspace, raw.id, "after-crash", "are you still there?");
   await waitFor(() => reactions(workspace, raw.id).some(reaction => reaction.emoji === SLEEPING), () => "the 💤 mark");
@@ -205,6 +224,32 @@ test("on restart, a killed session's row becomes stopped/crashed and is not rest
   assert.equal(claude(workspace).invocations.length, 1);
   assert.deepEqual([(await threadRows(workspace))[raw.id].state, (await threadRows(workspace))[raw.id].stop_reason],
     ["stopped", "crashed"]);
+});
+
+test("stopping the supervisor leaves a live thread session running, and a restarted supervisor keeps its row bound and starts nothing", async () => {
+  const workspace = reconcileWorkspace();
+  const { supervisor } = await supervised(workspace);
+  const raw = thread("1700000000000390001");
+  await liveThread(workspace, raw);
+  const conversationId = (await threadRows(workspace))[raw.id].provider_conversation_id;
+
+  assert.equal((await supervisor.stop()).exitCode, 0);
+
+  assert.ok((await hostSessions(workspace)).includes(tmuxName(raw.id)), "the session host still lists the session");
+  assert.equal(await threadConnected(workspace, raw.id), true);
+
+  await startThreadSupervisor(workspace, { env: ENV });
+  // The session the row is bound to hears the next message; no new one is launched for it.
+  threadMessage(workspace, raw.id, "after-restart", "still with me?");
+  await waitFor(() => notifications(workspace, raw.id).some(notification =>
+    String(notification.content).includes("still with me?")), () => "the message in the running session", 15000);
+  await settle(1500);
+
+  const row = (await threadRows(workspace))[raw.id];
+  assert.deepEqual([row.state, row.stop_reason, row.provider_conversation_id], ["live", null, conversationId]);
+  assert.equal(claude(workspace).invocations.length, 1);
+  assert.ok((await hostSessions(workspace)).includes(tmuxName(raw.id)), "the session host still lists the session");
+  assert.equal(await threadConnected(workspace, raw.id), true);
 });
 
 test("on restart, only a thread whose newest owner message is newer than the last agent reply starts, with the messages after that reply in its bootstrap exactly once", async () => {
@@ -275,7 +320,8 @@ test("an injected shardResume (gateway_resumed) runs the same reconcile", async 
 test("a Router restart (link reconnect) runs the same reconcile", async () => {
   const workspace = reconcileWorkspace();
   const { router } = await supervised(workspace);
-  process.kill(-router.child.pid, "SIGKILL");
+  if (process.platform === "win32") router.child.kill("SIGKILL");
+  else process.kill(-router.child.pid, "SIGKILL");
   await router.closed;
   const missed = thread("1700000000000370001");
   seedThreads(workspace, { [missed.id]: missed });
@@ -295,8 +341,7 @@ test("a session that crashes while the supervisor runs is stopped/crashed, and t
   await liveThread(workspace, raw);
   const conversationId = (await threadRows(workspace))[raw.id].provider_conversation_id;
 
-  const { pid } = readState(workspace.stateDir).fixtures.tmux.sessions[tmuxName(raw.id)];
-  process.kill(-pid, "SIGKILL");
+  killSession(workspace, raw.id);
   await disconnected(workspace, raw.id);
   const crashed = await threadRow(workspace, raw.id, current => current.state === "stopped");
   assert.deepEqual([crashed.state, crashed.stop_reason], ["stopped", "crashed"]);

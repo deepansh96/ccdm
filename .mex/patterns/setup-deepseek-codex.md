@@ -18,7 +18,7 @@ last_updated: 2026-11-10
 1. Verify the requested model's API name against DeepSeek's current model reference. V4.1 Flash uses `deepseek-flash` as of 2026-09-22.
 2. Run the helper. Supply the key through the hidden prompt, environment, or stdin. Existing homes and checkout paths are refused.
    - macOS: `python3 scripts/setup-codex-deepseek.py --home <external-home>`.
-   - Windows: pending (#246). The helper does not yet write an auth command or a private home that work on Windows.
+   - Windows: `python scripts/setup-codex-deepseek.py --home <external-home>`. Windows has no `/bin/cat`, so the helper writes `node` as the auth command, with the `api-key` path as its last argument. Node must be on `PATH` for a session that uses the home.
 3. Optionally add `--with-exa` for hosted keyless search/page reading. For existing homes add `[mcp_servers.exa]` with `url = "https://mcp.exa.ai/mcp"` to the home configuration, then start a new session. Exa has free rate limits and receives search queries/page URLs; provider-native `web_search` remains disabled.
 4. Test strict Codex configuration, a short answer, file editing/shell execution, image input, and app-server MCP tools in a disposable directory. Test agents must not use Discord tools and must return only to their parent.
 5. For computer-use testing, read the installed skill and use a public page or local fixture. Image support alone does not configure GUI tools. Stop at permission or website barriers; do not claim success for a blocked page.
@@ -36,7 +36,9 @@ last_updated: 2026-11-10
 - The helper is scoped to Flash. Other DeepSeek models and provider quota reporting require separate work and validation.
 
 ## Verify
-- [ ] Generated home/files use `0700`/`0600`; no credentials reach source, logs, or command arguments.
+- [ ] No credentials reach source, logs, or command arguments.
+  - macOS: the generated home and files use `0700`/`0600`.
+  - Windows: the home's access list names only the current user (and SYSTEM) and inherits nothing. The helper sets this and stops if it cannot; `--rotate-key` sets it again before it writes the key.
 - [ ] Local-fake setup, catalog rejection, rotation, and named-account launch tests pass.
 - [ ] Live model, file, vision, and tool checks match the capabilities being reported.
 - [ ] Existing defaults, unrelated projects, and Discord listeners are unchanged.

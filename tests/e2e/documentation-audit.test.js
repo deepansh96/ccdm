@@ -304,10 +304,10 @@ const descriptiveHistory = [
   { file: ".mex/ROUTER.md", section: "## Current Project State" },
 ];
 
-// Root's command entries in CLAUDE.md.example: "Commands" up to "Voice Messages",
-// which takes in "Discord Polls". The rest of the file is P5.7b's, so it carries
-// a pending marker or is left alone.
-const ROOT_ENTRIES = { file: "CLAUDE.md.example", from: "### Commands", to: "### Voice Messages" };
+// Root's command entries in CLAUDE.md.example: "Commands" up to "Channel Routing
+// Rules", which takes in "Discord Polls" and "Voice Messages". The rest of the
+// file is P5.7b's, so it carries a pending marker or is left alone.
+const ROOT_ENTRIES = { file: "CLAUDE.md.example", from: "### Commands", to: "### Channel Routing Rules" };
 
 const headingLevel = line => /^#{1,6} /.test(line) ? line.indexOf(" ") : 0;
 
@@ -493,6 +493,7 @@ test("root-commands.md covers root's commands and restarts root without nohup", 
     "scripts/ccdm restart-session <project>",
     "scripts/ccdm context report",
     "scripts/ccdm restart-root",
+    "scripts/ccdm transcribe \"<path>\"",
     "poll",
     "macOS:",
     "Windows:",
@@ -522,19 +523,39 @@ test("the runbook carries the launch, restart, capture and trust rules and marks
   for (const [file, issues] of Object.entries({
     ".mex/patterns/operate-thread-supervisor.md": ["#241", "#249"],
     ".mex/patterns/operate-conversation-reminders.md": ["#242", "#249"],
-    ".mex/patterns/setup-deepseek-codex.md": ["#246"],
-    ".mex/patterns/setup-mimo-codex.md": ["#246"],
   })) {
     for (const issue of issues) {
       assert.match(read(file), new RegExp(`Windows: pending[^\\n]*${issue}\\b`), `${file} has no "Windows: pending" line for ${issue}`);
     }
   }
-  const example = read(ROOT_ENTRIES.file).split(/\r?\n/);
-  for (const [heading, issue] of [["### Voice Messages", "#246"]]) {
-    const [start, end] = sectionRange(example, heading);
-    assert.match(example.slice(start, end).join("\n"), new RegExp(`Windows: pending[^\\n]*${issue}\\b`),
-      `${ROOT_ENTRIES.file} "${heading.trim()}" has no "Windows: pending" marker for ${issue}`);
+});
+
+test("root's voice entry runs scripts/ccdm transcribe on both OSes and names no temp path", () => {
+  const example = fs.readFileSync(ROOT_ENTRIES.file, "utf8").split(/\r?\n/);
+  const [start, end] = sectionRange(example, "### Voice Messages");
+  const entry = example.slice(start, end).join("\n");
+  assert.match(entry, /Run: `scripts\/ccdm transcribe "<path>"`/);
+  assert.match(entry, /same on macOS and Windows/);
+  assert.match(entry, /exits 3/);
+  // No whisper command line of its own, no shared temp directory, nothing pending.
+  assert.doesNotMatch(entry, /\/tmp|--output_dir|`whisper |Windows: pending/);
+});
+
+test("the Codex home helpers' runbook gives Windows a command and no pending marker", () => {
+  for (const [file, helper] of [
+    [".mex/patterns/setup-deepseek-codex.md", "setup-codex-deepseek.py"],
+    [".mex/patterns/setup-mimo-codex.md", "setup-codex-mimo.py"],
+  ]) {
+    const source = fs.readFileSync(file, "utf8");
+    assert.match(source, new RegExp(`macOS: \`python3 scripts/${escape(helper)} `), `${file} lost its macOS command`);
+    assert.match(source, new RegExp(`Windows: \`python scripts/${escape(helper)} [^\\n]*\`node\`[^\\n]*\`PATH\``),
+      `${file} has no Windows command that names the node auth command`);
+    assert.doesNotMatch(source, /Windows: pending/);
   }
+  const setup = fs.readFileSync(".mex/context/setup.md", "utf8");
+  assert.match(setup, /Windows: `python scripts\/setup-codex-mimo\.py [^\n]*`python scripts\/setup-codex-deepseek\.py /);
+  assert.match(setup, /`scripts\/ccdm transcribe "<audio path>"`/);
+  assert.doesNotMatch(setup, /#246/);
 });
 
 test("root's usage entry names the script on macOS and scripts/ccdm usage on Windows", () => {

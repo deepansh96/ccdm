@@ -3,14 +3,14 @@
 A running supervisor does it through its control socket. When none answers,
 each of the project's threads (its rows in the store, and its launch dirs
 under `launches/<project>/threads/`) has the listeners carrying its
-`.thread-<id>.key` path stopped, its tmux session and key removed, and, when
-no worker holds the store, its row set `stopped/operator`.
+`.thread-<id>.key` path stopped, its session (tmux, or the session host on
+Windows) and key removed, and, when no worker holds the store, its row set
+`stopped/operator`.
 """
 
 from __future__ import annotations
 
 import sqlite3
-import subprocess
 import sys
 
 from ccdmlib.platform import filelock
@@ -71,18 +71,15 @@ def _mark_stopped(state_dir, project: str) -> None:
 
 
 def sweep(project_root, state_dir, project: str) -> list[str]:
-    rows = _rows(state_dir, project)
+    rows = {row["thread_id"]: row for row in _rows(state_dir, project)}
     screen = _screen_name(project_root, project)
-    tmux = {row["thread_id"]: row["runtime_tmux"] for row in rows}
     stopped = []
-    for thread_id in dict.fromkeys([*(row["thread_id"] for row in rows), *_launched(project)]):
-        key_file = lifecycle.key_path(thread_id)
+    for thread_id in dict.fromkeys([*rows, *_launched(project)]):
+        row = rows.get(thread_id) or {}
         running = lifecycle.session_running(thread_id)
-        lifecycle.kill_listeners(key_file)
-        names = {tmux.get(thread_id), f"{screen}-t-{thread_id}" if screen else None} - {None}
-        for name in names:
-            subprocess.run(["tmux", "kill-session", "-t", f"={name}"], capture_output=True)
-        key_file.unlink(missing_ok=True)
+        # The stored session name, and the one every launch gives the thread's session.
+        names = [row.get("runtime_tmux"), f"{screen}-t-{thread_id}" if screen else None]
+        lifecycle.end_session(thread_id, names, row.get("resolved_provider") or row.get("provider"))
         if running:
             stopped.append(thread_id)
     try:
