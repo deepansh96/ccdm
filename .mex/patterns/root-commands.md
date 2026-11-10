@@ -1,6 +1,6 @@
 ---
 name: root-commands
-description: Root's everyday commands on macOS and Windows (list, status, start, stop, restart, context report, restart yourself, create a poll), each with its triggers and its `scripts/ccdm` command.
+description: Root's everyday commands on macOS and Windows (list, status, start, stop, restart, context report, usage report, restart yourself, create a poll), each with its triggers and its `scripts/ccdm` command.
 triggers:
   - "list"
   - "status"
@@ -9,6 +9,8 @@ triggers:
   - "stop project"
   - "restart project"
   - "context report"
+  - "usage"
+  - "limits"
   - "restart yourself"
   - "poll"
   - "voice message"
@@ -89,6 +91,18 @@ Triggers: `context report`, `context for all`.
 The report covers registered Claude projects only. It skips Codex projects, Thread Conversations, `remote:` projects and root.
 
 For one session, run `scripts/ccdm session context <screen_name>`. Never run it on your own session: you are busy running the command, so it times out.
+
+### Usage report
+Triggers: `usage`, `limits`, `how much usage is left`, `check usage`.
+
+1. Run the report. Both commands print the same sections in the same order:
+   - macOS: `scripts/claude-usage.sh`
+   - Windows: `scripts/ccdm usage`
+2. Reply with the account, each live limit with its percentage and reset time, the lifetime stats, the top projects and the streaks, in the layout root's `CLAUDE.md` gives.
+
+The report only reads Claude's OAuth login: the Keychain on macOS, `~/.claude/.credentials.json` on Windows. It never refreshes or writes it, and it never passes the token as a command argument.
+
+When the login is missing or stale, the two live sections print "Could not fetch profile" and "Could not fetch live usage", the local sections still print, and the command exits 0. Report the local part and say the live limits are unavailable. Never refresh or edit the login yourself; Claude Code refreshes its own login while it runs.
 
 ### Restart yourself
 Triggers: `restart yourself`, `restart root`, `restart self`. Do this only when the user explicitly asks to restart root.

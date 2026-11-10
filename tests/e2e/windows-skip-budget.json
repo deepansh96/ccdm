@@ -1,5 +1,5 @@
 {
-  "budget": 136,
+  "budget": 137,
   "skips": [
     {
       "file": "codex-start.test.js",
@@ -343,6 +343,12 @@
       "test": "a resumed Claude session whose session id cannot be read keeps the known conversation id",
       "tag": "posix",
       "reason": "on ccdm-host the launcher finds Claude by its session file, so a launch without one fails"
+    },
+    {
+      "file": "ccdm-usage.test.js",
+      "test": "ccdm usage matches claude-usage.sh line for line on the same fixture home",
+      "tag": "posix",
+      "reason": "runs claude-usage.sh, a bash script that needs python3 and curl; the same expected text is checked on Windows"
     }
   ]
 }
