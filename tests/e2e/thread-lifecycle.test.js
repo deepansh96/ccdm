@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -7,10 +7,11 @@ import test from "node:test";
 import { injectDiscordMessage, startFakeCodexServer } from "./support/bridge.js";
 import { OWNER_ID, createRouterWorkspace, routerRegistry, routerWithWebhooks, runRouterCli,
   waitFor } from "./support/router.js";
-import { PYTHON } from "./support/platform.js";
+import { PYTHON, platformGate } from "./support/platform.js";
+import { callSeam, hostOps, tmuxCalls } from "./support/session-fixture.js";
 import { readState, updateState } from "./support/state.js";
-import { cleanup } from "./support/teardown.js";
-import { startThreadSupervisor, supervisorStateDir, supervisorStatus } from "./support/thread-supervisor.js";
+import { cleanup, registerTeardownCallback } from "./support/teardown.js";
+import { startThreadSupervisor, supervisorEnv, supervisorStateDir, supervisorStatus } from "./support/thread-supervisor.js";
 
 test.afterEach(cleanup);
 
@@ -336,7 +337,7 @@ db = sqlite3.connect(sys.argv[1], timeout=5)
 print(json.dumps(db.execute("SELECT runtime_pid FROM threads WHERE thread_id = ?", (sys.argv[2],)).fetchone()[0]))`,
 path.join(supervisorStateDir(workspace), "threads.sqlite3"), THREAD_ID], { encoding: "utf8" }));
 
-test("a resumed Claude session whose session id cannot be read keeps the known conversation id", async () => {
+test("a resumed Claude session whose session id cannot be read keeps the known conversation id", platformGate("posix", "on ccdm-host the launcher finds Claude by its session file, so a launch without one fails"), async () => {
   const workspace = threadWorkspace();
   await supervised(workspace);
   const conversationId = await stoppedThread(workspace);
@@ -418,6 +419,95 @@ test("a guest message cannot reopen a closed thread, and an owner message reopen
   // The guest's ignored message is not replayed into the reopened conversation.
   assert.doesNotMatch(claude(workspace).channelNotifications.at(-1).content, /any news\?/);
   assert.match(claude(workspace).channelNotifications.at(-1).content, /reopening this/);
+});
+
+// ---- what a stop leaves behind on Windows, where a session's processes are found by their arguments ----
+
+const WIN_ONLY = "POSIX finds a thread's listeners by their environment";
+const keyFile = workspace => path.join(workspace.routerStateDir, "keys", `.thread-${THREAD_ID}.key`);
+const launchDir = (workspace, threadId = THREAD_ID) =>
+  path.join(workspace.routerStateDir, "launches", "demo", "threads", threadId);
+
+// A process this test starts and holds, so a stop that ends it can have hit nothing
+// else. It idles with `args` as its last arguments.
+function spawnWithArgs(args) {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", ...args],
+    { stdio: "ignore", windowsHide: true });
+  const exited = new Promise(resolve => child.once("exit", resolve));
+  registerTeardownCallback(async () => {
+    child.kill("SIGKILL");
+    await exited;
+  });
+  return { child, exited, running: () => child.exitCode === null && child.signalCode === null };
+}
+
+// [runtime_pid, runtime_tmux] as the store has them.
+const storedRuntime = workspace => JSON.parse(execFileSync(PYTHON, ["-c", `import json, sqlite3, sys
+db = sqlite3.connect(sys.argv[1], timeout=5)
+print(json.dumps(list(db.execute("SELECT runtime_pid, runtime_tmux FROM threads WHERE thread_id = ?", (sys.argv[2],)).fetchone())))`,
+path.join(supervisorStateDir(workspace), "threads.sqlite3"), THREAD_ID], { encoding: "utf8" }));
+
+// Every process whose arguments hold the pair `--ccdm-key-file <the thread's key>`, read as the supervisor reads them.
+const keyFileCarriers = workspace => JSON.parse(execFileSync(PYTHON, ["-c", `import json, os, sys
+sys.path.insert(0, sys.argv[1])
+from ccdmlib.platform import proc
+same = lambda value: os.path.normcase(os.path.normpath(value))
+found = []
+for process in proc.find(lambda candidate: candidate.pid != os.getpid()):
+    argv = proc.command_line(process.pid) or []
+    if any(flag == "--ccdm-key-file" and same(value) == same(sys.argv[2]) for flag, value in zip(argv, argv[1:])):
+        found.append(process.pid)
+print(json.dumps(found))`, path.join(workspace.repoDir, "scripts"), keyFile(workspace)], { encoding: "utf8" }));
+
+test("on Windows, an archive leaves no process carrying the thread's key file, no host session, and no runtime in the store", platformGate("win32", WIN_ONLY), async () => {
+  const workspace = threadWorkspace();
+  await supervised(workspace);
+  await liveThread(workspace);
+  await waitFor(() => storedRuntime(workspace)[0] != null, () => "the launcher's result on the row");
+  assert.equal(storedRuntime(workspace)[1], THREAD_TMUX);
+  await waitFor(() => keyFileCarriers(workspace).length > 0, () => "the thread's channel server");
+
+  archive(workspace);
+
+  await threadRow(workspace, row => row.state === "stopped");
+  await assertStopped(workspace);
+  assert.deepEqual(storedRuntime(workspace), [null, null]);
+  assert.deepEqual(keyFileCarriers(workspace), []);
+  assert.equal(fs.existsSync(keyFile(workspace)), false);
+  const kill = hostOps(workspace).find(call => call.op === "kill" && call.name === THREAD_TMUX);
+  assert.ok(kill, "the session host was asked to end the session");
+  assert.equal(kill.graceMs, 0);
+  assert.deepEqual(tmuxCalls(workspace), []);
+});
+
+test("on Windows, a stop ends a listener that outlived the thread's host session, found by its key file or launch files, and spares near matches", platformGate("win32", WIN_ONLY), async () => {
+  const workspace = threadWorkspace();
+  await supervised(workspace);
+  await liveThread(workspace);
+  // The launcher's form of the key path, and the same path with forward slashes, are one path.
+  const byKey = spawnWithArgs(["--ccdm-key-file", keyFile(workspace).replaceAll("\\", "/")]);
+  const byLaunchFile = spawnWithArgs(["--settings", path.join(launchDir(workspace), "settings.json")]);
+  const nearMisses = [
+    spawnWithArgs(["--ccdm-key-file", `${keyFile(workspace)}.bak`]),
+    spawnWithArgs([keyFile(workspace), "--ccdm-key-file"]),
+    spawnWithArgs(["--ccdm-key-file", path.join(workspace.routerStateDir, "keys", "demo.key")]),
+    spawnWithArgs(["--settings", path.join(launchDir(workspace, `${THREAD_ID}9`), "settings.json")]),
+    spawnWithArgs(["--settings", path.join(workspace.routerStateDir, "launches", "demo", "settings.json")]),
+  ];
+  // The host session goes first, as when the host restarted: only the listeners outside it are left.
+  const ended = await callSeam(workspace, "python", "stop", { positional: [THREAD_TMUX], env: supervisorEnv(workspace), python: PYTHON });
+  assert.deepEqual([ended.ok, ended.value], [true, { stopped: true }], ended.message);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions[THREAD_TMUX], undefined);
+
+  // Whichever stop comes first ends them: this archive, or the crash stop once the Router loses the session.
+  archive(workspace);
+
+  await threadRow(workspace, row => row.state === "stopped");
+  await Promise.all([byKey.exited, byLaunchFile.exited]);
+  assert.deepEqual(keyFileCarriers(workspace), []);
+  assert.deepEqual(nearMisses.map(process => process.running()), nearMisses.map(() => true));
+  assert.equal(fs.existsSync(keyFile(workspace)), false);
+  assert.deepEqual(storedRuntime(workspace), [null, null]);
 });
 
 const CODEX_THREAD_UUID = "0199a5c4-7e1b-7c3d-9f2a-4b8e6d1c3a58";
