@@ -1184,6 +1184,25 @@ test("a state lock whose holder has ended is taken over at once, and a live hold
   }
 });
 
+// A holder stalled past the stale limit loses its lock to a waiter. When it
+// finishes it must not remove the lock that waiter now holds.
+test("a holder whose state lock was cleared as stale leaves the next holder's lock alone", () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-state-lock-"));
+  try {
+    const lock = path.join(stateDir, "state.lock");
+    const next = path.join(lock, String(process.ppid));
+    withStateLock(stateDir, () => {
+      // What a waiter does to a stale lock, and then its own claim.
+      fs.rmSync(lock, { force: true, recursive: true });
+      fs.mkdirSync(lock);
+      fs.mkdirSync(next);
+    });
+    assert.deepEqual(fs.readdirSync(lock), [String(process.ppid)]);
+  } finally {
+    fs.rmSync(stateDir, { force: true, recursive: true });
+  }
+});
+
 test("failure diagnostics include command details and redact secrets", async () => {
   const workspace = createWorkspace({ excludeFixtures: ["claude"] });
 

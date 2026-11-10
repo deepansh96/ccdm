@@ -58,12 +58,20 @@ function takeOverFromDeadHolder(lock) {
   }
 }
 
+// A holder that ran past the stale limit finds its claim gone: a waiter cleared
+// the lock, and whatever is at this path now belongs to someone else.
 function release(lock) {
   try {
     fs.rmdirSync(path.join(lock, String(process.pid)));
-    fs.rmdirSync(lock);
-  } catch {
+  } catch (error) {
+    if (error.code === "ENOENT") return;
     fs.rmSync(lock, CLEAR);
+    return;
+  }
+  try {
+    fs.rmdirSync(lock);
+  } catch (error) {
+    if (error.code !== "ENOENT") fs.rmSync(lock, CLEAR);
   }
 }
 
