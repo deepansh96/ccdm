@@ -78,7 +78,8 @@ Each service is opt-in. Install one only when the operator asks.
 - `npx mex-agent check` - checks memory scaffold drift.
 - macOS: `python3 scripts/setup-codex-mimo.py --home ~/.codex-mimo --billing payg` - prepares an isolated MiMo Codex home (Python 3.10+, recent Codex supporting provider auth commands); use `--billing token-plan` for subscription keys or `--rotate-key` to replace an existing key.
 - macOS: `python3 scripts/setup-codex-deepseek.py --home ~/.codex-deepseek` - prepares an isolated DeepSeek Flash home using the same private credential pattern; `--catalog-file` accepts catalog JSON or a vendor script parsed as data, and `--rotate-key` preserves other home state.
-- Windows: pending (#246) for both Codex home helpers.
+- Windows: `python scripts/setup-codex-mimo.py --home ~/.codex-mimo --billing payg` and `python scripts/setup-codex-deepseek.py --home ~/.codex-deepseek` - the same two helpers with the same options. Windows has no `/bin/cat`, so the home's auth command is `node`, which reads the private `api-key` file; Node must be on `PATH` for a session that uses the home. The helper protects the home's access list and stops if it cannot.
+- `scripts/ccdm transcribe "<audio path>"` - prints the transcript of a voice message with local `whisper`, on macOS and Windows; exits 3 when `whisper` is not installed.
 
 ## Common Issues
 **No reply, or 💤 on messages:** Run `node scripts/router.js status`; start the Router or the project's session.
@@ -90,7 +91,7 @@ Each service is opt-in. Install one only when the operator asks.
 
 **Claude account expired:** Start or log into Claude using the same `CLAUDE_CONFIG_DIR` to refresh OAuth.
 
-**Voice messages are not transcribed:** Install `openai-whisper` or ask the user to type the message.
+**Voice messages are not transcribed:** Install `openai-whisper` or ask the user to type the message. On Windows `whisper.exe` must be on `PATH`, or `CODEX_BRIDGE_AUDIO_TRANSCRIPTION_COMMAND` must name it.
 
 **Tools missing inside a session:** Launch only through `scripts/ccdm`.
 

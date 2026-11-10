@@ -11,6 +11,7 @@ triggers:
   - "context report"
   - "restart yourself"
   - "poll"
+  - "voice message"
 edges:
   - target: context/session-management.md
     condition: before changing session state, for the lifecycle rules behind these commands
@@ -133,6 +134,17 @@ Triggers: `poll`, `create a poll`.
 - `duration` is in hours, from 1 to 168.
 - `answers` holds up to 10 options. Each may add an emoji: `"emoji": {"id": null, "name": "🎉"}` inside `poll_media`.
 - `allow_multiselect` lets users vote for more than one option.
+
+### Transcribe a voice message
+Triggers: a voice message, or any audio attachment (`.ogg`), sent to root.
+
+1. Download the attachment with `download_attachment`. It returns the path of the saved file.
+2. Run `scripts/ccdm transcribe "<path>"`, with the quotes around the path. It runs local `whisper` and prints the transcript. The command is the same on macOS and Windows.
+3. Answer what the transcript says, and quote the transcript in your reply so the user can confirm it.
+
+- Exit 3 means `whisper` is not installed. Say so and ask the user to type the message.
+- The command gives `whisper` its own private temp directory and removes it afterwards. Never run `whisper` yourself with an output directory.
+- A voice message in a Codex project channel needs none of this: the Codex bridge transcribes it before the turn starts.
 
 ## Gotchas
 - `scripts/ccdm` must run in the Bash tool. In PowerShell or cmd the entry is `scripts\ccdm.cmd`, where `&` and `|` inside an argument can run as commands. That is why free text goes through `--stdin` or `--file`.
