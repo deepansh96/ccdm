@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/sh
 # Usage: ./scripts/threads.sh create <project> <name> [--provider claude|codex]
 #          [--account <alias>] [--model <model>] [--effort <effort>] [message…]
 # Creates a Thread Conversation through the running Thread Supervisor's
@@ -14,14 +14,7 @@
 # owner would in the thread.
 # Exits 2 when nothing was done for bad usage, a bad flag or setting, or a
 # thread the resolver cannot name, and 1 when no supervisor answers.
-
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-exec python3 - "$SCRIPT_DIR" "$@" <<'PY'
-import sys
-sys.dont_write_bytecode = True
-sys.path.insert(0, sys.argv[1])
-from thread_supervisor.threads_cli import main
-raise SystemExit(main(sys.argv[2:]))
-PY
+# `create` also reads its message from stdin (--message-stdin) or from a
+# UTF-8 file (--message-file <path>), given among the flags.
+# The commands themselves are scripts/thread_supervisor/threads_cli.py.
+exec "$(cd "$(dirname "$0")" && pwd)/ccdm" threads "$@"
