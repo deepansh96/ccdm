@@ -55,6 +55,11 @@ function protectDir(dir) {
   else fs.chmodSync(dir, 0o700);
 }
 
+// The fake Codex finds its response by CODEX_HOME, which the poster sets to the
+// resolved Codex Home. On Windows that resolve also spells out an 8.3 short name
+// (a CI runner's temp folder is one), and only the native realpath does the same.
+const codexHomeKey = (home) => (WIN ? fs.realpathSync.native(home) : fs.realpathSync(home));
+
 function serviceFor(configDir) {
   return `Claude Code-credentials-${crypto.createHash("sha256").update(configDir).digest("hex").slice(0, 8)}`;
 }
@@ -1037,7 +1042,7 @@ test("poster falls back when Codex JSON-RPC returns a non-object response", asyn
   );
   const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
   fs.writeFileSync(responsesPath, `${JSON.stringify({
-    [fs.realpathSync(codexHome)]: { mode: "non-object" },
+    [codexHomeKey(codexHome)]: { mode: "non-object" },
   }, null, 2)}\n`);
 
   const result = await runPoster(workspace, {
@@ -1068,7 +1073,7 @@ test("poster reads Codex JSON-RPC lines already buffered above the descriptor", 
   );
   const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
   fs.writeFileSync(responsesPath, `${JSON.stringify({
-    [fs.realpathSync(codexHome)]: {
+    [codexHomeKey(codexHome)]: {
       mode: "buffered",
       result: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 27 } } },
     },
@@ -1111,7 +1116,7 @@ test("poster reports named Codex Accounts in default-first alphabetical order", 
   const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
   const nowSeconds = Math.floor(Date.now() / 1000);
   fs.writeFileSync(responsesPath, `${JSON.stringify({
-    [fs.realpathSync(defaultHome)]: {
+    [codexHomeKey(defaultHome)]: {
       rateLimits: { planType: "chatgpt", primary: { usedPercent: 12 }, secondary: { usedPercent: 34 } },
       rateLimitResetCredits: {
         availableCount: 2,
@@ -1123,8 +1128,8 @@ test("poster reports named Codex Accounts in default-first alphabetical order", 
         ],
       },
     },
-    [fs.realpathSync(alphaHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 56 }, secondary: { usedPercent: 78 } } },
-    [fs.realpathSync(premiumHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 21 }, secondary: { usedPercent: 43 } } },
+    [codexHomeKey(alphaHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 56 }, secondary: { usedPercent: 78 } } },
+    [codexHomeKey(premiumHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 21 }, secondary: { usedPercent: 43 } } },
   }, null, 2)}\n`);
 
   const result = await runPoster(workspace, {
@@ -1233,8 +1238,8 @@ test("poster deduplicates named aliases that share a Codex Home", async () => {
   );
   const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
   fs.writeFileSync(responsesPath, `${JSON.stringify({
-    [fs.realpathSync(sharedHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 11 } } },
-    [fs.realpathSync(otherHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 22 } } },
+    [codexHomeKey(sharedHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 11 } } },
+    [codexHomeKey(otherHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 22 } } },
   }, null, 2)}\n`);
 
   const result = await runPoster(workspace, {
@@ -1272,8 +1277,8 @@ test("poster falls back to raw Codex Homes in a legacy registry", async () => {
   );
   const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
   fs.writeFileSync(responsesPath, `${JSON.stringify({
-    [fs.realpathSync(sharedHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 31 } } },
-    [fs.realpathSync(projectHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 42 } } },
+    [codexHomeKey(sharedHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 31 } } },
+    [codexHomeKey(projectHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 42 } } },
   }, null, 2)}\n`);
 
   const result = await runPoster(workspace, {
@@ -1309,7 +1314,7 @@ test("poster reports a missing configured Codex Home as unavailable", async () =
   );
   const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
   fs.writeFileSync(responsesPath, `${JSON.stringify({
-    [fs.realpathSync(availableHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 19 } } },
+    [codexHomeKey(availableHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 19 } } },
   }, null, 2)}\n`);
 
   const result = await runPoster(workspace, {
@@ -1360,7 +1365,7 @@ test("poster falls back to recent Codex session tokens after a live rate-limit f
   );
   const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
   fs.writeFileSync(responsesPath, `${JSON.stringify({
-    [fs.realpathSync(codexHome)]: { mode: "error" },
+    [codexHomeKey(codexHome)]: { mode: "error" },
   }, null, 2)}\n`);
 
   const result = await runPoster(workspace, {
@@ -1415,7 +1420,7 @@ test("poster preserves stale rate-limit fallback age and ignores a newer malform
   );
   const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
   fs.writeFileSync(responsesPath, `${JSON.stringify({
-    [fs.realpathSync(codexHome)]: { mode: "error" },
+    [codexHomeKey(codexHome)]: { mode: "error" },
   }, null, 2)}\n`);
 
   const result = await runPoster(workspace, {
@@ -1461,7 +1466,7 @@ test("poster preserves stale token-count fallback age markers", async () => {
   );
   const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
   fs.writeFileSync(responsesPath, `${JSON.stringify({
-    [fs.realpathSync(codexHome)]: { mode: "error" },
+    [codexHomeKey(codexHome)]: { mode: "error" },
   }, null, 2)}\n`);
 
   const result = await runPoster(workspace, {
@@ -1494,7 +1499,7 @@ test("poster discovers only registry Codex Homes, not ROOT_CODEX_HOME", async ()
   );
   const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
   fs.writeFileSync(responsesPath, `${JSON.stringify({
-    [fs.realpathSync(configuredHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 17 } } },
+    [codexHomeKey(configuredHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 17 } } },
   }, null, 2)}\n`);
 
   const result = await runPoster(workspace, {
@@ -1598,9 +1603,9 @@ test("poster merges named accounts with project legacy homes and deduplicates sh
   );
   const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
   fs.writeFileSync(responsesPath, `${JSON.stringify({
-    [fs.realpathSync(defaultHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 11 } } },
-    [fs.realpathSync(namedOtherHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 22 } } },
-    [fs.realpathSync(projectHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 33 } } },
+    [codexHomeKey(defaultHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 11 } } },
+    [codexHomeKey(namedOtherHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 22 } } },
+    [codexHomeKey(projectHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 33 } } },
   }, null, 2)}\n`);
 
   const result = await runPoster(workspace, {
@@ -1641,10 +1646,10 @@ test("poster merges top-level legacy homes with named accounts when no top-level
   );
   const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
   fs.writeFileSync(responsesPath, `${JSON.stringify({
-    [fs.realpathSync(alphaHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 14 } } },
-    [fs.realpathSync(zuluHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 25 } } },
-    [fs.realpathSync(topLegacyHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 36 } } },
-    [fs.realpathSync(projectLegacyHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 47 } } },
+    [codexHomeKey(alphaHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 14 } } },
+    [codexHomeKey(zuluHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 25 } } },
+    [codexHomeKey(topLegacyHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 36 } } },
+    [codexHomeKey(projectLegacyHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 47 } } },
   }, null, 2)}\n`);
 
   const result = await runPoster(workspace, {
@@ -1686,8 +1691,8 @@ test("poster labels a shared home with the alphabetically first alias without a 
   );
   const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
   fs.writeFileSync(responsesPath, `${JSON.stringify({
-    [fs.realpathSync(uniqueHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 13 } } },
-    [fs.realpathSync(sharedHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 24 } } },
+    [codexHomeKey(uniqueHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 13 } } },
+    [codexHomeKey(sharedHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 24 } } },
   }, null, 2)}\n`);
 
   const result = await runPoster(workspace, {
@@ -1879,7 +1884,7 @@ test("scheduled poster posts the original text report once per 30-minute slot wi
   );
   const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
   fs.writeFileSync(responsesPath, `${JSON.stringify({
-    [fs.realpathSync(codexHome)]: {
+    [codexHomeKey(codexHome)]: {
       rateLimits: { planType: "chatgpt", primary: { usedPercent: 42, windowDurationMins: 10080 } },
     },
   }, null, 2)}\n`);
@@ -3266,7 +3271,7 @@ test("Windows --collect-only records Claude, Codex and DeepSeek under the state 
   })}\n`);
   const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
   fs.writeFileSync(responsesPath, `${JSON.stringify({
-    [fs.realpathSync(codexHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 12 }, secondary: { usedPercent: 34 } } },
+    [codexHomeKey(codexHome)]: { rateLimits: { planType: "chatgpt", primary: { usedPercent: 12 }, secondary: { usedPercent: 34 } } },
   })}\n`);
 
   const result = await runScript(workspace, POSTER, {
