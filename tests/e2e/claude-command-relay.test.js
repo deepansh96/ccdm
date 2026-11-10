@@ -106,7 +106,7 @@ test("send-claude-command refuses non-Claude and remote targets", async () => {
   seedRegistry(
     codexWorkspace,
     buildRegistry(codexWorkspace, {
-      alpha: { type: "codex", screen_name: "alpha_codex", ws_port: 18342 },
+      alpha: { type: "codex", screen_name: "alpha_codex", ws_port: 18642 },
     }),
   );
   seedTmuxSession("alpha_codex", { paneOutput: "Codex bridge\n" }, { stateDir: codexWorkspace.stateDir });

@@ -480,7 +480,7 @@ test("project stop and root restart keep the independent service and closed stat
   const context = await setup(workspace);
   const registry = readRegistry(workspace);
   registry.projects.demo = { ...registry.projects.demo, path: path.join(workspace.tmpDir, "demo"),
-    screen_name: "demo_codex", ws_port: 18342, session_id: "existing-session", pid: null };
+    screen_name: "demo_codex", ws_port: 18742, session_id: "existing-session", pid: null };
   writeRegistry(workspace, registry);
   assert.equal(await event(workspace, context.stateDir, "close_requested", "close-before-stop",
     "2026-09-24T10:00:00Z", { actor_id: "owner", source_message_id: "close-message", command: "/close" }),

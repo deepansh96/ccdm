@@ -51,7 +51,7 @@ async function restartWorld(backend, { type = "claude", screen = "demo_session",
   const record = path.join(workspace.tmpRoot, "steps.jsonl");
   const routerState = path.join(stateRoot, "router");
   seedRegistry(workspace, {
-    projects: { demo: { type, screen_name: screen, path: workspace.repoDir, channel_id: "demo-channel", ws_port: 18342, pid: null, session_id: null } },
+    projects: { demo: { type, screen_name: screen, path: workspace.repoDir, channel_id: "demo-channel", ws_port: 18542, pid: null, session_id: null } },
   });
   for (const [name, file, variable] of [
     ["stop-session", "stop_session.py", "CCDM_E2E_STOP_EXIT"],
@@ -273,8 +273,8 @@ function isAlive(pid) {
 
 test("on Windows, a Codex restart runs the real stop: the old app-server no longer holds the port, and another port's stays", platformGate("win32", "the port sweep reads the Windows process table"), async () => {
   const world = await restartWorld("ccdm-host", { type: "codex", real: ["stop-session"] });
-  const appServer = spawnWithArgs(["app-server", "--listen", "ws://127.0.0.1:18342"]);
-  const otherPort = spawnWithArgs(["app-server", "--listen", "ws://127.0.0.1:18343"]);
+  const appServer = spawnWithArgs(["app-server", "--listen", "ws://127.0.0.1:18542"]);
+  const otherPort = spawnWithArgs(["app-server", "--listen", "ws://127.0.0.1:18543"]);
 
   const result = await world.run(["demo"]);
 

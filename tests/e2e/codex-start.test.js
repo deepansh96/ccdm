@@ -49,7 +49,10 @@ function buildCodexRegistry(workspace, options = {}) {
         screen_name: "alpha_codex",
         channel_id: "channel-id",
         type: "codex",
-        ws_port: 18342,
+        // A port no other test file uses: on Windows the launch looks for a bridge or
+        // app-server on it across the whole machine, and other files that run at the
+        // same time start and stop real ones on their own ports.
+        ws_port: 18442,
         ...(options.transport ? { transport: options.transport } : {}),
         ...(options.guestUserIds ? { guest_user_ids: options.guestUserIds } : {}),
         ...(options.codexHome ? { codex_home: options.codexHome } : {}),
@@ -628,7 +631,7 @@ test("start-codex-session ignores a broken Codex Account Alias on an unrelated p
         channel_id: "beta-channel-id",
         type: "codex",
         codex_account: "missing-account",
-        ws_port: 18343,
+        ws_port: 18443,
         session_id: null,
         pid: null,
       },
@@ -845,7 +848,7 @@ test("start-codex-session ignores a broken Codex home on an unrelated project", 
         channel_id: "beta-channel-id",
         type: "codex",
         codex_home: path.join(workspace.homeDir, "missing beta codex home"),
-        ws_port: 18343,
+        ws_port: 18443,
         session_id: null,
         pid: null,
       },
@@ -984,13 +987,13 @@ test("start-codex-session refuses duplicate bridge and app-server processes from
   seedRegistry(appServerWorkspace, appServerRegistry);
   const appServerPid = seedOwnedProcess(
     appServerWorkspace,
-    "codex app-server --listen ws://127.0.0.1:18342",
+    "codex app-server --listen ws://127.0.0.1:18442",
   );
 
   const appServerResult = await startCodex(appServerWorkspace);
 
   assert.equal(appServerResult.exitCode, 1);
-  assert.match(appServerResult.stdout, /channel channel-id or port 18342/);
+  assert.match(appServerResult.stdout, /channel channel-id or port 18442/);
   assert.match(appServerResult.stdout, new RegExp(String(appServerPid)));
   assert.equal(readState(appServerWorkspace.stateDir).fixtures.tmux.sessions.alpha_codex, undefined);
   assert.equal(fs.existsSync(alphaKeyFile(appServerWorkspace)), false);
@@ -1036,7 +1039,7 @@ test("start-codex-session preserves current duplicate port registry behavior", a
         screen_name: "beta_codex",
         channel_id: "beta-channel-id",
         type: "codex",
-        ws_port: 18342,
+        ws_port: 18442,
         session_id: null,
         pid: null,
       },
@@ -1210,7 +1213,7 @@ test("on Windows a running bridge or app-server with this project's key file or 
   const keep = "setInterval(() => {}, 1000)";
   for (const makeArgs of [
     workspace => ["-e", keep, "--", "--ccdm-key-file", alphaKeyFile(workspace)],
-    () => ["-e", keep, "--", "app-server", "--listen", "ws://127.0.0.1:18342"],
+    () => ["-e", keep, "--", "app-server", "--listen", "ws://127.0.0.1:18442"],
   ]) {
     const workspace = createCodexWorkspace();
     seedRegistry(workspace, buildCodexRegistry(workspace));
