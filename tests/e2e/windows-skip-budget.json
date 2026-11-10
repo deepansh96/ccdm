@@ -1,5 +1,5 @@
 {
-  "budget": 139,
+  "budget": 138,
   "skips": [
     {
       "file": "codex-start.test.js",
@@ -337,12 +337,6 @@
       "test": "on macOS and Linux install-service root-at-logon is refused and reaches no installer",
       "tag": "posix",
       "reason": "root-at-logon is a Windows task; macOS keeps its LaunchAgent"
-    },
-    {
-      "file": "thread-lifecycle.test.js",
-      "test": "a resumed Claude session whose session id cannot be read keeps the known conversation id",
-      "tag": "posix",
-      "reason": "on ccdm-host the launcher finds Claude by its session file, so a launch without one fails"
     },
     {
       "file": "ccdm-usage.test.js",

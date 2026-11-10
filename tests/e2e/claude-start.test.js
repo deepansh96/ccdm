@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -680,7 +680,76 @@ for (const backend of BACKENDS) {
     if (WIN) assert.match(startedAt, /^\d+$/);
     else assert.equal(startedAt, undefined);
   });
+
+  test(`${backend}: a Claude that writes no session file is still recorded by its PID, with no session id`, async () => {
+    const { workspace } = await claudeRouterWorkspace();
+    updateState(workspace.stateDir, (state) => { state.fixtures.claude.omitSessionFile = true; });
+
+    // The launcher waits about 10 s for the session id before it records the PID alone.
+    const result = await runScript(workspace, "scripts/start-session.sh", {
+      args: ["alpha"], env: routerEnv(workspace, await backendEnv(workspace, backend)), timeoutMs: 40000,
+    });
+
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /Recorded PID \d+; session_id not found yet/);
+    const { pid, session_id: sessionId, pid_started_at: startedAt } = readRegistry(workspace).projects.alpha;
+    assert.equal(pid, launchRecord(workspace).pid);
+    assert.equal(sessionId, null);
+    if (WIN) assert.match(startedAt, /^\d+$/);
+  });
 }
+
+// `find_claude_process` with a shorter wait: prints `[pid, start time]`.
+const FIND_CLAUDE_DRIVER = `
+import sys
+sys.dont_write_bytecode = True
+import json
+sys.path.insert(0, sys.argv[1])
+from ccdmlib.cli import _launch
+_launch._PID_ROUNDS = 8
+print(json.dumps(_launch.find_claude_process(*json.loads(sys.argv[2]))))
+`;
+
+test("on Windows a host session's Claude with no session file is found by its command line, and only inside its session", platformGate("win32", "reads real command lines; POSIX reads the key file from the environment, in the launch above"), async () => {
+  const workspace = seededWorkspace();
+  const env = { ...workspace.env, PYTHONUTF8: "1", ...(await backendEnv(workspace)) };
+  const mcpConfig = path.join(launchDir(workspace), "mcp.json");
+  const channelFlags = ["--dangerously-load-development-channels", "server:ccdm"];
+  // `--` keeps Node from reading the flags as its own options.
+  const idle = (...args) => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", ...args], { stdio: "ignore", windowsHide: true });
+    const exited = new Promise(resolve => child.once("exit", resolve));
+    registerTeardownCallback(async () => {
+      child.kill();
+      await exited;
+    });
+    return child.pid;
+  };
+  const find = () => new Promise((resolve, reject) => {
+    const args = ["alpha_session", path.join(workspace.routerStateDir, "keys", "alpha.key"), settledHome(workspace), launchDir(workspace)];
+    execFile(PYTHON, ["-c", FIND_CLAUDE_DRIVER, path.join(workspace.repoDir, "scripts"), JSON.stringify(args)],
+      { cwd: workspace.tmpRoot, env, encoding: "utf8", windowsHide: true }, (error, stdout, stderr) => {
+        if (error) return reject(new Error(`${error.message}: ${stderr}`));
+        resolve(JSON.parse(stdout.trim().split("\n").at(-1)));
+      });
+  });
+  // In the session: a process that only names this launch's mcp.json, and another launch's Claude.
+  const bystander = idle("--mcp-config", mcpConfig);
+  const otherLaunch = idle(...channelFlags, "--mcp-config", path.join(workspace.routerStateDir, "launches", "beta", "mcp.json"));
+  // Outside the session: a process with exactly this launch's Claude arguments.
+  idle(...channelFlags, "--mcp-config", mcpConfig);
+  seedTmuxSession("alpha_session", { job: [bystander, otherLaunch] }, { stateDir: workspace.stateDir });
+  await new Promise(resolve => setTimeout(resolve, 500));
+
+  assert.deepEqual(await find(), [null, null]);
+
+  const claudeProcess = idle(...channelFlags, "--mcp-config", mcpConfig);
+  updateState(workspace.stateDir, (state) => { state.fixtures.tmux.sessions.alpha_session.job.push(claudeProcess); });
+  await new Promise(resolve => setTimeout(resolve, 500));
+  const [pid, startedAt] = await find();
+  assert.equal(pid, claudeProcess);
+  assert.match(startedAt, /^\d+$/);
+});
 
 test("the generated settings.json hook commands are hook_command()'s output", async () => {
   const { workspace } = await claudeRouterWorkspace();

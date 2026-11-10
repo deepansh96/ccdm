@@ -32,6 +32,7 @@ _POLL_S = 0.2
 _DEFAULT_LAUNCH_TIMEOUT_S = 60.0
 _PID_ROUNDS = 20
 _PID_ROUND_S = 0.5
+_SESSION_FILE_ROUNDS = 4  # A host session's Claude gets this long to write its session file.
 _UNLINK_ROUNDS = 20
 _UNLINK_ROUND_S = 0.05
 
@@ -427,17 +428,54 @@ def _claude_pid_from_host(name: str, claude_home: str) -> Optional[int]:
     return None
 
 
-def find_claude_process(name: str, key_file: str, claude_home: str) -> Tuple[Optional[int], Optional[str]]:
+def _claude_pid_by_command_line(name: str, key_file: str, launch_dir: Optional[str]) -> Optional[int]:
+    """The host session's process that was started as this launch's Claude, or ``None``.
+
+    Only the session's own processes are looked at. POSIX reads the key file from
+    the environment, as on tmux. Windows reads the command line: Claude's channel
+    flags and ``--mcp-config <launch_dir>/mcp.json``, so it needs ``launch_dir``.
+    """
+    members = session_host.pids(name)
+    if not WIN32:
+        for pid, command in _ps_rows():
+            if pid in members and _is_claude_listener(_split_command(command)) and _carries_key_file(command, key_file):
+                return pid
+        return None
+    if not launch_dir:
+        return None
+    mcp_config = os.path.join(launch_dir, "mcp.json")
+    matches = []
+    for pid in members:
+        argv = proc.command_line(pid) or []
+        config = _argument_after(argv, _MCP_CONFIG_FLAG)
+        if _LISTENER_FLAG in argv and _LISTENER_CHANNEL in argv and config is not None and paths.same_path(config, mcp_config):
+            matches.append(pid)
+    # A launcher that starts Claude with its own arguments matches too: take its child.
+    parents = {row.ppid for row in proc.find(lambda process: process.pid in matches)} if len(matches) > 1 else set()
+    return next((pid for pid in matches if pid not in parents), None)
+
+
+def find_claude_process(
+    name: str, key_file: str, claude_home: str, launch_dir: Optional[str] = None
+) -> Tuple[Optional[int], Optional[str]]:
     """``(pid, start time)`` of a session's Claude, or ``(None, None)`` after 10 s.
 
     On tmux it is the process carrying this launch's key file. On ccdm-host it is
-    the session's process with a ``<claude_home>/sessions/<pid>.json``. The start
-    time is ``None`` on POSIX. ``claude_home`` is from :func:`effective_claude_home`
-    on ccdm-host. Thread launchers record the result as ``runtime_pid``.
+    the session's process with a ``<claude_home>/sessions/<pid>.json``; if none has
+    one after 2 s, it is the session's process whose command line is this launch's
+    Claude (``launch_dir`` is the launch directory, needed for that on Windows).
+    The start time is ``None`` on POSIX. ``claude_home`` is from
+    :func:`effective_claude_home` on ccdm-host. Thread launchers record the result
+    as ``runtime_pid``.
     """
     on_tmux = session_host.backend_name() == "tmux"
-    for _ in range(_PID_ROUNDS):
-        pid = _claude_pid_by_key_file(key_file) if on_tmux else _claude_pid_from_host(name, claude_home)
+    for attempt in range(_PID_ROUNDS):
+        if on_tmux:
+            pid = _claude_pid_by_key_file(key_file)
+        else:
+            pid = _claude_pid_from_host(name, claude_home)
+            if not pid and attempt >= _SESSION_FILE_ROUNDS:
+                pid = _claude_pid_by_command_line(name, key_file, launch_dir)
         if pid:
             return pid, proc.start_time(pid)
         time.sleep(_PID_ROUND_S)
