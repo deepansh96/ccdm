@@ -24,9 +24,9 @@ last_updated: 2026-11-10
 `guest_mode` is one top-level registry option. Any other value is an invalid registry: the Router keeps its last good table, `router status` shows the error, and `guest-access.js` refuses every action.
 
 - macOS: leave `guest_mode` out (or set `"roles"`). Each project gets one guest role; the role and each guest are denied the other managed locations and allowed the project channel, and the invite carries the role. This needs server-wide Manage Roles, which only the Mac's bot has.
-- Windows: the Windows bot never gets server-wide Manage Roles, so role mode is not an option there and is never offered as a fallback. The mode is chosen only after the spike in #202 has recorded what a category-scoped bot can do. Until that result exists, the registry must say `"guest_mode": "none"`.
-  - Windows, `"none"` (the safe value): `invite`, `grant` and `sync` refuse, name owner decision D4, exit non-zero and make no Discord call. `revoke` and `list` still work; `revoke` removes the guest from the registry and deletes their recorded invites.
-  - Windows, `"member-overwrites"` (only once #202 records that the member overwrites, their deletion and the targeted invite all work with channel-level Manage Permissions):
+- Windows: the Windows bot never gets server-wide Manage Roles, so role mode is not an option there and is never offered as a fallback. The check in #202 recorded that a category-scoped bot can make every guest call of `"member-overwrites"`, so Windows setup offers that mode by default; an owner who wants no guests answers `none`.
+  - Windows, `"none"`: `invite`, `grant` and `sync` refuse, exit non-zero and make no Discord call. `revoke` and `list` still work; `revoke` removes the guest from the registry and deletes their recorded invites.
+  - Windows, `"member-overwrites"` (the setup default; the bot needs Manage Permissions on its own category only):
     1. `invite` and `grant` create no role. They deny the guest View Channel on the other project channels, `category_ids`, `guest_deny_channel_ids` and the channels under those, and allow the guest the project channel, all as overwrites on the guest's own user. `invite` then creates the one-use targeted invite, which carries no role.
     2. If `invite` says the user is not in the server yet, no permission could be written for them. After they join, run `node scripts/guest-access.js sync <project>`; until then they cannot see the project channel.
     3. `revoke` deletes the guest's allow overwrite on the project channel and their recorded invites.
