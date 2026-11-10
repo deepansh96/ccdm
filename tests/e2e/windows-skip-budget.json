@@ -1,5 +1,5 @@
 {
-  "budget": 141,
+  "budget": 144,
   "skips": [
     {
       "file": "codex-start.test.js",
@@ -196,6 +196,24 @@
     {
       "file": "router-root-codex.test.js",
       "test": "*",
+      "tag": "posix",
+      "reason": "root Codex stays on Linux and macOS until the owner's decision on a Windows Codex root (D2)"
+    },
+    {
+      "file": "router-root-fallback.test.js",
+      "test": "root codex falls back to a direct gateway for root channels while the Router is down, and hands back before rejoining",
+      "tag": "posix",
+      "reason": "root Codex stays on Linux and macOS until the owner's decision on a Windows Codex root (D2)"
+    },
+    {
+      "file": "router-root-fallback.test.js",
+      "test": "restarting root codex while the Router is down fails and leaves the emergency root running with its key",
+      "tag": "posix",
+      "reason": "root Codex stays on Linux and macOS until the owner's decision on a Windows Codex root (D2)"
+    },
+    {
+      "file": "router-root-fallback.test.js",
+      "test": "root codex replies, edits, reacts, and types in root channels through the fallback, and goes back to the Router once it returns",
       "tag": "posix",
       "reason": "root Codex stays on Linux and macOS until the owner's decision on a Windows Codex root (D2)"
     },
