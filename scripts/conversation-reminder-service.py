@@ -679,6 +679,11 @@ def sync(project_root: Path, state_dir: Path) -> dict:
     count = 0
     try:
         db.execute("BEGIN IMMEDIATE")
+        # Read again under the store's write lock. assignment-changed issues a
+        # generation in the registry inside its own transaction, so a registry
+        # read while waiting for the lock can be older than the store, and its
+        # old generation would retire the conversation that was just carried over.
+        registry = EVENTS.load_registry(project_root)
         projects = registry.get("projects")
         if not isinstance(projects, dict):
             raise ValueError("registry project assignments are invalid")
