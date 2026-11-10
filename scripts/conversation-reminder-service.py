@@ -23,6 +23,7 @@ if _SCRIPTS_DIR not in sys.path:
 from ccdmlib.platform import filelock  # noqa: E402
 from ccdmlib.platform.paths import state_root  # noqa: E402
 from ccdmlib.platform.private_fs import fix_hint, is_private  # noqa: E402
+from ccdmlib.platform.services import service_installed  # noqa: E402
 
 
 EVENTS_PATH = Path(__file__).with_name("conversation-reminder-events.py")
@@ -835,13 +836,13 @@ THREAD_PERMISSION_NAMES = {"CreatePublicThreads": "Create Public Threads",
                            "ManageThreads": "Manage Threads", "ViewAuditLog": "View Audit Log"}
 # Granted at the guild, not in a channel.
 GUILD_PERMISSIONS = {"ViewAuditLog"}
-THREAD_SUPERVISOR_PLIST = Path("Library") / "LaunchAgents" / "com.ccdm.thread-supervisor.plist"
 
 
 def threads_enabled(registry: dict, router: dict | None) -> bool:
     """Thread Conversations are enabled once the supervisor is installed, configured, or connected."""
-    return ((Path.home() / THREAD_SUPERVISOR_PLIST).exists() or "thread_session_caps" in registry or
-            bool(((router or {}).get("supervisor") or {}).get("connected")))
+    # The installed check comes last: on Windows it asks Task Scheduler.
+    return ("thread_session_caps" in registry or bool(((router or {}).get("supervisor") or {}).get("connected"))
+            or service_installed("thread-supervisor"))
 
 
 def router_prerequisites(registry: dict) -> dict:
@@ -859,7 +860,7 @@ def router_prerequisites(registry: dict) -> dict:
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         router = None
     reported = {row.get("project"): row for row in (router or {}).get("projects") or [] if isinstance(row, dict)}
-    threads = threads_enabled(registry, router)
+    threads = None  # asked once, and only when a project has a thread permission to report
     result = {}
     for name in names:
         blockers = []
@@ -878,7 +879,10 @@ def router_prerequisites(registry: dict) -> dict:
                 label = ROOT_PERMISSION_NAMES.get(flag, flag)
                 blockers.append(f"root lacks {label} in the project channel; grant root permission {label} in "
                                 f"{projects[name].get('channel_id')}")
-            for flag in (row.get("missing_thread_permissions") or []) if threads and missing is not None else []:
+            missing_in_threads = (row.get("missing_thread_permissions") or []) if missing is not None else []
+            if missing_in_threads and threads is None:
+                threads = threads_enabled(registry, router)
+            for flag in missing_in_threads if threads else []:
                 label = THREAD_PERMISSION_NAMES.get(flag, flag)
                 blockers.append(f"root lacks {label} in the guild; grant root permission {label} in guild "
                                 f"{registry.get('guild_id')}" if flag in GUILD_PERMISSIONS else
@@ -1712,6 +1716,36 @@ def suspend_interrupted_sends(state_dir: Path) -> None:
         db.close()
 
 
+OBSERVER_STOP_SECONDS = 15
+
+
+def start_observer(observer_args: list, observer_env: dict) -> subprocess.Popen:
+    """Start the Node observer holding its stdin, which is how it is asked to stop."""
+    return subprocess.Popen([*observer_args, "--stop-on-stdin-end"], env=observer_env, stdin=subprocess.PIPE)
+
+
+def stop_observer(observer: subprocess.Popen, wait_seconds: float = OBSERVER_STOP_SECONDS) -> int:
+    """Ask the observer to stop by closing its stdin; force it only if it stays.
+
+    The observer finishes an in-flight request (bounded by its 10-second Discord
+    timeout) before exiting. Closing stdin is the one request that works on
+    every OS: ``terminate()`` is a hard kill on Windows."""
+    try:
+        if observer.stdin is not None:
+            observer.stdin.close()
+    except OSError:
+        pass
+    try:
+        return observer.wait(timeout=wait_seconds)
+    except subprocess.TimeoutExpired:
+        observer.terminate()
+    try:
+        return observer.wait(timeout=wait_seconds)
+    except subprocess.TimeoutExpired:
+        observer.kill()
+        return observer.wait()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("sync", "status", "preflight", "disable", "enable", "run", "recover",
@@ -1823,7 +1857,7 @@ def main() -> int:
                     result["readiness"] = status(args.state_dir, args.project_root)["readiness"]
                     print(json.dumps(result, sort_keys=True))
                     return 0
-                observer = subprocess.Popen(observer_args, env=observer_env)
+                observer = start_observer(observer_args, observer_env)
                 try:
                     while not is_disabled(args.state_dir):
                         sync(args.project_root, args.state_dir)
@@ -1831,14 +1865,7 @@ def main() -> int:
                             raise ValueError("conversation observer stopped")
                         time.sleep(0.5)
                 finally:
-                    # The observer finishes an in-flight request (bounded by its
-                    # 10-second Discord timeout) before exiting.
-                    observer.terminate()
-                    try:
-                        observer.wait(timeout=15)
-                    except subprocess.TimeoutExpired:
-                        observer.kill()
-                        observer.wait()
+                    stop_observer(observer)
             result = status(args.state_dir, args.project_root)
         print(json.dumps(result, sort_keys=True))
         return 0
