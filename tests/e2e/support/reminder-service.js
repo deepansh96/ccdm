@@ -1,5 +1,5 @@
 // Shared setup for the Conversation Reminders service suites: conversation-reminder-service,
-// conversation-reminder-recovery and conversation-reminder-state.
+// conversation-reminder-recovery, conversation-reminder-state and conversation-reminder-store.
 
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
