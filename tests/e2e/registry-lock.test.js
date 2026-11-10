@@ -31,6 +31,24 @@ test.afterEach(async () => {
 
 const registryFile = workspace => path.join(workspace.repoDir, "registry.json");
 
+// That the committed registry.json is private. On Windows that is the file's own
+// DACL, in a repository directory that passes on more: a rename on one volume
+// keeps a file's DACL, so the file is moved into a private directory and checked
+// there. Call it last; it returns where the file now is.
+function assertCommittedRegistryPrivate(workspace) {
+  const file = registryFile(workspace);
+  if (process.platform !== "win32") {
+    assertPrivate(file);
+    return file;
+  }
+  const privateDir = path.join(workspace.tmpDir, "private-check");
+  createRequire(import.meta.url)("../../scripts/platform/privacy.js").ensurePrivateDirSync(privateDir);
+  const moved = path.join(privateDir, "registry.json");
+  fs.renameSync(file, moved);
+  assertPrivate(moved);
+  return moved;
+}
+
 // `demo` has its webhook and a connected session; `other` is running (a
 // recorded PID and session). Every process in the Test Workspace shares one
 // armable mid-transaction pause.
@@ -76,12 +94,12 @@ async function assertBothChangesSurvive(workspace, router, reply, stop) {
   assert.deepEqual({ pid: other.pid, session_id: other.session_id }, { pid: null, session_id: null });
   // The reminder service's assignment-changed write survives too.
   assert.match(demo.assignment_generation, /^gen-[0-9a-f]{32}$/);
-  assertPrivate(registryFile(workspace));
   assert.deepEqual(fs.readdirSync(workspace.repoDir).filter(name => /registry\.json\.(lock|.*\.tmp)/.test(name)), []);
   const status = await runRouterCli(workspace, ["status", "--json"]);
   assert.equal(status.exitCode, 0, status.stderr);
   assert.equal(JSON.parse(status.stdout).registry_error ?? null, null);
   assert.doesNotMatch(router.stdout, /registry_reload_failed/);
+  assertCommittedRegistryPrivate(workspace);
 }
 
 // Awaited later; a failure before then must not crash the test process.
@@ -427,8 +445,6 @@ for (const language of ["node", "python"]) {
   });
 }
 
-// A rename on one volume keeps a file's DACL, so moving the committed file into a
-// private directory checks the DACL the commit gave it, not the repository's.
 for (const language of ["node", "python"]) {
   test(`on Windows, a ${language} commit gives registry.json a DACL for this user alone in a directory that passes on more`, ON_WINDOWS, async () => {
     const workspace = createRouterWorkspace(otherProject());
@@ -439,11 +455,7 @@ for (const language of ["node", "python"]) {
       await runPython(workspace, "ru.set_project_fields(sys.argv[2], 'other', {'committed': True})", [file]);
     }
 
-    const privateDir = path.join(workspace.tmpDir, "private-check");
-    createRequire(import.meta.url)(path.join(REPO_ROOT, "scripts/platform/privacy.js")).ensurePrivateDirSync(privateDir);
-    const moved = path.join(privateDir, "registry.json");
-    fs.renameSync(file, moved);
-    assertPrivate(moved);
+    const moved = assertCommittedRegistryPrivate(workspace);
     assert.equal(JSON.parse(fs.readFileSync(moved, "utf8")).projects.other.committed, true);
     assert.deepEqual(lockLitter(workspace), []);
   });

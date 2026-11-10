@@ -10,6 +10,7 @@ import { startFakeCodexServer } from "./support/bridge.js";
 import { platformGate } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import { OWNER_ID, createRouterWorkspace, routerEnv, runRouterCli, startRouter } from "./support/router.js";
+import { startFakeHost } from "./support/session-fixture.js";
 import { readState, seedFixtureProcess, seedTmuxSession, updateState, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 
@@ -71,15 +72,26 @@ function updateRegistry(workspace, update) {
   fs.writeFileSync(registryFile(workspace), `${JSON.stringify(registry, null, 2)}\n`);
 }
 
-function migrate(workspace, args, extraEnv = {}) {
+// On Windows the launchers go through the fake ccdm-host, sharing the fixture's session table.
+const fakeHosts = new WeakMap();
+async function launcherEnv(workspace) {
+  if (process.platform !== "win32") return {};
+  if (!fakeHosts.has(workspace)) fakeHosts.set(workspace, startFakeHost(workspace, { env: routerEnv(workspace) }));
+  return (await fakeHosts.get(workspace)).env;
+}
+
+async function migrate(workspace, args, extraEnv = {}) {
   return runScript(workspace, "scripts/migrate-to-router.sh", {
-    args, env: routerEnv(workspace, { CCDM_ROUTER_NODE: process.execPath, CCDM_REMINDER_NODE: process.execPath, ...extraEnv }),
+    args,
+    env: routerEnv(workspace, {
+      CCDM_ROUTER_NODE: process.execPath, CCDM_REMINDER_NODE: process.execPath, ...(await launcherEnv(workspace)), ...extraEnv,
+    }),
     timeoutMs: 60000,
   });
 }
 
-function startClaude(workspace) {
-  return runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace) });
+async function startClaude(workspace) {
+  return runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace, await launcherEnv(workspace)) });
 }
 
 async function routerSessions(workspace) {
@@ -92,10 +104,11 @@ const webhookMessages = (workspace) => (readState(workspace.stateDir).fixtures.d
   .filter((message) => message.webhookId)
   .map(({ channelId, webhookId }) => ({ channelId, webhookId }));
 
-// Refused before any runtime change: no key, tmux session, or PID.
+// Refused before any runtime change: no key, tmux session, or PID. The Claude
+// launcher names the command the way this OS's lifecycle commands are typed.
 function assertRefusedWithoutWebhook(workspace, result, project, screen) {
   assert.equal(result.exitCode, 1, result.stderr || result.stdout);
-  assert.match(result.stderr, new RegExp(`Refusing to start '${project}': it has no webhook_id.*Run scripts/migrate-to-router\\.sh ${project}`));
+  assert.match(result.stderr, new RegExp(`Refusing to start '${project}': it has no webhook_id.*Run scripts/(?:migrate-to-router\\.sh|ccdm migrate-to-router) ${project}`));
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions[screen], undefined);
   assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", `${project}.key`)), false);
   assert.equal(readRegistry(workspace).projects[project].pid, null);
@@ -132,7 +145,9 @@ test("migrating an unmigrated Claude project stops its legacy pool listener, rec
   await startRouter(workspace);
   // Without a webhook the project cannot launch; its pool-era listener still runs.
   assertRefusedWithoutWebhook(workspace, await startClaude(workspace), "demo", "demo_claude");
-  const legacyPid = spawnLegacyPoolListener(workspace, poolStateDir);
+  // Found by its environment in `ps`, which Windows cannot read; a Windows
+  // install never had a pool bot, so it has no such listener to stop.
+  const legacyPid = process.platform === "win32" ? null : spawnLegacyPoolListener(workspace, poolStateDir);
 
   const result = await migrate(workspace, ["demo"]);
 
@@ -149,7 +164,7 @@ test("migrating an unmigrated Claude project stops its legacy pool listener, rec
   // The router launch holds the tmux session.
   const session = readState(workspace.stateDir).fixtures.tmux.sessions.demo_claude;
   assert.equal(session.env?.DISCORD_STATE_DIR, undefined);
-  assert.equal(isAlive(legacyPid), false);
+  if (legacyPid !== null) assert.equal(isAlive(legacyPid), false);
 });
 
 test("migrating a Codex project with no transport field or webhook records it on the Router, verifies a probe round trip, and exits 0", async () => {
@@ -158,7 +173,8 @@ test("migrating a Codex project with no transport field or webhook records it on
   assert.equal(readRegistry(workspace).projects.beta.webhook_id, undefined);
   await startRouter(workspace);
   // Without a webhook the project cannot launch.
-  const refused = await runScript(workspace, "scripts/start-codex-session.sh", { args: ["beta"], env: routerEnv(workspace) });
+  const refused = await runScript(workspace, "scripts/start-codex-session.sh",
+    { args: ["beta"], env: routerEnv(workspace, await launcherEnv(workspace)) });
   assertRefusedWithoutWebhook(workspace, refused, "beta", "beta_codex");
 
   const result = await migrate(workspace, ["beta"]);

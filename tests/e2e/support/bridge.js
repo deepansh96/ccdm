@@ -6,7 +6,7 @@ import path from "node:path";
 import { WebSocketServer } from "ws";
 
 import { createWorkspace, scaledTimeout } from "./runner.js";
-import { readState, recordCommandInvocation, updateState } from "./state.js";
+import { readState, recordCommandInvocation, recordState, updateState } from "./state.js";
 import { registerTeardownCallback } from "./teardown.js";
 
 const overlayRoots = new WeakMap();
@@ -135,7 +135,8 @@ export function runPreloadProbe(workspace, code, extraEnv = {}) {
 }
 
 function recordCodexEvent(workspace, event) {
-  updateState(workspace.stateDir, (state) => {
+  // An MCP tool child that ends after teardown reports here.
+  recordState(workspace.stateDir, (state) => {
     state.fixtures.codex.protocolEvents.push({ at: new Date().toISOString(), ...event });
   });
 }

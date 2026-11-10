@@ -1,0 +1,37 @@
+# Local notes for this machine
+
+Setup copies this file to `CLAUDE.local.md`, which git ignores and root reads when it is present. Replace each `<placeholder>`. Keep machine-specific facts here and never copy them into tracked files. Never write a token, password or key in this file.
+
+## This machine
+
+- Machine id and label, as in `registry.json`: `<machine id>` / `<machine label>`
+- Operating system and shell: `<for example Windows 11, PowerShell 7>`
+- Where project folders live: `<folder>`
+- Anything root must know before it starts or stops sessions here: `<notes>`
+
+## Claude homes
+
+One row for each Claude login on this machine. The folder is what `CLAUDE_CONFIG_DIR` points at.
+
+| Name | Folder | Account | Used for |
+|---|---|---|---|
+| `<default>` | `<folder>` | `<account email or nickname>` | `<root, which projects>` |
+
+## Codex accounts
+
+One row for each entry of `codex_accounts` in `registry.json`. The folder is that account's Codex home.
+
+| Alias | Folder | Account | Used for |
+|---|---|---|---|
+| `<alias>` | `<folder>` | `<account email or nickname>` | `<which projects>` |
+
+## Discord bots
+
+- This machine's root bot: `<bot name>`
+- Root channel: `<channel name>`
+- Category for this machine's projects: `<category name>`
+- Another machine's root bot in the same server, if there is one: `<bot name>`
+
+## Access exceptions
+
+- `<project or channel>`: `<who may do what>`
