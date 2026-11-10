@@ -1,78 +1,69 @@
-Restart your own session (Claude Code or Codex). This kills your current process and starts a fresh one in the same tmux session.
+Restart your own session. This works for a Claude or Codex session, on macOS and on Windows. You run one `scripts/ccdm` command. It ends your current process, so you cannot report afterwards.
+
+## How to run `scripts/ccdm`
+
+`scripts/ccdm` is a file in the CCDM checkout, not in your project folder. The command line is the same on macOS and Windows.
+
+- The CCDM checkout is the folder in the variable `CCDM_REMINDER_PROJECT_ROOT`. If you are root, it is your working directory.
+- Claude session: run it with the Bash tool, as `"$CCDM_REMINDER_PROJECT_ROOT/scripts/ccdm" <command>`.
+- Codex session on macOS: run it the same way.
+- Codex session on Windows: your commands run in PowerShell. Run `& "$env:CCDM_REMINDER_PROJECT_ROOT\scripts\ccdm.cmd" <command>`.
+- If the variable is empty and you are not root, do not guess a path. Go to "If you cannot run the command".
+
+The steps below write `scripts/ccdm` for short. Always run it in the form above.
 
 ## Steps
 
-1. **Detect your tmux session name.** Run:
-   ```bash
-   tmux list-sessions
+1. **Find out which session you are.** Print these three variables:
+   ```sh
+   echo "session=$CCDM_SESSION_NAME claude_project=$CCDM_CLAUDE_PROJECT codex_project=$CCDM_CODEX_PROJECT"
    ```
-   Then figure out which tmux session you're in by checking the process tree:
-   ```bash
-   pstree -p $$ | head -5
-   ```
-   Match the ancestor PID to a tmux session.
+   In PowerShell, print `$env:CCDM_SESSION_NAME` and `$env:CCDM_CODEX_PROJECT`.
+   - Session `root_agent`: you are **root**.
+   - Session that ends in `-t-` and a number, for example `alpha-t-1234567890`: you are a **thread session**. The number is your thread id.
+   - Any other session name: you are a **project session**.
+   - Your project is the value of `claude_project` or `codex_project`, whichever is set.
+   - If `session` is empty, go to "If you cannot run the command".
 
-2. **Detect your environment and session type.** Run these commands and note the values:
-   ```bash
-   echo "CWD: $(pwd)"
-   echo "STATE_DIR: $DISCORD_STATE_DIR"
-   tmux list-sessions
-   ```
-   Then determine your session type: check if you're a Claude Code session or a Codex bridge session. Look up your project in registry.json (at the CCDM root directory) and check the `type` field. If `type` is `"codex"`, you're a Codex session. Otherwise you're Claude Code.
+2. **Tell the user you are restarting.** Send this message before you run anything. Say which kind of restart it is:
+   - Project session: "Restarting this session. The new session starts a fresh conversation."
+   - Thread session: "Restarting this thread's session. It resumes the same conversation."
+   - Root: "Restarting root. The new root starts a fresh conversation."
 
-3. **Determine the launch command.** Based on what you detected:
-   - `SESSION_NAME`: the tmux session name (e.g., `alpha`, `beta`, `gamma`)
-   - `PROJECT_DIR`: your current working directory
-   - Use `bash -ic` on Linux, `zsh -ic` on macOS (check `uname`)
+3. **Run the one command for your kind of session.** Run it as a normal foreground command. Do not put it in the background and do not wrap it in another command. It detaches itself where that is needed.
 
-   **If Claude Code session:**
-   - `STATE_DIR`: the DISCORD_STATE_DIR value (e.g., `~/.claude/channels/discord4`)
-   - Launch command: `cd $PROJECT_DIR && DISCORD_STATE_DIR=$STATE_DIR claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions`
+   - **Project session:**
+     ```sh
+     scripts/ccdm restart-session <project>
+     ```
+     Only a project session runs this command. It works for Claude and Codex projects. It hands the restart to a detached copy, prints `ccdm: restart-session continues in a detached process` with a log path, and exits 0 before the restart is done. The copy then stops your session and starts a new one.
 
-   **If Codex session:**
-   - Use the `start-codex-session.sh` script from the CCDM root directory
-   - The script reads all config from registry.json automatically
+   - **Thread session:**
+     ```sh
+     scripts/ccdm threads restart <project> <thread id>
+     ```
+     The Thread Supervisor does the restart. Your session ends as soon as it takes the request, so the command may print `Restarting thread ...` or nothing at all. Never run the project command above from a thread: it restarts the parent channel's session, not yours.
 
-4. **Tell the user you're restarting**, then run the restart:
+   - **Root:**
+     ```sh
+     scripts/ccdm restart-root
+     ```
+     If you are root Codex, run `scripts/ccdm restart-root --provider codex` instead, and add the root channel id as the last argument when the registry lists more than one root channel. Windows: root Codex is not supported, so `--provider codex` is refused there.
+     It checks the Router first. If the Router does not answer, it prints the refusal, exits 1 and changes nothing: tell the user what it printed. Otherwise it hands the restart to a detached copy, prints that copy's log path and exits 0 before the restart is done.
 
-   **For Claude Code:**
-   ```bash
-   nohup bash -c '
-     SESSION_NAME="<session_name>"
-     STATE_DIR="<state_dir>"
-     PROJECT_DIR="<project_dir>"
-     SHELL_CMD="bash -ic"  # use "zsh -ic" on macOS
+4. **Stop.** Do not run anything else after the command. Your process ends shortly after it.
 
-     # Kill current tmux session
-     tmux kill-session -t "$SESSION_NAME"
-     sleep 2
+## If you cannot run the command
 
-     # Start fresh
-     tmux new-session -d -s "$SESSION_NAME" -- $SHELL_CMD "cd $PROJECT_DIR && DISCORD_STATE_DIR=$STATE_DIR claude --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions"
+Do not try another way to restart. Tell the user to restart you from Discord instead:
 
-     # Dismiss trust dialog
-     sleep 8 && tmux send-keys -t "$SESSION_NAME" Enter
-   ' &>/dev/null &
-   ```
+- Project session: the user sends `/restart` in the project channel.
+- Thread session: the user sends `/restart` in the thread.
+- Root: the user runs `scripts/ccdm restart-root` from a terminal in the CCDM checkout.
 
-   **For Codex:**
-   ```bash
-   nohup bash -c '
-     SESSION_NAME="<session_name>"
-     PROJECT_NAME="<project_name>"
-     CCDM_ROOT="<ccdm_root_dir>"
+## Notes
 
-     # Kill current tmux session
-     tmux kill-session -t "$SESSION_NAME"
-     sleep 2
-
-     # Start fresh via the codex session script
-     "$CCDM_ROOT/scripts/start-codex-session.sh" "$PROJECT_NAME"
-   ' &>/dev/null &
-   ```
-
-5. **Important notes:**
-   - Always use `nohup ... &` so the script survives your own process being killed.
-   - Do NOT use `-c` flag (no conversation resume) unless the user explicitly asks.
-   - Send a Discord message confirming the restart BEFORE running the nohup command, since you won't be able to message after.
-   - The new session will be a completely fresh conversation with no memory of the previous one.
+- A restart request is for your own session only. Never restart another project, and never restart root from a project or thread session.
+- A project session's new session has no memory of this conversation. A thread session resumes its conversation.
+- If the new session does not come up, the user can read `~/.local/state/ccdm/logs/restart-<project>.log` (project) or `~/.local/state/ccdm/logs/restart-root-root_agent.log` (root), and can watch a session from a terminal with `scripts/ccdm attach <project>` or `scripts/ccdm attach root`.
+- If a command prints `the thread supervisor is not reachable`, the thread was not restarted. Tell the user, and ask them to send `/restart` in the thread once the Thread Supervisor runs again.
