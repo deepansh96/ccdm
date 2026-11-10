@@ -122,20 +122,21 @@ test("the budget is exactly the number of tests skipped on Windows", async () =>
   assert.equal(skips.length <= allowed, true);
 });
 
-// Why a test is skipped on Windows. The closed list is the three names the
-// required Windows job will accept: a real macOS facility (launchd, Keychain, a
-// zsh installer whose Windows counterpart has its own suite), POSIX signals, and
-// the tmux backend. The provisional names hold what fits none of them, until it
-// is decided whether the list grows by them or their entries have to go:
-//   posix-pair          the POSIX half of a pair; `windows_test` names the test
-//                       (or tests) covering the same behaviour on Windows
-//   windows-refused-d2  root Codex, refused on Windows on purpose for now
-//   posix-file-modes    behaviour Windows does not have, such as file mode bits
+// Why a test is skipped on Windows. The list is closed: a skip that fits none of
+// these names has to run on Windows instead.
+//   darwin-only           a real macOS facility (launchd, Keychain, a zsh
+//                         installer whose Windows counterpart has its own suite)
+//   posix-signals         POSIX signals
+//   tmux-backend          the tmux backend
+//   posix-pair            the POSIX half of a pair; `windows_test` names the test
+//                         (or tests) covering the same behaviour on Windows
+//   windows-refused-d2    root Codex, refused on Windows on purpose for now; these
+//                         entries go when root Codex runs on Windows
+//   posix-only-behaviour  behaviour Windows does not have, such as file mode bits
 // `gap` is a test that should run on Windows and does not yet. Only the entries
 // named in KNOWN_GAPS ("<file> :: <test>") may carry it, so a new gap cannot be
 // added in the budget alone. There is none today.
-const CLOSED_CATEGORIES = ["darwin-only", "posix-signals", "tmux-backend"];
-const PROVISIONAL_CATEGORIES = ["posix-pair", "windows-refused-d2", "posix-file-modes"];
+const CLOSED_CATEGORIES = ["darwin-only", "posix-signals", "tmux-backend", "posix-pair", "windows-refused-d2", "posix-only-behaviour"];
 const KNOWN_GAPS = [];
 
 // The name of every test a suite declares, as its source writes it: a name built
@@ -170,7 +171,7 @@ export function categoryProblem(entry, sources, cases, knownGaps = KNOWN_GAPS) {
   if (category === "gap") {
     return knownGaps.includes(keyOf(entry)) ? null : "is a gap that KNOWN_GAPS in windows-skip-budget.test.js does not name";
   }
-  if (![...CLOSED_CATEGORIES, ...PROVISIONAL_CATEGORIES].includes(category)) return `has the category "${category}", which is not on the list`;
+  if (!CLOSED_CATEGORIES.includes(category)) return `has the category "${category}", which is not on the list`;
   if (entry.tag === "darwin" && category !== "darwin-only") return "is tagged darwin, so its category must be darwin-only";
   if (category !== "posix-pair") return entry.windows_test === undefined ? null : "names a windows_test without being a posix-pair";
   const named = [].concat(entry.windows_test ?? []);
@@ -221,8 +222,7 @@ test("the category check catches a planted entry with another category or none, 
   assert.equal(windowsTest("platform-contract/planted.cases.js", "a windows case"), null);
   assert.equal(windowsTest("platform-contract/planted.cases.js", "a shared case"), null);
   assert.equal(problem({ windows_test: [{ file: "planted.test.js", test: "runs everywhere" }, { file: "planted.test.js", test: "${language} windows half" }] }), null);
-  for (const category of CLOSED_CATEGORIES) assert.equal(problem({ category, windows_test: undefined }), null, category);
-  for (const category of ["windows-refused-d2", "posix-file-modes"]) assert.equal(problem({ category, windows_test: undefined }), null, category);
+  for (const category of CLOSED_CATEGORIES.filter((name) => name !== "posix-pair")) assert.equal(problem({ category, windows_test: undefined }), null, category);
 
   assert.match(problem({ category: undefined }), /has no category/);
   assert.match(problem({ category: "" }), /has no category/);

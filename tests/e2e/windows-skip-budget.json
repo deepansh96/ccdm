@@ -5,14 +5,14 @@
       "file": "codex-start.test.js",
       "test": "start-codex-session rejects an aliased Codex Home it cannot write",
       "tag": "posix",
-      "category": "posix-file-modes",
+      "category": "posix-only-behaviour",
       "reason": "a directory's mode bits do not limit writes on Windows"
     },
     {
       "file": "codex-start.test.js",
       "test": "start-codex-session rejects a non-writable Codex Home",
       "tag": "posix",
-      "category": "posix-file-modes",
+      "category": "posix-only-behaviour",
       "reason": "a directory's mode bits do not limit writes on Windows"
     },
     {
@@ -188,7 +188,7 @@
       "file": "stop-restart.test.js",
       "test": "during cutover, stop-session also sweeps a legacy pool Claude listener for the project's former pool bot",
       "tag": "posix",
-      "category": "posix-file-modes",
+      "category": "posix-only-behaviour",
       "reason": "sweeps listeners left from the pool bots that came before the Router; a Windows install never had them, so the Windows stop has no such sweep"
     },
     {
@@ -353,42 +353,42 @@
       "file": "platform-contract.test.js",
       "test": "atomic: writeFileAtomic gives a new target mode 0600 by default",
       "tag": "posix",
-      "category": "posix-file-modes",
+      "category": "posix-only-behaviour",
       "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
     },
     {
       "file": "platform-contract.test.js",
       "test": "atomic: writeFileAtomic sets exactly the given mode over an existing file",
       "tag": "posix",
-      "category": "posix-file-modes",
+      "category": "posix-only-behaviour",
       "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
     },
     {
       "file": "platform-contract.test.js",
       "test": "atomic: writeFileAtomicSync gives a new target mode 0600 by default",
       "tag": "posix",
-      "category": "posix-file-modes",
+      "category": "posix-only-behaviour",
       "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
     },
     {
       "file": "platform-contract.test.js",
       "test": "atomic: writeFileAtomicSync sets exactly the given mode over an existing file",
       "tag": "posix",
-      "category": "posix-file-modes",
+      "category": "posix-only-behaviour",
       "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
     },
     {
       "file": "platform-contract.test.js",
       "test": "atomic: write_file_atomic gives a new target mode 0600 by default",
       "tag": "posix",
-      "category": "posix-file-modes",
+      "category": "posix-only-behaviour",
       "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
     },
     {
       "file": "platform-contract.test.js",
       "test": "atomic: write_file_atomic sets exactly the given mode over an existing file",
       "tag": "posix",
-      "category": "posix-file-modes",
+      "category": "posix-only-behaviour",
       "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
     },
     {
@@ -538,42 +538,42 @@
       "file": "platform-contract.test.js",
       "test": "privacy: a 0700 directory has no blockers",
       "tag": "posix",
-      "category": "posix-file-modes",
+      "category": "posix-only-behaviour",
       "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
     },
     {
       "file": "platform-contract.test.js",
       "test": "privacy: a 0755 directory blocks with the chmod text",
       "tag": "posix",
-      "category": "posix-file-modes",
+      "category": "posix-only-behaviour",
       "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
     },
     {
       "file": "platform-contract.test.js",
       "test": "privacy: ensure leaves a 0700 directory",
       "tag": "posix",
-      "category": "posix-file-modes",
+      "category": "posix-only-behaviour",
       "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
     },
     {
       "file": "platform-contract.test.js",
       "test": "privacy: a 0600 file is private",
       "tag": "posix",
-      "category": "posix-file-modes",
+      "category": "posix-only-behaviour",
       "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
     },
     {
       "file": "platform-contract.test.js",
       "test": "privacy: a 0644 file is not private",
       "tag": "posix",
-      "category": "posix-file-modes",
+      "category": "posix-only-behaviour",
       "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
     },
     {
       "file": "platform-contract.test.js",
       "test": "privacy: write_private leaves a 0600 file",
       "tag": "posix",
-      "category": "posix-file-modes",
+      "category": "posix-only-behaviour",
       "reason": "asserts POSIX mode bits, which Windows files do not have; the access-list cases of the same module run on Windows"
     },
     {
@@ -591,7 +591,7 @@
       "file": "platform-contract.test.js",
       "test": "process: using the process helpers on POSIX does not load koffi",
       "tag": "posix",
-      "category": "posix-file-modes",
+      "category": "posix-only-behaviour",
       "reason": "the native library is loaded only on Windows, where the process helpers need it; there is nothing to assert there"
     },
     {
@@ -631,14 +631,14 @@
       "file": "platform-contract.test.js",
       "test": "tools: resolve-codex-home on POSIX keeps the error for an unset HOME",
       "tag": "posix",
-      "category": "posix-file-modes",
+      "category": "posix-only-behaviour",
       "reason": "the error names HOME, which POSIX uses for '~'; Windows takes '~' from the user profile and has no HOME to be unset"
     },
     {
       "file": "router-pipe.test.js",
       "test": "a live Unix socket blocks serve when no lock exists",
       "tag": "posix",
-      "category": "posix-file-modes",
+      "category": "posix-only-behaviour",
       "reason": "a Unix socket is a path a live listener can hold; a named pipe gets a new name on every serve, so there is nothing to find held"
     },
     {
