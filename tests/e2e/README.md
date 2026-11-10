@@ -204,6 +204,7 @@ The Claude usage-report scenarios drive `scripts/claude-usage.sh` with fixture h
 - The `curl` fixture records method, URL, path, query, headers, and body under `$CCDM_TEST_STATE`, matches extensible route entries by method/hostname/path/url, supports JSON and raw-body response modes, and blocks unapproved targets as network egress.
 - OAuth profile and usage routes are faked through `https://api.anthropic.com/api/oauth/{profile,usage}`. Malformed API responses are covered as current graceful warning behavior.
 - The `launchctl` fixture records LaunchAgent `unload`, `load`, and `list` calls under `$CCDM_TEST_STATE`; installer scenarios never touch the real user's LaunchAgents directory.
+- The script is the macOS and Linux report. On Windows the scenarios that need it to read the fixture home's history or more than one Keychain item are skipped (`posix`); `ccdm-usage.test.js` runs the same scenarios on `scripts/ccdm usage`, the Windows report.
 
 The tracked `scripts/usage-stats-poster.py` scenarios drive the manual Discord posting surface with the same Test Workspace and Keychain fixture plus a local HTTP fake for Anthropic and Discord:
 

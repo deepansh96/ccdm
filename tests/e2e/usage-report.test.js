@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { platformGate } from "./support/platform.js";
 import { createWorkspace, runScript } from "./support/runner.js";
 import { readState, updateState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
@@ -11,6 +12,12 @@ import { cleanup } from "./support/teardown.js";
 test.afterEach(async () => {
   await cleanup();
 });
+
+// claude-usage.sh is the macOS and Linux report; the Windows one is `ccdm usage`,
+// and ccdm-usage.test.js runs these cases on it. In Git Bash the script hands a
+// native Python the shell's own spelling of $HOME, which it cannot open, and a
+// second Keychain token reaches curl with a carriage return on it.
+const SCRIPT_REPORT = platformGate("posix", "claude-usage.sh is the macOS and Linux report");
 
 function serviceFor(configDir) {
   return `Claude Code-credentials-${crypto.createHash("sha256").update(configDir).digest("hex").slice(0, 8)}`;
@@ -147,7 +154,7 @@ function seedSecurityCredential(workspace) {
   });
 }
 
-test("claude usage report reads live OAuth data and local history from fixtures", async () => {
+test("claude usage report reads live OAuth data and local history from fixtures", SCRIPT_REPORT, async () => {
   const workspace = createWorkspace();
   seedClaudeUsageHome(workspace);
   seedAnthropicRoutes(workspace);
@@ -230,7 +237,7 @@ test("claude usage report uses whichever default-home Keychain item expires last
   }
 });
 
-test("claude usage report falls back to the other Keychain item when the API rejects a token", async () => {
+test("claude usage report falls back to the other Keychain item when the API rejects a token", SCRIPT_REPORT, async () => {
   const workspace = createWorkspace();
   seedMinimalStats(workspace);
   seedAnthropicRoutes(workspace);
@@ -376,7 +383,7 @@ test("usage report handles missing auth, malformed API responses, and missing lo
   assert.match(noStats.stdout, /stats-cache\.json not found/);
 });
 
-test("usage report tolerates corrupt session JSON while preserving stats and project output", async () => {
+test("usage report tolerates corrupt session JSON while preserving stats and project output", SCRIPT_REPORT, async () => {
   const workspace = createWorkspace();
   seedClaudeUsageHome(workspace);
   fs.writeFileSync(path.join(workspace.homeDir, ".claude", "sessions", "corrupt.json"), "{not json");
