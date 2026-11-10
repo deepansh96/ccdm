@@ -560,6 +560,10 @@ export async function startFakeCodexServer(workspace, options = {}) {
       if (!release) throw new Error(`No pending fake turn release for ${turnId}`);
       release();
     },
+    // Held turns not yet released, or released but not yet completed.
+    pendingReleases() {
+      return [...pendingTurnReleases.keys()];
+    },
     async close() {
       await new Promise((resolve) => server.close(resolve));
       if (httpServer.listening) await new Promise((resolve) => httpServer.close(resolve));
@@ -631,12 +635,20 @@ function bridgeOutput(source) {
 // steers a message or reaction that arrives during a turn into that turn. It
 // logs a turn's end only once it is idle, so what a test sends after this wait
 // starts a turn of its own.
-export async function waitForFinishedTurns(source, count, timeoutMs = 10000) {
+//
+// `codex`, when given, is the fake app-server the bridge talks to: a timeout then
+// also says what that server received and which held turns it still waits to
+// release, beside the bridge's stderr, where it reports a failed step.
+export async function waitForFinishedTurns(source, count, timeoutMs = 10000, codex = null) {
   const finished = () => (bridgeOutput(source).match(/\[turn\] Finished /g) ?? []).length;
   const deadline = Date.now() + scaledTimeout(timeoutMs);
   while (finished() < count) {
     if (Date.now() > deadline) {
-      throw new Error(`Timed out waiting for ${count} finished turn(s), saw ${finished()}; bridge output:\n${bridgeOutput(source)}`);
+      const received = codex ? `\nfake app-server received: ${JSON.stringify(codex.clientMessages.map((message) =>
+        message.method ? `${message.method}${message.params?.keyPath ? ` ${message.params.keyPath}` : ""}` : `answer to ${message.id}`))}`
+        + `\nturns it still holds: ${JSON.stringify(codex.pendingReleases())}` : "";
+      throw new Error(`Timed out waiting for ${count} finished turn(s), saw ${finished()}; bridge output:\n${bridgeOutput(source)}`
+        + `${typeof source.stderr === "string" ? `\nbridge stderr:\n${source.stderr}` : ""}${received}`);
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }

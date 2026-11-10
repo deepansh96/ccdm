@@ -544,7 +544,7 @@ test("attachment replies and successful optional text fallback produce confirmed
   codex.releaseTurn("upload-turn");
   // The next message must start the fallback turn, not steer the upload turn,
   // so it waits for the bridge to finish two turns: the bootstrap, then the upload.
-  await waitForFinishedTurns(bridge, 2);
+  await waitForFinishedTurns(bridge, 2, undefined, codex);
   injectDiscordMessage(workspace, { id: "fallback-owner", content: "plain answer" });
   await waitForState(workspace, (state) => state.fixtures.discord.messages.some((row) => row.content === "fallback answer" && row.webhookId === "fake-webhook-1"));
   // The fallback's receipt is recorded after its Discord post lands.
