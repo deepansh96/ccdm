@@ -77,12 +77,14 @@ const RULES = [
   { job: WINDOWS, name: "windows runs the full suite", ok: has(NPM_TEST) },
   { job: WINDOWS, name: "windows writes the per-file report", ok: has(REPORT_DIR) },
   { job: WINDOWS, name: "windows uploads the report", ok: has(/uses: actions\/upload-artifact@/) },
+  { job: WINDOWS, name: "windows does not rerun a failed file", ok: lacks(/CCDM_E2E_NO_RERUN/) },
 
   { job: REQUIRED, name: "required list runs on windows", ok: has(/runs-on: windows-latest/) },
   { job: REQUIRED, name: "required list can fail the PR", ok: lacks(CONTINUES) },
   { job: REQUIRED, name: "required list reads windows-required.txt", ok: has(/< tests\/e2e\/windows-required\.txt/) },
   { job: REQUIRED, name: "required list runs only the listed files", ok: job => /node tests\/run-e2e\.mjs "\$\{files\[@\]\}"/.test(job) && !NPM_TEST.test(job) },
   { job: REQUIRED, name: "required list refuses an empty list", ok: has(/lists no files[\s\S]*exit 1/) },
+  { job: REQUIRED, name: "required list reruns a failed file alone", ok: has(/^\s*CCDM_E2E_NO_RERUN: "0"\s*$/m) },
 
   { job: MACOS, name: "macos runs on macos", ok: has(/runs-on: macos-latest/) },
   { job: MACOS, name: "macos uses Node 22", ok: has(NODE_22) },
@@ -147,12 +149,14 @@ const BREAKS = {
   "windows runs the full suite": [WINDOWS, "run: npm test", "run: node tests/run-e2e.mjs tests/e2e/ci-contract.test.js"],
   "windows writes the per-file report": [WINDOWS, "CCDM_E2E_REPORT_DIR", "CCDM_E2E_OTHER_DIR"],
   "windows uploads the report": [WINDOWS, "actions/upload-artifact@v4", "actions/cache@v4"],
+  "windows does not rerun a failed file": [WINDOWS, "CCDM_E2E_JOBS: 4", 'CCDM_E2E_JOBS: 4\n          CCDM_E2E_NO_RERUN: "0"'],
 
   "required list runs on windows": [REQUIRED, "windows-latest", "ubuntu-latest"],
   "required list can fail the PR": [REQUIRED, "    timeout-minutes: 60", "    timeout-minutes: 60\n    continue-on-error: true"],
   "required list reads windows-required.txt": [REQUIRED, "tests/e2e/windows-required.txt", "tests/e2e/other.txt"],
   "required list runs only the listed files": [REQUIRED, 'node tests/run-e2e.mjs "${files[@]}"', "npm test"],
   "required list refuses an empty list": [REQUIRED, "lists no files", "is fine"],
+  "required list reruns a failed file alone": [REQUIRED, 'CCDM_E2E_NO_RERUN: "0"', 'CCDM_E2E_NO_RERUN: "1"'],
 
   "macos runs on macos": [MACOS, "macos-latest", "ubuntu-latest"],
   "macos uses Node 22": [MACOS, "node-version: 22", "node-version: 24"],

@@ -114,6 +114,10 @@ jobs:
         shell: bash
         env:
           CCDM_PYTHON: ${{ steps.python.outputs.python-path }}
+          # Rerun a failed file alone once, as on Linux and macOS (the runner's Windows
+          # default is off). A file that then passes is printed as FLAKY. The informational
+          # windows-e2e job leaves the rerun off so every intermittent failure shows.
+          CCDM_E2E_NO_RERUN: "0"
           # Outside the checkout: workspaces copy every untracked file in it.
           CCDM_E2E_REPORT_DIR: ${{ runner.temp }}/e2e-required-report
         run: |
