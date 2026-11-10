@@ -14,6 +14,18 @@ function Test-Usable([string]$Candidate) {
     return [bool]$Candidate -and ($Candidate -notmatch '\.(cmd|bat)$') -and ($Candidate -notmatch '[\\/]WindowsApps[\\/]')
 }
 
+# The file $Name in $Directory when it is there and usable, or nothing. Paths are
+# joined and tested through .NET, not Join-Path and Test-Path: the first cmdlet
+# from a module makes a PowerShell with no module cache yet read every installed
+# module to find it, which takes many seconds on a machine with many modules.
+function Find-Program([string]$Directory, [string]$Name) {
+    try {
+        $candidate = [System.IO.Path]::Combine($Directory, $Name).Replace('/', '\')
+        if ((Test-Usable $candidate) -and [System.IO.File]::Exists($candidate)) { return $candidate }
+    } catch { }
+    return $null
+}
+
 function Find-Python {
     foreach ($name in "CCDM_PYTHON", "CCDM_REMINDER_PYTHON") {
         $value = [Environment]::GetEnvironmentVariable($name)
@@ -26,16 +38,16 @@ function Find-Python {
         Where-Object { $_ -match '^([a-zA-Z]:[\\/]|[\\/]{2}[^\\/])' })
     # The launcher only finds the interpreter, which then runs without it.
     foreach ($directory in $directories) {
-        $launcher = Join-Path $directory "py.exe"
-        if (-not (Test-Usable $launcher) -or -not (Test-Path -LiteralPath $launcher -PathType Leaf)) { continue }
+        $launcher = Find-Program $directory "py.exe"
+        if (-not $launcher) { continue }
         try {
             $found = [string](& $launcher -3 -c "import sys; sys.stdout.write(sys.executable)" 2>$null)
             if ($LASTEXITCODE -eq 0 -and (Test-Usable $found)) { return $found }
         } catch { }
     }
     foreach ($directory in $directories) {
-        $interpreter = Join-Path $directory "python.exe"
-        if ((Test-Usable $interpreter) -and (Test-Path -LiteralPath $interpreter -PathType Leaf)) { return $interpreter }
+        $interpreter = Find-Program $directory "python.exe"
+        if ($interpreter) { return $interpreter }
     }
     return $null
 }
@@ -62,5 +74,5 @@ if (-not $recent) {
     Stop-WithPythonHelp "$python did not run, or is older than Python 3.11."
 }
 
-& $python (Join-Path $PSScriptRoot "scripts\ccdm.py") setup @args
+& $python ([System.IO.Path]::Combine($PSScriptRoot, "scripts\ccdm.py")) setup @args
 exit $LASTEXITCODE
