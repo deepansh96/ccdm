@@ -1254,8 +1254,6 @@ py -3 scripts\thread-supervisor.py preflight
 scripts\ccdm reminders preflight
 ```
 
-Some of the printed fixes still name a macOS `.sh` installer. On Windows, run `scripts\ccdm install-service <name>` for the same service.
-
 **A service stays stopped after `enable`.** After `py -3 scripts\thread-supervisor.py enable` or `scripts\ccdm reminders enable`, run `scripts\ccdm install-service <name>` again. `enable` alone starts nothing.
 
 **The install says a worker is already running outside the service.** A Thread Supervisor or reminder worker that you started by hand blocks the install. Stop it with Ctrl+C in its terminal, then install again.

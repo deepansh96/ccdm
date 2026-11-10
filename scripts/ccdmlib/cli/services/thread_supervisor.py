@@ -23,6 +23,11 @@ from ...platform import exe
 from ..start_codex_session import _FORWARDED_ON_WINDOWS
 
 TEMPLATE = "thread-supervisor.task.xml.in"
+HELP = (
+    "The task runs the Thread Supervisor, which starts and stops the sessions of Thread Conversations.",
+    "The install runs the supervisor's preflight first, which needs the Router running, and starts the task.",
+    "It takes no options.",
+)
 
 _WHAT = "Thread Supervisor"
 _SUPERVISOR = SCRIPTS_DIR / "thread-supervisor.py"

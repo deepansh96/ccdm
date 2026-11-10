@@ -368,6 +368,27 @@ test("start-codex-session rejects malformed resume arguments before changing sta
   }
 });
 
+test("start-codex-session --help and bad usage name the command as this OS runs it", async () => {
+  const workspace = createCodexWorkspace();
+  seedRegistry(workspace, buildCodexRegistry(workspace));
+  const form = "<project_name> [--resume <thread_uuid>]";
+
+  const help = await startCodex(workspace, { args: ["--help"] });
+
+  assert.equal(help.exitCode, 0, help.stderr || help.stdout);
+  // Windows types the subcommand under scripts/; elsewhere the help keeps the text it has always printed.
+  assert.equal(help.stdout.split(/\r?\n/)[0], `Usage: ${WIN ? "scripts/ccdm" : "ccdm"} start-codex-session ${form}`);
+  if (WIN) {
+    // Without a shim to name itself, as a Windows user runs it.
+    const bad = await runScript(workspace, "scripts/ccdm", {
+      args: ["start-codex-session", "alpha", "--resume"], env: routerEnv(workspace, await backendEnv(workspace)),
+    });
+    assert.equal(bad.exitCode, 1, bad.stdout);
+    assert.equal(bad.stderr.trim(), `Usage: scripts/ccdm start-codex-session ${form}`);
+  }
+  assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {});
+});
+
 test("start-codex-session launches a project under its Codex Account Alias home", async () => {
   const workspace = createCodexWorkspace();
   const projectAccountHome = path.join(workspace.homeDir, ".codex-project-account");
@@ -634,7 +655,11 @@ test("a Codex project without a webhook_id is refused before MCP cleanup, a key,
   const result = await startCodex(workspace);
 
   assert.equal(result.exitCode, 1, result.stderr || result.stdout);
-  assert.match(result.stderr, /Refusing to start 'alpha': it has no webhook_id, so its replies could not be posted\. Run scripts\/migrate-to-router\.sh alpha/);
+  // Windows has no pool bot to migrate from, and no migrate-to-router command: the fix there is the webhook alone.
+  const fix = WIN ? "Run node scripts/router.js ensure-webhook alpha, then retry."
+    : "Run scripts/migrate-to-router.sh alpha (or node scripts/router.js ensure-webhook alpha), then retry.";
+  assert.ok(result.stderr.includes(`Refusing to start 'alpha': it has no webhook_id, so its replies could not be posted. ${fix}`), result.stderr);
+  if (WIN) assert.doesNotMatch(result.stderr, /migrate-to-router/);
   assertNoLaunch(workspace, "no webhook_id");
   assert.equal(readState(workspace.stateDir).fixtures.codex.bridgeInvocations.length, 0);
   assert.equal(fs.readFileSync(config, "utf8"), staleConfig);
@@ -950,6 +975,7 @@ test("start-codex-session refuses duplicate bridge and app-server processes from
   assert.equal(bridgeResult.exitCode, 1);
   assert.match(bridgeResult.stdout, /existing Codex Discord bridge process\(es\)/);
   assert.match(bridgeResult.stdout, new RegExp(String(bridgePid)));
+  assert.match(bridgeResult.stdout, /^Run scripts\/stop-session\.sh 'alpha' first, then retry\.$/m);
   assert.equal(readState(bridgeWorkspace.stateDir).fixtures.tmux.sessions.alpha_codex, undefined);
   assert.equal(fs.existsSync(alphaKeyFile(bridgeWorkspace)), false);
 
@@ -1195,6 +1221,9 @@ test("on Windows a running bridge or app-server with this project's key file or 
     assert.equal(result.exitCode, 1, result.stderr || result.stdout);
     assert.match(result.stdout, /existing Codex Discord bridge process\(es\)/);
     assert.match(result.stdout, new RegExp(`\\b${child.pid}\\b`));
+    // The command as Windows has it: there is no stop-session.sh to run.
+    assert.match(result.stdout, /^Run scripts\/ccdm stop-session 'alpha' first, then retry\.\r?$/m);
+    assert.doesNotMatch(result.stdout, /\.sh\b/);
     assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_codex, undefined);
     assert.equal(fs.existsSync(alphaKeyFile(workspace)), false);
   }

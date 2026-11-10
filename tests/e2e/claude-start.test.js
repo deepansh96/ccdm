@@ -222,8 +222,11 @@ test("a Claude project without a webhook_id is refused before any key, launch fi
   const result = await startSession(workspace);
 
   assert.equal(result.exitCode, 1, result.stderr || result.stdout);
-  const migrate = WIN ? "scripts/ccdm migrate-to-router" : "scripts/migrate-to-router.sh";
-  assert.ok(result.stderr.includes(`Refusing to start 'alpha': it has no webhook_id, so its replies could not be posted. Run ${migrate} alpha`), result.stderr);
+  // Windows has no pool bot to migrate from, and no migrate-to-router command: the fix there is the webhook alone.
+  const fix = WIN ? "Run node scripts/router.js ensure-webhook alpha, then retry."
+    : "Run scripts/migrate-to-router.sh alpha (or node scripts/router.js ensure-webhook alpha), then retry.";
+  assert.ok(result.stderr.includes(`Refusing to start 'alpha': it has no webhook_id, so its replies could not be posted. ${fix}`), result.stderr);
+  if (WIN) assert.doesNotMatch(result.stderr, /migrate-to-router/);
   assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions, {});
   assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", "alpha.key")), false);
   assert.equal(fs.existsSync(launchDir(workspace)), false);

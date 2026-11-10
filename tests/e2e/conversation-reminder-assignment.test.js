@@ -393,6 +393,10 @@ test("an observed deregistration blocks an identical re-add until a new generati
   assert.equal(blocked.conversations.demo.due_at, null);
   assert.equal(blocked.conversations.demo.last_ack_message_id, null);
   assert.match(blocked.assignment_guidance, /assignment-changed --project demo/);
+  // The guidance names the reminder command as this OS runs it.
+  const remindersCommand = process.platform === "win32" ? "scripts/ccdm reminders" : "scripts/conversation-reminder-service.py";
+  assert.ok(blocked.assignment_guidance.includes(`run ${remindersCommand} assignment-changed --project demo.`),
+    blocked.assignment_guidance);
 
   const changed = await command(workspace, context.stateDir, "assignment-changed", { args: ["--project", "demo"] });
   const renewed = await command(workspace, context.stateDir, "status");

@@ -172,6 +172,8 @@ async function readiness(workspace) {
 }
 
 const eventTypes = report => report.events.map(event => event.event_type);
+// How readiness names the launcher in its fix: the script on macOS and Linux, the subcommand on Windows.
+const START_SESSION = process.platform === "win32" ? "scripts/ccdm start-session" : "scripts/start-session.sh";
 const windowsOnly = platformGate("win32", "POSIX readiness keeps os.kill and ps, and its marker carries no start time");
 
 // The channel server records its events one after another, each through a
@@ -354,8 +356,9 @@ for (const [name, change] of [
     const { exitCode, report } = await readiness(workspace);
     await channel.stop();
     assert.equal(exitCode, 2);
-    assert.match(report.unsupported_capabilities.join(" "),
-      /Claude launch-scoped transport is not verified for this assignment; restart the session with scripts\/start-session\.sh demo/);
+    assert.ok(report.unsupported_capabilities.join(" ").includes(
+      `Claude launch-scoped transport is not verified for this assignment; restart the session with ${START_SESSION} demo`),
+    report.unsupported_capabilities.join(" "));
   });
 }
 
@@ -659,8 +662,13 @@ test("a killed Claude channel server never leaves a stale ready transport", asyn
   assert.equal(fs.existsSync(marker), true);
   const dead = await readiness(workspace);
   assert.equal(dead.exitCode, 2);
-  assert.match(dead.report.unsupported_capabilities.join(" "),
-    /Claude launch-scoped transport is not running for this assignment; restart the session with scripts\/start-session\.sh demo/);
+  assert.ok(dead.report.unsupported_capabilities.join(" ").includes(
+    `Claude launch-scoped transport is not running for this assignment; restart the session with ${START_SESSION} demo`),
+  dead.report.unsupported_capabilities.join(" "));
+  // The plain report points at the reminder command as this OS runs it.
+  const plain = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo"], env: routerEnv(workspace) });
+  const remindersCommand = process.platform === "win32" ? "scripts/ccdm reminders" : "scripts/conversation-reminder-service.py";
+  assert.ok(plain.stdout.split(/\r?\n/).includes(`Reminder delivery: see ${remindersCommand} status`), plain.stdout);
 
   const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"], env: await launcherEnv(workspace) });
   assert.equal(stopped.exitCode, 0, stopped.stderr || stopped.stdout);

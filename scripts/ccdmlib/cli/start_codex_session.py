@@ -30,7 +30,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
-from ..platform import atomic, exe, private_fs, proc, session_host
+from ..platform import atomic, commands, exe, private_fs, proc, session_host
 from ..platform.paths import expand_home, same_path, state_root
 from ._detach import detach_if_self
 
@@ -38,6 +38,8 @@ WIN32 = sys.platform == "win32"
 _COMMAND = "start-codex-session"
 _ARGUMENT_FORM = "<project_name> [--resume <thread_uuid>]"
 _INVOKED_AS = "CCDM_INVOKED_AS"
+# What the usage line calls the command when no shim names itself.
+_DEFAULT_INVOCATION = f"scripts/ccdm {_COMMAND}" if commands.WIN32 else f"ccdm {_COMMAND}"
 _KEY_FILE_FLAG = "--ccdm-key-file"
 _BRIDGE_SCRIPT = "scripts/codex-bridge.js"
 _DEFAULT_LAUNCH_TIMEOUT_S = 120
@@ -458,7 +460,7 @@ def _is_canonical_uuid(value: str) -> bool:
 
 def _parse(arguments: List[str]) -> Tuple[Optional[int], str, str]:
     """(exit code if the arguments end the command, project, resume thread)."""
-    invoked = os.environ.get(_INVOKED_AS) or f"ccdm {_COMMAND}"
+    invoked = os.environ.get(_INVOKED_AS) or _DEFAULT_INVOCATION
     project = arguments[0] if arguments else ""
     resume = ""
     if len(arguments) > 1:
@@ -478,7 +480,7 @@ def _parse(arguments: List[str]) -> Tuple[Optional[int], str, str]:
 def handler(args: argparse.Namespace) -> int:
     arguments: List[str] = list(args.arguments)
     if arguments in (["--help"], ["-h"]):
-        _say(_usage(f"ccdm {_COMMAND}"))
+        _say(_usage(_DEFAULT_INVOCATION))
         _say("Starts a registered Codex project's bridge as a hosted session.")
         return 0
     stop_code, project_name, resume = _parse(arguments)
@@ -521,7 +523,7 @@ def handler(args: argparse.Namespace) -> int:
         )
         for pid in existing:
             _say(f"  {pid}")
-        _say(f"Run scripts/stop-session.sh '{project_name}' first, then retry.")
+        _say(f"Run {commands.script_ref('stop-session')} '{project_name}' first, then retry.")
         return 1
 
     # The Router posts replies only through the project's webhook: a project
@@ -529,7 +531,7 @@ def handler(args: argparse.Namespace) -> int:
     if not project.webhook_id:
         _complain(
             f"Refusing to start '{project_name}': it has no webhook_id, so its replies could not be posted. "
-            f"Run scripts/migrate-to-router.sh {project_name} (or node scripts/router.js ensure-webhook {project_name}), then retry."
+            f"{commands.webhook_fix(project_name)}, then retry."
         )
         return 1
 

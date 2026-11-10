@@ -14,10 +14,14 @@ import sqlite3
 import sys
 
 from ccdmlib.platform import filelock
+from ccdmlib.platform.commands import message_prefix
 
 from . import control, lifecycle, registry, store
 from .paths import default_state_dir, router_state_dir
 from .worker import lock_path
+
+# What each error line starts with: the command the operator ran.
+PREFIX = message_prefix("stop-session")
 
 
 def _say(message: str) -> None:
@@ -28,7 +32,7 @@ def _rows(state_dir, project: str) -> list[dict]:
     try:
         inspected = store.inspect(state_dir) or {}
     except (OSError, ValueError, sqlite3.Error) as error:
-        print(f"stop-session.sh: the thread store could not be read: {error}", file=sys.stderr)
+        print(f"{PREFIX}: the thread store could not be read: {error}", file=sys.stderr)
         return []
     return [row for row in inspected.get("threads", []) if row["project"] == project]
 
@@ -85,7 +89,7 @@ def sweep(project_root, state_dir, project: str) -> list[str]:
     try:
         _mark_stopped(state_dir, project)
     except (OSError, ValueError, sqlite3.Error) as error:
-        print(f"stop-session.sh: the thread store could not be updated: {error}", file=sys.stderr)
+        print(f"{PREFIX}: the thread store could not be updated: {error}", file=sys.stderr)
     return stopped
 
 
@@ -99,7 +103,7 @@ def main(project_root, project: str) -> int:
         return 0
     if not response.get("ok"):
         error = response.get("error") or {}
-        print(f"stop-session.sh: {error.get('message') or error.get('code')}", file=sys.stderr)
+        print(f"{PREFIX}: {error.get('message') or error.get('code')}", file=sys.stderr)
         return 1
     stopped = (response.get("result") or {}).get("stopped") or []
     _say(f"Stopped {len(stopped)} thread session(s) for '{project}'")

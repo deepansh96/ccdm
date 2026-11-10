@@ -20,6 +20,13 @@ from ...platform.session_host import SessionHostError
 
 TEMPLATE = "host.task.xml.in"
 ACCEPTS_OPTIONS = True
+OPTIONS = "[--force]"
+HELP = (
+    "The task runs ccdm-host, which holds every session, and the install starts it.",
+    "Installing the host ends every live session, so the install refuses while one is live",
+    "and prints how to upgrade and keep the conversations.",
+    "  --force  install now and end the live sessions",
+)
 
 # The host drops every CCDM_* name it inherits, so the state root is passed on
 # explicitly. CCDM_HOST_KEEP_AWAKE turns on the power request held while project
@@ -124,12 +131,16 @@ def _refusal(sessions: Sequence[Dict[str, Any]]) -> ServiceError:
         1,
         f"Error: ccdm-host has {count}, and installing the host ends every one; the existing task was left unchanged",
         *_session_lines(sessions),
-        "To upgrade the host and keep the conversations:",
-        "  1. Note each session's id: scripts/ccdm status",
-        "  2. Stop each session: scripts/ccdm stop-session <project>",
-        "  3. Install the host: scripts/ccdm install-service host",
-        "  4. Start each session again: scripts/ccdm start-session <project> --resume <id>",
-        "To install now and end these sessions: scripts/ccdm install-service host --force",
+        "To upgrade the host and keep the conversations, from a terminal outside CCDM:",
+        "  1. Note each project's conversation id: scripts/ccdm status",
+        "  2. Stop each project and its threads: scripts/ccdm stop-session <project> --all",
+        "  3. Install the host; --force ends the sessions that are left, such as root: "
+        "scripts/ccdm install-service host --force",
+        "  4. Start root: scripts/ccdm restart-root",
+        "  5. Start each Claude project with its id: scripts/ccdm start-session <project> --resume <id>",
+        "     A Codex project starts with scripts/ccdm start-codex-session <project>; status shows no id for it.",
+        "     A thread resumes its conversation at your next message in it.",
+        "To install now and end these sessions, run step 3 alone.",
     )
 
 
