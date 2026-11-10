@@ -6,11 +6,12 @@ import test from "node:test";
 import { injectDiscordMessage } from "./support/bridge.js";
 import { OWNER_ID, createRouterWorkspace, routerRegistry, routerWithWebhooks, runRouterCli, seedThreads,
   startRouter, waitFor } from "./support/router.js";
-import { PYTHON } from "./support/platform.js";
+import { PYTHON, platformGate } from "./support/platform.js";
 import { callSeam } from "./support/session-fixture.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup, workspaceOwnsPid } from "./support/teardown.js";
-import { startThreadSupervisor, supervisorEnv, supervisorStatus } from "./support/thread-supervisor.js";
+import { expectLateThreadHost, startThreadHost, startThreadSupervisor, supervisorEnv, supervisorStatus }
+  from "./support/thread-supervisor.js";
 
 test.afterEach(cleanup);
 
@@ -394,4 +395,67 @@ test("on restart, an owner's native reply to a root-bot message is root's and st
 
   assert.equal((await threadRows(workspace))[raw.id].state, "registered");
   assert.deepEqual(claude(workspace).invocations ?? [], []);
+});
+
+// At logon the worker's task and ccdm-host's start in no order, so the worker's
+// first launch waits for the host, 90 s at most. The scale divides that.
+const beforeHost = platformGate("win32", "only the ccdm-host backend has a host to wait for");
+const hostWait = scale => ({ ...ENV, CCDM_THREAD_HOST_WAIT_TIME_SCALE: String(scale) });
+const notices = (workspace, threadId) => threadPosts(workspace, threadId).filter(message => !message.webhookId)
+  .map(message => message.content);
+
+// A bound thread whose owner message nobody answered, and no ccdm-host yet.
+async function unansweredWithNoHost(workspace, raw) {
+  expectLateThreadHost(workspace);
+  await routerWithWebhooks(workspace, ["demo"]);
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.replyText = "on it";
+  });
+  const first = await startThreadSupervisor(workspace, { env: ENV });
+  threadEvent(workspace, raw, "create");
+  await threadRow(workspace, raw.id);
+  assert.equal((await first.stop()).exitCode, 0);
+  threadMessage(workspace, raw.id, "before-host", "is the build green?");
+  await waitFor(() => reactions(workspace, raw.id).length === 1, () => "the 💤 mark");
+  seedHistory(workspace, raw.id, [["before-host", owner, "is the build green?"]]);
+}
+
+test("a worker that starts before ccdm-host holds its first launch until the host answers, then starts the unanswered thread with no failure notice", beforeHost, async () => {
+  const workspace = reconcileWorkspace();
+  const raw = thread("1700000000000390001");
+  await unansweredWithNoHost(workspace, raw);
+
+  const supervisor = await startThreadSupervisor(workspace, { env: hostWait(3) });
+  await threadRow(workspace, raw.id, row => row.state === "booting");
+  await settle(2000);
+  assert.equal((await threadRows(workspace))[raw.id].state, "booting");
+  assert.deepEqual(claude(workspace).invocations ?? [], []);
+  await startThreadHost(workspace);
+
+  await threadRow(workspace, raw.id, row => row.state === "live");
+  await waitFor(() => threadPosts(workspace, raw.id).length === 1, () => "the bootstrap reply", 15000);
+  assert.deepEqual(notices(workspace, raw.id), []);
+  assert.deepEqual(notifications(workspace, raw.id).map(notification => notification.meta.message_id), ["before-host"]);
+  assert.deepEqual(await hostSessions(workspace), [tmuxName(raw.id)]);
+  const { exitCode, stderr } = await supervisor.stop();
+  assert.equal(exitCode, 0);
+  assert.equal(occurrences(stderr, "ccdm-host does not answer yet; waiting up to 90 s"), 1, stderr);
+  assert.equal(occurrences(stderr, "ccdm-host answers; launching"), 1, stderr);
+});
+
+test("when ccdm-host never answers, the first launch goes ahead after the bounded wait and fails with the usual notice", beforeHost, async () => {
+  const workspace = reconcileWorkspace();
+  const raw = thread("1700000000000390002");
+  await unansweredWithNoHost(workspace, raw);
+
+  const supervisor = await startThreadSupervisor(workspace, { env: hostWait(30) });
+
+  const row = await threadRow(workspace, raw.id, current => current.state === "stopped");
+  assert.deepEqual([row.state, row.stop_reason], ["stopped", "start-failed"]);
+  await waitFor(() => notices(workspace, raw.id).length === 1, () => "the start-failure notice", 15000);
+  assert.match(notices(workspace, raw.id)[0], /^Thread session failed to start: /);
+  assert.deepEqual(claude(workspace).invocations ?? [], []);
+  const { exitCode, stderr } = await supervisor.stop();
+  assert.equal(exitCode, 0);
+  assert.equal(occurrences(stderr, "ccdm-host did not answer after 90 s; launching anyway"), 1, stderr);
 });

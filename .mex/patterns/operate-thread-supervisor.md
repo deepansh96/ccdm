@@ -22,16 +22,16 @@ last_updated: 2026-11-10
 ## Context
 Read `docs/thread-supervisor.md`. The supervisor is a Router client (`supervisor` role) with no Discord credential. It owns Thread Conversation lifecycle; the Router routes thread traffic. Its private state is `~/.local/state/ccdm/thread-supervisor/`.
 
-Thread sessions launch on both OSes, and the operator's thread commands run on both. The supervisor's service exists on macOS only today; each Windows line below that says pending names the issue that adds it.
+Thread sessions launch on both OSes, and the operator's thread commands run on both. The supervisor's service is a LaunchAgent on macOS and the scheduled task `\CCDM\ThreadSupervisor` on Windows; both run the same `run --supervised` worker.
 
 ## Steps
 1. Make sure root has Create Public Threads, Send Messages in Threads and Manage Threads in the project channels, and View Audit Log on the guild. These are granted once by hand in Discord, never by a script.
 2. Install supervision only when the operator asks.
    - macOS: run `scripts/install-thread-supervisor.sh`. It runs the read-only `preflight` first and changes nothing if a check fails.
-   - Windows: pending (#249). There is no Thread Supervisor service to install yet.
+   - Windows: run `scripts/ccdm install-service thread-supervisor`. It runs the same read-only `preflight` first, prints each blocker, exits 2 and changes nothing if a check fails. It refuses while a worker started by hand is running. `scripts/ccdm uninstall-service thread-supervisor` removes the task and leaves thread sessions running.
 3. Inspect the supervisor and the Router.
    - macOS: `scripts/thread-supervisor.py status` shows the worker, caps, `capacity.invalid` and bound threads.
-   - Windows: pending (#249) for the supervisor's status.
+   - Windows: `py -3 scripts\thread-supervisor.py status` shows the same. `scripts/ccdm service-status thread-supervisor` shows the task (`running`, `backoff`, `crashloop`, `disabled`), and its logs are `~/.local/state/ccdm/services/thread-supervisor.log` and `.err`.
    - Both: `node scripts/router.js status` shows the `thread` lines, the `supervisor:` line, `thread_permissions=` per project and `guild permissions:`.
 4. Operate threads.
    - macOS: `scripts/threads.sh list [<project>]`, `scripts/threads.sh create <project> <name> [flags] [message]`, and `scripts/threads.sh stop|restart|close [<project>] <name|link|id>`.
@@ -40,7 +40,7 @@ Thread sessions launch on both OSes, and the operator's thread commands run on b
 5. To stop a project's thread sessions, run `scripts/ccdm stop-session <project> --threads`; `--all` also stops the channel. A plain `scripts/ccdm stop-session <project>` or "restart <project>" touches the channel only.
 6. Debug in the foreground.
    - macOS: run `scripts/thread-supervisor.py disable`, then `scripts/thread-supervisor.py run`; `enable` clears the disabled marker but starts nothing, so rerun `scripts/install-thread-supervisor.sh` after it to relaunch the LaunchAgent.
-   - Windows: pending (#249).
+   - Windows: run `py -3 scripts\thread-supervisor.py disable`, then `py -3 scripts\thread-supervisor.py run`. The supervised worker exits 0 on `disable` and the task does not restart it. `enable` clears the marker but starts nothing, so rerun `scripts/ccdm install-service thread-supervisor` after it.
 
 ## Gotchas
 - Never edit `threads.sqlite3` by hand; use the thread commands in step 4 or Discord actions (archive, delete, a new owner message).

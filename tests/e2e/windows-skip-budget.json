@@ -373,6 +373,24 @@
       "test": "a crash after durable claim but before the Discord request is released without resending during recovery",
       "tag": "posix",
       "reason": "the crash is injected by a shell script standing in for Python; on Windows that must be a real program"
+    },
+    {
+      "file": "usage-report.test.js",
+      "test": "claude usage report reads live OAuth data and local history from fixtures",
+      "tag": "posix",
+      "reason": "claude-usage.sh reads the Keychain and passes $HOME paths to python3, which a native Windows Python cannot open; ccdm-usage.test.js checks every section of `ccdm usage` on Windows"
+    },
+    {
+      "file": "usage-report.test.js",
+      "test": "claude usage report falls back to the other Keychain item when the API rejects a token",
+      "tag": "posix",
+      "reason": "claude-usage.sh reads two Keychain items line by line, and a native Windows Python ends each with a carriage return; ccdm-usage.test.js runs the same fallback on `ccdm usage` on Windows"
+    },
+    {
+      "file": "usage-report.test.js",
+      "test": "usage report tolerates corrupt session JSON while preserving stats and project output",
+      "tag": "posix",
+      "reason": "claude-usage.sh passes $HOME paths to python3, which a native Windows Python cannot open; ccdm-usage.test.js runs the corrupt-session case on `ccdm usage` on Windows"
     }
   ]
 }
