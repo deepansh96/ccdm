@@ -589,6 +589,8 @@ export function injectDiscordMessage(workspace, message = {}) {
       ...(message.webhookId ? { webhookId: message.webhookId } : {}),
       ...(message.createdTimestamp ? { createdTimestamp: message.createdTimestamp } : {}),
       ...(message.replyTo ? { replyTo: message.replyTo } : {}),
+      // Mentioned users that are bots, besides the gateway's own bot.
+      ...(message.botIds ? { botIds: message.botIds } : {}),
     });
   });
 }

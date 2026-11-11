@@ -397,3 +397,47 @@ test("router status exits non-zero when the Router is not running", async () => 
   assert.notEqual(status.exitCode, 0);
   assert.match(status.stderr, /router unreachable/);
 });
+
+// View Channel is permission bit 10; the guild's @everyone role has the guild's id.
+const DENY_EVERYONE_VIEW = { id: "guild-id", type: 0, allow: "0", deny: "1024" };
+
+test("router status warns when @everyone can view a shared root channel and is silent when it cannot", async () => {
+  const workspace = createRouterWorkspace({ ...routerRegistry(), root_channels: ["private-roots", "open-roots", "own-root"],
+    shared_root_channels: ["private-roots", "open-roots"] });
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.channels = [
+      { id: "private-roots", permission_overwrites: [DENY_EVERYONE_VIEW] },
+      { id: "open-roots", permission_overwrites: [] },
+      { id: "own-root", permission_overwrites: [] },
+    ];
+  });
+  await startRouter(workspace);
+
+  const text = await runRouterCli(workspace, ["status"]);
+  const json = await runRouterCli(workspace, ["status", "--json"]);
+
+  assert.equal(text.exitCode, 0, text.stderr || text.stdout);
+  assert.deepEqual(text.stdout.split("\n").filter(line => /shared root channel|@everyone/.test(line)), [
+    "warning: @everyone can view shared root channel open-roots; deny View Channel to @everyone there",
+  ]);
+  assert.deepEqual(JSON.parse(json.stdout).shared_root_channels, [
+    { channel_id: "private-roots", everyone_can_view: false },
+    { channel_id: "open-roots", everyone_can_view: true },
+  ]);
+});
+
+test("router status without shared_root_channels reports exactly the fields and lines it always has", async () => {
+  const workspace = createRouterWorkspace({ ...routerRegistry(), root_channels: ["open-root"] });
+  await startRouter(workspace);
+
+  const text = await runRouterCli(workspace, ["status"]);
+  const json = await runRouterCli(workspace, ["status", "--json"]);
+
+  assert.equal(json.exitCode, 0, json.stderr || json.stdout);
+  assert.deepEqual(Object.keys(JSON.parse(json.stdout)), ["gateway", "registry_loaded_at", "registry_error", "sessions",
+    "supervisor", "projects", "scope_violations", "threads_enabled"]);
+  // `guild permissions:` shows only while Thread Conversations are enabled on the host.
+  assert.deepEqual(text.stdout.split("\n").filter(line => !line.startsWith("guild permissions:")).map(line => line.replace(/^(\s*\S+).*$/, "$1")), [
+    "gateway:", "registry", "sessions:", "supervisor:", "webhooks:", "  demo", "  beta", "  legacy", "scope", "",
+  ]);
+});

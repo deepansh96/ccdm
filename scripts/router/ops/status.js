@@ -24,6 +24,22 @@ async function missingPermissions(ctx, channelId, flags = ROOT_PERMISSIONS) {
   return flags.filter(flag => !permissions?.has(flag));
 }
 
+// Whether @everyone can view a shared root channel, from the gateway's cached
+// channel overwrites and roles; null before the gateway can tell.
+async function everyoneCanView(ctx, channelId) {
+  const client = ctx.discord?.client;
+  if (!client?.user) return null;
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  const everyone = channel?.guild?.roles?.everyone;
+  if (!everyone) return null;
+  try {
+    const permissions = channel.permissionsFor(everyone);
+    return permissions ? permissions.has("ViewChannel") : null;
+  } catch {
+    return null;
+  }
+}
+
 // Root's standing in one registered channel, for `args.project`.
 async function target(ctx, project) {
   const channelId = [...ctx.table.registered].find(([, name]) => name === project)?.[0];
@@ -42,6 +58,10 @@ async function status(ctx, args = {}) {
       missing_thread_permissions: await missingPermissions(ctx, route.channel_id, THREAD_PERMISSIONS),
     });
   }
+  const shared = [];
+  for (const channelId of ctx.table.sharedRootChannels ?? []) {
+    shared.push({ channel_id: channelId, everyone_can_view: await everyoneCanView(ctx, channelId) });
+  }
   const supervisor = ctx.supervisor?.();
   return {
     gateway: ctx.gateway.state,
@@ -56,6 +76,8 @@ async function status(ctx, args = {}) {
     })),
     supervisor: { connected: Boolean(supervisor), connected_at: supervisor?.connectedAt ?? null },
     projects,
+    // Only with `shared_root_channels`, so a registry without it reports as before.
+    ...(shared.length ? { shared_root_channels: shared } : {}),
     scope_violations: ctx.violations(),
     ...(args.project === undefined ? {} : { target: await target(ctx, String(args.project)) }),
   };

@@ -23,7 +23,7 @@ edges:
     condition: when the request is to register or deregister a project
   - target: patterns/debug-discord-session.md
     condition: when a command here fails or a session does not answer
-last_updated: 2026-11-10
+last_updated: 2026-11-11
 ---
 
 # Root Commands
@@ -161,6 +161,7 @@ Triggers: a voice message, or any audio attachment (`.ogg`), sent to root.
 - A voice message in a Codex project channel needs none of this: the Codex bridge transcribes it before the turn starts.
 
 ## Gotchas
+- In a shared root channel (`shared_root_channels`), "list", "status" and "usage" are about your own machine only. Ignore a request that names the other machine, and point the owner at its bot by the name in `CLAUDE.local.md`. See `context/discord-security.md`.
 - `scripts/ccdm` must run in the Bash tool. In PowerShell or cmd the entry is `scripts\ccdm.cmd`, where `&` and `|` inside an argument can run as commands. That is why free text goes through `--stdin` or `--file`.
 - A session that is stopped in `scripts/ccdm list` can still have a leftover listener. `scripts/ccdm stop-session <project>` sweeps it.
 - `scripts/ccdm restart-session <project>` run from inside that project's own session hands off and exits 0 before the restart is done. Root is never inside a project session, so root sees the real result.

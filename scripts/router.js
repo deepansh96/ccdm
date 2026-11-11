@@ -262,6 +262,11 @@ async function status(json = false) {
       : "unknown";
     console.log(`guild permissions: ${guild}`);
   }
+  // A shared root channel must be private: warn when it is not, say nothing when it is.
+  for (const { channel_id: channelId, everyone_can_view: view } of result.shared_root_channels ?? []) {
+    if (view) console.log(`warning: @everyone can view shared root channel ${channelId}; deny View Channel to @everyone there`);
+    else if (view === null) console.log(`shared root channel ${channelId}: privacy unknown until the gateway is ready`);
+  }
   console.log(`scope violations: ${result.scope_violations.length}`);
   for (const violation of result.scope_violations) {
     console.log(`  ${violation.at} project=${violation.project} op=${violation.op} target=${violation.target}`);

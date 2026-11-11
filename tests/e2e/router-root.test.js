@@ -312,3 +312,112 @@ test("a guest addressing the bot in a project thread reaches neither root nor th
   assert.deepEqual(root.events, []);
   assert.deepEqual(threadIds(thread.events), []);
 });
+
+// Another machine's root bot, sharing a root channel with this Router's.
+const OTHER_BOT = "other-bot-id";
+const owner = { id: OWNER_ID, username: "Owner" };
+
+// Root's routes for `shared` set on `shared-channel`, beside the non-shared `root-channel`.
+async function sharedRoot(shared = ["shared-channel"]) {
+  const registry = { ...rootRegistry(), root_channels: ["root-channel", "shared-channel"] };
+  if (shared) registry.shared_root_channels = shared;
+  const workspace = createRouterWorkspace(registry);
+  writeRootKey(workspace, "root-key");
+  await routerWithWebhooks(workspace, ["demo"]);
+  const root = await connectRoot(workspace, "root-key");
+  const demo = await connectSession(workspace, "demo", "demo-key");
+  return { workspace, root, demo };
+}
+
+// The tag and reply cases of one root channel, each named `<prefix>-<case>`:
+// the bot messages a reply can point at first, then the owner's messages.
+function injectTagCases(workspace, channelId, prefix) {
+  injectDiscordMessage(workspace, { id: `${prefix}-root-said`, channelId, content: "this machine: 3 projects",
+    author: { id: BOT_ID, username: "Root", bot: true } });
+  injectDiscordMessage(workspace, { id: `${prefix}-other-said`, channelId, content: "other machine: 2 projects",
+    author: { id: OTHER_BOT, username: "Other Root", bot: true } });
+  const cases = [
+    ["tag-mine", `<@${BOT_ID}> list`],
+    ["tag-other", `<@${OTHER_BOT}> list`],
+    ["tag-other-nick", `<@!${OTHER_BOT}> list`],
+    ["tag-both", `<@${OTHER_BOT}> <@!${BOT_ID}> list`],
+    ["untagged", "list"],
+    ["tag-person", "<@helper-id> can you look?"],
+    ["tag-role", "<@&other-bot-role-id> list"],
+    ["reply-other", "and usage?", `${prefix}-other-said`],
+    ["reply-mine", "and usage?", `${prefix}-root-said`],
+    ["reply-other-tag-mine", `<@${BOT_ID}> you too`, `${prefix}-other-said`],
+  ];
+  for (const [name, content, replyTo] of cases) {
+    injectDiscordMessage(workspace, { id: `${prefix}-${name}`, channelId, content, replyTo, botIds: [OTHER_BOT],
+      author: owner });
+  }
+}
+
+test("in a shared root channel, tagging or replying to another bot is for that bot's root", async () => {
+  const { workspace, root, demo } = await sharedRoot();
+
+  injectTagCases(workspace, "shared-channel", "shared");
+  injectTagCases(workspace, "root-channel", "own");
+  await settle(workspace, demo);
+
+  assert.deepEqual(ids(root.events), [
+    "shared-tag-mine", "shared-tag-both", "shared-untagged", "shared-tag-person", "shared-tag-role",
+    "shared-reply-mine", "shared-reply-other-tag-mine",
+    // A non-shared root channel still delivers every owner message, as before.
+    "own-tag-mine", "own-tag-other", "own-tag-other-nick", "own-tag-both", "own-untagged", "own-tag-person",
+    "own-tag-role", "own-reply-other", "own-reply-mine", "own-reply-other-tag-mine",
+  ]);
+  assert.deepEqual(ids(demo.events), []);
+});
+
+test("in a shared root channel, a reaction on another bot's message is for that bot's root", async () => {
+  const { workspace, root, demo } = await sharedRoot();
+  const otherMessage = { author: { id: OTHER_BOT, username: "Other Root", bot: true }, content: "other machine" };
+  const botMessage = { author: { id: BOT_ID, username: "Root", bot: true }, content: "this machine" };
+  const ownerMessage = { author: { ...owner, bot: false }, content: "list" };
+  const inject = (id, channelId, message) =>
+    injectDiscordReaction(workspace, { id, channelId, emoji: "👍", messageId: `${id}-message`, user: owner, message });
+  inject("shared-on-other", "shared-channel", otherMessage);
+  inject("shared-on-other-partial", "shared-channel", { ...otherMessage, partial: true });
+  inject("shared-on-mine", "shared-channel", { ...botMessage, partial: true });
+  inject("shared-on-owner", "shared-channel", ownerMessage);
+  inject("own-on-other", "root-channel", otherMessage);
+  inject("fence", "demo-channel", ownerMessage);
+  await waitFor(() => demo.events.length > 0, () => "the demo reaction");
+  await waitFor(() => root.events.length >= 3, () => "three root reactions");
+  await new Promise(resolve => setTimeout(resolve, 150));
+
+  assert.deepEqual(root.events.map(({ message_id, message_from_bot }) => ({ message_id, message_from_bot })), [
+    { message_id: "shared-on-mine-message", message_from_bot: true },
+    { message_id: "shared-on-owner-message", message_from_bot: false },
+    { message_id: "own-on-other-message", message_from_bot: false },
+  ]);
+});
+
+test("without shared_root_channels every root channel routes owner messages and reactions as before", async () => {
+  const { workspace, root, demo } = await sharedRoot(null);
+
+  injectTagCases(workspace, "shared-channel", "shared");
+  injectDiscordReaction(workspace, { id: "on-other", channelId: "shared-channel", emoji: "👍", messageId: "on-other-message",
+    user: owner, message: { author: { id: OTHER_BOT, username: "Other Root", bot: true }, content: "other machine" } });
+  await waitFor(() => root.events.some(event => event.event === "reaction"), () => "the root reaction");
+  await settle(workspace, demo);
+
+  const messages = root.events.filter(event => event.event === "message");
+  assert.deepEqual(ids(messages), ["tag-mine", "tag-other", "tag-other-nick", "tag-both", "untagged", "tag-person",
+    "tag-role", "reply-other", "reply-mine", "reply-other-tag-mine"].map(name => `shared-${name}`));
+  // The whole event, field for field, as root has always received it.
+  const replyOther = messages.find(event => event.message_id === "shared-reply-other");
+  assert.deepEqual({ ...replyOther, ts: "ts" }, {
+    type: "event", event: "message", message_id: "shared-reply-other", channel_id: "shared-channel",
+    author: { id: OWNER_ID, name: "Owner", is_owner: true }, content: "and usage?", attachments: [],
+    reply_to: "shared-other-said", ts: "ts",
+  });
+  const reaction = root.events.find(event => event.event === "reaction");
+  assert.deepEqual({ ...reaction, ts: "ts" }, {
+    type: "event", event: "reaction", message_id: "on-other-message", channel_id: "shared-channel", emoji: "👍",
+    message_webhook_id: null, message_author_id: OTHER_BOT, message_from_bot: false, message_content: "other machine",
+    user: { id: OWNER_ID, name: "Owner", is_owner: true }, ts: "ts",
+  });
+});

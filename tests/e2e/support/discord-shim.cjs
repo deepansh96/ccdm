@@ -46,10 +46,16 @@ function fixtureChannel(id, overrides = {}) {
         throw new TypeError("Cannot read properties of undefined (reading 'permissions')");
       }
       const userId = typeof member === "string" ? member : member?.id;
+      // A seeded channel overwrite denying View Channel (bit 10) to this id.
+      const overwrite = (raw.permission_overwrites ?? []).find(entry => entry.id === userId);
+      const viewDenied = Boolean(overwrite && (BigInt(overwrite.deny ?? 0) & 1024n));
       return { has(permission) {
+        if (permission === "ViewChannel" && viewDenied) return false;
         return !(readState().fixtures?.discord?.permissionDenials?.[userId] || []).includes(permission);
       } };
     },
+    // The cached guild, whose @everyone role has the guild's id.
+    guild: { id: raw.guild_id ?? "guild-id", roles: { everyone: { id: raw.guild_id ?? "guild-id" } } },
     async send(content) {
       const failure = readState().fixtures?.discord?.failures?.send;
       if (failure) {
@@ -100,6 +106,17 @@ function repliedUser(client, raw) {
   return null;
 }
 
+// Like discord.js's `message.mentions.users`: each user mention (`<@id>` or
+// `<@!id>`, never a role's `<@&id>`) in the content, keyed by id. A user is a
+// bot when it is this gateway's bot or listed in the message's `botIds`.
+function mentionedUsers(client, raw) {
+  const users = new Map();
+  for (const [, id] of String(raw.content ?? "").matchAll(/<@!?([^>&]+)>/g)) {
+    users.set(id, { id, bot: id === client.user.id || (raw.botIds ?? []).includes(id) });
+  }
+  return users;
+}
+
 function fixtureMessage(client, raw) {
   return {
     attachments: attachmentMap(raw.attachments),
@@ -119,7 +136,7 @@ function fixtureMessage(client, raw) {
     id: raw.id,
     type: raw.type ?? 0,
     reference: raw.replyTo ? { channelId: raw.channelId, messageId: raw.replyTo } : null,
-    mentions: { repliedUser: repliedUser(client, raw) },
+    mentions: { repliedUser: repliedUser(client, raw), users: mentionedUsers(client, raw) },
     webhookId: raw.webhookId ?? null,
     reactions: {
       cache: new Map([

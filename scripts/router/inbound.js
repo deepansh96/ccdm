@@ -47,6 +47,18 @@ function addressesRoot(message) {
   return Boolean(message.reference?.messageId) && message.mentions?.repliedUser?.id === botId;
 }
 
+// In a shared root channel (`shared_root_channels`), the owner picks a
+// machine by tagging its bot. A message that tags a bot or natively replies
+// to one is for another machine's root unless it addresses this Router's bot.
+// A role mention (`<@&id>`), even a bot's managed role, is not a user
+// mention and leaves the message untagged.
+function addressesAnotherBot(message) {
+  if (addressesRoot(message)) return false;
+  const users = message.mentions?.users;
+  if ([...(users?.values?.() ?? [])].some(user => user?.bot)) return true;
+  return Boolean(message.reference?.messageId) && Boolean(message.mentions?.repliedUser?.bot);
+}
+
 function messageEvent(route, author, message) {
   return {
     event: "message",
@@ -79,6 +91,7 @@ function classifyMessage(table, message, thread = null) {
     const author = allowedAuthor(table.rootAllowedUserIds, table, user);
     const route = { project: "root", channel_id: channelId };
     if (!author) return null;
+    if (table.sharedRootChannels?.has(channelId) && addressesAnotherBot(message)) return null;
     if (ROOT_COMMAND.test(String(message.content || "").trim())) {
       return { route, root: true, event: { event: "command", command: "model", message_id: message.id,
         channel_id: channelId, author, ts: new Date(message.createdTimestamp).toISOString() } };
@@ -218,6 +231,9 @@ async function classifyReaction(table, reaction, user, botId = null, thread = nu
   if (reaction.message.partial) await reaction.message.fetch();
   const webhookId = reaction.message.webhookId ? String(reaction.message.webhookId) : null;
   const authorId = reaction.message.author?.id ? String(reaction.message.author.id) : null;
+  // In a shared root channel, a reaction on another bot's message is for that bot's root.
+  if (root && table.sharedRootChannels?.has(channelId) && (webhookId || reaction.message.author?.bot)
+    && !(botId && !webhookId && authorId === String(botId))) return null;
   return {
     route,
     ...(root ? { root: true } : {}),

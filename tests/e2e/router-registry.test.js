@@ -232,3 +232,30 @@ test("deregistering a project revokes its listener and op-only connections while
     { code: "scope_violation" });
   assert.deepEqual(beta.events, []);
 });
+
+test("shared_root_channels must list Discord IDs that are root channels", async () => {
+  const workspace = createRouterWorkspace();
+  writeProjectKey(workspace, "demo", "demo-key");
+  const router = await startRouter(workspace, { env: RELOAD_ENV });
+  const good = { ...routerRegistry(), root_channels: ["root-channel", "shared-channel"] };
+  const invalid = [
+    [{ ...good, shared_root_channels: ["demo-channel"] }, /shared_root_channels: demo-channel is not in root_channels/],
+    [{ ...good, shared_root_channels: [""] }, /shared_root_channels must be a list of Discord IDs/],
+    [{ ...good, shared_root_channels: [{ id: "shared-channel" }] }, /shared_root_channels must be a list of Discord IDs/],
+    [{ ...good, shared_root_channels: "shared-channel" }, /shared_root_channels must be a list of Discord IDs/],
+  ];
+
+  for (const [registry, message] of invalid) {
+    const failures = () => router.stdout.split("registry_reload_failed").length - 1;
+    const before = failures();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    replaceRegistry(workspace, registry);
+    await waitFor(() => failures() > before, () => `schema failure for ${message}:\n${router.stdout}`);
+    const status = await runRouterCli(workspace, ["status"]);
+    assert.match(status.stdout, new RegExp(`registry error: \\S+ invalid registry: .*${message.source}`));
+  }
+
+  await afterReload(router, () => replaceRegistry(workspace, { ...good, shared_root_channels: ["shared-channel"] }));
+  const status = await runRouterCli(workspace, ["status"]);
+  assert.doesNotMatch(status.stdout, /registry error/);
+});
