@@ -979,7 +979,9 @@ The Windows PC needs its own Discord bot. Never use another machine's bot token 
      - Manage Webhooks (Project Identity webhooks)
      - Manage Channels, Create Instant Invite, Manage Permissions (registration and guest access)
      - Create Public Threads, Manage Threads (Thread Conversations)
-7. On every other category of the server, add the bot and deny it View Channel. The bot then sees only its own category.
+7. Choose what else the bot may see. The Router answers only in its root channel and its registered project channels, and ignores every other channel it can see. Other categories are up to you:
+   - To keep the bot to its own category, add the bot to every other category and deny it View Channel.
+   - To let it see the rest of the server, leave the other categories alone. The bot can then read them, and so can anything that holds its token, but it does not act in them. Private channels stay hidden unless you add the bot to them.
 8. Create the root channel inside the new category, for example `#root-win`. Keep its permissions synced with the category.
 9. In Discord, turn on Settings > Advanced > Developer Mode. Then right-click and choose Copy ID to get four IDs: your own user ID, the server ID, the root channel ID and the category ID. Note them down. Setup asks for them.
 
@@ -1107,7 +1109,7 @@ The command checks the Router first. It finishes when root has connected to the 
 register
 ```
 
-Root asks for the channel, the project folder and the provider. Give this PC's projects a name that ends in `-win`, for example `my-app-win`. The project's channel must be inside the Windows category, because the bot sees no other.
+Root asks for the channel, the project folder and the provider. Give this PC's projects a name that ends in `-win`, for example `my-app-win`. Put the project's channel inside the Windows category, so it gets the category's permissions.
 
 ### Everyday commands
 
@@ -1309,7 +1311,7 @@ A Mac and a Windows PC can run CCDM in the same Discord server.
 - **Two bots.** Each machine has its own bot, its own token, its own Router, its own `registry.json` and its own services. Never copy a token or a `registry.json` from one machine to the other.
 - **Two categories.** Each machine has its own private category and its own root channel. To talk to a machine's root, write in that machine's root channel.
 - **Names.** Windows project names end in `-win`, so no channel or session has the name of a Mac project.
-- **Mentions.** Each bot sees only its own category. An `@mention` reaches only the bot that can see the channel. Mentioning the Mac's bot in a Windows channel does nothing, and the other way round.
+- **Mentions.** Each machine's Router answers only in its own root channel and project channels. Mentioning the Mac's bot in a Windows channel does nothing, and the other way round, even when a bot can see the other machine's channels.
 - **Resume.** A conversation is stored on the machine that ran it. `--resume` works only on that machine. You cannot continue a Mac conversation on Windows, or a Windows conversation on the Mac.
 - **Each machine works alone.** One machine keeps working while the other sleeps or is off. You set up, upgrade and restart each one by itself.
 - **Usage.** Both machines can use the same accounts. Only the Mac posts the usage report; Windows only collects.

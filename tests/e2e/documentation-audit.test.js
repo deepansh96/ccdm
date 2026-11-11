@@ -1004,7 +1004,7 @@ test("the README's Multiple machines part states the mention and resume limits",
   for (const phrase of [
     "Each machine has its own bot",
     "Windows project names end in `-win`",
-    "An `@mention` reaches only the bot that can see the channel",
+    "Each machine's Router answers only in its own root channel and project channels",
     "`--resume` works only on that machine",
     "Only the Mac posts the usage report",
   ]) {
