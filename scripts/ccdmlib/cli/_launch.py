@@ -37,6 +37,13 @@ _UNLINK_ROUNDS = 20
 _UNLINK_ROUND_S = 0.05
 
 _TRUST_PROMPT = re.compile(r"Is this a project you created or one you trust", re.IGNORECASE)
+# An answer line of the trust question: optional marker (>, ❯ or ›), optional number, then Yes or No.
+_TRUST_ANSWER = re.compile(r"^\s*(?P<marker>[>❯›])?\s*(?:\d+[.)]\s*)?(?P<answer>Yes|No)\b")
+_TRUST_TRIES = 5
+_TRUST_RETRY_S = 2.0
+_TRUST_MOVE_TRIES = 5
+_TRUST_MOVE_SETTLE_S = 0.5
+_TRUST_UNREADABLE_S = 1.0
 _CHANNEL_PROMPT = re.compile(r"Loading development channels?", re.IGNORECASE)
 _AUTO_MODE_OFFER = re.compile(r"Make auto mode your default permission mode", re.IGNORECASE)
 
@@ -151,6 +158,95 @@ class Dialogs:
             session_host.send_key(self.name, "Escape")
 
 
+def _trust_question_showing(screen: str) -> bool:
+    """The trust question is on screen and no later start-up prompt follows it."""
+    last = None
+    for last in _TRUST_PROMPT.finditer(screen):
+        pass
+    if last is None:
+        return False
+    rest = screen[last.end():]
+    return not (_CHANNEL_PROMPT.search(rest) or _AUTO_MODE_OFFER.search(rest))
+
+
+def _trust_answers(screen: str) -> Tuple[Optional[int], Optional[int], int]:
+    """``(yes line, selected line, answer count)`` of the trust question's menu.
+
+    Indexes count answer lines below the last trust question, in screen order.
+    An answer line starts, after an optional selection marker and number, with
+    "Yes" or "No". Claude has shown both ``❯ 1. Yes, proceed`` / ``2. No, exit``
+    and ``> No, exit`` / ``Yes, I trust this folder``.
+    """
+    last = None
+    for last in _TRUST_PROMPT.finditer(screen):
+        pass
+    below = screen[last.end():] if last else screen
+    yes = selected = None
+    count = 0
+    for line in below.splitlines():
+        match = _TRUST_ANSWER.match(line)
+        if not match:
+            continue
+        if match.group("answer") == "Yes" and yes is None:
+            yes = count
+        if match.group("marker") and selected is None:
+            selected = count
+        count += 1
+    return yes, selected, count
+
+
+class _TrustAnswer:
+    """Answers the folder-trust question with "Yes", whichever answer is selected.
+
+    Enter goes only when the selection marker is on the "Yes" line; otherwise
+    ``Up``/``Down`` move it there and the next capture checks again. A question
+    still on screen 2 s after Enter is answered again, up to 5 times. A menu with
+    no recognisable "Yes" line, or no selected line, fails after a short grace
+    (a frame can be caught half drawn) without a key being pressed.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.enters = 0
+        self.moves = 0
+        self.wait_until = 0.0
+        self.unreadable_since: Optional[float] = None
+
+    def step(self, screen: str) -> None:
+        now = time.monotonic()
+        if now < self.wait_until:
+            return
+        yes, selected, _count = _trust_answers(screen)
+        if yes is None or selected is None:
+            self.unreadable_since = self.unreadable_since or now
+            if now - self.unreadable_since >= _TRUST_UNREADABLE_S:
+                what = "no \"Yes\" answer" if yes is None else "no selected answer"
+                raise LaunchFailed(
+                    f"Claude's folder-trust question could not be answered: its menu shows {what}"
+                )
+            return
+        self.unreadable_since = None
+        if selected == yes:
+            if self.enters >= _TRUST_TRIES:
+                raise LaunchFailed(
+                    f"Claude's folder-trust question could not be answered: it was still on screen "
+                    f"after {_TRUST_TRIES} answers"
+                )
+            self.enters += 1
+            session_host.send_key(self.name, "Enter")
+            self.wait_until = now + _TRUST_RETRY_S
+            return
+        if self.moves >= _TRUST_MOVE_TRIES:
+            raise LaunchFailed(
+                "Claude's folder-trust question could not be answered: the selection would not move to \"Yes\""
+            )
+        self.moves += 1
+        key = "Down" if yes > selected else "Up"
+        for _ in range(abs(yes - selected)):
+            session_host.send_key(self.name, key)
+        self.wait_until = now + _TRUST_MOVE_SETTLE_S
+
+
 def _screen(name: str) -> str:
     return session_host.capture(name, join=True)
 
@@ -165,9 +261,10 @@ def accept_dialogs(name: str, cwd: str, project_path: str, deadline: float) -> D
 
     One loop up to ``deadline`` (from :func:`launch_deadline`):
 
-    * The folder-trust prompt gets Enter only when ``cwd``, the folder the
-      session runs in, is ``project_path``, the registry ``path`` being started.
-      Otherwise :class:`LaunchFailed` names both.
+    * The folder-trust prompt is answered "Yes" only when ``cwd``, the folder
+      the session runs in, is ``project_path``, the registry ``path`` being
+      started. Otherwise :class:`LaunchFailed` names both. See
+      :class:`_TrustAnswer` for how "Yes" is picked whichever answer is selected.
     * The "development channels" prompt gets Enter, and the function returns.
     * The one-time auto-mode offer gets Esc, once.
 
@@ -176,7 +273,7 @@ def accept_dialogs(name: str, cwd: str, project_path: str, deadline: float) -> D
     today's message if the session ends or the channel prompt never appears.
     """
     dialogs = Dialogs(name)
-    trust_answered = False
+    trust = _TrustAnswer(name)
     while time.monotonic() < deadline:
         try:
             screen = _screen(name)
@@ -184,14 +281,13 @@ def accept_dialogs(name: str, cwd: str, project_path: str, deadline: float) -> D
             if error.code == _UNKNOWN_SESSION:
                 raise LaunchFailed(_EXITED_BEFORE_CHANNEL_PROMPT) from error
             raise
-        if not trust_answered and _TRUST_PROMPT.search(screen):
+        if _trust_question_showing(screen):
             if not paths.same_path(cwd, project_path):
                 raise LaunchFailed(
                     f"Refusing the folder-trust prompt: the session's folder {cwd} "
                     f"is not the project's registered path {project_path}"
                 )
-            trust_answered = True
-            session_host.send_key(name, "Enter")
+            trust.step(screen)
         else:
             dialogs.dismiss_auto_mode_offer(screen)
             if _CHANNEL_PROMPT.search(screen):
