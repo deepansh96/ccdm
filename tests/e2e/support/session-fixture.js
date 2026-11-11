@@ -24,6 +24,14 @@ const WAIT_POLL_MS = 25;
 const PROTOCOL_VERSION = 1;
 
 export const TRUST_PROMPT = "Do you trust the files in this folder?\n\nIs this a project you created or one you trust?\n\n❯ 1. Yes, proceed\n  2. No, exit\n";
+// The trust question as a menu: `{options, selected, numbered, ignoreEnters}`. The
+// selected line carries the marker; `ignoreEnters` Enters are dropped first.
+export function trustMenuScreen(menu) {
+  const marker = menu.numbered ? "❯" : ">";
+  const lines = menu.options.map((option, index) =>
+    `${index === menu.selected ? marker : " "} ${menu.numbered ? `${index + 1}. ` : ""}${option}`);
+  return `Accessing workspace:\n\nIs this a project you created or one you trust? (Like your own code.) If not, take a moment to review what's in this\nfolder first.\n\n${lines.join("\n")}\n\nEnter to confirm · Esc to cancel\n`;
+}
 export const AUTO_MODE_OFFER = "Make auto mode your default permission mode?\n\n1. Yes\n2. Not now\n";
 export const CONTEXT_SCREEN = "Context Usage\n⛁ ⛁ ⛁ ⛀ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   claude-fixture · 45k/200k tokens (22%)\n⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Messages: 30k tokens (15%)\n";
 
@@ -184,6 +192,20 @@ export function createSessionFixture(context) {
       const contextScreen = state.fixtures.claude.contextScreen;
       if (keys[0] === "-l") {
         session.typedText = keys.at(-1);
+      } else if (session.trustPrompt === "pending" && session.trustMenu && ["Up", "Down", "Enter"].includes(keys[0])) {
+        // A menu: Up/Down move the selection; Enter picks it, unless the menu is not taking input yet.
+        const menu = session.trustMenu;
+        if (keys[0] !== "Enter") {
+          menu.selected = Math.max(0, Math.min(menu.options.length - 1, menu.selected + (keys[0] === "Down" ? 1 : -1)));
+        } else if (menu.ignoreEnters > 0) {
+          menu.ignoreEnters -= 1;
+        } else if (menu.options[menu.selected].startsWith("Yes")) {
+          session.trustPrompt = "accepted";
+        } else {
+          session.trustPrompt = "refused";
+        }
+        session.paneOutput = session.trustPrompt === "accepted" ? session.afterTrustScreen
+          : session.trustPrompt === "refused" ? "" : trustMenuScreen(menu);
       } else if (keys[0] === "Enter" && session.trustPrompt === "pending") {
         session.trustPrompt = "accepted";
         session.paneOutput = session.afterTrustScreen;

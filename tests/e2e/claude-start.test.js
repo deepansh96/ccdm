@@ -7,7 +7,7 @@ import test from "node:test";
 import { PYTHON, assertPrivate, platformGate } from "./support/platform.js";
 import { createWorkspace, runScript } from "./support/runner.js";
 import { OWNER_ID, createRouterWorkspace, routerEnv, routerWithWebhooks, runRouterCli } from "./support/router.js";
-import { AUTO_MODE_OFFER, startFakeHost } from "./support/session-fixture.js";
+import { AUTO_MODE_OFFER, startFakeHost, trustMenuScreen } from "./support/session-fixture.js";
 import { readState, seedFixtureProcess, seedRegistry, seedTmuxSession, updateState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 
@@ -647,6 +647,79 @@ for (const backend of BACKENDS) {
     assert.equal(result.ok, false);
     assert.ok(result.message.includes(elsewhere), result.message);
     assert.ok(result.message.includes(projectPath), result.message);
+    assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session.sendKeys, undefined);
+  });
+
+  // A trust-question menu in the seeded session, answered by accept_dialogs alone.
+  function seedTrustMenu(workspace, menu) {
+    seedTmuxSession("alpha_session", {
+      trustPrompt: "pending",
+      trustMenu: menu,
+      paneOutput: trustMenuScreen(menu),
+      afterTrustScreen: PROMPT_SCREEN,
+    }, { stateDir: workspace.stateDir });
+  }
+
+  test(`${backend}: a trust question with "Yes" selected first gets Enter once`, async () => {
+    const workspace = seededWorkspace();
+    const projectPath = readRegistry(workspace).projects.alpha.path;
+    seedTrustMenu(workspace, { options: ["Yes, proceed", "No, exit"], selected: 0, numbered: true });
+
+    const result = await acceptDialogsResult(workspace, "alpha_session", projectPath, projectPath, { backend, timeout: 10 });
+
+    assert.deepEqual(result, { ok: true });
+    const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session;
+    assert.equal(session.trustPrompt, "accepted");
+    assert.deepEqual(session.sendKeys, [["Enter"], ["Enter"]]);
+  });
+
+  test(`${backend}: a trust question with "No" selected first gets Down, then Enter only on "Yes"`, async () => {
+    const workspace = seededWorkspace();
+    const projectPath = readRegistry(workspace).projects.alpha.path;
+    seedTrustMenu(workspace, { options: ["No, exit", "Yes, I trust this folder"], selected: 0, numbered: false });
+
+    const result = await acceptDialogsResult(workspace, "alpha_session", projectPath, projectPath, { backend, timeout: 10 });
+
+    assert.deepEqual(result, { ok: true });
+    const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session;
+    assert.equal(session.trustPrompt, "accepted");
+    assert.deepEqual(session.sendKeys, [["Down"], ["Enter"], ["Enter"]]);
+  });
+
+  test(`${backend}: a trust question still showing after the first Enter is answered again`, async () => {
+    const workspace = seededWorkspace();
+    const projectPath = readRegistry(workspace).projects.alpha.path;
+    seedTrustMenu(workspace, { options: ["No, exit", "Yes, I trust this folder"], selected: 0, numbered: false, ignoreEnters: 1 });
+
+    const result = await acceptDialogsResult(workspace, "alpha_session", projectPath, projectPath, { backend, timeout: 15 });
+
+    assert.deepEqual(result, { ok: true });
+    const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session;
+    assert.equal(session.trustPrompt, "accepted");
+    assert.deepEqual(session.sendKeys, [["Down"], ["Enter"], ["Enter"], ["Enter"]]);
+  });
+
+  test(`${backend}: a trust question that never goes away fails after 5 answers, naming the trust question`, async () => {
+    const workspace = seededWorkspace();
+    const projectPath = readRegistry(workspace).projects.alpha.path;
+    seedTrustMenu(workspace, { options: ["Yes, proceed", "No, exit"], selected: 0, numbered: true, ignoreEnters: 99 });
+
+    const result = await acceptDialogsResult(workspace, "alpha_session", projectPath, projectPath, { backend, timeout: 30 });
+
+    assert.equal(result.ok, false);
+    assert.match(result.message, /folder-trust question could not be answered/);
+    assert.deepEqual(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session.sendKeys, Array(5).fill(["Enter"]));
+  });
+
+  test(`${backend}: a trust question with no "Yes" answer fails without a key being pressed`, async () => {
+    const workspace = seededWorkspace();
+    const projectPath = readRegistry(workspace).projects.alpha.path;
+    seedTrustMenu(workspace, { options: ["No, exit", "Review the folder first"], selected: 0, numbered: false });
+
+    const result = await acceptDialogsResult(workspace, "alpha_session", projectPath, projectPath, { backend, timeout: 10 });
+
+    assert.equal(result.ok, false);
+    assert.match(result.message, /folder-trust question could not be answered: its menu shows no "Yes" answer/);
     assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session.sendKeys, undefined);
   });
 
