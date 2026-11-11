@@ -1183,6 +1183,52 @@ for (const flag of ["-r", "--read-only"]) {
   });
 }
 
+// The attach client under the console that ships with Windows (node-pty without
+// its bundled conpty.dll), where leaving the alternate screen used to make the
+// first write to stderr fail and the client exit 1.
+function inboxConsoleClient(workspace, args) {
+  const pty = require("node-pty").spawn(process.execPath, [workspace.script, "attach", ...args], {
+    cols: 120, rows: 30, cwd: workspace.fixtures, env: workspace.childEnv(), useConpty: true, useConptyDll: false,
+  });
+  let output = "";
+  pty.onData(data => { output += data; });
+  const exited = new Promise(resolve => { pty.onExit(({ exitCode }) => resolve(exitCode)); });
+  registerTeardownCallback(async () => {
+    try {
+      pty.kill();
+    } catch { /* It already ended. */ }
+    await Promise.race([exited, sleep(5000)]);
+  });
+  return { exited, output: () => plainText(output), type: text => pty.write(text) };
+}
+
+test("under the inbox Windows console, attach -r leaves with Ctrl-] and exit code 0", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  await ptySession(workspace, "inbox", attachFixture(workspace).file);
+  await waitForCapture(workspace, "inbox", /before-attach/);
+
+  const client = inboxConsoleClient(workspace, ["-t", "=inbox", "-r"]);
+  await waitUntil(() => client.output().includes("before-attach"), () => `the replayed screen; saw ${client.output()}`, 10000);
+  client.type("x");
+  client.type("\x1d");
+  assert.equal(await client.exited, 0);
+  assert.equal((await cli(workspace, ["has-session", "-t", "=inbox"])).code, 0);
+});
+
+test("under the inbox Windows console, attach exits 0 and prints its note when the session ends", onlyWindows, async () => {
+  const workspace = hostWorkspace();
+  await startHost(workspace);
+  await ptySession(workspace, "inbox_end", attachFixture(workspace).file);
+  await waitForCapture(workspace, "inbox_end", /before-attach/);
+
+  const client = inboxConsoleClient(workspace, ["-t", "=inbox_end"]);
+  await waitUntil(() => client.output().includes("before-attach"), () => `the replayed screen; saw ${client.output()}`, 10000);
+  client.type("q");
+  assert.equal(await client.exited, 0);
+  await waitUntil(() => /\[session inbox_end ended with code 3\]/.test(client.output()), () => `the end note; saw ${client.output()}`);
+});
+
 test("a read-only attach never resizes, the last writer sets the size, and the fixed size comes back when writers leave", onlyWindows, async () => {
   const workspace = hostWorkspace();
   await startHost(workspace);

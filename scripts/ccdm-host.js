@@ -94,7 +94,13 @@ class AttachClient extends HostClient {
 
 // Runs until Ctrl-], the session's end or the host's. Resolves to the exit code.
 function runAttach(client, name, readOnly) {
-  const { stdin, stdout } = process;
+  // process.stderr is opened on first use. Opened only after leaving the
+  // alternate screen, the inbox Windows console no longer reports fd 2 as a
+  // console, so Node picks a file stream whose write fails with EPIPE. Opening
+  // it here, before the screen switch, keeps it a console stream.
+  const { stdin, stdout, stderr } = process;
+  // A note that cannot be written must not change the exit code.
+  stderr.on("error", () => {});
   return new Promise((resolve, reject) => {
     const decoder = new StringDecoder("utf8");
     const sendFrame = frame => client.socket.write(encode(frame));
@@ -125,7 +131,11 @@ function runAttach(client, name, readOnly) {
       }
       // stdout on a Windows console is asynchronous, as is the pipe's last write.
       stdout.write(onScreen ? LEAVE_ATTACH : "", () => {
-        process.stderr.write(note);
+        if (note) {
+          try {
+            stderr.write(note);
+          } catch { /* The terminal is gone; the exit code still stands. */ }
+        }
         client.socket.end(() => client.close());
         resolve(code);
       });
