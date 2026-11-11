@@ -32,6 +32,15 @@ One row for each entry of `codex_accounts` in `registry.json`. The folder is tha
 - Category for this machine's projects: `<category name>`
 - Another machine's root bot in the same server, if there is one: `<bot name>`
 
+## Shared root channel
+
+Only when this machine's root shares a root channel with another machine's root (`shared_root_channels` in `registry.json`). Root reads these names to answer for its own machine and to point at the other bot.
+
+- Shared root channel: `<channel name>`
+- This machine's root bot display name: `<bot name>`
+- The other machine's root bot display name: `<peer bot name>`
+- What the other machine runs, in a few words: `<for example the Mac projects>`
+
 ## Access exceptions
 
 - `<project or channel>`: `<who may do what>`
