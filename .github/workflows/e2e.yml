@@ -44,14 +44,16 @@ jobs:
       - run: npm test
 
   windows-e2e:
+    name: windows-e2e (Node ${{ matrix.node }}, shard ${{ matrix.shard }})
     runs-on: windows-latest
-    # Informational until the Windows port is finished: a failure warns, it does not fail the PR.
-    continue-on-error: true
-    timeout-minutes: 90
+    # Required, like the Linux and macOS jobs. The suite is split by test file so each
+    # shard stays well under the cap; tests/e2e/README.md "CI Behavior" has the times.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         node: [22, 24]
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@v4
 
@@ -70,62 +72,42 @@ jobs:
 
       - run: npm ci
 
-      - name: Run the full suite
-        env:
-          CCDM_PYTHON: ${{ steps.python.outputs.python-path }}
-          CCDM_E2E_JOBS: 4
-          # Suites not ported yet can hang; do not let each use the 10 minute default.
-          CCDM_E2E_FILE_TIMEOUT_MS: 300000
-          # Outside the checkout: workspaces copy every untracked file in it.
-          CCDM_E2E_REPORT_DIR: ${{ runner.temp }}/e2e-report
-        run: npm test
-
-      - name: Upload the per-file report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-e2e-report-node-${{ matrix.node }}
-          path: ${{ runner.temp }}/e2e-report
-          if-no-files-found: warn
-
-  windows-required:
-    runs-on: windows-latest
-    # The list grows with every ported suite; the run took 18 to 30 minutes at 64 files.
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - uses: actions/setup-python@v5
-        id: python
-        with:
-          python-version: '3.11'
-
-      - name: Install dashboard test dependency
-        run: python -m pip install Pillow
-
-      - run: npm ci
-
-      - name: Run the suites in windows-required.txt
+      - name: Run this shard of the full suite
         shell: bash
         env:
           CCDM_PYTHON: ${{ steps.python.outputs.python-path }}
+          CCDM_E2E_JOBS: 4
           # Rerun a failed file alone once, as on Linux and macOS (the runner's Windows
-          # default is off). A file that then passes is printed as FLAKY. The informational
-          # windows-e2e job leaves the rerun off so every intermittent failure shows.
+          # default is off). A file that then passes is printed as FLAKY.
           CCDM_E2E_NO_RERUN: "0"
           # Outside the checkout: workspaces copy every untracked file in it.
-          CCDM_E2E_REPORT_DIR: ${{ runner.temp }}/e2e-required-report
+          CCDM_E2E_REPORT_DIR: ${{ runner.temp }}/e2e-report
+          # Every tests/e2e/**/*.test.js, sorted by path; file i goes to shard (i mod SHARDS) + 1.
+          # SHARDS must match the shard list in the matrix.
+          SHARD: ${{ matrix.shard }}
+          SHARDS: 2
         run: |
-          mapfile -t files < <(tr -d '\r' < tests/e2e/windows-required.txt | grep -Ev '^[[:space:]]*(#|$)')
+          mapfile -t files < <(node -e '
+            const fs = require("fs");
+            const path = require("path");
+            const shard = Number(process.env.SHARD);
+            const shards = Number(process.env.SHARDS);
+            if (!(Number.isInteger(shards) && shards >= 1 && Number.isInteger(shard) && shard >= 1 && shard <= shards)) {
+              throw new Error(`shard ${process.env.SHARD} of ${process.env.SHARDS} is not a shard`);
+            }
+            const files = fs.readdirSync(path.join("tests", "e2e"), { recursive: true })
+              .map(file => `tests/e2e/${file.split(path.sep).join("/")}`)
+              .filter(file => file.endsWith(".test.js"))
+              .sort();
+            for (const [index, file] of files.entries()) {
+              if (index % shards === shard - 1) console.log(file);
+            }
+          ')
           if [ "${#files[@]}" -eq 0 ]; then
-            echo "tests/e2e/windows-required.txt lists no files" >&2
+            echo "shard $SHARD of $SHARDS has no test files" >&2
             exit 1
           fi
+          echo "shard $SHARD of $SHARDS: ${#files[@]} test files"
           node tests/run-e2e.mjs "${files[@]}"
 
       # Also after a failure or the time limit, so the files that did finish can be read.
@@ -133,8 +115,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-required-report
-          path: ${{ runner.temp }}/e2e-required-report
+          name: windows-e2e-report-node-${{ matrix.node }}-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/e2e-report
           if-no-files-found: warn
 
   macos-e2e:

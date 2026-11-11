@@ -20,7 +20,7 @@ Each fixture tool is `<tool>.exe` plus `<tool>.shim`, hard-linked into each work
 
 Write the gate on the `test(` line, directly or through a `const` holding it, so the budget check can read it. A suite gated as a whole goes in `tests/e2e/support/surfaces.js`, whose `runSurface()` records which suites run on which OS, and the file takes its `test` from `suiteTest(nodeTest, import.meta.url)`.
 
-Every test skipped on Windows needs an entry in `tests/e2e/windows-skip-budget.json` with its file, test name, tag and reason, and the total must fit `budget`. `tests/e2e/windows-skip-budget.test.js` fails on an unlisted skip, a stale entry, or a count over budget.
+Every test skipped on Windows needs an entry in `tests/e2e/windows-skip-budget.json` with its file, test name, tag, `category` and reason, and `budget` must equal the number of skipped tests. The category comes from the closed list in CI Behavior; a `posix-pair` entry also names its `windows_test`, the Windows test that covers the same behaviour. `tests/e2e/windows-skip-budget.test.js` fails on an unlisted skip, a stale entry, a count that differs from `budget`, or a category that is missing or not on the list.
 
 Seams: `CCDM_E2E_CSC` and `CCDM_E2E_GIT_SH` name the compiler and `sh.exe`; a path that does not exist counts as missing.
 
@@ -43,7 +43,7 @@ Harness deadlines (`waitFor`, `waitForState`, the `runProcess` kill timer) are m
 
 ### Runner Settings and Reports
 
-`tests/run-e2e.mjs` reads these environment variables. On macOS and Linux the defaults keep the behaviour above; Windows gets a deadline, fewer jobs and no rerun by default (the `windows-required` CI job sets `CCDM_E2E_NO_RERUN=0`; see CI Behavior).
+`tests/run-e2e.mjs` reads these environment variables. On macOS and Linux the defaults keep the behaviour above; Windows gets a deadline, fewer jobs and no rerun by default (the `windows-e2e` CI job sets `CCDM_E2E_NO_RERUN=0`; see CI Behavior).
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -334,20 +334,20 @@ GitHub Actions runs on `push` and `pull_request`. Port PRs target the `windows-p
 | Job | Runs on | What it does | Can fail the PR |
 | --- | --- | --- | --- |
 | `local-fake-e2e` | Linux, Node 22, Python 3.11 | Full suite, with `npm ci --omit=optional` | Yes |
-| `windows-e2e` | Windows, Node 22 and 24, Python 3.11 | Full suite; uploads the per-file report from `CCDM_E2E_REPORT_DIR` | No, it only warns (`continue-on-error`) |
-| `windows-required` | Windows, Node 22, Python 3.11 | Only the files in `tests/e2e/windows-required.txt`, with `CCDM_E2E_NO_RERUN=0` so a failed file is rerun alone once | Yes |
+| `windows-e2e` | Windows, Node 22 and 24, Python 3.11, two shards each | Full suite, split by test file; uploads each shard's per-file report from `CCDM_E2E_REPORT_DIR` | Yes, every shard |
 | `macos-e2e` | macOS, Node 22, `/usr/bin/python3` 3.9 | Python floor checks, then the full suite, with `npm ci --omit=optional` | Yes |
 
 The Linux and macOS jobs fail if `koffi` or another native Windows package is installed.
 
-`windows-required` turns the rerun-alone step on (`CCDM_E2E_NO_RERUN=0`), so it handles an intermittent failure the way the Linux and macOS jobs do: a file that fails in the parallel pass is rerun once, alone, and one that then passes is printed as `=== FLAKY` and recorded with `flaky: true` in `summary.json`, and the job stays green. Reruns run one after another after the parallel pass, each with the per-file deadline again (10 minutes by default on Windows), and the runner has no cap on how many files it reruns. A file that timed out is not rerun. `windows-e2e` (informational) leaves the rerun off on purpose, so it shows every intermittent failure.
+`windows-e2e` runs the whole suite on Windows on both Node versions, so a PR must pass every Local Fake test on Windows as it must on Linux and macOS. The job is a matrix of Node 22 and 24 by shard 1 and 2, four checks named `windows-e2e (Node 22, shard 1)` and so on, each stopped at 45 minutes (`timeout-minutes: 45`). Run whole, the suite took 28 to 40 minutes on one Windows runner, too close to the cap; each shard runs about half the files. The split is by test file and needs no list: every `tests/e2e/**/*.test.js`, sorted by path, goes to shard `(i mod 2) + 1`, where `i` is its index. A new test file joins a shard on its own. `ci-contract.test.js` runs the job's own split for each shard and fails if a file is in no shard or in two. To change the number of shards, change `SHARDS` and the matrix's `shard` list together.
+
+Each shard runs four files at a time (`CCDM_E2E_JOBS=4`) with the Windows per-file deadline of 10 minutes, and turns the rerun-alone step on (`CCDM_E2E_NO_RERUN=0`), so it handles an intermittent failure the way the Linux and macOS jobs do: a file that fails in the parallel pass is rerun once, alone, and one that then passes is printed as `=== FLAKY` and recorded with `flaky: true` in `summary.json`, and the job stays green. Reruns run one after another after the parallel pass, each with the per-file deadline again, and the runner has no cap on how many files it reruns. A file that timed out is not rerun.
+
+Every test skipped on Windows has an entry in `tests/e2e/windows-skip-budget.json` (see Running on Windows) with a `category` from a closed list: `darwin-only`, `posix-signals`, `tmux-backend`, `posix-pair`, `windows-refused-d2` and `posix-only-behaviour`. `ci-contract.test.js` fails if that list grows or an entry has another category or none. A skip that fits none of them is a test that has to run on Windows: fix it in the slice that owns the feature, do not widen the budget.
 
 `macos-e2e` is the main Mac regression guard during the port. `CCDM_PYTHON` and the front of `PATH` select the Mac's own Python. `tmux`, `zsh`, `launchctl`, `security`, `ps` and `curl` stay fake in the Local Fake suite; no test runs the real `launchctl` or `security`. The one exception for real tools is `macos-real-tools.test.js`, which runs today's tmux command shapes against Homebrew tmux and real zsh, with `TMUX` unset and `TMUX_TMPDIR` inside its workspace, so it cannot reach your own tmux server.
 
 The Python floor on the Mac is 3.9. The job runs `vermin --target=3.9- --eval-annotations --violations scripts/` (the trailing `-` means "3.9 or later"; without it vermin demands exactly 3.9). vermin cannot tell an `X | Y` annotation from a bitwise `|` and does not read shell scripts, so `support/python_floor.py annotations` rejects such an annotation without `from __future__ import annotations`, in `.py` files and in the `<<'PY'` heredocs of `.sh` files, and fails a heredoc that does not parse on 3.9. `support/python_floor.py imports` imports every module under `scripts/ccdmlib/`, which catches a top-level `import msvcrt`, and the job loads the Python service entry points.
-
-To add a file to `tests/e2e/windows-required.txt`, first see it pass in the `windows-e2e` job, then append its repo-relative path on a line of its own. Parallel slices each add only their own lines; the later PR rebases.
-
 ## Hardcoded-Boundary Inventory
 
 - `/tmp/cc-context-<state>` was the retired nickname rate-limit file outside fixture `TMPDIR`. Tests use unique state directory basenames, assert that no such file is written, and clean up explicitly.
