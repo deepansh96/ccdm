@@ -55,6 +55,16 @@ function validateRegistry(registry) {
       problems.push(`${field} must be a list of Discord IDs`);
     }
   }
+  const shared = registry.shared_root_channels;
+  if (shared != null) {
+    if (!(Array.isArray(shared) && shared.every(isId))) problems.push("shared_root_channels must be a list of Discord IDs");
+    else {
+      const roots = new Set((Array.isArray(registry.root_channels) ? registry.root_channels : []).map(String));
+      for (const id of shared) {
+        if (!roots.has(String(id))) problems.push(`shared_root_channels: ${id} is not in root_channels`);
+      }
+    }
+  }
   if (!isObject(registry.projects)) problems.push("projects must be an object keyed by project name");
   const owners = new Map((Array.isArray(registry.root_channels) ? registry.root_channels : [])
     .filter(isId).map(id => [String(id), "root"]));
@@ -109,6 +119,8 @@ function buildRoutingTable(registry) {
     registered,
     rootChannels: new Set((registry.root_channels || []).map(String)),
     rootAllowedUserIds: new Set((registry.root_allowed_user_ids || []).map(String)),
+    // Root channels shared with another machine's Router, where tagging a bot picks the machine.
+    sharedRootChannels: new Set((registry.shared_root_channels || []).map(String)),
   };
 }
 
