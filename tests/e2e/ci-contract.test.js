@@ -42,13 +42,26 @@ const lacks = pattern => job => !pattern.test(job);
 const ALL = "*";
 const LINUX = "local-fake-e2e";
 const WINDOWS = "windows-e2e";
-const REQUIRED = "windows-required";
 const MACOS = "macos-e2e";
 const CONTINUES = /^\s*continue-on-error:/m;
 const NPM_TEST = /^\s*(- )?run: npm test\s*$/m;
 const NODE_22 = /node-version: 22\s*$/m;
 const OMIT_OPTIONAL = /^\s*- run: npm ci --omit=optional\s*$/m;
 const REPORT_DIR = /CCDM_E2E_REPORT_DIR: \$\{\{ runner\.temp \}\}\/e2e-report/;
+
+// The Windows job's shard picker (its `node -e '...'` script) and shard count,
+// or null when the matrix's shard list is not exactly 1..SHARDS.
+function shardSetup(job) {
+  const picker = job.match(/node -e '([^']*)'/);
+  const count = job.match(/^\s*SHARDS: (\d+)\s*$/m);
+  const list = job.match(/^\s*shard: \[([\d, ]+)\]\s*$/m);
+  if (!picker || !count || !list || !/^\s*SHARD: \$\{\{ matrix\.shard \}\}\s*$/m.test(job)) return null;
+  const shards = Number(count[1]);
+  const listed = list[1].split(",").map(Number);
+  const expected = Array.from({ length: shards }, (_, index) => index + 1);
+  if (shards < 1 || listed.join() !== expected.join()) return null;
+  return { picker: picker[1], shards };
+}
 
 // The native packages are checked for, and after the install that could add them.
 function assertsKoffiAbsent(job) {
@@ -73,18 +86,17 @@ const RULES = [
   { job: WINDOWS, name: "windows runs on windows", ok: has(/runs-on: windows-latest/) },
   { job: WINDOWS, name: "windows covers Node 22 and 24", ok: has(/^\s*node: \[22, 24\]\s*$/m) },
   { job: WINDOWS, name: "windows uses Python 3.11", ok: has(/python-version: '3\.11'/) },
-  { job: WINDOWS, name: "windows is informational", ok: has(/^ {4}continue-on-error: true\s*$/m) },
-  { job: WINDOWS, name: "windows runs the full suite", ok: has(NPM_TEST) },
+  { job: WINDOWS, name: "windows can fail the PR", ok: lacks(CONTINUES) },
+  { job: WINDOWS, name: "windows stops each shard at 45 minutes", ok: has(/^ {4}timeout-minutes: 45\s*$/m) },
+  { job: WINDOWS, name: "windows runs every shard to the end", ok: has(/^\s*fail-fast: false\s*$/m) },
+  { job: WINDOWS, name: "windows shards match SHARDS", ok: job => shardSetup(job) !== null },
+  { job: WINDOWS, name: "windows names each shard's check", ok: has(/^ {4}name: windows-e2e \(Node \$\{\{ matrix\.node \}\}, shard \$\{\{ matrix\.shard \}\}\)\s*$/m) },
+  { job: WINDOWS, name: "windows runs only its shard's files", ok: job => /node tests\/run-e2e\.mjs "\$\{files\[@\]\}"/.test(job) && !NPM_TEST.test(job) },
+  { job: WINDOWS, name: "windows refuses an empty shard", ok: has(/has no test files[\s\S]*exit 1/) },
+  { job: WINDOWS, name: "windows reruns a failed file alone", ok: has(/^\s*CCDM_E2E_NO_RERUN: "0"\s*$/m) },
   { job: WINDOWS, name: "windows writes the per-file report", ok: has(REPORT_DIR) },
   { job: WINDOWS, name: "windows uploads the report", ok: has(/uses: actions\/upload-artifact@/) },
-  { job: WINDOWS, name: "windows does not rerun a failed file", ok: lacks(/CCDM_E2E_NO_RERUN/) },
-
-  { job: REQUIRED, name: "required list runs on windows", ok: has(/runs-on: windows-latest/) },
-  { job: REQUIRED, name: "required list can fail the PR", ok: lacks(CONTINUES) },
-  { job: REQUIRED, name: "required list reads windows-required.txt", ok: has(/< tests\/e2e\/windows-required\.txt/) },
-  { job: REQUIRED, name: "required list runs only the listed files", ok: job => /node tests\/run-e2e\.mjs "\$\{files\[@\]\}"/.test(job) && !NPM_TEST.test(job) },
-  { job: REQUIRED, name: "required list refuses an empty list", ok: has(/lists no files[\s\S]*exit 1/) },
-  { job: REQUIRED, name: "required list reruns a failed file alone", ok: has(/^\s*CCDM_E2E_NO_RERUN: "0"\s*$/m) },
+  { job: WINDOWS, name: "windows names each shard's report", ok: has(/name: windows-e2e-report-node-\$\{\{ matrix\.node \}\}-shard-\$\{\{ matrix\.shard \}\}/) },
 
   { job: MACOS, name: "macos runs on macos", ok: has(/runs-on: macos-latest/) },
   { job: MACOS, name: "macos uses Node 22", ok: has(NODE_22) },
@@ -145,18 +157,17 @@ const BREAKS = {
   "windows runs on windows": [WINDOWS, "windows-latest", "ubuntu-latest"],
   "windows covers Node 22 and 24": [WINDOWS, "node: [22, 24]", "node: [22]"],
   "windows uses Python 3.11": [WINDOWS, "python-version: '3.11'", "python-version: '3.13'"],
-  "windows is informational": [WINDOWS, "continue-on-error: true", "continue-on-error: false"],
-  "windows runs the full suite": [WINDOWS, "run: npm test", "run: node tests/run-e2e.mjs tests/e2e/ci-contract.test.js"],
+  "windows can fail the PR": [WINDOWS, "    timeout-minutes: 45", "    timeout-minutes: 45\n    continue-on-error: ${{ matrix.node == 22 }}"],
+  "windows stops each shard at 45 minutes": [WINDOWS, "timeout-minutes: 45", "timeout-minutes: 90"],
+  "windows runs every shard to the end": [WINDOWS, "fail-fast: false", "fail-fast: true"],
+  "windows shards match SHARDS": [WINDOWS, "SHARDS: 2", "SHARDS: 3"],
+  "windows names each shard's check": [WINDOWS, ", shard ${{ matrix.shard }})", ")"],
+  "windows runs only its shard's files": [WINDOWS, 'node tests/run-e2e.mjs "${files[@]}"', "npm test"],
+  "windows refuses an empty shard": [WINDOWS, "has no test files", "is fine"],
+  "windows reruns a failed file alone": [WINDOWS, 'CCDM_E2E_NO_RERUN: "0"', 'CCDM_E2E_NO_RERUN: "1"'],
   "windows writes the per-file report": [WINDOWS, "CCDM_E2E_REPORT_DIR", "CCDM_E2E_OTHER_DIR"],
   "windows uploads the report": [WINDOWS, "actions/upload-artifact@v4", "actions/cache@v4"],
-  "windows does not rerun a failed file": [WINDOWS, "CCDM_E2E_JOBS: 4", 'CCDM_E2E_JOBS: 4\n          CCDM_E2E_NO_RERUN: "0"'],
-
-  "required list runs on windows": [REQUIRED, "windows-latest", "ubuntu-latest"],
-  "required list can fail the PR": [REQUIRED, "    timeout-minutes: 60", "    timeout-minutes: 60\n    continue-on-error: true"],
-  "required list reads windows-required.txt": [REQUIRED, "tests/e2e/windows-required.txt", "tests/e2e/other.txt"],
-  "required list runs only the listed files": [REQUIRED, 'node tests/run-e2e.mjs "${files[@]}"', "npm test"],
-  "required list refuses an empty list": [REQUIRED, "lists no files", "is fine"],
-  "required list reruns a failed file alone": [REQUIRED, 'CCDM_E2E_NO_RERUN: "0"', 'CCDM_E2E_NO_RERUN: "1"'],
+  "windows names each shard's report": [WINDOWS, "-shard-${{ matrix.shard }}", ""],
 
   "macos runs on macos": [MACOS, "macos-latest", "ubuntu-latest"],
   "macos uses Node 22": [MACOS, "node-version: 22", "node-version: 24"],
@@ -178,8 +189,8 @@ const BREAKS = {
   "macos runs the full suite": [MACOS, "- run: npm test", "- run: npm run lint"],
 };
 
-test("the workflow has the four jobs, each in its required shape", () => {
-  assert.deepEqual([...workflowJobs(WORKFLOW).keys()], [LINUX, WINDOWS, REQUIRED, MACOS]);
+test("the workflow has the three jobs, each in its required shape", () => {
+  assert.deepEqual([...workflowJobs(WORKFLOW).keys()], [LINUX, WINDOWS, MACOS]);
   assert.deepEqual(violations(WORKFLOW), []);
 });
 
@@ -211,29 +222,99 @@ test("the job reader keeps blocks apart and ignores comments", () => {
   assert.deepEqual([...workflowJobs(text)], [["one", "    runs-on: a"], ["two", "    runs-on: b"]]);
 });
 
-function requiredListProblems(text, exists) {
-  const entries = text.split(/\r?\n/).map(line => line.trim()).filter(line => line && !line.startsWith("#"));
-  const problems = entries.length ? [] : ["the list is empty"];
-  for (const entry of entries) {
-    if (!/^tests\/e2e\/[^/]+\.test\.js$/.test(entry)) problems.push(`${entry} is not a test file path`);
-    else if (!exists(entry)) problems.push(`${entry} does not exist`);
+// Every test file the runner would find, as repo-relative paths. The folder is
+// read here on its own, so a file anyone adds joins the coverage check.
+function allTestFiles() {
+  return fs.readdirSync(path.join(ROOT, "tests", "e2e"), { recursive: true })
+    .map(file => `tests/e2e/${file.split(path.sep).join("/")}`)
+    .filter(file => file.endsWith(".test.js"))
+    .sort();
+}
+
+// Runs the workflow's own shard picker for every shard and returns the problems.
+function shardProblems(job, expected) {
+  const setup = shardSetup(job);
+  if (!setup) return ["the shard setup is unreadable"];
+  const problems = [];
+  const seen = new Map();
+  for (let shard = 1; shard <= setup.shards; shard += 1) {
+    const run = spawnSync(process.execPath, ["-e", setup.picker], {
+      cwd: ROOT,
+      encoding: "utf8",
+      windowsHide: true,
+      env: { ...process.env, SHARD: String(shard), SHARDS: String(setup.shards) },
+    });
+    if (run.status !== 0) {
+      problems.push(`shard ${shard} failed: ${run.stderr.trim().split(/\r?\n/).pop()}`);
+      continue;
+    }
+    const files = run.stdout.split(/\r?\n/).filter(Boolean);
+    if (!files.length) problems.push(`shard ${shard} has no files`);
+    for (const file of files) seen.set(file, [...(seen.get(file) ?? []), shard]);
   }
-  for (const entry of new Set(entries)) {
-    if (entries.indexOf(entry) !== entries.lastIndexOf(entry)) problems.push(`${entry} is listed twice`);
+  for (const file of expected) {
+    const shards = seen.get(file) ?? [];
+    if (shards.length === 0) problems.push(`${file} is in no shard`);
+    if (shards.length > 1) problems.push(`${file} is in shards ${shards.join(", ")}`);
+  }
+  for (const file of seen.keys()) if (!expected.includes(file)) problems.push(`${file} is not a test file`);
+  return problems;
+}
+
+test("every test file runs in exactly one Windows shard", () => {
+  const expected = allTestFiles();
+  assert.ok(expected.length > 50, `only ${expected.length} test files found`);
+  assert.ok(expected.includes("tests/e2e/ci-contract.test.js"));
+  assert.deepEqual(shardProblems(workflowJobs(WORKFLOW).get(WINDOWS), expected), []);
+});
+
+test("the shard check fails when a file is left out or runs twice", () => {
+  const job = workflowJobs(WORKFLOW).get(WINDOWS);
+  const expected = allTestFiles();
+  const pick = "if (index % shards === shard - 1) console.log(file);";
+  assert.ok(job.includes(pick));
+
+  const dropsFirst = job.replace(pick, "if (index % shards === shard - 1 && index !== 0) console.log(file);");
+  assert.deepEqual(shardProblems(dropsFirst, expected), [`${expected[0]} is in no shard`]);
+
+  const secondTwice = job.replace(pick, "if (index % shards === shard - 1 || index === 1) console.log(file);");
+  assert.deepEqual(shardProblems(secondTwice, expected), [`${expected[1]} is in shards 1, 2`]);
+
+  assert.deepEqual(shardProblems(job, [...expected, "tests/e2e/planted.test.js"]), ["tests/e2e/planted.test.js is in no shard"]);
+  assert.deepEqual(shardProblems(job.replace("shard: [1, 2]", "shard: [1]"), expected), ["the shard setup is unreadable"]);
+});
+
+// The closed list of skip categories decided on #258. windows-skip-budget.test.js
+// checks each entry in full; this keeps the list itself from growing unnoticed.
+const SKIP_CATEGORIES = ["darwin-only", "posix-signals", "tmux-backend", "posix-pair", "windows-refused-d2", "posix-only-behaviour"];
+
+function skipBudgetProblems(entries) {
+  const problems = [];
+  for (const entry of entries) {
+    const name = `${entry.file} :: ${entry.test}`;
+    if (typeof entry.category !== "string" || entry.category === "") problems.push(`${name} has no category`);
+    // A `gap` is allowed only when windows-skip-budget.test.js names it; that test checks it.
+    else if (entry.category !== "gap" && !SKIP_CATEGORIES.includes(entry.category)) {
+      problems.push(`${name} has the category "${entry.category}"`);
+    }
   }
   return problems;
 }
 
-test("windows-required.txt is non-empty and names existing test files once each", () => {
-  const list = fs.readFileSync(path.join(ROOT, "tests", "e2e", "windows-required.txt"), "utf8");
-  assert.deepEqual(requiredListProblems(list, entry => fs.existsSync(path.join(ROOT, entry))), []);
+test("every Windows skip budget entry has a category from the closed list", () => {
+  const budgetTest = fs.readFileSync(path.join(ROOT, "tests", "e2e", "windows-skip-budget.test.js"), "utf8");
+  const declared = budgetTest.match(/^const CLOSED_CATEGORIES = (\[[^\]]*\]);$/m);
+  assert.ok(declared, "windows-skip-budget.test.js no longer declares CLOSED_CATEGORIES");
+  assert.deepEqual(JSON.parse(declared[1]), SKIP_CATEGORIES);
 
-  const always = () => true;
-  assert.deepEqual(requiredListProblems("# only a comment\n\n", always), ["the list is empty"]);
-  assert.deepEqual(requiredListProblems("tests/e2e/a.test.js\n", () => false), ["tests/e2e/a.test.js does not exist"]);
-  assert.deepEqual(requiredListProblems("scripts/a.py\n", always), ["scripts/a.py is not a test file path"]);
-  assert.deepEqual(requiredListProblems("tests/e2e/a.test.js\ntests/e2e/a.test.js\n", always),
-    ["tests/e2e/a.test.js is listed twice"]);
+  const { skips } = JSON.parse(fs.readFileSync(path.join(ROOT, "tests", "e2e", "windows-skip-budget.json"), "utf8"));
+  assert.ok(skips.length > 0);
+  assert.deepEqual(skipBudgetProblems(skips), []);
+
+  const planted = { file: "planted.test.js", test: "t", tag: "posix", reason: "r" };
+  assert.deepEqual(skipBudgetProblems([...skips, planted]), ["planted.test.js :: t has no category"]);
+  assert.deepEqual(skipBudgetProblems([...skips, { ...planted, category: "flaky" }]), ['planted.test.js :: t has the category "flaky"']);
+  for (const category of SKIP_CATEGORIES) assert.deepEqual(skipBudgetProblems([{ ...planted, category }]), [], category);
 });
 
 function floorRun(t, mode, files) {
