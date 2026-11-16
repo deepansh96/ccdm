@@ -516,19 +516,68 @@ test("adopting an older multi-message board keeps its first message and deletes 
   assert.deepEqual((await supervisorStatus(workspace)).board.message_ids, ["1700000000000770001"]);
 });
 
-test("a crash counts as failed today, then as idle once a day old", async () => {
-  const workspace = threadWorkspace();
-  await supervised(workspace);
-  const yesterday = new Date(Date.now() - 25 * 3600 * 1000).toISOString();
-  const store = insertRows(workspace, [["1700000000000910001", "stopped", "crashed", null],
-    ["1700000000000910002", "stopped", "crashed", null]]);
-  await boardShows(workspace, quiet(0, 2));
-  // One crash is a day old: the supervisor keeps the time each state began.
+const hoursAgo = hours => new Date(Date.now() - hours * 3600 * 1000).toISOString();
+// Set one stored time on a thread row.
+function setStamp(store, threadId, column, value) {
   execFileSync("python3", ["-c", `import sqlite3, sys
 db = sqlite3.connect(sys.argv[1], timeout=5)
-db.execute("UPDATE threads SET display_since=? WHERE thread_id='1700000000000910001'", (sys.argv[2],))
-db.commit()`, store, yesterday]);
-  await boardShows(workspace, quiet(1, 1));
+db.execute(f"UPDATE threads SET {sys.argv[3]}=? WHERE thread_id=?", (sys.argv[4], sys.argv[2]))
+db.commit()`, store, threadId, column, value]);
+}
+
+test("a crash counts as failed today while its thread was active in the last day, then as idle", async () => {
+  const workspace = threadWorkspace();
+  await supervised(workspace);
+  const [first, second, third] = ["1700000000000910001", "1700000000000910002", "1700000000000910003"];
+  const store = insertRows(workspace, [[first, "stopped", "crashed", null], [second, "stopped", "start-failed", null],
+    [third, "stopped", "crashed", null]]);
+  setStamp(store, first, "last_owner_activity_at", hoursAgo(1));
+  setStamp(store, second, "last_owner_activity_at", hoursAgo(30));
+  setStamp(store, second, "turn_end_seen", hoursAgo(2));
+  // The third has no activity at all: idle, though its board state is new.
+  await boardShows(workspace, quiet(1, 2));
+  // A day later, by every time it has, the first counts as idle too.
+  setStamp(store, first, "last_owner_activity_at", hoursAgo(25));
+  await boardShows(workspace, quiet(2, 1));
+});
+
+// A schema-v1 store, as the supervisor wrote it before turn status, with two
+// crashed threads: one the owner last used three days ago, one never used.
+function writeV1Store(workspace) {
+  const state = supervisorStateDir(workspace);
+  fs.mkdirSync(state, { recursive: true, mode: 0o700 });
+  const file = path.join(state, "threads.sqlite3");
+  execFileSync("python3", ["-c", `import os, sys
+sys.path.insert(0, sys.argv[1])
+import sqlite3
+from thread_supervisor import store
+os.close(os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+db = sqlite3.connect(sys.argv[2])
+db.execute("CREATE TABLE threads (" + store.TABLES["threads"].split("queued_start TEXT,")[0] + "queued_start TEXT)")
+for table in ("creation_requests", "boot_buffers"):
+    db.execute(f"CREATE TABLE {table} ({store.TABLES[table]})")
+for thread_id, activity in (("1700000000000920001", sys.argv[4]), ("1700000000000920002", None)):
+    db.execute("""INSERT INTO threads (thread_id, project, name, creator_id, parent_channel_id, created_at, state,
+        stop_reason, last_owner_activity_at, last_agent_reply_at)
+        VALUES (?, 'demo', 'Old task', ?, 'demo-channel', '2026-10-01T00:00:00.000Z', 'stopped', 'crashed', ?, ?)""",
+        (thread_id, sys.argv[3], activity, activity))
+db.execute("PRAGMA user_version=1")
+db.commit()`, path.join(process.cwd(), "scripts"), file, OWNER_ID, hoursAgo(72)]);
+  return file;
+}
+
+test("crashes migrated from a v1 store with old activity count as idle, not failed today", async () => {
+  const workspace = threadWorkspace();
+  writeV1Store(workspace);
+  await supervised(workspace);
+  await boardShows(workspace, quiet(2));
+  const threads = (await supervisorStatus(workspace)).projects.demo.threads;
+  // The migration's first tick dated both failures now; the board does not trust that.
+  for (const id of ["1700000000000920001", "1700000000000920002"]) {
+    assert.equal(threads[id].display_state, "failed");
+    assert.ok(Date.now() - Date.parse(threads[id].display_since) < 120000, threads[id].display_since);
+  }
+  assert.doesNotMatch(boardText(workspace), /failed today/);
 });
 
 // A Codex thread: the bridge's turn/completed hands the turn to the owner.

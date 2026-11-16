@@ -7,8 +7,10 @@ Under a small `-# CCDM threads` line it shows what needs the owner:
     💤 N idle · ⚠️ M failed today
 
 An empty section is left out. A failed turn waits on the owner like any
-other. ⚠️ counts crashes and failed starts of the last 24 hours and is left
-out at 0; older ones, and stopped, paused and new threads, count as idle.
+other. ⚠️ counts crashed and failed-start threads whose last real activity
+(owner message or start, agent reply, input, turn end) is within 24 hours,
+and is left out at 0; other failures, and stopped, paused and new threads,
+count as idle.
 With nothing waiting or working the board is one line,
 `✅ Nothing needs you · 💤 N idle`. It never grows past one message: past
 Discord's limit the lowest section loses lines, shown as "+N more".
@@ -45,8 +47,14 @@ from .link import LinkError
 HEADER = "-# CCDM threads"
 MESSAGE_LIMIT = 2000
 DEFAULT_INTERVAL_SECONDS = 10
-# A crash or failed start this recent counts as failed; an older one as idle.
+# A crash or failed start counts as failed only while the thread's last real
+# activity is this recent; otherwise it counts as idle.
 FAILED_WINDOW_SECONDS = 24 * 3600
+# That activity: the owner's last message (a start sets it too), the agent's
+# last reply, the last input, and the last turn end seen (a session going
+# live sets it). Not `display_since`: the v2 migration's first status tick set
+# it for every old row, so an old crash would look a day new.
+ACTIVITY_COLUMNS = ("last_owner_activity_at", "last_agent_reply_at", "last_input_at", "turn_end_seen")
 SNOWFLAKE = re.compile(r"\d{17,20}")
 # A board call never holds the worker long.
 CALL_TIMEOUT_SECONDS = 5
@@ -97,6 +105,24 @@ def _epoch(stamp) -> int:
     return int(moment.timestamp())
 
 
+def _seconds(stamp) -> int | None:
+    """A stored time as epoch seconds; None when it is missing or unreadable."""
+    if not isinstance(stamp, str) or not stamp:
+        return None
+    try:
+        moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int((moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)).timestamp())
+
+
+def _failed_recently(row, now_s: int) -> bool:
+    """Whether a crashed or failed-start thread's latest real activity is within the failed window."""
+    stamps = [_seconds(row[column]) for column in ACTIVITY_COLUMNS]
+    latest = max((stamp for stamp in stamps if stamp is not None), default=None)
+    return latest is not None and now_s - latest < FAILED_WINDOW_SECONDS
+
+
 def _buckets(context, rows: dict, now_s: int) -> tuple[list, list, int, int]:
     """Open threads by what they ask of the owner: waiting rows, working rows,
     and the idle and recently failed counts."""
@@ -109,10 +135,10 @@ def _buckets(context, rows: dict, now_s: int) -> tuple[list, list, int, int]:
             waiting.append(row)  # A failed turn hands the turn to the owner too.
         elif state == "working":
             working.append(row)
-        elif state == "failed" and now_s - _epoch(row["display_since"]) < FAILED_WINDOW_SECONDS:
+        elif state == "failed" and _failed_recently(row, now_s):
             failed += 1
         else:
-            idle += 1  # Idle, paused, new, stopped, and failures older than a day.
+            idle += 1  # Idle, paused, new, stopped, and failures with no activity in a day.
     order = lambda row: (_epoch(row["display_since"]), row["thread_id"])  # noqa: E731
     return sorted(waiting, key=order), sorted(working, key=order), idle, failed
 
