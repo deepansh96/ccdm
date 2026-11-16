@@ -352,3 +352,31 @@ test("on restart, an owner's native reply to a root-bot message is root's and st
   assert.equal((await threadRows(workspace))[raw.id].state, "registered");
   assert.deepEqual(claude(workspace).invocations ?? [], []);
 });
+
+test("on restart, a registered project whose channel Discord no longer has does not stop reconcile", async () => {
+  const workspace = reconcileWorkspace();
+  const registryFile = path.join(workspace.repoDir, "registry.json");
+  const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+  registry.projects.gone = { channel_id: "gone-channel", type: "claude", transport: "router", path: workspace.tmpDir,
+    screen_name: "gone_claude" };
+  fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
+  const { supervisor } = await supervised(workspace);
+  const raw = thread("1700000000000390001");
+  threadEvent(workspace, raw, "create");
+  await threadRow(workspace, raw.id);
+  assert.equal((await supervisor.stop()).exitCode, 0);
+
+  // While the supervisor is down, the thread is archived and gone's channel is deleted.
+  threadEvent(workspace, raw, "update", { archived: true, archiveTimestamp: new Date().toISOString(),
+    previous: { ...raw, archived: false } });
+  await delivered(workspace, 2);
+  updateState(workspace.stateDir, state => { state.fixtures.discord.missingChannels = ["gone-channel"]; });
+
+  const restarted = await startThreadSupervisor(workspace, { env: ENV });
+  // The thread list still answers, so the open thread is unarchived as usual.
+  await waitFor(() => discord(workspace).threads[raw.id].archived === false, () => "the unarchive", 15000);
+  assert.equal((await threadRow(workspace, raw.id)).state, "registered");
+  const exit = await restarted.stop();
+  assert.match(exit.stderr, /reconcile: skipped project gone's channel gone-channel \(Discord 404\)/);
+  assert.doesNotMatch(exit.stderr, /the thread list failed/);
+});

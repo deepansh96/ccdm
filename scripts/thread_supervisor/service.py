@@ -79,7 +79,7 @@ def _configuration_blockers(project_root: Path, state_dir: Path) -> list[str]:
 def _router_blockers() -> list[str]:
     try:
         completed = subprocess.run([_node(), str(ROUTER_SCRIPT), "status", "--json"], capture_output=True,
-                                   text=True, timeout=15)
+                                   text=True, timeout=45)
         reachable = completed.returncode == 0 and isinstance(json.loads(completed.stdout), dict)
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         reachable = False

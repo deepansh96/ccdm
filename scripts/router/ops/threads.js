@@ -23,6 +23,8 @@ const ARCHIVE_DURATIONS = new Set([60, 1440, 4320, 10080]);
 const PAGE_LIMIT = 100;
 // Archived pages read per parent channel, at most, in one `thread_list`.
 const ARCHIVED_PAGES = 10;
+// Discord answers for a parent channel that `thread_list` skips: gone, or unreadable.
+const SKIPPABLE_CHANNEL = new Set([403, 404]);
 const ARCHIVE_ACTION = 111;
 const DISCORD_EPOCH = 1420070400000n;
 const PROVIDERS = new Set(["claude", "codex"]);
@@ -133,12 +135,23 @@ async function threadList(ctx, args) {
     if (thread.type === PUBLIC_THREAD && route) threads.push(listed(thread, route));
   }
   const cutoff = days === undefined ? -Infinity : Date.now() - days * 24 * 60 * 60 * 1000;
+  const skipped = [];
   for (const route of parents) {
     let before;
     for (let page = 0; page < ARCHIVED_PAGES; page++) {
-      const result = await discordRequest("GET", `/channels/${route.channel_id}/threads/archived/public`, {
-        token: ctx.token, query: { limit: PAGE_LIMIT, ...(before ? { before } : {}) },
-      });
+      let result;
+      try {
+        result = await discordRequest("GET", `/channels/${route.channel_id}/threads/archived/public`, {
+          token: ctx.token, query: { limit: PAGE_LIMIT, ...(before ? { before } : {}) },
+        });
+      } catch (error) {
+        // A registered channel Discord no longer has (404), or root cannot
+        // read (403), loses only its own archived threads, never the list.
+        if (!(error instanceof DiscordError && SKIPPABLE_CHANNEL.has(error.status))) throw error;
+        skipped.push({ project: route.project, channel_id: route.channel_id, status: error.status });
+        logSkippedOnce(ctx, route, error);
+        break;
+      }
       const archived = (result.threads ?? []).map(thread => listed(thread, route));
       const recent = archived.filter(thread => Date.parse(thread.archive_timestamp) >= cutoff);
       threads.push(...recent);
@@ -146,7 +159,18 @@ async function threadList(ctx, args) {
       before = archived.at(-1).archive_timestamp;
     }
   }
-  return { threads };
+  return { threads, skipped_channels: skipped };
+}
+
+// A skipped channel is logged once per registry load, not on every reconcile.
+const skippedLogged = new WeakMap();
+function logSkippedOnce(ctx, route, error) {
+  const logged = skippedLogged.get(ctx.table) ?? new Set();
+  skippedLogged.set(ctx.table, logged);
+  if (logged.has(route.channel_id)) return;
+  logged.add(route.channel_id);
+  ctx.log?.(`thread_list_skipped project=${route.project} channel=${route.channel_id} status=${error.status} ` +
+    `error=${error.message}`);
 }
 
 async function threadHistory(ctx, args) {

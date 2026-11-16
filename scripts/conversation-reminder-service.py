@@ -835,7 +835,7 @@ def router_prerequisites(registry: dict) -> dict:
     try:
         completed = subprocess.run([os.environ.get("CCDM_REMINDER_NODE", "node"),
                                     str(Path(__file__).with_name("router.js")), "status", "--json"],
-                                   capture_output=True, text=True, timeout=15)
+                                   capture_output=True, text=True, timeout=45)
         router = json.loads(completed.stdout) if completed.returncode == 0 else None
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         router = None
