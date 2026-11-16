@@ -1240,6 +1240,77 @@ def _claude_refresh_target(services, cache, config_dir):
     return None
 
 
+def _claude_limit_entry(window, raw_percent, resets_at, scope=None):
+    """Return one sanitized Claude limit; a bad percentage is unavailable, never 0%."""
+    try:
+        percent = float(raw_percent)
+        if isinstance(raw_percent, bool) or not math.isfinite(percent):
+            raise ValueError
+    except (TypeError, ValueError):
+        percent = None
+    entry = {
+        "window": f"{window} ({scope})" if scope else window,
+        "used_percent": max(0.0, min(100.0, percent)) if percent is not None else None,
+        "available": percent is not None,
+        "status": "available" if percent is not None else "unavailable",
+        "reason": None if percent is not None else "Usage percentage unavailable",
+        "resets_at": _normalise_reset_timestamp(resets_at),
+    }
+    if scope:
+        entry["scope"] = scope
+    return entry
+
+
+def _claude_usage_limits(usage):
+    limits = usage.get("limits") if isinstance(usage, dict) else None
+    return [entry for entry in limits if isinstance(entry, dict)] if isinstance(limits, list) else []
+
+
+def _claude_unscoped_limits(usage):
+    """Return the first unscoped ``session`` and ``weekly_all`` entries by kind."""
+    found = {}
+    for entry in _claude_usage_limits(usage):
+        kind = entry.get("kind")
+        if kind in {"session", "weekly_all"} and entry.get("scope") is None and kind not in found:
+            found[kind] = entry
+    return found
+
+
+CLAUDE_SCOPE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9 ._+-]")
+
+
+def _claude_scope_name(scope):
+    """Return a model-only scope's display name, or ``None`` to ignore the entry.
+
+    A scope naming a surface (alone or with a model) is not a whole-model
+    allowance, so it is never shown under the model's name.
+    """
+    if not isinstance(scope, dict) or scope.get("surface") is not None:
+        return None
+    model = scope.get("model")
+    name = model.get("display_name") if isinstance(model, dict) else None
+    if not isinstance(name, str):
+        return None
+    # The name is rendered inside Discord markdown and stored in history.
+    cleaned = " ".join(CLAUDE_SCOPE_NAME_PATTERN.sub("", name).split())[:32].strip()
+    return cleaned or None
+
+
+def _claude_scoped_limits(usage):
+    """Return one 7-day limit per model from ``weekly_scoped`` entries, first wins."""
+    scoped = []
+    seen = set()
+    for entry in _claude_usage_limits(usage):
+        if entry.get("kind") != "weekly_scoped":
+            continue
+        name = _claude_scope_name(entry.get("scope"))
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        scoped.append(_claude_limit_entry("7-day", entry.get("percent"), entry.get("resets_at"), scope=name))
+    return scoped
+
+
 def _collect_claude_oauth_metric(
     base_url, services, label, dir_hint, email=None, cache=None, client_version=None, refresher=None
 ):
@@ -1326,34 +1397,37 @@ def _collect_claude_oauth_metric(
     organization = profile.get("organization") if isinstance(profile, dict) else None
     organization_type = organization.get("organization_type") if isinstance(organization, dict) else None
     metric["plan"] = str(organization_type or "N/A").replace("_", " ").title()
-    for key, window in (("five_hour", "5-hour"), ("seven_day", "7-day")):
+    unscoped_limits = _claude_unscoped_limits(usage)
+    for key, kind, window in (("five_hour", "session", "5-hour"), ("seven_day", "weekly_all", "7-day")):
         data = usage.get(key) if isinstance(usage, dict) else None
-        if not isinstance(data, dict):
-            continue
-        raw_percent = data.get("utilization")
-        try:
-            percent = float(raw_percent)
-            if isinstance(raw_percent, bool) or not math.isfinite(percent):
-                raise ValueError
-        except (TypeError, ValueError):
-            percent = None
-        metric["limits"].append({
-            "window": window,
-            "used_percent": max(0.0, min(100.0, percent)) if percent is not None else None,
-            "available": percent is not None,
-            "status": "available" if percent is not None else "unavailable",
-            "reason": None if percent is not None else "Usage percentage unavailable",
-            "resets_at": _normalise_reset_timestamp(data.get("resets_at")),
-        })
+        # The legacy field comes first; when it is absent or its percentage is
+        # unusable, the newer ``limits`` array's entry for the window is used.
+        sources = []
+        if isinstance(data, dict):
+            sources.append(_claude_limit_entry(window, data.get("utilization"), data.get("resets_at")))
+        if kind in unscoped_limits:
+            entry = unscoped_limits[kind]
+            sources.append(_claude_limit_entry(window, entry.get("percent"), entry.get("resets_at")))
+        if sources:
+            metric["limits"].append(next((source for source in sources if source["available"]), sources[0]))
+    metric["limits"].extend(_claude_scoped_limits(usage))
     if not metric["limits"]:
         metric["status"] = "unavailable"
         metric["reason"] = "No rate-limit data"
     lines = [f"**{label}** ({metric['plan']})"]
+    scoped = any(limit.get("scope") for limit in metric["limits"])
     for limit in metric["limits"]:
         reset = fmt_reset(limit.get("resets_at"), datetime.now(timezone.utc))
         reset_part = f"  resets in {reset}" if reset else ""
         value_text = text_bar(limit["used_percent"]) if limit["available"] else "*unavailable*"
-        lines.append(f"{'5-Hour' if limit['window'] == '5-hour' else '7-Day'}: {value_text}{reset_part}")
+        if limit.get("scope"):
+            name = f"7-Day ({limit['scope']})"
+        elif limit["window"] == "5-hour":
+            name = "5-Hour"
+        else:
+            # Name the all-models row only when a model-scoped row sits beside it.
+            name = "7-Day (all)" if scoped else "7-Day"
+        lines.append(f"{name}: {value_text}{reset_part}")
     extra_usage = usage.get("extra_usage", {}) if isinstance(usage, dict) else {}
     if isinstance(extra_usage, dict) and extra_usage.get("is_enabled"):
         lines.append(f"Extra usage: **${_safe_int(extra_usage.get('used_credits')) / 100:.2f}** spent")
@@ -2037,36 +2111,94 @@ def collect_codex_metrics(registry, config=None, now=None, deepseek_usage=_DEEPS
     )
 
 
+# Discord embed limits: a field value, the field count, and the whole embed.
+DISCORD_FIELD_VALUE_LIMIT = 1024
+DISCORD_EMBED_FIELD_LIMIT = 25
+DISCORD_EMBED_TOTAL_LIMIT = 6000
+TRUNCATED_MARK = "\n*truncated*"
+
+
+def _truncate_block(block, limit):
+    """Cut one block to ``limit`` characters at a line boundary, marked truncated."""
+    if len(block) <= limit:
+        return block
+    room = limit - len(TRUNCATED_MARK)
+    kept = ""
+    for line in block.split("\n"):
+        candidate = f"{kept}\n{line}" if kept else line
+        if len(candidate) > room:
+            break
+        kept = candidate
+    # A first line longer than the whole field is cut where it must be.
+    return (kept or block[:room]).rstrip() + TRUNCATED_MARK
+
+
+def _pack_field_values(blocks):
+    """Pack account blocks into field values of at most 1024 characters.
+
+    Blocks are never split across fields; only a block longer than a whole
+    field on its own is truncated.
+    """
+    values = []
+    for block in blocks:
+        block = _truncate_block(block, DISCORD_FIELD_VALUE_LIMIT)
+        if values and len(values[-1]) + 2 + len(block) <= DISCORD_FIELD_VALUE_LIMIT:
+            values[-1] = f"{values[-1]}\n\n{block}"
+        else:
+            values.append(block)
+    return values
+
+
 def _usage_report_values(claude_metrics, codex_metrics):
-    """Build the bounded text fields used by manual and scheduled reports."""
-    claude_value = "\n\n".join(
-        metric["text"]
-        for metric in claude_metrics
-        if isinstance(metric.get("text"), str) and metric["text"]
-    )
-    codex_value = "\n\n".join(
-        metric["text"]
-        for metric in codex_metrics
-        if isinstance(metric.get("text"), str) and metric["text"]
-    ) or None
-    if len(claude_value) > 1024:
-        claude_value = claude_value[:1000].rstrip() + "\n*truncated*"
-    if len(codex_value or "") > 1024:
-        codex_value = codex_value[:1000].rstrip() + "\n*truncated*"
-    return claude_value, codex_value
+    """Build the bounded text field values used by manual and scheduled reports.
+
+    Returns ``(claude_values, codex_values)``: lists of field values, one field
+    per list item, with ``codex_values`` ``None`` when there is no Codex text.
+    """
+    def blocks(metrics):
+        return [metric["text"] for metric in metrics if isinstance(metric.get("text"), str) and metric["text"]]
+
+    return _pack_field_values(blocks(claude_metrics)) or [""], _pack_field_values(blocks(codex_metrics)) or None
 
 
 def _usage_report_embed(claude_value, codex_value=None):
-    """Return the original text-only Usage Report embed."""
+    """Return the original text-only Usage Report embed.
+
+    Each value may be one string or a list of field values; a provider's
+    second and later fields are named ``<provider> (cont.)``. Over Discord's
+    field-count or total-length limit, the provider with the most fields loses
+    its last field, and its new last field is marked truncated, until the
+    embed fits; each provider keeps at least its first field.
+    """
     timestamp = datetime.now().strftime("%b %d, %H:%M")
     embed = {
         "title": "Usage Report",
         "color": 0x5865F2,
-        "fields": [{"name": "Claude Code", "value": claude_value, "inline": True}],
+        "fields": [],
         "footer": {"text": timestamp},
     }
-    if codex_value is not None:
-        embed["fields"].append({"name": "Codex", "value": codex_value, "inline": True})
+    providers = []
+    for name, values in (("Claude Code", claude_value), ("Codex", codex_value)):
+        if values is not None:
+            providers.append([
+                {"name": name if index == 0 else f"{name} (cont.)", "value": value, "inline": True}
+                for index, value in enumerate([values] if isinstance(values, str) else values)
+            ])
+
+    def over_limit():
+        fields = [field for provider in providers for field in provider]
+        size = len(embed["title"]) + len(timestamp) + sum(len(f["name"]) + len(f["value"]) for f in fields)
+        return len(fields) > DISCORD_EMBED_FIELD_LIMIT or size > DISCORD_EMBED_TOTAL_LIMIT
+
+    while over_limit():
+        provider = max(providers, key=len)
+        if len(provider) < 2:
+            break
+        provider.pop()
+        last = provider[-1]
+        if not last["value"].endswith(TRUNCATED_MARK):
+            last["value"] = _truncate_block(last["value"] + TRUNCATED_MARK, DISCORD_FIELD_VALUE_LIMIT)
+    embed["fields"] = [field for provider in providers for field in provider]
     return embed
 
 
@@ -2164,6 +2296,11 @@ def _safe_history_cards(metrics):
                 "available": bool(available),
                 "status": "available" if available else "unavailable",
             }
+            # A model-scoped limit (Claude's 7-day Fable allowance) already has
+            # its own window, e.g. "7-day (Fable)", so it is a separate series
+            # and never mixes into the all-models "7-day" one.
+            if isinstance(limit.get("scope"), str) and limit["scope"].strip():
+                card["scope"] = _safe_label(limit["scope"], "")[:32]
             if available:
                 card["used_percent"] = max(0.0, min(100.0, value))
             reason = limit.get("reason") or metric.get("reason")

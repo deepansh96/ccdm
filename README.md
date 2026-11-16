@@ -699,14 +699,21 @@ History is stored at `~/Library/Application Support/CCDM/usage-stats/history.sql
 ```
 
 The poster reports:
-- Claude Code limits from Anthropic OAuth APIs via the macOS Keychain credentials
+- Claude Code limits from Anthropic OAuth APIs via the macOS Keychain credentials:
+  the 5-hour session (absent on accounts that have none, such as Max), the
+  7-day allowance for all models, and one 7-day row per model that has its own
+  weekly allowance (today `7-Day (Fable)`), each with its reset time. When a
+  model row is shown, the all-models row reads `7-Day (all)`; an account
+  without one keeps the plain `7-Day` label. History stores each model row as
+  its own series (window `7-day (<model>)` with `scope`), never mixed into the
+  all-models `7-day` series
 - ChatGPT/Codex limits for every alias in the top-level `codex_accounts`
   registry map, with `default_codex_account` shown first and the remaining
   aliases shown alphabetically
 - Local token-usage fallback from each named Codex Home's `sessions` directory
   when live rate limits are unavailable
 
-Each automated Discord post sends only the original text Usage Report embed. Codex is displayed as a weekly allowance only. Claude API-key accounts have no comparable percentage limit, so their embed text shows sanitized local estimated Today and This month costs, request counts, and status. The credential-free trend renderer (`scripts/usage-dashboard-renderer.py`) is retained for back-compat but is no longer invoked by the posting workflow.
+Each automated Discord post sends only the original text Usage Report embed. A provider section longer than one embed field (1024 characters) continues in further fields named `Claude Code (cont.)` or `Codex (cont.)`, split only between account blocks, so no account is cut off; only a single block longer than a whole field is truncated, and an embed over Discord's 25-field or 6000-character limit drops trailing continuation fields (marking the last one kept as truncated) while each provider keeps its first field. Codex is displayed as a weekly allowance only. Claude API-key accounts have no comparable percentage limit, so their embed text shows sanitized local estimated Today and This month costs, request counts, and status. The credential-free trend renderer (`scripts/usage-dashboard-renderer.py`) is retained for back-compat but is no longer invoked by the posting workflow.
 
 The poster reads the same named-account registry configuration shown in
 [Codex Accounts](#codex-accounts); it does not need a separate list of Codex
