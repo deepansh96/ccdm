@@ -17,7 +17,7 @@
 //   CCDM_THREAD_PROVIDER      the thread's provider (`claude`)
 //   CCDM_THREAD_BOOTSTRAP_FILE  the Thread Supervisor's bootstrap for this launch
 //   CCDM_THREAD_TMUX          this thread session's own tmux session
-//   CCDM_THREAD_ACTIVITY_FILE   this launch's activity.json, marked turn_running on each notification
+//   CCDM_THREAD_ACTIVITY_FILE   this launch's activity.json: turn_running on each notification, paused, turn_replied
 //
 // In thread mode the server says hello as the `thread` role, so its Session
 // Scope is the thread alone. It holds live events until the supervisor's
@@ -62,7 +62,7 @@ const path = require("node:path");
 const { createInterface } = require("node:readline");
 const reminder = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
-const { markTurn } = require("./thread-activity.js");
+const { markPaused, markReplied, markTurn } = require("./thread-activity.js");
 const { createEmergencyGateway } = require("./router/emergency.js");
 const modelInfo = require("./model-info.js");
 
@@ -616,11 +616,13 @@ function main() {
   const COMMANDS = {
     pause: async event => {
       paused = true;
+      if (THREAD) markPaused(process.env.CCDM_THREAD_ACTIVITY_FILE, true);
       await react(event, "⏸️");
       await say(event, "Session paused. New messages will be queued.");
     },
     unpause: async event => {
       paused = false;
+      if (THREAD) markPaused(process.env.CCDM_THREAD_ACTIVITY_FILE, false);
       for (const [kind, queuedEvent] of pausedEvents.splice(0)) notify(kind, queuedEvent);
       await react(event, "▶️");
       await say(event, "Session unpaused.");
@@ -700,6 +702,8 @@ function main() {
         text = await tool.run(router, input);
       } else {
         const result = await request(tool.op, tool.args(input));
+        // The thread's turn has replied, for the supervisor's owner ping.
+        if (THREAD && tool.op === "reply") markReplied(process.env.CCDM_THREAD_ACTIVITY_FILE);
         // Record the receipt before Claude sees the result, so the Stop hook
         // that follows the turn finds it.
         await reminderEvents;

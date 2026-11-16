@@ -30,12 +30,27 @@ const { createRouterServer } = require("./router/server.js");
 const { deleteWebhook, ensureWebhook } = require("./router/webhooks.js");
 
 const OFFLINE_EMOJI = "💤";
-// Thread bits granted at the guild rather than in a project channel.
+// Thread bits granted at the guild rather than in a project channel: optional.
 const GUILD_THREAD_PERMISSIONS = ["ViewAuditLog"];
 const THREAD_SUPERVISOR_PLIST = path.join("Library", "LaunchAgents", "com.ccdm.thread-supervisor.plist");
 
+// Owner pings remembered, at most.
+const PING_MEMORY = 2000;
+
 function log(line) {
   console.log(`[router] ${line}`);
+}
+
+// A Set that forgets its oldest entries past `limit`.
+function boundedSet(limit) {
+  const set = new Set();
+  const add = set.add.bind(set);
+  set.add = value => {
+    add(value);
+    while (set.size > limit) set.delete(set.values().next().value);
+    return set;
+  };
+  return set;
 }
 
 async function serve() {
@@ -52,10 +67,13 @@ async function serve() {
   const bot = { id: null };
   // The gateway client, for `status` to check root's channel permissions.
   const discord = { client: null };
+  // The owner pings this Router posted, so a native reply to one reaches the
+  // thread rather than root. A Router restart forgets them.
+  const pings = boundedSet(PING_MEMORY);
   const server = createRouterServer({
     stateDir: stateDir(), socketPath: socketPath(), getTable: () => table, gateway, registry,
     context: {
-      stateDir: stateDir(), registryFile: registryPath(), token, attachments, bot, discord, log,
+      stateDir: stateDir(), registryFile: registryPath(), token, attachments, bot, discord, log, pings,
       // A failed reminder update is logged; the reply it heals still goes out.
       assignmentChanged: project => assignmentChanged(project, { registryFile: registryPath() })
         .then(() => log(`assignment_changed project=${project}`), error => log(`assignment_changed_failed ${error.message}`)),
@@ -92,10 +110,11 @@ async function serve() {
   // or else the supervisor, or else get 💤. The supervisor also gets a copy of
   // every message, in the same turn as the session delivery.
   async function routeThreadMessage(message, thread) {
-    const routed = classifyMessage(table, message, thread);
+    const options = { isPing: id => pings.has(id) };
+    const routed = classifyMessage(table, message, thread, options);
     if (routed) attachments.remember(routed.event);
     const delivered = Boolean(routed?.thread) && server.deliverThread(thread.thread_id, routed.event);
-    const supervised = server.deliverSupervisor(supervisedMessage(table, message, thread, delivered));
+    const supervised = server.deliverSupervisor(supervisedMessage(table, message, thread, delivered, options));
     if (!routed || delivered) return;
     if (routed.root) {
       if (!server.deliverRoot(routed.event)) await markOffline(thread.thread_id, message.id);
@@ -213,7 +232,10 @@ async function status(json = false) {
   }
   result.threads_enabled = threadsEnabled(result);
   if (!result.threads_enabled) {
-    for (const project of result.projects) delete project.missing_thread_permissions;
+    for (const project of result.projects) {
+      delete project.missing_thread_permissions;
+      delete project.missing_optional_thread_permissions;
+    }
   }
   if (json) return console.log(JSON.stringify(result));
   console.log(`gateway: ${result.gateway}`);
@@ -232,15 +254,20 @@ async function status(json = false) {
     const missing = project.missing_permissions;
     const access = missing === null ? "unknown" : missing.length ? `missing ${missing.join(",")}` : "ok";
     const threads = result.threads_enabled ? ` thread_permissions=${permissionState(project.missing_thread_permissions,
-      flag => !GUILD_THREAD_PERMISSIONS.includes(flag))}` : "";
+      () => true)}` : "";
     console.log(`  ${project.project} channel=${project.channel_id} webhook=${project.webhook ? "present" : "missing"} root_permissions=${access}${threads}`);
   }
   if (result.threads_enabled) {
     // Guild permissions read the same through every channel; any channel's answer is the guild's.
-    const known = result.projects.find(project => project.missing_thread_permissions);
-    const guild = known ? permissionState(known.missing_thread_permissions, flag => GUILD_THREAD_PERMISSIONS.includes(flag))
-      : "unknown";
-    console.log(`guild permissions: ${guild}`);
+    const known = result.projects.find(project => project.missing_optional_thread_permissions);
+    const guild = known ? permissionState(known.missing_optional_thread_permissions,
+      flag => GUILD_THREAD_PERMISSIONS.includes(flag)) : "unknown";
+    console.log(`guild permissions (optional): ${guild}`);
+  }
+  const board = result.status_channel ?? {};
+  if (board.error) console.log(`thread status channel: off (invalid: ${board.error})`);
+  else if (board.channel_id) {
+    console.log(`thread status channel: ${board.channel_id} permissions=${permissionState(board.missing_permissions, () => true)}`);
   }
   console.log(`scope violations: ${result.scope_violations.length}`);
   for (const violation of result.scope_violations) {

@@ -778,8 +778,10 @@ function routeDiscordApi(url, init = {}) {
     updateState((state) => {
       state.fixtures.discord.deletes ||= [];
       state.fixtures.discord.reminderRequests ||= [];
+      // `threadArchived`: whether the message's thread was archived when the delete arrived.
       state.fixtures.discord.deletes.push({ authorization: headerValue(init.headers, "Authorization"),
-        channelId: getMessageMatch[1], messageId: getMessageMatch[2] });
+        channelId: getMessageMatch[1], messageId: getMessageMatch[2],
+        threadArchived: Boolean(state.fixtures.discord.threads?.[getMessageMatch[1]]?.archived) });
       state.fixtures.discord.reminderRequests.push({ method: "DELETE", messageId: getMessageMatch[2] });
       const message = state.fixtures.discord.messages?.find(entry => entry.id === getMessageMatch[2]);
       exists = Boolean(message && !message.deleted);
@@ -827,6 +829,14 @@ function routeDiscordApi(url, init = {}) {
   const editMessageMatch = /^\/api\/v10\/channels\/([^/]+)\/messages\/([^/]+)$/.exec(url.pathname);
   if (url.hostname === "discord.com" && editMessageMatch && method === "PATCH") {
     const parsedBody = init.body ? JSON.parse(String(init.body)) : {};
+    // A message the fake sent and then deleted is gone, as in Discord.
+    const gone = readState().fixtures.discord.messages?.some(message => message.id === editMessageMatch[2] && message.deleted);
+    if (gone) {
+      return response(JSON.stringify({ code: 10008, message: "Unknown Message" }), {
+        headers: { "content-type": "application/json" },
+        status: 404,
+      });
+    }
     updateState((state) => {
       state.fixtures.discord.edits ||= [];
       state.fixtures.discord.edits.push({
@@ -835,6 +845,9 @@ function routeDiscordApi(url, init = {}) {
         content: parsedBody.content ?? "",
         messageId: editMessageMatch[2],
       });
+      // A message the fake sent now reads with its edited content.
+      const sent = state.fixtures.discord.messages?.find(message => message.id === editMessageMatch[2] && !message.deleted);
+      if (sent && sent.channelId === editMessageMatch[1] && parsedBody.content !== undefined) sent.content = parsedBody.content;
     });
     return response(JSON.stringify({ id: editMessageMatch[2], content: parsedBody.content ?? "" }), {
       headers: { "content-type": "application/json" },

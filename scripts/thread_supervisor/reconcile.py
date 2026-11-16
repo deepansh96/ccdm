@@ -6,18 +6,20 @@ It runs on each Router connection (worker start and every reconnect) and on
 channel moved meanwhile is `closed/project-moved` and never started. A
 `booting` or `live` row whose process is gone is `stopped/crashed`. `thread_list` (active threads, and threads archived in the
 last 7 days) then binds unknown active threads under the normal binding
-rules, and classifies archives the supervisor missed through the archive-actor
-lookup. A thread is started only when `thread_history` shows its newest owner
-message is newer than its newest project-webhook message; its bootstrap holds
-the owner and guest messages after that agent reply, which the session never
-received; a message that mentions root, or natively replies to a root-bot
-message, is root's and never counts. `crashed`, `start-failed` and `operator`
+rules, and unarchives every archived thread whose conversation is not
+closed: a thread stays open until `/close`. A thread is started only when
+`thread_history` shows its newest owner message is newer than its newest
+project-webhook message; its bootstrap holds the owner and guest messages
+after that agent reply, which the session never received; a message that
+mentions root, or natively replies to a root-bot message other than an owner
+ping, is root's and never counts. `crashed`, `start-failed` and `operator`
 stops never restart here.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
+import re
 import sys
 import time
 
@@ -31,9 +33,10 @@ HISTORY_PAGE = 100
 HISTORY_PAGES = 10
 # Stops only a person or a failure undoes.
 NEVER_RESTARTED = ("crashed", "start-failed", "operator")
-ARCHIVE_REASONS = ("auto-archive", "archive-actor-unknown")
 # Default and reply messages; system notices are not conversation.
 MESSAGE_TYPES = (0, 19)
+# The supervisor's owner pings (turns.PING and the like), as Discord shows them.
+OWNER_PING = re.compile(r"^(?:🔔|⚠️) <@!?\d+> ")
 
 
 def _log(message: str) -> None:
@@ -74,9 +77,8 @@ def _reconcile_thread(context, thread: dict) -> None:
     if row and row["project"] != project:
         return
     if thread.get("archived"):
-        if row and row["state"] != "closed" and not (row["state"] == "stopped"
-                                                     and row["stop_reason"] in ARCHIVE_REASONS):
-            lifecycle.stop_archived(context, row, _archived_at_ms(thread) - lifecycle.ARCHIVE_LOOKBACK_MS)
+        if row and row["state"] != "closed" and not row["pending_close"]:
+            lifecycle.reopen(context, row, _archived_at_ms(thread) - lifecycle.ARCHIVE_LOOKBACK_MS)
         return
     if row is None:
         binding.on_thread_create(context, {"project": project, "thread_id": thread_id, "name": thread.get("name"),
@@ -130,6 +132,8 @@ def _replies_to_root(context, message: dict) -> bool:
     referenced = message.get("referenced_message")
     if not context.bot_user_id or not message.get("message_reference") or not isinstance(referenced, dict):
         return False
+    if OWNER_PING.match(str(referenced.get("content") or "")):
+        return False  # A reply to an owner ping answers the thread.
     return str((referenced.get("author") or {}).get("id") or "") == context.bot_user_id
 
 

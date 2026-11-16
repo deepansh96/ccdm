@@ -57,10 +57,30 @@ Accounts are aliases only. Claude aliases live in the registry's `claude_account
 
 ## Archive, delete and resume
 
-- **Archive:** an owner or root archive, or `/close`, closes the conversation and stops its session. Any other archive, including Discord's inactivity auto-archive, only stops the session (`stopped/auto-archive`). The supervisor reads the archive actor from audit-log action 111 entries that set `archived` to true (a rename or archive-duration change is not an archive), polling for up to 60 s. A lookup that fails throughout is recorded as `stopped/archive-actor-unknown` and fails open as an auto-archive.
-- **Unarchive:** a bot unarchive starts nothing.
+- **Archive:** a thread stays unarchived until it is closed. Only `/close` and `scripts/threads.sh close` archive it, and they close the conversation and stop its session. Any other archive is reverted at once: Discord's one-week inactivity auto-archive, the owner or a guest archiving it by hand, or a root archive outside the close flow. Reverting never closes the conversation. A live session that is not mid-turn stops as `stopped/auto-archive`, since a week without messages means it held a slot for nothing, and the next owner or guest message resumes it exactly. A booting session, or one mid-turn, keeps running. With the optional View Audit Log the supervisor logs who archived the thread, from one audit-log read. Rows written by older versions may still show `closed/owner-archive`, `closed/root-archive` or `stopped/archive-actor-unknown`, but none of them is written any more.
+- **Unarchive:** an unarchive, including the supervisor's own revert, starts nothing.
 - **Delete:** stops the session and drops the supervisor row and the reminder state. Provider conversation files stay on disk.
 - **Resume:** an owner or guest message resumes a stopped thread. Only an owner message reopens a Closed Conversation. Either way it resumes the same provider conversation (`claude --resume`, or Codex `--resume <uuid>`) in the same cwd and the home the conversation started in, even if the project has since switched accounts. A missing transcript or rollout is a start failure with a one-line reason, never a silent fresh start.
+
+## Status: owner pings and the status board
+
+The supervisor tracks whose turn it is in every thread. It reads each live session's `activity.json`, which the CCDM channel server and the Codex bridge keep. That file records whether a turn is running, when the last one ended and how (`completed`, `failed`, or for Codex `interrupted`), whether the turn replied, and whether `/pause` holds new turns. The supervisor combines that with its own copy of every thread message.
+
+- **Agent's turn:** an owner or guest message that is not a command and does not address root, or a creation request's first message, hands the turn to the agent.
+- **Owner's turn:** when a live session's turn has ended and no turn has run for 5 s (`CCDM_THREAD_STATUS_SETTLE_S`), with no input after it, the turn passes to the owner. A turn with no new input changes nothing: a compaction, the bootstrap of `/restart`, or a retry.
+- **Owner ping:** when the turn passes to the owner, root posts `🔔 @owner ready for you` in the thread. The text is `finished without a reply` when the turn posted none, and `⚠️ @owner the last turn failed` after a failed turn. Its `allowed_mentions` name the owner alone, and at most one ping exists per thread: the owner's next message in the thread deletes it, as do the next ping and `/close` (before its archive). There is no ping:
+  - after a turn driven by a guest;
+  - after a stop, a crash or `/close`, since only live sessions are read;
+  - when the registry sets `"thread_owner_pings": false` (`CCDM_THREAD_OWNER_PINGS=0|1` overrides it).
+  
+  A native reply to a ping reaches the thread's session, not root. After a Router restart, a reply to an older ping reaches root as before.
+- **Status board:** with `thread_status_channel_id` naming a dedicated channel, root keeps one message there, or up to five when it overflows, edited in place. It lists every open thread, grouped as 🔔 waiting on you, ⚠️ failed (crashed, start failed or turn failed), ⏳ working (also starting and queued), and 💤 idle (also paused, stopped or new). Each line has a jump link, the project, provider/model, the state, and a self-updating relative time since that state began.
+  - **Edits:** the text changes only when a state does. A flush runs at most every 10 s (`CCDM_THREAD_STATUS_BOARD_INTERVAL_S`) and edits only the messages whose text changed; the Router coalesces edits too.
+  - **Restarts:** after a restart, the supervisor reuses the board's messages from its store. Without a stored board, it adopts root's earlier board messages in the channel, so it never posts a duplicate. A board message deleted in Discord makes the whole board post again.
+  - **Overflow:** past five messages, the 💤 threads collapse to a count.
+  - **Turning it off:** with the key unset, or invalid (not an ID, or a root or project channel), the board is off. The Router keeps the rest of the registry and shows the reason in `router status`.
+
+`scripts/thread-supervisor.py status` shows each thread's `whose_turn`, `display_state`, `display_since` and `ping_message_id`, plus `board` and `owner_pings`.
 
 ## Capacity
 
@@ -75,7 +95,7 @@ Live thread sessions are capped per provider by the registry's `thread_session_c
 While the supervisor is down, a thread message with no live session gets 💤. The supervisor will reconcile on its own start, on every Router reconnect and on every gateway resume:
 
 - it binds threads it missed;
-- it classifies archives it did not see;
+- it unarchives every archived thread whose conversation is not closed;
 - it marks dead sessions `crashed`;
 - it starts only threads whose newest owner message is newer than the last agent reply, with the undelivered messages in the bootstrap; a root mention or a native reply to root never counts.
 
@@ -95,8 +115,8 @@ Each thread is its own Conversation Reminder conversation, keyed `(project, conv
 
 - **Reminders:** root posts 👀 into the thread on the usual 1h → 24h backoff, behind the 5 s gate.
 - **Acknowledgment:** the owner's reply acknowledges only that thread. Guests never acknowledge.
-- **Close:** `/close` and an owner archive close only that thread's reminders. The next owner message reopens them.
-- **Archived threads:** a reminder posted into an auto-archived thread reopens the thread without starting a session.
+- **Close:** `/close` closes only that thread's reminders. The next owner message reopens them.
+- **Archived threads:** a reminder posted into a thread that is still archived (say, while the supervisor was down) reopens the thread without starting a session.
 - **Resets:** a provider or account switch resets tracking. A delete drops the state.
 - **Status:** reminder `status` nests threads under their project.
 
@@ -118,18 +138,21 @@ The worker writes a fresh `keys/.supervisor.key` in the Router state on each sta
 - **Disable / enable** with `scripts/thread-supervisor.py disable` and `enable`. While disabled, the supervised worker exits and launchd does not relaunch it. `enable` only clears the disabled marker; it does not start the worker. Rerun `scripts/install-thread-supervisor.sh` afterwards to relaunch the LaunchAgent.
 - **Debug in the foreground** with `scripts/thread-supervisor.py disable`, then `scripts/thread-supervisor.py run`. A second worker exits with status 2 while the lock is held.
 - **Operate threads** with `scripts/threads.sh list [<project>]` and `scripts/threads.sh stop|restart|close [<project>] <name|link|id>`. `send-claude-command.sh`, guest access (which acts on the parent project) and `export-discord-range.js` also accept a thread id.
-- **Router view:** `node scripts/router.js status` lists each `thread` connection, the supervisor line, and root's missing thread permissions while threads are enabled.
+- **Router view:** `node scripts/router.js status` lists each `thread` connection, the supervisor line, and root's missing thread permissions while threads are enabled. It also shows `thread status channel: <id> permissions=…`, or `off (invalid: …)`, when the key is set.
 
 ## Root permissions
 
-Root needs four permissions for threads. They are **granted once by hand**, and no CCDM script PATCHes permissions:
+Root needs three permissions for threads. They are **granted once by hand**, and no CCDM script PATCHes permissions:
 
 - **Create Public Threads**, in every project channel;
 - **Send Messages in Threads**, in every project channel;
-- **Manage Threads**, in every project channel;
-- **View Audit Log**, at the guild level, to tell an owner or root archive from an auto-archive.
+- **Manage Threads**, in every project channel, to reopen threads that something other than `/close` archived.
 
-Grant them on root's role (Server Settings → Roles), or on each project category or channel. `router status` and reminder readiness report any missing bit only while threads are enabled: the supervisor's LaunchAgent plist exists, `thread_session_caps` is in the registry, or a supervisor is connected. Without View Audit Log, archives are recorded as `archive-actor-unknown` and handled as auto-archives, so an owner archive no longer closes the conversation.
+**View Audit Log**, at the guild level, is useful but optional. With it, the supervisor logs who archived a thread it reopened.
+
+For the status board, give root View Channel, Send Messages and Read Message History in the status channel, and deny Send Messages to everyone else, so the board stays the channel's last messages.
+
+Grant them on root's role (Server Settings → Roles), or on each project category or channel. `router status` and reminder readiness report any missing required bit only while threads are enabled: the supervisor's LaunchAgent plist exists, `thread_session_caps` is in the registry, or a supervisor is connected. `router status` lists View Audit Log separately, as `guild permissions (optional)`.
 
 ## Operator checklist
 
@@ -137,9 +160,10 @@ These steps run once after the thread work is merged and deployed. They touch re
 
 **Grant and install:**
 
-- [ ] Grant root Create Public Threads, Send Messages in Threads and Manage Threads on the project channels, and View Audit Log on the guild.
-- [ ] Run `scripts/install-thread-supervisor.sh`. Confirm that `scripts/thread-supervisor.py status` shows the worker running.
-- [ ] In `node scripts/router.js status`, confirm `supervisor: connected`, `thread_permissions=ok` for each project, and `guild permissions: ok`.
+- [ ] Grant root Create Public Threads, Send Messages in Threads and Manage Threads on the project channels, and optionally View Audit Log on the guild.
+- [ ] For the status board, create a channel, give root View Channel, Send Messages and Read Message History there, and set `thread_status_channel_id` in the registry.
+- [ ] Run `scripts/install-thread-supervisor.sh`. Confirm that `scripts/thread-supervisor.py status` shows the worker running and `board.state: on`.
+- [ ] In `node scripts/router.js status`, confirm `supervisor: connected`, `thread_permissions=ok` for each project, and `thread status channel: <id> permissions=ok`.
 
 **Live smoke:**
 
@@ -147,6 +171,9 @@ These steps run once after the thread work is merged and deployed. They touch re
 - [ ] **thread → Codex reply:** repeat in a Codex project channel, or use `/thread smoke --provider codex hello` in a Claude one. Expect a reply in the thread as `<project>-codex · N%`.
 - [ ] **`/close`:** send `/close` in one smoke thread. Expect the root-bot acknowledgement and the thread archived. `scripts/threads.sh list` shows it `closed/close-command`, and its tmux session is gone.
 - [ ] Optionally send another owner message in the closed thread. It should reopen and answer with the same conversation.
+- [ ] **ping and board:** after a smoke thread answers, expect one `🔔 @you ready for you` in the thread (a push notification) and the thread under 🔔 on the board. Your next message there deletes the ping, and the board shows it ⏳ while it works.
+- [ ] **archive revert:** archive a smoke thread by hand. Expect it reopened within seconds, still open in `scripts/threads.sh list`.
+- [ ] **queued follow-up (Claude):** send a second message while Claude is writing its final answer. The board should show ⏳ until that follow-up's answer, which proves the `UserPromptSubmit` hook marks the turn running. If it shows 🔔 instead, the hook does not fire for channel prompts.
 
 **Clean up:**
 

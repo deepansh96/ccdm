@@ -11,7 +11,7 @@ import signal
 import sqlite3
 import sys
 
-from . import projects, store
+from . import board, projects, store, turns
 from .control import ControlServer
 from .dispatch import dispatch
 from .link import Link
@@ -36,8 +36,20 @@ class Context:
     bot_user_id: str | None = None
     # Launches in progress, by thread id (boot.Boot).
     boots: dict = field(default_factory=dict)
-    # Archive actor lookups in progress, by thread id (lifecycle.ArchivePoll).
-    archive_polls: dict = field(default_factory=dict)
+    # Turn status (turns.py): each live session's activity file as last read
+    # ({thread_id: (mtime_ns, data)}), when an unsettled turn end was first
+    # seen, pings the Router could not post yet, and each open thread's board
+    # state and label from the last tick.
+    activity: dict = field(default_factory=dict)
+    end_first_seen: dict = field(default_factory=dict)
+    pending_pings: dict = field(default_factory=dict)
+    labels: dict = field(default_factory=dict)
+    status_tick_at: float = 0.0
+    # The status board (board.py): when it last flushed, whether its earlier
+    # messages were looked for, and whether the Router lacks the new ops.
+    board_flush_at: float = 0.0
+    board_adopted: bool = False
+    status_ops_missing: bool = False
     # The registry as last read, for deregistrations and channel moves (projects.Watch).
     watch: object = None
 
@@ -52,6 +64,15 @@ def health_path(state_dir: Path) -> Path:
 
 def write_health(state_dir: Path, link: Link, router: str) -> None:
     write_private(health_path(state_dir), json.dumps({"pid": os.getpid(), "link_pid": link.pid, "router": router}))
+
+
+def _status(context: Context) -> None:
+    """Turn status, then the status board, each on its own interval; a failure never stops the worker."""
+    try:
+        turns.tick(context)
+        board.flush(context)
+    except Exception as error:
+        print(f"thread-supervisor: the turn status update failed: {error}", file=sys.stderr, flush=True)
 
 
 def run(project_root: Path, state_dir: Path, disabled=None) -> None:
@@ -85,6 +106,8 @@ def run(project_root: Path, state_dir: Path, disabled=None) -> None:
                 # Registry changes are handled while connected, so the queue they free can start.
                 if connected and context.watch.changed():
                     dispatch(context, {"type": "internal", "event": "registry"})
+                if connected:
+                    _status(context)
                 frame = link.next_frame(0.25)
                 if frame is None:
                     continue
@@ -92,6 +115,8 @@ def run(project_root: Path, state_dir: Path, disabled=None) -> None:
                 if kind == "connected":
                     context.bot_user_id = frame.get("bot_user_id")
                     connected = True
+                    # A Router that reconnects may now have the turn-status ops.
+                    context.status_ops_missing = False
                     write_health(state_dir, link, "connected")
                     # Whatever happened while this worker or the Router was away.
                     dispatch(context, {"type": "internal", "event": "reconcile"})

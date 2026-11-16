@@ -1,7 +1,7 @@
 ---
 name: agents
 description: Always-loaded project anchor for CCDM.
-last_updated: 2026-10-01
+last_updated: 2026-11-16
 ---
 
 # CCDM - Claude Code Discord Manager
@@ -17,7 +17,8 @@ CCDM manages isolated Claude Code and Codex Discord sessions for multiple local 
 - One session serves one project channel, enforced by the Router; stop existing listeners before starting replacements.
 - When a restart request comes from or names a registered project channel, restart that project's isolated session; restart the root agent only when the user explicitly asks to restart root.
 - Thread Conversations are independent of their channel: "restart <project>" and `scripts/stop-session.sh <project>` act on the channel's session only, unless the request names its threads (`--threads` for threads only, `--all` for both, or `scripts/threads.sh restart <name|link>` for one).
-- Root's thread permissions, Create Public Threads, Send Messages in Threads, Manage Threads and guild View Audit Log, are granted once by hand; never PATCH them from a script. `router status` reports any that are missing.
+- Root's thread permissions, Create Public Threads, Send Messages in Threads and Manage Threads (plus the optional guild View Audit Log, useful for logging who archived a thread), are granted once by hand; never PATCH them from a script. `router status` reports any that are missing.
+- A Thread Conversation stays unarchived until `/close` or `threads.sh close`: the Thread Supervisor reverts every other archive. Its owner pings and the status board in `thread_status_channel_id` are root-bot posts; the ping mentions only the owner.
 - Use `zsh -ic` for tmux launches so user-installed tools resolve correctly.
 - Project Codex conversations can resume across homes/accounts: copy the verified rollout into the target home's matching `sessions/` path, then start with `--resume <thread_uuid>`.
 - Follow `.mex/context/session-management.md` for the stop/copy/account-switch sequence; retain the source rollout, never overwrite a target rollout, and never copy credentials.

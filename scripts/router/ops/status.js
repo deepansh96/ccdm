@@ -7,8 +7,13 @@ const { readWebhookSecret } = require("../webhooks.js");
 // create or heal the project's webhook.
 const ROOT_PERMISSIONS = ["SendMessages", "ReadMessageHistory", "AddReactions", "ManageMessages", "ManageWebhooks"];
 // What root also needs while Thread Conversations are enabled: the three
-// channel thread bits, and the guild's View Audit Log to classify archives.
-const THREAD_PERMISSIONS = ["CreatePublicThreads", "SendMessagesInThreads", "ManageThreads", "ViewAuditLog"];
+// channel thread bits.
+const THREAD_PERMISSIONS = ["CreatePublicThreads", "SendMessagesInThreads", "ManageThreads"];
+// Useful but optional: the guild's View Audit Log lets the supervisor log who
+// archived a thread it reopens.
+const OPTIONAL_THREAD_PERMISSIONS = ["ViewAuditLog"];
+// What root needs in the thread status board's channel.
+const STATUS_CHANNEL_PERMISSIONS = ["ViewChannel", "SendMessages", "ReadMessageHistory"];
 
 // Root's missing permissions in a channel, or null before the gateway is ready.
 async function missingPermissions(ctx, channelId, flags = ROOT_PERMISSIONS) {
@@ -40,8 +45,10 @@ async function status(ctx, args = {}) {
       webhook: Boolean(route.webhook_id && secret?.webhook_id === route.webhook_id),
       missing_permissions: await missingPermissions(ctx, route.channel_id),
       missing_thread_permissions: await missingPermissions(ctx, route.channel_id, THREAD_PERMISSIONS),
+      missing_optional_thread_permissions: await missingPermissions(ctx, route.channel_id, OPTIONAL_THREAD_PERMISSIONS),
     });
   }
+  const statusChannelId = ctx.table.statusChannelId ?? null;
   const supervisor = ctx.supervisor?.();
   return {
     gateway: ctx.gateway.state,
@@ -55,6 +62,12 @@ async function status(ctx, args = {}) {
       connected_at: session.connectedAt,
     })),
     supervisor: { connected: Boolean(supervisor), connected_at: supervisor?.connectedAt ?? null },
+    // The thread status board: off when unset, and off with `error` when invalid.
+    status_channel: {
+      channel_id: statusChannelId,
+      error: ctx.table.statusChannelError ?? null,
+      missing_permissions: statusChannelId ? await missingPermissions(ctx, statusChannelId, STATUS_CHANNEL_PERMISSIONS) : null,
+    },
     projects,
     scope_violations: ctx.violations(),
     ...(args.project === undefined ? {} : { target: await target(ctx, String(args.project)) }),

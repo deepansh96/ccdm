@@ -1,6 +1,6 @@
 # Thread status board, owner pings, and never-archive: design
 
-Status: design for review (2026-11-16). Nothing here is built yet. Code references are `path:line` on `origin/main` at 94a1b43.
+Status: built on `feat/thread-status-board` (2026-11-16). D1–D8 and D10 were accepted as proposed; D9 was changed (see §14). Code references are `path:line` on `origin/main` at 94a1b43, before the change.
 
 ## 1. What we are building
 
@@ -133,7 +133,7 @@ Every status op fails `status_channel_unset` when the key is absent. All of them
 ## 7. Configuration
 
 - **`thread_status_channel_id`** (Discord ID). The board is on only when it is set.
-  - **Router validation** (`registry.js:25-57`): the value must be an ID that is neither a root channel nor a project channel. An invalid value makes the registry invalid, so the last good table is kept and the error shows in `router status` (D9).
+  - **Router validation** (`registry.js:25-57`): the value must be an ID that is neither a root channel nor a project channel. An invalid value never invalidates the registry: the rest of it loads normally, the board is off (`status_channel_invalid` from every status op), and the error shows in `router status` as `thread status channel: off (invalid: <reason>)` and in `--json` as `status_channel.error` (D9, as changed).
   - **Ingress.** Messages in that channel route nowhere: it is unregistered.
 - **`thread_owner_pings`** (boolean, default `true`). It is independent of the board, so pings work without a status channel (D3).
 - **Hot reload.** The Router's reload (`registry.js:99-116`) retargets the status ops at once. The supervisor rereads on `context.watch.changed()` (`worker.py:86`):
@@ -220,7 +220,7 @@ The fake Discord gains a status channel, records message PATCH and DELETE calls 
 5. **Guest-driven turn.** The board shows 🔔 · guest, and there is no ping. A v2 `/pause` followed by an owner message shows 💤 paused and no ping.
 6. **Debounce and idempotence.** A burst of transitions gives at most one PATCH per slot per interval. Unchanged content gives no PATCH.
 7. **Restart.** A supervisor restart reuses the slots with no new POST. A deleted store adopts the board through `status_board_list`. A slot deleted in Discord leads to a full repost. 60 threads fill several ordered slots; shrinking deletes the extras.
-8. **Configuration.** With the key unset, no status op is called and nothing errors. Setting it by hot reload makes the board appear without a restart. A key equal to a project channel is invalid in `router status`, and the last good table is kept.
+8. **Configuration.** With the key unset, no status op is called and nothing errors. Setting it by hot reload makes the board appear without a restart. A key equal to a project channel turns only the board off: `router status` shows the error, and the registry and the project's routing are unaffected.
 9. **Native reply.** A native reply to a ping reaches the thread session, not root.
 
 **Extended files:**
@@ -231,7 +231,7 @@ The fake Discord gains a status channel, records message PATCH and DELETE calls 
   - a mid-turn or booting archive is unarchived and keeps its session;
   - a `/close` or `threads.sh close` archive is kept;
   - a reconcile at start unarchives an archived open row;
-  - the audit log is never read.
+  - without View Audit Log an archive is still reverted (as built, one audit-log read only names the actor in the log).
 - `thread-supervisor.test.js`:
   - a v1 store with rows migrates to v2 with a 0600 backup;
   - an injected failure leaves v1 intact;
@@ -252,5 +252,7 @@ Channel Conversation status; board buttons/components; pushing activity through 
 - **D6.** An owner UI archive no longer closes a thread. The audit-log lookup is removed, and View Audit Log is dropped from the required permissions, which changes an `AGENTS.md` non-negotiable.
 - **D7.** A failed turn (v2) shows ⚠️ and pings with a "turn failed" text.
 - **D8.** A native reply to a ping routes to the thread session (a Router routing change).
-- **D9.** An invalid `thread_status_channel_id` invalidates the registry (last good table kept), rather than only turning the board off.
+- **D9 (changed at approval).** An invalid `thread_status_channel_id` (not an ID, a root channel or a project channel) does not invalidate the registry. It turns the board off, and the error shows in `router status` and `router status --json`, while the rest of the registry loads normally. The supervisor applies the same check and shows `board: invalid` in its `status`.
+
+As built, D6 keeps View Audit Log listed as useful but optional: the supervisor still makes one audit-log read per reverted archive, only to log who archived the thread. `router status` reports it on a `guild permissions (optional):` line and in `missing_optional_thread_permissions`; it never blocks reminder readiness. `CCDM_THREAD_OWNER_PINGS=0|1` overrides `thread_owner_pings` for one worker (the test harness defaults it to `0`).
 - **D10.** The status channel is made root-write-only by hand, so the board stays at the bottom.

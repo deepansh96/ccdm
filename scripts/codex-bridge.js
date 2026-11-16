@@ -20,7 +20,7 @@ process.env.CCDM_REMINDER_CONTEXT_FILE = REMINDER_CONTEXT_FILE;
 process.env.CCDM_REMINDER_RECEIPTS_DIR = REMINDER_RECEIPTS_DIR;
 const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { createRouterTransport } = require("./codex-bridge-transport.js");
-const { markTurn } = require("./thread-activity.js");
+const { markPaused, markReplied, markTurn } = require("./thread-activity.js");
 const modelInfo = require("./model-info.js");
 const routerPaths = require("./router/paths.js");
 const { withRegistryLock } = require("./router/registry.js");
@@ -83,7 +83,8 @@ const ROUTER_PROJECT = ROUTER_ROOT ? "" : process.env.CCDM_CODEX_PROJECT || "";
 // events wait until the bootstrap exists (CCDM_THREAD_BOOT_TIMEOUT_S, 120 s by
 // default), and messages it already includes are dropped. Its turns are kept
 // in CCDM_THREAD_ACTIVITY_FILE from `turn/started` until the bridge is idle
-// again after `turn/completed`.
+// again after `turn/completed`, with how it ended, whether it replied, and
+// whether /pause holds new turns.
 const DISCORD_THREAD_ID = ROUTER_ROOT ? "" : process.env.CCDM_THREAD_ID || "";
 const THREAD_MODE = Boolean(DISCORD_THREAD_ID);
 const THREAD_ACTIVITY_FILE = THREAD_MODE ? process.env.CCDM_THREAD_ACTIVITY_FILE || "" : "";
@@ -739,6 +740,7 @@ function handleNotification(msg) {
           msg.params.item.server?.startsWith("discord-") &&
           ["reply", "edit_message", "react"].includes(msg.params.item.tool)) {
         mcpReplyCalled = true;
+        if (msg.params.item.tool === "reply") markReplied(THREAD_ACTIVITY_FILE);
       }
       break;
 
@@ -878,8 +880,10 @@ async function onTurnCompleted(turn = {}) {
   await clearDiscordChannelScope();
   turnActive = false;
   // From here a new Discord message starts a turn instead of steering this
-  // one, so only now is the thread session idle.
-  markTurn(THREAD_ACTIVITY_FILE, false);
+  // one, so only now is the thread session idle. An interrupted turn (a
+  // stop, a reset) never hands the turn to the owner.
+  markTurn(THREAD_ACTIVITY_FILE, false,
+    turn.status === "failed" || terminalError ? "failed" : turn.status === "interrupted" ? "interrupted" : "completed");
   console.log(`[turn] Finished (${turn.status ?? "no status"}); bridge idle`);
   if (outputSuppressed && bootstrapCompletion) {
     const complete = bootstrapCompletion;
@@ -1677,6 +1681,7 @@ function startDiscordBot() {
     if (bridgeSlashCommand && text === "/pause") {
       console.log("[discord] /pause requested");
       bridgePaused = true;
+      markPaused(THREAD_ACTIVITY_FILE, true);
       await discordTransport.react(msg, "⏸️");
       await sendToDiscord("Bridge paused. New messages will be queued.", channelId);
       return;
@@ -1685,6 +1690,7 @@ function startDiscordBot() {
     if (bridgeSlashCommand && text === "/unpause") {
       console.log("[discord] /unpause requested");
       bridgePaused = false;
+      markPaused(THREAD_ACTIVITY_FILE, false);
       processQueue();
       await discordTransport.react(msg, "▶️");
       await sendToDiscord("Bridge unpaused.", channelId);

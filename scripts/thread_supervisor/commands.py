@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import sys
 
-from . import boot, config, lifecycle, model_info, reminders, store
+from . import boot, config, lifecycle, model_info, reminders, store, turns
 from .clock import now
 from .link import LinkError
 
@@ -73,10 +73,10 @@ def _relaunch(context, row, owner: bool, fresh: bool) -> None:
     if row["state"] == "closed" and not owner:
         return _notice(context, thread_id, OWNER_ONLY_REOPEN)
     _notice(context, thread_id, CLEARING if fresh else RESTARTING)
-    context.archive_polls.pop(thread_id, None)
     lifecycle.stop_session(context, row)
     if fresh:
         store.update(context.db, thread_id, provider_conversation_id=None)
+        turns.reset(context, thread_id)
     # The command itself is never a turn: the new session gets no trigger and no starter.
     boot.start(context, store.thread(context.db, thread_id), None, starter="")
 
@@ -86,13 +86,14 @@ def _close(context, row, owner: bool, event: dict) -> None:
     if not owner:
         return _notice(context, thread_id, OWNER_ONLY_CLOSE)
     _notice(context, thread_id, CLOSING)
+    # Messages in an archived thread cannot be deleted: the owner ping goes first.
+    turns.delete_ping(context, store.thread(context.db, thread_id))
     store.update(context.db, thread_id, pending_close=json.dumps({"message_id": event.get("message_id"),
                                                                   "requested_at": now()}))
     try:
         context.link.call("thread_update", {"thread_id": thread_id, "archived": True})
     except LinkError as error:
         _log(f"thread {thread_id}: archiving for /close failed: {error.code}")
-    context.archive_polls.pop(thread_id, None)
     lifecycle.stop_session(context, store.thread(context.db, thread_id))
     store.update(context.db, thread_id, state="closed", stop_reason=None, close_reason="close-command",
                  pending_close=None)

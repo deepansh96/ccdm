@@ -221,14 +221,18 @@ test("agent anchor and .mex describe Session Scope enforcement by the Router", (
 });
 
 // The thread docs, each with the phrases that pin the shipped behaviour (ADR 0005).
+// View Audit Log is listed too, as useful but optional.
 const ROOT_THREAD_PERMISSIONS = ["Create Public Threads", "Send Messages in Threads", "Manage Threads", "View Audit Log"];
+const TURN_STATUS = ["thread_status_channel_id", "thread_owner_pings"];
 const threadDocs = {
   "docs/thread-supervisor.md": [
     "Thread Conversation", "Thread Supervisor", "Channel Conversation", "Session Scope", "Closed Conversation",
     "no Discord credential", "com.ccdm.thread-supervisor", "scripts/install-thread-supervisor.sh",
     "scripts/thread-supervisor.py run", "preflight", "scripts/start-thread-session.sh", "keys/.thread-<thread_id>.key",
     "/thread <name>", "create_thread", "scripts/threads.sh create", "10080", "/config", "/close", "/restart",
-    "/clear", "/compact", "✅", "👀", "💤", "<project>-<provider> · N%", "archive-actor-unknown", "auto-archive",
+    "/clear", "/compact", "✅", "👀", "💤", "<project>-<provider> · N%", "stopped/auto-archive",
+    "Any other archive is reverted at once", ...TURN_STATUS, "ready for you", "CCDM_THREAD_OWNER_PINGS",
+    "useful but optional", "ping and board",
     "--resume", "thread_session_caps", "claude_accounts", "Claude 6", "Codex 8",
     "Paused to free a session slot; send a message here to resume.", "Queued, N sessions busy.", "reconcile",
     "stop-session.sh <project> --threads", "--all", "Conversation Reminder", "router status",
@@ -238,20 +242,24 @@ const threadDocs = {
   "README.md": [
     "## Thread Conversations", "docs/thread-supervisor.md", "scripts/install-thread-supervisor.sh", "/thread",
     "scripts/threads.sh", "thread_session_caps", "claude_accounts", "--threads", ...ROOT_THREAD_PERMISSIONS,
+    ...TURN_STATUS,
   ],
   "AGENTS.md": [
     "Thread Conversations", "channel's session only", "unless the request names its threads",
-    ...ROOT_THREAD_PERMISSIONS, "granted once by hand",
+    ...ROOT_THREAD_PERMISSIONS, "granted once by hand", "optional", "thread_status_channel_id",
+    "stays unarchived until `/close` or `threads.sh close`",
   ],
   ".mex/ROUTER.md": ["Thread Conversation", "scripts/threads.sh", "install-thread-supervisor.sh",
-    "thread-conversation-journey.test.js"],
-  ".mex/context/architecture.md": ["Thread Supervisor", "start-thread-session.sh", "thread role"],
+    "thread-conversation-journey.test.js", "thread_notice_delete", "status_board_edit", "user_version` 2"],
+  ".mex/context/architecture.md": ["Thread Supervisor", "start-thread-session.sh", "thread role", "turns.py", "board.py"],
   ".mex/context/session-management.md": ["Thread Conversation", "start-thread-session.sh", "--threads", "--all",
-    "restart <project>"],
+    "restart <project>", "stays unarchived until it is closed", ...TURN_STATUS],
   ".mex/context/discord-security.md": ["## Thread Conversations", "thread alone", "holds no Discord credential",
-    ...ROOT_THREAD_PERMISSIONS, "granted once by hand"],
+    ...ROOT_THREAD_PERMISSIONS, "granted once by hand", "allowed_mentions: {parse: [], users: [owner]}",
+    "without invalidating the registry"],
   ".mex/patterns/operate-thread-supervisor.md": ["scripts/install-thread-supervisor.sh", "preflight",
-    "scripts/thread-supervisor.py status", "scripts/threads.sh list", ...ROOT_THREAD_PERMISSIONS],
+    "scripts/thread-supervisor.py status", "scripts/threads.sh list", ...ROOT_THREAD_PERMISSIONS,
+    "thread status channel:"],
   ".mex/patterns/register-project.md": ["Thread Conversations", "closed/deregistered", "stop-session.sh <project> --all"],
   ".mex/patterns/INDEX.md": ["operate-thread-supervisor.md"],
   "tests/e2e/README.md": ["## Thread Conversations", "thread-conversation-journey.test.js",

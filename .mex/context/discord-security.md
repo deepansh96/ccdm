@@ -17,7 +17,7 @@ edges:
     condition: when granting, syncing, listing, or revoking guest access
   - target: patterns/debug-discord-session.md
     condition: when a session cannot read or reply in its channel
-last_updated: 2026-10-02
+last_updated: 2026-11-16
 ---
 
 # Discord Security
@@ -36,12 +36,20 @@ A Thread Conversation's Session Scope is its thread alone. The `thread` role is 
 
 The Thread Supervisor holds no Discord credential and makes no direct Discord REST call. It connects as the single `supervisor` role (`keys/.supervisor.key`, rewritten on each start), and every Discord action it takes is a supervisor-only Router op confined to registered project channels and their eligible threads. Its notices post as the root bot. Its `thread_message` copy of bot and webhook messages is for reply tracking only; bot and webhook messages still never reach sessions.
 
-Root needs four permissions for threads, granted once by hand; no script PATCHes them:
+The turn-status ops stay inside the same boundary:
+
+- **Owner pings:** `thread_notice` with `mention_owner: true` works only in an eligible thread. The Router puts the registry owner's id in place of `{owner}`, refuses any other mention syntax, and sends `allowed_mentions: {parse: [], users: [owner]}`, so no one else can be pinged.
+- **Deleting a notice:** `thread_notice_delete` deletes only root's own non-webhook message in that thread.
+- **Status board:** `status_board_list`, `status_board_post`, `status_board_edit` and `status_board_delete` act only in the registry's `thread_status_channel_id`, never a channel named in their arguments, and edit or delete only root's own messages there.
+
+The status channel cannot be a root or project channel: such a value turns the board off and is reported by `router status`, without invalidating the registry. Messages in the status channel route nowhere. A native reply to one of the Router's owner pings reaches the thread's session instead of root.
+
+Root needs three permissions for threads, granted once by hand; no script PATCHes them:
 
 - Create Public Threads, Send Messages in Threads and Manage Threads in every project channel;
-- View Audit Log on the guild, which the supervisor uses to tell an owner or root archive from an auto-archive.
+- optionally, View Audit Log on the guild: useful, so the supervisor can log who archived a thread before it reopens it, but not required.
 
-`router status` and reminder readiness report missing bits only while threads are enabled.
+`router status` and reminder readiness report missing required bits only while threads are enabled.
 
 ## Credentials
 

@@ -79,6 +79,9 @@ def _turn_running(row) -> bool:
     return not (isinstance(activity, dict) and activity.get("turn_running") is False)
 
 
+turn_running = _turn_running
+
+
 def _last_activity(row) -> str:
     return row["last_owner_activity_at"] or row["created_at"]
 
