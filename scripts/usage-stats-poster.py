@@ -798,7 +798,195 @@ def _codex_reset_credit_deadline(reset_credits, now=None):
     return deadline.isoformat() if deadline else None
 
 
-def format_codex_rate_limits(rate_limits, label, reset_credits=None, source_ts=None, now=None):
+CODEX_CREDIT_BALANCE_MAX_LENGTH = 40
+# Used credits are summed over these trailing windows of the poster's history.
+CODEX_CREDIT_USAGE_WINDOWS = (("24h", timedelta(hours=24)), ("7d", timedelta(days=7)))
+# A window's baseline is the last stored balance at or before its start, and
+# must be no older than this; otherwise history cannot cover the window.
+CODEX_CREDIT_BASELINE_MAX_AGE = timedelta(hours=6)
+CODEX_CREDIT_ACCOUNT_KEY_PATTERN = re.compile(r"^[0-9a-f]{16}$")
+
+
+def _codex_credit_account_key(account_id):
+    """Return a short salted hash of the app-server ``accountId``, or ``None``.
+
+    Only this hash is kept, so credit history can tell accounts apart (a home
+    that switches ChatGPT accounts, or a label that moves) without storing the
+    identifier itself.
+    """
+    if not isinstance(account_id, str) or not account_id.strip():
+        return None
+    return hashlib.sha256(f"ccdm-credits:{account_id}".encode("utf-8")).hexdigest()[:16]
+
+
+def _parse_codex_credit_balance(value):
+    """Return a finite, non-negative credit balance from a decimal string, or ``None``."""
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    text = str(value).strip()
+    if not text or len(text) > CODEX_CREDIT_BALANCE_MAX_LENGTH:
+        return None
+    try:
+        amount = Decimal(text)
+    except (InvalidOperation, ValueError):
+        return None
+    if not amount.is_finite() or amount < 0:
+        return None
+    # abs() turns "-0" into 0 so it never renders as "-0".
+    balance = float(abs(amount))
+    return balance if math.isfinite(balance) else None
+
+
+def _codex_credits(rate_limits):
+    """Return ``{"unlimited": True}``, ``{"balance": float}``, or ``None`` to show nothing."""
+    credits = rate_limits.get("credits") if isinstance(rate_limits, dict) else None
+    if not isinstance(credits, dict):
+        return None
+    if credits.get("unlimited") is True:
+        return {"unlimited": True}
+    balance = _parse_codex_credit_balance(credits.get("balance"))
+    if balance is None or (credits.get("hasCredits") is not True and balance <= 0):
+        return None
+    return {"balance": balance}
+
+
+def _fmt_credits(value):
+    """Format a credit amount with thousands separators and no false precision."""
+    if value >= 100:
+        return f"{value:,.0f}"
+    text = f"{value:,.1f}" if value >= 10 else f"{value:,.2f}"
+    return text.rstrip("0").rstrip(".")
+
+
+def _codex_credit_marker(rate_limits, credits):
+    """Return a short spend-state marker, or ``None`` when ordinary usage applies."""
+    if rate_limits.get("spendControlReached") is True:
+        return "spend limit reached"
+    reached = rate_limits.get("rateLimitReachedType")
+    if isinstance(reached, str) and reached.endswith("credits_depleted"):
+        return "credits depleted"
+    weekly = _codex_weekly_limit(rate_limits)
+    used = _safe_percentage(weekly.get("usedPercent", weekly.get("used_percent"))) if isinstance(weekly, dict) else None
+    limit_reached = reached == "rate_limit_reached" or (used is not None and used >= 100)
+    has_balance = credits.get("unlimited") is True or credits.get("balance", 0) > 0
+    return "running on credits" if limit_reached and has_balance else None
+
+
+def format_codex_credits(rate_limits, credits_used=None):
+    """Return the Codex credits line, or ``None`` when the account reports none.
+
+    ``credits_used`` maps a window label (``24h``/``7d``) to the credits used
+    in that window; a window history cannot cover yet is ``None`` and omitted.
+    """
+    credits = _codex_credits(rate_limits)
+    if credits is None:
+        return None
+    if credits.get("unlimited"):
+        line = "Credits: **unlimited**"
+    else:
+        line = f"Credits: **{_fmt_credits(credits['balance'])}** left"
+        used = [
+            f"{_fmt_credits(credits_used[window])} in {window}"
+            for window, _ in CODEX_CREDIT_USAGE_WINDOWS
+            if isinstance(credits_used, dict) and credits_used.get(window) is not None
+        ]
+        if used:
+            line += " · used " + " · ".join(used)
+    marker = _codex_credit_marker(rate_limits, credits)
+    return f"{line} · {marker}" if marker else line
+
+
+def _codex_credits_used(points, balance, now):
+    """Sum credit-balance decreases per trailing window from ``(time, balance)`` points.
+
+    ``points`` must all belong to the current account. ``balance`` is the
+    current live balance, taken as the last point at ``now``. Each window starts
+    from its baseline, the last point at or before the window start; without a
+    baseline no older than ``CODEX_CREDIT_BASELINE_MAX_AGE`` the window is
+    ``None``. Increases between consecutive points are top-ups and are ignored.
+    """
+    ordered = sorted(points)
+    used = {}
+    for window, length in CODEX_CREDIT_USAGE_WINDOWS:
+        start = now - length
+        baseline = [point for point in ordered if point[0] <= start][-1:]
+        if not baseline or baseline[0][0] < start - CODEX_CREDIT_BASELINE_MAX_AGE:
+            used[window] = None
+            continue
+        series = baseline + [point for point in ordered if start < point[0] <= now]
+        values = [value for _, value in series] + [balance]
+        used[window] = sum(max(0.0, before - after) for before, after in zip(values, values[1:]))
+    return used
+
+
+def _history_credit_balance(value):
+    """Return a stored balance only when it is a finite, non-negative number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        value = float(value)
+    except OverflowError:
+        return None
+    return value if math.isfinite(value) and value >= 0 else None
+
+
+def read_codex_credit_history(db_path, since):
+    """Read stored Codex credit balances per label since ``since``.
+
+    Returns ``{label: [(slot, balance, account_key)]}``; ``account_key`` is the
+    stored account hash, or ``None`` when absent (such a point is never
+    compared with a live balance).
+
+    The read is read-only and best effort: a missing, locked, unreadable, or
+    malformed history returns ``{}`` (no used figures), never an error, so the
+    manual post path cannot fail because of history.
+    """
+    try:
+        path = Path(db_path).expanduser()
+        if not path.is_absolute():
+            return {}
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return {}
+        # The store always uses a rollback journal. A WAL sidecar is foreign,
+        # and even a read-only open would write its shared-memory file, so skip.
+        if any(os.path.lexists(f"{path}{suffix}") for suffix in ("-wal", "-shm")):
+            return {}
+        connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=2)
+        try:
+            rows = connection.execute(
+                "SELECT slot_utc, payload_json FROM snapshots WHERE slot_utc >= ? ORDER BY slot_utc",
+                (_iso_utc(since),),
+            ).fetchall()
+        finally:
+            connection.close()
+    except Exception:  # noqa: BLE001 - history only adds optional used figures.
+        return {}
+    history = {}
+    for slot_utc, encoded in rows:
+        try:
+            slot = datetime.fromisoformat(str(slot_utc).replace("Z", "+00:00"))
+            payload = json.loads(encoded)
+        except (TypeError, ValueError, OverflowError, json.JSONDecodeError):
+            continue
+        cards = payload.get("cards") if isinstance(payload, dict) else None
+        if slot.tzinfo is None or not isinstance(cards, list):
+            continue
+        seen = set()
+        for card in cards:
+            if not isinstance(card, dict) or card.get("provider") != "codex":
+                continue
+            account = card.get("account")
+            balance = _history_credit_balance(card.get("credits_balance"))
+            if not isinstance(account, str) or balance is None or account in seen:
+                continue
+            seen.add(account)
+            key = card.get("credits_account")
+            key = key if isinstance(key, str) and CODEX_CREDIT_ACCOUNT_KEY_PATTERN.match(key) else None
+            history.setdefault(account, []).append((slot, balance, key))
+    return history
+
+
+def format_codex_rate_limits(rate_limits, label, reset_credits=None, source_ts=None, now=None, credits_used=None):
     plan = _format_plan(rate_limits.get("planType", rate_limits.get("plan_type")))
     lines = [f"**{label}** ({plan})"]
     data = _codex_weekly_limit(rate_limits)
@@ -808,6 +996,9 @@ def format_codex_rate_limits(rate_limits, label, reset_credits=None, source_ts=N
         reset_part = f"  resets in {reset}" if reset else ""
         value_text = text_bar(used_percent) if used_percent is not None else "*unavailable*"
         lines.append(f"Weekly: {value_text}{reset_part}")
+    credits_line = format_codex_credits(rate_limits, credits_used)
+    if credits_line:
+        lines.append(credits_line)
     if reset_credits is None:
         reset_credits = rate_limits.get("rateLimitResetCredits")
     if isinstance(reset_credits, dict) and isinstance(reset_credits.get("availableCount"), int):
@@ -942,6 +1133,10 @@ def read_codex_rate_limits(codex_home):
         rate_limits = dict(rate_limits)
         if "rateLimitResetCredits" in result:
             rate_limits["rateLimitResetCredits"] = result["rateLimitResetCredits"]
+        # Keep only a salted hash of the account id, for credit history.
+        account_key = _codex_credit_account_key(result.get("accountId"))
+        if account_key:
+            rate_limits["creditAccountKey"] = account_key
         return rate_limits
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
@@ -1146,17 +1341,50 @@ def _claude_headers(oauth, client_version=None):
     }
 
 
-def format_claude_limit_resets(status, now=None):
+# Scoped weekly buckets whose suffix names a model, e.g. ``seven_day_opus``.
+CLAUDE_RESET_MODEL_BUCKETS = {"fable": "Fable", "opus": "Opus", "sonnet": "Sonnet", "haiku": "Haiku"}
+
+
+def _claude_reset_group(grant, scope_name):
+    """Return a reset grant's display group, or ``None`` for an unknown shape.
+
+    A grant that clears the all-models ``seven_day`` bucket, or the 5-hour
+    session without any 7-day bucket, is a general reset. One that clears only
+    a scoped weekly bucket (``seven_day_<bucket>``) resets a single model's
+    allowance: it takes the model named by the bucket (``seven_day_opus``),
+    else the account's one model-scoped weekly limit, else "Fable" when its
+    label says so, else "model". A grant without a ``clears`` list is ignored.
+    """
+    clears = grant.get("clears")
+    if not isinstance(clears, list):
+        return None
+    buckets = [bucket for bucket in clears if isinstance(bucket, str)]
+    if "seven_day" in buckets:
+        return "general"
+    scoped = [bucket[len("seven_day_"):] for bucket in buckets if bucket.startswith("seven_day_")]
+    if not scoped:
+        return "general" if "five_hour" in buckets else None
+    named = next((CLAUDE_RESET_MODEL_BUCKETS[name] for name in scoped if name in CLAUDE_RESET_MODEL_BUCKETS), None)
+    if named:
+        return named
+    if scope_name:
+        return scope_name
+    label = grant.get("label")
+    return "Fable" if isinstance(label, str) and "fable" in label.lower() else "model"
+
+
+def format_claude_limit_resets(status, now=None, scope_name=None):
     """Return the limit-reset line for a usage ``cedar_ember`` block, if any.
 
-    Ineligible accounts get no line. Paused and expired grants are not usable,
-    so they are left out of the count and the use-by deadline.
+    Ineligible accounts get no line. Paused, expired, and used-up grants are
+    not usable, so they are left out of every count and use-by deadline.
+    General resets and model-scoped (Fable) resets are counted separately,
+    each with its own earliest deadline; a group with none is omitted.
     """
     if not isinstance(status, dict) or status.get("eligible") is not True:
         return None
     now = now or datetime.now(timezone.utc)
-    available = 0
-    deadline = None
+    groups = {}
     grants = status.get("grants")
     for grant in grants if isinstance(grants, list) else []:
         if not isinstance(grant, dict) or grant.get("paused") is True:
@@ -1164,17 +1392,29 @@ def format_claude_limit_resets(status, now=None):
         left = grant.get("resets_left")
         if isinstance(left, bool) or not isinstance(left, int) or left <= 0:
             continue
+        group = _claude_reset_group(grant, scope_name)
+        if group is None:
+            continue
         ends_at = _normalise_reset_timestamp(grant.get("ends_at"))
-        if ends_at:
-            ends = datetime.fromisoformat(ends_at.replace("Z", "+00:00"))
-            if ends <= now:
-                continue
+        ends = datetime.fromisoformat(ends_at.replace("Z", "+00:00")) if ends_at else None
+        if ends is not None and ends <= now:
+            continue
+        count, deadline = groups.get(group, (0, None))
+        if ends is not None:
             deadline = min(deadline, ends) if deadline else ends
-        available += left
-    line = f"Limit resets available: **{available}**"
-    if deadline:
-        line += f"  use within {fmt_reset(deadline.isoformat(), now)}"
-    return line
+        groups[group] = (count + left, deadline)
+    if not groups:
+        return "Resets: **0** available"
+    # General resets first, then model-scoped groups in the order seen.
+    order = sorted(groups, key=lambda group: group != "general")
+    parts = []
+    for group in order:
+        count, deadline = groups[group]
+        part = f"**{count}** {group}"
+        if deadline:
+            part += f" (use within {fmt_reset(deadline.isoformat(), now)})"
+        parts.append(part)
+    return "Resets: " + " · ".join(parts)
 
 
 def _profile_email(profile):
@@ -1431,7 +1671,11 @@ def _collect_claude_oauth_metric(
     extra_usage = usage.get("extra_usage", {}) if isinstance(usage, dict) else {}
     if isinstance(extra_usage, dict) and extra_usage.get("is_enabled"):
         lines.append(f"Extra usage: **${_safe_int(extra_usage.get('used_credits')) / 100:.2f}** spent")
-    reset_line = format_claude_limit_resets(usage.get("cedar_ember") if isinstance(usage, dict) else None)
+    scoped_names = [limit["scope"] for limit in metric["limits"] if limit.get("scope")]
+    reset_line = format_claude_limit_resets(
+        usage.get("cedar_ember") if isinstance(usage, dict) else None,
+        scope_name=scoped_names[0] if len(scoped_names) == 1 else None,
+    )
     if reset_line:
         lines.append(reset_line)
     metric["text"] = "\n".join(lines)
@@ -1517,7 +1761,7 @@ def _codex_weekly_limit(rate_limits):
     return candidates[0][1] if candidates else None
 
 
-def _metric_from_codex_rate_limits(rate_limits, label, source="live", source_ts=None):
+def _metric_from_codex_rate_limits(rate_limits, label, source="live", source_ts=None, credit_history=None, now=None):
     metric = {"provider": "codex", "account": label, "limits": [], "source": source}
     if not isinstance(rate_limits, dict):
         metric["status"] = "unavailable"
@@ -1538,7 +1782,24 @@ def _metric_from_codex_rate_limits(rate_limits, label, source="live", source_ts=
     if not metric["limits"]:
         metric["status"] = "unavailable"
         metric["reason"] = "No rate-limit data"
-    metric["text"] = format_codex_rate_limits(rate_limits, label, source_ts=source_ts)
+    credits_used = None
+    credits = _codex_credits(rate_limits)
+    if source == "live" and credits and "balance" in credits:
+        # Only a live balance is recorded and compared: a stale session-file
+        # balance would date old spending to this slot.
+        metric["credits_balance"] = credits["balance"]
+        account_key = rate_limits.get("creditAccountKey")
+        if isinstance(account_key, str) and CODEX_CREDIT_ACCOUNT_KEY_PATTERN.match(account_key):
+            # Compare only balances from this same account: a home that
+            # switched accounts, or a label that moved, starts a new series.
+            metric["credits_account"] = account_key
+            points = [
+                (at, value)
+                for at, value, key in (credit_history or {}).get(_safe_label(label, "unknown"), [])
+                if key == account_key
+            ]
+            credits_used = _codex_credits_used(points, credits["balance"], now or datetime.now(timezone.utc))
+    metric["text"] = format_codex_rate_limits(rate_limits, label, source_ts=source_ts, credits_used=credits_used)
     if source_ts:
         metric["source_ts"] = source_ts
     return metric
@@ -2054,7 +2315,9 @@ def _deepseek_home_report(home, label, now=None, usage_module=_DEEPSEEK_USAGE_UN
     return "\n".join([f"**{label}** (API)"] + text_lines)
 
 
-def collect_codex_metrics(registry, config=None, now=None, deepseek_usage=_DEEPSEEK_USAGE_UNSET, deepseek_balance=None):
+def collect_codex_metrics(
+    registry, config=None, now=None, deepseek_usage=_DEEPSEEK_USAGE_UNSET, deepseek_balance=None, credit_history=None
+):
     """Return structured current Codex metrics without retaining source paths.
 
     DeepSeek homes bypass the subscription rate-limit request: their live
@@ -2064,6 +2327,7 @@ def collect_codex_metrics(registry, config=None, now=None, deepseek_usage=_DEEPS
     app-server; only this rate-limit query is skipped.
     """
     metrics = []
+    credit_now = now or _utc_now()
     for account in discover_codex_accounts(registry):
         home = account["home"]
         label = account["label"]
@@ -2079,7 +2343,7 @@ def collect_codex_metrics(registry, config=None, now=None, deepseek_usage=_DEEPS
             continue
         live = read_codex_rate_limits(home)
         if isinstance(live, dict):
-            metrics.append(_metric_from_codex_rate_limits(live, label))
+            metrics.append(_metric_from_codex_rate_limits(live, label, credit_history=credit_history, now=credit_now))
             continue
         session_data = _latest_codex_session_data(home)
         if session_data is not None and isinstance(session_data[0], dict):
@@ -2283,6 +2547,7 @@ def _safe_history_cards(metrics):
         limits = metric.get("limits")
         if not isinstance(limits, list):
             limits = []
+        first_card = len(cards)
         for index, limit in enumerate(limits):
             if not isinstance(limit, dict):
                 continue
@@ -2319,6 +2584,14 @@ def _safe_history_cards(metrics):
                 "status": "unavailable",
                 "reason": _safe_label(metric.get("reason"), "Data unavailable"),
             })
+        # A Codex credit balance is a plain number (no credential or payload),
+        # kept once per account on its first card for used-credit history.
+        balance = _history_credit_balance(metric.get("credits_balance"))
+        if provider == "codex" and balance is not None and len(cards) > first_card:
+            cards[first_card]["credits_balance"] = round(balance, 4)
+            key = metric.get("credits_account")
+            if isinstance(key, str) and CODEX_CREDIT_ACCOUNT_KEY_PATTERN.match(key):
+                cards[first_card]["credits_account"] = key
     return cards
 
 
@@ -2795,6 +3068,12 @@ def post_dashboard_to_discord(config, bot_token, image_paths, claude_value, code
     return result.get("id", "unknown") if isinstance(result, dict) else "unknown"
 
 
+def _codex_credit_history(config, now):
+    """Read the credit balances that the used-credit windows can need."""
+    longest = max(length for _, length in CODEX_CREDIT_USAGE_WINDOWS)
+    return read_codex_credit_history(config["history_db_path"], now - longest - CODEX_CREDIT_BASELINE_MAX_AGE)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="poster config JSON path")
@@ -2841,7 +3120,11 @@ def main(argv=None):
         # never prevent an operator from posting the existing JSON embed.
         if not scheduled:
             claude_metrics = collect_claude_metrics(config)
-            codex_metrics = collect_codex_metrics(registry, config)
+            # History is only read (best effort) for used credits; it is never
+            # created, locked, or written here.
+            codex_metrics = collect_codex_metrics(
+                registry, config, credit_history=_codex_credit_history(config, _utc_now())
+            )
             claude_value, codex_value = _usage_report_values(claude_metrics, codex_metrics)
             message_id = post_to_discord(config, bot_token, claude_value, codex_value)
             print(f"Posted (message ID: {message_id})")
@@ -2849,7 +3132,9 @@ def main(argv=None):
 
         now = _utc_now()
         claude_metrics = collect_claude_metrics(config)
-        codex_metrics = collect_codex_metrics(registry, config, now=now)
+        codex_metrics = collect_codex_metrics(
+            registry, config, now=now, credit_history=_codex_credit_history(config, now)
+        )
         metrics = claude_metrics + codex_metrics
         claude_value, codex_value = _usage_report_values(claude_metrics, codex_metrics)
         current_payload = {
