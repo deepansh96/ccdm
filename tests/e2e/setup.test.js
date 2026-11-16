@@ -37,6 +37,13 @@ test("registry example documents the default thread session caps", () => {
   assert.deepEqual(registryExample.thread_session_caps, { claude: 6, codex: 8 });
 });
 
+test("registry example documents the thread status channel and owner pings", () => {
+  const registryExample = JSON.parse(fs.readFileSync("registry.example.json", "utf8"));
+
+  assert.equal(registryExample.thread_status_channel_id, "YOUR_THREAD_STATUS_CHANNEL_ID");
+  assert.equal(registryExample.thread_owner_pings, true);
+});
+
 test("registry example shows the one-bot Router fields and no pool or bot tokens", () => {
   const source = fs.readFileSync("registry.example.json", "utf8");
   const registryExample = JSON.parse(source);

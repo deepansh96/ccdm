@@ -31,7 +31,7 @@ import subprocess
 import sys
 import threading
 
-from . import capacity, lifecycle, ports, registry, store
+from . import capacity, lifecycle, ports, registry, store, turns
 from .clock import now
 from .link import LinkError
 from .paths import router_state_dir, write_private
@@ -155,6 +155,7 @@ def _note_owner_activity(context, thread_id: str, event: dict) -> None:
 
 
 def on_thread_message(context, event: dict) -> None:
+    turns.on_message(context, event)
     thread_id = event.get("thread_id")
     if not isinstance(thread_id, str) or event.get("author_class") not in DRIVERS:
         return
@@ -189,6 +190,14 @@ def start(context, row, trigger: dict | None, starter: str | None = None, backlo
     resolved = registry.resolved_settings(entry, row)
     codex = resolved["provider"] == "codex"
     pending = [*backlog, *([trigger] if trigger else [])]
+    # The turn is the agent's: a trigger (live, or found by reconcile) or a
+    # first message. A queued row noted it when it was queued.
+    if row["state"] == "queued":
+        pass
+    elif trigger:
+        turns.note_input(context, thread_id, "guest" if trigger.get("author_class") == "guest" else "owner")
+    elif starter:
+        turns.note_input(context, thread_id, "starter")
     if not capacity.admit(context, row, resolved, trigger, starter):
         for message in pending:
             store.buffer_message(context.db, thread_id, message["message_id"], _payload(message), now())
@@ -257,6 +266,7 @@ def on_session_live(context, event: dict) -> None:
     except OSError as error:
         return fail(context, thread_id, boot, f"the bootstrap could not be written: {error.strerror or error}")
     store.finish_boot(context.db, thread_id, "live")
+    turns.baseline(context, thread_id)
     boot.live = True
     if boot.launched:
         drop(context, thread_id)

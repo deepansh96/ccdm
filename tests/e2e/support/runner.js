@@ -621,7 +621,12 @@ function runRouterClaudeHost() {
             while ((readState().fixtures.claude.holdTurnsIn || []).includes(serverEnv.CCDM_THREAD_ID)) {
               await new Promise((done) => setTimeout(done, 50));
             }
-            await runHooks("Stop", { stop_hook_active: false, background_tasks: [], session_crons: [] });
+            // \`fixtures.claude.failTurnsIn\` ends a thread's turns with StopFailure, as an API error does.
+            if ((readState().fixtures.claude.failTurnsIn || []).includes(serverEnv.CCDM_THREAD_ID)) {
+              await runHooks("StopFailure", { error: "rate_limit" });
+            } else {
+              await runHooks("Stop", { stop_hook_active: false, background_tasks: [], session_crons: [] });
+            }
           });
         } else if (toolCalls.has(message.id)) {
           const pending = toolCalls.get(message.id);

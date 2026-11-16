@@ -273,7 +273,7 @@ function channelMessage(state, messageId) {
   const discord = state.fixtures?.discord ?? {};
   const sent = (discord.messages ?? []).find(message => message.id === messageId && !message.deleted);
   if (sent) {
-    return { id: sent.id, channel_id: sent.channelId, content: sent.content,
+    return { id: sent.id, channel_id: sent.channelId, content: sent.editedContent ?? sent.content,
       ...(sent.webhookId ? { webhook_id: sent.webhookId } : {}),
       author: sent.webhookId ? { id: sent.webhookId, username: sent.username, bot: true }
         : { id: authorForToken(sent.authorization), bot: true } };
@@ -778,8 +778,10 @@ function routeDiscordApi(url, init = {}) {
     updateState((state) => {
       state.fixtures.discord.deletes ||= [];
       state.fixtures.discord.reminderRequests ||= [];
+      // `threadArchived`: whether the message's thread was archived when the delete arrived.
       state.fixtures.discord.deletes.push({ authorization: headerValue(init.headers, "Authorization"),
-        channelId: getMessageMatch[1], messageId: getMessageMatch[2] });
+        channelId: getMessageMatch[1], messageId: getMessageMatch[2],
+        threadArchived: Boolean(state.fixtures.discord.threads?.[getMessageMatch[1]]?.archived) });
       state.fixtures.discord.reminderRequests.push({ method: "DELETE", messageId: getMessageMatch[2] });
       const message = state.fixtures.discord.messages?.find(entry => entry.id === getMessageMatch[2]);
       exists = Boolean(message && !message.deleted);
@@ -827,6 +829,14 @@ function routeDiscordApi(url, init = {}) {
   const editMessageMatch = /^\/api\/v10\/channels\/([^/]+)\/messages\/([^/]+)$/.exec(url.pathname);
   if (url.hostname === "discord.com" && editMessageMatch && method === "PATCH") {
     const parsedBody = init.body ? JSON.parse(String(init.body)) : {};
+    // A message the fake sent and then deleted is gone, as in Discord.
+    const gone = readState().fixtures.discord.messages?.some(message => message.id === editMessageMatch[2] && message.deleted);
+    if (gone) {
+      return response(JSON.stringify({ code: 10008, message: "Unknown Message" }), {
+        headers: { "content-type": "application/json" },
+        status: 404,
+      });
+    }
     updateState((state) => {
       state.fixtures.discord.edits ||= [];
       state.fixtures.discord.edits.push({
@@ -835,6 +845,12 @@ function routeDiscordApi(url, init = {}) {
         content: parsedBody.content ?? "",
         messageId: editMessageMatch[2],
       });
+      // A message the fake sent now reads (GET) with its edited content. The
+      // recorded POST keeps the content it was sent with.
+      const sent = state.fixtures.discord.messages?.find(message => message.id === editMessageMatch[2] && !message.deleted);
+      if (sent && sent.channelId === editMessageMatch[1] && parsedBody.content !== undefined) {
+        sent.editedContent = parsedBody.content;
+      }
     });
     return response(JSON.stringify({ id: editMessageMatch[2], content: parsedBody.content ?? "" }), {
       headers: { "content-type": "application/json" },
@@ -1065,6 +1081,12 @@ async function guardedFetch(input, init = {}) {
       updateState(state => { state.fixtures.discord.responsePending = true; });
       await new Promise(resolve => setTimeout(resolve, delay));
       updateState(state => { state.fixtures.discord.responsePending = false; });
+    }
+    // A slow message delete (`restDeleteDelayMs`), answered after the delay.
+    const deleteDelay = readState().fixtures?.discord?.restDeleteDelayMs || 0;
+    if (deleteDelay && (init.method || "GET").toUpperCase() === "DELETE" &&
+        /^\/api\/v10\/channels\/[^/]+\/messages\/[^/]+$/.test(url.pathname)) {
+      await new Promise(resolve => setTimeout(resolve, deleteDelay));
     }
     // Real Discord's round trip for one page of channel history.
     const pageDelay = readState().fixtures?.discord?.historyPageDelayMs || 0;

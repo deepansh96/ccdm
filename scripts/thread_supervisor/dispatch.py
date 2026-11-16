@@ -24,7 +24,6 @@ HANDLERS = {
 }
 # Frames the worker posts itself, never the Router.
 INTERNAL_HANDLERS = {
-    "archive_poll": lifecycle.on_archive_poll,
     "control": control.on_control,
     "launch_exit": boot.on_launch_exit,
     "project_close": projects.on_project_close,

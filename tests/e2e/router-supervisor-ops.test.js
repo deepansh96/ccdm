@@ -3,8 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { connectThread, createRouterWorkspace, rawRouterSocket, routerRegistry, routerWithWebhooks, seedThreads,
-  waitFor } from "./support/router.js";
+import { injectDiscordMessage } from "./support/bridge.js";
+import { connectThread, createRouterWorkspace, rawRouterSocket, routerRegistry, routerWithWebhooks, runRouterCli,
+  seedThreads, waitFor } from "./support/router.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -242,6 +243,7 @@ const CALLS = {
   thread_archive_actor: id => ({ thread_id: id, since: "2026-09-10T00:00:00Z" }),
   thread_react: id => ({ channel_id: id, message_id: "m1", emoji: "👀" }),
   thread_notice: id => ({ channel_id: id, text: "Hello" }),
+  thread_notice_delete: id => ({ channel_id: id, message_id: "m1" }),
   thread_revoke: id => ({ thread_id: id, reason: "closed" }),
 };
 
@@ -253,7 +255,7 @@ test("every supervisor op refuses root, unregistered, remote:, private and stray
   }
   assert.deepEqual(Object.entries(codes).filter(([, code]) => code !== "scope_violation"), []);
   // The thread-only ops refuse the project channel itself; channel-only ops refuse a thread.
-  for (const op of ["thread_update", "thread_history", "thread_archive_actor", "thread_revoke"]) {
+  for (const op of ["thread_update", "thread_history", "thread_archive_actor", "thread_notice_delete", "thread_revoke"]) {
     assert.equal((await supervisor.request(op, CALLS[op]("demo-channel"))).error?.code, "scope_violation", op);
   }
   for (const op of ["thread_create", "thread_list"]) {
@@ -268,7 +270,9 @@ test("project and thread connections calling a supervisor op are forbidden", asy
   const { workspace } = await supervisedRouter();
   const project = await connectProject(workspace);
   const thread = await connectThread(workspace, { threadId: "demo-thread" });
-  const calls = { ...CALLS, thread_request_done: () => ({ request_id: "r", ok: true, thread_id: "demo-thread" }) };
+  const calls = { ...CALLS, thread_request_done: () => ({ request_id: "r", ok: true, thread_id: "demo-thread" }),
+    status_board_list: () => ({}), status_board_post: () => ({ text: "x" }),
+    status_board_edit: () => ({ message_id: "m", text: "x" }), status_board_delete: () => ({ message_id: "m" }) };
   for (const op of Object.keys(calls)) {
     assert.equal((await project.request(op, calls[op]("demo-channel"))).error?.code, "forbidden", `project ${op}`);
     assert.equal((await thread.request(op, calls[op]("demo-thread"))).error?.code, "forbidden", `thread ${op}`);
@@ -334,4 +338,197 @@ test("create_thread fails at once with supervisor_unavailable when no supervisor
   assert.equal((await project.request("create_thread", { channel_id: "demo-channel", name: "Task" })).error?.code,
     "supervisor_unavailable");
   assert.ok(Date.now() - started < 1000);
+});
+
+const NUMERIC_PROJECT_CHANNEL = "1700000000000777003";
+const NUMERIC_ROOT_CHANNEL = "1700000000000777002";
+
+// The thread status board's channel, set in the registry.
+async function boardRouter(statusChannel = "1700000000000777001") {
+  const workspace = createRouterWorkspace({
+    ...routerRegistry({ far: { channel_id: "far-channel", type: "claude", path: "remote:mac:/srv/far" },
+      // A project and a root channel with snowflake ids, which a status channel may not reuse.
+      numeric: { channel_id: NUMERIC_PROJECT_CHANNEL, type: "claude", path: "remote:mac:/srv/numeric" } }),
+    root_channels: ["root-channel", NUMERIC_ROOT_CHANNEL],
+    ...(statusChannel === null ? {} : { thread_status_channel_id: statusChannel }),
+  });
+  seedThreads(workspace, {
+    "demo-thread": { type: 11, parentId: "demo-channel", name: "Fix flaky test", ownerId: "owner-id" },
+    "sibling-thread": { type: 11, parentId: "demo-channel", name: "Sibling" },
+    "root-thread": { type: 11, parentId: "root-channel" },
+  });
+  const router = await routerWithWebhooks(workspace, ["demo"]);
+  const supervisor = await connectSupervisor(workspace);
+  return { workspace, router, supervisor };
+}
+
+const posted = workspace => (discord(workspace).messages ?? []).map(({ id, channelId, content, authorization, allowedMentions }) =>
+  ({ id, channelId, content, authorization, allowedMentions }));
+
+test("thread_notice with mention_owner pings only the owner, in a thread only", async () => {
+  const { workspace, supervisor } = await boardRouter();
+  const ping = ok(await supervisor.request("thread_notice", { channel_id: "demo-thread", text: "🔔 {owner} ready for you",
+    mention_owner: true }));
+  assert.deepEqual(posted(workspace), [{ id: ping.message_id, channelId: "demo-thread", content: "🔔 <@owner-id> ready for you",
+    authorization: ROOT_AUTH, allowedMentions: { parse: [], users: ["owner-id"] } }]);
+
+  const refused = async (args, code) => assert.equal((await supervisor.request("thread_notice",
+    { channel_id: "demo-thread", mention_owner: true, ...args })).error?.code, code, JSON.stringify(args));
+  await refused({ text: "ready for you" }, "invalid_args");
+  await refused({ text: "{owner} and {owner}" }, "invalid_args");
+  await refused({ text: "{owner} and <@guest-id>" }, "invalid_args");
+  await refused({ text: "{owner} @everyone" }, "invalid_args");
+  await refused({ text: "{owner} <@&role-id>" }, "invalid_args");
+  await refused({ text: `{owner} ${"x".repeat(300)}` }, "invalid_args");
+  await refused({ text: "{owner}", mention_owner: "yes" }, "invalid_args");
+  for (const target of ["demo-channel", "root-channel", "root-thread", "stray-channel"]) {
+    assert.equal((await supervisor.request("thread_notice", { channel_id: target, text: "{owner}", mention_owner: true }))
+      .error?.code, "scope_violation", target);
+  }
+  assert.equal(posted(workspace).length, 1);
+});
+
+test("thread_notice_delete deletes only root's own message in that thread", async () => {
+  const { workspace, supervisor } = await boardRouter();
+  const ping = ok(await supervisor.request("thread_notice", { channel_id: "demo-thread", text: "🔔 {owner} ready",
+    mention_owner: true }));
+  const registry = JSON.parse(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"));
+  updateState(workspace.stateDir, state => {
+    state.fixtures.discord.history = { "demo-thread": [
+      { id: "agent-reply", content: "Done.", webhook_id: registry.projects.demo.webhook_id,
+        author: { id: registry.projects.demo.webhook_id, bot: true } },
+      { id: "owner-message", content: "Fix it", author: { id: "owner-id" } },
+    ] };
+  });
+  const refused = async (channel, message) => assert.equal((await supervisor.request("thread_notice_delete",
+    { channel_id: channel, message_id: message })).error?.code, "scope_violation", `${channel} ${message}`);
+  // A sibling thread does not hold the ping: nothing to delete there.
+  assert.deepEqual(ok(await supervisor.request("thread_notice_delete", { channel_id: "sibling-thread",
+    message_id: ping.message_id })), { deleted: false });
+  await refused("demo-thread", "agent-reply");
+  await refused("demo-thread", "owner-message");
+  await refused("demo-channel", ping.message_id);
+  assert.deepEqual(ok(await supervisor.request("thread_notice_delete", { channel_id: "demo-thread", message_id: ping.message_id })),
+    { deleted: true });
+  assert.deepEqual(ok(await supervisor.request("thread_notice_delete", { channel_id: "demo-thread", message_id: ping.message_id })),
+    { deleted: false });
+  assert.deepEqual((discord(workspace).deletes ?? []).map(({ channelId, messageId }) => [channelId, messageId]),
+    [["demo-thread", ping.message_id]]);
+});
+
+test("status board ops post, edit, list and delete root's messages in the status channel only", async () => {
+  const { workspace, supervisor } = await boardRouter();
+  const first = ok(await supervisor.request("status_board_post", { text: "-# CCDM threads · 1/1\n🔔 <#demo-thread>" }));
+  assert.equal(first.channel_id, "1700000000000777001");
+  assert.deepEqual(posted(workspace), [{ id: first.message_id, channelId: "1700000000000777001",
+    content: "-# CCDM threads · 1/1\n🔔 <#demo-thread>", authorization: ROOT_AUTH, allowedMentions: { parse: [] } }]);
+  ok(await supervisor.request("status_board_edit", { message_id: first.message_id, text: "-# CCDM threads · 1/1\n⏳" }));
+  assert.deepEqual(discord(workspace).edits.map(({ channelId, messageId, content, authorization }) =>
+    [channelId, messageId, content, authorization]), [["1700000000000777001", first.message_id, "-# CCDM threads · 1/1\n⏳", ROOT_AUTH]]);
+
+  // Another user's message there, a webhook message, or a message elsewhere is not the board's.
+  updateState(workspace.stateDir, state => {
+    state.fixtures.discord.history = { "1700000000000777001": [
+      { id: "board-old", content: "-# CCDM threads · 1/1", author: { id: "fixture-bot-user-id", bot: true } },
+      { id: "someone", content: "hello", author: { id: "owner-id" } },
+      { id: "hooked", content: "x", webhook_id: "hook-id", author: { id: "hook-id", bot: true } },
+    ], "demo-channel": [{ id: "elsewhere", content: "x", author: { id: "fixture-bot-user-id", bot: true } }] };
+  });
+  const listed = ok(await supervisor.request("status_board_list", { limit: 10 }));
+  assert.deepEqual(listed.messages.map(message => [message.id, message.content]), [["board-old", "-# CCDM threads · 1/1"]]);
+  for (const id of ["someone", "hooked"]) {
+    assert.equal((await supervisor.request("status_board_edit", { message_id: id, text: "x" })).error?.code, "scope_violation", id);
+    assert.equal((await supervisor.request("status_board_delete", { message_id: id })).error?.code, "scope_violation", id);
+  }
+  // A message in another channel is not in the status channel at all.
+  assert.equal((await supervisor.request("status_board_edit", { message_id: "elsewhere", text: "x" })).error?.code, "not_found");
+  assert.deepEqual(ok(await supervisor.request("status_board_delete", { message_id: "elsewhere" })), { deleted: false });
+  assert.equal((await supervisor.request("status_board_edit", { message_id: "gone", text: "x" })).error?.code, "not_found");
+  assert.equal((await supervisor.request("status_board_post", { text: "" })).error?.code, "invalid_args");
+  assert.equal((await supervisor.request("status_board_post", { text: "x".repeat(2001) })).error?.code, "invalid_args");
+  assert.equal((await supervisor.request("status_board_list", { limit: 51 })).error?.code, "invalid_args");
+  // A channel_id argument changes nothing: the target is always the registry's.
+  const other = ok(await supervisor.request("status_board_post", { channel_id: "demo-channel", text: "-# CCDM threads" }));
+  assert.equal(other.channel_id, "1700000000000777001");
+  assert.deepEqual(ok(await supervisor.request("status_board_delete", { message_id: first.message_id })), { deleted: true });
+  assert.deepEqual(new Set(posted(workspace).map(message => message.channelId)), new Set(["1700000000000777001"]));
+});
+
+test("status board ops fail status_channel_unset without the registry key, and nothing is sent", async () => {
+  const { workspace, supervisor } = await boardRouter(null);
+  for (const [op, args] of [["status_board_post", { text: "x" }], ["status_board_edit", { message_id: "m", text: "x" }],
+    ["status_board_list", {}], ["status_board_delete", { message_id: "m" }]]) {
+    assert.equal((await supervisor.request(op, args)).error?.code, "status_channel_unset", op);
+  }
+  assert.deepEqual(discord(workspace).messages ?? [], []);
+});
+
+test("an invalid thread_status_channel_id turns the board off, shown in router status, while the registry loads", async () => {
+  const notAnId = "thread_status_channel_id must be a Discord channel ID (17-20 digits)";
+  for (const [value, error] of [[NUMERIC_PROJECT_CHANNEL, "thread_status_channel_id is project numeric's channel"],
+    [NUMERIC_ROOT_CHANNEL, "thread_status_channel_id is a root channel"], [{ id: 1 }, notAnId],
+    // A path, a padded id, a non-snowflake word and the example's placeholder are all not ids.
+    ["../status/1700000000000777001", notAnId], [" 1700000000000777001", notAnId], ["demo-channel", notAnId],
+    ["YOUR_THREAD_STATUS_CHANNEL_ID", notAnId]]) {
+    const { workspace, supervisor } = await boardRouter(value);
+    assert.equal((await supervisor.request("status_board_post", { text: "x" })).error?.code, "status_channel_invalid");
+    const text = (await runRouterCli(workspace, ["status"])).stdout;
+    assert.ok(text.split("\n").includes(`thread status channel: off (invalid: ${error})`), text);
+    assert.doesNotMatch(text, /registry error/);
+    const json = JSON.parse((await runRouterCli(workspace, ["status", "--json"])).stdout);
+    assert.deepEqual(json.status_channel, { channel_id: null, error, missing_permissions: null });
+    assert.equal(json.registry_error, null);
+    // Every project still routes.
+    const project = await connectProject(workspace);
+    assert.equal((await project.request("typing", { channel_id: "demo-channel" })).ok, true);
+    await cleanup();
+  }
+});
+
+test("router status reports the status channel and root's missing permissions there", async () => {
+  const { workspace } = await boardRouter();
+  assert.match((await runRouterCli(workspace, ["status"])).stdout, /^thread status channel: 1700000000000777001 permissions=ok$/m);
+  updateState(workspace.stateDir, state => {
+    state.fixtures.discord.permissionDenials = { "fixture-bot-user-id": ["SendMessages"] };
+  });
+  const json = JSON.parse((await runRouterCli(workspace, ["status", "--json"])).stdout);
+  assert.deepEqual(json.status_channel, { channel_id: "1700000000000777001", error: null, missing_permissions: ["SendMessages"] });
+});
+
+test("a native reply to an owner ping reaches the thread session, not root", async () => {
+  const { workspace, supervisor } = await boardRouter();
+  const thread = await connectThread(workspace, { threadId: "demo-thread" });
+  const ping = ok(await supervisor.request("thread_notice", { channel_id: "demo-thread", text: "🔔 {owner} ready for you",
+    mention_owner: true }));
+  const notice = ok(await supervisor.request("thread_notice", { channel_id: "demo-thread", text: "Restarting." }));
+  injectDiscordMessage(workspace, { id: "reply-to-ping", channelId: "demo-thread", content: "go on", replyTo: ping.message_id,
+    author: { id: "owner-id", username: "Owner" } });
+  await waitFor(() => thread.events.some(event => event.message_id === "reply-to-ping"), () => "the reply at the thread");
+  const supervised = await waitFor(() => supervisor.events.find(event => event.event === "thread_message"
+    && event.message_id === "reply-to-ping"), () => "the supervisor's copy");
+  assert.deepEqual([supervised.to_root, supervised.delivered_to_session], [false, true]);
+  // A native reply to any other root-bot message is still root's.
+  injectDiscordMessage(workspace, { id: "reply-to-notice", channelId: "demo-thread", content: "why?", replyTo: notice.message_id,
+    author: { id: "owner-id", username: "Owner" } });
+  const toRoot = await waitFor(() => supervisor.events.find(event => event.event === "thread_message"
+    && event.message_id === "reply-to-notice"), () => "the supervisor's copy of the reply to the notice");
+  assert.equal(toRoot.to_root, true);
+  assert.ok(!thread.events.some(event => event.message_id === "reply-to-notice"));
+
+  // A ping this Router does not remember (one posted before a restart) is
+  // known by its exact text; a root message that only looks like one is not.
+  const remembered = ok(await supervisor.request("thread_notice", { channel_id: "demo-thread",
+    text: "🔔 <@owner-id> ready for you" }));
+  const lookalike = ok(await supervisor.request("thread_notice", { channel_id: "demo-thread",
+    text: "🔔 <@owner-id> ready for you!" }));
+  for (const [id, replyTo, toThread] of [["reply-to-old-ping", remembered.message_id, true],
+    ["reply-to-lookalike", lookalike.message_id, false]]) {
+    injectDiscordMessage(workspace, { id, channelId: "demo-thread", content: "and?", replyTo,
+      author: { id: "owner-id", username: "Owner" } });
+    const copy = await waitFor(() => supervisor.events.find(event => event.event === "thread_message"
+      && event.message_id === id), () => `the supervisor's copy of ${id}`);
+    assert.equal(copy.to_root, !toThread, id);
+  }
+  await waitFor(() => thread.events.some(event => event.message_id === "reply-to-old-ping"), () => "the old ping's reply");
+  assert.ok(!thread.events.some(event => event.message_id === "reply-to-lookalike"));
 });

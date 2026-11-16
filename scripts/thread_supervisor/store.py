@@ -1,4 +1,11 @@
-"""The Thread Supervisor's private SQLite store, schema v1."""
+"""The Thread Supervisor's private SQLite store, schema v2.
+
+v2 adds each thread's turn status (whose turn it is, its last input and
+accepted turn end, its board state and since when, its owner ping) and the
+`status_board` table of the status board's messages. A v1 store migrates on
+the next `connect`, after a private `threads.v1.backup.sqlite3` copy; a failed
+migration leaves the v1 store as it was, and a newer version is refused.
+"""
 
 from __future__ import annotations
 
@@ -13,13 +20,17 @@ import uuid
 from .paths import private_directory
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 THREAD_STATES = ("registered", "booting", "live", "queued", "stopped", "closed")
 STOP_REASONS = ("auto-archive", "archive-actor-unknown", "evicted", "operator", "crashed", "start-failed")
 CLOSE_REASONS = ("owner-archive", "root-archive", "close-command", "deregistered", "project-moved")
 REQUESTER_KINDS = ("owner", "guest", "root", "channel-agent")
 REQUEST_STATUSES = ("pending", "fulfilled", "failed")
 OVERRIDES = ("provider", "account", "model", "effort")
+TURN_OWNERS = ("agent", "owner")
+INPUT_CLASSES = ("owner", "guest", "starter")
+TURN_OUTCOMES = ("completed", "failed")
+DISPLAY_STATES = ("working", "waiting", "idle", "failed")
 
 
 def _one_of(column: str, values: tuple[str, ...], nullable: bool = False) -> str:
@@ -31,6 +42,22 @@ def _one_of(column: str, values: tuple[str, ...], nullable: bool = False) -> str
 # the project's setting; `resolved_*` hold what its session runs with.
 # `parent_channel_id` is the project channel it was bound under, and a queued
 # row's `queued_start` holds the trigger and starter it starts with (JSON).
+# The v2 turn-status columns, added to v1's by the migration. `whose_turn` is
+# who the conversation waits on; `turn_end_seen` is the last turn end read
+# from the session's activity.json; `display_*` is its board state and since
+# when; `ping_message_id` is its one owner ping.
+TURN_COLUMNS = {
+    "whose_turn": f"TEXT {_one_of('whose_turn', TURN_OWNERS, nullable=True)}",
+    "last_input_at": "TEXT",
+    "last_input_class": f"TEXT {_one_of('last_input_class', INPUT_CLASSES, nullable=True)}",
+    "turn_end_seen": "TEXT",
+    "turn_outcome": f"TEXT {_one_of('turn_outcome', TURN_OUTCOMES, nullable=True)}",
+    "display_state": f"TEXT {_one_of('display_state', DISPLAY_STATES, nullable=True)}",
+    "display_since": "TEXT",
+    "ping_message_id": "TEXT",
+}
+STATUS_BOARD = """slot INTEGER PRIMARY KEY, channel_id TEXT NOT NULL, message_id TEXT NOT NULL,
+        content_sha256 TEXT NOT NULL"""
 TABLES = {
     "threads": f"""thread_id TEXT PRIMARY KEY, project TEXT NOT NULL, name TEXT NOT NULL,
         creator_id TEXT NOT NULL, starter_message_id TEXT, parent_channel_id TEXT, created_at TEXT NOT NULL,
@@ -42,7 +69,9 @@ TABLES = {
         close_reason TEXT {_one_of("close_reason", CLOSE_REASONS, nullable=True)},
         runtime_tmux TEXT, runtime_pid INTEGER, ws_port INTEGER,
         last_owner_activity_at TEXT, last_agent_reply_at TEXT,
-        pending_config TEXT, pending_close TEXT, queue_position INTEGER, queued_start TEXT""",
+        pending_config TEXT, pending_close TEXT, queue_position INTEGER, queued_start TEXT,
+        """ + ", ".join(f"{column} {definition}" for column, definition in TURN_COLUMNS.items()),
+    "status_board": STATUS_BOARD,
     "creation_requests": f"""request_id TEXT PRIMARY KEY, project TEXT NOT NULL, name TEXT NOT NULL,
         provider TEXT, account TEXT, model TEXT, effort TEXT, first_message TEXT,
         requester_id TEXT NOT NULL,
@@ -52,7 +81,7 @@ TABLES = {
     "boot_buffers": """thread_id TEXT NOT NULL, message_id TEXT NOT NULL, payload TEXT NOT NULL,
         received_at TEXT NOT NULL, PRIMARY KEY(thread_id, message_id)""",
 }
-COLUMNS = {
+V1_COLUMNS = {
     "threads": {"thread_id", "project", "name", "creator_id", "starter_message_id", "parent_channel_id", "created_at",
                 "provider", "account", "model", "effort",
                 "resolved_provider", "resolved_account", "resolved_model", "resolved_effort",
@@ -63,24 +92,76 @@ COLUMNS = {
                           "first_message", "requester_id", "requester_kind", "status", "thread_id", "created_at"},
     "boot_buffers": {"thread_id", "message_id", "payload", "received_at"},
 }
+COLUMNS = {
+    **V1_COLUMNS,
+    "threads": V1_COLUMNS["threads"] | set(TURN_COLUMNS),
+    "status_board": {"slot", "channel_id", "message_id", "content_sha256"},
+}
+COLUMNS_BY_VERSION = {1: V1_COLUMNS, SCHEMA_VERSION: COLUMNS}
 
 
 def store_path(state_dir: Path) -> Path:
     return state_dir / "threads.sqlite3"
 
 
-def verify(db: sqlite3.Connection) -> None:
-    """Refuse a store whose version, tables or exact column sets are not schema v1."""
-    if db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+def backup_path(state_dir: Path, version: int) -> Path:
+    return state_dir / f"threads.v{version}.backup.sqlite3"
+
+
+def verify(db: sqlite3.Connection, versions: tuple[int, ...] = (SCHEMA_VERSION,)) -> int:
+    """Refuse a store whose version, tables or exact column sets are not one
+    of ``versions``; returns its version."""
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    if version not in versions:
         raise ValueError("thread store schema is unsupported")
+    expected = COLUMNS_BY_VERSION[version]
     tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    if tables != set(COLUMNS):
+    if tables != set(expected):
         raise ValueError("thread store schema is unsupported")
-    for table, columns in COLUMNS.items():
+    for table, columns in expected.items():
         if {row[1] for row in db.execute(f"PRAGMA table_info({table})")} != columns:
             raise ValueError("thread store schema is unsupported")
     if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
         raise ValueError("thread store is corrupt")
+    return version
+
+
+def _backup(db: sqlite3.Connection, state_dir: Path, version: int) -> None:
+    """A private copy of the store before its migration; an earlier copy is kept."""
+    target = backup_path(state_dir, version)
+    if target.exists():
+        return
+    temporary = state_dir / f".{target.name}.{os.getpid()}.tmp"
+    os.close(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+    try:
+        copy = sqlite3.connect(temporary)
+        try:
+            db.backup(copy)
+        finally:
+            copy.close()
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    except (OSError, sqlite3.Error):
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _migrate(db: sqlite3.Connection, state_dir: Path) -> None:
+    """v1 → v2, in one transaction, after the backup."""
+    _backup(db, state_dir, 1)
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if db.execute("PRAGMA user_version").fetchone()[0] == 1:
+            for column, definition in TURN_COLUMNS.items():
+                db.execute(f"ALTER TABLE threads ADD COLUMN {column} {definition}")
+            db.execute(f"CREATE TABLE status_board ({STATUS_BOARD})")
+            if os.environ.get("CCDM_THREAD_STORE_FAIL_MIGRATION") == "1":  # The E2E suite's failed migration.
+                raise sqlite3.OperationalError("injected migration failure")
+            db.execute("PRAGMA user_version=2")
+        db.execute("COMMIT")
+    except sqlite3.Error:
+        db.execute("ROLLBACK")
+        raise
 
 
 def _check_private(path: Path) -> None:
@@ -89,7 +170,7 @@ def _check_private(path: Path) -> None:
 
 
 def _publish(state_dir: Path, path: Path) -> None:
-    """Build a complete schema-v1 store in a private temporary file beside
+    """Build a complete current-schema store in a private temporary file beside
     ``path`` and link it into place, so no reader ever sees a half-made store.
     A store some other process published first wins."""
     temporary = state_dir / f".threads.{os.getpid()}.{uuid.uuid4().hex}.sqlite3"
@@ -132,8 +213,10 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA synchronous=FULL")
         db.execute("PRAGMA secure_delete=ON")
-        verify(db)
-    except (sqlite3.Error, ValueError):
+        if verify(db, (1, SCHEMA_VERSION)) == 1:
+            _migrate(db, state_dir)
+            verify(db)
+    except (sqlite3.Error, ValueError, OSError):
         db.close()
         raise
     for suffix in ("", "-wal", "-shm"):
@@ -168,9 +251,12 @@ def _inspect(path: Path) -> dict:
     db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     db.row_factory = sqlite3.Row
     try:
-        verify(db)
-        return {"user_version": db.execute("PRAGMA user_version").fetchone()[0],
-                "threads": [dict(row) for row in db.execute("SELECT * FROM threads ORDER BY project, created_at, thread_id")]}
+        # A v1 store not yet migrated by a worker is still readable.
+        version = verify(db, (1, SCHEMA_VERSION))
+        return {"user_version": version,
+                "threads": [dict(row) for row in db.execute("SELECT * FROM threads ORDER BY project, created_at, thread_id")],
+                "status_board": [dict(row) for row in db.execute("SELECT * FROM status_board ORDER BY slot")]
+                if version >= 2 else []}
     finally:
         db.close()
 
@@ -319,3 +405,18 @@ def forget(db: sqlite3.Connection, thread_id: str) -> None:
     except sqlite3.Error:
         db.execute("ROLLBACK")
         raise
+
+
+def board_slots(db: sqlite3.Connection) -> list[sqlite3.Row]:
+    """The status board's messages, top first."""
+    return db.execute("SELECT * FROM status_board ORDER BY slot").fetchall()
+
+
+def set_board_slot(db: sqlite3.Connection, slot: int, channel_id: str, message_id: str, content_sha256: str) -> None:
+    db.execute("""INSERT INTO status_board (slot, channel_id, message_id, content_sha256) VALUES (?,?,?,?)
+        ON CONFLICT(slot) DO UPDATE SET channel_id=excluded.channel_id, message_id=excluded.message_id,
+        content_sha256=excluded.content_sha256""", (slot, channel_id, message_id, content_sha256))
+
+
+def drop_board_slots(db: sqlite3.Connection, from_slot: int = 1) -> None:
+    db.execute("DELETE FROM status_board WHERE slot >= ?", (from_slot,))

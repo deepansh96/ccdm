@@ -72,7 +72,6 @@ def on_registry(context, _frame: dict | None = None) -> None:
 
 def close(context, row, reason: str) -> None:
     """Stop a thread's session and close it for a project change."""
-    context.archive_polls.pop(row["thread_id"], None)
     lifecycle.stop_session(context, row)
     store.finish_boot(context.db, row["thread_id"], "closed")
     store.update(context.db, row["thread_id"], close_reason=reason, pending_close=None)
