@@ -1,18 +1,30 @@
-"""The thread status board: root-bot messages in the registry's status channel, edited in place.
+"""The thread status board: one root-bot message in the registry's status channel, edited in place.
 
-It lists every open Thread Conversation, grouped by board state in attention
-order (🔔 waiting on you, ⚠️ failed, ⏳ working, 💤 idle), each with a jump
-link, its project, provider/model, its state, and a self-updating relative
-time since that state began. The text changes only when a state does, and a
-flush, at most once per interval, edits only the messages whose text changed,
-one Router call at a time (5 s timeout), never while a frame waits.
-Past `MAX_SLOTS` messages the idle threads collapse to a count.
+Under a small `-# CCDM threads` line it shows what needs the owner:
 
-The board's messages are kept in the store's `status_board` table. With none
+    🔔 Waiting on you (N)      oldest first: <#thread> · project · <t:…:R>
+    ⏳ Working (N)             <#thread> · project
+    💤 N idle · ⚠️ M failed today
+
+An empty section is left out. A failed turn waits on the owner like any
+other. ⚠️ counts crashed and failed-start threads whose last real activity
+(owner message or start, agent reply, input, turn end) is within 24 hours,
+and is left out at 0; other failures, and stopped, paused and new threads,
+count as idle.
+With nothing waiting or working the board is one line,
+`✅ Nothing needs you · 💤 N idle`. It never grows past one message: past
+Discord's limit the lowest section loses lines, shown as "+N more".
+
+The text changes only when a state does, and a flush, at most once per
+interval, edits only when the text changed, one Router call at a time (5 s
+timeout), never while a frame waits.
+
+The board's message is kept in the store's `status_board` table. With none
 stored (a new store, or a new channel), root's own messages that start with
-the board header are adopted, so a restart never posts a second board; a post
-that timed out is looked for the same way before the next post. A message
-deleted in Discord makes the whole board post again, in order. With
+the header are adopted, oldest first; any beyond the first (an older
+multi-message board) are deleted, so a restart never posts a second board. A
+post that timed out is looked for the same way before the next post. The
+message deleted in Discord makes the board post again. With
 `thread_status_channel_id` unset or invalid, or a Router that does not
 advertise the `status_board` capability, the board is off: nothing is
 posted, and no error is raised.
@@ -31,12 +43,18 @@ from . import registry, store
 from .link import LinkError
 
 
+# The board's first line: small grey text, and how adoption knows root's own board.
 HEADER = "-# CCDM threads"
 MESSAGE_LIMIT = 2000
-MAX_SLOTS = 5
 DEFAULT_INTERVAL_SECONDS = 10
-ORDER = ("waiting", "failed", "working", "idle")
-ICONS = {"waiting": "🔔", "failed": "⚠️", "working": "⏳", "idle": "💤"}
+# A crash or failed start counts as failed only while the thread's last real
+# activity is this recent; otherwise it counts as idle.
+FAILED_WINDOW_SECONDS = 24 * 3600
+# That activity: the owner's last message (a start sets it too), the agent's
+# last reply, the last input, and the last turn end seen (a session going
+# live sets it). Not `display_since`: the v2 migration's first status tick set
+# it for every old row, so an old crash would look a day new.
+ACTIVITY_COLUMNS = ("last_owner_activity_at", "last_agent_reply_at", "last_input_at", "turn_end_seen")
 SNOWFLAKE = re.compile(r"\d{17,20}")
 # A board call never holds the worker long.
 CALL_TIMEOUT_SECONDS = 5
@@ -87,53 +105,80 @@ def _epoch(stamp) -> int:
     return int(moment.timestamp())
 
 
-def _line(current: dict, row, shown: tuple[str, str]) -> str:
-    entry = registry.project(current, row["project"]) or {}
-    settings = registry.resolved_settings(entry, row)
-    provider = row["resolved_provider"] or settings["provider"]
-    model = row["resolved_model"] or settings["model"] or "default"
-    return (f"{ICONS[shown[0]]} <#{row['thread_id']}> · {row['project']} · {provider}/{model} · {shown[1]} "
-            f"<t:{_epoch(row['display_since'])}:R>")
+def _seconds(stamp) -> int | None:
+    """A stored time as epoch seconds; None when it is missing or unreadable."""
+    if not isinstance(stamp, str) or not stamp:
+        return None
+    try:
+        moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int((moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)).timestamp())
 
 
-def _chunks(lines: list[str]) -> list[list[str]]:
-    """Lines packed into messages, leaving room for each one's header."""
-    chunks, current, size = [], [], 0
-    for line in lines:
-        if current and size + len(line) + 1 > MESSAGE_LIMIT - 80:
-            chunks.append(current)
-            current, size = [], 0
-        current.append(line)
-        size += len(line) + 1
-    if current or not chunks:
-        chunks.append(current)
-    return chunks
+def _failed_recently(row, now_s: int) -> bool:
+    """Whether a crashed or failed-start thread's latest real activity is within the failed window."""
+    stamps = [_seconds(row[column]) for column in ACTIVITY_COLUMNS]
+    latest = max((stamp for stamp in stamps if stamp is not None), default=None)
+    return latest is not None and now_s - latest < FAILED_WINDOW_SECONDS
+
+
+def _buckets(context, rows: dict, now_s: int) -> tuple[list, list, int, int]:
+    """Open threads by what they ask of the owner: waiting rows, working rows,
+    and the idle and recently failed counts."""
+    waiting, working, idle, failed = [], [], 0, 0
+    for thread_id, (state, label) in context.labels.items():
+        row = rows.get(thread_id)
+        if row is None:
+            continue
+        if state == "waiting" or (state == "failed" and label.startswith("turn failed")):
+            waiting.append(row)  # A failed turn hands the turn to the owner too.
+        elif state == "working":
+            working.append(row)
+        elif state == "failed" and _failed_recently(row, now_s):
+            failed += 1
+        else:
+            idle += 1  # Idle, paused, new, stopped, and failures with no activity in a day.
+    order = lambda row: (_epoch(row["display_since"]), row["thread_id"])  # noqa: E731
+    return sorted(waiting, key=order), sorted(working, key=order), idle, failed
+
+
+def _fit(sections: list[tuple[str, list[str]]], summary: str) -> str:
+    """The one board message: each non-empty section's header, count and
+    lines, then the summary. Past the message limit the lowest section loses
+    lines first, each cut shown as "+N more"."""
+    keep = [len(lines) for _title, lines in sections]
+
+    def text() -> str:
+        out = [HEADER]
+        for (title, lines), kept in zip(sections, keep):
+            if not lines:
+                continue
+            out.append(f"{title} ({len(lines)})")
+            out.extend(lines[:kept])
+            if kept < len(lines):
+                out.append(f"+{len(lines) - kept} more")
+        out.append(summary)
+        return "\n".join(out)
+
+    for index in reversed(range(len(sections))):
+        while len(text()) > MESSAGE_LIMIT and keep[index] > 0:
+            keep[index] -= 1
+    return text()
 
 
 def render(context, current: dict) -> list[str]:
-    """The board's messages, top first."""
+    """The board: always one message."""
     rows = {row["thread_id"]: row for row in context.db.execute("SELECT * FROM threads WHERE state != 'closed'")}
-    grouped = {group: [] for group in ORDER}
-    for thread_id, shown in context.labels.items():
-        row = rows.get(thread_id)
-        if row is not None and shown[0] in grouped:
-            grouped[shown[0]].append((row["display_since"] or "", thread_id, row, shown))
-    lines = {group: [_line(current, row, shown) for _since, _id, row, shown in sorted(entries, key=lambda e: e[:2])]
-             for group, entries in grouped.items()}
-    every = [line for group in ORDER for line in lines[group]]
-    chunks = _chunks(every) if every else [["No open threads."]]
-    if len(chunks) > MAX_SLOTS and lines["idle"]:
-        collapsed = [line for group in ORDER[:-1] for line in lines[group]]
-        collapsed.append(f"{ICONS['idle']} +{len(lines['idle'])} idle threads")
-        chunks = _chunks(collapsed)
-    if len(chunks) > MAX_SLOTS:
-        kept = [line for chunk in chunks[:MAX_SLOTS] for line in chunk]
-        kept = kept[:-1] + [f"… +{len(every) - len(kept) + 1} more threads"]
-        chunks = _chunks(kept)[:MAX_SLOTS]
-    stamps = [row["display_since"] for row in rows.values() if row["display_since"]]
-    changed = f" · last change <t:{_epoch(max(stamps, key=_epoch))}:R>" if stamps else ""
-    return [f"{HEADER} · {index}/{len(chunks)}{changed}\n" + "\n".join(chunk)
-            for index, chunk in enumerate(chunks, 1)]
+    waiting, working, idle, failed = _buckets(context, rows, int(time.time()))
+    summary = f"💤 {idle} idle" + (f" · ⚠️ {failed} failed today" if failed else "")
+    if not waiting and not working:
+        return [f"{HEADER}\n✅ Nothing needs you · {summary}"]
+    return [_fit([
+        ("🔔 Waiting on you", [f"<#{row['thread_id']}> · {row['project']} · <t:{_epoch(row['display_since'])}:R>"
+                              for row in waiting]),
+        ("⏳ Working", [f"<#{row['thread_id']}> · {row['project']}" for row in working]),
+    ], summary)]
 
 
 def _sha(text: str) -> str:

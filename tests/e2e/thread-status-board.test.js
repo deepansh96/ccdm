@@ -93,7 +93,10 @@ const boardPosts = workspace => (discord(workspace).messages ?? []).filter(messa
 const boardEdits = workspace => (discord(workspace).edits ?? []).filter(edit => edit.channelId === STATUS_CHANNEL);
 const idle = workspace => waitForThreadIdle(workspace, "demo", THREAD_ID);
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
-const line = (icon, label) => `${icon} <#${THREAD_ID}> · demo · claude/default · ${label} <t:`;
+// The board's parts, as the tests look for them.
+const waiting = (count = 1) => `🔔 Waiting on you (${count})\n<#${THREAD_ID}> · demo · <t:`;
+const working = (count = 1) => `⏳ Working (${count})\n<#${THREAD_ID}> · demo\n`;
+const quiet = (idle, failed = 0) => `✅ Nothing needs you · 💤 ${idle} idle${failed ? ` · ⚠️ ${failed} failed today` : ""}`;
 
 async function boardShows(workspace, text) {
   await waitFor(() => boardText(workspace).includes(text), () => `the board to show ${text}: ${boardText(workspace)}`, 15000);
@@ -129,10 +132,11 @@ test("an answered owner turn pings only the owner once in the thread and shows �
   assert.deepEqual([row.whose_turn, row.last_input_class, row.turn_outcome, row.ping_message_id],
     ["owner", "owner", "completed", ping.id]);
 
-  await boardShows(workspace, line("🔔", "waiting on you"));
+  await boardShows(workspace, waiting());
   const [board] = boardPosts(workspace);
   assert.deepEqual([board.authorization, board.allowedMentions], [ROOT_AUTH, { parse: [] }]);
-  assert.match(board.content, /^-# CCDM threads · 1\/1/);
+  assert.match(current(board), new RegExp(`^-# CCDM threads\n🔔 Waiting on you \\(1\\)\n<#${THREAD_ID}> · demo · `
+    + "<t:\\d+:R>\n💤 0 idle$"));
   assert.equal(boardPosts(workspace).length, 1);
   // Nothing changes, so nothing is edited.
   const edits = boardEdits(workspace).length;
@@ -168,7 +172,7 @@ test("a guest-driven turn shows 🔔 · guest on the board and pings no one", as
   await supervised(workspace);
   await answeredThread(workspace, GUEST);
 
-  await boardShows(workspace, line("🔔", "waiting on you · guest"));
+  await boardShows(workspace, waiting());
   await pause(1500);
   assert.deepEqual(allPings(workspace), []);
 });
@@ -191,7 +195,7 @@ test("a /restart's bootstrap turn, with no new input, sends no ping", async () =
   assert.deepEqual(livePings(workspace), []);
   assert.equal(allPings(workspace).length, 1);
   assert.equal((await threadRow(workspace)).whose_turn, "owner");
-  await boardShows(workspace, line("🔔", "waiting on you"));
+  await boardShows(workspace, waiting());
 });
 
 test("a turn ended by an operator stop sends no ping, and the board shows the thread stopped", async () => {
@@ -203,7 +207,7 @@ test("a turn ended by an operator stop sends no ping, and the board shows the th
     state.fixtures.claude.holdTurnsIn = [THREAD_ID];
   });
   threadMessage(workspace, "busy-message-1", "run the whole suite");
-  await boardShows(workspace, line("⏳", "working"));
+  await boardShows(workspace, working());
 
   const stop = await runScript(workspace, "scripts/threads.sh", { args: ["stop", THREAD_ID], env: supervisorEnv(workspace) });
   assert.equal(stop.exitCode, 0, stop.stderr);
@@ -211,7 +215,7 @@ test("a turn ended by an operator stop sends no ping, and the board shows the th
   updateState(workspace.stateDir, state => {
     state.fixtures.claude.holdTurnsIn = [];
   });
-  await boardShows(workspace, line("💤", "stopped (operator)"));
+  await boardShows(workspace, quiet(1));
   await pause(1500);
   assert.deepEqual(livePings(workspace), []);
   assert.equal(allPings(workspace).length, 1);
@@ -226,13 +230,13 @@ test("a session that crashes mid-turn shows ⚠️ crashed and sends no ping", a
     state.fixtures.claude.holdTurnsIn = [THREAD_ID];
   });
   threadMessage(workspace, "busy-message-1", "run the whole suite");
-  await boardShows(workspace, line("⏳", "working"));
+  await boardShows(workspace, working());
 
   const { pid } = readState(workspace.stateDir).fixtures.tmux.sessions[THREAD_TMUX];
   process.kill(-pid, "SIGKILL");
 
   await threadRow(workspace, row => row.state === "stopped" && row.stop_reason === "crashed");
-  await boardShows(workspace, line("⚠️", "crashed"));
+  await boardShows(workspace, quiet(0, 1));
   await pause(1500);
   assert.deepEqual(livePings(workspace), []);
 });
@@ -247,7 +251,7 @@ test("a failed turn shows ⚠️ turn failed and pings the owner that it failed"
 
   const [ping] = await waitFor(() => livePings(workspace).length && livePings(workspace), () => "the failure ping", 15000);
   assert.equal(ping.content, "⚠️ <@owner-id> the last turn failed");
-  await boardShows(workspace, line("⚠️", "turn failed"));
+  await boardShows(workspace, waiting());
   assert.equal((await threadRow(workspace)).turn_outcome, "failed");
 });
 
@@ -256,7 +260,7 @@ test("threads.sh close deletes the ping before archiving, and the thread leaves 
   await supervised(workspace);
   await answeredThread(workspace);
   const [ping] = await waitFor(() => livePings(workspace).length && livePings(workspace), () => "the ping", 15000);
-  await boardShows(workspace, line("🔔", "waiting on you"));
+  await boardShows(workspace, waiting());
 
   const close = await runScript(workspace, "scripts/threads.sh", { args: ["close", THREAD_ID], env: supervisorEnv(workspace) });
   assert.equal(close.exitCode, 0, close.stderr);
@@ -267,7 +271,7 @@ test("threads.sh close deletes the ping before archiving, and the thread leaves 
   assert.deepEqual((discord(workspace).deletes ?? []).filter(entry => entry.messageId === ping.id)
     .map(entry => entry.threadArchived), [false]);
   assert.equal(discord(workspace).threads[THREAD_ID].archived, true);
-  await boardShows(workspace, "No open threads.");
+  await boardShows(workspace, quiet(0));
   assert.ok(!boardText(workspace).includes(`<#${THREAD_ID}>`));
 });
 
@@ -276,7 +280,7 @@ test("the owner's /close in the thread deletes the ping before archiving, and th
   await supervised(workspace);
   await answeredThread(workspace);
   const [ping] = await waitFor(() => livePings(workspace).length && livePings(workspace), () => "the ping", 15000);
-  await boardShows(workspace, line("🔔", "waiting on you"));
+  await boardShows(workspace, waiting());
 
   // A thread_command the Router hands the supervisor, answered by commands.py's /close.
   threadMessage(workspace, "close-message-1", "/close");
@@ -287,7 +291,7 @@ test("the owner's /close in the thread deletes the ping before archiving, and th
     .map(entry => entry.threadArchived), [false]);
   assert.equal(discord(workspace).threads[THREAD_ID].archived, true);
   assert.ok(sent(workspace, THREAD_ID).some(message => !message.webhookId && message.content === "Closing this thread."));
-  await boardShows(workspace, "No open threads.");
+  await boardShows(workspace, quiet(0));
   // A closed thread is not pinged again, and the archive stands.
   await pause(1000);
   assert.deepEqual(livePings(workspace), []);
@@ -309,7 +313,7 @@ test("a /close a crash interrupted after recording itself is finished on restart
   const workspace = threadWorkspace();
   const first = await supervised(workspace, { CCDM_THREAD_FAIL_AFTER_PENDING_CLOSE: "1" });
   await answeredThread(workspace);
-  await boardShows(workspace, line("🔔", "waiting on you"));
+  await boardShows(workspace, waiting());
 
   // The worker dies after `pending_close` and the archive, before the row closes.
   threadMessage(workspace, "close-message-1", "/close");
@@ -323,7 +327,7 @@ test("a /close a crash interrupted after recording itself is finished on restart
   assert.deepEqual([row.close_reason, row.stop_reason], ["close-command", null]);
   assert.equal(discord(workspace).threads[THREAD_ID].archived, true);
   await waitFor(() => reminderClosed(workspace), () => "the conversation_closed event");
-  await boardShows(workspace, "No open threads.");
+  await boardShows(workspace, quiet(0));
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions[THREAD_TMUX], undefined);
 });
 
@@ -353,7 +357,7 @@ test("a supervisor restart reuses the board; a lost store adopts it; a board mes
   const workspace = threadWorkspace();
   const first = await supervised(workspace);
   await answeredThread(workspace);
-  await boardShows(workspace, line("🔔", "waiting on you"));
+  await boardShows(workspace, waiting());
   assert.equal(boardPosts(workspace).length, 1);
 
   // A restart: the stored board is edited, never posted again.
@@ -362,7 +366,7 @@ test("a supervisor restart reuses the board; a lost store adopts it; a board mes
   threadMessage(workspace, "next-message-1", "now add a test");
   await waitFor(() => agentReplies(workspace).length === 2, () => "the second reply", 15000);
   await waitFor(() => livePings(workspace).length === 1, () => "the second ping", 15000);
-  await boardShows(workspace, line("🔔", "waiting on you"));
+  await boardShows(workspace, waiting());
   assert.equal(boardPosts(workspace).length, 1);
 
   // A lost store: root's board message in the channel is found and adopted.
@@ -392,7 +396,7 @@ test("a supervisor restart reuses the board; a lost store adopts it; a board mes
   threadEvent(workspace, "create", { id: other, name: "Second thread" });
   await waitFor(() => boardPosts(workspace).length === 2, () => "the board posted again", 15000);
   assert.equal(boardMessages(workspace).length, 1);
-  await boardShows(workspace, `💤 <#${other}> · demo`);
+  await boardShows(workspace, "💤 2 idle");
 });
 
 test("with no status channel there is no board and no error; setting the key starts one without a restart", async () => {
@@ -409,7 +413,7 @@ test("with no status channel there is no board and no error; setting the key sta
   registry.thread_status_channel_id = STATUS_CHANNEL;
   fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
 
-  await boardShows(workspace, line("🔔", "waiting on you"));
+  await boardShows(workspace, waiting());
   assert.equal((await supervisorStatus(workspace)).board.state, "on");
 });
 
@@ -440,39 +444,140 @@ test("thread_owner_pings: false turns pings off, and the board still shows the t
   const workspace = threadWorkspace({ thread_status_channel_id: STATUS_CHANNEL, thread_owner_pings: false });
   await supervised(workspace, { CCDM_THREAD_OWNER_PINGS: "" });
   await answeredThread(workspace);
-  await boardShows(workspace, line("🔔", "waiting on you"));
+  await boardShows(workspace, waiting());
   await pause(1000);
   assert.deepEqual(allPings(workspace), []);
   assert.equal((await supervisorStatus(workspace)).owner_pings, false);
 });
 
-test("a board past one message splits into ordered messages, and shrinks again", async () => {
+// Rows straight into the store, as `[thread_id, state, stop_reason, whose_turn]`.
+function insertRows(workspace, rows) {
+  const store = path.join(supervisorStateDir(workspace), "threads.sqlite3");
+  execFileSync("python3", ["-c", `import json, sqlite3, sys
+db = sqlite3.connect(sys.argv[1], timeout=5)
+for thread_id, state, reason, turn in json.loads(sys.argv[3]):
+    db.execute("""INSERT INTO threads (thread_id, project, name, creator_id, parent_channel_id, created_at, state,
+        stop_reason, whose_turn) VALUES (?, 'demo', ?, ?, 'demo-channel', '2026-10-01T00:00:00.000Z', ?, ?, ?)""",
+        (thread_id, f"Task {thread_id[-3:]}", sys.argv[2], state, reason, turn))
+db.commit()`, store, OWNER_ID, JSON.stringify(rows)]);
+  return store;
+}
+
+test("an overfull board stays one message: the lowest section loses lines first, shown as +N more", async () => {
   const workspace = threadWorkspace();
   await supervised(workspace);
-  const store = path.join(supervisorStateDir(workspace), "threads.sqlite3");
-  // Sixty open threads that never started.
+  const id = index => `1700000000000${900000 + index}`;
+  // Sixty threads waiting on the owner (their sessions stopped), ten working, three idle.
+  const store = insertRows(workspace, [
+    ...Array.from({ length: 60 }, (_, index) => [id(index), "stopped", "operator", "owner"]),
+    ...Array.from({ length: 10 }, (_, index) => [id(100 + index), "booting", null, "agent"]),
+    ...Array.from({ length: 3 }, (_, index) => [id(200 + index), "registered", null, null]),
+  ]);
+
+  await waitFor(() => boardText(workspace).includes("🔔 Waiting on you (60)"), () => `the full board: ${boardText(workspace)}`,
+    15000);
+  assert.equal(boardMessages(workspace).length, 1);
+  const lines = boardText(workspace).split("\n");
+  assert.ok(boardText(workspace).length <= 2000, boardText(workspace).length);
+  assert.equal(lines[0], "-# CCDM threads");
+  const shown = lines.filter(text => text.startsWith("<#")).length;
+  assert.ok(shown > 20 && shown < 60, `${shown} waiting lines`);
+  // Working, the lower section, is cut first: its header stays, every line goes.
+  assert.deepEqual(lines.slice(-4), [`+${60 - shown} more`, "⏳ Working (10)", "+10 more", "💤 3 idle"]);
+
+  // Most of them close: the same message shrinks, with nothing cut.
   execFileSync("python3", ["-c", `import sqlite3, sys
 db = sqlite3.connect(sys.argv[1], timeout=5)
-for index in range(60):
-    db.execute("""INSERT INTO threads (thread_id, project, name, creator_id, parent_channel_id, created_at, state)
-        VALUES (?, 'demo', ?, ?, 'demo-channel', '2026-10-01T00:00:00.000Z', 'registered')""",
-        (str(1700000000000900000 + index), f"Task {index}", sys.argv[2]))
-db.commit()`, store, OWNER_ID]);
-
-  await waitFor(() => boardMessages(workspace).length >= 2 && boardText(workspace).split("\n")
-    .filter(text => text.startsWith("💤 <#")).length === 60, () => `the split board: ${boardText(workspace)}`, 15000);
-  const messages = boardMessages(workspace);
-  messages.forEach((message, index) => {
-    assert.ok(current(message).startsWith(`-# CCDM threads · ${index + 1}/${messages.length}`), current(message));
-    assert.ok(current(message).length <= 2000);
-  });
-
-  execFileSync("python3", ["-c", `import sqlite3, sys
-db = sqlite3.connect(sys.argv[1], timeout=5)
-db.execute("UPDATE threads SET state='closed', close_reason='close-command' WHERE thread_id >= '1700000000000900005'")
+db.execute("UPDATE threads SET state='closed', close_reason='close-command' WHERE thread_id >= '1700000000000900002' AND thread_id < '1700000000000900100'")
 db.commit()`, store]);
-  await waitFor(() => boardMessages(workspace).length === 1, () => "the shrunk board", 15000);
-  assert.equal(boardText(workspace).split("\n").filter(text => text.startsWith("💤 <#")).length, 5);
+  await waitFor(() => boardText(workspace).includes("🔔 Waiting on you (2)"), () => `the shrunk board: ${boardText(workspace)}`,
+    15000);
+  assert.equal(boardPosts(workspace).length, 1);
+  assert.doesNotMatch(boardText(workspace), /more/);
+  assert.match(boardText(workspace), /⏳ Working \(10\)\n(<#\d+> · demo\n){10}💤 3 idle$/);
+});
+
+test("adopting an older multi-message board keeps its first message and deletes the rest", async () => {
+  const workspace = threadWorkspace();
+  const bot = { id: BOT_USER_ID, bot: true };
+  updateState(workspace.stateDir, state => {
+    state.fixtures.discord.history = { [STATUS_CHANNEL]: [
+      { id: "1700000000000770002", content: "-# CCDM threads · 2/2 · last change <t:1:R>\n💤 old", author: bot },
+      { id: "1700000000000770001", content: "-# CCDM threads · 1/2 · last change <t:1:R>\n⚠️ old", author: bot },
+    ] };
+  });
+  await supervised(workspace);
+
+  await waitFor(() => boardEdits(workspace).some(edit => edit.messageId === "1700000000000770001"
+    && edit.content === `-# CCDM threads\n${quiet(0)}`), () => "the adopted board's edit", 15000);
+  await waitFor(() => (discord(workspace).deletes ?? []).some(entry => entry.messageId === "1700000000000770002"),
+    () => "the extra message's delete", 15000);
+  assert.deepEqual(boardPosts(workspace), []);
+  assert.deepEqual((await supervisorStatus(workspace)).board.message_ids, ["1700000000000770001"]);
+});
+
+const hoursAgo = hours => new Date(Date.now() - hours * 3600 * 1000).toISOString();
+// Set one stored time on a thread row.
+function setStamp(store, threadId, column, value) {
+  execFileSync("python3", ["-c", `import sqlite3, sys
+db = sqlite3.connect(sys.argv[1], timeout=5)
+db.execute(f"UPDATE threads SET {sys.argv[3]}=? WHERE thread_id=?", (sys.argv[4], sys.argv[2]))
+db.commit()`, store, threadId, column, value]);
+}
+
+test("a crash counts as failed today while its thread was active in the last day, then as idle", async () => {
+  const workspace = threadWorkspace();
+  await supervised(workspace);
+  const [first, second, third] = ["1700000000000910001", "1700000000000910002", "1700000000000910003"];
+  const store = insertRows(workspace, [[first, "stopped", "crashed", null], [second, "stopped", "start-failed", null],
+    [third, "stopped", "crashed", null]]);
+  setStamp(store, first, "last_owner_activity_at", hoursAgo(1));
+  setStamp(store, second, "last_owner_activity_at", hoursAgo(30));
+  setStamp(store, second, "turn_end_seen", hoursAgo(2));
+  // The third has no activity at all: idle, though its board state is new.
+  await boardShows(workspace, quiet(1, 2));
+  // A day later, by every time it has, the first counts as idle too.
+  setStamp(store, first, "last_owner_activity_at", hoursAgo(25));
+  await boardShows(workspace, quiet(2, 1));
+});
+
+// A schema-v1 store, as the supervisor wrote it before turn status, with two
+// crashed threads: one the owner last used three days ago, one never used.
+function writeV1Store(workspace) {
+  const state = supervisorStateDir(workspace);
+  fs.mkdirSync(state, { recursive: true, mode: 0o700 });
+  const file = path.join(state, "threads.sqlite3");
+  execFileSync("python3", ["-c", `import os, sys
+sys.path.insert(0, sys.argv[1])
+import sqlite3
+from thread_supervisor import store
+os.close(os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+db = sqlite3.connect(sys.argv[2])
+db.execute("CREATE TABLE threads (" + store.TABLES["threads"].split("queued_start TEXT,")[0] + "queued_start TEXT)")
+for table in ("creation_requests", "boot_buffers"):
+    db.execute(f"CREATE TABLE {table} ({store.TABLES[table]})")
+for thread_id, activity in (("1700000000000920001", sys.argv[4]), ("1700000000000920002", None)):
+    db.execute("""INSERT INTO threads (thread_id, project, name, creator_id, parent_channel_id, created_at, state,
+        stop_reason, last_owner_activity_at, last_agent_reply_at)
+        VALUES (?, 'demo', 'Old task', ?, 'demo-channel', '2026-10-01T00:00:00.000Z', 'stopped', 'crashed', ?, ?)""",
+        (thread_id, sys.argv[3], activity, activity))
+db.execute("PRAGMA user_version=1")
+db.commit()`, path.join(process.cwd(), "scripts"), file, OWNER_ID, hoursAgo(72)]);
+  return file;
+}
+
+test("crashes migrated from a v1 store with old activity count as idle, not failed today", async () => {
+  const workspace = threadWorkspace();
+  writeV1Store(workspace);
+  await supervised(workspace);
+  await boardShows(workspace, quiet(2));
+  const threads = (await supervisorStatus(workspace)).projects.demo.threads;
+  // The migration's first tick dated both failures now; the board does not trust that.
+  for (const id of ["1700000000000920001", "1700000000000920002"]) {
+    assert.equal(threads[id].display_state, "failed");
+    assert.ok(Date.now() - Date.parse(threads[id].display_since) < 120000, threads[id].display_since);
+  }
+  assert.doesNotMatch(boardText(workspace), /failed today/);
 });
 
 // A Codex thread: the bridge's turn/completed hands the turn to the owner.
@@ -502,7 +607,7 @@ db.commit()`, path.join(supervisorStateDir(workspace), "threads.sqlite3"), OWNER
 
   const [ping] = await waitFor(() => livePings(workspace).length && livePings(workspace), () => "the owner ping", 15000);
   assert.equal(ping.content, "🔔 <@owner-id> ready for you");
-  await boardShows(workspace, `🔔 <#${THREAD_ID}> · demo · codex/`);
+  await boardShows(workspace, waiting());
   const row = await threadRow(workspace);
   assert.deepEqual([row.whose_turn, row.turn_outcome], ["owner", "completed"]);
 });

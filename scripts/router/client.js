@@ -20,7 +20,9 @@
 // After the Router goes away the client says hello again on its own and emits
 // `reconnect` with the scope. While disconnected every request fails at once
 // with `router_unavailable`; nothing is queued. A `revoked` event, a refused
-// hello on reconnect, or close() ends the client for good (`end`).
+// hello on reconnect (except `not_ready`, from a Router whose gateway is
+// still starting, which is retried with the backoff), or close() ends the
+// client for good (`end`).
 //
 // `beforeHello`, if given, is awaited each time the Router is reachable again
 // after a lost connection, before the hello goes out (root closes its
@@ -41,6 +43,8 @@ const { socketPath: defaultSocketPath } = require("./paths.js");
 
 const PROTOCOL_VERSION = 1;
 const DEFAULT_RECONNECT_BACKOFF = Object.freeze({ minMs: 500, maxMs: 30000 });
+// Hello refusals a reconnecting client retries rather than ending on.
+const RETRYABLE_HELLO_ERRORS = new Set(["not_ready"]);
 
 function routerError(code, message = code) {
   return Object.assign(new Error(message), { code });
@@ -144,7 +148,10 @@ class RouterClient extends EventEmitter {
           if (reconnected) this.emit("reconnect", frame.scope);
         } else if (frame.type === "hello_error") {
           const error = routerError(frame.error?.code, frame.error?.message);
-          if (this.connectedOnce) this.end(error);
+          // A Router still starting refuses with `not_ready`: the socket
+          // closes and the reconnect backoff says hello again. Any other
+          // refusal after the first connect ends the client.
+          if (this.connectedOnce && !RETRYABLE_HELLO_ERRORS.has(error.code)) this.end(error);
           settle(reject, error);
         } else if (frame.type === "response") this.settleRequest(frame);
         else if (frame.type === "event" && frame.event === "scope_changed") {

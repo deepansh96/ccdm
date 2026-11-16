@@ -113,6 +113,38 @@ test("thread_list returns eligible active threads and archived threads within ar
 
   const demoOnly = ok(await supervisor.request("thread_list", { channel_id: "demo-channel", archived_within_days: 60 }));
   assert.deepEqual(demoOnly.threads.map(thread => thread.id).sort(), ["demo-thread", "old-thread", "recent-thread"]);
+  assert.deepEqual(demoOnly.skipped_channels, []);
+});
+
+test("thread_list skips a registered channel Discord no longer has, logs it once, and lists the rest", async () => {
+  const { workspace, router, supervisor } = await supervisedRouter();
+  const ago = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  seedThreads(workspace, {
+    "recent-thread": { type: 11, parentId: "demo-channel", archived: true, archiveTimestamp: ago },
+    "beta-thread": { type: 11, parentId: "beta-channel", archived: true, archiveTimestamp: ago },
+  });
+  updateState(workspace.stateDir, state => { state.fixtures.discord.missingChannels = ["beta-channel"]; });
+
+  for (let run = 0; run < 2; run++) {
+    const listed = ok(await supervisor.request("thread_list", { archived_within_days: 7 }));
+    assert.deepEqual(listed.threads.map(thread => thread.id).sort(), ["demo-thread", "recent-thread"]);
+    assert.deepEqual(listed.skipped_channels, [{ project: "beta", channel_id: "beta-channel", status: 404 }]);
+  }
+  const logged = `${router.stdout}\n${router.stderr}`.split("\n").filter(line => line.includes("thread_list_skipped"));
+  assert.equal(logged.length, 1, logged.join("\n"));
+  assert.match(logged[0], /project=beta channel=beta-channel status=404/);
+});
+
+test("router status names a project whose registered channel no longer exists", async () => {
+  const { workspace } = await supervisedRouter();
+  updateState(workspace.stateDir, state => { state.fixtures.discord.missingChannels = ["beta-channel"]; });
+  const json = JSON.parse((await runRouterCli(workspace, ["status", "--json"])).stdout);
+  const byName = Object.fromEntries(json.projects.map(project => [project.project, project.channel_missing]));
+  assert.deepEqual([byName.beta, byName.demo], [true, false]);
+  const text = (await runRouterCli(workspace, ["status"])).stdout;
+  assert.ok(text.split("\n").includes("missing channels: beta (beta-channel)"), text);
+  assert.match(text, /^ {2}beta channel=beta-channel .* channel_missing$/m);
+  assert.doesNotMatch(text, /^ {2}demo .*channel_missing$/m);
 });
 
 test("thread_history returns thread messages with their author class", async () => {

@@ -37,6 +37,8 @@ const THREAD_SUPERVISOR_PLIST = path.join("Library", "LaunchAgents", "com.ccdm.t
 
 // Owner pings remembered, at most.
 const PING_MEMORY = 2000;
+// How long `router status` waits for the status op.
+const STATUS_TIMEOUT_MS = 30000;
 
 function log(line) {
   console.log(`[router] ${line}`);
@@ -68,6 +70,10 @@ async function serve() {
   const bot = { id: null };
   // The gateway client, for `status` to check root's channel permissions.
   const discord = { client: null };
+  // Settles once the gateway is ready. The socket listens before login, so a
+  // hello whose check needs Discord (a thread's) waits for this first.
+  let markGatewayReady;
+  const gatewayReady = new Promise(resolve => { markGatewayReady = resolve; });
   // The owner pings this Router posted: a fast path for telling a native reply
   // to a ping (the thread's) from one to another root message (root's). After
   // a restart the same answer comes from the replied-to message's own text
@@ -76,7 +82,7 @@ async function serve() {
   const server = createRouterServer({
     stateDir: stateDir(), socketPath: socketPath(), getTable: () => table, gateway, registry,
     context: {
-      stateDir: stateDir(), registryFile: registryPath(), token, attachments, bot, discord, log, pings,
+      stateDir: stateDir(), registryFile: registryPath(), token, attachments, bot, discord, log, pings, gatewayReady,
       // A failed reminder update is logged; the reply it heals still goes out.
       assignmentChanged: project => assignmentChanged(project, { registryFile: registryPath() })
         .then(() => log(`assignment_changed project=${project}`), error => log(`assignment_changed_failed ${error.message}`)),
@@ -236,11 +242,15 @@ async function serve() {
   await ready;
   bot.id = client.user.id;
   gateway.state = "ready";
+  markGatewayReady();
   log(`router ready: ${table.projects.size} router project(s), socket ${socketPath()}`);
 }
 
 async function status(json = false) {
-  const client = new RouterClient({ role: "status", timeoutMs: 5000 });
+  // Status reads root's permissions in every registered channel, which takes
+  // seconds with dozens of projects. Callers that run this as a subprocess
+  // allow 45 s.
+  const client = new RouterClient({ role: "status", timeoutMs: STATUS_TIMEOUT_MS });
   let result;
   try {
     await client.connect();
@@ -277,7 +287,13 @@ async function status(json = false) {
     const access = missing === null ? "unknown" : missing.length ? `missing ${missing.join(",")}` : "ok";
     const threads = result.threads_enabled ? ` thread_permissions=${permissionState(project.missing_thread_permissions,
       () => true)}` : "";
-    console.log(`  ${project.project} channel=${project.channel_id} webhook=${project.webhook ? "present" : "missing"} root_permissions=${access}${threads}`);
+    const gone = project.channel_missing ? " channel_missing" : "";
+    console.log(`  ${project.project} channel=${project.channel_id} webhook=${project.webhook ? "present" : "missing"} root_permissions=${access}${threads}${gone}`);
+  }
+  // Registered channels Discord no longer has: those projects cannot be served.
+  const missingChannels = result.projects.filter(project => project.channel_missing);
+  if (missingChannels.length) {
+    console.log(`missing channels: ${missingChannels.map(project => `${project.project} (${project.channel_id})`).join(", ")}`);
   }
   if (result.threads_enabled) {
     // Guild permissions read the same through every channel; any channel's answer is the guild's.
