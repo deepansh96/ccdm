@@ -19,7 +19,8 @@ const { createAttachmentCache } = require("./router/attachments.js");
 const { RouterClient } = require("./router/client.js");
 const { discordRequest } = require("./router/discord-rest.js");
 const { acquireRouterLock } = require("./router/lock.js");
-const { classifyMessage, classifyReaction, observedMessage, supervisedMessage, threadRoute } = require("./router/inbound.js");
+const { classifyMessage, classifyReaction, isOwnerPing, observedMessage, supervisedMessage, threadRoute } =
+  require("./router/inbound.js");
 const { preflight } = require("./router/preflight.js");
 const { probe } = require("./router/probe.js");
 const { registryPath, rootStateDir, rootToken, socketPath, stateDir } = require("./router/paths.js");
@@ -67,8 +68,10 @@ async function serve() {
   const bot = { id: null };
   // The gateway client, for `status` to check root's channel permissions.
   const discord = { client: null };
-  // The owner pings this Router posted, so a native reply to one reaches the
-  // thread rather than root. A Router restart forgets them.
+  // The owner pings this Router posted: a fast path for telling a native reply
+  // to a ping (the thread's) from one to another root message (root's). After
+  // a restart the same answer comes from the replied-to message's own text
+  // (`isOwnerPing`), so routing does not change.
   const pings = boundedSet(PING_MEMORY);
   const server = createRouterServer({
     stateDir: stateDir(), socketPath: socketPath(), getTable: () => table, gateway, registry,
@@ -109,8 +112,27 @@ async function serve() {
   // A thread message: owner and guest messages reach the live thread session,
   // or else the supervisor, or else get 💤. The supervisor also gets a copy of
   // every message, in the same turn as the session delivery.
+  // The id of the owner ping `message` natively replies to, or null.
+  async function repliedPing(message, thread) {
+    const reference = message.reference?.messageId ? String(message.reference.messageId) : null;
+    const botId = client.user?.id;
+    if (!reference || !botId || message.mentions?.repliedUser?.id !== botId) return null;
+    if (pings.has(reference)) return reference;
+    let replied = message.channel?.messages?.cache?.get(reference) ?? null;
+    if (!replied) {
+      try {
+        replied = await discordRequest("GET", `/channels/${thread.thread_id}/messages/${reference}`, { token });
+      } catch (error) {
+        log(`ping_lookup_failed thread=${thread.thread_id} message=${reference} ${error.message}`);
+        return null;  // Unknown: the reply stays root's, as for any root message.
+      }
+    }
+    return isOwnerPing(replied, botId, table.ownerId) ? reference : null;
+  }
+
   async function routeThreadMessage(message, thread) {
-    const options = { isPing: id => pings.has(id) };
+    const ping = await repliedPing(message, thread);
+    const options = { isPing: id => id === ping };
     const routed = classifyMessage(table, message, thread, options);
     if (routed) attachments.remember(routed.event);
     const delivered = Boolean(routed?.thread) && server.deliverThread(thread.thread_id, routed.event);

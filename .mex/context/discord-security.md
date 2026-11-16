@@ -42,7 +42,7 @@ The turn-status ops stay inside the same boundary:
 - **Deleting a notice:** `thread_notice_delete` deletes only root's own non-webhook message in that thread.
 - **Status board:** `status_board_list`, `status_board_post`, `status_board_edit` and `status_board_delete` act only in the registry's `thread_status_channel_id`, never a channel named in their arguments, and edit or delete only root's own messages there.
 
-The status channel cannot be a root or project channel: such a value turns the board off and is reported by `router status`, without invalidating the registry. Messages in the status channel route nowhere. A native reply to one of the Router's owner pings reaches the thread's session instead of root.
+The status channel must be a 17-20 digit channel id string, exactly, and cannot be a root or project channel: any other value turns the board off and is reported by `router status`, without invalidating the registry. Messages in the status channel route nowhere. A native reply to an owner ping reaches the thread's session instead of root. A ping is recognised by its exact text (root's own non-webhook message reading one of the three ping texts for the owner), so no other root message is mistaken for one and a Router restart does not change routing. The supervisor uses `mention_owner` and the board ops only when the Router's `hello_ok` advertises them, so an older Router never posts a literal `{owner}`.
 
 Root needs three permissions for threads, granted once by hand; no script PATCHes them:
 

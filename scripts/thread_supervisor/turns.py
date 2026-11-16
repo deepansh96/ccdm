@@ -43,11 +43,22 @@ INPUT_GRACE_SECONDS = 60
 # How long a ping the Router could not post yet is retried.
 PING_RETRY_SECONDS = 300
 RETRYABLE = ("router_unavailable", "rate_limited", "timeout", "discord_error")
+# Failures after which the ping may have been posted anyway: a retry looks for it first.
+AMBIGUOUS = ("router_unavailable", "timeout", "discord_error")
+# A ping post or delete never holds the worker long.
+PING_CALL_TIMEOUT_SECONDS = 5
+# How far back a retry looks for a ping that was posted after all.
+PING_HISTORY_LIMIT = 20
 # Thread commands are the supervisor's or the session's, never an input.
 COMMAND = re.compile(r"^/(?:close|config|model|restart|clear|compact|pause|unpause)(?:\s|$)")
+# The owner pings. The Router recognises a ping by the same three texts
+# (scripts/router/inbound.js OWNER_PING_TEXTS); change both together.
 PING = "🔔 {owner} ready for you"
 PING_NO_REPLY = "🔔 {owner} finished without a reply"
 PING_FAILED = "⚠️ {owner} the last turn failed"
+PING_TEXTS = (PING, PING_NO_REPLY, PING_FAILED)
+# The Router's hello_ok capability for `thread_notice` with `mention_owner`.
+PING_CAPABILITY = "owner_pings"
 
 
 def _log(message: str) -> None:
@@ -84,6 +95,21 @@ def pings_enabled(current: dict) -> bool:
     if override in ("0", "1"):
         return override == "1"
     return current.get("thread_owner_pings") is not False
+
+
+def ping_text(template: str, owner_id: str) -> str:
+    """A ping as Discord shows it: the Router puts the owner's mention in place of `{owner}`."""
+    return template.replace("{owner}", f"<@{owner_id}>")
+
+
+def is_ping(message: dict, bot_user_id: str | None, owner_id: str | None) -> bool:
+    """Whether a Discord message is an owner ping: root's own (no webhook)
+    message whose content is exactly one of the ping texts for the owner."""
+    if not isinstance(message, dict) or not bot_user_id or not owner_id or message.get("webhook_id"):
+        return False
+    if str((message.get("author") or {}).get("id") or "") != str(bot_user_id):
+        return False
+    return str(message.get("content") or "") in {ping_text(template, owner_id) for template in PING_TEXTS}
 
 
 def activity(context, row) -> dict | None:
@@ -127,11 +153,19 @@ def on_message(context, event: dict) -> None:
     if (event.get("to_root") or COMMAND.match(content) or _addresses_root(context, content)
             or not isinstance(event.get("message_id"), str)):
         return
-    note_input(context, thread_id, author)
+    note_input(context, thread_id, author, event.get("ts"))
 
 
-def note_input(context, thread_id: str, kind: str) -> None:
-    store.update(context.db, thread_id, whose_turn="agent", last_input_at=now(), last_input_class=kind,
+def note_input(context, thread_id: str, kind: str, at=None) -> None:
+    """The agent has the turn from ``at``: the input's own Discord time when
+    known, never the time the worker got to it, so a frame handled late (behind
+    a reconcile or a slow Router call) does not look newer than the turn end
+    that answered it. The recorded input time never moves back."""
+    stamp = at if _moment(at) else now()
+    row = store.thread(context.db, thread_id)
+    if row and _later(row["last_input_at"], stamp):
+        stamp = row["last_input_at"]
+    store.update(context.db, thread_id, whose_turn="agent", last_input_at=stamp, last_input_class=kind,
                  turn_outcome=None)
     context.pending_pings.pop(thread_id, None)
 
@@ -162,7 +196,8 @@ def delete_ping(context, row) -> None:
         return
     store.update(context.db, row["thread_id"], ping_message_id=None)
     try:
-        context.link.call("thread_notice_delete", {"channel_id": row["thread_id"], "message_id": message_id})
+        context.link.call("thread_notice_delete", {"channel_id": row["thread_id"], "message_id": message_id},
+                          timeout=PING_CALL_TIMEOUT_SECONDS)
     except LinkError as error:
         _log(f"thread {row['thread_id']}: deleting the owner ping failed: {error.code}")
 
@@ -173,10 +208,11 @@ def _ping(context, thread_id: str, text: str, deadline: float) -> None:
         return
     delete_ping(context, row)
     try:
-        result = context.link.call("thread_notice", {"channel_id": thread_id, "text": text, "mention_owner": True})
+        result = context.link.call("thread_notice", {"channel_id": thread_id, "text": text, "mention_owner": True},
+                                   timeout=PING_CALL_TIMEOUT_SECONDS)
     except LinkError as error:
         if error.code in RETRYABLE and time.monotonic() < deadline:
-            context.pending_pings[thread_id] = (text, deadline)
+            context.pending_pings[thread_id] = (text, deadline, error.code in AMBIGUOUS)
         elif error.code == "unknown_op":
             context.status_ops_missing = True
             _log("the Router has no owner ping op yet; pings are off until it reconnects")
@@ -188,8 +224,40 @@ def _ping(context, thread_id: str, text: str, deadline: float) -> None:
         store.update(context.db, thread_id, ping_message_id=str(message_id))
 
 
+def _posted_after_all(context, row, text: str) -> bool | None:
+    """After a failure that may have posted the ping anyway: adopt root's ping
+    with that text from the thread's recent history, posted after the turn
+    end it announces. True when adopted, False when there is none, and None
+    when the history could not be read (the retry waits)."""
+    try:
+        owner = registry.owner_id(registry.load(context.project_root))
+        result = context.link.call("thread_history", {"thread_id": row["thread_id"], "limit": PING_HISTORY_LIMIT},
+                                   timeout=PING_CALL_TIMEOUT_SECONDS) or {}
+    except (OSError, ValueError):
+        return None
+    except LinkError as error:
+        _log(f"thread {row['thread_id']}: looking for a posted ping failed: {error.code}")
+        return None
+    expected = ping_text(text, owner) if owner else None
+    for message in result.get("messages") or []:  # Newest first.
+        if (is_ping(message, context.bot_user_id, owner) and message.get("content") == expected
+                and isinstance(message.get("id"), str)
+                and not _later(row["turn_end_seen"], message.get("timestamp"))):
+            store.update(context.db, row["thread_id"], ping_message_id=message["id"])
+            _log(f"thread {row['thread_id']}: adopted the owner ping {message['id']} the Router posted after all")
+            return True
+    return False
+
+
+def pings_supported(context) -> bool:
+    """Whether the connected Router advertised `mention_owner`: an older one
+    would post `{owner}` literally."""
+    return PING_CAPABILITY in (context.router_capabilities or ())
+
+
 def _ping_eligible(context, row) -> bool:
-    if context.status_ops_missing or row["state"] != "live" or row["last_input_class"] == "guest":
+    if (context.status_ops_missing or not pings_supported(context) or row["state"] != "live"
+            or row["last_input_class"] == "guest"):
         return False
     try:
         if not pings_enabled(registry.load(context.project_root)):
@@ -232,11 +300,19 @@ def _observe_turn(context, row) -> None:
 
 
 def _retry_pings(context) -> None:
-    for thread_id, (text, deadline) in list(context.pending_pings.items()):
+    for thread_id, (text, deadline, ambiguous) in list(context.pending_pings.items()):
         context.pending_pings.pop(thread_id, None)
         row = store.thread(context.db, thread_id)
-        if row and row["whose_turn"] == "owner" and _ping_eligible(context, row) and time.monotonic() < deadline:
-            _ping(context, thread_id, text, deadline)
+        if not (row and row["whose_turn"] == "owner" and _ping_eligible(context, row) and time.monotonic() < deadline):
+            continue
+        if ambiguous:
+            found = _posted_after_all(context, row, text)
+            if found is None:
+                context.pending_pings[thread_id] = (text, deadline, True)
+                continue
+            if found:
+                continue
+        _ping(context, thread_id, text, deadline)
 
 
 def display(context, row) -> tuple[str, str] | None:

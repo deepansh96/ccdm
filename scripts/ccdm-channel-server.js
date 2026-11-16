@@ -88,6 +88,8 @@ const ROOT_INSTRUCTIONS = [
 const ROOT = process.env.CCDM_ROUTER_ROLE === "root";
 const THREAD_ID = ROOT ? "" : process.env.CCDM_THREAD_ID || "";
 const THREAD = Boolean(THREAD_ID);
+// A new launch starts unpaused, whatever the last one left in activity.json.
+if (THREAD) markPaused(process.env.CCDM_THREAD_ACTIVITY_FILE, false);
 // Mirrors COMMANDS and THREAD_COMMANDS in scripts/router/inbound.js.
 const RELAYED_COMMANDS = THREAD ? "/pause, /unpause and /compact" : "/pause, /unpause, /compact, /clear and /restart";
 const RELAY_INSTRUCTIONS = `Discord relays only ${RELAYED_COMMANDS} as commands; any other slash command the owner sends arrives as a plain message and does not run. When the owner sends one, or asks you to run one (such as a skill only they may invoke), type it into your own tmux pane: tmux send-keys -t "$TMUX_PANE" -l '/<command>' && tmux send-keys -t "$TMUX_PANE" Enter. It runs when your current turn ends.`;

@@ -47,8 +47,24 @@ function addressesRoot(message) {
   return Boolean(message.reference?.messageId) && message.mentions?.repliedUser?.id === botId;
 }
 
+// The supervisor's owner pings as it sends them
+// (scripts/thread_supervisor/turns.py PING_TEXTS); change both together.
+const OWNER_PING_TEXTS = Object.freeze([
+  "🔔 {owner} ready for you", "🔔 {owner} finished without a reply", "⚠️ {owner} the last turn failed",
+]);
+
+// Whether a message (a discord.js Message or a raw API message) is an owner
+// ping: the root bot's own message, not a webhook's, whose content is exactly
+// one of the ping texts for the owner. No other root message matches.
+function isOwnerPing(message, botId, ownerId) {
+  if (!message || !botId || !ownerId || message.webhook_id || message.webhookId) return false;
+  if (String(message.author?.id ?? "") !== String(botId)) return false;
+  const content = String(message.content ?? "");
+  return OWNER_PING_TEXTS.some(text => text.replace("{owner}", `<@${ownerId}>`) === content);
+}
+
 // A native reply to one of the supervisor's owner pings answers the thread,
-// not root: `isPing` names the pings this Router posted.
+// not root: `isPing` says whether the replied-to message is a ping.
 function repliesToPing(message, options) {
   const botId = message.client?.user?.id;
   if (!botId || !options.isPing || new RegExp(`<@!?${botId}>`).test(String(message.content || ""))) return false;
@@ -252,4 +268,5 @@ async function classifyReaction(table, reaction, user, botId = null, thread = nu
   };
 }
 
-module.exports = { classifyMessage, classifyReaction, observedMessage, supervisedMessage, threadRoute };
+module.exports = { OWNER_PING_TEXTS, classifyMessage, classifyReaction, isOwnerPing, observedMessage, supervisedMessage,
+  threadRoute };

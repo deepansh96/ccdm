@@ -114,6 +114,15 @@ let pendingBootstrapInstructionReason = null;
 let pendingCompactionChannelId = null;
 let messageQueue = [];
 let bridgePaused = false;
+// Every pause and resume, whatever its cause, also goes to a thread's activity
+// file, so the Thread Supervisor never stops a paused session (its queued
+// messages would be lost) and the board shows it paused.
+function setBridgePaused(paused) {
+  bridgePaused = paused;
+  markPaused(THREAD_ACTIVITY_FILE, paused);
+}
+// A new launch starts unpaused, whatever the last one left in activity.json.
+markPaused(THREAD_ACTIVITY_FILE, false);
 const discordTransport = createRouterTransport({
   project: ROUTER_PROJECT, role: ROUTER_ROOT ? "root" : THREAD_MODE ? "thread" : "project", keyFile: ROUTER_KEY_FILE,
   launchDir: ROUTER_LAUNCH_DIR, registryPath: REGISTRY_PATH, primaryChannelId: CHANNEL_ID,
@@ -888,7 +897,7 @@ async function onTurnCompleted(turn = {}) {
   if (outputSuppressed && bootstrapCompletion) {
     const complete = bootstrapCompletion;
     bootstrapCompletion = null;
-    if (terminalError) bridgePaused = true;
+    if (terminalError) setBridgePaused(true);
     complete(terminalError);
   }
   if (terminalError?.recover) {
@@ -1109,7 +1118,7 @@ async function sendBootstrapInstructionTurn(reason, { required = false } = {}) {
     clearTimeout(timer);
     if (outcome === "timeout") {
       // Stop accepting/processing work before cancellation, even if acknowledgment is late.
-      bridgePaused = true;
+      setBridgePaused(true);
       await sendRequest("turn/interrupt", { threadId, turnId: activeTurnId });
       throw new Error("Bootstrap timed out; active turn interrupted. Restart the session.");
     }
@@ -1680,8 +1689,7 @@ function startDiscordBot() {
 
     if (bridgeSlashCommand && text === "/pause") {
       console.log("[discord] /pause requested");
-      bridgePaused = true;
-      markPaused(THREAD_ACTIVITY_FILE, true);
+      setBridgePaused(true);
       await discordTransport.react(msg, "⏸️");
       await sendToDiscord("Bridge paused. New messages will be queued.", channelId);
       return;
@@ -1689,8 +1697,7 @@ function startDiscordBot() {
 
     if (bridgeSlashCommand && text === "/unpause") {
       console.log("[discord] /unpause requested");
-      bridgePaused = false;
-      markPaused(THREAD_ACTIVITY_FILE, false);
+      setBridgePaused(false);
       processQueue();
       await discordTransport.react(msg, "▶️");
       await sendToDiscord("Bridge unpaused.", channelId);

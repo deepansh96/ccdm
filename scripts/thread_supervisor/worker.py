@@ -34,6 +34,8 @@ class Context:
     db: sqlite3.Connection
     link: Link
     bot_user_id: str | None = None
+    # The connected Router's hello_ok capabilities (owner pings, the status board).
+    router_capabilities: frozenset = frozenset()
     # Launches in progress, by thread id (boot.Boot).
     boots: dict = field(default_factory=dict)
     # Turn status (turns.py): each live session's activity file as last read
@@ -46,9 +48,13 @@ class Context:
     labels: dict = field(default_factory=dict)
     status_tick_at: float = 0.0
     # The status board (board.py): when it last flushed, whether its earlier
-    # messages were looked for, and whether the Router lacks the new ops.
+    # messages were looked for (and must be again, after a post that may have
+    # landed), and whether the Router lacks the new ops.
     board_flush_at: float = 0.0
     board_adopted: bool = False
+    board_readopt: bool = False
+    # Messages of a board being posted again, still to delete, one per flush.
+    board_orphans: list = field(default_factory=list)
     status_ops_missing: bool = False
     # The registry as last read, for deregistrations and channel moves (projects.Watch).
     watch: object = None
@@ -67,7 +73,11 @@ def write_health(state_dir: Path, link: Link, router: str) -> None:
 
 
 def _status(context: Context) -> None:
-    """Turn status, then the status board, each on its own interval; a failure never stops the worker."""
+    """Turn status, then the status board, each on its own interval; a failure
+    never stops the worker. It waits while frames are queued, so a session
+    going live (and its bootstrap) never waits behind it."""
+    if context.link.has_frames():
+        return
     try:
         turns.tick(context)
         board.flush(context)
@@ -114,6 +124,8 @@ def run(project_root: Path, state_dir: Path, disabled=None) -> None:
                 kind = frame.get("type")
                 if kind == "connected":
                     context.bot_user_id = frame.get("bot_user_id")
+                    context.router_capabilities = frozenset(
+                        item for item in frame.get("capabilities") or [] if isinstance(item, str))
                     connected = True
                     # A Router that reconnects may now have the turn-status ops.
                     context.status_ops_missing = False

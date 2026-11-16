@@ -32,6 +32,8 @@ from .paths import router_state_dir
 # the event reaches the supervisor.
 ARCHIVE_LOOKBACK_MS = 30000
 STOP_GRACE_SECONDS = 3
+# The audit-log read only names an actor in the log: it never holds the worker long.
+LOG_READ_TIMEOUT_SECONDS = 5
 KEY_ENV = re.compile(r"""CCDM_ROUTER_KEY_FILE=(?:"([^"]+)"|'([^']+)'|([^\s]+))""")
 
 
@@ -123,8 +125,12 @@ def on_thread_update(context, event: dict) -> None:
     row = store.thread(context.db, thread_id)
     if not row or row["project"] != event.get("project"):
         return
-    if row["state"] == "closed" or row["pending_close"]:
+    if row["state"] == "closed":
         return  # The archive `/close` (or `threads.sh close`) made.
+    if row["pending_close"]:
+        # A close interrupted after it recorded itself (`/close` runs to the
+        # end within one event, so only a crash leaves this): finish it.
+        return finish_close(context, row)
     since_ms = event.get("since_ms")
     reopen(context, row, since_ms if isinstance(since_ms, int) else int(time.time() * 1000) - ARCHIVE_LOOKBACK_MS)
 
@@ -143,27 +149,46 @@ def reopen(context, row, since_ms: int) -> None:
 
 def stop_if_idle(context, row) -> None:
     """Stop a live session that is not mid-turn as `stopped/auto-archive`; the
-    next owner or guest message resumes it. A booting session, or one mid-turn,
-    keeps running."""
+    next owner or guest message resumes it. A booting session, one mid-turn,
+    or a paused one (whose held messages would be lost) keeps running."""
     from . import capacity  # capacity imports this module.
 
-    if not row or row["state"] != "live" or row["thread_id"] in context.boots or capacity.turn_running(row):
+    if (not row or row["state"] != "live" or row["thread_id"] in context.boots or capacity.turn_running(row)
+            or capacity.paused(row)):
         return
     stop_session(context, row)
     store.finish_boot(context.db, row["thread_id"], "stopped", "auto-archive")
+
+
+def finish_close(context, row) -> None:
+    """The end of `/close` and `threads.sh close` once the thread is archived:
+    the session stops, the row closes as `close-command`, and the reminder
+    service hears `conversation_closed`. Reconcile and the archive handler
+    also use it to finish a close a crash interrupted after `pending_close`."""
+    from . import turns  # turns imports this module.
+
+    thread_id = row["thread_id"]
+    turns.delete_ping(context, row)
+    stop_session(context, store.thread(context.db, thread_id) or row)
+    store.update(context.db, thread_id, state="closed", stop_reason=None, close_reason="close-command",
+                 pending_close=None)
+    reminders.emit(context, "conversation_closed", row)
 
 
 def _archive_actor(context, thread_id: str, since_ms: int) -> str:
     """Who archived the thread, for the log only: one audit-log read, which
     needs the optional View Audit Log."""
     try:
-        result = context.link.call("thread_archive_actor", {"thread_id": thread_id, "since": since_ms}) or {}
+        result = context.link.call("thread_archive_actor", {"thread_id": thread_id, "since": since_ms},
+                                   timeout=LOG_READ_TIMEOUT_SECONDS) or {}
     except LinkError as error:
         return f"an unknown actor ({error.code})"
     if result.get("forbidden"):
         return "an unknown actor (no View Audit Log)"
     for entry in result.get("entries") or []:
-        changes = entry.get("changes") or [] if isinstance(entry, dict) else []
+        if not isinstance(entry, dict):
+            continue
+        changes = entry.get("changes") or []
         if any(isinstance(change, dict) and change.get("key") == "archived" and change.get("new_value") is True
                for change in changes):
             actor = str(entry.get("user_id") or "")

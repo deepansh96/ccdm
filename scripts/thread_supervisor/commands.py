@@ -16,9 +16,10 @@ still runs waits for it to exit, so a stop never races a launch.
 from __future__ import annotations
 
 import json
+import os
 import sys
 
-from . import boot, config, lifecycle, model_info, reminders, store, turns
+from . import boot, config, lifecycle, model_info, store, turns
 from .clock import now
 from .link import LinkError
 
@@ -94,7 +95,7 @@ def _close(context, row, owner: bool, event: dict) -> None:
         context.link.call("thread_update", {"thread_id": thread_id, "archived": True})
     except LinkError as error:
         _log(f"thread {thread_id}: archiving for /close failed: {error.code}")
-    lifecycle.stop_session(context, store.thread(context.db, thread_id))
-    store.update(context.db, thread_id, state="closed", stop_reason=None, close_reason="close-command",
-                 pending_close=None)
-    reminders.emit(context, "conversation_closed", row)
+    if os.environ.get("CCDM_THREAD_FAIL_AFTER_PENDING_CLOSE") == "1":
+        # Tests only: the worker dies between recording the close and finishing it.
+        os._exit(70)
+    lifecycle.finish_close(context, store.thread(context.db, thread_id) or row)

@@ -35,6 +35,8 @@ class Link:
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
         self.frames: queue.Queue = queue.Queue()
         self.responses: dict[str, dict] = {}
+        # Calls the worker stopped waiting for: their late answers are dropped.
+        self.abandoned: set[str] = set()
         self.answered = threading.Condition()
         self.ids = itertools.count(1)
         threading.Thread(target=self._read, daemon=True).start()
@@ -53,8 +55,12 @@ class Link:
                 continue
             if frame.get("type") == "response":
                 with self.answered:
-                    self.responses[str(frame.get("id"))] = frame
-                    self.answered.notify_all()
+                    request_id = str(frame.get("id"))
+                    if request_id in self.abandoned:
+                        self.abandoned.discard(request_id)
+                    else:
+                        self.responses[request_id] = frame
+                        self.answered.notify_all()
             else:
                 self.frames.put(frame)
         self.frames.put({"type": "link_exit"})
@@ -72,8 +78,14 @@ class Link:
         except queue.Empty:
             return None
 
-    def call(self, op: str, args: dict) -> object:
-        """One Router op through the link; raises LinkError with the Router's code."""
+    def has_frames(self) -> bool:
+        """Whether frames wait: background work (the status board) yields to them."""
+        return not self.frames.empty()
+
+    def call(self, op: str, args: dict, timeout: float | None = None) -> object:
+        """One Router op through the link; raises LinkError with the Router's code.
+        ``timeout`` shortens the wait for calls that must not hold the worker;
+        the Router may still finish such a call after the worker gave up."""
         request_id = str(next(self.ids))
         try:
             self.process.stdin.write(json.dumps({"type": "request", "id": request_id, "op": op, "args": args}) + "\n")
@@ -83,8 +95,10 @@ class Link:
         with self.answered:
             answered = self.answered.wait_for(
                 lambda: request_id in self.responses or self.process.poll() is not None,
-                OP_TIMEOUT_SECONDS.get(op, CALL_TIMEOUT_SECONDS))
+                timeout if timeout is not None else OP_TIMEOUT_SECONDS.get(op, CALL_TIMEOUT_SECONDS))
             frame = self.responses.pop(request_id, None)
+            if frame is None:
+                self.abandoned.add(request_id)
         if frame is None:
             raise LinkError("timeout" if not answered else "router_unavailable", f"{op} got no answer")
         if not frame.get("ok"):

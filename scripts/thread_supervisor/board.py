@@ -4,14 +4,17 @@ It lists every open Thread Conversation, grouped by board state in attention
 order (🔔 waiting on you, ⚠️ failed, ⏳ working, 💤 idle), each with a jump
 link, its project, provider/model, its state, and a self-updating relative
 time since that state began. The text changes only when a state does, and a
-flush, at most once per interval, edits only the messages whose text changed.
+flush, at most once per interval, edits only the messages whose text changed,
+one Router call at a time (5 s timeout), never while a frame waits.
 Past `MAX_SLOTS` messages the idle threads collapse to a count.
 
 The board's messages are kept in the store's `status_board` table. With none
 stored (a new store, or a new channel), root's own messages that start with
-the board header are adopted, so a restart never posts a second board. A
-message deleted in Discord makes the whole board post again, in order. With
-`thread_status_channel_id` unset or invalid the board is off: nothing is
+the board header are adopted, so a restart never posts a second board; a post
+that timed out is looked for the same way before the next post. A message
+deleted in Discord makes the whole board post again, in order. With
+`thread_status_channel_id` unset or invalid, or a Router that does not
+advertise the `status_board` capability, the board is off: nothing is
 posted, and no error is raised.
 """
 
@@ -20,6 +23,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import os
+import re
 import sys
 import time
 
@@ -33,6 +37,13 @@ MAX_SLOTS = 5
 DEFAULT_INTERVAL_SECONDS = 10
 ORDER = ("waiting", "failed", "working", "idle")
 ICONS = {"waiting": "🔔", "failed": "⚠️", "working": "⏳", "idle": "💤"}
+SNOWFLAKE = re.compile(r"\d{17,20}")
+# A board call never holds the worker long.
+CALL_TIMEOUT_SECONDS = 5
+# Failures after which a post may have landed anyway.
+AMBIGUOUS = ("timeout", "discord_error", "router_unavailable")
+# The Router's hello_ok capability for the status_board ops.
+CAPABILITY = "status_board"
 
 
 def _log(message: str) -> None:
@@ -52,10 +63,11 @@ def channel_setting(current: dict) -> tuple[str | None, str | None]:
     value = current.get("thread_status_channel_id")
     if value is None:
         return None, None
-    # The Router's isId: a non-empty string or a positive integer.
-    if not ((isinstance(value, str) and value.strip()) or (type(value) is int and value > 0)):
-        return None, "thread_status_channel_id must be a Discord ID"
-    channel = str(value).strip()
+    # The same rule as the Router's (scripts/router/registry.js STATUS_CHANNEL_ID): a
+    # snowflake string, nothing stripped, so the two always agree.
+    if not (isinstance(value, str) and SNOWFLAKE.fullmatch(value)):
+        return None, "thread_status_channel_id must be a Discord channel ID (17-20 digits)"
+    channel = value
     if channel in {str(item) for item in current.get("root_channels") or [] if isinstance(item, (str, int))}:
         return None, "thread_status_channel_id is a root channel"
     projects = current.get("projects")
@@ -132,23 +144,40 @@ def _numeric(message_id: str) -> tuple[int, str]:
     return (len(message_id), message_id)
 
 
-def _adopt(context, channel: str) -> None:
-    """With no stored board, take over root's earlier board messages in the channel, oldest first."""
-    result = context.link.call("status_board_list", {}) or {}
+def _adopt(context, channel: str, slots) -> None:
+    """Take over root's board messages in the channel that the store does not
+    hold: all of them, oldest first, when it holds none; otherwise those newer
+    than its last one (a post that landed after the worker stopped waiting)."""
+    result = context.link.call("status_board_list", {}, timeout=CALL_TIMEOUT_SECONDS) or {}
     found = sorted((message["id"] for message in result.get("messages") or []
                     if isinstance(message, dict) and isinstance(message.get("id"), str)
                     and str(message.get("content") or "").startswith(HEADER)), key=_numeric)
-    for slot, message_id in enumerate(found, 1):
+    known = [slot["message_id"] for slot in slots]
+    newest = max((_numeric(message_id) for message_id in known), default=None)
+    fresh = [message_id for message_id in found
+             if message_id not in known and (newest is None or _numeric(message_id) > newest)]
+    for slot, message_id in enumerate(fresh, len(slots) + 1):
         store.set_board_slot(context.db, slot, channel, message_id, "")
 
 
 def _reset(context) -> None:
     store.drop_board_slots(context.db)
     context.board_adopted = False
+    context.board_readopt = False
+
+
+def supported(context) -> bool:
+    """Whether the connected Router serves the board ops (its hello_ok capability)."""
+    return not context.status_ops_missing and CAPABILITY in (context.router_capabilities or ())
 
 
 def flush(context, force: bool = False) -> None:
-    """Bring the status channel's board up to date, at most once per interval."""
+    """Bring the status channel's board one call closer to the current text.
+
+    Each flush makes at most one Router call, with a short timeout, and asks
+    for the next flush at once while work remains; the worker runs a flush
+    only when no frame waits, so the board never delays a session going live
+    or its bootstrap."""
     if not force and time.monotonic() - context.board_flush_at < interval_seconds():
         return
     context.board_flush_at = time.monotonic()
@@ -158,7 +187,7 @@ def flush(context, force: bool = False) -> None:
         return
     channel, _error = channel_setting(current)
     slots = store.board_slots(context.db)
-    if channel is None or context.status_ops_missing:
+    if channel is None or not supported(context):
         if slots and channel is None:
             _reset(context)
         return
@@ -166,35 +195,8 @@ def flush(context, force: bool = False) -> None:
         _reset(context)  # A new channel: the old board's messages stay where they were.
         slots = []
     try:
-        if not slots and not context.board_adopted:
-            context.board_adopted = True
-            _adopt(context, channel)
-            slots = store.board_slots(context.db)
-        texts = render(context, current)
-        for index, text in enumerate(texts, 1):
-            sha = _sha(text)
-            if index <= len(slots):
-                if slots[index - 1]["content_sha256"] == sha:
-                    continue
-                try:
-                    context.link.call("status_board_edit", {"message_id": slots[index - 1]["message_id"], "text": text})
-                except LinkError as error:
-                    if error.code not in ("not_found", "scope_violation"):
-                        raise
-                    # Someone deleted (or replaced) a board message: post the whole board again, in order.
-                    for slot in slots:
-                        _delete(context, slot["message_id"])
-                    _reset(context)
-                    context.board_adopted = True
-                    context.board_flush_at = 0.0
-                    return
-                store.set_board_slot(context.db, index, channel, slots[index - 1]["message_id"], sha)
-            else:
-                result = context.link.call("status_board_post", {"text": text}) or {}
-                store.set_board_slot(context.db, index, channel, str(result["message_id"]), sha)
-        for slot in slots[len(texts):]:
-            _delete(context, slot["message_id"])
-        store.drop_board_slots(context.db, len(texts) + 1)
+        if _step(context, channel, current, slots):
+            context.board_flush_at = 0.0  # More may remain: the next loop goes on.
     except LinkError as error:
         if error.code == "unknown_op":
             context.status_ops_missing = True
@@ -205,9 +207,54 @@ def flush(context, force: bool = False) -> None:
             _log(f"the status board update failed: {error.code}")
 
 
+def _step(context, channel: str, current: dict, slots) -> bool:
+    """One board call toward the current text; False when the board is up to date."""
+    if context.board_orphans:
+        _delete(context, context.board_orphans.pop(0))
+        return True
+    if (not slots and not context.board_adopted) or context.board_readopt:
+        context.board_adopted, context.board_readopt = True, False
+        _adopt(context, channel, slots)
+        return True
+    texts = render(context, current)
+    for index, text in enumerate(texts, 1):
+        sha = _sha(text)
+        if index <= len(slots):
+            slot = slots[index - 1]
+            if slot["content_sha256"] == sha:
+                continue
+            try:
+                context.link.call("status_board_edit", {"message_id": slot["message_id"], "text": text},
+                                  timeout=CALL_TIMEOUT_SECONDS)
+            except LinkError as error:
+                if error.code not in ("not_found", "scope_violation"):
+                    raise
+                # Someone deleted (or replaced) a board message: delete the
+                # rest, then post the whole board again, in order.
+                context.board_orphans = [other["message_id"] for other in slots if other is not slot]
+                _reset(context)
+                context.board_adopted = True
+                return True
+            store.set_board_slot(context.db, index, channel, slot["message_id"], sha)
+            return True
+        try:
+            result = context.link.call("status_board_post", {"text": text}, timeout=CALL_TIMEOUT_SECONDS) or {}
+        except LinkError as error:
+            if error.code in AMBIGUOUS:
+                context.board_readopt = True  # It may have landed: look before posting again.
+            raise
+        store.set_board_slot(context.db, index, channel, str(result["message_id"]), sha)
+        return True
+    if len(slots) > len(texts):
+        _delete(context, slots[-1]["message_id"])
+        store.drop_board_slots(context.db, len(slots))
+        return True
+    return False
+
+
 def _delete(context, message_id: str) -> None:
     try:
-        context.link.call("status_board_delete", {"message_id": message_id})
+        context.link.call("status_board_delete", {"message_id": message_id}, timeout=CALL_TIMEOUT_SECONDS)
     except LinkError as error:
         _log(f"deleting status board message {message_id} failed: {error.code}")
 

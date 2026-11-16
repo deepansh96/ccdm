@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -20,7 +20,7 @@ test.afterEach(cleanup);
 // the thread and the status board in the status channel come out.
 const THREAD_ID = "1700000000000556677";
 const THREAD_TMUX = `demo_claude-t-${THREAD_ID}`;
-const STATUS_CHANNEL = "status-channel";
+const STATUS_CHANNEL = "1700000000000777001";
 const ROOT_AUTH = `Bot ${ROOT_TOKEN}`;
 const BOT_USER_ID = "fixture-bot-user-id";
 const THREAD = { id: THREAD_ID, type: 11, parentId: "demo-channel", name: "Fix flaky test", ownerId: OWNER_ID,
@@ -86,7 +86,9 @@ const agentReplies = workspace => sent(workspace, THREAD_ID).filter(message => m
 const numeric = id => [id.length, id];
 const boardMessages = workspace => sent(workspace, STATUS_CHANNEL)
   .sort((a, b) => (numeric(a.id) < numeric(b.id) ? -1 : 1));
-const boardText = workspace => boardMessages(workspace).map(message => message.content).join("\n");
+// What a message reads as now: the fake keeps an edit apart from the content it was posted with.
+const current = message => message.editedContent ?? message.content;
+const boardText = workspace => boardMessages(workspace).map(current).join("\n");
 const boardPosts = workspace => (discord(workspace).messages ?? []).filter(message => message.channelId === STATUS_CHANNEL);
 const boardEdits = workspace => (discord(workspace).edits ?? []).filter(edit => edit.channelId === STATUS_CHANNEL);
 const idle = workspace => waitForThreadIdle(workspace, "demo", THREAD_ID);
@@ -292,6 +294,61 @@ test("the owner's /close in the thread deletes the ping before archiving, and th
   assert.equal(discord(workspace).threads[THREAD_ID].archived, true);
 });
 
+// Whether any file under the reminder service's state (its outbox, or the
+// store an ingested event went to) holds a `conversation_closed` for the thread.
+function reminderClosed(workspace) {
+  const files = dir => (fs.existsSync(dir) ? fs.readdirSync(dir, { withFileTypes: true }) : []).flatMap(entry =>
+    entry.isDirectory() ? files(path.join(dir, entry.name)) : [path.join(dir, entry.name)]);
+  return files(path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders")).some(file => {
+    const text = fs.readFileSync(file).toString("latin1");
+    return text.includes("conversation_closed") && text.includes(THREAD_ID);
+  });
+}
+
+test("a /close a crash interrupted after recording itself is finished on restart: closed, reminders told, off the board", async () => {
+  const workspace = threadWorkspace();
+  const first = await supervised(workspace, { CCDM_THREAD_FAIL_AFTER_PENDING_CLOSE: "1" });
+  await answeredThread(workspace);
+  await boardShows(workspace, line("🔔", "waiting on you"));
+
+  // The worker dies after `pending_close` and the archive, before the row closes.
+  threadMessage(workspace, "close-message-1", "/close");
+  assert.equal((await first.result).exitCode, 70);
+  const halfway = await threadRow(workspace);
+  assert.notEqual(halfway.state, "closed");
+  assert.equal(reminderClosed(workspace), false);
+
+  await startThreadSupervisor(workspace, { env: FAST });
+  const row = await threadRow(workspace, current => current.state === "closed");
+  assert.deepEqual([row.close_reason, row.stop_reason], ["close-command", null]);
+  assert.equal(discord(workspace).threads[THREAD_ID].archived, true);
+  await waitFor(() => reminderClosed(workspace), () => "the conversation_closed event");
+  await boardShows(workspace, "No open threads.");
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions[THREAD_TMUX], undefined);
+});
+
+test("a thread message the supervisor handles late counts from its own time, so the answered turn still pings", async () => {
+  const workspace = threadWorkspace();
+  await supervised(workspace);
+  await answeredThread(workspace);
+  const [first] = await waitFor(() => livePings(workspace).length && livePings(workspace), () => "the first ping", 15000);
+
+  // The first ping's delete answers slowly, so the worker handles the owner's
+  // next message only after the session (which the Router feeds directly)
+  // answered it and its turn ended.
+  updateState(workspace.stateDir, state => { state.fixtures.discord.restDeleteDelayMs = 3000; });
+  const sentAt = Date.now();
+  threadMessage(workspace, "next-message-1", "now add a test");
+  await waitFor(() => agentReplies(workspace).length === 2, () => "the second reply", 15000);
+  assert.ok(Date.now() - sentAt < 3000, "the turn ended while the worker was still busy");
+
+  const [second] = await waitFor(() => livePings(workspace).length === 1 && livePings(workspace)[0].id !== first.id
+    && livePings(workspace), () => "the second ping", 20000);
+  assert.equal(second.content, "🔔 <@owner-id> ready for you");
+  const row = await threadRow(workspace, current => current.ping_message_id === second.id);
+  assert.deepEqual([row.whose_turn, row.turn_outcome], ["owner", "completed"]);
+});
+
 test("a supervisor restart reuses the board; a lost store adopts it; a board message deleted in Discord is posted again", async () => {
   const workspace = threadWorkspace();
   const first = await supervised(workspace);
@@ -312,7 +369,7 @@ test("a supervisor restart reuses the board; a lost store adopts it; a board mes
   await second.stop();
   const [board] = boardMessages(workspace);
   updateState(workspace.stateDir, state => {
-    state.fixtures.discord.history = { [STATUS_CHANNEL]: [{ id: board.id, content: board.content,
+    state.fixtures.discord.history = { [STATUS_CHANNEL]: [{ id: board.id, content: current(board),
       author: { id: BOT_USER_ID, bot: true } }] };
   });
   for (const name of fs.readdirSync(supervisorStateDir(workspace))) {
@@ -357,14 +414,26 @@ test("with no status channel there is no board and no error; setting the key sta
 });
 
 test("an invalid status channel turns only the board off", async () => {
-  const workspace = threadWorkspace({ thread_status_channel_id: "demo-channel" });
+  const rootChannel = "1700000000000777002";
+  const workspace = threadWorkspace({ thread_status_channel_id: rootChannel, root_channels: ["root-channel", rootChannel] });
   await supervised(workspace);
   await answeredThread(workspace);
   await waitFor(() => livePings(workspace).length === 1, () => "the ping still goes out", 15000);
   await pause(1000);
-  assert.deepEqual(sent(workspace, "demo-channel"), []);
+  assert.deepEqual(sent(workspace, rootChannel), []);
   assert.deepEqual((await supervisorStatus(workspace)).board,
-    { state: "invalid", error: "thread_status_channel_id is project demo's channel" });
+    { state: "invalid", error: "thread_status_channel_id is a root channel" });
+
+  // A path-like value is no channel id either, and nothing is posted anywhere for it.
+  const registryFile = path.join(workspace.repoDir, "registry.json");
+  const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+  registry.thread_status_channel_id = "../status/1700000000000777001";
+  fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
+  assert.deepEqual((await supervisorStatus(workspace)).board,
+    { state: "invalid", error: "thread_status_channel_id must be a Discord channel ID (17-20 digits)" });
+  await pause(1000);
+  const channels = new Set((discord(workspace).messages ?? []).map(message => message.channelId));
+  assert.deepEqual([...channels].filter(channel => channel !== THREAD_ID), []);
 });
 
 test("thread_owner_pings: false turns pings off, and the board still shows the thread waiting", async () => {
@@ -394,8 +463,8 @@ db.commit()`, store, OWNER_ID]);
     .filter(text => text.startsWith("💤 <#")).length === 60, () => `the split board: ${boardText(workspace)}`, 15000);
   const messages = boardMessages(workspace);
   messages.forEach((message, index) => {
-    assert.ok(message.content.startsWith(`-# CCDM threads · ${index + 1}/${messages.length}`), message.content);
-    assert.ok(message.content.length <= 2000);
+    assert.ok(current(message).startsWith(`-# CCDM threads · ${index + 1}/${messages.length}`), current(message));
+    assert.ok(current(message).length <= 2000);
   });
 
   execFileSync("python3", ["-c", `import sqlite3, sys
@@ -436,4 +505,33 @@ db.commit()`, path.join(supervisorStateDir(workspace), "threads.sqlite3"), OWNER
   await boardShows(workspace, `🔔 <#${THREAD_ID}> · demo · codex/`);
   const row = await threadRow(workspace);
   assert.deepEqual([row.whose_turn, row.turn_outcome], ["owner", "completed"]);
+});
+
+// The activity writer on its own: the hook ignores a `/` command typed into the
+// pane (no Stop may follow it), and concurrent writers never lose each other's fields.
+test("the activity hook skips / commands, and concurrent activity writers keep every field", async () => {
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync(process.env.TMPDIR || "/tmp"), "ccdm-activity-"));
+  try {
+    const file = path.join(dir, "activity.json");
+    const script = path.resolve("scripts/thread-activity.js");
+    const hook = event => execFileSync(process.execPath, [script, file], { input: JSON.stringify(event) });
+    const read = () => JSON.parse(fs.readFileSync(file, "utf8"));
+
+    hook({ hook_event_name: "Stop" });
+    assert.equal(read().turn_running, false);
+    hook({ hook_event_name: "UserPromptSubmit", prompt: "  /compact" });
+    assert.equal(read().turn_running, false);
+    hook({ hook_event_name: "UserPromptSubmit", prompt: "please go on" });
+    assert.equal(read().turn_running, true);
+
+    // Twenty processes at once, half marking a reply and half a pause.
+    const writer = index => new Promise((resolve, reject) => execFile(process.execPath, ["-e",
+      `require(${JSON.stringify(script)}).${index % 2 ? "markReplied" : "markPaused"}(${JSON.stringify(file)}${index % 2 ? "" : ", true"})`],
+    error => (error ? reject(error) : resolve())));
+    await Promise.all(Array.from({ length: 20 }, (_, index) => writer(index)));
+    assert.deepEqual([read().turn_running, read().turn_replied, read().paused], [true, true, true]);
+    assert.deepEqual(fs.readdirSync(dir).sort(), ["activity.json"]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

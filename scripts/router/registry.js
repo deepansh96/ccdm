@@ -59,13 +59,19 @@ function validateRegistry(registry) {
 
 // The thread status board's channel, `thread_status_channel_id`. A bad value
 // never invalidates the registry: the board is off and `router status` shows
-// why, while every project still routes.
+// why, while every project still routes. The value must be a snowflake string
+// exactly, nothing stripped; the Thread Supervisor applies the same rule
+// (scripts/thread_supervisor/board.py SNOWFLAKE), so the two always agree.
+const STATUS_CHANNEL_ID = /^\d{17,20}$/;
+
 function statusChannel(registry, channels) {
   const value = registry.thread_status_channel_id;
   if (value === undefined || value === null) return { statusChannelId: null, statusChannelError: null };
   const off = error => ({ statusChannelId: null, statusChannelError: `thread_status_channel_id ${error}` });
-  if (!isId(value)) return off("must be a Discord ID");
-  const id = String(value);
+  if (typeof value !== "string" || !STATUS_CHANNEL_ID.test(value)) {
+    return off("must be a Discord channel ID (17-20 digits)");
+  }
+  const id = value;
   if (Array.isArray(registry.root_channels) && registry.root_channels.map(String).includes(id)) {
     return off("is a root channel");
   }

@@ -252,7 +252,19 @@ Channel Conversation status; board buttons/components; pushing activity through 
 - **D6.** An owner UI archive no longer closes a thread. The audit-log lookup is removed, and View Audit Log is dropped from the required permissions, which changes an `AGENTS.md` non-negotiable.
 - **D7.** A failed turn (v2) shows ⚠️ and pings with a "turn failed" text.
 - **D8.** A native reply to a ping routes to the thread session (a Router routing change).
-- **D9 (changed at approval).** An invalid `thread_status_channel_id` (not an ID, a root channel or a project channel) does not invalidate the registry. It turns the board off, and the error shows in `router status` and `router status --json`, while the rest of the registry loads normally. The supervisor applies the same check and shows `board: invalid` in its `status`.
+- **D9 (changed at approval).** An invalid `thread_status_channel_id` (not a 17-20 digit channel id string exactly, as review tightened it so the Router and supervisor always agree; a root channel; or a project channel) does not invalidate the registry. It turns the board off, and the error shows in `router status` and `router status --json`, while the rest of the registry loads normally. The supervisor applies the same check and shows `board: invalid` in its `status`.
 
 As built, D6 keeps View Audit Log listed as useful but optional: the supervisor still makes one audit-log read per reverted archive, only to log who archived the thread. `router status` reports it on a `guild permissions (optional):` line and in `missing_optional_thread_permissions`; it never blocks reminder readiness. `CCDM_THREAD_OWNER_PINGS=0|1` overrides `thread_owner_pings` for one worker (the test harness defaults it to `0`).
+
+Review changes after the build:
+- an input counts from its Discord `ts`, not from when the worker handled it;
+- the board makes one Router call per flush, and only while no frame waits;
+- ping, board and audit-log calls time out after 5 s;
+- a ping or board post that may have landed is looked for before it is posted again;
+- the Router and reconcile recognise a ping by its exact text, which replaces the Router-memory-only check that §11 assumed;
+- pings and the board need the Router's `hello_ok` capabilities;
+- a `/` prompt does not mark a turn running, and a turn with no activity for 6 h is stuck, not running;
+- a paused session is never stopped by an archive revert;
+- `activity.json` writes are locked;
+- reconcile finishes a close that a crash interrupted.
 - **D10.** The status channel is made root-write-only by hand, so the board stays at the bottom.

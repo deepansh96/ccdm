@@ -4,7 +4,9 @@ Router reconnect, or a Gateway resume.
 It runs on each Router connection (worker start and every reconnect) and on
 `gateway_resumed`. Project changes come first, so a thread whose project's
 channel moved meanwhile is `closed/project-moved` and never started. A
-`booting` or `live` row whose process is gone is `stopped/crashed`. `thread_list` (active threads, and threads archived in the
+`booting` or `live` row whose process is gone is `stopped/crashed`, and a close
+a crash interrupted after `pending_close` is finished. `thread_list` (active
+threads, and threads archived in the
 last 7 days) then binds unknown active threads under the normal binding
 rules, and unarchives every archived thread whose conversation is not
 closed: a thread stays open until `/close`. A thread is started only when
@@ -19,11 +21,10 @@ stops never restart here.
 from __future__ import annotations
 
 from datetime import datetime
-import re
 import sys
 import time
 
-from . import binding, boot, lifecycle, projects, store
+from . import binding, boot, lifecycle, projects, registry, store, turns
 from .clock import now
 from .link import LinkError
 
@@ -35,8 +36,6 @@ HISTORY_PAGES = 10
 NEVER_RESTARTED = ("crashed", "start-failed", "operator")
 # Default and reply messages; system notices are not conversation.
 MESSAGE_TYPES = (0, 19)
-# The supervisor's owner pings (turns.PING and the like), as Discord shows them.
-OWNER_PING = re.compile(r"^(?:🔔|⚠️) <@!?\d+> ")
 
 
 def _log(message: str) -> None:
@@ -46,6 +45,7 @@ def _log(message: str) -> None:
 def reconcile(context, _event: dict | None = None) -> None:
     # Project changes first: a thread whose channel moved meanwhile is closed, never started.
     projects.on_registry(context)
+    _finish_interrupted_closes(context)
     _mark_crashed(context)
     try:
         listed = context.link.call("thread_list", {"archived_within_days": ARCHIVED_WITHIN_DAYS}) or {}
@@ -58,6 +58,18 @@ def reconcile(context, _event: dict | None = None) -> None:
             _reconcile_thread(context, thread)
         except Exception as error:  # One thread must not stop the rest.
             _log(f"reconcile: thread {thread['id']} failed: {error}")
+
+
+def _finish_interrupted_closes(context) -> None:
+    """A close that recorded `pending_close` and then died: archive the thread
+    (again: an archive that already happened is unchanged) and finish it."""
+    for row in context.db.execute("SELECT * FROM threads WHERE pending_close IS NOT NULL AND state != 'closed'"):
+        try:
+            context.link.call("thread_update", {"thread_id": row["thread_id"], "archived": True})
+        except LinkError as error:
+            _log(f"reconcile: thread {row['thread_id']}: archiving its interrupted close failed: {error.code}")
+        lifecycle.finish_close(context, row)
+        _log(f"reconcile: thread {row['thread_id']}: finished its interrupted close")
 
 
 def _mark_crashed(context) -> None:
@@ -132,9 +144,17 @@ def _replies_to_root(context, message: dict) -> bool:
     referenced = message.get("referenced_message")
     if not context.bot_user_id or not message.get("message_reference") or not isinstance(referenced, dict):
         return False
-    if OWNER_PING.match(str(referenced.get("content") or "")):
-        return False  # A reply to an owner ping answers the thread.
-    return str((referenced.get("author") or {}).get("id") or "") == context.bot_user_id
+    if str((referenced.get("author") or {}).get("id") or "") != context.bot_user_id:
+        return False
+    # A reply to an owner ping answers the thread, as the Router routes it.
+    return not turns.is_ping(referenced, context.bot_user_id, _owner_id(context))
+
+
+def _owner_id(context) -> str | None:
+    try:
+        return registry.owner_id(registry.load(context.project_root))
+    except (OSError, ValueError):
+        return None
 
 
 def _events(context, row, thread: dict, messages) -> list[dict]:

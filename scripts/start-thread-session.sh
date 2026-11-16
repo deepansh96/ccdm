@@ -350,7 +350,8 @@ write_private(launch / "mcp.json", json.dumps({"mcpServers": {"ccdm": {
 # The official Discord plugin must not load beside the CCDM channel. The Stop
 # and StopFailure command hooks mark the turn ended (completed or failed) in
 # activity.json, and UserPromptSubmit marks it running, for a prompt Claude
-# takes in after the turn that received it stopped; the reminder hook records
+# takes in after the turn that received it stopped (never for a `/` command
+# typed into the pane, which no Stop may follow); the reminder hook records
 # the turn's completion.
 activity_hook = f"node '{Path(server_script).with_name('thread-activity.js')}' '{launch / 'activity.json'}'"
 reminder_hook = f"node '{Path(server_script).with_name('claude-reminder-hook.js')}'"
