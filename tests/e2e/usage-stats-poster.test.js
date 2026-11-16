@@ -365,16 +365,19 @@ test("poster keeps the expired-login notice when Claude Code cannot refresh it",
 test("poster shows Claude limit resets available when Claude Code is installed", async () => {
   const workspace = createWorkspace();
   const future = (days) => new Date(Date.now() + days * 86_400_000 + 1_800_000).toISOString();
+  const general = ["seven_day", "seven_day_overage_included"];
+  const fable = ["seven_day_overage_included"];
   const api = await startPosterApi({
     resetGrants: {
       eligible: true,
       ineligible_reason: null,
       grants: [
-        { id: "launch", resets_total: 2, resets_left: 2, ends_at: future(14), paused: false },
-        { id: "soon", resets_total: 1, resets_left: 1, ends_at: future(3), paused: false },
-        { id: "spent", resets_total: 1, resets_left: 0, ends_at: future(1), paused: false },
-        { id: "paused", resets_total: 1, resets_left: 1, ends_at: future(2), paused: true },
-        { id: "expired", resets_total: 1, resets_left: 1, ends_at: future(-2), paused: false },
+        { id: "launch", resets_total: 2, resets_left: 2, ends_at: future(14), paused: false, clears: general },
+        { id: "soon", resets_total: 1, resets_left: 1, ends_at: future(3), paused: false, clears: general },
+        { id: "spent", resets_total: 1, resets_left: 0, ends_at: future(1), paused: false, clears: general },
+        { id: "paused", resets_total: 1, resets_left: 1, ends_at: future(2), paused: true, clears: general },
+        { id: "expired", resets_total: 1, resets_left: 1, ends_at: future(-2), paused: false, clears: general },
+        { id: "launch-fable", label: "One Fable reset", resets_left: 1, ends_at: future(40), paused: false, clears: fable },
       ],
     },
   });
@@ -388,7 +391,8 @@ test("poster shows Claude limit resets available when Claude Code is installed",
   assert.equal(usageRequest.path, "/api/oauth/usage?cedar_ember=1");
   assert.equal(usageRequest.userAgent, "claude-cli/2.1.293 (external, cli)");
   const claudeValue = JSON.parse(api.requests.find((request) => request.method === "POST").body).embeds[0].fields[0].value;
-  assert.match(claudeValue, /\nLimit resets available: \*\*3\*\*  use within 3d 0h$/);
+  // This account has no model-scoped weekly row, so the Fable label names the group.
+  assert.match(claudeValue, /\nResets: \*\*3\*\* general \(use within 3d 0h\) · \*\*1\*\* Fable \(use within 40d 0h\)$/);
 });
 
 test("poster omits Claude limit resets for an ineligible account or without Claude Code", async () => {
@@ -413,8 +417,63 @@ test("poster omits Claude limit resets for an ineligible account or without Clau
     assert.ok(api.requests.some((request) => request.path === usagePath));
     const claudeValue = JSON.parse(api.requests.find((request) => request.method === "POST").body).embeds[0].fields[0].value;
     assert.match(claudeValue, /Extra usage: \*\*\$12\.50\*\* spent$/);
-    assert.doesNotMatch(claudeValue, /Limit resets/);
+    assert.doesNotMatch(claudeValue, /Resets:/);
   }
+});
+
+test("Claude limit resets split general and model-scoped grants, each with its own deadline", () => {
+  const probe = probePoster([
+    "import json",
+    "from datetime import datetime, timezone",
+    "now = datetime(2026, 11, 16, 13, 40, tzinfo=timezone.utc)",
+    "def grant(id, clears, left=1, ends='2027-03-09T07:59:00+00:00', label='New model launch: one Fable reset', **extra):",
+    "    return {'id': id, 'label': label, 'resets_total': 1, 'resets_left': left, 'starts_at': '2026-11-09T18:00:00+00:00',",
+    "            'ends_at': ends, 'clears': clears, 'paused': False, 'usable_now': left > 0, 'unavailable_reason': None if left > 0 else 'unavailable',",
+    "            'type': 'full', **extra}",
+    "GENERAL = grant('full-reset-2611', ['seven_day', 'seven_day_overage_included'], ends='2026-12-10T22:00:00+00:00', label='One full limit reset (November 2026)')",
+    "TEAM_GENERAL = grant('full-reset-2611', ['five_hour', 'seven_day', 'seven_day_overage_included'], ends='2026-12-10T22:00:00+00:00', label='One full limit reset (November 2026)')",
+    "def fable(id, team=False, **extra):",
+    "    return grant(id, (['five_hour'] if team else []) + ['seven_day_overage_included'], **extra)",
+    "def status(*grants, eligible=True):",
+    "    return {'eligible': eligible, 'ineligible_reason': None, 'grants': list(grants)}",
+    "cases = {",
+    "  # claude-p: one general reset and three Fable resets.",
+    "  'max': poster.format_claude_limit_resets(status(GENERAL, fable('launch-2610-fable'), fable('launch-2610-fable-12mo'), fable('launch-2610-fable-6mo')), now, 'Fable'),",
+    "  # claude-af (Team): both kinds also clear five_hour.",
+    "  'team': poster.format_claude_limit_resets(status(TEAM_GENERAL, fable('launch-2610-fable', True), fable('launch-2610-fable-6mo', True)), now, 'Fable'),",
+    "  # claude-iv: its first Fable grant is used up (resets_left 0, not usable now).",
+    "  'used': poster.format_claude_limit_resets(status(GENERAL, fable('launch-2610-fable', left=0), fable('launch-2610-fable-6mo')), now, 'Fable'),",
+    "  # Each group keeps its own earliest deadline.",
+    "  'deadlines': poster.format_claude_limit_resets(status(",
+    "      GENERAL, grant('full-2', ['seven_day'], ends='2026-11-19T13:40:00+00:00'),",
+    "      fable('a', ends='2027-01-01T13:40:00+00:00'), fable('b', ends='2026-12-01T13:40:00+00:00')), now, 'Fable'),",
+    "  'scope_name': poster.format_claude_limit_resets(status(fable('a')), now, 'Opus'),",
+    "  'label_fallback': poster.format_claude_limit_resets(status(fable('a')), now),",
+    "  'model_fallback': poster.format_claude_limit_resets(status(fable('a', label='One more reset')), now),",
+    "  'excluded': poster.format_claude_limit_resets(status(",
+    "      fable('paused', paused=True), fable('expired', ends='2026-11-01T00:00:00+00:00'), fable('zero', left=0),",
+    "      grant('bool', ['seven_day'], left=True), grant('no-clears', None), grant('five-hour-only', ['five_hour']),",
+    "      grant('not-a-list', 'seven_day'), grant('junk', [None, 7, {}]), 'not-a-grant'), now, 'Fable'),",
+    "  'general_only': poster.format_claude_limit_resets(status(GENERAL, grant('no-end', ['seven_day'], ends=None)), now),",
+    "  'ineligible': poster.format_claude_limit_resets(status(GENERAL, eligible=False), now),",
+    "  'missing': poster.format_claude_limit_resets(None, now),",
+    "}",
+    "print(json.dumps(cases))",
+  ].join("\n"));
+  assert.equal(probe.status, 0, probe.stderr);
+  assert.deepEqual(JSON.parse(probe.stdout), {
+    max: "Resets: **1** general (use within 24d 8h) · **3** Fable (use within 112d 18h)",
+    team: "Resets: **1** general (use within 24d 8h) · **2** Fable (use within 112d 18h)",
+    used: "Resets: **1** general (use within 24d 8h) · **1** Fable (use within 112d 18h)",
+    deadlines: "Resets: **2** general (use within 3d 0h) · **2** Fable (use within 15d 0h)",
+    scope_name: "Resets: **1** Opus (use within 112d 18h)",
+    label_fallback: "Resets: **1** Fable (use within 112d 18h)",
+    model_fallback: "Resets: **1** model (use within 112d 18h)",
+    excluded: "Resets: **0** available",
+    general_only: "Resets: **2** general (use within 24d 8h)",
+    ineligible: null,
+    missing: null,
+  });
 });
 
 test("manual JSON posting does not open or write the configured history database", async () => {
@@ -899,6 +958,150 @@ test("history uses valid SQLite slots as the authoritative chronological timesta
   ].join("\n"), path.join("scripts", "usage-stats-poster.py")], { encoding: "utf8" });
   assert.equal(probe.status, 0, probe.stderr);
   assert.deepEqual(JSON.parse(probe.stdout), ["2026-08-18T12:10:00Z", "2026-08-18T12:20:00Z"]);
+});
+
+test("Codex credits parse a decimal balance and render remaining credits compactly", () => {
+  const probe = probePoster([
+    "import json",
+    "def limits(credits, used=40, reached=None, spend=False):",
+    "    return {'planType': 'prolite', 'primary': {'usedPercent': used, 'windowDurationMins': 10080}, 'credits': credits,",
+    "            'rateLimitReachedType': reached, 'spendControlReached': spend}",
+    "def credits(balance, has=True, unlimited=False):",
+    "    return {'hasCredits': has, 'unlimited': unlimited, 'balance': balance}",
+    "balances = ['61285.3747500000', '1234567.5', '99.94', '12.25', '3.5', '0.004', '0', '-0.01', '-5', 'NaN', 'nan', 'Infinity', '1e400',",
+    "            'abc', '', ' ', '1' * 41, True, False, None, 7, 2.5, float('nan'), float('inf'), -1, [], {}]",
+    "out = {",
+    "  'balances': [poster.format_codex_credits(limits(credits(value))) for value in balances],",
+    "  'no_credits_object': poster.format_codex_credits(limits(None)),",
+    "  'credits_not_dict': poster.format_codex_credits(limits('61285')),",
+    "  'has_false_zero': poster.format_codex_credits(limits(credits('0', has=False))),",
+    "  'has_false_none': poster.format_codex_credits(limits(credits(None, has=False))),",
+    "  'has_false_positive': poster.format_codex_credits(limits(credits('25.5', has=False))),",
+    "  'unlimited': poster.format_codex_credits(limits(credits(None, unlimited=True))),",
+    "  'on_credits': poster.format_codex_credits(limits(credits('61285.37475'), used=100, reached='rate_limit_reached')),",
+    "  'reached_by_percent': poster.format_codex_credits(limits(credits('10'), used=100)),",
+    "  'reached_no_balance': poster.format_codex_credits(limits(credits('0'), used=100, reached='rate_limit_reached')),",
+    "  'depleted': poster.format_codex_credits(limits(credits('0'), reached='workspace_member_credits_depleted')),",
+    "  'spend': poster.format_codex_credits(limits(credits('5'), spend=True)),",
+    "  'used': poster.format_codex_credits(limits(credits('61285.37')), {'24h': 1240.4, '7d': 8900}),",
+    "  'used_week_unknown': poster.format_codex_credits(limits(credits('61285.37')), {'24h': 0.0, '7d': None}),",
+    "  'used_none': poster.format_codex_credits(limits(credits('61285.37')), {'24h': None, '7d': None}),",
+    "}",
+    "print(json.dumps(out))",
+  ].join("\n"));
+  assert.equal(probe.status, 0, probe.stderr);
+  const result = JSON.parse(probe.stdout);
+  assert.deepEqual(result.balances, [
+    "Credits: **61,285** left", "Credits: **1,234,568** left", "Credits: **99.9** left", "Credits: **12.2** left",
+    "Credits: **3.5** left", "Credits: **0** left", "Credits: **0** left",
+    null, null, null, null, null, null, null, null, null, null, null, null, null,
+    "Credits: **7** left", "Credits: **2.5** left", null, null, null, null, null,
+  ]);
+  assert.equal(result.no_credits_object, null);
+  assert.equal(result.credits_not_dict, null);
+  assert.equal(result.has_false_zero, null);
+  assert.equal(result.has_false_none, null);
+  assert.equal(result.has_false_positive, "Credits: **25.5** left");
+  assert.equal(result.unlimited, "Credits: **unlimited**");
+  assert.equal(result.on_credits, "Credits: **61,285** left · running on credits");
+  assert.equal(result.reached_by_percent, "Credits: **10** left · running on credits");
+  assert.equal(result.reached_no_balance, "Credits: **0** left");
+  assert.equal(result.depleted, "Credits: **0** left · credits depleted");
+  assert.equal(result.spend, "Credits: **5** left · spend limit reached");
+  assert.equal(result.used, "Credits: **61,285** left · used 1,240 in 24h · 8,900 in 7d");
+  assert.equal(result.used_week_unknown, "Credits: **61,285** left · used 0 in 24h");
+  assert.equal(result.used_none, "Credits: **61,285** left");
+});
+
+test("Codex used credits sum balance decreases from history and skip top-ups and missing history", () => {
+  const probe = probePoster([
+    "import json, sqlite3, tempfile",
+    "from datetime import datetime, timedelta, timezone",
+    "from pathlib import Path",
+    "now = datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc)",
+    "ago = lambda **delta: now - timedelta(**delta)",
+    "points = [",
+    "  (ago(days=7, minutes=10), 9000.0),  # before the 7-day window: ignored",
+    "  (ago(days=7), 5000.0), (ago(days=3), 4000.0),",
+    "  (ago(hours=24), 3000.0), (ago(hours=12), 2500.0),",
+    "  (ago(hours=6), 4500.0),  # a top-up: the increase is ignored",
+    "  (ago(hours=1), 4200.0),",
+    "]",
+    "out = {",
+    "  'used': poster._codex_credits_used(points, 4000.0, now),",
+    "  'missing': poster._codex_credits_used([], 4000.0, now),",
+    "  # History that starts mid-window cannot support the window yet.",
+    "  'partial': poster._codex_credits_used([(ago(hours=20), 4100.0)], 4000.0, now),",
+    "  'tolerance': poster._codex_credits_used([(ago(hours=23, minutes=40), 4100.0)], 4000.0, now),",
+    "  'unchanged': poster._codex_credits_used([(ago(hours=24), 4000.0), (ago(hours=1), 4000.0)], 4000.0, now),",
+    "}",
+    "root = Path(tempfile.mkdtemp()); root.chmod(0o700)",
+    "db = root / 'history.sqlite3'",
+    "out['missing_db'] = poster.read_codex_credit_history(db, ago(days=8))",
+    "out['missing_db_created'] = db.exists()",
+    "metric = poster._metric_from_codex_rate_limits({'primary': {'usedPercent': 100, 'windowDurationMins': 10080}, 'credits': {'hasCredits': True, 'unlimited': False, 'balance': '4000.25'}}, 'codex-iv-large', now=now)",
+    "out['metric_balance'] = metric['credits_balance']",
+    "out['first_text'] = metric['text']",
+    "store = poster.HistoryStore(db)",
+    "with store.locked() as connection:",
+    "    for at, balance in points:",
+    "        cards = [{'provider': 'codex', 'account': 'codex-iv-large', 'window': 'Weekly', 'available': True, 'status': 'available', 'used_percent': 50.0, 'credits_balance': balance},",
+    "                 {'provider': 'codex', 'account': 'codex-iv-large', 'window': 'Other', 'credits_balance': 1.0},",
+    "                 {'provider': 'claude', 'account': 'codex-iv-large', 'window': '7-day', 'credits_balance': 99.0},",
+    "                 {'provider': 'codex', 'account': 'other', 'window': 'Weekly', 'credits_balance': True}]",
+    "        store.write_snapshot(connection, at, {'generated_at': poster._iso_utc(at), 'cards': cards})",
+    "    store.write_snapshot(connection, ago(minutes=30), {'generated_at': 'x', 'cards': [{'provider': 'codex', 'account': 'codex-iv-large', 'credits_balance': float('nan')}]})",
+    "    connection.execute(\"insert into snapshots values ('2026-11-16T11:40:00Z', 'x', 'not json')\")",
+    "    connection.commit()",
+    "history = poster.read_codex_credit_history(db, ago(days=7, minutes=30))",
+    "out['history'] = {account: [[poster._iso_utc(at), value] for at, value in rows] for account, rows in history.items()}",
+    "metric = poster._metric_from_codex_rate_limits({'primary': {'usedPercent': 100, 'windowDurationMins': 10080}, 'credits': {'hasCredits': True, 'unlimited': False, 'balance': '4000'}}, 'codex-iv-large', credit_history=history, now=now)",
+    "out['text'] = metric['text']",
+    "out['cards'] = poster._safe_history_cards([metric])",
+    "stale = poster._metric_from_codex_rate_limits({'primary': {'usedPercent': 10}, 'credits': {'hasCredits': True, 'balance': '12'}}, 'codex-iv-large', 'local_session', credit_history=history, now=now)",
+    "out['stale'] = [stale.get('credits_balance'), stale['text'], poster._safe_history_cards([stale])]",
+    "(root / 'corrupt.sqlite3').write_text('not a database')",
+    "out['corrupt'] = poster.read_codex_credit_history(root / 'corrupt.sqlite3', ago(days=8))",
+    "out['directory'] = poster.read_codex_credit_history(root, ago(days=8))",
+    "out['relative'] = poster.read_codex_credit_history('history.sqlite3', ago(days=8))",
+    "print(json.dumps(out))",
+  ].join("\n"));
+  assert.equal(probe.status, 0, probe.stderr);
+  const result = JSON.parse(probe.stdout);
+  // 24h: 3000 -> 2500 (500), top-up to 4500 ignored, 4500 -> 4200 (300), 4200 -> 4000 now (200).
+  // 7d: 5000 -> 4000 -> 3000 (2000) plus the same 1000.
+  assert.deepEqual(result.used, { "24h": 1000, "7d": 3000 });
+  assert.deepEqual(result.missing, { "24h": null, "7d": null });
+  assert.deepEqual(result.partial, { "24h": null, "7d": null });
+  assert.deepEqual(result.tolerance, { "24h": 100, "7d": null });
+  assert.deepEqual(result.unchanged, { "24h": 0, "7d": null });
+  assert.deepEqual(result.missing_db, {});
+  assert.equal(result.missing_db_created, false);
+  assert.equal(result.metric_balance, 4000.25);
+  assert.equal(result.first_text.split("\n")[2], "Credits: **4,000** left · running on credits");
+  // One balance per account per snapshot, Codex only, malformed rows and values skipped.
+  assert.deepEqual(result.history, {
+    "codex-iv-large": [
+      ["2026-11-09T11:50:00Z", 9000], ["2026-11-09T12:00:00Z", 5000], ["2026-11-13T12:00:00Z", 4000],
+      ["2026-11-15T12:00:00Z", 3000], ["2026-11-16T00:00:00Z", 2500], ["2026-11-16T06:00:00Z", 4500],
+      ["2026-11-16T11:00:00Z", 4200],
+    ],
+  });
+  assert.equal(
+    result.text.split("\n")[2],
+    "Credits: **4,000** left · used 1,000 in 24h · 3,000 in 7d · running on credits",
+  );
+  assert.deepEqual(result.cards, [{
+    provider: "codex", account: "codex-iv-large", window: "Weekly", available: true, status: "available",
+    used_percent: 100, credits_balance: 4000,
+  }]);
+  // A session-file balance is shown but never recorded or compared.
+  assert.equal(result.stale[0], null);
+  assert.match(result.stale[1], /\nCredits: \*\*12\*\* left$/);
+  assert.equal(Object.hasOwn(result.stale[2][0], "credits_balance"), false);
+  assert.deepEqual(result.corrupt, {});
+  assert.deepEqual(result.directory, {});
+  assert.deepEqual(result.relative, {});
 });
 
 test("legacy Codex 5-hour and 7-day cards collapse to one weekly 7-day value", () => {
@@ -2026,7 +2229,10 @@ test("poster shows every block of three Fable accounts and three busy API accoun
     resetGrants: {
       eligible: true,
       ineligible_reason: null,
-      grants: [{ id: "launch", resets_total: 4, resets_left: 4, ends_at: claudeFutureReset(24 * 24), paused: false }],
+      grants: [
+        { id: "full-reset", resets_left: 1, ends_at: claudeFutureReset(24 * 24), paused: false, clears: ["five_hour", "seven_day", "seven_day_overage_included"] },
+        { id: "launch-fable", resets_left: 3, ends_at: claudeFutureReset(24 * 113), paused: false, clears: ["five_hour", "seven_day_overage_included"] },
+      ],
     },
   });
   for (const name of [".claude-af", ".claude-iv"]) {
@@ -2077,8 +2283,10 @@ test("poster shows every block of three Fable accounts and three busy API accoun
   ]);
   for (const block of blocks.slice(0, 3)) {
     assert.deepEqual(block.split("\n").slice(1).map((line) => line.split(":")[0]), [
-      "5-Hour", "7-Day (all)", "7-Day (Fable)", "Extra usage", "Limit resets available",
+      "5-Hour", "7-Day (all)", "7-Day (Fable)", "Extra usage", "Resets",
     ]);
+    // The reset grants' model is named from the account's one scoped weekly row.
+    assert.match(block, /\nResets: \*\*1\*\* general \(use within 24d 0h\) · \*\*3\*\* Fable \(use within 113d 0h\)$/);
   }
   for (const block of blocks.slice(3)) {
     assert.match(block, /\(API key, local estimate\)\nToday: .*\nThis month: .*\nTokens: .*\nCache: .*\nModels: .*\n\*Only Claude Code usage recorded on this Mac\*$/);
@@ -2270,6 +2478,82 @@ test("scheduled poster posts the original text report once per 30-minute slot wi
   const suppressed = await run("2026-08-18T13:15:00Z");
   assert.equal(suppressed.exitCode, 0, suppressed.stderr || suppressed.stdout);
   assert.doesNotMatch(suppressed.stderr, /exceeds 5 GiB/);
+});
+
+test("poster shows Codex credits left and records balances to report credits used", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const historyPath = path.join(workspace.homeDir, "Library", "Application Support", "CCDM", "usage-stats", "history.sqlite3");
+  seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
+  const codexHome = path.join(workspace.homeDir, ".codex-credits");
+  fs.mkdirSync(codexHome);
+  fs.writeFileSync(
+    path.join(workspace.repoDir, "registry.json"),
+    `${JSON.stringify({ codex_accounts: { "codex-credits": codexHome }, default_codex_account: "codex-credits", projects: {} }, null, 2)}\n`,
+  );
+  const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
+  const respond = (balance) => fs.writeFileSync(responsesPath, `${JSON.stringify({
+    [fs.realpathSync(codexHome)]: {
+      rateLimits: {
+        limitId: "codex",
+        planType: "prolite",
+        primary: { usedPercent: 100, windowDurationMins: 10080 },
+        secondary: null,
+        credits: { hasCredits: true, unlimited: false, balance },
+        spendControlReached: false,
+        rateLimitReachedType: "rate_limit_reached",
+      },
+    },
+  })}\n`);
+  const run = (now, args = ["--scheduled"]) => runScript(workspace, "scripts/usage-stats-poster.py", {
+    args,
+    env: { CCDM_TEST_CODEX_STDIO_RESPONSES: responsesPath, CCDM_TEST_NOW: now, CCDM_USAGE_STATS_NOTIFY: "0" },
+  });
+  const lastCodexValue = () => {
+    const posts = api.requests.filter((request) => request.method === "POST");
+    const embed = JSON.parse(posts.at(-1).body).embeds[0];
+    assertEmbedWithinDiscordLimits(embed);
+    return embed.fields.find(({ name }) => name === "Codex").value;
+  };
+
+  // The first run has no history yet, so it shows only what is left.
+  respond("61285.3747500000");
+  const first = await run("2026-11-15T12:00:00Z");
+  assert.equal(first.exitCode, 0, first.stderr || first.stdout);
+  assert.match(lastCodexValue(), /\nCredits: \*\*61,285\*\* left · running on credits$/);
+
+  // A top-up between runs is not counted as use.
+  respond("62000");
+  const topUp = await run("2026-11-15T18:00:00Z", ["--collect-only"]);
+  assert.equal(topUp.exitCode, 0, topUp.stderr || topUp.stdout);
+
+  respond("60760.0");
+  const second = await run("2026-11-16T11:50:00Z");
+  assert.equal(second.exitCode, 0, second.stderr || second.stdout);
+  assert.match(lastCodexValue(), /\nCredits: \*\*60,760\*\* left · used 1,240 in 24h · running on credits$/);
+
+  const query = (sql) => spawnSync("python3", ["-c", [
+    "import sqlite3, sys",
+    "for row in sqlite3.connect(sys.argv[1]).execute(sys.argv[2]):",
+    "    print(row[0])",
+  ].join("\n"), historyPath, sql], { encoding: "utf8" }).stdout.trim().split("\n");
+  const payloads = query("select payload_json from snapshots order by slot_utc").map((row) => JSON.parse(row));
+  assert.deepEqual(payloads.map(({ cards }) => cards.find(({ provider }) => provider === "codex").credits_balance), [61285.3748, 62000, 60760]);
+  const stored = payloads.map((row) => JSON.stringify(row)).join("\n");
+  assert.doesNotMatch(stored, /hasCredits|61285\.37475|rateLimitReachedType|fixture-(oauth|root)-token/);
+
+  // The manual post reads history read-only: same figures, no new snapshot.
+  const snapshotsBefore = query("select count(*) from snapshots")[0];
+  const manual = await run("2026-11-16T11:55:00Z", []);
+  assert.equal(manual.exitCode, 0, manual.stderr || manual.stdout);
+  assert.match(lastCodexValue(), /\nCredits: \*\*60,760\*\* left · used 1,240 in 24h · running on credits$/);
+  assert.equal(query("select count(*) from snapshots")[0], snapshotsBefore);
+
+  // Unreadable history never stops a manual post; used figures are just omitted.
+  fs.writeFileSync(historyPath, "not a sqlite database");
+  const unreadable = await run("2026-11-16T12:00:00Z", []);
+  assert.equal(unreadable.exitCode, 0, unreadable.stderr || unreadable.stdout);
+  assert.match(lastCodexValue(), /\nCredits: \*\*60,760\*\* left · running on credits$/);
 });
 
 test("scheduled poster retries a failed or skipped slot on any later run in that slot", async () => {
