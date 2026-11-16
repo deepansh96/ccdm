@@ -708,24 +708,30 @@ The poster reports:
   its own series (window `7-day (<model>)` with `scope`), never mixed into the
   all-models `7-day` series
 - Claude limit resets (when Claude Code is installed and the account is
-  eligible) on one line, split by what each grant clears: a grant that clears
-  the all-models 7-day limit is **general**; one that clears only a
-  model-scoped weekly limit is named after the account's model-scoped row
-  (today Fable), for example
+  eligible) on one line, split by what each grant's `clears` list resets: a
+  grant that clears the all-models 7-day limit, or the 5-hour session without
+  any 7-day limit, is **general**; one that clears only a model-scoped weekly
+  limit takes the model its bucket names (such as `seven_day_opus`), else the
+  account's model-scoped row (today Fable), for example
   `Resets: **1** general (use within 24d 8h) · **3** Fable (use within 112d 18h)`.
   Each group has its own earliest use-by deadline; paused, expired, used-up,
-  and unrecognised grants are left out, and a group with none is omitted
+  and unrecognised grants (including any without `clears`) are left out, and a
+  group with none is omitted
 - ChatGPT/Codex limits for every alias in the top-level `codex_accounts`
   registry map, with `default_codex_account` shown first and the remaining
   aliases shown alphabetically
 - Codex credits for subscription accounts whose live rate-limit read reports
   them: `Credits: **61,285** left`, or `unlimited`. The app-server reports only
   the current balance, so credits used come from the poster's own history:
-  each scheduled snapshot stores the live balance as a plain number, and the
-  line adds `used N in 24h · N in 7d`, the sum of balance decreases between
-  consecutive snapshots (increases are top-ups and are ignored). A window is
-  shown only once history reaches back to its start. When the weekly limit is
-  reached and credits remain, the line ends `running on credits`
+  each scheduled snapshot stores the live balance as a plain number with a
+  16-character salted hash of the app-server account id (never the id), and
+  the line adds `used N in 24h · N in 7d`, the sum of balance decreases between
+  consecutive snapshots of the same account (increases are top-ups and are
+  ignored). A balance from another account under the same label, or without
+  an account hash, is never compared. A window starts from the last stored
+  balance at or before its start, at most 6 hours older, and is omitted
+  without one. When the weekly limit is reached and credits remain, the line
+  ends `running on credits`
 - Local token-usage fallback from each named Codex Home's `sessions` directory
   when live rate limits are unavailable
 

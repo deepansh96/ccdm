@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -452,8 +452,14 @@ test("Claude limit resets split general and model-scoped grants, each with its o
     "  'model_fallback': poster.format_claude_limit_resets(status(fable('a', label='One more reset')), now),",
     "  'excluded': poster.format_claude_limit_resets(status(",
     "      fable('paused', paused=True), fable('expired', ends='2026-11-01T00:00:00+00:00'), fable('zero', left=0),",
-    "      grant('bool', ['seven_day'], left=True), grant('no-clears', None), grant('five-hour-only', ['five_hour']),",
+    "      grant('bool', ['seven_day'], left=True), grant('no-clears', None), grant('empty-clears', []),",
     "      grant('not-a-list', 'seven_day'), grant('junk', [None, 7, {}]), 'not-a-grant'), now, 'Fable'),",
+    "  # A grant that clears the 5-hour session but no 7-day bucket is general.",
+    "  'five_hour_only': poster.format_claude_limit_resets(status(GENERAL, grant('five-hour-only', ['five_hour'], ends='2026-11-20T13:40:00+00:00')), now, 'Fable'),",
+    "  # A bucket that names a model wins over the account's scoped row; overage-included keeps the scoped name.",
+    "  'named_bucket': poster.format_claude_limit_resets(status(",
+    "      grant('opus', ['seven_day_opus'], label='One Opus reset'), fable('fable')), now, 'Fable'),",
+    "  'unknown_bucket': poster.format_claude_limit_resets(status(grant('other', ['seven_day_cowork'], label='One reset')), now, 'Fable'),",
     "  'general_only': poster.format_claude_limit_resets(status(GENERAL, grant('no-end', ['seven_day'], ends=None)), now),",
     "  'ineligible': poster.format_claude_limit_resets(status(GENERAL, eligible=False), now),",
     "  'missing': poster.format_claude_limit_resets(None, now),",
@@ -471,12 +477,15 @@ test("Claude limit resets split general and model-scoped grants, each with its o
     model_fallback: "Resets: **1** model (use within 112d 18h)",
     excluded: "Resets: **0** available",
     general_only: "Resets: **2** general (use within 24d 8h)",
+    five_hour_only: "Resets: **2** general (use within 4d 0h)",
+    named_bucket: "Resets: **1** Opus (use within 112d 18h) · **1** Fable (use within 112d 18h)",
+    unknown_bucket: "Resets: **1** Fable (use within 112d 18h)",
     ineligible: null,
     missing: null,
   });
 });
 
-test("manual JSON posting does not open or write the configured history database", async () => {
+test("manual JSON posting never creates, writes, or changes the configured history database", async () => {
   const workspace = createWorkspace();
   const api = await startPosterApi();
   const sharedParent = path.join(workspace.homeDir, "shared-state");
@@ -492,6 +501,30 @@ test("manual JSON posting does not open or write the configured history database
   assert.equal(fs.existsSync(path.join(sharedParent, ".history.lock")), false);
   assert.equal(fs.statSync(sharedParent).mode & 0o777, 0o755);
   assert.equal(api.requests.filter((request) => request.method === "POST").length, 1);
+
+  // With an existing database and sidecars, the manual path may read history
+  // but leaves every file byte-identical and creates none.
+  const created = spawnSync("python3", ["-c", [
+    "import json, sqlite3, sys",
+    "connection = sqlite3.connect(sys.argv[1])",
+    "connection.execute('CREATE TABLE snapshots (slot_utc TEXT PRIMARY KEY, generated_at TEXT NOT NULL, payload_json TEXT NOT NULL)')",
+    "connection.execute('INSERT INTO snapshots VALUES (?, ?, ?)', ('2026-11-16T00:00:00Z', '2026-11-16T00:00:00Z', json.dumps({'cards': [{'provider': 'codex', 'account': 'fixture', 'credits_balance': 5}]})))",
+    "connection.commit()",
+  ].join("\n"), historyPath], { encoding: "utf8" });
+  assert.equal(created.status, 0, created.stderr);
+  const digests = () => Object.fromEntries(fs.readdirSync(sharedParent).sort().map((name) => [
+    name, crypto.createHash("sha256").update(fs.readFileSync(path.join(sharedParent, name))).digest("hex"),
+  ]));
+  const allSidecars = [".history.lock", "usage.sqlite3-journal", "usage.sqlite3-wal", "usage.sqlite3-shm"];
+  for (const sidecars of [[".history.lock"], [".history.lock", "usage.sqlite3-journal"], allSidecars]) {
+    for (const name of allSidecars) fs.rmSync(path.join(sharedParent, name), { force: true });
+    for (const name of sidecars) fs.writeFileSync(path.join(sharedParent, name), `sidecar fixture ${name}\n`);
+    const before = digests();
+    const again = await runScript(workspace, "scripts/usage-stats-poster.py");
+    assert.equal(again.exitCode, 0, again.stderr || again.stdout);
+    assert.deepEqual(digests(), before, `after a manual post with ${sidecars.join(", ")}`);
+  }
+  assert.equal(api.requests.filter((request) => request.method === "POST").length, 4);
 });
 
 test("missing or malformed Claude utilization is recorded as unavailable", async () => {
@@ -968,7 +1001,7 @@ test("Codex credits parse a decimal balance and render remaining credits compact
     "            'rateLimitReachedType': reached, 'spendControlReached': spend}",
     "def credits(balance, has=True, unlimited=False):",
     "    return {'hasCredits': has, 'unlimited': unlimited, 'balance': balance}",
-    "balances = ['61285.3747500000', '1234567.5', '99.94', '12.25', '3.5', '0.004', '0', '-0.01', '-5', 'NaN', 'nan', 'Infinity', '1e400',",
+    "balances = ['61285.3747500000', '1234567.5', '99.94', '12.25', '3.5', '0.004', '0', '-0', '-0.00', '-0.01', '-5', 'NaN', 'nan', 'Infinity', '1e400',",
     "            'abc', '', ' ', '1' * 41, True, False, None, 7, 2.5, float('nan'), float('inf'), -1, [], {}]",
     "out = {",
     "  'balances': [poster.format_codex_credits(limits(credits(value))) for value in balances],",
@@ -994,6 +1027,8 @@ test("Codex credits parse a decimal balance and render remaining credits compact
   assert.deepEqual(result.balances, [
     "Credits: **61,285** left", "Credits: **1,234,568** left", "Credits: **99.9** left", "Credits: **12.2** left",
     "Credits: **3.5** left", "Credits: **0** left", "Credits: **0** left",
+    // "-0" is zero, never "-0".
+    "Credits: **0** left", "Credits: **0** left",
     null, null, null, null, null, null, null, null, null, null, null, null, null,
     "Credits: **7** left", "Credits: **2.5** left", null, null, null, null, null,
   ]);
@@ -1020,8 +1055,11 @@ test("Codex used credits sum balance decreases from history and skip top-ups and
     "from pathlib import Path",
     "now = datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc)",
     "ago = lambda **delta: now - timedelta(**delta)",
+    "A = poster._codex_credit_account_key('fixture-account-a')",
+    "B = poster._codex_credit_account_key('fixture-account-b')",
+    "names = {A: 'A', B: 'B', None: None}",
     "points = [",
-    "  (ago(days=7, minutes=10), 9000.0),  # before the 7-day window: ignored",
+    "  (ago(days=7, minutes=10), 9000.0),  # older than the 7-day baseline: ignored",
     "  (ago(days=7), 5000.0), (ago(days=3), 4000.0),",
     "  (ago(hours=24), 3000.0), (ago(hours=12), 2500.0),",
     "  (ago(hours=6), 4500.0),  # a top-up: the increase is ignored",
@@ -1030,35 +1068,55 @@ test("Codex used credits sum balance decreases from history and skip top-ups and
     "out = {",
     "  'used': poster._codex_credits_used(points, 4000.0, now),",
     "  'missing': poster._codex_credits_used([], 4000.0, now),",
-    "  # History that starts mid-window cannot support the window yet.",
+    "  # History that starts inside a window has no baseline for it yet.",
     "  'partial': poster._codex_credits_used([(ago(hours=20), 4100.0)], 4000.0, now),",
-    "  'tolerance': poster._codex_credits_used([(ago(hours=23, minutes=40), 4100.0)], 4000.0, now),",
+    "  # A sleep across the window start still has an older baseline (here 5h before it).",
+    "  'baseline_before_gap': poster._codex_credits_used([(ago(hours=29), 4300.0), (ago(hours=2), 4100.0)], 4000.0, now),",
+    "  # A baseline more than 6 hours before the window start is too old.",
+    "  'baseline_too_old': poster._codex_credits_used([(ago(hours=31), 4300.0), (ago(hours=2), 4100.0)], 4000.0, now),",
     "  'unchanged': poster._codex_credits_used([(ago(hours=24), 4000.0), (ago(hours=1), 4000.0)], 4000.0, now),",
+    "  'key': [A, len(A), A == poster._codex_credit_account_key('fixture-account-a'), A != B,",
+    "          poster._codex_credit_account_key(''), poster._codex_credit_account_key(None), poster._codex_credit_account_key(7)],",
     "}",
     "root = Path(tempfile.mkdtemp()); root.chmod(0o700)",
     "db = root / 'history.sqlite3'",
     "out['missing_db'] = poster.read_codex_credit_history(db, ago(days=8))",
     "out['missing_db_created'] = db.exists()",
-    "metric = poster._metric_from_codex_rate_limits({'primary': {'usedPercent': 100, 'windowDurationMins': 10080}, 'credits': {'hasCredits': True, 'unlimited': False, 'balance': '4000.25'}}, 'codex-iv-large', now=now)",
-    "out['metric_balance'] = metric['credits_balance']",
+    "def live(balance, key=None):",
+    "    limits = {'primary': {'usedPercent': 100, 'windowDurationMins': 10080}, 'credits': {'hasCredits': True, 'unlimited': False, 'balance': balance}}",
+    "    if key: limits['creditAccountKey'] = key",
+    "    return limits",
+    "metric = poster._metric_from_codex_rate_limits(live('4000.25', A), 'codex-iv-large', now=now)",
+    "out['metric_balance'] = [metric['credits_balance'], names[metric['credits_account']]]",
     "out['first_text'] = metric['text']",
     "store = poster.HistoryStore(db)",
+    "def card(balance, key=A, **extra):",
+    "    return {'provider': 'codex', 'account': 'codex-iv-large', 'window': 'Weekly', 'credits_balance': balance, 'credits_account': key, **extra}",
     "with store.locked() as connection:",
     "    for at, balance in points:",
-    "        cards = [{'provider': 'codex', 'account': 'codex-iv-large', 'window': 'Weekly', 'available': True, 'status': 'available', 'used_percent': 50.0, 'credits_balance': balance},",
-    "                 {'provider': 'codex', 'account': 'codex-iv-large', 'window': 'Other', 'credits_balance': 1.0},",
+    "        cards = [card(balance, available=True, status='available', used_percent=50.0), card(1.0, window='Other'),",
     "                 {'provider': 'claude', 'account': 'codex-iv-large', 'window': '7-day', 'credits_balance': 99.0},",
     "                 {'provider': 'codex', 'account': 'other', 'window': 'Weekly', 'credits_balance': True}]",
     "        store.write_snapshot(connection, at, {'generated_at': poster._iso_utc(at), 'cards': cards})",
-    "    store.write_snapshot(connection, ago(minutes=30), {'generated_at': 'x', 'cards': [{'provider': 'codex', 'account': 'codex-iv-large', 'credits_balance': float('nan')}]})",
+    "    # Another account's balance under the same label, a keyless balance, and a bad key.",
+    "    store.write_snapshot(connection, ago(hours=3), {'generated_at': 'x', 'cards': [card(61285.0, B)]})",
+    "    store.write_snapshot(connection, ago(hours=2), {'generated_at': 'x', 'cards': [card(9999.0, None)]})",
+    "    store.write_snapshot(connection, ago(hours=4), {'generated_at': 'x', 'cards': [card(8888.0, 'NOT-A-KEY')]})",
+    "    store.write_snapshot(connection, ago(minutes=30), {'generated_at': 'x', 'cards': [card(float('nan'))]})",
     "    connection.execute(\"insert into snapshots values ('2026-11-16T11:40:00Z', 'x', 'not json')\")",
     "    connection.commit()",
-    "history = poster.read_codex_credit_history(db, ago(days=7, minutes=30))",
-    "out['history'] = {account: [[poster._iso_utc(at), value] for at, value in rows] for account, rows in history.items()}",
-    "metric = poster._metric_from_codex_rate_limits({'primary': {'usedPercent': 100, 'windowDurationMins': 10080}, 'credits': {'hasCredits': True, 'unlimited': False, 'balance': '4000'}}, 'codex-iv-large', credit_history=history, now=now)",
+    "history = poster.read_codex_credit_history(db, ago(days=7, hours=6))",
+    "out['history'] = {account: [[poster._iso_utc(at), value, names.get(key, key)] for at, value, key in rows] for account, rows in history.items()}",
+    "metric = poster._metric_from_codex_rate_limits(live('4000', A), 'codex-iv-large', credit_history=history, now=now)",
     "out['text'] = metric['text']",
-    "out['cards'] = poster._safe_history_cards([metric])",
-    "stale = poster._metric_from_codex_rate_limits({'primary': {'usedPercent': 10}, 'credits': {'hasCredits': True, 'balance': '12'}}, 'codex-iv-large', 'local_session', credit_history=history, now=now)",
+    "out['cards'] = [{**c, 'credits_account': names.get(c.get('credits_account'))} for c in poster._safe_history_cards([metric])]",
+    "# The home switched to account B under the same label: A's 61,285-style history is never diffed into B.",
+    "switched = poster._metric_from_codex_rate_limits(live('500', B), 'codex-iv-large', credit_history=history, now=now)",
+    "out['switched'] = [switched['text'].split('\\n')[2], names[poster._safe_history_cards([switched])[0]['credits_account']]]",
+    "# A live read without an account id is not comparable with any stored series.",
+    "keyless = poster._metric_from_codex_rate_limits(live('4000'), 'codex-iv-large', credit_history=history, now=now)",
+    "out['keyless'] = [keyless['text'].split('\\n')[2], poster._safe_history_cards([keyless])[0]]",
+    "stale = poster._metric_from_codex_rate_limits({'primary': {'usedPercent': 10}, 'credits': {'hasCredits': True, 'balance': '12'}, 'creditAccountKey': A}, 'codex-iv-large', 'local_session', credit_history=history, now=now)",
     "out['stale'] = [stale.get('credits_balance'), stale['text'], poster._safe_history_cards([stale])]",
     "(root / 'corrupt.sqlite3').write_text('not a database')",
     "out['corrupt'] = poster.read_codex_credit_history(root / 'corrupt.sqlite3', ago(days=8))",
@@ -1068,37 +1126,48 @@ test("Codex used credits sum balance decreases from history and skip top-ups and
   ].join("\n"));
   assert.equal(probe.status, 0, probe.stderr);
   const result = JSON.parse(probe.stdout);
-  // 24h: 3000 -> 2500 (500), top-up to 4500 ignored, 4500 -> 4200 (300), 4200 -> 4000 now (200).
-  // 7d: 5000 -> 4000 -> 3000 (2000) plus the same 1000.
+  // 24h: baseline 3000 -> 2500 (500), top-up to 4500 ignored, 4500 -> 4200 (300), 4200 -> 4000 now (200).
+  // 7d: baseline 5000 -> 4000 -> 3000 (2000) plus the same 1000.
   assert.deepEqual(result.used, { "24h": 1000, "7d": 3000 });
   assert.deepEqual(result.missing, { "24h": null, "7d": null });
   assert.deepEqual(result.partial, { "24h": null, "7d": null });
-  assert.deepEqual(result.tolerance, { "24h": 100, "7d": null });
+  assert.deepEqual(result.baseline_before_gap, { "24h": 300, "7d": null });
+  assert.deepEqual(result.baseline_too_old, { "24h": null, "7d": null });
   assert.deepEqual(result.unchanged, { "24h": 0, "7d": null });
+  assert.match(result.key[0], /^[0-9a-f]{16}$/);
+  assert.deepEqual(result.key.slice(1), [16, true, true, null, null, null]);
+  assert.doesNotMatch(probe.stdout, /fixture-account-[ab]/);
   assert.deepEqual(result.missing_db, {});
   assert.equal(result.missing_db_created, false);
-  assert.equal(result.metric_balance, 4000.25);
+  assert.deepEqual(result.metric_balance, [4000.25, "A"]);
   assert.equal(result.first_text.split("\n")[2], "Credits: **4,000** left · running on credits");
-  // One balance per account per snapshot, Codex only, malformed rows and values skipped.
+  // One balance per label per snapshot, Codex only, malformed rows and values skipped; bad keys read as none.
   assert.deepEqual(result.history, {
     "codex-iv-large": [
-      ["2026-11-09T11:50:00Z", 9000], ["2026-11-09T12:00:00Z", 5000], ["2026-11-13T12:00:00Z", 4000],
-      ["2026-11-15T12:00:00Z", 3000], ["2026-11-16T00:00:00Z", 2500], ["2026-11-16T06:00:00Z", 4500],
-      ["2026-11-16T11:00:00Z", 4200],
+      ["2026-11-09T11:50:00Z", 9000, "A"], ["2026-11-09T12:00:00Z", 5000, "A"], ["2026-11-13T12:00:00Z", 4000, "A"],
+      ["2026-11-15T12:00:00Z", 3000, "A"], ["2026-11-16T00:00:00Z", 2500, "A"], ["2026-11-16T06:00:00Z", 4500, "A"],
+      ["2026-11-16T08:00:00Z", 8888, null], ["2026-11-16T09:00:00Z", 61285, "B"], ["2026-11-16T10:00:00Z", 9999, null],
+      ["2026-11-16T11:00:00Z", 4200, "A"],
     ],
   });
+  // Only account A's balances are compared, so B's and keyless points change nothing.
   assert.equal(
     result.text.split("\n")[2],
     "Credits: **4,000** left · used 1,000 in 24h · 3,000 in 7d · running on credits",
   );
   assert.deepEqual(result.cards, [{
     provider: "codex", account: "codex-iv-large", window: "Weekly", available: true, status: "available",
-    used_percent: 100, credits_balance: 4000,
+    used_percent: 100, credits_balance: 4000, credits_account: "A",
   }]);
+  assert.deepEqual(result.switched, ["Credits: **500** left · running on credits", "B"]);
+  assert.equal(result.keyless[0], "Credits: **4,000** left · running on credits");
+  assert.equal(result.keyless[1].credits_balance, 4000);
+  assert.equal(Object.hasOwn(result.keyless[1], "credits_account"), false);
   // A session-file balance is shown but never recorded or compared.
   assert.equal(result.stale[0], null);
   assert.match(result.stale[1], /\nCredits: \*\*12\*\* left$/);
   assert.equal(Object.hasOwn(result.stale[2][0], "credits_balance"), false);
+  assert.equal(Object.hasOwn(result.stale[2][0], "credits_account"), false);
   assert.deepEqual(result.corrupt, {});
   assert.deepEqual(result.directory, {});
   assert.deepEqual(result.relative, {});
@@ -2492,8 +2561,9 @@ test("poster shows Codex credits left and records balances to report credits use
     `${JSON.stringify({ codex_accounts: { "codex-credits": codexHome }, default_codex_account: "codex-credits", projects: {} }, null, 2)}\n`,
   );
   const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
-  const respond = (balance) => fs.writeFileSync(responsesPath, `${JSON.stringify({
+  const respond = (balance, accountId = "fixture-chatgpt-account-a") => fs.writeFileSync(responsesPath, `${JSON.stringify({
     [fs.realpathSync(codexHome)]: {
+      accountId,
       rateLimits: {
         limitId: "codex",
         planType: "prolite",
@@ -2518,7 +2588,7 @@ test("poster shows Codex credits left and records balances to report credits use
 
   // The first run has no history yet, so it shows only what is left.
   respond("61285.3747500000");
-  const first = await run("2026-11-15T12:00:00Z");
+  const first = await run("2026-11-15T11:40:00Z");
   assert.equal(first.exitCode, 0, first.stderr || first.stdout);
   assert.match(lastCodexValue(), /\nCredits: \*\*61,285\*\* left · running on credits$/);
 
@@ -2539,14 +2609,49 @@ test("poster shows Codex credits left and records balances to report credits use
   ].join("\n"), historyPath, sql], { encoding: "utf8" }).stdout.trim().split("\n");
   const payloads = query("select payload_json from snapshots order by slot_utc").map((row) => JSON.parse(row));
   assert.deepEqual(payloads.map(({ cards }) => cards.find(({ provider }) => provider === "codex").credits_balance), [61285.3748, 62000, 60760]);
+  // Only a 16-hex salted hash of the account id is stored, never the id itself.
+  const accountKeys = payloads.map(({ cards }) => cards.find(({ provider }) => provider === "codex").credits_account);
+  assert.match(accountKeys[0], /^[0-9a-f]{16}$/);
+  assert.deepEqual(accountKeys, [accountKeys[0], accountKeys[0], accountKeys[0]]);
   const stored = payloads.map((row) => JSON.stringify(row)).join("\n");
-  assert.doesNotMatch(stored, /hasCredits|61285\.37475|rateLimitReachedType|fixture-(oauth|root)-token/);
+  assert.doesNotMatch(stored, /hasCredits|61285\.37475|rateLimitReachedType|fixture-chatgpt-account|accountId|fixture-(oauth|root)-token/);
 
   // The manual post reads history read-only: same figures, no new snapshot.
   const snapshotsBefore = query("select count(*) from snapshots")[0];
   const manual = await run("2026-11-16T11:55:00Z", []);
   assert.equal(manual.exitCode, 0, manual.stderr || manual.stdout);
   assert.match(lastCodexValue(), /\nCredits: \*\*60,760\*\* left · used 1,240 in 24h · running on credits$/);
+  assert.equal(query("select count(*) from snapshots")[0], snapshotsBefore);
+
+  // The home switches ChatGPT accounts under the same label: the old account's
+  // balances are never diffed into the new one (no false "used 60,260").
+  respond("500", "fixture-chatgpt-account-b");
+  const switched = await run("2026-11-16T11:58:00Z", []);
+  assert.equal(switched.exitCode, 0, switched.stderr || switched.stdout);
+  assert.match(lastCodexValue(), /\nCredits: \*\*500\*\* left · running on credits$/);
+  respond("60760.0");
+
+  // A locked database never stops a manual post; used figures are just omitted.
+  const locker = spawn("python3", ["-c", [
+    "import sqlite3, sys",
+    "connection = sqlite3.connect(sys.argv[1], isolation_level=None)",
+    "connection.execute('BEGIN EXCLUSIVE')",
+    "print('locked', flush=True)",
+    "sys.stdin.read()",
+  ].join("\n"), historyPath], { stdio: ["pipe", "pipe", "inherit"] });
+  const lockerExit = new Promise((resolve) => locker.on("exit", resolve));
+  registerTeardownCallback(async () => {
+    if (locker.exitCode === null) locker.kill();
+  });
+  await new Promise((resolve, reject) => {
+    locker.stdout.on("data", (chunk) => chunk.toString().includes("locked") && resolve());
+    locker.on("exit", () => reject(new Error("history locker exited early")));
+  });
+  const locked = await run("2026-11-16T11:59:00Z", []);
+  locker.stdin.end();
+  await lockerExit;
+  assert.equal(locked.exitCode, 0, locked.stderr || locked.stdout);
+  assert.match(lastCodexValue(), /\nCredits: \*\*60,760\*\* left · running on credits$/);
   assert.equal(query("select count(*) from snapshots")[0], snapshotsBefore);
 
   // Unreadable history never stops a manual post; used figures are just omitted.

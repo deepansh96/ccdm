@@ -801,8 +801,22 @@ def _codex_reset_credit_deadline(reset_credits, now=None):
 CODEX_CREDIT_BALANCE_MAX_LENGTH = 40
 # Used credits are summed over these trailing windows of the poster's history.
 CODEX_CREDIT_USAGE_WINDOWS = (("24h", timedelta(hours=24)), ("7d", timedelta(days=7)))
-# History must reach back to within this much of a window's start to cover it.
-CODEX_CREDIT_HISTORY_TOLERANCE = timedelta(minutes=30)
+# A window's baseline is the last stored balance at or before its start, and
+# must be no older than this; otherwise history cannot cover the window.
+CODEX_CREDIT_BASELINE_MAX_AGE = timedelta(hours=6)
+CODEX_CREDIT_ACCOUNT_KEY_PATTERN = re.compile(r"^[0-9a-f]{16}$")
+
+
+def _codex_credit_account_key(account_id):
+    """Return a short salted hash of the app-server ``accountId``, or ``None``.
+
+    Only this hash is kept, so credit history can tell accounts apart (a home
+    that switches ChatGPT accounts, or a label that moves) without storing the
+    identifier itself.
+    """
+    if not isinstance(account_id, str) or not account_id.strip():
+        return None
+    return hashlib.sha256(f"ccdm-credits:{account_id}".encode("utf-8")).hexdigest()[:16]
 
 
 def _parse_codex_credit_balance(value):
@@ -818,7 +832,8 @@ def _parse_codex_credit_balance(value):
         return None
     if not amount.is_finite() or amount < 0:
         return None
-    balance = float(amount)
+    # abs() turns "-0" into 0 so it never renders as "-0".
+    balance = float(abs(amount))
     return balance if math.isfinite(balance) else None
 
 
@@ -884,17 +899,21 @@ def format_codex_credits(rate_limits, credits_used=None):
 def _codex_credits_used(points, balance, now):
     """Sum credit-balance decreases per trailing window from ``(time, balance)`` points.
 
-    ``balance`` is the current live balance, taken as the last point at ``now``.
-    Increases between consecutive points are top-ups and are ignored. A window
-    whose earliest point is not within the tolerance of its start is ``None``.
+    ``points`` must all belong to the current account. ``balance`` is the
+    current live balance, taken as the last point at ``now``. Each window starts
+    from its baseline, the last point at or before the window start; without a
+    baseline no older than ``CODEX_CREDIT_BASELINE_MAX_AGE`` the window is
+    ``None``. Increases between consecutive points are top-ups and are ignored.
     """
+    ordered = sorted(points)
     used = {}
     for window, length in CODEX_CREDIT_USAGE_WINDOWS:
         start = now - length
-        series = sorted((at, value) for at, value in points if start <= at <= now)
-        if not series or series[0][0] > start + CODEX_CREDIT_HISTORY_TOLERANCE:
+        baseline = [point for point in ordered if point[0] <= start][-1:]
+        if not baseline or baseline[0][0] < start - CODEX_CREDIT_BASELINE_MAX_AGE:
             used[window] = None
             continue
+        series = baseline + [point for point in ordered if start < point[0] <= now]
         values = [value for _, value in series] + [balance]
         used[window] = sum(max(0.0, before - after) for before, after in zip(values, values[1:]))
     return used
@@ -912,7 +931,11 @@ def _history_credit_balance(value):
 
 
 def read_codex_credit_history(db_path, since):
-    """Read stored Codex credit balances per account since ``since``.
+    """Read stored Codex credit balances per label since ``since``.
+
+    Returns ``{label: [(slot, balance, account_key)]}``; ``account_key`` is the
+    stored account hash, or ``None`` when absent (such a point is never
+    compared with a live balance).
 
     The read is read-only and best effort: a missing, locked, unreadable, or
     malformed history returns ``{}`` (no used figures), never an error, so the
@@ -923,6 +946,10 @@ def read_codex_credit_history(db_path, since):
         if not path.is_absolute():
             return {}
         if not stat.S_ISREG(os.lstat(path).st_mode):
+            return {}
+        # The store always uses a rollback journal. A WAL sidecar is foreign,
+        # and even a read-only open would write its shared-memory file, so skip.
+        if any(os.path.lexists(f"{path}{suffix}") for suffix in ("-wal", "-shm")):
             return {}
         connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=2)
         try:
@@ -953,7 +980,9 @@ def read_codex_credit_history(db_path, since):
             if not isinstance(account, str) or balance is None or account in seen:
                 continue
             seen.add(account)
-            history.setdefault(account, []).append((slot, balance))
+            key = card.get("credits_account")
+            key = key if isinstance(key, str) and CODEX_CREDIT_ACCOUNT_KEY_PATTERN.match(key) else None
+            history.setdefault(account, []).append((slot, balance, key))
     return history
 
 
@@ -1104,6 +1133,10 @@ def read_codex_rate_limits(codex_home):
         rate_limits = dict(rate_limits)
         if "rateLimitResetCredits" in result:
             rate_limits["rateLimitResetCredits"] = result["rateLimitResetCredits"]
+        # Keep only a salted hash of the account id, for credit history.
+        account_key = _codex_credit_account_key(result.get("accountId"))
+        if account_key:
+            rate_limits["creditAccountKey"] = account_key
         return rate_limits
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
@@ -1308,22 +1341,32 @@ def _claude_headers(oauth, client_version=None):
     }
 
 
+# Scoped weekly buckets whose suffix names a model, e.g. ``seven_day_opus``.
+CLAUDE_RESET_MODEL_BUCKETS = {"fable": "Fable", "opus": "Opus", "sonnet": "Sonnet", "haiku": "Haiku"}
+
+
 def _claude_reset_group(grant, scope_name):
     """Return a reset grant's display group, or ``None`` for an unknown shape.
 
-    A grant that clears the all-models ``seven_day`` bucket is a general reset.
-    One that clears only a scoped weekly bucket (``seven_day_<bucket>``) resets
-    a single model's allowance: it is named after the account's one model-scoped
-    weekly limit, else "Fable" when its label says so, else "model".
+    A grant that clears the all-models ``seven_day`` bucket, or the 5-hour
+    session without any 7-day bucket, is a general reset. One that clears only
+    a scoped weekly bucket (``seven_day_<bucket>``) resets a single model's
+    allowance: it takes the model named by the bucket (``seven_day_opus``),
+    else the account's one model-scoped weekly limit, else "Fable" when its
+    label says so, else "model". A grant without a ``clears`` list is ignored.
     """
     clears = grant.get("clears")
     if not isinstance(clears, list):
         return None
-    buckets = {bucket for bucket in clears if isinstance(bucket, str)}
+    buckets = [bucket for bucket in clears if isinstance(bucket, str)]
     if "seven_day" in buckets:
         return "general"
-    if not any(bucket.startswith("seven_day_") for bucket in buckets):
-        return None
+    scoped = [bucket[len("seven_day_"):] for bucket in buckets if bucket.startswith("seven_day_")]
+    if not scoped:
+        return "general" if "five_hour" in buckets else None
+    named = next((CLAUDE_RESET_MODEL_BUCKETS[name] for name in scoped if name in CLAUDE_RESET_MODEL_BUCKETS), None)
+    if named:
+        return named
     if scope_name:
         return scope_name
     label = grant.get("label")
@@ -1745,8 +1788,17 @@ def _metric_from_codex_rate_limits(rate_limits, label, source="live", source_ts=
         # Only a live balance is recorded and compared: a stale session-file
         # balance would date old spending to this slot.
         metric["credits_balance"] = credits["balance"]
-        points = (credit_history or {}).get(_safe_label(label, "unknown"), [])
-        credits_used = _codex_credits_used(points, credits["balance"], now or datetime.now(timezone.utc))
+        account_key = rate_limits.get("creditAccountKey")
+        if isinstance(account_key, str) and CODEX_CREDIT_ACCOUNT_KEY_PATTERN.match(account_key):
+            # Compare only balances from this same account: a home that
+            # switched accounts, or a label that moved, starts a new series.
+            metric["credits_account"] = account_key
+            points = [
+                (at, value)
+                for at, value, key in (credit_history or {}).get(_safe_label(label, "unknown"), [])
+                if key == account_key
+            ]
+            credits_used = _codex_credits_used(points, credits["balance"], now or datetime.now(timezone.utc))
     metric["text"] = format_codex_rate_limits(rate_limits, label, source_ts=source_ts, credits_used=credits_used)
     if source_ts:
         metric["source_ts"] = source_ts
@@ -2537,6 +2589,9 @@ def _safe_history_cards(metrics):
         balance = _history_credit_balance(metric.get("credits_balance"))
         if provider == "codex" and balance is not None and len(cards) > first_card:
             cards[first_card]["credits_balance"] = round(balance, 4)
+            key = metric.get("credits_account")
+            if isinstance(key, str) and CODEX_CREDIT_ACCOUNT_KEY_PATTERN.match(key):
+                cards[first_card]["credits_account"] = key
     return cards
 
 
@@ -3016,7 +3071,7 @@ def post_dashboard_to_discord(config, bot_token, image_paths, claude_value, code
 def _codex_credit_history(config, now):
     """Read the credit balances that the used-credit windows can need."""
     longest = max(length for _, length in CODEX_CREDIT_USAGE_WINDOWS)
-    return read_codex_credit_history(config["history_db_path"], now - longest - CODEX_CREDIT_HISTORY_TOLERANCE)
+    return read_codex_credit_history(config["history_db_path"], now - longest - CODEX_CREDIT_BASELINE_MAX_AGE)
 
 
 def build_parser():
