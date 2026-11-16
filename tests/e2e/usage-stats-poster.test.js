@@ -456,6 +456,244 @@ test("missing or malformed Claude utilization is recorded as unavailable", async
   assert.doesNotMatch(payloadProbe.stdout, /\"used_percent\":0/);
 });
 
+// Anthropic's `limits` array, shaped like a live `/api/oauth/usage` response.
+function claudeLimit(kind, percent, resetsAt, model = null, surface = null) {
+  return {
+    kind,
+    group: kind === "session" ? "session" : "weekly",
+    percent,
+    severity: "normal",
+    resets_at: resetsAt,
+    scope: kind === "weekly_scoped" ? { model: model === null ? null : { id: null, display_name: model }, surface } : null,
+    is_active: false,
+  };
+}
+
+function claudeLegacyWindow(utilization, resetsAt) {
+  return { utilization, resets_at: resetsAt, limit_dollars: null, used_dollars: null, remaining_dollars: null, locked_reason: null };
+}
+
+const claudeFutureReset = (hours) => new Date(Date.now() + hours * 3_600_000 + 1_800_000).toISOString();
+
+function postedClaudeValue(api) {
+  return JSON.parse(api.requests.find((request) => request.method === "POST").body).embeds[0].fields[0].value;
+}
+
+test("scheduled poster shows Claude 7-day usage for all models and for Fable, and keeps them separate in history", async () => {
+  const workspace = createWorkspace();
+  const session = claudeFutureReset(3);
+  const weekly = claudeFutureReset(100);
+  const api = await startPosterApi({
+    usage: {
+      extra_usage: { is_enabled: false },
+      five_hour: claudeLegacyWindow(45.0, session),
+      seven_day: claudeLegacyWindow(39.0, weekly),
+      seven_day_opus: null,
+      seven_day_sonnet: null,
+      limits: [
+        claudeLimit("session", 45, session),
+        claudeLimit("weekly_all", 39, weekly),
+        claudeLimit("weekly_scoped", 40, weekly, "Fable"),
+      ],
+      weekly_scoped_shares: [{ limit_index: 2, used_percent_of_weekly: 20, allowance_percent_of_weekly: 50 }],
+    },
+  });
+  const historyPath = path.join(workspace.homeDir, "history", "history.sqlite3");
+  seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+    args: ["--scheduled"],
+    env: { CCDM_USAGE_STATS_NOTIFY: "0" },
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const lines = postedClaudeValue(api).split("\n");
+  assert.equal(lines[0], "**claude-p** (Pro)");
+  assert.match(lines[1], /^5-Hour: `\[#######\.{8}\]` \*\*45%\*\*  resets in 3h \d+m$/);
+  assert.match(lines[2], /^7-Day \(all\): `\[######\.{9}\]` \*\*39%\*\*  resets in 4d 4h$/);
+  assert.match(lines[3], /^7-Day \(Fable\): `\[######\.{9}\]` \*\*40%\*\*  resets in 4d 4h$/);
+  assert.equal(lines.length, 4);
+
+  const probe = spawnSync("python3", ["-c", [
+    "import sqlite3, sys",
+    "connection = sqlite3.connect(sys.argv[1])",
+    "print(connection.execute('select payload_json from snapshots').fetchone()[0])",
+  ].join("\n"), historyPath], { encoding: "utf8" });
+  assert.equal(probe.status, 0, probe.stderr);
+  assert.doesNotMatch(probe.stdout, /fixture-oauth-token|weekly_scoped_shares|display_name/);
+  const cards = JSON.parse(probe.stdout).cards.filter((card) => card.provider === "claude");
+  assert.deepEqual(cards.map(({ window, scope, used_percent: used }) => ({ window, scope, used })), [
+    { window: "5-hour", scope: undefined, used: 45 },
+    { window: "7-day", scope: undefined, used: 39 },
+    { window: "7-day (Fable)", scope: "Fable", used: 40 },
+  ]);
+  assert.equal(cards[2].resets_at, cards[1].resets_at);
+  assert.match(cards[2].resets_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/);
+});
+
+test("poster shows a Max account's all-models and Fable weekly limits without a 5-hour row", async () => {
+  const workspace = createWorkspace();
+  const weekly = claudeFutureReset(50);
+  const api = await startPosterApi({
+    organization: { organization_type: "claude_max" },
+    usage: {
+      extra_usage: { is_enabled: false },
+      five_hour: null,
+      seven_day: claudeLegacyWindow(80.0, weekly),
+      limits: [claudeLimit("weekly_all", 80, weekly), claudeLimit("weekly_scoped", 89, weekly, "Fable")],
+    },
+  });
+  seedPosterWorkspace(workspace, api.baseUrl);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const lines = postedClaudeValue(api).split("\n");
+  assert.equal(lines[0], "**claude-p** (Claude Max)");
+  assert.match(lines[1], /^7-Day \(all\): `\[############\.{3}\]` \*\*80%\*\*  resets in 2d 2h$/);
+  assert.match(lines[2], /^7-Day \(Fable\): `\[#############\.{2}\]` \*\*89%\*\*  resets in 2d 2h$/);
+  assert.equal(lines.length, 3);
+});
+
+test("poster keeps the legacy Claude rows when the limits array is missing or malformed", async () => {
+  const weekly = claudeFutureReset(30);
+  const cases = [
+    // No `limits` at all: today's 5-Hour and 7-Day rows, unchanged labels.
+    [{}, ["5-Hour: `[######.........]` **37%**", "7-Day: `[#########......]` **62%**"]],
+    [{ limits: "not-a-list" }, ["5-Hour: `[######.........]` **37%**", "7-Day: `[#########......]` **62%**"]],
+    [{ limits: { kind: "weekly_scoped" } }, ["5-Hour: `[######.........]` **37%**", "7-Day: `[#########......]` **62%**"]],
+    // Legacy weekly field gone, but the limits array still reports the window.
+    [
+      { five_hour: null, seven_day: null, limits: [claudeLimit("weekly_all", 14, weekly), claudeLimit("weekly_scoped", 2, weekly, "Fable")] },
+      [/^7-Day \(all\): `\[#{2}\.{13}\]` \*\*14%\*\*  resets in 1d 6h$/, /^7-Day \(Fable\): `\[\.{15}\]` \*\*2%\*\*  resets in 1d 6h$/],
+    ],
+    // Legacy five_hour gone: the 5-hour row comes from the `session` entry.
+    [
+      { five_hour: null, limits: [claudeLimit("session", 45, claudeFutureReset(2)), claudeLimit("weekly_all", 62, weekly)] },
+      [/^5-Hour: `\[#######\.{8}\]` \*\*45%\*\*  resets in 2h \d+m$/, "7-Day: `[#########......]` **62%**"],
+    ],
+    // Legacy dicts present but with unusable utilization: the limits entries win.
+    [
+      {
+        five_hour: claudeLegacyWindow(null, null),
+        seven_day: claudeLegacyWindow("not-a-number", null),
+        limits: [claudeLimit("session", 10, claudeFutureReset(2)), claudeLimit("weekly_all", 20, weekly)],
+      },
+      [/^5-Hour: `\[##\.{13}\]` \*\*10%\*\*  resets in 2h \d+m$/, /^7-Day: `\[###\.{12}\]` \*\*20%\*\*  resets in 1d 6h$/],
+    ],
+    // Both sources unusable: the row stays unavailable rather than 0%.
+    [
+      { five_hour: claudeLegacyWindow(null, null), limits: [claudeLimit("session", "bad", null)] },
+      ["5-Hour: *unavailable*", "7-Day: `[#########......]` **62%**"],
+    ],
+  ];
+  for (const [usage, expected] of cases) {
+    const workspace = createWorkspace();
+    const api = await startPosterApi({ usage: { extra_usage: { is_enabled: false }, ...usage } });
+    seedPosterWorkspace(workspace, api.baseUrl);
+
+    const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+    const lines = postedClaudeValue(api).split("\n").slice(1);
+    assert.equal(lines.length, expected.length, JSON.stringify(lines));
+    expected.forEach((line, index) => (typeof line === "string" ? assert.equal(lines[index], line) : assert.match(lines[index], line)));
+  }
+});
+
+test("poster ignores malformed and unknown Claude limit entries", async () => {
+  const workspace = createWorkspace();
+  const weekly = claudeFutureReset(30);
+  const api = await startPosterApi({
+    usage: {
+      extra_usage: { is_enabled: false },
+      limits: [
+        null,
+        "weekly_scoped",
+        claudeLimit("monthly_scoped", 70, weekly, "Fable"),
+        claudeLimit("weekly_scoped", 11, weekly, null, { id: "desktop" }),
+        claudeLimit("weekly_scoped", 12, weekly, "Haiku", { id: "desktop" }),
+        claudeLimit("weekly_scoped", 13, weekly, "   "),
+        { ...claudeLimit("weekly_scoped", 14, weekly), scope: "Fable" },
+        { ...claudeLimit("weekly_scoped", 15, weekly), scope: { model: { display_name: 42 }, surface: null } },
+        claudeLimit("weekly_scoped", true, weekly, "Fable"),
+        claudeLimit("weekly_scoped", 99, weekly, "fable"),
+        claudeLimit("weekly_scoped", 33, weekly, "Opus `*4*`"),
+      ],
+    },
+  });
+  seedPosterWorkspace(workspace, api.baseUrl);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.deepEqual(postedClaudeValue(api).split("\n").slice(1).map((line) => line.replace(/  resets in .*$/, "")), [
+    "5-Hour: `[######.........]` **37%**",
+    "7-Day (all): `[#########......]` **62%**",
+    // A boolean percent is unavailable, never 1% or 0%; a later "fable" duplicate is dropped.
+    "7-Day (Fable): *unavailable*",
+    "7-Day (Opus 4): `[#####..........]` **33%**",
+  ]);
+});
+
+test("Claude scoped limits validate percentages like utilization and clamp at the 0/100 boundary", () => {
+  const probe = probePoster([
+    "import json, math",
+    "def scoped(percent, name='Fable'):",
+    "    return {'kind': 'weekly_scoped', 'percent': percent, 'resets_at': '2026-11-20T19:59:59.955104+00:00', 'scope': {'model': {'id': None, 'display_name': name}, 'surface': None}}",
+    "cases = [0, 100, -5, 250, 0.4, '40', True, False, None, 'nan', float('inf'), [1], {}]",
+    "out = []",
+    "for value in cases:",
+    "    [entry] = poster._claude_scoped_limits({'limits': [scoped(value)]})",
+    "    legacy = poster._claude_limit_entry('7-day', value, None)",
+    "    out.append([entry['used_percent'], entry['available'], entry['status'], legacy['used_percent'], legacy['available']])",
+    "print(json.dumps({",
+    "  'cases': out,",
+    "  'entry': poster._claude_scoped_limits({'limits': [scoped(100)]})[0],",
+    "  'cards': poster._safe_history_cards([{'provider': 'claude', 'account': 'claude-p', 'limits': [",
+    "      poster._claude_limit_entry('7-day', 0, None),",
+    "      poster._claude_scoped_limits({'limits': [scoped(100)]})[0],",
+    "  ]}]),",
+    "  'none': poster._claude_scoped_limits({'limits': None}) + poster._claude_scoped_limits(None) + poster._claude_scoped_limits({}),",
+    "}))",
+  ].join("\n"));
+  assert.equal(probe.status, 0, probe.stderr);
+  const result = JSON.parse(probe.stdout);
+  assert.deepEqual(result.cases, [
+    [0, true, "available", 0, true],
+    [100, true, "available", 100, true],
+    [0, true, "available", 0, true],
+    [100, true, "available", 100, true],
+    [0.4, true, "available", 0.4, true],
+    [40, true, "available", 40, true],
+    [null, false, "unavailable", null, false],
+    [null, false, "unavailable", null, false],
+    [null, false, "unavailable", null, false],
+    [null, false, "unavailable", null, false],
+    [null, false, "unavailable", null, false],
+    [null, false, "unavailable", null, false],
+    [null, false, "unavailable", null, false],
+  ]);
+  assert.deepEqual(result.entry, {
+    window: "7-day (Fable)",
+    scope: "Fable",
+    used_percent: 100,
+    available: true,
+    status: "available",
+    reason: null,
+    resets_at: "2026-11-20T19:59:59.955104Z",
+  });
+  // History keeps the all-models and Fable series apart: distinct windows, and only the scoped card has `scope`.
+  assert.deepEqual(result.cards, [
+    { provider: "claude", account: "claude-p", window: "7-day", available: true, status: "available", used_percent: 0 },
+    {
+      provider: "claude", account: "claude-p", window: "7-day (Fable)", available: true, status: "available",
+      scope: "Fable", used_percent: 100, resets_at: "2026-11-20T19:59:59.955104Z",
+    },
+  ]);
+  assert.deepEqual(result.none, []);
+});
+
 test("history store preserves shared parents and rejects unsupported schemas and symlink paths", async () => {
   const workspace = createWorkspace();
   const api = await startPosterApi();
@@ -1730,7 +1968,15 @@ test("poster includes hand-authored Claude API-account cost estimates", async ()
   assert.match(claudeValue, /Cache: 16\.4k read · 20\.5k write/);
 });
 
-test("poster truncates long Claude sections at Discord's field limit", async () => {
+function assertEmbedWithinDiscordLimits(embed) {
+  assert.ok(embed.fields.length <= 25, `${embed.fields.length} fields`);
+  for (const field of embed.fields) assert.ok(field.value.length <= 1024, `${field.name}: ${field.value.length}`);
+  const total = embed.title.length + embed.footer.text.length
+    + embed.fields.reduce((sum, field) => sum + field.name.length + field.value.length, 0);
+  assert.ok(total <= 6000, `embed total ${total}`);
+}
+
+test("poster splits long Claude sections into extra fields at account boundaries", async () => {
   const workspace = createWorkspace();
   const api = await startPosterApi();
   const accounts = Array.from({ length: 40 }, (_, index) => ({
@@ -1744,10 +1990,142 @@ test("poster truncates long Claude sections at Discord's field limit", async () 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const post = api.requests.find((request) => request.method === "POST");
   assert.ok(post);
-  const value = JSON.parse(post.body).embeds[0].fields[0].value;
-  assert.ok(value.length <= 1024);
-  assert.match(value, /\*truncated\*$/);
-  assert.match(value, /Configured Claude API account 0/);
+  const embed = JSON.parse(post.body).embeds[0];
+  assertEmbedWithinDiscordLimits(embed);
+  assert.ok(embed.fields.length > 1);
+  assert.deepEqual(new Set(embed.fields.map(({ name }) => name)), new Set(["Claude Code", "Claude Code (cont.)"]));
+  assert.equal(embed.fields[0].name, "Claude Code");
+  assert.ok(embed.fields.every(({ inline }) => inline === true));
+  const blocks = embed.fields.flatMap(({ value }) => value.split("\n\n"));
+  assert.doesNotMatch(blocks.join("\n"), /truncated/);
+  // claude-p first, then every API account, each block whole and in order.
+  assert.match(blocks[0], /^\*\*claude-p\*\* \(Pro\)/);
+  assert.deepEqual(
+    blocks.slice(1).map((block) => block.match(/^\*\*Configured Claude API account (\d+) /)?.[1]),
+    accounts.map((_, index) => String(index)),
+  );
+  for (const block of blocks.slice(1)) assert.match(block, /^\*\*[^\n]+\*\* \(API key\)\n\*Unable to read local usage\*$/);
+});
+
+test("poster shows every block of three Fable accounts and three busy API accounts without truncation", async () => {
+  const workspace = createWorkspace();
+  const session = claudeFutureReset(2);
+  const weekly = claudeFutureReset(110);
+  const api = await startPosterApi({
+    organization: { organization_type: "claude_max" },
+    usage: {
+      extra_usage: { is_enabled: true, used_credits: 0 },
+      five_hour: claudeLegacyWindow(47.0, session),
+      seven_day: claudeLegacyWindow(39.0, weekly),
+      limits: [
+        claudeLimit("session", 47, session),
+        claudeLimit("weekly_all", 39, weekly),
+        claudeLimit("weekly_scoped", 41, weekly, "Fable"),
+      ],
+    },
+    resetGrants: {
+      eligible: true,
+      ineligible_reason: null,
+      grants: [{ id: "launch", resets_total: 4, resets_left: 4, ends_at: claudeFutureReset(24 * 24), paused: false }],
+    },
+  });
+  for (const name of [".claude-af", ".claude-iv"]) {
+    const dir = path.join(workspace.homeDir, name);
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, ".claude.json"), `${JSON.stringify({ oauthAccount: { emailAddress: "fixture@example.test" } })}\n`);
+  }
+  const apiAccounts = [];
+  for (const [index, name] of ["claude-t4d-api", "claude-iv-api", "claude-p-api"].entries()) {
+    const home = path.join(workspace.homeDir, `.fixture-${name}`);
+    fs.mkdirSync(path.join(home, "projects", "fixture-project"), { recursive: true });
+    const records = ["claude-fable-5-2", "claude-opus-5-5", "claude-haiku-4-5-20251001"].flatMap((model, modelIndex) =>
+      Array.from({ length: 3 + index + modelIndex }, (_, count) => JSON.stringify({
+        timestamp: new Date().toISOString(),
+        type: "assistant",
+        message: {
+          id: `fixture-${name}-${model}-${count}`,
+          model,
+          usage: { input_tokens: 120, output_tokens: 3800, cache_read_input_tokens: 240000, cache_creation_input_tokens: 9100 },
+        },
+      })));
+    fs.writeFileSync(path.join(home, "projects", "fixture-project", "session.jsonl"), `${records.join("\n")}\n`);
+    apiAccounts.push({ path: `~/.fixture-${name}`, label: name });
+  }
+  seedPosterWorkspace(workspace, api.baseUrl, { claude_api_accounts: apiAccounts });
+  const state = readState(workspace.stateDir);
+  for (const name of [".claude-af", ".claude-iv"]) {
+    state.fixtures.security.credentials[serviceFor(path.join(workspace.homeDir, name))] = {
+      claudeAiOauth: { accessToken: "fixture-oauth-token" },
+    };
+  }
+  writeState(state, workspace.stateDir);
+  installNativeClaude(workspace, "2.1.293");
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const embed = JSON.parse(api.requests.find((request) => request.method === "POST").body).embeds[0];
+  assertEmbedWithinDiscordLimits(embed);
+  const claudeFields = embed.fields.filter(({ name }) => name.startsWith("Claude Code"));
+  assert.deepEqual(claudeFields.map(({ name }) => name), ["Claude Code", "Claude Code (cont.)"]);
+  // The single-field form of this report would be over Discord's limit.
+  assert.ok(claudeFields.reduce((sum, { value }) => sum + value.length + 2, -2) > 1024);
+  const blocks = claudeFields.flatMap(({ value }) => value.split("\n\n"));
+  assert.doesNotMatch(blocks.join("\n"), /truncated/);
+  assert.deepEqual(blocks.map((block) => block.split("\n")[0].replace(/^\*\*([^*]+)\*\*.*$/, "$1")), [
+    "claude-p", "claude-af", "claude-iv", "claude-t4d-api", "claude-iv-api", "claude-p-api",
+  ]);
+  for (const block of blocks.slice(0, 3)) {
+    assert.deepEqual(block.split("\n").slice(1).map((line) => line.split(":")[0]), [
+      "5-Hour", "7-Day (all)", "7-Day (Fable)", "Extra usage", "Limit resets available",
+    ]);
+  }
+  for (const block of blocks.slice(3)) {
+    assert.match(block, /\(API key, local estimate\)\nToday: .*\nThis month: .*\nTokens: .*\nCache: .*\nModels: .*\n\*Only Claude Code usage recorded on this Mac\*$/);
+  }
+});
+
+test("usage report fields pack whole blocks, truncate only an oversized block, and respect the embed budget", () => {
+  const probe = probePoster([
+    "import json",
+    "def metric(text): return {'text': text}",
+    "line = 'x' * 60",
+    "huge = '**huge** (Pro)\\n' + '\\n'.join([line] * 30)",
+    "small = ['**acct-%d** (Pro)\\n' % i + '\\n'.join([line] * 4) for i in range(3)]",
+    "claude, codex = poster._usage_report_values([metric(small[0]), metric(huge), metric(small[1]), {'text': None}, metric(small[2])], [])",
+    "many = [metric('**acct-%02d** (Pro)\\n' % i + '\\n'.join([line] * 12)) for i in range(20)]",
+    "many_claude, many_codex = poster._usage_report_values(many, [metric('**codex** (ChatGPT)\\nWeekly: 1%')])",
+    "embed = poster._usage_report_embed(many_claude, many_codex)",
+    "print(json.dumps({'claude': claude, 'codex': codex, 'small': small, 'many_fields': len(many_claude), 'embed': embed,",
+    "  'string': poster._usage_report_embed('one', 'two')['fields'], 'empty': poster._usage_report_values([], [])}))",
+  ].join("\n"));
+  assert.equal(probe.status, 0, probe.stderr);
+  const result = JSON.parse(probe.stdout);
+  // The oversized block gets its own field, cut at a line boundary; its neighbours stay whole.
+  assert.equal(result.claude.length, 3);
+  assert.equal(result.claude[0], result.small[0]);
+  assert.ok(result.claude[1].startsWith("**huge** (Pro)\n"));
+  assert.ok(result.claude[1].length <= 1024);
+  assert.match(result.claude[1], /\nx{60}\n\*truncated\*$/);
+  assert.equal(result.claude[2], `${result.small[1]}\n\n${result.small[2]}`);
+  assert.equal(result.codex, null);
+  // 20 blocks of ~750 characters need 20 fields, more than the 6000-character embed allows.
+  assert.equal(result.many_fields, 20);
+  assertEmbedWithinDiscordLimits(result.embed);
+  // Claude loses trailing fields; Codex keeps its field; the last kept Claude field says so.
+  const names = result.embed.fields.map(({ name }) => name);
+  assert.ok(names.length < 21);
+  assert.equal(names[0], "Claude Code");
+  assert.equal(names.at(-1), "Codex");
+  assert.deepEqual(new Set(names.slice(1, -1)), new Set(["Claude Code (cont.)"]));
+  assert.match(result.embed.fields.at(-2).value, /\n\*truncated\*$/);
+  assert.equal(result.embed.fields.at(-1).value, "**codex** (ChatGPT)\nWeekly: 1%");
+  assert.equal(result.embed.fields.slice(0, -2).filter(({ value }) => /truncated/.test(value)).length, 0);
+  assert.deepEqual(result.string, [
+    { name: "Claude Code", value: "one", inline: true },
+    { name: "Codex", value: "two", inline: true },
+  ]);
+  assert.deepEqual(result.empty, [[""], null]);
 });
 
 test("poster reports missing config, Keychain, and endpoint failures without credentials", async () => {
