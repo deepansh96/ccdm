@@ -26,6 +26,16 @@ const OBSERVER_KEY_FILE = ".observer.key";
 const SUPERVISOR_KEY_FILE = ".supervisor.key";
 const PROVIDERS = new Set(["claude", "codex"]);
 const PUBLIC_THREAD = 11;
+// How long a hello whose check needs Discord waits for the gateway after a
+// Router start, before it is refused as `not_ready` (which a client retries).
+const DEFAULT_HELLO_READY_WAIT_MS = 60000;
+// Discord answers that settle a thread check: the channel is gone, or root cannot see it.
+const CHANNEL_GONE = new Set([403, 404]);
+
+function helloReadyWaitMs(env = process.env) {
+  const value = Number(env.CCDM_ROUTER_HELLO_READY_WAIT_MS);
+  return env.CCDM_ROUTER_HELLO_READY_WAIT_MS && Number.isFinite(value) && value >= 0 ? value : DEFAULT_HELLO_READY_WAIT_MS;
+}
 
 function send(socket, frame) {
   if (!socket.destroyed) socket.write(`${JSON.stringify(frame)}\n`);
@@ -281,8 +291,25 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     send(connection.socket, { type: "hello_ok", v: PROTOCOL_VERSION, scope: projectScope(route) });
   }
 
+  // Whether the gateway is ready, waiting up to `helloReadyWaitMs()` for it.
+  async function gatewayReady() {
+    if (!context.gatewayReady) return true;
+    let timer;
+    const timedOut = new Promise(resolve => { timer = setTimeout(() => resolve(false), helloReadyWaitMs()); });
+    try {
+      return await Promise.race([context.gatewayReady.then(() => true), timedOut]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   // A thread session: its own key, and a public thread under its registered,
-  // non-`remote:` project's channel. The thread is checked once, here.
+  // non-`remote:` project's channel. The thread is checked once, here, and
+  // only once the gateway is ready: right after a Router start the socket
+  // already listens, and every live thread session says hello again at once.
+  // Refused then, a client of any version would end for good, so the hello
+  // waits instead; past the wait it is refused as `not_ready`, which current
+  // clients retry.
   async function threadHello(connection, frame, reject) {
     const threadId = String(frame.thread_id ?? "");
     const route = getTable().projects.get(String(frame.project));
@@ -290,7 +317,21 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       !keysMatch(await threadKey(threadId), frame.key)) {
       return reject("unauthorized", "unknown project, thread or key");
     }
-    const channel = await context.discord?.client?.channels.fetch(threadId).catch(() => null);
+    if (!(await gatewayReady())) {
+      return reject("not_ready", "the Router's Discord gateway is not ready yet; say hello again");
+    }
+    if (connection.socket.destroyed) return;  // The client gave up while it waited.
+    let channel = null;
+    try {
+      channel = await context.discord?.client?.channels.fetch(threadId);
+    } catch (error) {
+      // Only Discord's own answer settles it; a failed lookup is retried.
+      if (!CHANNEL_GONE.has(error?.status)) {
+        log(`thread_hello_check_failed thread=${threadId} error=${error?.message ?? error}`);
+        return reject("not_ready", `${threadId} could not be checked yet; say hello again`);
+      }
+    }
+    if (connection.socket.destroyed) return;
     if (route.remote || channel?.type !== PUBLIC_THREAD || String(channel.parentId) !== route.channel_id) {
       return reject("not_a_project_thread", `${threadId} is not a public thread in ${route.project}'s channel`);
     }

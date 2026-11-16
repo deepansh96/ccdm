@@ -100,6 +100,10 @@ While the supervisor is down, a thread message with no live session gets 💤. T
 - it marks dead sessions `crashed`;
 - it starts only threads whose newest owner message is newer than the last agent reply, with the undelivered messages in the bootstrap; a root mention or a native reply to root never counts.
 
+A registered project channel that Discord no longer has (or that root cannot read) is skipped by the Router's thread list and named in the supervisor's log, and the other channels reconcile as usual; `router status` shows such a project as `channel_missing`.
+
+After a Router restart, every live thread session says hello again. The Router listens before its Discord gateway is ready, so a thread hello waits for it (up to 60 s) before checking the thread, and thread sessions come back on their own. Past that wait the hello is refused as `not_ready`, and the client tries again.
+
 A live session that dies while the supervisor runs is marked `crashed` as soon as the Router reports it gone, which frees its slot. Crashed, failed and operator-stopped sessions never restart automatically; the next owner or guest message resumes them.
 
 ## Project changes

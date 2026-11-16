@@ -51,6 +51,12 @@ def reconcile(context, _event: dict | None = None) -> None:
         listed = context.link.call("thread_list", {"archived_within_days": ARCHIVED_WITHIN_DAYS}) or {}
     except LinkError as error:
         return _log(f"reconcile: the thread list failed: {error.code}")
+    # A registered channel Discord no longer has (or root cannot read) is
+    # skipped by the Router; the rest of the list still reconciles.
+    for skipped in listed.get("skipped_channels") or []:
+        if isinstance(skipped, dict):
+            _log(f"reconcile: skipped project {skipped.get('project')}'s channel {skipped.get('channel_id')} "
+                 f"(Discord {skipped.get('status')})")
     for thread in listed.get("threads") or []:
         if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
             continue

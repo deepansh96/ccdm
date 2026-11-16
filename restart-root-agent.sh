@@ -22,7 +22,7 @@ import sys
 node = os.environ.get("CCDM_ROUTER_NODE") or "node"
 try:
     status = subprocess.run([node, sys.argv[1], "status"], stdout=subprocess.DEVNULL,
-                            stderr=subprocess.PIPE, text=True, timeout=15)
+                            stderr=subprocess.PIPE, text=True, timeout=45)
 except (OSError, subprocess.TimeoutExpired) as error:
     sys.exit(f"Router status check failed: {error}")
 if status.returncode:

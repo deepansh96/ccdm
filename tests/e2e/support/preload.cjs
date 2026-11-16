@@ -476,6 +476,11 @@ function routeDiscordApi(url, init = {}) {
         ...(before ? { before } : {}) });
     });
     const json = body => response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
+    // `missingChannels`: channels Discord no longer has.
+    if (archivedThreadsMatch && (readState().fixtures?.discord?.missingChannels ?? []).includes(archivedThreadsMatch[1])) {
+      return response(JSON.stringify({ code: 10003, message: "Unknown Channel" }),
+        { headers: { "content-type": "application/json" }, status: 404 });
+    }
     if (activeThreadsMatch) return json({ threads: threads.filter(thread => !thread.archived && (!thread.guildId || thread.guildId === activeThreadsMatch[1])).map(threadChannel), members: [] });
     const archived = threads.filter(thread => thread.archived && thread.type === 11 &&
       thread.parentId === archivedThreadsMatch[1] && (!before || Date.parse(thread.archiveTimestamp) < Date.parse(before)))
