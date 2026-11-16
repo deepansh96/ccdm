@@ -20,8 +20,7 @@ test.afterEach(cleanup);
 const BOT_USER_ID = "fixture-bot-user-id";
 const PAUSED = "Paused to free a session slot; send a message here to resume.";
 // The production 30-minute idle threshold, cut to nothing for the tests.
-const NO_IDLE_WAIT = { CCDM_THREAD_IDLE_S: "0", CCDM_THREAD_ARCHIVE_POLL_WINDOW_S: "1",
-  CCDM_THREAD_ARCHIVE_POLL_INTERVAL_S: "0.2" };
+const NO_IDLE_WAIT = { CCDM_THREAD_IDLE_S: "0" };
 // Each thread runs in its own tmux session, `<screen>-t-<thread id>`.
 const THREADS = {
   a: { id: "1700000000000100001", name: "Thread A" },
@@ -191,8 +190,18 @@ test("a session mid-turn or without activity.json is never evicted: new threads 
     assert.deepEqual([(await threadRow(workspace, thread)).state, notices(workspace, thread)], ["live", []]);
   }
 
-  // An archive frees A's slot: the queue head, C, starts with its queued message.
+  // An archive of A mid-turn is reverted and A keeps its session and its slot.
   threadEvent(workspace, THREADS.a, "update", { archived: true, previous: { id: THREADS.a.id, archived: false } });
+  await waitFor(() => readState(workspace.stateDir).fixtures.discord.threads[THREADS.a.id]?.archived === false,
+    () => "A's unarchive");
+  await new Promise(resolve => setTimeout(resolve, 500));
+  assert.deepEqual([(await threadRow(workspace, THREADS.a)).state, (await threadRow(workspace, THREADS.c)).state],
+    ["live", "queued"]);
+
+  // /close frees A's slot: the queue head, C, starts with its queued message.
+  injectDiscordMessage(workspace, { id: "a-close", channelId: THREADS.a.id, content: "/close",
+    author: { id: OWNER_ID, username: "Owner" } });
+  await threadRow(workspace, THREADS.a, row => row.state === "closed");
   await threadRow(workspace, THREADS.c, row => row.state === "live");
   await waitFor(() => replies(workspace, THREADS.c).length === 1, () => "C's reply", 20000);
   assert.match(claude(workspace).channelNotifications.find(n => n.meta.chat_id === THREADS.c.id).content, /start C/);
@@ -316,8 +325,9 @@ test("a queued creation request keeps its first message across a supervisor rest
 
   assert.equal((await supervisor.stop()).exitCode, 0);
   await startThreadSupervisor(workspace, { env: NO_IDLE_WAIT });
-  // An archive frees A's slot for the queued thread.
-  threadEvent(workspace, THREADS.a, "update", { archived: true, previous: { id: THREADS.a.id, archived: false } });
+  // /close frees A's slot for the queued thread.
+  injectDiscordMessage(workspace, { id: "a-close", channelId: THREADS.a.id, content: "/close",
+    author: { id: OWNER_ID, username: "Owner" } });
 
   await threadRow(workspace, created, row => row.state === "live");
   await waitFor(() => (claude(workspace).channelNotifications ?? []).some(n => n.meta.chat_id === created.id),

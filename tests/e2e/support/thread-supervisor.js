@@ -25,9 +25,11 @@ export async function waitForThreadIdle(workspace, project, threadId, timeoutMs 
 }
 
 // The worker launches its Node link through CCDM_ROUTER_NODE, as the session
-// launchers do, and finds the Router through CCDM_ROUTER_STATE_DIR.
+// launchers do, and finds the Router through CCDM_ROUTER_STATE_DIR. Owner
+// pings are off unless a test turns them on (`CCDM_THREAD_OWNER_PINGS: "1"`),
+// so they never add to the thread posts other tests count.
 export function supervisorEnv(workspace, extraEnv = {}) {
-  return routerEnv(workspace, extraEnv);
+  return routerEnv(workspace, { CCDM_THREAD_OWNER_PINGS: "0", ...extraEnv });
 }
 
 // One supervisor CLI command; `json` is its parsed stdout, when it has any.

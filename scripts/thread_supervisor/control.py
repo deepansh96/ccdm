@@ -140,7 +140,6 @@ def stop_threads(context, project) -> dict:
 
 
 def _operator_stop(context, row) -> None:
-    context.archive_polls.pop(row["thread_id"], None)
     lifecycle.stop_session(context, row)
     store.finish_boot(context.db, row["thread_id"], "stopped", "operator")
 

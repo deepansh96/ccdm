@@ -13,6 +13,8 @@ const { OpError, ScopeViolation } = require("./ops/errors.js");
 const { OPERATIONS } = require("./ops/index.js");
 
 const PROTOCOL_VERSION = 1;
+// The supervisor features this Router serves, in its hello_ok.
+const SUPERVISOR_CAPABILITIES = Object.freeze(["owner_pings", "status_board"]);
 // How many recent scope violations `router status` keeps.
 const RECENT_VIOLATIONS = 20;
 // Root's key file, beside the project keys; a leading dot keeps it apart
@@ -253,8 +255,11 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       supervisorSession = connection;
       const projects = [...getTable().projects.values()]
         .map(({ project, channel_id, webhook_id }) => ({ project, channel_id, webhook_id }));
+      // What this Router supports beyond the base ops: a supervisor sends
+      // `mention_owner` and uses the status board ops only when listed here.
       return send(connection.socket, {
         type: "hello_ok", v: PROTOCOL_VERSION, scope: { project: "supervisor" }, bot_user_id: context.bot?.id ?? null, projects,
+        capabilities: SUPERVISOR_CAPABILITIES,
       });
     }
     if (frame.role === "thread") return threadHello(connection, frame, reject);

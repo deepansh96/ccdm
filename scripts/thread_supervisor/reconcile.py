@@ -4,14 +4,17 @@ Router reconnect, or a Gateway resume.
 It runs on each Router connection (worker start and every reconnect) and on
 `gateway_resumed`. Project changes come first, so a thread whose project's
 channel moved meanwhile is `closed/project-moved` and never started. A
-`booting` or `live` row whose process is gone is `stopped/crashed`. `thread_list` (active threads, and threads archived in the
+`booting` or `live` row whose process is gone is `stopped/crashed`, and a close
+a crash interrupted after `pending_close` is finished. `thread_list` (active
+threads, and threads archived in the
 last 7 days) then binds unknown active threads under the normal binding
-rules, and classifies archives the supervisor missed through the archive-actor
-lookup. A thread is started only when `thread_history` shows its newest owner
-message is newer than its newest project-webhook message; its bootstrap holds
-the owner and guest messages after that agent reply, which the session never
-received; a message that mentions root, or natively replies to a root-bot
-message, is root's and never counts. `crashed`, `start-failed` and `operator`
+rules, and unarchives every archived thread whose conversation is not
+closed: a thread stays open until `/close`. A thread is started only when
+`thread_history` shows its newest owner message is newer than its newest
+project-webhook message; its bootstrap holds the owner and guest messages
+after that agent reply, which the session never received; a message that
+mentions root, or natively replies to a root-bot message other than an owner
+ping, is root's and never counts. `crashed`, `start-failed` and `operator`
 stops never restart here.
 """
 
@@ -21,7 +24,7 @@ from datetime import datetime
 import sys
 import time
 
-from . import binding, boot, lifecycle, projects, store
+from . import binding, boot, lifecycle, projects, registry, store, turns
 from .clock import now
 from .link import LinkError
 
@@ -31,7 +34,6 @@ HISTORY_PAGE = 100
 HISTORY_PAGES = 10
 # Stops only a person or a failure undoes.
 NEVER_RESTARTED = ("crashed", "start-failed", "operator")
-ARCHIVE_REASONS = ("auto-archive", "archive-actor-unknown")
 # Default and reply messages; system notices are not conversation.
 MESSAGE_TYPES = (0, 19)
 
@@ -43,6 +45,7 @@ def _log(message: str) -> None:
 def reconcile(context, _event: dict | None = None) -> None:
     # Project changes first: a thread whose channel moved meanwhile is closed, never started.
     projects.on_registry(context)
+    _finish_interrupted_closes(context)
     _mark_crashed(context)
     try:
         listed = context.link.call("thread_list", {"archived_within_days": ARCHIVED_WITHIN_DAYS}) or {}
@@ -55,6 +58,18 @@ def reconcile(context, _event: dict | None = None) -> None:
             _reconcile_thread(context, thread)
         except Exception as error:  # One thread must not stop the rest.
             _log(f"reconcile: thread {thread['id']} failed: {error}")
+
+
+def _finish_interrupted_closes(context) -> None:
+    """A close that recorded `pending_close` and then died: archive the thread
+    (again: an archive that already happened is unchanged) and finish it."""
+    for row in context.db.execute("SELECT * FROM threads WHERE pending_close IS NOT NULL AND state != 'closed'"):
+        try:
+            context.link.call("thread_update", {"thread_id": row["thread_id"], "archived": True})
+        except LinkError as error:
+            _log(f"reconcile: thread {row['thread_id']}: archiving its interrupted close failed: {error.code}")
+        lifecycle.finish_close(context, row)
+        _log(f"reconcile: thread {row['thread_id']}: finished its interrupted close")
 
 
 def _mark_crashed(context) -> None:
@@ -74,9 +89,8 @@ def _reconcile_thread(context, thread: dict) -> None:
     if row and row["project"] != project:
         return
     if thread.get("archived"):
-        if row and row["state"] != "closed" and not (row["state"] == "stopped"
-                                                     and row["stop_reason"] in ARCHIVE_REASONS):
-            lifecycle.stop_archived(context, row, _archived_at_ms(thread) - lifecycle.ARCHIVE_LOOKBACK_MS)
+        if row and row["state"] != "closed" and not row["pending_close"]:
+            lifecycle.reopen(context, row, _archived_at_ms(thread) - lifecycle.ARCHIVE_LOOKBACK_MS)
         return
     if row is None:
         binding.on_thread_create(context, {"project": project, "thread_id": thread_id, "name": thread.get("name"),
@@ -130,7 +144,17 @@ def _replies_to_root(context, message: dict) -> bool:
     referenced = message.get("referenced_message")
     if not context.bot_user_id or not message.get("message_reference") or not isinstance(referenced, dict):
         return False
-    return str((referenced.get("author") or {}).get("id") or "") == context.bot_user_id
+    if str((referenced.get("author") or {}).get("id") or "") != context.bot_user_id:
+        return False
+    # A reply to an owner ping answers the thread, as the Router routes it.
+    return not turns.is_ping(referenced, context.bot_user_id, _owner_id(context))
+
+
+def _owner_id(context) -> str | None:
+    try:
+        return registry.owner_id(registry.load(context.project_root))
+    except (OSError, ValueError):
+        return None
 
 
 def _events(context, row, thread: dict, messages) -> list[dict]:

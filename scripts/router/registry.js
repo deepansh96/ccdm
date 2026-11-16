@@ -57,6 +57,29 @@ function validateRegistry(registry) {
   if (problems.length) throw new Error(`invalid registry: ${problems.join("; ")}`);
 }
 
+// The thread status board's channel, `thread_status_channel_id`. A bad value
+// never invalidates the registry: the board is off and `router status` shows
+// why, while every project still routes. The value must be a snowflake string
+// exactly, nothing stripped; the Thread Supervisor applies the same rule
+// (scripts/thread_supervisor/board.py SNOWFLAKE), so the two always agree.
+const STATUS_CHANNEL_ID = /^\d{17,20}$/;
+
+function statusChannel(registry, channels) {
+  const value = registry.thread_status_channel_id;
+  if (value === undefined || value === null) return { statusChannelId: null, statusChannelError: null };
+  const off = error => ({ statusChannelId: null, statusChannelError: `thread_status_channel_id ${error}` });
+  if (typeof value !== "string" || !STATUS_CHANNEL_ID.test(value)) {
+    return off("must be a Discord channel ID (17-20 digits)");
+  }
+  const id = value;
+  if (Array.isArray(registry.root_channels) && registry.root_channels.map(String).includes(id)) {
+    return off("is a root channel");
+  }
+  const project = channels.get(id);
+  if (project) return off(`is project ${project.project}'s channel`);
+  return { statusChannelId: id, statusChannelError: null };
+}
+
 function buildRoutingTable(registry) {
   validateRegistry(registry);
   const channels = new Map();
@@ -79,6 +102,7 @@ function buildRoutingTable(registry) {
     projects.set(name, route);
   }
   return {
+    ...statusChannel(registry, channels),
     ownerId: registry.discord_user_id ? String(registry.discord_user_id) : null,
     guildId: registry.guild_id ? String(registry.guild_id) : null,
     channels,

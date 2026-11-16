@@ -5,7 +5,7 @@
 // Router connection through the shared RouterClient (reconnect, deadlines)
 // and relays NDJSON over stdio with the Python worker that spawned it:
 //
-//   stdout: {type:"connected", bot_user_id, projects}  after each hello_ok
+//   stdout: {type:"connected", bot_user_id, projects, capabilities}  after each hello_ok
 //           {type:"disconnected"}                       the Router went away
 //           {type:"event", event, ...}                  every pushed event
 //           {type:"response", id, ok, result|error}     an op call's answer
@@ -30,7 +30,7 @@ function log(message) {
 
 const client = new RouterClient({ key: fs.readFileSync(keyFile, "utf8").trim(), role: "supervisor" });
 const connected = () => emit({ type: "connected", bot_user_id: client.hello?.bot_user_id ?? null,
-  projects: client.hello?.projects ?? [] });
+  projects: client.hello?.projects ?? [], capabilities: client.hello?.capabilities ?? [] });
 client.on("event", frame => emit(frame));
 client.on("reconnect", connected);
 client.on("disconnect", () => emit({ type: "disconnected" }));

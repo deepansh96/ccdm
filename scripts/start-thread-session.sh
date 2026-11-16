@@ -348,16 +348,21 @@ write_private(launch / "mcp.json", json.dumps({"mcpServers": {"ccdm": {
     "command": "node", "args": [server_script], "env": env,
 }}}, indent=2) + "\n")
 # The official Discord plugin must not load beside the CCDM channel. The Stop
-# and StopFailure command hooks mark the turn ended in activity.json; the
-# reminder hook records the turn's completion.
+# and StopFailure command hooks mark the turn ended (completed or failed) in
+# activity.json, and UserPromptSubmit marks it running, for a prompt Claude
+# takes in after the turn that received it stopped (never for a `/` command
+# typed into the pane, which no Stop may follow); the reminder hook records
+# the turn's completion.
 activity_hook = f"node '{Path(server_script).with_name('thread-activity.js')}' '{launch / 'activity.json'}'"
 reminder_hook = f"node '{Path(server_script).with_name('claude-reminder-hook.js')}'"
+hooks = {event: [{"hooks": [{"type": "command", "command": command}
+                            for command in ([activity_hook] if event in ("Stop", "StopFailure") else [])
+                            + [reminder_hook]]}]
+         for event in ("SessionStart", "Stop", "StopFailure", "SessionEnd")}
+hooks["UserPromptSubmit"] = [{"hooks": [{"type": "command", "command": activity_hook}]}]
 write_private(launch / "settings.json", json.dumps({
     "enabledPlugins": {"discord@claude-plugins-official": False},
-    "hooks": {event: [{"hooks": [{"type": "command", "command": command}
-                                 for command in ([activity_hook] if event in ("Stop", "StopFailure") else [])
-                                 + [reminder_hook]]}]
-              for event in ("SessionStart", "Stop", "StopFailure", "SessionEnd")},
+    "hooks": hooks,
 }, indent=2) + "\n")
 write_private(launch / "reminder-env.json", json.dumps(reminder_env) + "\n")
 PY

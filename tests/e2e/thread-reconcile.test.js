@@ -18,8 +18,7 @@ test.afterEach(cleanup);
 // events, messages, seeded thread history and the fake audit log go in.
 // `routerWithWebhooks` gives demo the fake's first webhook.
 const WEBHOOK_ID = "fake-webhook-1";
-const ENV = { CCDM_THREAD_ARCHIVE_POLL_WINDOW_S: "1.5", CCDM_THREAD_ARCHIVE_POLL_INTERVAL_S: "0.2",
-  CCDM_ROUTER_RECONNECT_MIN_MS: "50", CCDM_ROUTER_RECONNECT_MAX_MS: "200" };
+const ENV = { CCDM_ROUTER_RECONNECT_MIN_MS: "50", CCDM_ROUTER_RECONNECT_MAX_MS: "200" };
 const SLEEPING = encodeURIComponent("💤");
 const EYES = encodeURIComponent("👀");
 
@@ -156,7 +155,7 @@ test("on restart, a thread created during the downtime binds, and a stranger's d
   assert.deepEqual(claude(workspace).invocations ?? [], []);
 });
 
-test("on restart, an owner archive during the downtime is classified as owner-archive and stops the session", async () => {
+test("on restart, an owner archive during the downtime is reverted and stops the idle session, leaving the thread open", async () => {
   const workspace = reconcileWorkspace();
   const { supervisor } = await supervised(workspace);
   const raw = thread("1700000000000330001");
@@ -176,8 +175,11 @@ test("on restart, an owner archive during the downtime is classified as owner-ar
 
   await startThreadSupervisor(workspace, { env: ENV });
 
-  const row = await threadRow(workspace, raw.id, current => current.state === "closed");
-  assert.deepEqual([row.state, row.close_reason], ["closed", "owner-archive"]);
+  // Only /close and threads.sh close archive a thread: reconcile unarchives it.
+  const row = await threadRow(workspace, raw.id, current => current.state === "stopped");
+  assert.deepEqual([row.stop_reason, row.close_reason], ["auto-archive", null]);
+  await waitFor(() => readState(workspace.stateDir).fixtures.discord.threads[raw.id].archived === false,
+    () => "the unarchive");
   await disconnected(workspace, raw.id);
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions[tmuxName(raw.id)], undefined);
 });
