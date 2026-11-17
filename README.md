@@ -574,7 +574,7 @@ Open a public thread under a registered project channel and type a task: it beco
   - `/compact`, `/pause` and `/unpause` work as in a channel.
   - `/close` archives the thread, stops its session and closes its reminders.
 - **Lifecycle:** a thread stays open until `/close` (or `scripts/threads.sh close`), which archives it and closes the conversation. Any other archive, Discord's one-week inactivity auto-archive or one by hand, is reverted at once, and an idle session is stopped. Your next message resumes the same conversation, and only your message reopens a closed one.
-- **Status:** when a turn ends and it is your turn, root posts `🔔 @you ready for you` in the thread (one at a time, deleted when you next write there; set `"thread_owner_pings": false` to turn pings off). With `thread_status_channel_id` set to a dedicated channel, root keeps a one-message status board there: the threads 🔔 waiting on you (oldest first, with how long they have waited) and ⏳ working, each with a jump link and its project, then a `💤 N idle · ⚠️ M failed today` count. With nothing waiting or working it reads `✅ Nothing needs you · 💤 N idle`.
+- **Status:** root reacts on your message instead of posting. ⏳ means the agent is working on it (only your latest message carries it), ✅ that the turn ended and it is your turn, and ⚠️ that the turn failed or the session crashed. A stop or `/close` takes the ⏳ off; ✅ and ⚠️ stay.
 - **Capacity:** live thread sessions are capped per provider by the registry's `thread_session_caps` (default `{"claude": 6, "codex": 8}`). At the cap the longest-idle session is paused, or the new one is queued.
 - **Accounts:** a thread may use an alias from `codex_accounts`, or from the new `claude_accounts` map (alias → Claude home).
 - **Operate:**
@@ -589,7 +589,7 @@ scripts/install-thread-supervisor.sh      # read-only preflight, then the com.cc
 scripts/thread-supervisor.py status        # worker, caps and bound threads
 ```
 
-Root needs three extra permissions, granted once by hand: Create Public Threads, Send Messages in Threads and Manage Threads in the project channels. View Audit Log on the guild is useful but optional: with it the supervisor logs who archived a thread it reopened. `router status` reports any that are missing while threads are enabled. For the status board, give root View Channel, Send Messages and Read Message History in the status channel, and leave everyone else read-only there. The post-merge live smoke steps are in the [operator checklist](docs/thread-supervisor.md#operator-checklist).
+Root needs three extra permissions, granted once by hand: Create Public Threads, Send Messages in Threads and Manage Threads in the project channels. View Audit Log on the guild is useful but optional: with it the supervisor logs who archived a thread it reopened. `router status` reports any that are missing while threads are enabled. The post-merge live smoke steps are in the [operator checklist](docs/thread-supervisor.md#operator-checklist).
 
 ## Creating the root bot
 
