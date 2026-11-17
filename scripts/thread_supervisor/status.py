@@ -1,4 +1,4 @@
-"""`status`: whether a worker runs, its Router connection, the session caps, the status board, and the bound threads."""
+"""`status`: whether a worker runs, its Router connection, the session caps, and the bound threads."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import fcntl
 import json
 from pathlib import Path
 
-from . import board, capacity, registry, store
+from . import capacity, registry, store
 from .worker import health_path, lock_path
 
 
@@ -49,14 +49,11 @@ def status(state_dir: Path, project_root: Path) -> dict:
             "queue_position": row["queue_position"],
             "provider_conversation_id": row["provider_conversation_id"],
             **{field: row[field] for field in store.OVERRIDES},
-            # Turn status; null in a v1 store a worker has not migrated yet.
+            # Turn status; null in an older store a worker has not migrated yet.
             **{field: row.get(field) for field in ("whose_turn", "last_input_class", "turn_outcome",
-                                                   "display_state", "display_since", "ping_message_id")},
+                                                   "mark_message_id", "mark_emoji",
+                                                   "shown_message_id", "shown_emoji")},
         }
-    try:
-        current = registry.load(project_root)
-    except (OSError, ValueError):
-        current = None
     return {
         "running": alive,
         "worker_pid": health.get("pid") if alive else None,
@@ -64,8 +61,5 @@ def status(state_dir: Path, project_root: Path) -> dict:
         "router": health.get("router", "unknown") if alive else "not-running",
         "store": {"user_version": inspected["user_version"]} if inspected else None,
         "capacity": _capacity(project_root),
-        "board": board.status(current, (inspected or {}).get("status_board") or []),
-        # The registry setting; CCDM_THREAD_OWNER_PINGS overrides it only in the worker that has it.
-        "owner_pings": current.get("thread_owner_pings") is not False if current is not None else None,
         "projects": projects,
     }

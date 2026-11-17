@@ -12,8 +12,6 @@ const THREAD_PERMISSIONS = ["CreatePublicThreads", "SendMessagesInThreads", "Man
 // Useful but optional: the guild's View Audit Log lets the supervisor log who
 // archived a thread it reopens.
 const OPTIONAL_THREAD_PERMISSIONS = ["ViewAuditLog"];
-// What root needs in the thread status board's channel.
-const STATUS_CHANNEL_PERMISSIONS = ["ViewChannel", "SendMessages", "ReadMessageHistory"];
 
 // How many projects' channels `status` checks at once.
 const STATUS_CONCURRENCY = 8;
@@ -89,7 +87,6 @@ async function projectStatus(ctx, route) {
 async function status(ctx, args = {}) {
   const projects = await mapLimited([...ctx.table.projects.values()], STATUS_CONCURRENCY,
     route => projectStatus(ctx, route));
-  const statusChannelId = ctx.table.statusChannelId ?? null;
   const supervisor = ctx.supervisor?.();
   return {
     gateway: ctx.gateway.state,
@@ -103,12 +100,6 @@ async function status(ctx, args = {}) {
       connected_at: session.connectedAt,
     })),
     supervisor: { connected: Boolean(supervisor), connected_at: supervisor?.connectedAt ?? null },
-    // The thread status board: off when unset, and off with `error` when invalid.
-    status_channel: {
-      channel_id: statusChannelId,
-      error: ctx.table.statusChannelError ?? null,
-      missing_permissions: statusChannelId ? await missingPermissions(ctx, statusChannelId, STATUS_CHANNEL_PERMISSIONS) : null,
-    },
     projects,
     scope_violations: ctx.violations(),
     ...(args.project === undefined ? {} : { target: await target(ctx, String(args.project)) }),

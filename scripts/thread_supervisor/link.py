@@ -79,7 +79,7 @@ class Link:
             return None
 
     def has_frames(self) -> bool:
-        """Whether frames wait: background work (the status board) yields to them."""
+        """Whether frames wait: background work (turn status and marks) yields to them."""
         return not self.frames.empty()
 
     def call(self, op: str, args: dict, timeout: float | None = None) -> object:

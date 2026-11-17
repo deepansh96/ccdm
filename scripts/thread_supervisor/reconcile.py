@@ -13,9 +13,8 @@ closed: a thread stays open until `/close`. A thread is started only when
 `thread_history` shows its newest owner message is newer than its newest
 project-webhook message; its bootstrap holds the owner and guest messages
 after that agent reply, which the session never received; a message that
-mentions root, or natively replies to a root-bot message other than an owner
-ping, is root's and never counts. `crashed`, `start-failed` and `operator`
-stops never restart here.
+mentions root, or natively replies to a root-bot message, is root's and never
+counts. `crashed`, `start-failed` and `operator` stops never restart here.
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ from datetime import datetime
 import sys
 import time
 
-from . import binding, boot, lifecycle, projects, registry, store, turns
+from . import binding, boot, lifecycle, projects, store, turns
 from .clock import now
 from .link import LinkError
 
@@ -70,6 +69,7 @@ def _finish_interrupted_closes(context) -> None:
     """A close that recorded `pending_close` and then died: archive the thread
     (again: an archive that already happened is unchanged) and finish it."""
     for row in context.db.execute("SELECT * FROM threads WHERE pending_close IS NOT NULL AND state != 'closed'"):
+        turns.before_archive(context, row["thread_id"])
         try:
             context.link.call("thread_update", {"thread_id": row["thread_id"], "archived": True})
         except LinkError as error:
@@ -85,7 +85,7 @@ def _mark_crashed(context) -> None:
             continue
         if row["state"] == "live" and lifecycle.session_running(row["thread_id"]):
             continue
-        lifecycle.stop_session(context, row)
+        lifecycle.stop_session(context, row, failed=True)
         store.finish_boot(context.db, row["thread_id"], "stopped", "crashed")
 
 
@@ -150,17 +150,7 @@ def _replies_to_root(context, message: dict) -> bool:
     referenced = message.get("referenced_message")
     if not context.bot_user_id or not message.get("message_reference") or not isinstance(referenced, dict):
         return False
-    if str((referenced.get("author") or {}).get("id") or "") != context.bot_user_id:
-        return False
-    # A reply to an owner ping answers the thread, as the Router routes it.
-    return not turns.is_ping(referenced, context.bot_user_id, _owner_id(context))
-
-
-def _owner_id(context) -> str | None:
-    try:
-        return registry.owner_id(registry.load(context.project_root))
-    except (OSError, ValueError):
-        return None
+    return str((referenced.get("author") or {}).get("id") or "") == context.bot_user_id
 
 
 def _events(context, row, thread: dict, messages) -> list[dict]:

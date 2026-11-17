@@ -116,7 +116,7 @@ let messageQueue = [];
 let bridgePaused = false;
 // Every pause and resume, whatever its cause, also goes to a thread's activity
 // file, so the Thread Supervisor never stops a paused session (its queued
-// messages would be lost) and the board shows it paused.
+// messages would be lost) and its status shows it paused.
 function setBridgePaused(paused) {
   bridgePaused = paused;
   markPaused(THREAD_ACTIVITY_FILE, paused);

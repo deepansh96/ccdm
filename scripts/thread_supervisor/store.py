@@ -1,10 +1,13 @@
-"""The Thread Supervisor's private SQLite store, schema v2.
+"""The Thread Supervisor's private SQLite store, schema v3.
 
-v2 adds each thread's turn status (whose turn it is, its last input and
-accepted turn end, its board state and since when, its owner ping) and the
-`status_board` table of the status board's messages. A v1 store migrates on
-the next `connect`, after a private `threads.v1.backup.sqlite3` copy; a failed
-migration leaves the v1 store as it was, and a newer version is refused.
+v2 added each thread's turn status (whose turn it is, its last input and
+accepted turn end) to v1, with a board state, an owner ping and a
+`status_board` table that v3 drops again. v3 adds each thread's turn mark: the
+reaction root wants on the owner's latest input (⏳, ✅ or ⚠️) and the one
+known to be shown on Discord. A v1 or v2 store migrates on the next `connect`,
+after a private `threads.v<n>.backup.sqlite3` copy, in one transaction that
+keeps every row; a failed migration leaves the store as it was, and a newer
+version is refused.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ import uuid
 from .paths import private_directory
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 THREAD_STATES = ("registered", "booting", "live", "queued", "stopped", "closed")
 STOP_REASONS = ("auto-archive", "archive-actor-unknown", "evicted", "operator", "crashed", "start-failed")
 CLOSE_REASONS = ("owner-archive", "root-archive", "close-command", "deregistered", "project-moved")
@@ -30,7 +33,9 @@ OVERRIDES = ("provider", "account", "model", "effort")
 TURN_OWNERS = ("agent", "owner")
 INPUT_CLASSES = ("owner", "guest", "starter")
 TURN_OUTCOMES = ("completed", "failed")
-DISPLAY_STATES = ("working", "waiting", "idle", "failed")
+# Turn marks: the agent is on it, it answered, it failed.
+WAITING, DONE, FAILED = "⏳", "✅", "⚠️"
+MARKS = (WAITING, DONE, FAILED)
 
 
 def _one_of(column: str, values: tuple[str, ...], nullable: bool = False) -> str:
@@ -42,22 +47,22 @@ def _one_of(column: str, values: tuple[str, ...], nullable: bool = False) -> str
 # the project's setting; `resolved_*` hold what its session runs with.
 # `parent_channel_id` is the project channel it was bound under, and a queued
 # row's `queued_start` holds the trigger and starter it starts with (JSON).
-# The v2 turn-status columns, added to v1's by the migration. `whose_turn` is
-# who the conversation waits on; `turn_end_seen` is the last turn end read
-# from the session's activity.json; `display_*` is its board state and since
-# when; `ping_message_id` is its one owner ping.
+# The turn-status columns after v1's. `whose_turn` is who the conversation
+# waits on; `turn_end_seen` is the last turn end read from the session's
+# activity.json. `mark_*` is the turn mark root wants on a message (both null
+# for none) and `shown_*` the one it last saw Discord take; the worker's tick
+# makes the second follow the first.
 TURN_COLUMNS = {
     "whose_turn": f"TEXT {_one_of('whose_turn', TURN_OWNERS, nullable=True)}",
     "last_input_at": "TEXT",
     "last_input_class": f"TEXT {_one_of('last_input_class', INPUT_CLASSES, nullable=True)}",
     "turn_end_seen": "TEXT",
     "turn_outcome": f"TEXT {_one_of('turn_outcome', TURN_OUTCOMES, nullable=True)}",
-    "display_state": f"TEXT {_one_of('display_state', DISPLAY_STATES, nullable=True)}",
-    "display_since": "TEXT",
-    "ping_message_id": "TEXT",
+    "mark_message_id": "TEXT",
+    "mark_emoji": f"TEXT {_one_of('mark_emoji', MARKS, nullable=True)}",
+    "shown_message_id": "TEXT",
+    "shown_emoji": f"TEXT {_one_of('shown_emoji', MARKS, nullable=True)}",
 }
-STATUS_BOARD = """slot INTEGER PRIMARY KEY, channel_id TEXT NOT NULL, message_id TEXT NOT NULL,
-        content_sha256 TEXT NOT NULL"""
 TABLES = {
     "threads": f"""thread_id TEXT PRIMARY KEY, project TEXT NOT NULL, name TEXT NOT NULL,
         creator_id TEXT NOT NULL, starter_message_id TEXT, parent_channel_id TEXT, created_at TEXT NOT NULL,
@@ -71,7 +76,6 @@ TABLES = {
         last_owner_activity_at TEXT, last_agent_reply_at TEXT,
         pending_config TEXT, pending_close TEXT, queue_position INTEGER, queued_start TEXT,
         """ + ", ".join(f"{column} {definition}" for column, definition in TURN_COLUMNS.items()),
-    "status_board": STATUS_BOARD,
     "creation_requests": f"""request_id TEXT PRIMARY KEY, project TEXT NOT NULL, name TEXT NOT NULL,
         provider TEXT, account TEXT, model TEXT, effort TEXT, first_message TEXT,
         requester_id TEXT NOT NULL,
@@ -92,12 +96,16 @@ V1_COLUMNS = {
                           "first_message", "requester_id", "requester_kind", "status", "thread_id", "created_at"},
     "boot_buffers": {"thread_id", "message_id", "payload", "received_at"},
 }
-COLUMNS = {
+V2_COLUMNS = {
     **V1_COLUMNS,
-    "threads": V1_COLUMNS["threads"] | set(TURN_COLUMNS),
+    "threads": V1_COLUMNS["threads"] | {"whose_turn", "last_input_at", "last_input_class", "turn_end_seen",
+                                        "turn_outcome", "display_state", "display_since", "ping_message_id"},
     "status_board": {"slot", "channel_id", "message_id", "content_sha256"},
 }
-COLUMNS_BY_VERSION = {1: V1_COLUMNS, SCHEMA_VERSION: COLUMNS}
+COLUMNS = {**V1_COLUMNS, "threads": V1_COLUMNS["threads"] | set(TURN_COLUMNS)}
+COLUMNS_BY_VERSION = {1: V1_COLUMNS, 2: V2_COLUMNS, SCHEMA_VERSION: COLUMNS}
+# Versions a worker migrates, and a read-only reader accepts as they are.
+OLDER_VERSIONS = (1, 2)
 
 
 def store_path(state_dir: Path) -> Path:
@@ -146,18 +154,27 @@ def _backup(db: sqlite3.Connection, state_dir: Path, version: int) -> None:
         raise
 
 
-def _migrate(db: sqlite3.Connection, state_dir: Path) -> None:
-    """v1 → v2, in one transaction, after the backup."""
-    _backup(db, state_dir, 1)
+def _migrate(db: sqlite3.Connection, state_dir: Path, version: int) -> None:
+    """v1 or v2 → v3, in one transaction, after the backup. `threads` is
+    rebuilt with the current definition and every row copied over in the
+    columns both versions have, so it works on any SQLite (no DROP COLUMN) and
+    the new columns get their checks; v2's `status_board` goes."""
+    _backup(db, state_dir, version)
     db.execute("BEGIN IMMEDIATE")
     try:
-        if db.execute("PRAGMA user_version").fetchone()[0] == 1:
-            for column, definition in TURN_COLUMNS.items():
-                db.execute(f"ALTER TABLE threads ADD COLUMN {column} {definition}")
-            db.execute(f"CREATE TABLE status_board ({STATUS_BOARD})")
+        if db.execute("PRAGMA user_version").fetchone()[0] == version:
+            kept = ", ".join(sorted(COLUMNS_BY_VERSION[version]["threads"] & COLUMNS["threads"]))
+            rows = db.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
+            db.execute(f"CREATE TABLE threads_v{SCHEMA_VERSION} ({TABLES['threads']})")
+            db.execute(f"INSERT INTO threads_v{SCHEMA_VERSION} ({kept}) SELECT {kept} FROM threads")
+            db.execute("DROP TABLE threads")
+            db.execute(f"ALTER TABLE threads_v{SCHEMA_VERSION} RENAME TO threads")
+            db.execute("DROP TABLE IF EXISTS status_board")
+            if db.execute("SELECT COUNT(*) FROM threads").fetchone()[0] != rows:
+                raise sqlite3.IntegrityError("the migration lost thread rows")
             if os.environ.get("CCDM_THREAD_STORE_FAIL_MIGRATION") == "1":  # The E2E suite's failed migration.
                 raise sqlite3.OperationalError("injected migration failure")
-            db.execute("PRAGMA user_version=2")
+            db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         db.execute("COMMIT")
     except sqlite3.Error:
         db.execute("ROLLBACK")
@@ -213,8 +230,9 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA synchronous=FULL")
         db.execute("PRAGMA secure_delete=ON")
-        if verify(db, (1, SCHEMA_VERSION)) == 1:
-            _migrate(db, state_dir)
+        version = verify(db, (*OLDER_VERSIONS, SCHEMA_VERSION))
+        if version != SCHEMA_VERSION:
+            _migrate(db, state_dir, version)
             verify(db)
     except (sqlite3.Error, ValueError, OSError):
         db.close()
@@ -251,12 +269,10 @@ def _inspect(path: Path) -> dict:
     db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     db.row_factory = sqlite3.Row
     try:
-        # A v1 store not yet migrated by a worker is still readable.
-        version = verify(db, (1, SCHEMA_VERSION))
+        # An older store not yet migrated by a worker is still readable.
+        version = verify(db, (*OLDER_VERSIONS, SCHEMA_VERSION))
         return {"user_version": version,
-                "threads": [dict(row) for row in db.execute("SELECT * FROM threads ORDER BY project, created_at, thread_id")],
-                "status_board": [dict(row) for row in db.execute("SELECT * FROM status_board ORDER BY slot")]
-                if version >= 2 else []}
+                "threads": [dict(row) for row in db.execute("SELECT * FROM threads ORDER BY project, created_at, thread_id")]}
     finally:
         db.close()
 
@@ -407,16 +423,14 @@ def forget(db: sqlite3.Connection, thread_id: str) -> None:
         raise
 
 
-def board_slots(db: sqlite3.Connection) -> list[sqlite3.Row]:
-    """The status board's messages, top first."""
-    return db.execute("SELECT * FROM status_board ORDER BY slot").fetchall()
+def end_waiting(db: sqlite3.Connection, thread_id: str, emoji: str | None = None) -> None:
+    """The thread's ⏳ becomes ``emoji`` on the same message, or goes when
+    ``emoji`` is None; any other mark is left as it is."""
+    db.execute("""UPDATE threads SET mark_emoji=?, mark_message_id=CASE WHEN ? IS NULL THEN NULL ELSE mark_message_id END
+        WHERE thread_id=? AND mark_emoji=?""", (emoji, emoji, thread_id, WAITING))
 
 
-def set_board_slot(db: sqlite3.Connection, slot: int, channel_id: str, message_id: str, content_sha256: str) -> None:
-    db.execute("""INSERT INTO status_board (slot, channel_id, message_id, content_sha256) VALUES (?,?,?,?)
-        ON CONFLICT(slot) DO UPDATE SET channel_id=excluded.channel_id, message_id=excluded.message_id,
-        content_sha256=excluded.content_sha256""", (slot, channel_id, message_id, content_sha256))
-
-
-def drop_board_slots(db: sqlite3.Connection, from_slot: int = 1) -> None:
-    db.execute("DELETE FROM status_board WHERE slot >= ?", (from_slot,))
+def unsynced_marks(db: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Threads whose wanted turn mark differs from the one shown."""
+    return db.execute("""SELECT * FROM threads WHERE mark_message_id IS NOT shown_message_id
+        OR mark_emoji IS NOT shown_emoji ORDER BY thread_id""").fetchall()
