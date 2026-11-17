@@ -316,6 +316,9 @@ function routeWebhooks(url, method, init) {
   });
   const channelMatch = /^\/api\/v10\/channels\/([^/]+)\/webhooks$/.exec(url.pathname);
   if (channelMatch && method === "GET") {
+    if ((readState().fixtures?.discord?.missingChannels ?? []).includes(channelMatch[1])) {
+      return json({ code: 10003, message: "Unknown Channel" }, 404);
+    }
     const webhooks = (readState().fixtures?.discord?.webhooks ?? []).filter(webhook => webhook.channel_id === channelMatch[1]);
     return json(webhooks);
   }
