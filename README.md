@@ -562,7 +562,18 @@ This creates a one-use invite and a per-project `ccdm-guest-<project>` role. The
 
 For users already in the server, use `grant` instead of `invite`. Use `revoke` to remove their project guest role, registry entry, and outstanding invites.
 
-When people already see a project channel through their own Discord roles and must keep every other channel and thread they see, set `"guest_mode": "registry-only"` on that project in `registry.json`. Then `grant` and `revoke` only add or remove the user in `guest_user_ids`, with no guest role, permission overwrite, or member role change. `invite` is refused, since an invite would have to grant a role. `sync`, including a bare `sync` over every project, skips the project. `list` marks it `(registry-only)`. The default, `"managed"`, is the role-gated behaviour above, and any other value fails before anything is written.
+When people already see a project channel through their own Discord roles and must keep every other channel and thread they see, set `"guest_mode": "registry-only"` on that project in `registry.json`:
+
+- `grant` checks that the user is in the server (a read-only lookup), then adds them to `guest_user_ids`. It creates no guest role and changes no permission overwrite or member role.
+- `revoke` removes the user from `guest_user_ids`, deletes any invite recorded for them, and takes a guest role left from managed mode off them.
+- `invite` is refused, since an invite would have to grant a role.
+- `sync`, including a bare `sync` over every project, skips the project.
+- `list` marks it `(registry-only)`, and `grant` and `list` warn when a guest role from managed mode is still set.
+- A managed `grant` or `sync` for another project still denies its guests every other managed channel, except that a guest who is also on a registry-only project's list gets a member allow on that project's channel, so they keep it.
+
+The default, `"managed"`, is the role-gated behaviour above. Any other value fails `invite`, `grant`, `revoke` and `sync` before anything is written, and `list` shows it as invalid. Every command takes a numeric Discord user ID (17-20 digits).
+
+To switch an existing managed project, set the mode, then `revoke` and `grant` each guest again: the revoke takes the old guest role off them. Member-level overwrites a managed grant wrote on other channels stay until you remove them in Discord.
 
 ## Thread Conversations
 

@@ -346,21 +346,21 @@ test("guest-access.js given a thread id or link grants and revokes the parent pr
   const guestAccess = (...args) => runNodeEntrypoint(workspace, "scripts/guest-access.js", { args,
     env: supervisorEnv(workspace) });
 
-  const granted = await guestAccess("grant", THREAD_ID, "new-guest-id");
+  const granted = await guestAccess("grant", THREAD_ID, "555555555555555555");
   assert.equal(granted.exitCode, 0, granted.stderr || granted.stdout);
-  assert.match(granted.stdout, /Granted new-guest-id guest access to demo\./);
-  assert.deepEqual(guests(workspace, "demo"), ["new-guest-id"]);
+  assert.match(granted.stdout, /Granted 555555555555555555 guest access to demo\./);
+  assert.deepEqual(guests(workspace, "demo"), ["555555555555555555"]);
   assert.equal(guests(workspace, "beta"), undefined);
   const overwritten = new Set((discord(workspace).permissionOverwrites ?? []).map(({ channelId }) => channelId));
   assert.ok(overwritten.has("demo-channel"), [...overwritten].join(", "));
   assert.ok(!overwritten.has(THREAD_ID), [...overwritten].join(", "));
 
-  const revoked = await guestAccess("revoke", link(THREAD_ID), "new-guest-id");
+  const revoked = await guestAccess("revoke", link(THREAD_ID), "555555555555555555");
   assert.equal(revoked.exitCode, 0, revoked.stderr || revoked.stdout);
-  assert.match(revoked.stdout, /Revoked new-guest-id guest access from demo\./);
+  assert.match(revoked.stdout, /Revoked 555555555555555555 guest access from demo\./);
   assert.deepEqual(guests(workspace, "demo"), []);
 
-  const refused = await guestAccess("grant", "no-such-thread", "new-guest-id");
+  const refused = await guestAccess("grant", "no-such-thread", "555555555555555555");
   assert.equal(refused.exitCode, 2, refused.stdout);
   assert.match(refused.stderr, /conversation-resolver: .+/);
 });

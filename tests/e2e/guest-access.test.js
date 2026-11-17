@@ -408,8 +408,6 @@ function discordWrites(workspace) {
 test("a registry-only grant records the guest without touching Discord permissions", async () => {
   const workspace = createWorkspace();
   seedRegistry(workspace, registryOnlyRegistry(workspace));
-  // No root credentials are needed when nothing is written to Discord.
-  fs.unlinkSync(path.join(workspace.homeDir, ".claude/channels/discord/.env"));
 
   const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
     args: ["grant", "alpha", GUEST_ID], env: preloadEnv(workspace),
@@ -421,6 +419,43 @@ test("a registry-only grant records the guest without touching Discord permissio
   assert.deepEqual(alpha.guest_user_ids, [GUEST_ID]);
   assert.equal(alpha.guest_role_id, undefined);
   assert.deepEqual(discordWrites(workspace), [[], [], [], [], []]);
+  // The only Discord call is a read-only membership check.
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.memberGets, [{ guildId: "guild-id", userId: GUEST_ID }]);
+});
+
+test("a registry-only grant refuses a user who is not in the guild", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, registryOnlyRegistry(workspace));
+  const state = readState(workspace.stateDir);
+  state.fixtures.discord.memberRolePut404UserIds = [GUEST_ID];
+  writeState(state, workspace.stateDir);
+
+  const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
+    args: ["grant", "alpha", GUEST_ID], env: preloadEnv(workspace),
+  });
+
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /222222222222222222 is not a member of the guild; check the user ID/);
+  assert.equal(readRegistry(workspace).projects.alpha.guest_user_ids, undefined);
+  assert.deepEqual(discordWrites(workspace), [[], [], [], [], []]);
+});
+
+test("guest access refuses a user ID that is not a Discord snowflake", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, registryOnlyRegistry(workspace));
+  const before = fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8");
+
+  for (const id of ["<@222222222222222222>", "alice", "2222"]) {
+    for (const action of ["grant", "invite", "revoke"]) {
+      const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
+        args: [action, "alpha", id], env: preloadEnv(workspace),
+      });
+      assert.equal(result.exitCode, 2, `${action} ${id}`);
+      assert.match(result.stderr, /is not a Discord user ID \(17-20 digits\)/);
+    }
+  }
+  assert.equal(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"), before);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.memberGets ?? [], []);
 });
 
 test("a registry-only invite is refused before any Discord write", async () => {
@@ -437,12 +472,11 @@ test("a registry-only invite is refused before any Discord write", async () => {
   assert.deepEqual(discordWrites(workspace), [[], [], [], [], []]);
 });
 
-test("a registry-only revoke removes the guest and leaves their roles alone", async () => {
+test("a registry-only revoke removes only the registry entry and recorded invites", async () => {
   const workspace = createWorkspace();
   const registry = registryOnlyRegistry(workspace);
-  // A role left from before the switch to registry-only is not removed either.
-  registry.projects.alpha.guest_role_id = "existing-role";
   registry.projects.alpha.guest_user_ids = [GUEST_ID, "333333333333333333"];
+  registry.projects.alpha.guest_invites = { [GUEST_ID]: ["fake-invite-1"] };
   seedRegistry(workspace, registry);
 
   const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
@@ -450,8 +484,65 @@ test("a registry-only revoke removes the guest and leaves their roles alone", as
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  assert.deepEqual(readRegistry(workspace).projects.alpha.guest_user_ids, ["333333333333333333"]);
+  const alpha = readRegistry(workspace).projects.alpha;
+  assert.deepEqual(alpha.guest_user_ids, ["333333333333333333"]);
+  assert.equal(alpha.guest_invites, undefined);
   assert.deepEqual(discordWrites(workspace), [[], [], [], [], []]);
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.inviteDeletes,
+    [{ authorization: "Bot root-token", code: "fake-invite-1" }]);
+});
+
+test("a registry-only revoke takes a guest role left from managed mode off the user", async () => {
+  const workspace = createWorkspace();
+  const registry = registryOnlyRegistry(workspace);
+  registry.projects.alpha.guest_role_id = "existing-role";
+  registry.projects.alpha.guest_user_ids = [GUEST_ID];
+  seedRegistry(workspace, registry);
+
+  const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
+    args: ["revoke", "alpha", GUEST_ID], env: preloadEnv(workspace),
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.deepEqual(readRegistry(workspace).projects.alpha.guest_user_ids, []);
+  const discord = readState(workspace.stateDir).fixtures.discord;
+  assert.deepEqual(discord.memberRoleDeletes,
+    [{ authorization: "Bot root-token", guildId: "guild-id", roleId: "existing-role", userId: GUEST_ID }]);
+  assert.deepEqual([discord.roleCreates, discord.permissionOverwrites, discord.memberRolePuts], [[], [], []]);
+});
+
+test("a registry-only grant and list warn about a guest role left from managed mode", async () => {
+  const workspace = createWorkspace();
+  const registry = registryOnlyRegistry(workspace);
+  registry.projects.alpha.guest_role_id = "existing-role";
+  seedRegistry(workspace, registry);
+
+  for (const args of [["grant", "alpha", GUEST_ID], ["list", "alpha"]]) {
+    const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", { args, env: preloadEnv(workspace) });
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+    assert.match(result.stderr, /alpha still has guest role existing-role from managed mode/);
+  }
+});
+
+test("a managed grant keeps a registry-only channel visible to that channel's own guests", async () => {
+  const workspace = createWorkspace();
+  const registry = registryOnlyRegistry(workspace);
+  // GUEST_ID drives alpha as a registry-only guest and now becomes a managed guest of beta.
+  registry.projects.alpha.guest_user_ids = [GUEST_ID];
+  seedRegistry(workspace, registry);
+
+  const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
+    args: ["grant", "beta", GUEST_ID], env: preloadEnv(workspace),
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const alphaOverwrites = readState(workspace.stateDir).fixtures.discord.permissionOverwrites
+    .filter((entry) => entry.channelId === "channel-alpha");
+  // beta's role is still denied on alpha, but the user's own allow outranks it.
+  assert.deepEqual(alphaOverwrites.map(({ overwriteId, type, allow, deny }) => ({ overwriteId, type, allow, deny })), [
+    { overwriteId: "fake-role-1", type: 0, allow: "0", deny: VIEW_CHANNEL },
+    { overwriteId: GUEST_ID, type: 1, allow: GUEST_ALLOW, deny: "0" },
+  ]);
 });
 
 test("sync skips registry-only projects and still syncs managed ones", async () => {
@@ -493,6 +584,21 @@ test("list marks registry-only projects", async () => {
   assert.match(result.stdout, /^beta: \(none\)$/m);
 });
 
+test("list reports an unknown guest_mode instead of failing every project", async () => {
+  const workspace = createWorkspace();
+  const registry = buildRegistry(workspace);
+  registry.projects.alpha.guest_mode = "registry_only";
+  seedRegistry(workspace, registry);
+
+  const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
+    args: ["list"], env: preloadEnv(workspace),
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /^alpha \(invalid guest_mode "registry_only"\): \(none\)$/m);
+  assert.match(result.stdout, /^beta: \(none\)$/m);
+});
+
 test("an unknown guest_mode fails before any registry or Discord write", async () => {
   const workspace = createWorkspace();
   const registry = buildRegistry(workspace);
@@ -500,7 +606,9 @@ test("an unknown guest_mode fails before any registry or Discord write", async (
   seedRegistry(workspace, registry);
   const before = fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8");
 
-  for (const args of [["grant", "alpha", GUEST_ID], ["invite", "alpha", GUEST_ID], ["revoke", "alpha", GUEST_ID], ["sync", "alpha"], ["sync"]]) {
+  // A grant for beta reads alpha's mode too, so it also fails before writing.
+  for (const args of [["grant", "alpha", GUEST_ID], ["invite", "alpha", GUEST_ID], ["revoke", "alpha", GUEST_ID], ["sync", "alpha"], ["sync"],
+    ["grant", "beta", GUEST_ID]]) {
     const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", { args, env: preloadEnv(workspace) });
     assert.notEqual(result.exitCode, 0, args.join(" "));
     assert.match(result.stderr, /Project alpha has unknown guest_mode "registry_only"; use "managed" or "registry-only"/);

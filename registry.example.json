@@ -22,7 +22,8 @@
       "screen_name": "example_project",
       "channel_id": "YOUR_PROJECT_CHANNEL_ID",
       "webhook_id": "WEBHOOK_ID_FROM_ENSURE_WEBHOOK",
-      "guest_user_ids": []
+      "guest_user_ids": [],
+      "guest_mode": "managed"
     }
   }
 }

@@ -23,7 +23,7 @@ last_updated: 2026-11-17
 - Do not send a generic guild invite.
 - Guests receive text, history, attachments, reactions, and thread replies, not voice access.
 - Plan A access is restricted by the root `AGENTS.md` rules.
-- `grant` and `sync` add member-level view denies on every other managed channel and category, which hides channels a person could see through their own roles. When guests must keep that access, set the project's `guest_mode` to `registry-only` first; then `grant`/`revoke` touch only `guest_user_ids` and `sync` skips the project.
+- `grant` and `sync` add member-level view denies on every other managed channel and category, which hides channels a person could see through their own roles. When guests must keep that access, set the project's `guest_mode` to `registry-only` first; then `grant`/`revoke` touch only `guest_user_ids` (plus recorded invites and any leftover guest role), `sync` skips the project, and managed grants elsewhere allow that channel for its own guests instead of denying it.
 
 ## Verify
 - [ ] Guest sees the target channel and no other managed project channel.
