@@ -47,6 +47,7 @@ Read the `registry.json` file in this project's root directory.
 - `channel_id`: the project's Discord channel, and its Session Scope
 - `webhook_id`: the project's Project Identity webhook, written by `ensure-webhook`
 - `guest_user_ids`: guests allowed in this channel
+- `guest_mode`: `managed` (default; guest access is role-gated) or `registry-only` (guests already see the channel through their own roles and keep all other access)
 - `ws_port`: Codex app-server port (Codex projects)
 - `session_id`, `pid`: runtime state, written by the start and stop scripts
 - optional account and model overrides (`claude_home`, `model`, `claude_effort`, `codex_account`, `codex_model`, `codex_reasoning_effort`, `codex_service_tier`)

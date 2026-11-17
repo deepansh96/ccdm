@@ -175,9 +175,9 @@ test("guest-access.js grant and revoke change who reaches a connected session wi
   writeProjectKey(workspace, "demo", "demo-key");
   const router = await startRouter(workspace, { env: RELOAD_ENV });
   const demo = await connectSession(workspace, "demo", "demo-key");
-  const guest = { id: "cli-guest-id", username: "CliGuest" };
+  const guest = { id: "444444444444444444", username: "CliGuest" };
   const guestAccess = (action) => runNodeEntrypoint(workspace, "scripts/guest-access.js", {
-    args: [action, "demo", "cli-guest-id"], env: routerEnv(workspace),
+    args: [action, "demo", "444444444444444444"], env: routerEnv(workspace),
   });
 
   const granted = await afterReload(router, () => guestAccess("grant"));

@@ -19,6 +19,20 @@ const GUEST_ALLOW =
   (1n << 16n) |
   (1n << 38n);
 
+// A project's `guest_mode`: "managed" (the default) gates the channel behind a
+// guest role and denies guests every other managed location; "registry-only"
+// keeps guests in `guest_user_ids` alone, for people who already see the channel
+// through their own Discord roles and must keep everything else they see.
+const GUEST_MODES = new Set(["managed", "registry-only"]);
+
+function guestMode(projectName, project) {
+  const mode = project.guest_mode ?? "managed";
+  if (!GUEST_MODES.has(mode)) {
+    throw new Error(`Project ${projectName} has unknown guest_mode ${JSON.stringify(mode)}; use "managed" or "registry-only"`);
+  }
+  return mode;
+}
+
 function usage() {
   console.error(`Usage:
   scripts/guest-access.js invite <project|channel_id|thread_id|link> <user_id>
@@ -170,13 +184,27 @@ async function deniedChannelIds(registry, targetProject, token) {
   ]).filter((channelId) => channelId !== targetProject.channel_id);
 }
 
+// The registry-only guests of each registry-only project's channel. A managed
+// guest who is also one of them keeps that channel: the managed role's deny
+// there would otherwise hide it, so they get a member allow instead of a deny.
+function registryOnlyGuestsByChannel(registry) {
+  const byChannel = new Map();
+  for (const [name, project] of Object.entries(registry.projects || {})) {
+    if (!project.channel_id || guestMode(name, project) !== "registry-only") continue;
+    byChannel.set(String(project.channel_id), new Set(unique(project.guest_user_ids || [])));
+  }
+  return byChannel;
+}
+
 async function syncDiscordPermissions(registry, project, roleId, token, userIds = project.guest_user_ids || [], options = {}) {
   const guests = unique(userIds);
   const denied = await deniedChannelIds(registry, project, token);
+  const keep = registryOnlyGuestsByChannel(registry);
   for (const channelId of denied) {
     await putOverwrite(token, channelId, roleId, 0, 0n, VIEW_CHANNEL);
     for (const userId of guests) {
-      await putOverwrite(token, channelId, userId, 1, 0n, VIEW_CHANNEL, Boolean(options.allowMissingMember));
+      const [allow, deny] = keep.get(channelId)?.has(userId) ? [GUEST_ALLOW, 0n] : [0n, VIEW_CHANNEL];
+      await putOverwrite(token, channelId, userId, 1, allow, deny, Boolean(options.allowMissingMember));
     }
   }
   await putOverwrite(token, project.channel_id, roleId, 0, GUEST_ALLOW, 0n);
@@ -209,9 +237,43 @@ async function prepareGuestAccess(registry, target, userId, options = {}) {
   return { projectName, project, roleId, token, guestUserIds };
 }
 
+// Fails when the registry entry's mode changed since the command read it.
+function requireMode(projectName, entry, expected) {
+  const mode = guestMode(projectName, entry);
+  if (mode !== expected) throw new Error(`${projectName} switched to guest_mode ${mode} while this command ran; run it again`);
+}
+
+// A guest role left from managed mode still shows the channel to whoever holds it.
+function warnLeftoverRole(projectName, project) {
+  if (project.guest_role_id) {
+    console.error(`Warning: ${projectName} still has guest role ${project.guest_role_id} from managed mode; ` +
+      "members holding it keep channel access by role until it is removed.");
+  }
+}
+
+// Registry-only grant: the Router reads `guest_user_ids` live, so this alone
+// lets the user drive the project; no role, overwrite or member role changes.
+// A read-only member lookup first refuses an ID that is no one in the guild.
+async function grantRegistryOnly(registry, projectName, project, userId) {
+  const token = rootToken();
+  const member = await discordApi(token, `/guilds/${registry.guild_id}/members/${userId}`, { allow404: true });
+  if (!member) throw new Error(`${userId} is not a member of the guild; check the user ID`);
+  await updateGuestEntry(projectName, entry => {
+    requireMode(projectName, entry, "registry-only");
+    entry.guest_user_ids = unique([...(entry.guest_user_ids || []), userId]);
+  });
+  warnLeftoverRole(projectName, project);
+  console.log(`Granted ${userId} registry-only guest access to ${projectName}; Discord permissions unchanged.`);
+}
+
 async function grant(registry, target, userId, options = {}) {
+  const [[projectName, project]] = resolveProjects(registry, target);
+  if (guestMode(projectName, project) === "registry-only") return grantRegistryOnly(registry, projectName, project, userId);
   const result = await prepareGuestAccess(registry, target, userId, options);
-  await updateGuestEntry(result.projectName, entry => addGuest(entry, result.roleId, userId));
+  await updateGuestEntry(result.projectName, entry => {
+    requireMode(result.projectName, entry, "managed");
+    addGuest(entry, result.roleId, userId);
+  });
   console.log(`Granted ${userId} guest access to ${result.projectName}.`);
   return result;
 }
@@ -257,9 +319,16 @@ async function createInvite(registry, project, userId, roleId, token) {
 }
 
 async function invite(registry, target, userId) {
+  const [[projectName, project]] = resolveProjects(registry, target);
+  if (guestMode(projectName, project) === "registry-only") {
+    throw new Error(`${projectName} uses registry-only guests: give ${userId} Discord access to the channel, then run grant`);
+  }
   const result = await prepareGuestAccess(registry, target, userId, { allowMissingMember: true });
   const inviteResult = await createInvite(registry, result.project, userId, result.roleId, result.token);
-  await updateGuestEntry(result.projectName, entry => addGuest(entry, result.roleId, userId, inviteResult.code));
+  await updateGuestEntry(result.projectName, entry => {
+    requireMode(result.projectName, entry, "managed");
+    addGuest(entry, result.roleId, userId, inviteResult.code);
+  });
   console.log(`Granted ${userId} guest access to ${result.projectName}.`);
   console.log(`Invite: ${inviteResult.url}`);
 }
@@ -269,12 +338,16 @@ async function deleteInvite(token, code) {
 }
 
 async function revoke(registry, target, userId) {
-  const token = rootToken();
   const [[projectName, project]] = resolveProjects(registry, target);
+  guestMode(projectName, project);
+  const codes = project.guest_invites?.[userId] || [];
+  // In either mode, a guest role (in registry-only mode, one left from managed
+  // mode) is taken off the user, so they stop seeing the channel through it.
+  const token = rootToken();
   if (project.guest_role_id) {
     await tryDeleteMemberRole(registry, userId, project.guest_role_id, token);
   }
-  for (const code of project.guest_invites?.[userId] || []) {
+  for (const code of codes) {
     await deleteInvite(token, code);
   }
   await updateGuestEntry(projectName, entry => removeGuest(entry, userId));
@@ -282,8 +355,13 @@ async function revoke(registry, target, userId) {
 }
 
 async function sync(registry, target) {
+  const projects = resolveProjects(registry, target);
   const token = rootToken();
-  for (const [projectName, project] of resolveProjects(registry, target)) {
+  for (const [projectName, project] of projects) {
+    if (guestMode(projectName, project) === "registry-only") {
+      console.log(`Skipped ${projectName}: registry-only guests keep their own Discord permissions.`);
+      continue;
+    }
     if (!project.channel_id) continue;
     if ((project.guest_user_ids || []).length > 0 && !project.guest_role_id) {
       const roleId = await ensureGuestRole(registry, projectName, project, token);
@@ -305,7 +383,14 @@ async function sync(registry, target) {
 function list(registry, target) {
   for (const [projectName, project] of resolveProjects(registry, target)) {
     const guests = project.guest_user_ids?.length ? project.guest_user_ids.join(", ") : "(none)";
-    console.log(`${projectName}: ${guests}`);
+    let mode;
+    try {
+      mode = guestMode(projectName, project) === "registry-only" ? " (registry-only)" : "";
+    } catch {
+      mode = ` (invalid guest_mode ${JSON.stringify(project.guest_mode)})`;
+    }
+    console.log(`${projectName}${mode}: ${guests}`);
+    if (mode === " (registry-only)") warnLeftoverRole(projectName, project);
   }
 }
 
@@ -314,6 +399,10 @@ async function main() {
   if (!["invite", "grant", "revoke", "sync", "list"].includes(action)) usage();
   if (["invite", "grant", "revoke"].includes(action) && (!target || !userId)) usage();
   if (["sync", "list"].includes(action) && userId) usage();
+  if (userId && !/^\d{17,20}$/.test(userId)) {
+    console.error(`Error: ${JSON.stringify(userId)} is not a Discord user ID (17-20 digits)`);
+    process.exit(2);
+  }
 
   const registry = loadRegistry();
   try {
@@ -322,6 +411,11 @@ async function main() {
     if (!(error instanceof ResolveError)) throw error;
     console.error(`conversation-resolver: ${error.message}`);
     process.exit(2);
+  }
+  // A managed grant, invite or sync reads every project's mode (to keep
+  // registry-only channels for their guests), so all are checked before any write.
+  if (["invite", "grant", "sync"].includes(action)) {
+    for (const [projectName, project] of Object.entries(registry.projects || {})) guestMode(projectName, project);
   }
   if (action === "invite") await invite(registry, target, userId);
   if (action === "grant") await grant(registry, target, userId);

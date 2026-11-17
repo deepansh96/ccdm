@@ -572,6 +572,25 @@ function routeDiscordApi(url, init = {}) {
     return response("", { status: 204 });
   }
 
+  // A guild member lookup; a user listed in memberRolePut404UserIds is not in the guild.
+  const memberMatch = /^\/api\/v10\/guilds\/([^/]+)\/members\/([^/]+)$/.exec(url.pathname);
+  if (url.hostname === "discord.com" && memberMatch && method === "GET") {
+    const state = readState();
+    updateState((state) => {
+      state.fixtures.discord.memberGets ||= [];
+      state.fixtures.discord.memberGets.push({ guildId: memberMatch[1], userId: memberMatch[2] });
+    });
+    if ((state.fixtures?.discord?.memberRolePut404UserIds || []).includes(memberMatch[2])) {
+      return response(JSON.stringify({ message: "Unknown Member", code: 10007 }), {
+        headers: { "content-type": "application/json" },
+        status: 404,
+      });
+    }
+    return response(JSON.stringify({ user: { id: memberMatch[2] }, roles: [] }), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
   const memberRoleMatch = /^\/api\/v10\/guilds\/([^/]+)\/members\/([^/]+)\/roles\/([^/]+)$/.exec(url.pathname);
   if (url.hostname === "discord.com" && memberRoleMatch && method === "PUT") {
     const state = readState();
