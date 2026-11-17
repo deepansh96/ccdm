@@ -462,6 +462,11 @@ PY
   exit 0
 fi
 
+# Claude Code labels every channel message that lands mid-turn "not from your
+# user"; this note tells the session the Router already verified the sender
+# (scripts/claude-channel-trust.txt), so the owner can still steer a busy turn.
+# zsh reads the file at launch: `$(<file)` keeps the note one argument.
+TRUST_FLAG=" --append-system-prompt \"\$(<'$SCRIPT_DIR/claude-channel-trust.txt')\""
 MODEL_FLAG=""
 [[ -n "$MODEL" ]] && MODEL_FLAG=" --model '$MODEL'"
 EFFORT_FLAG=""
@@ -477,7 +482,7 @@ PY
 )" || fail "The thread launch files could not be read"
 # zsh -i loads ~/.zshrc, so prompts there (oh-my-zsh's update prompt) must be
 # switched off or a headless launch blocks before it starts anything.
-if ! tmux new-session -d -s "$TMUX_NAME" -- env DISABLE_AUTO_UPDATE=true DISABLE_UPDATE_PROMPT=true zsh -ic "cd '$PATH_DIR' && CCDM_ROUTER_KEY_FILE='$KEY_FILE'$REMINDER_ENV$CONFIG_DIR_ENV claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions --mcp-config '$LAUNCH_DIR/mcp.json' --settings '$LAUNCH_DIR/settings.json'$MODEL_FLAG$EFFORT_FLAG$RESUME_FLAG" >&2; then
+if ! tmux new-session -d -s "$TMUX_NAME" -- env DISABLE_AUTO_UPDATE=true DISABLE_UPDATE_PROMPT=true zsh -ic "cd '$PATH_DIR' && CCDM_ROUTER_KEY_FILE='$KEY_FILE'$REMINDER_ENV$CONFIG_DIR_ENV claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions --mcp-config '$LAUNCH_DIR/mcp.json' --settings '$LAUNCH_DIR/settings.json'$TRUST_FLAG$MODEL_FLAG$EFFORT_FLAG$RESUME_FLAG" >&2; then
   fail "tmux could not start the thread session"
 fi
 echo "Started Claude thread session in tmux session '$TMUX_NAME'" >&2

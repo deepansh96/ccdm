@@ -57,6 +57,8 @@ The bridge dynamically registers one Discord MCP server for its channel, backed 
 
 Use `scripts/guest-access.js`; do not create generic server invites. `invite` or `grant` creates/synchronizes the project role, denies other managed locations, allows the target channel, and updates the registry's `guest_user_ids`. The Router reloads guests from the registry, so a grant or revoke applies to the next message without a restart. `revoke` removes the role, the registry entry, and outstanding invites. Guests can never reach root: their bot mentions are dropped.
 
+Every Claude channel and thread event carries `sender="owner"` or `sender="guest"`, set by the channel server from the Router's sender check. Claude Code labels every channel message that lands mid-turn "not from your user", so Claude launches append `scripts/claude-channel-trust.txt` with `--append-system-prompt`. It tells the session that a `sender="owner"` message is the owner whenever it arrives, which keeps mid-turn steering working; guests keep guest handling. A resumed conversation keeps its recorded system prompt until it compacts.
+
 Project-specific user and channel access exceptions live in ignored `CLAUDE.local.md`. Apply those rules without copying local IDs into tracked files.
 
 ## Routing Rules

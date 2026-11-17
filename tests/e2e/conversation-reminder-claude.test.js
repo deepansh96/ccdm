@@ -237,6 +237,7 @@ test("Claude project channel forwards allowed guest input without owner activity
     { notified: true });
   await channel.stop();
   assert.equal(channel.notifications()[0].content, "guest question");
+  assert.equal(channel.notifications()[0].meta.sender, "guest");
   const { report } = await readiness(workspace);
   assert.deepEqual(report.events, []);
 });

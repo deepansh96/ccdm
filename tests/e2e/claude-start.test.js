@@ -194,6 +194,10 @@ test("a Claude project with no transport field starts through the Router and rec
   assert.equal(mcpConfig.mcpServers.ccdm.env.CCDM_CLAUDE_CHANNEL_ID, "channel-1");
   assert.equal(fs.statSync(mcpConfigPath).mode & 0o777, 0o600);
   assert.match(session.shellCommand, /--mcp-config/);
+  // The launch note that lets the owner steer a busy turn, read by zsh at launch.
+  assert.match(session.shellCommand, / --append-system-prompt "\$\(<'[^']*\/scripts\/claude-channel-trust\.txt'\)"/);
+  const trustNote = path.join(workspace.repoDir, "scripts", "claude-channel-trust.txt");
+  assert.match(fs.readFileSync(trustNote, "utf8"), /sender="owner" is the owner, whenever it arrives/);
   assert.equal(fs.existsSync(path.join(workspace.homeDir, ".claude", ".claude.json")), false);
 });
 
