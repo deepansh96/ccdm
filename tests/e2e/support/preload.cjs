@@ -115,6 +115,12 @@ function formBodyFields(body) {
   return fields;
 }
 
+// `{ threadArchived }` for a channel the fake knows as a thread, else nothing.
+function threadArchivedAt(state, channelId) {
+  const thread = state.fixtures.discord.threads?.[channelId];
+  return thread ? { threadArchived: Boolean(thread.archived) } : {};
+}
+
 function takeRestFailure(method, url, init = {}) {
   const state = readState();
   const failures = state.fixtures?.discord?.restFailures;
@@ -871,6 +877,8 @@ function routeDiscordApi(url, init = {}) {
         channelId: reactionMatch[1],
         emoji: reactionMatch[3],
         messageId: reactionMatch[2],
+        // In a known thread: whether it was archived when the reaction arrived.
+        ...threadArchivedAt(state, reactionMatch[1]),
       });
     });
     return response("", { status: 204 });
@@ -883,6 +891,7 @@ function routeDiscordApi(url, init = {}) {
         channelId: reactionMatch[1],
         emoji: reactionMatch[3],
         messageId: reactionMatch[2],
+        ...threadArchivedAt(state, reactionMatch[1]),
       });
     });
     return response("", { status: 204 });

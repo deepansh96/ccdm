@@ -83,13 +83,15 @@ def session_running(thread_id: str) -> bool:
     return bool(_listener_pids(key_path(thread_id)))
 
 
-def stop_session(context, row) -> None:
+def stop_session(context, row, failed: bool = False) -> None:
     """Stop a thread's session by its `.thread-<id>.key` path, never by name
     patterns a project or sibling session could match; then its own tmux
-    session and key go."""
-    from . import boot  # boot imports capacity, which imports this module.
+    session and key go. A turn that already ended still gets its mark;
+    otherwise the ⏳ goes, or becomes ⚠️ when ``failed`` (a crash)."""
+    from . import boot, turns  # Both import modules that import this one.
 
     thread_id = row["thread_id"]
+    turns.on_stop(context, row, failed)
     boot.drop(context, thread_id)
     kill_listeners(key_path(thread_id))
     if row["runtime_tmux"]:
@@ -165,10 +167,7 @@ def finish_close(context, row) -> None:
     the session stops, the row closes as `close-command`, and the reminder
     service hears `conversation_closed`. Reconcile and the archive handler
     also use it to finish a close a crash interrupted after `pending_close`."""
-    from . import turns  # turns imports this module.
-
     thread_id = row["thread_id"]
-    turns.delete_ping(context, row)
     stop_session(context, store.thread(context.db, thread_id) or row)
     store.update(context.db, thread_id, state="closed", stop_reason=None, close_reason="close-command",
                  pending_close=None)

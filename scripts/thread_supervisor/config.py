@@ -126,7 +126,9 @@ def on_thread_config(context, row, owner: bool, event: dict) -> None:
 
 
 def on_thread_reaction(context, event: dict) -> None:
-    """Only the owner's ✅ on the pending warning itself applies a pending change."""
+    """Only the owner's ✅ on the pending warning itself applies a pending change.
+    Root's own ✅ turn marks never get here (the Router drops bot reactions),
+    and none is ever on a warning, which is root's own notice."""
     thread_id = event.get("thread_id")
     if event.get("emoji") != CHECK or not (event.get("user") or {}).get("is_owner") or not isinstance(thread_id, str):
         return
