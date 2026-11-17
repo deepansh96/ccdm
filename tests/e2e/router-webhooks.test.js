@@ -126,6 +126,24 @@ test("delete-webhook removes the project's webhook, its private token, and its r
   assert.equal(demoEntry.channel_id, "demo-channel");
 });
 
+test("delete-webhook clears the token and registry id of a project whose channel Discord deleted", async () => {
+  const workspace = createRouterWorkspace();
+  const created = await runRouterCli(workspace, ["ensure-webhook", "demo"]);
+  assert.equal(created.exitCode, 0, created.stderr || created.stdout);
+  // Deleting a channel deletes its webhooks too.
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.missingChannels = ["demo-channel"];
+    state.fixtures.discord.webhooks = [];
+  });
+
+  const result = await runRouterCli(workspace, ["delete-webhook", "demo"]);
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /no webhook ccdm-demo to delete/);
+  assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "webhooks", "demo.json")), false);
+  assert.equal(Object.hasOwn(registry(workspace).projects.demo, "webhook_id"), false);
+});
+
 test("edit_message also refetches a lost private webhook token", async () => {
   const workspace = createRouterWorkspace();
   await routerWithWebhooks(workspace, ["demo"]);
