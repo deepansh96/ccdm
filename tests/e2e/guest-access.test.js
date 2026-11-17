@@ -389,3 +389,122 @@ test("guest access exits 2 with the conversation resolver's reason for a target 
   const discord = readState(workspace.stateDir).fixtures.discord;
   assert.deepEqual([discord.roleCreates ?? [], discord.permissionOverwrites ?? []], [[], []]);
 });
+
+// A registry-only project: its guests already see the channel through their
+// own Discord roles, so guest access only edits `guest_user_ids` and must never
+// add a role, an overwrite or a member role that would hide their other channels.
+function registryOnlyRegistry(workspace) {
+  const registry = buildRegistry(workspace);
+  registry.projects.alpha.guest_mode = "registry-only";
+  return registry;
+}
+
+function discordWrites(workspace) {
+  const discord = readState(workspace.stateDir).fixtures.discord;
+  return [discord.roleCreates ?? [], discord.permissionOverwrites ?? [], discord.memberRolePuts ?? [],
+    discord.memberRoleDeletes ?? [], discord.invites ?? []];
+}
+
+test("a registry-only grant records the guest without touching Discord permissions", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, registryOnlyRegistry(workspace));
+  // No root credentials are needed when nothing is written to Discord.
+  fs.unlinkSync(path.join(workspace.homeDir, ".claude/channels/discord/.env"));
+
+  const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
+    args: ["grant", "alpha", GUEST_ID], env: preloadEnv(workspace),
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /Granted 222222222222222222 registry-only guest access to alpha; Discord permissions unchanged/);
+  const alpha = readRegistry(workspace).projects.alpha;
+  assert.deepEqual(alpha.guest_user_ids, [GUEST_ID]);
+  assert.equal(alpha.guest_role_id, undefined);
+  assert.deepEqual(discordWrites(workspace), [[], [], [], [], []]);
+});
+
+test("a registry-only invite is refused before any Discord write", async () => {
+  const workspace = createWorkspace();
+  seedRegistry(workspace, registryOnlyRegistry(workspace));
+
+  const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
+    args: ["invite", "alpha", GUEST_ID], env: preloadEnv(workspace),
+  });
+
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /alpha uses registry-only guests: give 222222222222222222 Discord access to the channel, then run grant/);
+  assert.equal(readRegistry(workspace).projects.alpha.guest_user_ids, undefined);
+  assert.deepEqual(discordWrites(workspace), [[], [], [], [], []]);
+});
+
+test("a registry-only revoke removes the guest and leaves their roles alone", async () => {
+  const workspace = createWorkspace();
+  const registry = registryOnlyRegistry(workspace);
+  // A role left from before the switch to registry-only is not removed either.
+  registry.projects.alpha.guest_role_id = "existing-role";
+  registry.projects.alpha.guest_user_ids = [GUEST_ID, "333333333333333333"];
+  seedRegistry(workspace, registry);
+
+  const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
+    args: ["revoke", "alpha", GUEST_ID], env: preloadEnv(workspace),
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.deepEqual(readRegistry(workspace).projects.alpha.guest_user_ids, ["333333333333333333"]);
+  assert.deepEqual(discordWrites(workspace), [[], [], [], [], []]);
+});
+
+test("sync skips registry-only projects and still syncs managed ones", async () => {
+  const workspace = createWorkspace();
+  const registry = registryOnlyRegistry(workspace);
+  registry.projects.alpha.guest_user_ids = [GUEST_ID];
+  registry.projects.beta.guest_role_id = "beta-role";
+  registry.projects.beta.guest_user_ids = ["333333333333333333"];
+  seedRegistry(workspace, registry);
+
+  const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
+    args: ["sync"], env: preloadEnv(workspace),
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /Skipped alpha: registry-only guests keep their own Discord permissions/);
+  assert.match(result.stdout, /Synced beta/);
+  const updated = readRegistry(workspace);
+  assert.equal(updated.projects.alpha.guest_role_id, undefined);
+  const discord = readState(workspace.stateDir).fixtures.discord;
+  assert.deepEqual(discord.roleCreates, []);
+  assert.equal(discord.permissionOverwrites.some((entry) => entry.overwriteId === GUEST_ID), false);
+  assert.ok(discord.permissionOverwrites.length > 0);
+  assert.equal(discord.memberRolePuts.some((entry) => entry.userId === GUEST_ID), false);
+});
+
+test("list marks registry-only projects", async () => {
+  const workspace = createWorkspace();
+  const registry = registryOnlyRegistry(workspace);
+  registry.projects.alpha.guest_user_ids = [GUEST_ID];
+  seedRegistry(workspace, registry);
+
+  const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", {
+    args: ["list"], env: preloadEnv(workspace),
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /^alpha \(registry-only\): 222222222222222222$/m);
+  assert.match(result.stdout, /^beta: \(none\)$/m);
+});
+
+test("an unknown guest_mode fails before any registry or Discord write", async () => {
+  const workspace = createWorkspace();
+  const registry = buildRegistry(workspace);
+  registry.projects.alpha.guest_mode = "registry_only";
+  seedRegistry(workspace, registry);
+  const before = fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8");
+
+  for (const args of [["grant", "alpha", GUEST_ID], ["invite", "alpha", GUEST_ID], ["revoke", "alpha", GUEST_ID], ["sync", "alpha"], ["sync"]]) {
+    const result = await runNodeEntrypoint(workspace, "scripts/guest-access.js", { args, env: preloadEnv(workspace) });
+    assert.notEqual(result.exitCode, 0, args.join(" "));
+    assert.match(result.stderr, /Project alpha has unknown guest_mode "registry_only"; use "managed" or "registry-only"/);
+  }
+  assert.equal(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"), before);
+  assert.deepEqual(discordWrites(workspace), [[], [], [], [], []]);
+});

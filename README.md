@@ -562,6 +562,8 @@ This creates a one-use invite and a per-project `ccdm-guest-<project>` role. The
 
 For users already in the server, use `grant` instead of `invite`. Use `revoke` to remove their project guest role, registry entry, and outstanding invites.
 
+When people already see a project channel through their own Discord roles and must keep every other channel and thread they see, set `"guest_mode": "registry-only"` on that project in `registry.json`. Then `grant` and `revoke` only add or remove the user in `guest_user_ids`, with no guest role, permission overwrite, or member role change. `invite` is refused, since an invite would have to grant a role. `sync`, including a bare `sync` over every project, skips the project. `list` marks it `(registry-only)`. The default, `"managed"`, is the role-gated behaviour above, and any other value fails before anything is written.
+
 ## Thread Conversations
 
 Open a public thread under a registered project channel and type a task: it becomes a **Thread Conversation**, a fresh Claude Code or Codex conversation for that project, running in the project checkout. The Router scopes it to that thread alone, so the Channel Conversation and sibling threads never see its traffic. Replies post into the thread through the project's webhook as `<project>-<provider> · N%`. The owner and the channel's guests drive threads without an @mention. Full details are in [docs/thread-supervisor.md](docs/thread-supervisor.md).

@@ -8,7 +8,7 @@ triggers:
 edges:
   - target: context/discord-security.md
     condition: always before changing guest permissions
-last_updated: 2026-09-29
+last_updated: 2026-11-17
 ---
 
 # Manage Guest Access
@@ -23,6 +23,7 @@ last_updated: 2026-09-29
 - Do not send a generic guild invite.
 - Guests receive text, history, attachments, reactions, and thread replies, not voice access.
 - Plan A access is restricted by the root `AGENTS.md` rules.
+- `grant` and `sync` add member-level view denies on every other managed channel and category, which hides channels a person could see through their own roles. When guests must keep that access, set the project's `guest_mode` to `registry-only` first; then `grant`/`revoke` touch only `guest_user_ids` and `sync` skips the project.
 
 ## Verify
 - [ ] Guest sees the target channel and no other managed project channel.

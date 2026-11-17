@@ -55,7 +55,7 @@ The bridge dynamically registers one Discord MCP server for its channel, backed 
 
 ## Guests
 
-Use `scripts/guest-access.js`; do not create generic server invites. `invite` or `grant` creates/synchronizes the project role, denies other managed locations, allows the target channel, and updates the registry's `guest_user_ids`. The Router reloads guests from the registry, so a grant or revoke applies to the next message without a restart. `revoke` removes the role, the registry entry, and outstanding invites. Guests can never reach root: their bot mentions are dropped.
+Use `scripts/guest-access.js`; do not create generic server invites. `invite` or `grant` creates/synchronizes the project role, denies other managed locations, allows the target channel, and updates the registry's `guest_user_ids`. The Router reloads guests from the registry, so a grant or revoke applies to the next message without a restart. `revoke` removes the role, the registry entry, and outstanding invites. A project with `"guest_mode": "registry-only"` keeps its guests in `guest_user_ids` alone, for people who already see the channel through their own roles: `grant` and `revoke` change only the registry (and delete any recorded invites), `invite` is refused, `sync` skips the project, and nothing creates a role or overwrite that would hide their other channels; an unknown mode fails before any write. Guests can never reach root: their bot mentions are dropped.
 
 Project-specific user and channel access exceptions live in ignored `CLAUDE.local.md`. Apply those rules without copying local IDs into tracked files.
 
