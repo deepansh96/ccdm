@@ -19,8 +19,7 @@ const { createAttachmentCache } = require("./router/attachments.js");
 const { RouterClient } = require("./router/client.js");
 const { discordRequest } = require("./router/discord-rest.js");
 const { acquireRouterLock } = require("./router/lock.js");
-const { classifyMessage, classifyReaction, isOwnerPing, observedMessage, supervisedMessage, threadRoute } =
-  require("./router/inbound.js");
+const { classifyMessage, classifyReaction, observedMessage, supervisedMessage, threadRoute } = require("./router/inbound.js");
 const { preflight } = require("./router/preflight.js");
 const { probe } = require("./router/probe.js");
 const { registryPath, rootStateDir, rootToken, socketPath, stateDir } = require("./router/paths.js");
@@ -35,25 +34,11 @@ const OFFLINE_EMOJI = "💤";
 const GUILD_THREAD_PERMISSIONS = ["ViewAuditLog"];
 const THREAD_SUPERVISOR_PLIST = path.join("Library", "LaunchAgents", "com.ccdm.thread-supervisor.plist");
 
-// Owner pings remembered, at most.
-const PING_MEMORY = 2000;
 // How long `router status` waits for the status op.
 const STATUS_TIMEOUT_MS = 30000;
 
 function log(line) {
   console.log(`[router] ${line}`);
-}
-
-// A Set that forgets its oldest entries past `limit`.
-function boundedSet(limit) {
-  const set = new Set();
-  const add = set.add.bind(set);
-  set.add = value => {
-    add(value);
-    while (set.size > limit) set.delete(set.values().next().value);
-    return set;
-  };
-  return set;
 }
 
 async function serve() {
@@ -74,15 +59,10 @@ async function serve() {
   // hello whose check needs Discord (a thread's) waits for this first.
   let markGatewayReady;
   const gatewayReady = new Promise(resolve => { markGatewayReady = resolve; });
-  // The owner pings this Router posted: a fast path for telling a native reply
-  // to a ping (the thread's) from one to another root message (root's). After
-  // a restart the same answer comes from the replied-to message's own text
-  // (`isOwnerPing`), so routing does not change.
-  const pings = boundedSet(PING_MEMORY);
   const server = createRouterServer({
     stateDir: stateDir(), socketPath: socketPath(), getTable: () => table, gateway, registry,
     context: {
-      stateDir: stateDir(), registryFile: registryPath(), token, attachments, bot, discord, log, pings, gatewayReady,
+      stateDir: stateDir(), registryFile: registryPath(), token, attachments, bot, discord, log, gatewayReady,
       // A failed reminder update is logged; the reply it heals still goes out.
       assignmentChanged: project => assignmentChanged(project, { registryFile: registryPath() })
         .then(() => log(`assignment_changed project=${project}`), error => log(`assignment_changed_failed ${error.message}`)),
@@ -118,31 +98,11 @@ async function serve() {
   // A thread message: owner and guest messages reach the live thread session,
   // or else the supervisor, or else get 💤. The supervisor also gets a copy of
   // every message, in the same turn as the session delivery.
-  // The id of the owner ping `message` natively replies to, or null.
-  async function repliedPing(message, thread) {
-    const reference = message.reference?.messageId ? String(message.reference.messageId) : null;
-    const botId = client.user?.id;
-    if (!reference || !botId || message.mentions?.repliedUser?.id !== botId) return null;
-    if (pings.has(reference)) return reference;
-    let replied = message.channel?.messages?.cache?.get(reference) ?? null;
-    if (!replied) {
-      try {
-        replied = await discordRequest("GET", `/channels/${thread.thread_id}/messages/${reference}`, { token });
-      } catch (error) {
-        log(`ping_lookup_failed thread=${thread.thread_id} message=${reference} ${error.message}`);
-        return null;  // Unknown: the reply stays root's, as for any root message.
-      }
-    }
-    return isOwnerPing(replied, botId, table.ownerId) ? reference : null;
-  }
-
   async function routeThreadMessage(message, thread) {
-    const ping = await repliedPing(message, thread);
-    const options = { isPing: id => id === ping };
-    const routed = classifyMessage(table, message, thread, options);
+    const routed = classifyMessage(table, message, thread);
     if (routed) attachments.remember(routed.event);
     const delivered = Boolean(routed?.thread) && server.deliverThread(thread.thread_id, routed.event);
-    const supervised = server.deliverSupervisor(supervisedMessage(table, message, thread, delivered, options));
+    const supervised = server.deliverSupervisor(supervisedMessage(table, message, thread, delivered));
     if (!routed || delivered) return;
     if (routed.root) {
       if (!server.deliverRoot(routed.event)) await markOffline(thread.thread_id, message.id);
@@ -301,11 +261,6 @@ async function status(json = false) {
     const guild = known ? permissionState(known.missing_optional_thread_permissions,
       flag => GUILD_THREAD_PERMISSIONS.includes(flag)) : "unknown";
     console.log(`guild permissions (optional): ${guild}`);
-  }
-  const board = result.status_channel ?? {};
-  if (board.error) console.log(`thread status channel: off (invalid: ${board.error})`);
-  else if (board.channel_id) {
-    console.log(`thread status channel: ${board.channel_id} permissions=${permissionState(board.missing_permissions, () => true)}`);
   }
   console.log(`scope violations: ${result.scope_violations.length}`);
   for (const violation of result.scope_violations) {

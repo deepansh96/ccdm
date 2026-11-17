@@ -47,33 +47,6 @@ function addressesRoot(message) {
   return Boolean(message.reference?.messageId) && message.mentions?.repliedUser?.id === botId;
 }
 
-// The supervisor's owner pings as it sends them
-// (scripts/thread_supervisor/turns.py PING_TEXTS); change both together.
-const OWNER_PING_TEXTS = Object.freeze([
-  "🔔 {owner} ready for you", "🔔 {owner} finished without a reply", "⚠️ {owner} the last turn failed",
-]);
-
-// Whether a message (a discord.js Message or a raw API message) is an owner
-// ping: the root bot's own message, not a webhook's, whose content is exactly
-// one of the ping texts for the owner. No other root message matches.
-function isOwnerPing(message, botId, ownerId) {
-  if (!message || !botId || !ownerId || message.webhook_id || message.webhookId) return false;
-  if (String(message.author?.id ?? "") !== String(botId)) return false;
-  const content = String(message.content ?? "");
-  return OWNER_PING_TEXTS.some(text => text.replace("{owner}", `<@${ownerId}>`) === content);
-}
-
-// A native reply to one of the supervisor's owner pings answers the thread,
-// not root: `isPing` says whether the replied-to message is a ping.
-function repliesToPing(message, options) {
-  const botId = message.client?.user?.id;
-  if (!botId || !options.isPing || new RegExp(`<@!?${botId}>`).test(String(message.content || ""))) return false;
-  const reference = message.reference?.messageId;
-  return Boolean(reference) && options.isPing(String(reference));
-}
-
-const addressesRootIn = (message, options) => addressesRoot(message) && !repliesToPing(message, options);
-
 function messageEvent(route, author, message) {
   return {
     event: "message",
@@ -95,12 +68,12 @@ function messageEvent(route, author, message) {
 
 // `thread` is the message's thread route from `threadRoute`, if any; a result
 // with `thread: true` is for that thread's session.
-function classifyMessage(table, message, thread = null, options = {}) {
+function classifyMessage(table, message, thread = null) {
   // 1. Bots and webhooks, including our own Project Identities, never reach a session.
   if (message.author?.bot || message.webhookId) return null;
   const channelId = String(message.channelId ?? message.channel?.id);
   const user = { ...message.author, globalName: message.member?.displayName || message.author.globalName };
-  if (thread) return classifyThreadMessage(table, message, thread, user, options);
+  if (thread) return classifyThreadMessage(table, message, thread, user);
   // 2. In a root channel, only the owner and root's allowed users reach root.
   if (table.rootChannels.has(channelId)) {
     const author = allowedAuthor(table.rootAllowedUserIds, table, user);
@@ -157,10 +130,10 @@ const threadCommand = (route, author, message) => supervisorCommand("thread_comm
 // In a thread, the owner and the parent's current guests reach the thread
 // session; the supervisor's commands (`supervisor: true`) reach no session. Addressing the bot is
 // for root, in the thread, and only from the owner.
-function classifyThreadMessage(table, message, route, user, options) {
+function classifyThreadMessage(table, message, route, user) {
   const author = allowedAuthor(new Set(route.guests), table, user);
   if (!author) return null;
-  if (addressesRootIn(message, options)) {
+  if (addressesRoot(message)) {
     return author.is_owner ? { route, root: true, event: messageEvent(route, author, message) } : null;
   }
   const content = String(message.content || "").trim();
@@ -188,7 +161,7 @@ function authorClass(table, message, route) {
 // webhooks and strangers included, saying whether its thread session got it
 // and whether it addresses root (a bot mention or a native reply to root),
 // which never boots or feeds a thread session.
-function supervisedMessage(table, message, thread, deliveredToSession, options = {}) {
+function supervisedMessage(table, message, thread, deliveredToSession) {
   const user = { ...message.author, globalName: message.member?.displayName || message.author?.globalName };
   const author = { id: String(user.id ?? ""), name: user.globalName || user.username || String(user.id ?? ""),
     bot: Boolean(user.bot) };
@@ -201,7 +174,7 @@ function supervisedMessage(table, message, thread, deliveredToSession, options =
     webhook_id: message.webhookId ? String(message.webhookId) : null,
     author_class: authorClass(table, message, thread),
     delivered_to_session: deliveredToSession,
-    to_root: !message.author?.bot && !message.webhookId && addressesRootIn(message, options),
+    to_root: !message.author?.bot && !message.webhookId && addressesRoot(message),
   };
 }
 
@@ -268,5 +241,4 @@ async function classifyReaction(table, reaction, user, botId = null, thread = nu
   };
 }
 
-module.exports = { OWNER_PING_TEXTS, classifyMessage, classifyReaction, isOwnerPing, observedMessage, supervisedMessage,
-  threadRoute };
+module.exports = { classifyMessage, classifyReaction, observedMessage, supervisedMessage, threadRoute };

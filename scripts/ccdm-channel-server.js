@@ -704,7 +704,7 @@ function main() {
         text = await tool.run(router, input);
       } else {
         const result = await request(tool.op, tool.args(input));
-        // The thread's turn has replied, for the supervisor's owner ping.
+        // The thread's turn has replied, recorded in its activity file.
         if (THREAD && tool.op === "reply") markReplied(process.env.CCDM_THREAD_ACTIVITY_FILE);
         // Record the receipt before Claude sees the result, so the Stop hook
         // that follows the turn finds it.
