@@ -141,7 +141,7 @@ test("a message after live arrives once as a live event, and its reply posts int
 
   assert.deepEqual(notifications(workspace).slice(1), [{
     content: "how is it going?",
-    meta: { chat_id: THREAD_ID, message_id: "live-message-1", user: "Owner", user_id: OWNER_ID,
+    meta: { chat_id: THREAD_ID, message_id: "live-message-1", user: "Owner", user_id: OWNER_ID, sender: "owner",
       ts: notifications(workspace)[1].meta.ts },
   }]);
   assert.equal(notifications(workspace).length, 2);
@@ -227,6 +227,8 @@ test("no Discord credential reaches the thread session's environment, launch fil
   // The session runs in the project checkout, in its own tmux session.
   assert.equal(state.fixtures.tmux.sessions[THREAD_TMUX].cwd, workspace.tmpDir);
   assert.deepEqual(state.fixtures.tmux.sessions[THREAD_TMUX].command.slice(0, 2), ["zsh", "-ic"]);
+  assert.match(state.fixtures.tmux.sessions[THREAD_TMUX].command[2],
+    / --append-system-prompt "\$\(<'[^']*\/scripts\/claude-channel-trust\.txt'\)"/);
   const status = await runRouterCli(workspace, ["status"]);
   assert.match(status.stdout, new RegExp(`thread demo thread=${THREAD_ID} provider=claude connected=`));
 });

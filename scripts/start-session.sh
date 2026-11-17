@@ -289,7 +289,7 @@ e=json.load(open(sys.argv[1]))
 print(''.join(f" {k}='{v}'" for k,v in e.items()))
 PY
 )"
-  tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$PATH_DIR' && CCDM_ROUTER_KEY_FILE='$key_file'$reminder_env$CONFIG_DIR_ENV claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions --mcp-config '$mcp_config' --settings '$settings'$MODEL_FLAG$EFFORT_FLAG$RESUME_FLAG"
+  tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$PATH_DIR' && CCDM_ROUTER_KEY_FILE='$key_file'$reminder_env$CONFIG_DIR_ENV claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions --mcp-config '$mcp_config' --settings '$settings'$TRUST_FLAG$MODEL_FLAG$EFFORT_FLAG$RESUME_FLAG"
   echo "Started Claude Router session in tmux session '$SCREEN_NAME'${RESUME_SESSION_ID:+ (resuming $RESUME_SESSION_ID)}"
 
   # Accept the per-launch development-channel confirmation, then wait for the
@@ -396,6 +396,11 @@ IFS=$'\t' read -r PATH_DIR SCREEN_NAME MODEL CLAUDE_EFFORT CLAUDE_HOME CHANNEL_I
 [[ "$CLAUDE_HOME" == "__NONE__" ]] && CLAUDE_HOME=""
 
 # Optional model override (e.g. "claude-opus-4-8[1m]"). Empty -> account default.
+# Claude Code labels every channel message that lands mid-turn "not from your
+# user"; this note tells the session the Router already verified the sender
+# (scripts/claude-channel-trust.txt), so the owner can still steer a busy turn.
+# zsh reads the file at launch: `$(<file)` keeps the note one argument.
+TRUST_FLAG=" --append-system-prompt \"\$(<'$SCRIPT_DIR/claude-channel-trust.txt')\""
 MODEL_FLAG=""
 if [[ -n "$MODEL" ]]; then
   MODEL_FLAG=" --model '$MODEL'"
