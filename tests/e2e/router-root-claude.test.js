@@ -72,9 +72,9 @@ test("owner messages in a root channel and owner bot mentions in a project chann
   await waitFor(() => demo.events.some((event) => event.message_id === "fence"), () => "the fence message at demo", 10000);
   assert.deepEqual(done.fixtures.claude.channelNotifications, [
     { content: "status of every project?", meta: {
-      chat_id: "root-channel", message_id: "in-root", user: "Owner", user_id: OWNER_ID, ts: "2026-09-29T10:00:00.000Z" } },
+      chat_id: "root-channel", message_id: "in-root", user: "Owner", user_id: OWNER_ID, sender: "owner", ts: "2026-09-29T10:00:00.000Z" } },
     { content: `<@${BOT_ID}> restart demo`, meta: {
-      chat_id: "demo-channel", message_id: "mention", user: "Owner", user_id: OWNER_ID, ts: "2026-09-29T10:01:00.000Z" } },
+      chat_id: "demo-channel", message_id: "mention", user: "Owner", user_id: OWNER_ID, sender: "owner", ts: "2026-09-29T10:01:00.000Z" } },
   ]);
   assert.deepEqual(demo.events.map((event) => event.message_id), ["fence"]);
 });

@@ -420,13 +420,21 @@ function attachmentMeta(attachments = []) {
   return { attachment_count: String(attachments.length), attachments: listed.join("; ") };
 }
 
+// The Router's verdict on who sent an event (scripts/router/inbound.js
+// allowedAuthor), as the tag's `sender`: the launch note
+// (scripts/claude-channel-trust.txt) tells Claude to trust `sender="owner"`
+// even when Claude Code labels a mid-turn message untrusted.
+function senderMeta(author) {
+  return typeof author?.is_owner === "boolean" ? { sender: author.is_owner ? "owner" : "guest" } : {};
+}
+
 function notification(kind, event) {
   if (kind === "message") {
     return {
       content: event.content || (event.attachments?.length ? "(attachment)" : ""),
       meta: {
         chat_id: event.channel_id, message_id: event.message_id, user: event.author.name, user_id: event.author.id,
-        ts: event.ts, ...attachmentMeta(event.attachments),
+        ...senderMeta(event.author), ts: event.ts, ...attachmentMeta(event.attachments),
       },
     };
   }
@@ -434,7 +442,7 @@ function notification(kind, event) {
     content: `(reacted ${event.emoji})`,
     meta: {
       chat_id: event.channel_id, message_id: event.message_id, user: event.user.name, user_id: event.user.id,
-      ts: event.ts, reaction: event.emoji,
+      ...senderMeta(event.user), ts: event.ts, reaction: event.emoji,
     },
   };
 }
