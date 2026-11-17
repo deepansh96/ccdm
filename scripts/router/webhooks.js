@@ -10,8 +10,9 @@ const { webhookName } = require("./identity.js");
 const { OpError } = require("./ops/errors.js");
 const { readRegistry, updateRegistry } = require("./registry.js");
 
-// Discord's error code for a deleted (or never existing) webhook.
+// Discord's error codes for a deleted (or never existing) webhook and channel.
 const UNKNOWN_WEBHOOK = 10015;
+const UNKNOWN_CHANNEL = 10003;
 
 function isUnknownWebhook(error) {
   return error instanceof DiscordError && error.body?.code === UNKNOWN_WEBHOOK;
@@ -157,7 +158,15 @@ async function deleteWebhook({ project, registryFile, stateDir, token }) {
   const stored = await readWebhookSecret(stateDir, project);
   const ids = new Set([entry.webhook_id, stored?.webhook_id].filter(Boolean).map(String));
   if (entry.channel_id) {
-    for (const webhook of await discordRequest("GET", `/channels/${entry.channel_id}/webhooks`, { token })) {
+    let webhooks;
+    try {
+      webhooks = await discordRequest("GET", `/channels/${entry.channel_id}/webhooks`, { token });
+    } catch (error) {
+      // A deleted channel took its webhooks with it: only the local token and id are left to clear.
+      if (!(error instanceof DiscordError && error.body?.code === UNKNOWN_CHANNEL)) throw error;
+      webhooks = [];
+    }
+    for (const webhook of webhooks) {
       if (webhook.name === webhookName(project)) ids.add(String(webhook.id));
     }
   }
