@@ -4,16 +4,13 @@
 // Discord action it takes is one of these, sent with the root token through
 // the shared REST queue. Each target must be a registered, non-`remote:`
 // project channel or a public thread under one; anything else is
-// `scope_violation`. The status board ops act only in the registry's
-// `thread_status_channel_id`, and only on root's own messages there. Also
-// `create_thread`, a channel session's request for a thread in its own
-// channel, which the supervisor fulfils.
+// `scope_violation`. Also `create_thread`, a channel session's request for a
+// thread in its own channel, which the supervisor fulfils.
 const crypto = require("node:crypto");
 const { splitMessage } = require("../chunks.js");
 const { DEFAULT_TIMEOUT_MS } = require("../deadlines.js");
 const { DiscordError, currentDeadline, discordRequest } = require("../discord-rest.js");
 const { threadRoute } = require("../inbound.js");
-const { coalescedEdit, nextEditArrival } = require("./channel-actions.js");
 const { OpError, ScopeViolation } = require("./errors.js");
 
 const PUBLIC_THREAD = 11;
@@ -28,13 +25,8 @@ const SKIPPABLE_CHANNEL = new Set([403, 404]);
 const ARCHIVE_ACTION = 111;
 const DISCORD_EPOCH = 1420070400000n;
 const PROVIDERS = new Set(["claude", "codex"]);
-// An owner ping is one short line naming the owner once, as `{owner}`.
-const PING_LIMIT = 300;
-const OWNER_PLACEHOLDER = "{owner}";
-// Any other mention syntax a ping could carry.
-const MENTION_SYNTAX = /<@|@everyone|@here/;
-const STATUS_LIST_LIMIT = 50;
-const MESSAGE_LIMIT = 2000;
+// Discord's refusal to act in an archived thread.
+const ARCHIVED_THREAD_CODE = 50083;
 
 const isId = id => typeof id === "string" && /^[\w-]+$/.test(id);
 
@@ -221,25 +213,30 @@ async function threadArchiveActor(ctx, args) {
   return { entries };
 }
 
+// Adds or removes one of root's reactions. A message that is gone is
+// `not_found`, and an archived thread, where reactions cannot change, is
+// `thread_archived`: the supervisor's turn marks take both as settled.
 async function threadReact(ctx, args) {
   const route = await conversationTarget(ctx, args.channel_id);
   if (!isId(args.message_id)) throw new OpError("invalid_args", "message_id is required");
   if (typeof args.emoji !== "string" || !args.emoji) throw new OpError("invalid_args", "emoji is required");
-  await discordRequest(args.remove === true ? "DELETE" : "PUT",
-    `/channels/${route.channel_id}/messages/${args.message_id}/reactions/${encodeURIComponent(args.emoji)}/@me`,
-    { token: ctx.token });
+  try {
+    await discordRequest(args.remove === true ? "DELETE" : "PUT",
+      `/channels/${route.channel_id}/messages/${args.message_id}/reactions/${encodeURIComponent(args.emoji)}/@me`,
+      { token: ctx.token });
+  } catch (error) {
+    if (error instanceof DiscordError && error.status === 404) throw new OpError("not_found", `no message ${args.message_id}`);
+    if (error instanceof DiscordError && error.body?.code === ARCHIVED_THREAD_CODE) {
+      throw new OpError("thread_archived", `thread ${route.channel_id} is archived`);
+    }
+    throw error;
+  }
   return { message_id: args.message_id, emoji: args.emoji, removed: args.remove === true };
 }
 
 // Notices post as the root bot, never through the project webhook, so the
-// reminder service never counts them as agent replies. With `mention_owner`,
-// a notice in a thread pings the owner, and only the owner: the Router puts
-// the owner's id in place of `{owner}` and allows no other mention.
+// reminder service never counts them as agent replies. They mention no one.
 async function threadNotice(ctx, args) {
-  if (args.mention_owner !== undefined && args.mention_owner !== true) {
-    throw new OpError("invalid_args", "mention_owner must be true when given");
-  }
-  if (args.mention_owner) return ownerPing(ctx, args);
   const route = await conversationTarget(ctx, args.channel_id);
   if (typeof args.text !== "string" || !args.text) throw new OpError("invalid_args", "text is required");
   const ids = [];
@@ -250,127 +247,6 @@ async function threadNotice(ctx, args) {
     ids.push(message.id);
   }
   return { message_id: ids[0], message_ids: ids };
-}
-
-async function ownerPing(ctx, args) {
-  const route = await threadTarget(ctx, args.channel_id);
-  const text = args.text;
-  if (typeof text !== "string" || !text || text.length > PING_LIMIT) {
-    throw new OpError("invalid_args", `text must be 1-${PING_LIMIT} characters`);
-  }
-  const parts = text.split(OWNER_PLACEHOLDER);
-  if (parts.length !== 2) throw new OpError("invalid_args", `text must name ${OWNER_PLACEHOLDER} exactly once`);
-  if (parts.some(part => MENTION_SYNTAX.test(part))) {
-    throw new OpError("invalid_args", "text may mention no one but the owner");
-  }
-  const owner = ctx.table.ownerId;
-  if (!owner) throw new OpError("owner_unknown", "the registry has no owner");
-  const message = await discordRequest("POST", `/channels/${route.thread_id}/messages`, {
-    token: ctx.token, body: { content: parts.join(`<@${owner}>`), allowed_mentions: { parse: [], users: [owner] } },
-  });
-  ctx.pings?.add(String(message.id));
-  return { message_id: message.id, message_ids: [message.id] };
-}
-
-// The root bot's own message `messageId` in `channelId`, or null when it is gone.
-async function ownBotMessage(ctx, channelId, messageId) {
-  if (!isId(messageId)) throw new OpError("invalid_args", "message_id is required");
-  let message;
-  try {
-    message = await discordRequest("GET", `/channels/${channelId}/messages/${messageId}`, { token: ctx.token });
-  } catch (error) {
-    if (error instanceof DiscordError && error.status === 404) return null;
-    throw error;
-  }
-  if (String(message.channel_id ?? channelId) !== channelId || message.webhook_id || !ctx.bot?.id ||
-      String(message.author?.id ?? "") !== String(ctx.bot.id)) {
-    throw new ScopeViolation(messageId, "only the root bot's own messages there can be changed");
-  }
-  return message;
-}
-
-async function deleteMessage(ctx, channelId, messageId) {
-  try {
-    await discordRequest("DELETE", `/channels/${channelId}/messages/${messageId}`, { token: ctx.token });
-    return true;
-  } catch (error) {
-    if (error instanceof DiscordError && error.status === 404) return false;
-    throw error;
-  }
-}
-
-// Deletes one of root's own messages in an eligible thread, such as an owner ping.
-async function threadNoticeDelete(ctx, args) {
-  const route = await threadTarget(ctx, args.channel_id);
-  const message = await ownBotMessage(ctx, route.thread_id, args.message_id);
-  ctx.pings?.delete(String(args.message_id));
-  if (!message) return { deleted: false };
-  return { deleted: await deleteMessage(ctx, route.thread_id, message.id) };
-}
-
-// The status board's channel: the registry's `thread_status_channel_id`,
-// never an op argument.
-function statusChannel(ctx) {
-  if (ctx.table.statusChannelError) throw new OpError("status_channel_invalid", ctx.table.statusChannelError);
-  if (!ctx.table.statusChannelId) throw new OpError("status_channel_unset", "thread_status_channel_id is not set");
-  return ctx.table.statusChannelId;
-}
-
-function statusText(text) {
-  if (typeof text !== "string" || !text || text.length > MESSAGE_LIMIT) {
-    throw new OpError("invalid_args", `text must be 1-${MESSAGE_LIMIT} characters`);
-  }
-  return text;
-}
-
-// Root's own messages in the status channel, newest first, to find the board again.
-async function statusBoardList(ctx, args) {
-  const channelId = statusChannel(ctx);
-  const limit = args.limit === undefined ? STATUS_LIST_LIMIT : args.limit;
-  if (!Number.isInteger(limit) || limit < 1 || limit > STATUS_LIST_LIMIT) {
-    throw new OpError("invalid_args", `limit must be 1-${STATUS_LIST_LIMIT}`);
-  }
-  const messages = await discordRequest("GET", `/channels/${channelId}/messages`, { token: ctx.token, query: { limit } });
-  const own = message => !message.webhook_id && ctx.bot?.id && String(message.author?.id ?? "") === String(ctx.bot.id);
-  return {
-    channel_id: channelId,
-    messages: (messages ?? []).filter(own)
-      .map(({ id, content, timestamp }) => ({ id, content: content ?? "", timestamp: timestamp ?? null })),
-  };
-}
-
-async function statusBoardPost(ctx, args) {
-  const channelId = statusChannel(ctx);
-  const message = await discordRequest("POST", `/channels/${channelId}/messages`, {
-    token: ctx.token, body: { content: statusText(args.text), allowed_mentions: { parse: [] } },
-  });
-  return { channel_id: channelId, message_id: message.id };
-}
-
-// Edits coalesce per message, as a session's `edit_message` does.
-async function statusBoardEdit(ctx, args) {
-  const arrival = nextEditArrival();
-  const channelId = statusChannel(ctx);
-  const text = statusText(args.text);
-  const message = await ownBotMessage(ctx, channelId, args.message_id);
-  if (!message) throw new OpError("not_found", `no message ${args.message_id}`);
-  return coalescedEdit(`status/${message.id}`, arrival, text, async latest => {
-    try {
-      const edited = await discordRequest("PATCH", `/channels/${channelId}/messages/${message.id}`, {
-        token: ctx.token, body: { content: latest, allowed_mentions: { parse: [] } },
-      });
-      return { channel_id: channelId, message_id: edited.id };
-    } catch (error) {
-      if (error instanceof DiscordError && error.status === 404) throw new OpError("not_found", `no message ${message.id}`);
-      throw error;
-    }
-  });
-}
-
-async function statusBoardDelete(ctx, args) {
-  const channelId = statusChannel(ctx);
-  const message = await ownBotMessage(ctx, channelId, args.message_id);
-  return { deleted: message ? await deleteMessage(ctx, channelId, message.id) : false };
 }
 
 async function threadRevoke(ctx, args) {
@@ -432,11 +308,6 @@ module.exports = {
     thread_archive_actor: supervisorOp(threadArchiveActor),
     thread_react: supervisorOp(threadReact),
     thread_notice: supervisorOp(threadNotice),
-    thread_notice_delete: supervisorOp(threadNoticeDelete),
-    status_board_list: supervisorOp(statusBoardList),
-    status_board_post: supervisorOp(statusBoardPost),
-    status_board_edit: supervisorOp(statusBoardEdit),
-    status_board_delete: supervisorOp(statusBoardDelete),
     thread_revoke: supervisorOp(threadRevoke),
     thread_request_done: supervisorOp(threadRequestDone),
     create_thread: { roles: ["project"], scoped: true, run: createThread },

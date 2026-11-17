@@ -14,8 +14,6 @@
     "claude": 6,
     "codex": 8
   },
-  "thread_status_channel_id": "YOUR_THREAD_STATUS_CHANNEL_ID",
-  "thread_owner_pings": true,
   "category_ids": [],
   "projects": {
     "example-project": {

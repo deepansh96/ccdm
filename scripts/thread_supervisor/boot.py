@@ -195,7 +195,9 @@ def start(context, row, trigger: dict | None, starter: str | None = None, backlo
     if row["state"] == "queued":
         pass
     elif trigger:
-        turns.note_input(context, thread_id, "guest" if trigger.get("author_class") == "guest" else "owner")
+        # The latest message gets the ⏳.
+        turns.note_input(context, thread_id, "guest" if trigger.get("author_class") == "guest" else "owner",
+                         message_id=(backlog[-1] if backlog else trigger)["message_id"])
     elif starter:
         turns.note_input(context, thread_id, "starter")
     if not capacity.admit(context, row, resolved, trigger, starter):
@@ -286,7 +288,7 @@ def on_session_revoked(context, event: dict) -> None:
     if not row or row["project"] != event.get("project") or row["state"] != "live":
         return
     _log(f"thread {thread_id}: the Router lost its session ({event.get('reason')}); marking it crashed")
-    lifecycle.stop_session(context, row)
+    lifecycle.stop_session(context, row, failed=True)
     store.finish_boot(context.db, thread_id, "stopped", "crashed")
 
 
@@ -333,6 +335,7 @@ def _launch_exited(context, thread_id: str, boot: Boot, frame: dict) -> None:
 def fail(context, thread_id: str, boot: Boot, reason: str) -> None:
     drop(context, thread_id)
     store.finish_boot(context.db, thread_id, "stopped", "start-failed")
+    store.end_waiting(context.db, thread_id, store.FAILED)
     _react(context, thread_id, boot.trigger_message_id, remove=True)
     line = " ".join(reason.split())
     if len(line) > NOTICE_LIMIT:

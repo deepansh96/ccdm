@@ -87,8 +87,8 @@ def _close(context, row, owner: bool, event: dict) -> None:
     if not owner:
         return _notice(context, thread_id, OWNER_ONLY_CLOSE)
     _notice(context, thread_id, CLOSING)
-    # Messages in an archived thread cannot be deleted: the owner ping goes first.
-    turns.delete_ping(context, store.thread(context.db, thread_id))
+    # Reactions cannot change in an archived thread: the ⏳ goes first.
+    turns.before_archive(context, thread_id)
     store.update(context.db, thread_id, pending_close=json.dumps({"message_id": event.get("message_id"),
                                                                   "requested_at": now()}))
     try:

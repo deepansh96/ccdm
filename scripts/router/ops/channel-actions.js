@@ -20,8 +20,6 @@ const edits = new Map();
 // Idle entries kept to recognise late older edits; pruned past this many.
 const IDLE_EDITS = 1000;
 let editArrivals = 0;
-// The arrival order of a new edit, for `coalescedEdit`.
-const nextEditArrival = () => ++editArrivals;
 
 function coalescedEdit(key, arrival, text, send) {
   return new Promise((resolve, reject) => {
@@ -70,7 +68,7 @@ async function drainEdits(entry, send) {
 // Discord's webhook message edit cannot change the username, so `context_pct`
 // has nothing to refresh there: only the content changes.
 async function editMessage(ctx, args) {
-  const arrival = nextEditArrival();
+  const arrival = ++editArrivals;
   if (typeof args.text !== "string" || args.text.length === 0 || args.text.length > MESSAGE_LIMIT) {
     throw new OpError("invalid_args", `text must be 1-${MESSAGE_LIMIT} characters`);
   }
@@ -122,8 +120,6 @@ async function typing(ctx) {
 }
 
 module.exports = {
-  coalescedEdit,
-  nextEditArrival,
   ops: {
     edit_message: { roles: ["project", "root", "thread"], scoped: true, run: editMessage },
     react: { roles: ["project", "root", "thread"], scoped: true, run: react },

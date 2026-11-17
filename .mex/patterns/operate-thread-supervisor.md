@@ -13,7 +13,7 @@ edges:
     condition: for thread Session Scope, the supervisor's credential boundary, and root's thread permissions
   - target: patterns/operate-conversation-reminders.md
     condition: when a thread's reminders, acknowledgment, or closure look wrong
-last_updated: 2026-11-16
+last_updated: 2026-11-17
 ---
 
 # Operate The Thread Supervisor
@@ -22,9 +22,9 @@ last_updated: 2026-11-16
 Read `docs/thread-supervisor.md`. The supervisor is a Router client (`supervisor` role) with no Discord credential. It owns Thread Conversation lifecycle; the Router routes thread traffic. Its private state is `~/.local/state/ccdm/thread-supervisor/`.
 
 ## Steps
-1. Make sure root has Create Public Threads, Send Messages in Threads and Manage Threads in the project channels. View Audit Log on the guild is optional: it only lets the supervisor log who archived a thread. With `thread_status_channel_id` set, root also needs View Channel, Send Messages and Read Message History in that channel. These are granted once by hand in Discord, never by a script.
+1. Make sure root has Create Public Threads, Send Messages in Threads and Manage Threads in the project channels. View Audit Log on the guild is optional: it only lets the supervisor log who archived a thread. These are granted once by hand in Discord, never by a script.
 2. Install supervision only when the operator asks: `scripts/install-thread-supervisor.sh`. It runs the read-only `preflight` first and changes nothing if a check fails.
-3. Inspect with `scripts/thread-supervisor.py status` (worker, caps, `capacity.invalid`, bound threads with `whose_turn` and `display_state`, `board`, `owner_pings`) and `node scripts/router.js status` (`thread` lines, `supervisor:` line, `thread_permissions=` per project, `guild permissions (optional):`, `thread status channel:`).
+3. Inspect with `scripts/thread-supervisor.py status` (worker, caps, `capacity.invalid`, bound threads with `whose_turn` and their wanted and shown turn marks, `mark_emoji` and `shown_emoji`) and `node scripts/router.js status` (`thread` lines, `supervisor:` line, `thread_permissions=` per project, `guild permissions (optional):`).
 4. Operate threads with `scripts/threads.sh list [<project>]`, `scripts/threads.sh create <project> <name> [flags] [message]`, and `scripts/threads.sh stop|restart|close [<project>] <name|link|id>`.
 5. To stop a project's thread sessions, run `scripts/stop-session.sh <project> --threads`; `--all` also stops the channel. A plain `stop-session.sh <project>` or "restart <project>" touches the channel only.
 6. To debug in the foreground, run `scripts/thread-supervisor.py disable`, then `scripts/thread-supervisor.py run`; `enable` clears the disabled marker but starts nothing, so rerun `scripts/install-thread-supervisor.sh` after it to relaunch the LaunchAgent.
@@ -33,14 +33,14 @@ Read `docs/thread-supervisor.md`. The supervisor is a Router client (`supervisor
 - Never edit `threads.sqlite3` by hand; use `threads.sh` or Discord actions (archive, delete, a new owner message).
 - `stopped/crashed`, `stopped/start-failed` and `stopped/operator` never restart automatically; the next owner or guest message, or `threads.sh restart`, starts them.
 - Only `/close` and `threads.sh close` archive a thread. The supervisor reverts any other archive at once and stops the session only if it is idle (`stopped/auto-archive`); without Manage Threads that revert fails and the thread stays archived.
-- An invalid `thread_status_channel_id` (a root or project channel, or not a Discord ID) turns the board off and shows in `router status`; the rest of the registry still loads. Owner pings need no status channel; `thread_owner_pings: false` turns them off.
+- Turn status is root's reaction on the latest input (⏳, then ✅ or ⚠️). A `mark_emoji` that differs from `shown_emoji` for long means the Router keeps refusing `thread_react` (look for `adding`/`removing … failed` in the supervisor log); it retries on its own with backoff. There is no status channel and no owner ping any more.
 - A thread message that got 💤 while the supervisor was down is delivered once, through reconcile, only if it is an unanswered owner message.
 - Caps come from the registry's `thread_session_caps` (default Claude 6, Codex 8); an invalid value falls back and shows in `status`.
 
 ## Verify
-- [ ] `router status` shows `supervisor: connected`, `thread_permissions=ok` for every project, and `thread status channel: <id> permissions=ok` when the board is set.
+- [ ] `router status` shows `supervisor: connected` and `thread_permissions=ok` for every project.
 - [ ] `~/Library/LaunchAgents/com.ccdm.thread-supervisor.plist` holds paths only, with no tokens.
-- [ ] A test thread under a project channel gets 👀, then a reply as `<project>-<provider> · N%`.
+- [ ] A test thread under a project channel gets 👀 and ⏳ on the message, then a reply as `<project>-<provider> · N%` and ✅ on the message.
 
 ## Debug
 - Check `service.log` and `service.err` in the supervisor state dir.
