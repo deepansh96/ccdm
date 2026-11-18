@@ -16,7 +16,7 @@
 //   CCDM_THREAD_ID            set by start-thread-session.sh: this session serves that thread
 //   CCDM_THREAD_PROVIDER      the thread's provider (`claude`)
 //   CCDM_THREAD_BOOTSTRAP_FILE  the Thread Supervisor's bootstrap for this launch
-//   CCDM_THREAD_ACTIVITY_FILE   this launch's activity.json, marked turn_running on each notification
+//   CCDM_THREAD_ACTIVITY_FILE   this launch's activity.json: turn_running on each notification, paused, turn_replied
 //
 // In thread mode the server says hello as the `thread` role, so its Session
 // Scope is the thread alone. It holds live events until the supervisor's
@@ -68,7 +68,7 @@ const { scheduleProjectRestart } = require("./lib/restart-helper.js");
 const sessionHost = require("./lib/session-host.js");
 const reminder = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
-const { markTurn } = require("./thread-activity.js");
+const { markPaused, markReplied, markTurn } = require("./thread-activity.js");
 const { createEmergencyGateway } = require("./router/emergency.js");
 const modelInfo = require("./model-info.js");
 
@@ -94,6 +94,8 @@ const ROOT_INSTRUCTIONS = [
 const ROOT = process.env.CCDM_ROUTER_ROLE === "root";
 const THREAD_ID = ROOT ? "" : process.env.CCDM_THREAD_ID || "";
 const THREAD = Boolean(THREAD_ID);
+// A new launch starts unpaused, whatever the last one left in activity.json.
+if (THREAD) markPaused(process.env.CCDM_THREAD_ACTIVITY_FILE, false);
 // Mirrors COMMANDS and THREAD_COMMANDS in scripts/router/inbound.js.
 const RELAYED_COMMANDS = THREAD ? "/pause, /unpause and /compact" : "/pause, /unpause, /compact, /clear and /restart";
 // Claude's working directory is the project, so Windows names the checkout in full.
@@ -426,13 +428,21 @@ function attachmentMeta(attachments = []) {
   return { attachment_count: String(attachments.length), attachments: listed.join("; ") };
 }
 
+// The Router's verdict on who sent an event (scripts/router/inbound.js
+// allowedAuthor), as the tag's `sender`: the launch note
+// (scripts/claude-channel-trust.txt) tells Claude to trust `sender="owner"`
+// even when Claude Code labels a mid-turn message untrusted.
+function senderMeta(author) {
+  return typeof author?.is_owner === "boolean" ? { sender: author.is_owner ? "owner" : "guest" } : {};
+}
+
 function notification(kind, event) {
   if (kind === "message") {
     return {
       content: event.content || (event.attachments?.length ? "(attachment)" : ""),
       meta: {
         chat_id: event.channel_id, message_id: event.message_id, user: event.author.name, user_id: event.author.id,
-        ts: event.ts, ...attachmentMeta(event.attachments),
+        ...senderMeta(event.author), ts: event.ts, ...attachmentMeta(event.attachments),
       },
     };
   }
@@ -440,7 +450,7 @@ function notification(kind, event) {
     content: `(reacted ${event.emoji})`,
     meta: {
       chat_id: event.channel_id, message_id: event.message_id, user: event.user.name, user_id: event.user.id,
-      ts: event.ts, reaction: event.emoji,
+      ...senderMeta(event.user), ts: event.ts, reaction: event.emoji,
     },
   };
 }
@@ -631,11 +641,13 @@ function main() {
   const COMMANDS = {
     pause: async event => {
       paused = true;
+      if (THREAD) markPaused(process.env.CCDM_THREAD_ACTIVITY_FILE, true);
       await react(event, "⏸️");
       await say(event, "Session paused. New messages will be queued.");
     },
     unpause: async event => {
       paused = false;
+      if (THREAD) markPaused(process.env.CCDM_THREAD_ACTIVITY_FILE, false);
       for (const [kind, queuedEvent] of pausedEvents.splice(0)) notify(kind, queuedEvent);
       await react(event, "▶️");
       await say(event, "Session unpaused.");
@@ -720,6 +732,8 @@ function main() {
         text = await tool.run(router, input);
       } else {
         const result = await request(tool.op, tool.args(input));
+        // The thread's turn has replied, recorded in its activity file.
+        if (THREAD && tool.op === "reply") markReplied(process.env.CCDM_THREAD_ACTIVITY_FILE);
         // Record the receipt before Claude sees the result, so the Stop hook
         // that follows the turn finds it.
         await reminderEvents;

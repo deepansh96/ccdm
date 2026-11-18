@@ -12,7 +12,7 @@ import sys
 from ccdmlib.platform import filelock
 from ccdmlib.platform.shutdown import on_shutdown
 
-from . import projects, store
+from . import projects, store, turns
 from .control import ControlServer
 from .dispatch import dispatch
 from .link import Link
@@ -37,8 +37,14 @@ class Context:
     bot_user_id: str | None = None
     # Launches in progress, by thread id (boot.Boot).
     boots: dict = field(default_factory=dict)
-    # Archive actor lookups in progress, by thread id (lifecycle.ArchivePoll).
-    archive_polls: dict = field(default_factory=dict)
+    # Turn status (turns.py): each live session's activity file as last read
+    # ({thread_id: (mtime_ns, data)}), when an unsettled turn end was first
+    # seen, and when each thread's failed turn-mark sync may be retried
+    # ({thread_id: (monotonic retry time, delay)}).
+    activity: dict = field(default_factory=dict)
+    end_first_seen: dict = field(default_factory=dict)
+    mark_retry: dict = field(default_factory=dict)
+    status_tick_at: float = 0.0
     # The registry as last read, for deregistrations and channel moves (projects.Watch).
     watch: object = None
 
@@ -57,6 +63,19 @@ def stop_path(state_dir: Path) -> Path:
 
 def write_health(state_dir: Path, link: Link, router: str) -> None:
     write_private(health_path(state_dir), json.dumps({"pid": os.getpid(), "link_pid": link.pid, "router": router}))
+
+
+def _status(context: Context) -> None:
+    """Turn status on its interval, then the turn marks Discord does not show
+    yet; a failure never stops the worker. It waits while frames are queued,
+    so a session going live (and its bootstrap) never waits behind it."""
+    if context.link.has_frames():
+        return
+    try:
+        turns.tick(context)
+        turns.sync_marks(context)
+    except Exception as error:
+        print(f"thread-supervisor: the turn status update failed: {error}", file=sys.stderr, flush=True)
 
 
 def run(project_root: Path, state_dir: Path, disabled=None) -> None:
@@ -89,6 +108,8 @@ def run(project_root: Path, state_dir: Path, disabled=None) -> None:
                 # Registry changes are handled while connected, so the queue they free can start.
                 if connected and context.watch.changed():
                     dispatch(context, {"type": "internal", "event": "registry"})
+                if connected:
+                    _status(context)
                 frame = link.next_frame(0.25)
                 if frame is None:
                     continue
@@ -96,6 +117,8 @@ def run(project_root: Path, state_dir: Path, disabled=None) -> None:
                 if kind == "connected":
                     context.bot_user_id = frame.get("bot_user_id")
                     connected = True
+                    # A reconnected Router may serve what failed meanwhile: retry the marks now.
+                    context.mark_retry.clear()
                     write_health(state_dir, link, "connected")
                     # Whatever happened while this worker or the Router was away.
                     dispatch(context, {"type": "internal", "event": "reconcile"})

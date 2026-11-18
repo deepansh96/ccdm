@@ -48,6 +48,10 @@ def status(state_dir: Path, project_root: Path) -> dict:
             "queue_position": row["queue_position"],
             "provider_conversation_id": row["provider_conversation_id"],
             **{field: row[field] for field in store.OVERRIDES},
+            # Turn status; null in an older store a worker has not migrated yet.
+            **{field: row.get(field) for field in ("whose_turn", "last_input_class", "turn_outcome",
+                                                   "mark_message_id", "mark_emoji",
+                                                   "shown_message_id", "shown_emoji")},
         }
     return {
         "running": alive,

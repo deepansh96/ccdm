@@ -36,7 +36,7 @@ import time
 from ccdmlib.cli import start_thread_session
 from ccdmlib.platform import session_host
 
-from . import capacity, lifecycle, ports, registry, store
+from . import capacity, lifecycle, ports, registry, store, turns
 from .clock import now
 from .link import LinkError
 from .paths import router_state_dir, write_private
@@ -214,6 +214,7 @@ def _note_owner_activity(context, thread_id: str, event: dict) -> None:
 
 
 def on_thread_message(context, event: dict) -> None:
+    turns.on_message(context, event)
     thread_id = event.get("thread_id")
     if not isinstance(thread_id, str) or event.get("author_class") not in DRIVERS:
         return
@@ -248,6 +249,16 @@ def start(context, row, trigger: dict | None, starter: str | None = None, backlo
     resolved = registry.resolved_settings(entry, row)
     codex = resolved["provider"] == "codex"
     pending = [*backlog, *([trigger] if trigger else [])]
+    # The turn is the agent's: a trigger (live, or found by reconcile) or a
+    # first message. A queued row noted it when it was queued.
+    if row["state"] == "queued":
+        pass
+    elif trigger:
+        # The latest message gets the ⏳.
+        turns.note_input(context, thread_id, "guest" if trigger.get("author_class") == "guest" else "owner",
+                         message_id=(backlog[-1] if backlog else trigger)["message_id"])
+    elif starter:
+        turns.note_input(context, thread_id, "starter")
     if not capacity.admit(context, row, resolved, trigger, starter):
         for message in pending:
             store.buffer_message(context.db, thread_id, message["message_id"], _payload(message), now())
@@ -316,6 +327,7 @@ def on_session_live(context, event: dict) -> None:
     except OSError as error:
         return fail(context, thread_id, boot, f"the bootstrap could not be written: {error.strerror or error}")
     store.finish_boot(context.db, thread_id, "live")
+    turns.baseline(context, thread_id)
     boot.live = True
     if boot.launched:
         drop(context, thread_id)
@@ -335,7 +347,7 @@ def on_session_revoked(context, event: dict) -> None:
     if not row or row["project"] != event.get("project") or row["state"] != "live":
         return
     _log(f"thread {thread_id}: the Router lost its session ({event.get('reason')}); marking it crashed")
-    lifecycle.stop_session(context, row)
+    lifecycle.stop_session(context, row, failed=True)
     store.finish_boot(context.db, thread_id, "stopped", "crashed")
 
 
@@ -382,6 +394,7 @@ def _launch_exited(context, thread_id: str, boot: Boot, frame: dict) -> None:
 def fail(context, thread_id: str, boot: Boot, reason: str) -> None:
     drop(context, thread_id)
     store.finish_boot(context.db, thread_id, "stopped", "start-failed")
+    store.end_waiting(context.db, thread_id, store.FAILED)
     _react(context, thread_id, boot.trigger_message_id, remove=True)
     line = " ".join(reason.split())
     if len(line) > NOTICE_LIMIT:

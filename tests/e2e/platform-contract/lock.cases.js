@@ -149,7 +149,7 @@ export default [
       const result = await ctx.nodeScript(script, [path.join(ctx.root, "scripts"), dir]);
       assert.equal(result.code, 0, result.stderr);
       assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, "activity.json"), "utf8")),
-        { turn_running: true, last_turn_end_at: null });
+        { turn_running: true, turn_replied: false, last_turn_end_at: null });
       assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, "context.json"), "utf8")), { context_pct: 42 });
       assert.deepEqual(fs.readdirSync(dir).sort(), ["activity.json", "context.json"]);
       if (!WIN) {

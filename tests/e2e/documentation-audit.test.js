@@ -226,14 +226,18 @@ test("agent anchor and .mex describe Session Scope enforcement by the Router", (
 });
 
 // The thread docs, each with the phrases that pin the shipped behaviour (ADR 0005).
+// View Audit Log is listed too, as useful but optional.
 const ROOT_THREAD_PERMISSIONS = ["Create Public Threads", "Send Messages in Threads", "Manage Threads", "View Audit Log"];
+const TURN_MARKS = ["⏳", "✅", "⚠️"];
 const threadDocs = {
   "docs/thread-supervisor.md": [
     "Thread Conversation", "Thread Supervisor", "Channel Conversation", "Session Scope", "Closed Conversation",
     "no Discord credential", "com.ccdm.thread-supervisor", "scripts/install-thread-supervisor.sh",
     "scripts/thread-supervisor.py run", "preflight", "scripts/start-thread-session.sh", "keys/.thread-<thread_id>.key",
     "/thread <name>", "create_thread", "scripts/threads.sh create", "10080", "/config", "/close", "/restart",
-    "/clear", "/compact", "✅", "👀", "💤", "<project>-<provider> · N%", "archive-actor-unknown", "auto-archive",
+    "/clear", "/compact", "✅", "👀", "💤", "<project>-<provider> · N%", "stopped/auto-archive",
+    "Any other archive is reverted at once", ...TURN_MARKS, "CCDM_THREAD_TURN_MARKS", "thread_react",
+    "useful but optional", "turn marks",
     "--resume", "thread_session_caps", "claude_accounts", "Claude 6", "Codex 8",
     "Paused to free a session slot; send a message here to resume.", "Queued, N sessions busy.", "reconcile",
     "stop-session.sh <project> --threads", "--all", "Conversation Reminder", "router status",
@@ -243,20 +247,23 @@ const threadDocs = {
   "README.md": [
     "## Thread Conversations", "docs/thread-supervisor.md", "scripts/install-thread-supervisor.sh", "/thread",
     "scripts/threads.sh", "thread_session_caps", "claude_accounts", "--threads", ...ROOT_THREAD_PERMISSIONS,
+    ...TURN_MARKS,
   ],
   "AGENTS.md": [
     "Thread Conversations", "channel's session only", "unless the request names its threads",
-    ...ROOT_THREAD_PERMISSIONS, "granted once by hand",
+    ...ROOT_THREAD_PERMISSIONS, "granted once by hand", "optional", ...TURN_MARKS,
+    "stays unarchived until `/close` or the operator's thread `close` command",
   ],
   ".mex/ROUTER.md": ["Thread Conversation", "scripts/threads.sh", "install-thread-supervisor.sh",
-    "thread-conversation-journey.test.js"],
-  ".mex/context/architecture.md": ["Thread Supervisor", "scripts/ccdm start-thread-session", "thread role"],
+    "thread-conversation-journey.test.js", "thread_react", "not_found", "user_version` 3", ...TURN_MARKS],
+  ".mex/context/architecture.md": ["Thread Supervisor", "scripts/ccdm start-thread-session", "thread role", "turns.py", "thread_react"],
   ".mex/context/session-management.md": ["Thread Conversation", "scripts/ccdm start-thread-session", "--threads", "--all",
-    "restart <project>"],
+    "restart <project>", "stays unarchived until it is closed", ...TURN_MARKS, "mark_emoji", "shown_emoji"],
   ".mex/context/discord-security.md": ["## Thread Conversations", "thread alone", "holds no Discord credential",
-    ...ROOT_THREAD_PERMISSIONS, "granted once by hand"],
+    ...ROOT_THREAD_PERMISSIONS, "granted once by hand", "allowed_mentions: {parse: []}", "thread_react"],
   ".mex/patterns/operate-thread-supervisor.md": ["scripts/install-thread-supervisor.sh", "preflight",
-    "scripts/thread-supervisor.py status", "scripts/threads.sh list", ...ROOT_THREAD_PERMISSIONS],
+    "scripts/thread-supervisor.py status", "scripts/threads.sh list", ...ROOT_THREAD_PERMISSIONS,
+    "mark_emoji"],
   ".mex/patterns/register-project.md": ["Thread Conversations", "closed/deregistered", "scripts/ccdm stop-session <project> --all"],
   ".mex/patterns/INDEX.md": ["operate-thread-supervisor.md"],
   "tests/e2e/README.md": ["## Thread Conversations", "thread-conversation-journey.test.js",
@@ -268,6 +275,11 @@ test("thread docs describe Thread Conversations, the Thread Supervisor and root'
     const source = fs.readFileSync(file, "utf8");
     for (const phrase of phrases) {
       assert.match(source, new RegExp(escape(phrase)), `${file} is missing "${phrase}"`);
+    }
+    // The status board and owner pings are gone; their settings are documented nowhere.
+    for (const gone of ["thread_status_channel_id", "thread_owner_pings", "CCDM_THREAD_OWNER_PINGS", "status_board_",
+      "mention_owner", "thread_notice_delete"]) {
+      assert.doesNotMatch(source, new RegExp(escape(gone)), `${file} still documents "${gone}"`);
     }
   }
   for (const workflow of ["Thread Conversations", "Thread Supervisor", "Thread journey"]) {

@@ -12,7 +12,7 @@ import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerRegistry, routerWith
 import { tmuxCalls } from "./support/session-fixture.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
-import { startThreadHost, startThreadSupervisor, supervisorEnv, supervisorStateDir, supervisorStatus } from "./support/thread-supervisor.js";
+import { startThreadHost, startThreadSupervisor, supervisorEnv, supervisorStateDir, supervisorStatus, waitForThreadIdle } from "./support/thread-supervisor.js";
 
 test.afterEach(cleanup);
 
@@ -143,7 +143,7 @@ test("a message after live arrives once as a live event, and its reply posts int
 
   assert.deepEqual(notifications(workspace).slice(1), [{
     content: "how is it going?",
-    meta: { chat_id: THREAD_ID, message_id: "live-message-1", user: "Owner", user_id: OWNER_ID,
+    meta: { chat_id: THREAD_ID, message_id: "live-message-1", user: "Owner", user_id: OWNER_ID, sender: "owner",
       ts: notifications(workspace)[1].meta.ts },
   }]);
   assert.equal(notifications(workspace).length, 2);
@@ -228,8 +228,15 @@ test("no Discord credential reaches the thread session's environment, launch fil
   assertPrivate(path.join(workspace.routerStateDir, "keys", `.thread-${THREAD_ID}.key`));
   // The session runs in the project checkout, in its own tmux session.
   assert.equal(state.fixtures.tmux.sessions[THREAD_TMUX].cwd, workspace.tmpDir);
-  if (process.platform === "win32") assert.equal(state.fixtures.sessionHost.launches.at(-1).kind, "thread");
-  else assert.deepEqual(state.fixtures.tmux.sessions[THREAD_TMUX].command.slice(0, 2), ["zsh", "-ic"]);
+  const trustFlag = / --append-system-prompt-file '?[^' ]*[\\/]scripts[\\/]claude-channel-trust\.txt'?/;
+  if (process.platform === "win32") {
+    const launch = state.fixtures.sessionHost.launches.at(-1);
+    assert.equal(launch.kind, "thread");
+    assert.match(launch.argv.join(" "), trustFlag);
+  } else {
+    assert.deepEqual(state.fixtures.tmux.sessions[THREAD_TMUX].command.slice(0, 2), ["zsh", "-ic"]);
+    assert.match(state.fixtures.tmux.sessions[THREAD_TMUX].command[2], trustFlag);
+  }
   const status = await runRouterCli(workspace, ["status"]);
   assert.match(status.stdout, new RegExp(`thread demo thread=${THREAD_ID} provider=claude connected=`));
 });
@@ -418,7 +425,8 @@ test("a resumed session's bootstrap carries the message that resumed it but not 
     () => "the bootstrap and its reply", 15000);
   assert.equal(occurrences(notifications(workspace)[0].content, "The parser drops trailing commas"), 1);
 
-  // An inactivity archive stops the session; the next owner message resumes it.
+  // An inactivity archive stops the session once its turn has ended; the next owner message resumes it.
+  await waitForThreadIdle(workspace, "demo", THREAD_ID);
   updateState(workspace.stateDir, state => {
     state.fixtures.discord.injectedThreads.push({ id: THREAD_ID, type: 11, parentId: "demo-channel",
       name: "Fix flaky test", ownerId: OWNER_ID, autoArchiveDuration: 1440, event: "update", archived: true,

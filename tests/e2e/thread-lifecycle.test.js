@@ -11,22 +11,23 @@ import { PYTHON, platformGate } from "./support/platform.js";
 import { callSeam, hostOps, tmuxCalls } from "./support/session-fixture.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
-import { startThreadSupervisor, supervisorEnv, supervisorStateDir, supervisorStatus } from "./support/thread-supervisor.js";
+import { startThreadSupervisor, supervisorEnv, supervisorStateDir, supervisorStatus, waitForThreadIdle } from "./support/thread-supervisor.js";
 
 test.afterEach(cleanup);
 
 // The Thread Conversation lifecycle end to end: archive, unarchive, delete and
 // resume, through the real Router, Thread Supervisor, start-thread-session.sh
 // and CCDM channel server, with the fixture claude and tmux. Only Discord
-// thread events, messages and the fake audit log go in.
+// thread events, messages and the fake audit log go in. A thread stays
+// unarchived until `/close`: any other archive is reverted.
 const THREAD_ID = "1700000000000223344";
 // `<screen>-t-<thread id>`.
 const THREAD_TMUX = `demo_claude-t-${THREAD_ID}`;
 const BOT_USER_ID = "fixture-bot-user-id";
 const THREAD = { id: THREAD_ID, type: 11, parentId: "demo-channel", name: "Fix flaky test", ownerId: OWNER_ID,
   autoArchiveDuration: 10080 };
-// The production 60-second audit-log poll, shortened for the tests.
-const FAST_POLL = { CCDM_THREAD_ARCHIVE_POLL_WINDOW_S: "1.5", CCDM_THREAD_ARCHIVE_POLL_INTERVAL_S: "0.2" };
+// The supervisor environment the tests run with.
+const SUPERVISOR_ENV = {};
 
 function threadWorkspace() {
   const workspace = createRouterWorkspace({ ...routerRegistry({
@@ -40,7 +41,7 @@ function threadWorkspace() {
   return workspace;
 }
 
-async function supervised(workspace, env = FAST_POLL) {
+async function supervised(workspace, env = SUPERVISOR_ENV) {
   await routerWithWebhooks(workspace, ["demo"]);
   updateState(workspace.stateDir, state => {
     state.fixtures.claude.replyText = "on it";
@@ -109,99 +110,125 @@ async function assertStopped(workspace) {
   }
 }
 
-test("an owner archive closes the conversation as owner-archive and stops its session", async () => {
+// Root's PATCHes of the thread's `archived`, in order.
+const archivePatches = workspace => (discord(workspace).threadPatches ?? [])
+  .filter(patch => patch.threadId === THREAD_ID && patch.body.archived !== undefined)
+  .map(({ authorization, body }) => [authorization, body.archived]);
+const ROOT_AUTH = "Bot root-bot-token";
+const idle = workspace => waitForThreadIdle(workspace, "demo", THREAD_ID);
+
+test("an auto-archive of an idle thread is reverted at once and stops its session, leaving the conversation open", async () => {
   const workspace = threadWorkspace();
   await supervised(workspace);
   await liveThread(workspace);
+  await idle(workspace);
+
+  archive(workspace);
+
+  await assertStopped(workspace);
+  await waitFor(() => archivePatches(workspace).length === 1, () => "the unarchive");
+  assert.deepEqual(archivePatches(workspace), [[ROOT_AUTH, false]]);
+  assert.equal(discord(workspace).threads[THREAD_ID].archived, false);
+  const row = await threadRow(workspace, current => current.state === "stopped");
+  assert.deepEqual([row.state, row.stop_reason, row.close_reason], ["stopped", "auto-archive", null]);
+  // One audit-log read names the actor in the log; nothing is polled.
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  assert.equal((discord(workspace).auditLogFetches ?? []).length, 1);
+});
+
+test("an owner's archive by hand is reverted too and never closes the conversation", async () => {
+  const workspace = threadWorkspace();
+  await supervised(workspace);
+  await liveThread(workspace);
+  await idle(workspace);
 
   seedArchiveEntry(workspace, OWNER_ID);
   archive(workspace);
 
-  const row = await threadRow(workspace, current => current.state === "closed");
-  assert.deepEqual([row.state, row.close_reason], ["closed", "owner-archive"]);
   await assertStopped(workspace);
-});
-
-test("a root-bot archive closes the conversation as root-archive", async () => {
-  const workspace = threadWorkspace();
-  await supervised(workspace);
-  await liveThread(workspace);
-
-  seedArchiveEntry(workspace, BOT_USER_ID);
-  archive(workspace);
-
-  const row = await threadRow(workspace, current => current.state === "closed");
-  assert.deepEqual([row.state, row.close_reason], ["closed", "root-archive"]);
-  await assertStopped(workspace);
-});
-
-test("an auto-archive with no audit entry stops the session as auto-archive after polling the audit log", async () => {
-  const workspace = threadWorkspace();
-  await supervised(workspace);
-  await liveThread(workspace);
-
-  archive(workspace);
-
-  await assertStopped(workspace);
-  // The 1.5 s window at 0.2 s apart polls several times before giving up.
-  await waitFor(() => (discord(workspace).auditLogFetches ?? []).length >= 3, () => "the audit-log polls", 15000);
-  const row = await threadRow(workspace);
-  assert.deepEqual([row.state, row.stop_reason, row.close_reason], ["stopped", "auto-archive", null]);
-  assert.deepEqual([...new Set(discord(workspace).auditLogFetches.map(fetch => fetch.actionType))], ["111"]);
-});
-
-test("another member's archive stops the session as auto-archive", async () => {
-  const workspace = threadWorkspace();
-  await supervised(workspace);
-  await liveThread(workspace);
-
-  seedArchiveEntry(workspace, "moderator-id");
-  archive(workspace);
-
-  await assertStopped(workspace);
-  // The supervisor writes the row only after the whole stop: on Windows that is
-  // after it has also swept the thread's listeners and removed its key, which can
-  // take a few seconds after the session itself is gone. So the row is waited for.
-  const row = await threadRow(workspace, current => current.state !== "live");
-  assert.deepEqual([row.state, row.stop_reason], ["stopped", "auto-archive"]);
-});
-
-test("an owner rename or a root-bot duration PATCH is not an archive: the auto-archive stays auto-archive", async () => {
-  const workspace = threadWorkspace();
-  await supervised(workspace);
-  await liveThread(workspace);
-
-  seedArchiveEntry(workspace, BOT_USER_ID, [{ key: "auto_archive_duration", old_value: 1440, new_value: 10080 }]);
-  seedArchiveEntry(workspace, OWNER_ID, [{ key: "name", old_value: "Fix flaky test", new_value: "Fix the flaky test" }]);
-  seedArchiveEntry(workspace, OWNER_ID, []);
-  archive(workspace);
-
-  await assertStopped(workspace);
-  await waitFor(() => (discord(workspace).auditLogFetches ?? []).length >= 3, () => "the audit-log polls", 15000);
-  const row = await threadRow(workspace, current => current.stop_reason === "auto-archive" || current.state === "closed");
+  await waitFor(() => archivePatches(workspace).length === 1, () => "the unarchive");
+  const row = await threadRow(workspace, current => current.state === "stopped");
   assert.deepEqual([row.state, row.stop_reason, row.close_reason], ["stopped", "auto-archive", null]);
 });
 
-test("a forbidden audit log stops the session as archive-actor-unknown", async () => {
+test("without View Audit Log an archive is still reverted", async () => {
   const workspace = threadWorkspace();
   await supervised(workspace);
   await liveThread(workspace);
+  await idle(workspace);
   updateState(workspace.stateDir, state => {
     state.fixtures.discord.auditLogForbidden = true;
   });
 
   archive(workspace);
 
-  const row = await threadRow(workspace, current => current.stop_reason === "archive-actor-unknown");
-  assert.deepEqual([row.state, row.stop_reason], ["stopped", "archive-actor-unknown"]);
-  assert.ok(discord(workspace).auditLogFetches.length >= 3, JSON.stringify(discord(workspace).auditLogFetches));
+  await waitFor(() => archivePatches(workspace).length === 1, () => "the unarchive");
+  const row = await threadRow(workspace, current => current.state === "stopped");
+  assert.deepEqual([row.state, row.stop_reason], ["stopped", "auto-archive"]);
+});
+
+test("an archive during a turn is reverted and the session keeps running", async () => {
+  const workspace = threadWorkspace();
+  await supervised(workspace);
+  await liveThread(workspace);
+  await idle(workspace);
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.holdTurnsIn = [THREAD_ID];
+  });
+  threadMessage(workspace, "busy-message-1", "run the whole suite");
+  await waitFor(() => claude(workspace).channelNotifications.length === 2, () => "the second turn");
+
+  archive(workspace);
+
+  await waitFor(() => archivePatches(workspace).length === 1, () => "the unarchive");
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  assert.equal((await threadRow(workspace)).state, "live");
+  assert.ok(await threadConnected(workspace));
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.holdTurnsIn = [];
+  });
+});
+
+test("the archive /close makes stays archived and closes the conversation", async () => {
+  const workspace = threadWorkspace();
+  await supervised(workspace);
+  await liveThread(workspace);
+
+  threadMessage(workspace, "close-message-1", "/close");
+
+  const row = await threadRow(workspace, current => current.state === "closed");
+  assert.deepEqual([row.state, row.close_reason], ["closed", "close-command"]);
   await assertStopped(workspace);
+  await waitFor(() => (discord(workspace).injectedThreads ?? []).every(entry => entry.delivered), () => "the archive event");
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  assert.deepEqual(archivePatches(workspace), [[ROOT_AUTH, true]]);
+  assert.equal(discord(workspace).threads[THREAD_ID].archived, true);
+});
+
+test("on start, the supervisor unarchives an archived thread whose conversation is not closed", async () => {
+  const workspace = threadWorkspace();
+  const supervisor = await supervised(workspace);
+  await liveThread(workspace);
+  await idle(workspace);
+  await supervisor.stop();
+  // Archived while the supervisor was down.
+  updateState(workspace.stateDir, state => {
+    Object.assign(state.fixtures.discord.threads[THREAD_ID], { archived: true, archiveTimestamp: new Date().toISOString() });
+  });
+
+  await startThreadSupervisor(workspace, { env: SUPERVISOR_ENV });
+
+  await waitFor(() => archivePatches(workspace).length === 1, () => "the unarchive on start", 15000);
+  assert.equal(discord(workspace).threads[THREAD_ID].archived, false);
+  const row = await threadRow(workspace);
+  assert.notEqual(row.state, "closed");
 });
 
 test("a bot unarchive, and the repeated THREAD_CREATE after it, start no session", async () => {
   const workspace = threadWorkspace();
   await supervised(workspace);
   await liveThread(workspace);
+  await idle(workspace);
   archive(workspace);
   await threadRow(workspace, row => row.stop_reason === "auto-archive");
   await assertStopped(workspace);
@@ -279,6 +306,7 @@ function writeClaudeTranscript(workspace, sessionId) {
 async function stoppedThread(workspace) {
   await liveThread(workspace);
   const { provider_conversation_id: conversationId } = await threadRow(workspace);
+  await idle(workspace);
   archive(workspace);
   await threadRow(workspace, row => row.state === "stopped");
   await assertStopped(workspace);
@@ -399,8 +427,7 @@ test("a guest message cannot reopen a closed thread, and an owner message reopen
   await liveThread(workspace);
   const { provider_conversation_id: conversationId } = await threadRow(workspace);
   writeClaudeTranscript(workspace, conversationId);
-  seedArchiveEntry(workspace, OWNER_ID);
-  archive(workspace);
+  threadMessage(workspace, "close-message-1", "/close");
   await threadRow(workspace, row => row.state === "closed");
   await assertStopped(workspace);
 
@@ -410,7 +437,7 @@ test("a guest message cannot reopen a closed thread, and an owner message reopen
   await new Promise(resolve => setTimeout(resolve, 2000));
   assert.equal(claude(workspace).invocations.length, 1);
   const closed = await threadRow(workspace);
-  assert.deepEqual([closed.state, closed.close_reason], ["closed", "owner-archive"]);
+  assert.deepEqual([closed.state, closed.close_reason], ["closed", "close-command"]);
 
   threadMessage(workspace, "owner-message-1", "reopening this");
 
@@ -418,7 +445,9 @@ test("a guest message cannot reopen a closed thread, and an owner message reopen
   const invocations = claude(workspace).invocations;
   assert.equal(invocations.length, 2);
   assert.equal(resumeArgs(invocations[1]), conversationId);
-  await waitFor(() => threadPosts(workspace).length === 2, () => "the reopened session's reply", 15000);
+  // The agent's replies only: `/close` posted its own root-bot acknowledgement.
+  await waitFor(() => threadPosts(workspace).filter(message => message.webhookId).length === 2,
+    () => "the reopened session's reply", 15000);
   // The guest's ignored message is not replayed into the reopened conversation.
   assert.doesNotMatch(claude(workspace).channelNotifications.at(-1).content, /any news\?/);
   assert.match(claude(workspace).channelNotifications.at(-1).content, /reopening this/);
@@ -545,13 +574,14 @@ test("the next owner message in a stopped Codex thread relaunches its bridge wit
   const workspace = threadWorkspace();
   fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
   const first = await codexServer(workspace, 29500, CODEX_THREAD_UUID);
-  await supervised(workspace, { ...FAST_POLL, CCDM_THREAD_WS_PORT_BASE: "29500" });
+  await supervised(workspace, { ...SUPERVISOR_ENV, CCDM_THREAD_WS_PORT_BASE: "29500" });
   requestCodexThread(workspace);
   await threadRow(workspace, row => row.provider === "codex");
   threadMessage(workspace, "boot-message-1", "please fix the parser");
   await first.listenWhenAllocated();
   await threadRow(workspace, row => row.state === "live" && row.provider_conversation_id === CODEX_THREAD_UUID);
   await waitFor(() => threadPosts(workspace).length === 1, () => "the bootstrap reply", 20000);
+  await idle(workspace);
   archive(workspace);
   await threadRow(workspace, row => row.state === "stopped");
   await waitFor(() => readState(workspace.stateDir).fixtures.tmux.sessions[THREAD_TMUX] === undefined,

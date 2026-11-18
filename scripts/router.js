@@ -32,8 +32,11 @@ const { createRouterServer } = require("./router/server.js");
 const { deleteWebhook, ensureWebhook } = require("./router/webhooks.js");
 
 const OFFLINE_EMOJI = "💤";
-// Thread bits granted at the guild rather than in a project channel.
+// Thread bits granted at the guild rather than in a project channel: optional.
 const GUILD_THREAD_PERMISSIONS = ["ViewAuditLog"];
+
+// How long `router status` waits for the status op.
+const STATUS_TIMEOUT_MS = 30000;
 
 function log(line) {
   console.log(`[router] ${line}`);
@@ -53,10 +56,14 @@ async function serve() {
   const bot = { id: null };
   // The gateway client, for `status` to check root's channel permissions.
   const discord = { client: null };
+  // Settles once the gateway is ready. The socket listens before login, so a
+  // hello whose check needs Discord (a thread's) waits for this first.
+  let markGatewayReady;
+  const gatewayReady = new Promise(resolve => { markGatewayReady = resolve; });
   const server = createRouterServer({
     stateDir: stateDir(), socketPath: socketPath(), getTable: () => table, gateway, registry,
     context: {
-      stateDir: stateDir(), registryFile: registryPath(), token, attachments, bot, discord, log,
+      stateDir: stateDir(), registryFile: registryPath(), token, attachments, bot, discord, log, gatewayReady,
       // A failed reminder update is logged; the reply it heals still goes out.
       assignmentChanged: project => assignmentChanged(project, { registryFile: registryPath() })
         .then(() => log(`assignment_changed project=${project}`), error => log(`assignment_changed_failed ${error.message}`)),
@@ -196,6 +203,7 @@ async function serve() {
   await ready;
   bot.id = client.user.id;
   gateway.state = "ready";
+  markGatewayReady();
   log(`router ready: ${table.projects.size} router project(s), socket ${socketPath()}`);
 }
 
@@ -218,7 +226,10 @@ function reportServiceState() {
 }
 
 async function status(json = false) {
-  const client = new RouterClient({ role: "status", timeoutMs: 5000 });
+  // Status reads root's permissions in every registered channel, which takes
+  // seconds with dozens of projects. Callers that run this as a subprocess
+  // allow 45 s.
+  const client = new RouterClient({ role: "status", timeoutMs: STATUS_TIMEOUT_MS });
   let result;
   try {
     await client.connect();
@@ -233,7 +244,10 @@ async function status(json = false) {
   }
   result.threads_enabled = threadsEnabled(result);
   if (!result.threads_enabled) {
-    for (const project of result.projects) delete project.missing_thread_permissions;
+    for (const project of result.projects) {
+      delete project.missing_thread_permissions;
+      delete project.missing_optional_thread_permissions;
+    }
   }
   if (json) return console.log(JSON.stringify(result));
   console.log(`gateway: ${result.gateway}`);
@@ -252,15 +266,21 @@ async function status(json = false) {
     const missing = project.missing_permissions;
     const access = missing === null ? "unknown" : missing.length ? `missing ${missing.join(",")}` : "ok";
     const threads = result.threads_enabled ? ` thread_permissions=${permissionState(project.missing_thread_permissions,
-      flag => !GUILD_THREAD_PERMISSIONS.includes(flag))}` : "";
-    console.log(`  ${project.project} channel=${project.channel_id} webhook=${project.webhook ? "present" : "missing"} root_permissions=${access}${threads}`);
+      () => true)}` : "";
+    const gone = project.channel_missing ? " channel_missing" : "";
+    console.log(`  ${project.project} channel=${project.channel_id} webhook=${project.webhook ? "present" : "missing"} root_permissions=${access}${threads}${gone}`);
+  }
+  // Registered channels Discord no longer has: those projects cannot be served.
+  const missingChannels = result.projects.filter(project => project.channel_missing);
+  if (missingChannels.length) {
+    console.log(`missing channels: ${missingChannels.map(project => `${project.project} (${project.channel_id})`).join(", ")}`);
   }
   if (result.threads_enabled) {
     // Guild permissions read the same through every channel; any channel's answer is the guild's.
-    const known = result.projects.find(project => project.missing_thread_permissions);
-    const guild = known ? permissionState(known.missing_thread_permissions, flag => GUILD_THREAD_PERMISSIONS.includes(flag))
-      : "unknown";
-    console.log(`guild permissions: ${guild}`);
+    const known = result.projects.find(project => project.missing_optional_thread_permissions);
+    const guild = known ? permissionState(known.missing_optional_thread_permissions,
+      flag => GUILD_THREAD_PERMISSIONS.includes(flag)) : "unknown";
+    console.log(`guild permissions (optional): ${guild}`);
   }
   console.log(`scope violations: ${result.scope_violations.length}`);
   for (const violation of result.scope_violations) {

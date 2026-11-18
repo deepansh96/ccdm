@@ -70,6 +70,8 @@ def _mark_stopped(state_dir, project: str) -> None:
                                   "'queued')", (project,)).fetchall():
                 store.finish_boot(db, row["thread_id"], "stopped", "operator")
                 store.update(db, row["thread_id"], runtime_pid=None, runtime_tmux=None)
+                # The next worker takes the ⏳ off.
+                store.end_waiting(db, row["thread_id"])
         finally:
             db.close()
 

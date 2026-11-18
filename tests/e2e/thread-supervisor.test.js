@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -58,6 +59,18 @@ async function fence(workspace, id = "fence-thread") {
   await waitFor(() => patches(workspace).some(patch => patch.threadId === id), () => `the ${id} PATCH`);
 }
 
+// A state directory the store accepts: mode 0700, or a protected DACL on Windows.
+function privateDir(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (process.platform === "win32") {
+    createRequire(import.meta.url)("../../scripts/platform/privacy.js").ensurePrivateDirSync(dir);
+  }
+}
+
+// A bound thread that has had no input yet has no turn status.
+const NO_TURN_YET = { whose_turn: null, last_input_class: null, turn_outcome: null, mark_message_id: null,
+  mark_emoji: null, shown_message_id: null, shown_emoji: null };
+
 test("an owner-created thread binds, shows in status, and is PATCHed to a one-week auto-archive", async () => {
   const { workspace } = await supervisedWorkspace();
   const supervisor = await startThreadSupervisor(workspace);
@@ -66,7 +79,7 @@ test("an owner-created thread binds, shows in status, and is PATCHed to a one-we
   assert.equal(status.running, true);
   assert.deepEqual(status.projects, { demo: { threads: { "owner-thread": {
     name: "Fix flaky test", creator_id: OWNER_ID, state: "registered", stop_reason: null, close_reason: null,
-    ws_port: null, queue_position: null, provider_conversation_id: null,
+    ws_port: null, queue_position: null, provider_conversation_id: null, ...NO_TURN_YET,
     provider: null, account: null, model: null, effort: null,
   } } } });
   await waitFor(() => patches(workspace).length === 1, () => "the auto-archive PATCH");
@@ -130,7 +143,7 @@ db.commit()`, store]);
   await fence(workspace);
   assert.deepEqual((await supervisorStatus(workspace)).projects.demo.threads["requested-bot-thread"], {
     name: "Port the parser", creator_id: BOT_USER_ID, state: "registered", stop_reason: null, close_reason: null,
-    ws_port: null, queue_position: null, provider_conversation_id: null,
+    ws_port: null, queue_position: null, provider_conversation_id: null, ...NO_TURN_YET,
     provider: "codex", account: null, model: "gpt-5.5", effort: "high",
   });
   assert.equal(status.projects.demo.threads["unrequested-bot-thread"], undefined);
@@ -238,16 +251,16 @@ test("the supervisor holds no Discord token and sends nothing to Discord but Rou
   assert.deepEqual(readState(workspace.stateDir).fixtures.network.blocked, []);
 });
 
-test("the store reports user_version 1, and an unexpected column is refused", async () => {
+test("the store reports user_version 3, and an unexpected column is refused", async () => {
   const { workspace } = await supervisedWorkspace();
   const supervisor = await startThreadSupervisor(workspace);
-  assert.deepEqual((await supervisorStatus(workspace)).store, { user_version: 1 });
+  assert.deepEqual((await supervisorStatus(workspace)).store, { user_version: 3 });
   assert.equal((await supervisor.stop()).exitCode, 0);
   const store = path.join(supervisorStateDir(workspace), "threads.sqlite3");
   const version = execFileSync(PYTHON, ["-c",
     "import sqlite3, sys; print(sqlite3.connect(sys.argv[1]).execute('PRAGMA user_version').fetchone()[0])", store],
   { encoding: "utf8" });
-  assert.equal(version.trim(), "1");
+  assert.equal(version.trim(), "3");
   execFileSync(PYTHON, ["-c", "import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); " +
     "db.execute('ALTER TABLE threads ADD COLUMN runtime_bot TEXT'); db.commit()", store]);
   const status = await supervisorCli(workspace, "status");
@@ -268,7 +281,7 @@ test("status answers with no worker, and reads an existing store in a protected 
     "store.connect(Path(sys.argv[2]), create=True).close()", path.join(process.cwd(), "scripts"), stateDir]);
   assertPrivate(stateDir);
   const after = await supervisorStatus(workspace);
-  assert.deepEqual([after.running, after.store], [false, { user_version: 1 }]);
+  assert.deepEqual([after.running, after.store], [false, { user_version: 3 }]);
 });
 
 test("--help says whose mode --supervised is: the LaunchAgent's, and on Windows the scheduled task's", async () => {
@@ -308,7 +321,7 @@ for round in range(30):
         except Exception as error:
             errors.append(str(error))
     assert creator.returncode == 0
-    assert store.inspect(state)["user_version"] == 1
+    assert store.inspect(state)["user_version"] == 3
     leftovers = sorted(p.name for p in state.iterdir() if p.name.startswith(".threads."))
     assert not leftovers, leftovers
 print(json.dumps({"errors": errors, "reads": reads}))
@@ -319,4 +332,172 @@ print(json.dumps({"errors": errors, "reads": reads}))
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
   }
+});
+
+// A schema-v1 store, as the supervisor wrote it before turn status, with one thread.
+function writeV1Store(workspace) {
+  const state = supervisorStateDir(workspace);
+  privateDir(state);
+  const file = path.join(state, "threads.sqlite3");
+  execFileSync(PYTHON, ["-c", `import os, sys
+sys.path.insert(0, sys.argv[1])
+import sqlite3
+from thread_supervisor import store
+os.close(os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+db = sqlite3.connect(sys.argv[2])
+db.execute("CREATE TABLE threads (" + store.TABLES["threads"].split("queued_start TEXT,")[0] + "queued_start TEXT)")
+for table in ("creation_requests", "boot_buffers"):
+    db.execute(f"CREATE TABLE {table} ({store.TABLES[table]})")
+db.execute("""INSERT INTO threads (thread_id, project, name, creator_id, parent_channel_id, created_at, state, stop_reason)
+    VALUES ('v1-thread', 'demo', 'Old task', ?, 'demo-channel', '2026-10-01T00:00:00.000Z', 'stopped', 'evicted')""",
+    (sys.argv[3],))
+db.execute("PRAGMA user_version=1")
+db.commit()`, path.join(process.cwd(), "scripts"), file, OWNER_ID]);
+  return file;
+}
+
+// A schema-v2 store, as the status board's supervisor wrote it: two threads
+// with turn status, an owner ping and a board state, a creation request, a
+// boot buffer, and a status board message.
+const V2_THREADS = `thread_id TEXT PRIMARY KEY, project TEXT NOT NULL, name TEXT NOT NULL,
+  creator_id TEXT NOT NULL, starter_message_id TEXT, parent_channel_id TEXT, created_at TEXT NOT NULL,
+  provider TEXT, account TEXT, model TEXT, effort TEXT,
+  resolved_provider TEXT, resolved_account TEXT, resolved_model TEXT, resolved_effort TEXT,
+  provider_conversation_id TEXT, provider_home TEXT, state TEXT NOT NULL, stop_reason TEXT, close_reason TEXT,
+  runtime_tmux TEXT, runtime_pid INTEGER, ws_port INTEGER, last_owner_activity_at TEXT, last_agent_reply_at TEXT,
+  pending_config TEXT, pending_close TEXT, queue_position INTEGER, queued_start TEXT,
+  whose_turn TEXT CHECK(whose_turn IS NULL OR whose_turn IN ('agent','owner')), last_input_at TEXT,
+  last_input_class TEXT, turn_end_seen TEXT, turn_outcome TEXT,
+  display_state TEXT CHECK(display_state IS NULL OR display_state IN ('working','waiting','idle','failed')),
+  display_since TEXT, ping_message_id TEXT`;
+
+function writeV2Store(workspace) {
+  const state = supervisorStateDir(workspace);
+  privateDir(state);
+  const file = path.join(state, "threads.sqlite3");
+  execFileSync(PYTHON, ["-c", `import os, sys
+sys.path.insert(0, sys.argv[1])
+import sqlite3
+from thread_supervisor import store
+os.close(os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+db = sqlite3.connect(sys.argv[2])
+db.execute(f"CREATE TABLE threads ({sys.argv[4]})")
+for table in ("creation_requests", "boot_buffers"):
+    db.execute(f"CREATE TABLE {table} ({store.TABLES[table]})")
+db.execute("""CREATE TABLE status_board (slot INTEGER PRIMARY KEY, channel_id TEXT NOT NULL, message_id TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL)""")
+db.execute("""INSERT INTO threads (thread_id, project, name, creator_id, parent_channel_id, created_at, state, stop_reason,
+    provider_conversation_id, last_owner_activity_at, whose_turn, last_input_at, last_input_class, turn_end_seen,
+    turn_outcome, display_state, display_since, ping_message_id)
+    VALUES ('v2-waiting', 'demo', 'Waiting task', ?, 'demo-channel', '2026-10-01T00:00:00.000Z', 'stopped', 'evicted',
+    'conversation-1', '2026-10-02T00:00:00.000Z', 'owner', '2026-10-02T00:00:00.000Z', 'owner',
+    '2026-10-02T00:01:00.000Z', 'completed', 'waiting', '2026-10-02T00:01:05.000Z', 'ping-1')""", (sys.argv[3],))
+db.execute("""INSERT INTO threads (thread_id, project, name, creator_id, parent_channel_id, created_at, state, close_reason,
+    pending_config) VALUES ('v2-closed', 'demo', 'Closed task', ?, 'demo-channel', '2026-10-01T00:00:00.000Z', 'closed',
+    'close-command', '{"message_id": "m"}')""", (sys.argv[3],))
+db.execute("""INSERT INTO creation_requests (request_id, project, name, requester_id, requester_kind, status, created_at)
+    VALUES ('request-1', 'demo', 'Waiting task', ?, 'owner', 'fulfilled', '2026-10-01T00:00:00.000Z')""", (sys.argv[3],))
+db.execute("""INSERT INTO boot_buffers (thread_id, message_id, payload, received_at)
+    VALUES ('v2-waiting', 'buffered-1', '{}', '2026-10-02T00:00:00.000Z')""")
+db.execute("INSERT INTO status_board VALUES (1, '1700000000000777001', 'board-1', 'sha')")
+db.execute("PRAGMA user_version=2")
+db.commit()`, path.join(process.cwd(), "scripts"), file, OWNER_ID, V2_THREADS]);
+  return file;
+}
+
+const inspectStore = file => JSON.parse(execFileSync(PYTHON, ["-c", `import json, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.row_factory = sqlite3.Row
+print(json.dumps({"version": db.execute("PRAGMA user_version").fetchone()[0],
+  "tables": sorted(row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")),
+  "columns": [row[1] for row in db.execute("PRAGMA table_info(threads)")],
+  "rows": [list(row) for row in db.execute("SELECT thread_id, state, stop_reason FROM threads ORDER BY thread_id")],
+  "threads": [dict(row) for row in db.execute("SELECT * FROM threads ORDER BY thread_id")],
+  "requests": [dict(row) for row in db.execute("SELECT * FROM creation_requests")],
+  "buffers": [dict(row) for row in db.execute("SELECT * FROM boot_buffers")]}))`, file],
+{ encoding: "utf8" }));
+
+const MARK_COLUMNS = ["mark_message_id", "mark_emoji", "shown_message_id", "shown_emoji"];
+const DROPPED_COLUMNS = ["display_state", "display_since", "ping_message_id"];
+
+test("a v1 store is readable as it is, and migrates to v3 on the worker's start after a private backup", async () => {
+  const { workspace } = await supervisedWorkspace();
+  const file = writeV1Store(workspace);
+  const before = await supervisorStatus(workspace);
+  assert.deepEqual(before.store, { user_version: 1 });
+  assert.equal(before.projects.demo.threads["v1-thread"].whose_turn, null);
+
+  const supervisor = await startThreadSupervisor(workspace);
+  assert.deepEqual((await supervisorStatus(workspace)).store, { user_version: 3 });
+  await supervisor.stop();
+  const migrated = inspectStore(file);
+  assert.equal(migrated.version, 3);
+  assert.deepEqual(migrated.tables, ["boot_buffers", "creation_requests", "threads"]);
+  for (const column of ["whose_turn", "last_input_at", "last_input_class", "turn_end_seen", "turn_outcome",
+    ...MARK_COLUMNS]) assert.ok(migrated.columns.includes(column), column);
+  for (const column of DROPPED_COLUMNS) assert.ok(!migrated.columns.includes(column), column);
+  assert.deepEqual(migrated.rows, [["v1-thread", "stopped", "evicted"]]);
+  const backup = path.join(supervisorStateDir(workspace), "threads.v1.backup.sqlite3");
+  assertPrivate(backup);
+  const saved = inspectStore(backup);
+  assert.equal(saved.version, 1);
+  assert.deepEqual(saved.rows, [["v1-thread", "stopped", "evicted"]]);
+});
+
+test("a v2 store migrates to v3 keeping every row, without its board, ping or board state", async () => {
+  const { workspace } = await supervisedWorkspace();
+  const file = writeV2Store(workspace);
+  const original = inspectStore(file);
+  const before = await supervisorStatus(workspace);
+  assert.deepEqual(before.store, { user_version: 2 });
+  assert.equal(before.projects.demo.threads["v2-waiting"].whose_turn, "owner");
+
+  const supervisor = await startThreadSupervisor(workspace);
+  assert.deepEqual((await supervisorStatus(workspace)).store, { user_version: 3 });
+  await supervisor.stop();
+  const migrated = inspectStore(file);
+  assert.equal(migrated.version, 3);
+  assert.deepEqual(migrated.tables, ["boot_buffers", "creation_requests", "threads"]);
+  for (const column of DROPPED_COLUMNS) assert.ok(!migrated.columns.includes(column), column);
+  // Every row and every kept column as it was; the new mark columns start empty.
+  const kept = row => Object.fromEntries(Object.entries(row).filter(([column]) => !DROPPED_COLUMNS.includes(column)));
+  assert.deepEqual(migrated.threads.map(row => Object.fromEntries(Object.entries(row)
+    .filter(([column]) => !MARK_COLUMNS.includes(column)))), original.threads.map(kept));
+  for (const row of migrated.threads) assert.deepEqual(MARK_COLUMNS.map(column => row[column]), [null, null, null, null]);
+  assert.deepEqual([migrated.requests, migrated.buffers], [original.requests, original.buffers]);
+  const backup = path.join(supervisorStateDir(workspace), "threads.v2.backup.sqlite3");
+  assertPrivate(backup);
+  const saved = inspectStore(backup);
+  assert.equal(saved.version, 2);
+  assert.ok(saved.tables.includes("status_board"));
+  assert.deepEqual(saved.threads, original.threads);
+});
+
+test("a failed migration leaves a v2 store as it was", async () => {
+  const { workspace } = await supervisedWorkspace();
+  const file = writeV2Store(workspace);
+  const original = inspectStore(file);
+  const failed = await supervisorCli(workspace, "run", { env: { CCDM_THREAD_STORE_FAIL_MIGRATION: "1" }, timeoutMs: 15000 });
+  assert.notEqual(failed.exitCode, 0, failed.stdout);
+  assert.deepEqual(inspectStore(file), original);
+});
+
+test("a failed migration leaves the v1 store as it was, and a newer store is refused", async () => {
+  const { workspace } = await supervisedWorkspace();
+  const file = writeV1Store(workspace);
+  const failed = await supervisorCli(workspace, "run", { env: { CCDM_THREAD_STORE_FAIL_MIGRATION: "1" }, timeoutMs: 15000 });
+  assert.notEqual(failed.exitCode, 0, failed.stdout);
+  const kept = inspectStore(file);
+  assert.equal(kept.version, 1);
+  assert.ok(!kept.columns.includes("whose_turn"));
+  assert.ok(!kept.columns.includes("mark_emoji"));
+  assert.deepEqual(kept.rows, [["v1-thread", "stopped", "evicted"]]);
+
+  execFileSync(PYTHON, ["-c", "import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); " +
+    "db.execute('PRAGMA user_version=4'); db.commit()", file]);
+  const status = await supervisorCli(workspace, "status");
+  assert.equal(status.exitCode, 2, status.stdout);
+  assert.match(status.json.reason, /thread store schema is unsupported/);
+  const run = await supervisorCli(workspace, "run", { timeoutMs: 15000 });
+  assert.equal(run.exitCode, 2, run.stdout);
 });

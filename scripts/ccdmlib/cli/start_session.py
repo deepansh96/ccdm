@@ -171,6 +171,10 @@ def _claude_argv(claude: Sequence[Any], project: _Project, launch: _Launch, resu
         "--dangerously-skip-permissions",
         "--mcp-config", launch.mcp_config,
         "--settings", launch.settings,
+        # Claude Code labels every channel message that lands mid-turn "not from
+        # your user"; this note tells the session the Router already verified the
+        # sender, so the owner can still steer a busy turn.
+        "--append-system-prompt-file", str(launch.root / "scripts" / _launch.CHANNEL_TRUST_NOTE),
     ]
     if project.model:
         argv += ["--model", project.model]

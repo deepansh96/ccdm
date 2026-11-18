@@ -258,7 +258,6 @@ export const THREAD_B = "1700000000000222222";
 
 export const ROOT_AUTH = `Bot ${ROOT_TOKEN}`;
 
-export const FAST_POLL = { CCDM_THREAD_ARCHIVE_POLL_WINDOW_S: "1.5", CCDM_THREAD_ARCHIVE_POLL_INTERVAL_S: "0.2" };
 
 export const owner = { id: OWNER_ID, username: "Owner" };
 
@@ -407,8 +406,8 @@ export const snowflakeNow = () => String((BigInt(Date.now()) - 1420070400000n) <
 export const THREAD_BLOCKERS = [
   "root lacks Create Public Threads in the project channel; grant root permission Create Public Threads in demo-channel",
   "root lacks Manage Threads in the project channel; grant root permission Manage Threads in demo-channel",
-  "root lacks View Audit Log in the guild; grant root permission View Audit Log in guild guild-id",
 ];
+// The guild's View Audit Log is optional (it only names who archived a thread), so it never blocks.
 
 export const THREAD_C = "1700000000000333333";
 

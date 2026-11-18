@@ -47,11 +47,13 @@ export function expectLateThreadHost(workspace) {
 }
 
 // The worker launches its Node link through CCDM_ROUTER_NODE, as the session
-// launchers do, and finds the Router through CCDM_ROUTER_STATE_DIR.
+// launchers do, and finds the Router through CCDM_ROUTER_STATE_DIR. Turn marks
+// (⏳ ✅ ⚠️) are off unless a test turns them on (`CCDM_THREAD_TURN_MARKS: "1"`),
+// so they never add to the reactions other tests count.
 export function supervisorEnv(workspace, extraEnv = {}) {
   const host = fakeHosts.get(workspace)?.env ?? (lateHosts.has(workspace) ? fakeHostEnv(workspace) : null);
   const hostEnv = host ? { ...host, CCDM_THREAD_SUPERVISOR_STATE_DIR: supervisorStateDir(workspace) } : {};
-  return routerEnv(workspace, { ...hostEnv, ...extraEnv });
+  return routerEnv(workspace, { CCDM_THREAD_TURN_MARKS: "0", ...hostEnv, ...extraEnv });
 }
 
 // One supervisor CLI command; `json` is its parsed stdout, when it has any.

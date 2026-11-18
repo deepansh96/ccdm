@@ -89,7 +89,7 @@ test("an owner message reaches the session as a channel notification and its rep
   assert.deepEqual(done.fixtures.claude.channelNotifications, [{
     content: "please run the tests",
     meta: {
-      chat_id: "demo-channel", message_id: "owner-message-1", user: "Owner", user_id: OWNER_ID,
+      chat_id: "demo-channel", message_id: "owner-message-1", user: "Owner", user_id: OWNER_ID, sender: "owner",
       ts: "2026-09-29T10:00:00.000Z", attachment_count: "1", attachments: "notes.txt (text/plain, 2KB)",
     },
   }], router.stdout);

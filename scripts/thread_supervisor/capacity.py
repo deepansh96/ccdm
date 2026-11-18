@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 import json
 import os
 import sys
+import time
 
 from . import lifecycle, registry, store
 from .link import LinkError
@@ -30,6 +31,7 @@ from .paths import router_state_dir
 
 DEFAULT_CAPS = {"claude": 6, "codex": 8}
 DEFAULT_IDLE_SECONDS = 30 * 60
+DEFAULT_STUCK_TURN_SECONDS = 6 * 3600
 RUNNING = ("booting", "live")
 PAUSED = "Paused to free a session slot; send a message here to resume."
 
@@ -71,12 +73,45 @@ def activity_path(project: str, thread_id: str):
     return router_state_dir() / "launches" / project / "threads" / thread_id / "activity.json"
 
 
-def _turn_running(row) -> bool:
+def stuck_turn_seconds() -> float:
+    """A turn marked running with no activity update for this long is stuck, not running."""
     try:
-        activity = json.loads(activity_path(row["project"], row["thread_id"]).read_text(encoding="utf-8"))
+        seconds = float(os.environ.get("CCDM_THREAD_STUCK_TURN_S") or DEFAULT_STUCK_TURN_SECONDS)
+    except ValueError:
+        return DEFAULT_STUCK_TURN_SECONDS
+    return seconds if seconds > 0 else DEFAULT_STUCK_TURN_SECONDS
+
+
+def _activity(row) -> tuple[dict | None, float | None]:
+    """The session's activity.json and its age in seconds; (None, None) when unreadable."""
+    path = activity_path(row["project"], row["thread_id"])
+    try:
+        age = time.time() - path.stat().st_mtime
+        activity = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None, None
+    return (activity if isinstance(activity, dict) else None), age
+
+
+def _turn_running(row) -> bool:
+    """Whether a turn runs. An unreadable file counts as running; a turn marked
+    running whose file has not changed for `stuck_turn_seconds()` (such as one
+    a local command typed into the pane started, with no Stop after it) does not."""
+    activity, age = _activity(row)
+    if activity is None:
         return True
-    return not (isinstance(activity, dict) and activity.get("turn_running") is False)
+    if activity.get("turn_running") is False:
+        return False
+    return age is None or age < stuck_turn_seconds()
+
+
+def paused(row) -> bool:
+    """Whether /pause holds the session's turns (its queued messages would be lost if it stopped)."""
+    activity, _age = _activity(row)
+    return bool(activity and activity.get("paused") is True)
+
+
+turn_running = _turn_running
 
 
 def _last_activity(row) -> str:

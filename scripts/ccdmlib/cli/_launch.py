@@ -54,6 +54,8 @@ _UNKNOWN_SESSION = "unknown_session"
 _KEY_FILE_FLAG = "--ccdm-key-file"
 _MCP_CONFIG_FLAG = "--mcp-config"
 _LISTENER_FLAG = "--dangerously-load-development-channels"
+# The launch note that tells a Claude session the Router verified each sender.
+CHANNEL_TRUST_NOTE = "claude-channel-trust.txt"
 _LISTENER_CHANNEL = "server:ccdm"
 _CHANNEL_SERVER = "ccdm-channel-server.js"
 _KEY_FILE_IN_ENV = re.compile(r"""CCDM_ROUTER_KEY_FILE=(?:"([^"]+)"|'([^']+)'|([^\s]+))""")

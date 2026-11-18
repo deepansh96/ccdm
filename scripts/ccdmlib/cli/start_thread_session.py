@@ -392,16 +392,21 @@ class _ThreadLaunch:
         }}}
         private_fs.write_private(launch / "mcp.json", json.dumps(config, indent=2) + "\n")
         # The official Discord plugin must not load beside the CCDM channel. The Stop
-        # and StopFailure command hooks mark the turn ended in activity.json; the
-        # reminder hook records the turn's completion.
+        # and StopFailure command hooks mark the turn ended (completed or failed) in
+        # activity.json, and UserPromptSubmit marks it running, for a prompt Claude
+        # takes in after the turn that received it stopped (never for a `/` command
+        # typed into the pane, which no Stop may follow); the reminder hook records
+        # the turn's completion.
         activity_hook = hooks.hook_command(scripts / "thread-activity.js", launch / "activity.json")
         reminder_hook = hooks.hook_command(scripts / "claude-reminder-hook.js")
+        session_hooks = {event: [{"hooks": [{"type": "command", "command": command}
+                                            for command in ([activity_hook] if event in ("Stop", "StopFailure") else [])
+                                            + [reminder_hook]]}]
+                         for event in ("SessionStart", "Stop", "StopFailure", "SessionEnd")}
+        session_hooks["UserPromptSubmit"] = [{"hooks": [{"type": "command", "command": activity_hook}]}]
         settings: Dict[str, Any] = {
             "enabledPlugins": {"discord@claude-plugins-official": False},
-            "hooks": {event: [{"hooks": [{"type": "command", "command": command}
-                                         for command in ([activity_hook] if event in ("Stop", "StopFailure") else [])
-                                         + [reminder_hook]]}]
-                      for event in ("SessionStart", "Stop", "StopFailure", "SessionEnd")},
+            "hooks": session_hooks,
         }
         if WIN32:
             settings["statusLine"] = _launch.status_line_setting(self.root, self.claude_home)
@@ -427,6 +432,8 @@ class _ThreadLaunch:
             "--dangerously-skip-permissions",
             "--mcp-config", str(launch / "mcp.json"),
             "--settings", str(launch / "settings.json"),
+            # The Router already verified each sender: the owner can steer a busy turn.
+            "--append-system-prompt-file", str(self.root / "scripts" / _launch.CHANNEL_TRUST_NOTE),
         ]
         if self.model:
             argv += ["--model", self.model]

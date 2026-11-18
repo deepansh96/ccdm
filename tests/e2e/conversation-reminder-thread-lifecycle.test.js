@@ -9,7 +9,7 @@ import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 import { startThreadSupervisor, supervisorEnv } from "./support/thread-supervisor.js";
 import {
-  FAST_POLL, THREAD_A, THREAD_B, THREAD_BLOCKERS, THREAD_C, THREAD_D, WIN, agentReplies, answeredHistory,
+  THREAD_A, THREAD_B, THREAD_BLOCKERS, THREAD_C, THREAD_D, WIN, agentReplies, answeredHistory,
   answeredThread, createThread, eyes, notices, owner, reminderService, settle, snowflakeNow, supervisedThread,
   threadReminderWorkspace, threadReminders, threadStatus, threadStatusMatching,
 } from "./support/reminder-threads.js";
@@ -68,10 +68,10 @@ test("an accepted /config provider= resets the thread's reminder tracking, and /
   await stop();
 });
 
-test("a thread /close and an owner archive each close only that thread's reminders", async () => {
+test("a thread /close closes only that thread's reminders; an owner archive is reverted and keeps them", async () => {
   const context = threadReminderWorkspace();
   const { workspace } = context;
-  const stop = await threadReminders(context, { supervisorEnv: FAST_POLL });
+  const stop = await threadReminders(context);
   await answeredThread(context, THREAD_A, "thread-a-question");
   await answeredThread(context, THREAD_B, "thread-b-question");
   injectDiscordMessage(workspace, { id: "channel-question", channelId: "demo-channel", author: owner,
@@ -84,7 +84,8 @@ test("a thread /close and an owner archive each close only that thread's reminde
   let demo = (await reminderService(context, "status")).conversations.demo;
   assert.deepEqual([demo.state, demo.threads[THREAD_B].state], ["awaiting-owner", "awaiting-owner"]);
 
-  // The owner archives B by hand; the audit log names the owner.
+  // The owner archives B by hand; the audit log names the owner. Only /close and
+  // threads.sh close archive a thread, so the supervisor reverts it and B stays open.
   updateState(workspace.stateDir, state => {
     (state.fixtures.discord.auditLogEntries ||= []).unshift({ id: snowflakeNow(), user_id: OWNER_ID,
       target_id: THREAD_B, action_type: 111, changes: [{ key: "archived", old_value: false, new_value: true }] });
@@ -95,16 +96,19 @@ test("a thread /close and an owner archive each close only that thread's reminde
     (state.fixtures.discord.injectedThreads ||= []).push({ ...threadB, archived: true, event: "update",
       previous: { ...threadB, archived: false } });
   });
-  await supervisedThread(workspace, THREAD_B, row => row.state === "closed" && row.close_reason === "owner-archive");
-  await threadStatusMatching(context, THREAD_B, row => row.state === "closed");
+  await supervisedThread(workspace, THREAD_B, row => row.state === "stopped" && row.stop_reason === "auto-archive");
+  await waitFor(() => readState(workspace.stateDir).fixtures.discord.threads[THREAD_B].archived === false,
+    () => "thread B's unarchive", 20000);
   demo = (await reminderService(context, "status")).conversations.demo;
-  assert.deepEqual([demo.state, demo.due_at !== null], ["awaiting-owner", true]);
+  assert.deepEqual([demo.state, demo.due_at !== null, demo.threads[THREAD_B].state],
+    ["awaiting-owner", true, "awaiting-owner"]);
 
-  // Past the hour only the channel is reminded.
+  // Past the hour the channel and B are reminded; the closed A is not.
   context.setClock(61);
   await waitFor(() => eyes(workspace, "demo-channel").length === 1, () => "the channel's reminder", 20000);
+  await waitFor(() => eyes(workspace, THREAD_B).length === 1, () => "thread B's reminder", 20000);
   await settle();
-  assert.deepEqual([eyes(workspace, THREAD_A), eyes(workspace, THREAD_B)], [[], []]);
+  assert.deepEqual(eyes(workspace, THREAD_A), []);
   await stop();
 });
 
@@ -198,22 +202,17 @@ test("enable discovery adopts active and recently archived open threads, and ski
   const context = threadReminderWorkspace();
   const { workspace } = context;
   const day = 24 * 3600000;
-  const stop = await threadReminders(context, { supervisorEnv: FAST_POLL, beforeEnable: async () => {
-    // D was bound, then the owner archived it yesterday: its conversation is closed.
+  const stop = await threadReminders(context, { beforeEnable: async () => {
+    // D was bound, then the owner closed it with /close yesterday: its conversation is closed.
     createThread(workspace, THREAD_D);
     await supervisedThread(workspace, THREAD_D);
-    updateState(workspace.stateDir, state => {
-      (state.fixtures.discord.auditLogEntries ||= []).unshift({ id: snowflakeNow(), user_id: OWNER_ID,
-        target_id: THREAD_D, action_type: 111, changes: [{ key: "archived", old_value: false, new_value: true }] });
-    });
-    const threadD = { id: THREAD_D, type: 11, parentId: "demo-channel", name: "Side task 444444",
-      ownerId: OWNER_ID, autoArchiveDuration: 10080 };
-    updateState(workspace.stateDir, state => {
-      state.fixtures.discord.injectedThreads.push({ ...threadD, archived: true,
-        archiveTimestamp: new Date(Date.now() - day).toISOString(), event: "update",
-        previous: { ...threadD, archived: false } });
-    });
+    injectDiscordMessage(workspace, { id: "thread-d-close", channelId: THREAD_D, author: owner, content: "/close" });
     await supervisedThread(workspace, THREAD_D, row => row.state === "closed");
+    await waitFor(() => readState(workspace.stateDir).fixtures.discord.threads[THREAD_D].archived === true,
+      () => "thread D's archive", 20000);
+    updateState(workspace.stateDir, state => {
+      state.fixtures.discord.threads[THREAD_D].archiveTimestamp = new Date(Date.now() - day).toISOString();
+    });
     // A is active, B was archived a day ago and C eight days ago.
     const thread = (id, fields) => ({ id, type: 11, parentId: "demo-channel", name: `Side task ${id.slice(-6)}`,
       ownerId: OWNER_ID, autoArchiveDuration: 10080, ...fields });

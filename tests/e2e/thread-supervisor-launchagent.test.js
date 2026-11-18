@@ -20,7 +20,7 @@ test.afterEach(cleanup);
 const LABEL = "com.ccdm.thread-supervisor";
 const plistPath = workspace => path.join(workspace.homeDir, "Library", "LaunchAgents", `${LABEL}.plist`);
 
-// Root lacks two channel thread bits and the guild's View Audit Log.
+// Root lacks two channel thread bits and the guild's optional View Audit Log.
 function denyThreadPermissions(workspace) {
   updateState(workspace.stateDir, state => {
     state.fixtures.discord.permissionDenials = { "fixture-bot-user-id":
@@ -48,13 +48,16 @@ async function routerStatus(workspace) {
 const DEMO_LINE = /^ {2}demo channel=demo-channel webhook=present root_permissions=ok$/m;
 const DEMO_THREAD_LINE =
   /^ {2}demo channel=demo-channel webhook=present root_permissions=ok thread_permissions=missing CreatePublicThreads,ManageThreads$/m;
-const GUILD_LINE = /^guild permissions: missing ViewAuditLog$/m;
+const GUILD_LINE = /^guild permissions \(optional\): missing ViewAuditLog$/m;
 
 function assertThreadBitsOmitted({ text, json }) {
   assert.match(text, DEMO_LINE);
   assert.doesNotMatch(text, /thread_permissions|guild permissions/);
   assert.equal(json.threads_enabled, false);
-  for (const project of json.projects) assert.equal(project.missing_thread_permissions, undefined, project.project);
+  for (const project of json.projects) {
+    assert.equal(project.missing_thread_permissions, undefined, project.project);
+    assert.equal(project.missing_optional_thread_permissions, undefined, project.project);
+  }
 }
 
 function assertThreadBitsListed({ text, json }) {
@@ -62,7 +65,9 @@ function assertThreadBitsListed({ text, json }) {
   assert.match(text, GUILD_LINE);
   assert.equal(json.threads_enabled, true);
   const demo = json.projects.find(({ project }) => project === "demo");
-  assert.deepEqual(demo.missing_thread_permissions, ["CreatePublicThreads", "ManageThreads", "ViewAuditLog"]);
+  // View Audit Log is useful but optional: it is listed apart from the required bits.
+  assert.deepEqual(demo.missing_thread_permissions, ["CreatePublicThreads", "ManageThreads"]);
+  assert.deepEqual(demo.missing_optional_thread_permissions, ["ViewAuditLog"]);
 }
 
 test("router status lists root's missing thread permissions only while threads are enabled", async () => {
@@ -96,7 +101,7 @@ test("router status lists root's missing thread permissions only while threads a
   editRegistry(workspace, addCaps);
   const granted = await routerStatus(workspace);
   assert.match(granted.text, /^ {2}demo channel=demo-channel webhook=present root_permissions=ok thread_permissions=ok$/m);
-  assert.match(granted.text, /^guild permissions: ok$/m);
+  assert.match(granted.text, /^guild permissions \(optional\): ok$/m);
 });
 
 // The worker the LaunchAgent runs: `run --supervised`, which honours `disable`.

@@ -10,7 +10,7 @@ import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 import { supervisorEnv } from "./support/thread-supervisor.js";
 import {
-  FAST_POLL, ROOT_AUTH, THREAD_A, THREAD_B, V7_STORE, V8_STORE, agentReplies, answeredThread, backups, cli,
+  ROOT_AUTH, THREAD_A, THREAD_B, V7_STORE, V8_STORE, agentReplies, answeredThread, backups, cli,
   createThread, eyes, guest, ingest, owner, posts, seedV7, settle, sql, storeRows, supervisedThread,
   threadReminderWorkspace, threadReminders,
 } from "./support/reminder-threads.js";
@@ -175,7 +175,7 @@ test("an owner reply in one thread acknowledges only that thread, and a guest re
 test("a reminder posted into an auto-archived thread reopens it without starting a session", async () => {
   const context = threadReminderWorkspace();
   const { workspace } = context;
-  const stop = await threadReminders(context, { supervisorEnv: FAST_POLL });
+  const stop = await threadReminders(context);
   await answeredThread(context, THREAD_A, "thread-question-1");
   const launched = readState(workspace.stateDir).fixtures.claude.channelServers.length;
 

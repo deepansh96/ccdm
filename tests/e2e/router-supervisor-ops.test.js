@@ -3,8 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { connectThread, createRouterWorkspace, rawRouterSocket, routerRegistry, routerWithWebhooks, seedThreads,
-  waitFor } from "./support/router.js";
+import { injectDiscordMessage } from "./support/bridge.js";
+import { connectThread, createRouterWorkspace, rawRouterSocket, routerRegistry, routerWithWebhooks, runRouterCli,
+  seedThreads, waitFor } from "./support/router.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -112,6 +113,38 @@ test("thread_list returns eligible active threads and archived threads within ar
 
   const demoOnly = ok(await supervisor.request("thread_list", { channel_id: "demo-channel", archived_within_days: 60 }));
   assert.deepEqual(demoOnly.threads.map(thread => thread.id).sort(), ["demo-thread", "old-thread", "recent-thread"]);
+  assert.deepEqual(demoOnly.skipped_channels, []);
+});
+
+test("thread_list skips a registered channel Discord no longer has, logs it once, and lists the rest", async () => {
+  const { workspace, router, supervisor } = await supervisedRouter();
+  const ago = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  seedThreads(workspace, {
+    "recent-thread": { type: 11, parentId: "demo-channel", archived: true, archiveTimestamp: ago },
+    "beta-thread": { type: 11, parentId: "beta-channel", archived: true, archiveTimestamp: ago },
+  });
+  updateState(workspace.stateDir, state => { state.fixtures.discord.missingChannels = ["beta-channel"]; });
+
+  for (let run = 0; run < 2; run++) {
+    const listed = ok(await supervisor.request("thread_list", { archived_within_days: 7 }));
+    assert.deepEqual(listed.threads.map(thread => thread.id).sort(), ["demo-thread", "recent-thread"]);
+    assert.deepEqual(listed.skipped_channels, [{ project: "beta", channel_id: "beta-channel", status: 404 }]);
+  }
+  const logged = `${router.stdout}\n${router.stderr}`.split("\n").filter(line => line.includes("thread_list_skipped"));
+  assert.equal(logged.length, 1, logged.join("\n"));
+  assert.match(logged[0], /project=beta channel=beta-channel status=404/);
+});
+
+test("router status names a project whose registered channel no longer exists", async () => {
+  const { workspace } = await supervisedRouter();
+  updateState(workspace.stateDir, state => { state.fixtures.discord.missingChannels = ["beta-channel"]; });
+  const json = JSON.parse((await runRouterCli(workspace, ["status", "--json"])).stdout);
+  const byName = Object.fromEntries(json.projects.map(project => [project.project, project.channel_missing]));
+  assert.deepEqual([byName.beta, byName.demo], [true, false]);
+  const text = (await runRouterCli(workspace, ["status"])).stdout;
+  assert.ok(text.split("\n").includes("missing channels: beta (beta-channel)"), text);
+  assert.match(text, /^ {2}beta channel=beta-channel .* channel_missing$/m);
+  assert.doesNotMatch(text, /^ {2}demo .*channel_missing$/m);
 });
 
 test("thread_history returns thread messages with their author class", async () => {
@@ -334,4 +367,58 @@ test("create_thread fails at once with supervisor_unavailable when no supervisor
   assert.equal((await project.request("create_thread", { channel_id: "demo-channel", name: "Task" })).error?.code,
     "supervisor_unavailable");
   assert.ok(Date.now() - started < 1000);
+});
+
+const reactionPath = (channelId, messageId, emoji) =>
+  `/api/v10/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/@me`;
+
+test("thread_react is not_found for a deleted message and thread_archived in an archived thread", async () => {
+  const { workspace, supervisor } = await supervisedRouter();
+  updateState(workspace.stateDir, state => {
+    state.fixtures.discord.restFailures = [
+      { method: "PUT", path: reactionPath("demo-thread", "gone", "⏳"), status: 404,
+        body: { code: 10008, message: "Unknown Message" } },
+      { method: "DELETE", path: reactionPath("demo-thread", "m1", "⏳"), status: 400,
+        body: { code: 50083, message: "Thread is archived" } },
+      { method: "PUT", path: reactionPath("demo-thread", "m2", "✅"), status: 500 },
+    ];
+  });
+  const code = async args => (await supervisor.request("thread_react", { channel_id: "demo-thread", ...args })).error?.code;
+  assert.equal(await code({ message_id: "gone", emoji: "⏳" }), "not_found");
+  assert.equal(await code({ message_id: "m1", emoji: "⏳", remove: true }), "thread_archived");
+  // Any other Discord failure stays a retryable discord_error.
+  assert.equal(await code({ message_id: "m2", emoji: "✅" }), "discord_error");
+});
+
+test("the owner ping and status board ops are gone, and the supervisor's hello lists no capabilities", async () => {
+  const { workspace, supervisor } = await supervisedRouter();
+  assert.equal("capabilities" in supervisor.hello, false, JSON.stringify(supervisor.hello));
+  for (const [op, args] of [["thread_notice_delete", { channel_id: "demo-thread", message_id: "m1" }],
+    ["status_board_list", {}], ["status_board_post", { text: "x" }],
+    ["status_board_edit", { message_id: "m", text: "x" }], ["status_board_delete", { message_id: "m" }]]) {
+    assert.equal((await supervisor.request(op, args)).error?.code, "unknown_op", op);
+  }
+  // A notice never mentions anyone, whatever it asks for.
+  ok(await supervisor.request("thread_notice", { channel_id: "demo-thread", text: "🔔 <@owner-id> ready for you",
+    mention_owner: true }));
+  assert.deepEqual(discord(workspace).messages.map(({ content, allowedMentions }) => [content, allowedMentions]),
+    [["🔔 <@owner-id> ready for you", { parse: [] }]]);
+  const json = JSON.parse((await runRouterCli(workspace, ["status", "--json"])).stdout);
+  assert.equal("status_channel" in json, false);
+});
+
+test("a native reply to any root-bot message in a thread is root's, whatever it says", async () => {
+  const { workspace, supervisor } = await supervisedRouter();
+  const thread = await connectThread(workspace, { threadId: "demo-thread" });
+  const notices = [ok(await supervisor.request("thread_notice", { channel_id: "demo-thread", text: "Restarting." })),
+    ok(await supervisor.request("thread_notice", { channel_id: "demo-thread", text: "🔔 <@owner-id> ready for you" }))];
+  for (const [index, notice] of notices.entries()) {
+    const id = `reply-to-notice-${index}`;
+    injectDiscordMessage(workspace, { id, channelId: "demo-thread", content: "why?", replyTo: notice.message_id,
+      author: { id: "owner-id", username: "Owner" } });
+    const copy = await waitFor(() => supervisor.events.find(event => event.event === "thread_message"
+      && event.message_id === id), () => `the supervisor's copy of ${id}`);
+    assert.deepEqual([copy.to_root, copy.delivered_to_session], [true, false], id);
+  }
+  assert.ok(!thread.events.some(event => String(event.message_id).startsWith("reply-to-notice")));
 });

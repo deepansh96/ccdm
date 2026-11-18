@@ -214,6 +214,7 @@ class Client extends EventEmitter {
     this.options = options;
     this.user = { id: "fixture-bot-user-id", tag: "fixture-bot#0001" };
     this._poller = null;
+    this._ready = false;
     this.channels = {
       cache: {
         get: (id) => {
@@ -229,9 +230,16 @@ class Client extends EventEmitter {
       fetch: async (id) => {
         updateState((state) => {
           state.fixtures.discord.channelFetches ||= [];
-          state.fixtures.discord.channelFetches.push({ id });
+          state.fixtures.discord.channelFetches.push({ id, ready: this._ready });
         });
+        // Like discord.js before ready: with no guild cached yet, a thread
+        // channel cannot be built, and the fetch answers null.
+        if (!this._ready) return null;
         const state = readState();
+        // `missingChannels`: Discord answers Unknown Channel, as discord.js raises it.
+        if ((state.fixtures?.discord?.missingChannels ?? []).includes(id)) {
+          throw Object.assign(new Error("Unknown Channel"), { status: 404, code: 10003 });
+        }
         const failure = state.fixtures?.discord?.failures?.channelFetch;
         if (failure) throw new Error(failure);
         if (state.fixtures?.discord?.channelFetchNull) return null;
@@ -247,14 +255,18 @@ class Client extends EventEmitter {
     });
     const failure = readState().fixtures?.discord?.failures?.login;
     if (failure) return Promise.reject(new Error(failure));
+    // `readyDelayMs`: how long the gateway takes to be ready after login
+    // (a real one takes seconds; a restarted Router listens meanwhile).
+    const delay = Number(readState().fixtures?.discord?.readyDelayMs) || 5;
     setTimeout(() => {
       updateState((state) => {
         state.fixtures.discord.ready ||= [];
         state.fixtures.discord.ready.push({ tag: this.user.tag });
       });
+      this._ready = true;
       this.emit("ready");
       this._startPolling();
-    }, 5);
+    }, delay);
     return Promise.resolve(token);
   }
 

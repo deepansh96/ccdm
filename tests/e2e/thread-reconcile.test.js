@@ -21,8 +21,7 @@ test.afterEach(cleanup);
 // events, messages, seeded thread history and the fake audit log go in.
 // `routerWithWebhooks` gives demo the fake's first webhook.
 const WEBHOOK_ID = "fake-webhook-1";
-const ENV = { CCDM_THREAD_ARCHIVE_POLL_WINDOW_S: "1.5", CCDM_THREAD_ARCHIVE_POLL_INTERVAL_S: "0.2",
-  CCDM_ROUTER_RECONNECT_MIN_MS: "50", CCDM_ROUTER_RECONNECT_MAX_MS: "200" };
+const ENV = { CCDM_ROUTER_RECONNECT_MIN_MS: "50", CCDM_ROUTER_RECONNECT_MAX_MS: "200" };
 const SLEEPING = encodeURIComponent("💤");
 const EYES = encodeURIComponent("👀");
 
@@ -213,7 +212,7 @@ test("on restart, a thread created during the downtime binds, and a stranger's d
   assert.deepEqual(claude(workspace).invocations ?? [], []);
 });
 
-test("on restart, an owner archive during the downtime is classified as owner-archive and stops the session", async () => {
+test("on restart, an owner archive during the downtime is reverted and stops the idle session, leaving the thread open", async () => {
   const workspace = reconcileWorkspace();
   const { supervisor } = await supervised(workspace);
   const raw = thread("1700000000000330001");
@@ -233,8 +232,11 @@ test("on restart, an owner archive during the downtime is classified as owner-ar
 
   await startThreadSupervisor(workspace, { env: ENV });
 
-  const row = await threadRow(workspace, raw.id, current => current.state === "closed");
-  assert.deepEqual([row.state, row.close_reason], ["closed", "owner-archive"]);
+  // Only /close and threads.sh close archive a thread: reconcile unarchives it.
+  const row = await threadRow(workspace, raw.id, current => current.state === "stopped");
+  assert.deepEqual([row.stop_reason, row.close_reason], ["auto-archive", null]);
+  await waitFor(() => readState(workspace.stateDir).fixtures.discord.threads[raw.id].archived === false,
+    () => "the unarchive");
   await disconnected(workspace, raw.id);
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions[tmuxName(raw.id)], undefined);
 });
@@ -497,4 +499,32 @@ test("when ccdm-host never answers, the first launch goes ahead after the bounde
   assert.deepEqual(claude(workspace).invocations ?? [], []);
   const { stderr } = await assertSupervisorStops(supervisor);
   assert.equal(occurrences(stderr, "ccdm-host did not answer after 90 s; launching anyway"), 1, stderr);
+});
+
+test("on restart, a registered project whose channel Discord no longer has does not stop reconcile", async () => {
+  const workspace = reconcileWorkspace();
+  const registryFile = path.join(workspace.repoDir, "registry.json");
+  const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+  registry.projects.gone = { channel_id: "gone-channel", type: "claude", transport: "router", path: workspace.tmpDir,
+    screen_name: "gone_claude" };
+  fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
+  const { supervisor } = await supervised(workspace);
+  const raw = thread("1700000000000390001");
+  threadEvent(workspace, raw, "create");
+  await threadRow(workspace, raw.id);
+  assert.equal((await supervisor.stop()).exitCode, 0);
+
+  // While the supervisor is down, the thread is archived and gone's channel is deleted.
+  threadEvent(workspace, raw, "update", { archived: true, archiveTimestamp: new Date().toISOString(),
+    previous: { ...raw, archived: false } });
+  await delivered(workspace, 2);
+  updateState(workspace.stateDir, state => { state.fixtures.discord.missingChannels = ["gone-channel"]; });
+
+  const restarted = await startThreadSupervisor(workspace, { env: ENV });
+  // The thread list still answers, so the open thread is unarchived as usual.
+  await waitFor(() => discord(workspace).threads[raw.id].archived === false, () => "the unarchive", 15000);
+  assert.equal((await threadRow(workspace, raw.id)).state, "registered");
+  const exit = await restarted.stop();
+  assert.match(exit.stderr, /reconcile: skipped project gone's channel gone-channel \(Discord 404\)/);
+  assert.doesNotMatch(exit.stderr, /the thread list failed/);
 });

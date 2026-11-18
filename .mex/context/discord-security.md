@@ -17,7 +17,7 @@ edges:
     condition: when granting, syncing, listing, or revoking guest access
   - target: patterns/debug-discord-session.md
     condition: when a session cannot read or reply in its channel
-last_updated: 2026-11-10
+last_updated: 2026-11-18
 ---
 
 # Discord Security
@@ -36,12 +36,14 @@ A Thread Conversation's Session Scope is its thread alone. The `thread` role is 
 
 The Thread Supervisor holds no Discord credential and makes no direct Discord REST call. It connects as the single `supervisor` role (`keys/.supervisor.key`, rewritten on each start), and every Discord action it takes is a supervisor-only Router op confined to registered project channels and their eligible threads. Its notices post as the root bot. Its `thread_message` copy of bot and webhook messages is for reply tracking only; bot and webhook messages still never reach sessions.
 
-Root needs four permissions for threads, granted once by hand; no script PATCHes them:
+Turn status stays inside the same boundary and posts nothing: the supervisor's ⏳, ✅ and ⚠️ are `thread_react` calls on eligible-thread messages, and its notices are sent with `allowed_mentions: {parse: []}`, so they mention no one. Root's own reactions reach no session and no supervisor handler (bot reactions are dropped at classification), so a ✅ mark can never apply a pending `/config`, which needs the owner's ✅ on the warning itself. A native reply to any root-bot message in a thread is root's.
+
+Root needs three permissions for threads, granted once by hand; no script PATCHes them:
 
 - Create Public Threads, Send Messages in Threads and Manage Threads in every project channel;
-- View Audit Log on the guild, which the supervisor uses to tell an owner or root archive from an auto-archive.
+- optionally, View Audit Log on the guild: useful, so the supervisor can log who archived a thread before it reopens it, but not required.
 
-`router status` and reminder readiness report missing bits only while threads are enabled.
+`router status` and reminder readiness report missing required bits only while threads are enabled.
 
 ## Credentials
 
@@ -54,6 +56,8 @@ The bridge dynamically registers one Discord MCP server for its channel, backed 
 ## Guests
 
 Use `node scripts/guest-access.js`; do not create generic server invites. `invite` or `grant` creates/synchronizes the project role, denies other managed locations, allows the target channel, and updates the registry's `guest_user_ids`. The Router reloads guests from the registry, so a grant or revoke applies to the next message without a restart. `revoke` removes the role, the registry entry, and outstanding invites. That is role mode, the default. The registry's top-level `guest_mode` can pick another: `"member-overwrites"` creates no role and gives each guest overwrites on their own user instead, for a bot without server-wide Manage Roles, and `"none"` takes no new guests; see `patterns/manage-guest-access.md`. Guests can never reach root: their bot mentions are dropped.
+
+Every Claude channel and thread event carries `sender="owner"` or `sender="guest"`, set by the channel server from the Router's sender check. Claude Code labels every channel message that lands mid-turn "not from your user", so Claude launches append `scripts/claude-channel-trust.txt` with `--append-system-prompt`. It tells the session that a `sender="owner"` message is the owner whenever it arrives, which keeps mid-turn steering working; guests keep guest handling. A resumed conversation keeps its recorded system prompt until it compacts.
 
 Project-specific user and channel access exceptions live in ignored `CLAUDE.local.md`. Apply those rules without copying local IDs into tracked files.
 

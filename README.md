@@ -575,7 +575,8 @@ Open a public thread under a registered project channel and type a task: it beco
   - `/restart` resumes the conversation, and `/clear` starts a fresh one.
   - `/compact`, `/pause` and `/unpause` work as in a channel.
   - `/close` archives the thread, stops its session and closes its reminders.
-- **Lifecycle:** your archive, root's archive or `/close` closes the conversation. Discord's inactivity auto-archive only stops the session. Your next message resumes the same conversation, and only your message reopens a closed one.
+- **Lifecycle:** a thread stays open until `/close` (or `scripts/threads.sh close`), which archives it and closes the conversation. Any other archive, Discord's one-week inactivity auto-archive or one by hand, is reverted at once, and an idle session is stopped. Your next message resumes the same conversation, and only your message reopens a closed one.
+- **Status:** root reacts on your message instead of posting. ⏳ means the agent is working on it (only your latest message carries it), ✅ that the turn ended and it is your turn, and ⚠️ that the turn failed or the session crashed. A stop or `/close` takes the ⏳ off; ✅ and ⚠️ stay.
 - **Capacity:** live thread sessions are capped per provider by the registry's `thread_session_caps` (default `{"claude": 6, "codex": 8}`). At the cap the longest-idle session is paused, or the new one is queued.
 - **Accounts:** a thread may use an alias from `codex_accounts`, or from the new `claude_accounts` map (alias → Claude home).
 - **Operate:**
@@ -590,7 +591,7 @@ scripts/install-thread-supervisor.sh      # read-only preflight, then the com.cc
 scripts/thread-supervisor.py status        # worker, caps and bound threads
 ```
 
-Root needs four extra permissions, granted once by hand: Create Public Threads, Send Messages in Threads and Manage Threads in the project channels, and View Audit Log on the guild. `router status` reports any that are missing while threads are enabled. The post-merge live smoke steps are in the [operator checklist](docs/thread-supervisor.md#operator-checklist).
+Root needs three extra permissions, granted once by hand: Create Public Threads, Send Messages in Threads and Manage Threads in the project channels. View Audit Log on the guild is useful but optional: with it the supervisor logs who archived a thread it reopened. `router status` reports any that are missing while threads are enabled. The post-merge live smoke steps are in the [operator checklist](docs/thread-supervisor.md#operator-checklist).
 
 ## Creating the root bot
 
@@ -607,7 +608,7 @@ CCDM needs exactly one Discord bot application, used by root and the Router.
    - Attach Files, Add Reactions, Manage Messages
    - Manage Webhooks (Project Identity webhooks)
    - Manage Channels, Manage Roles, Create Instant Invite (registration and guest access)
-   - Create Public Threads, Manage Threads, View Audit Log (Thread Conversations)
+   - Create Public Threads, Manage Threads (Thread Conversations), and optionally View Audit Log
 
    Set Integration type to **Guild Install**. Copy the generated URL.
 
@@ -685,7 +686,7 @@ The opt-in foreground [Project Conversation state service](docs/conversation-rem
 
 A separate, opt-in macOS LaunchAgent can post usage stats to Discord on a schedule. It is not installed by `setup.sh` and it is not the old tmux-based `usage-report-loop.sh` flow.
 
-The tracked installer requires Python 3 only, then renders and validates `~/Library/LaunchAgents/com.discord.usage-stats-poster.plist` with absolute paths to Python, Codex, the poster, and its logs. Pillow is not required: the scheduled and manual poster output is text-only, so installation never probes for image libraries, and a missing `python3` exits before touching LaunchAgents or the existing plist. The separate `scripts/usage-dashboard-renderer.py` trend renderer keeps Pillow as an optional dependency when it is invoked manually. The LaunchAgent is interval-only and runs every 600 seconds, so installation does not trigger an immediate post. Every automated run records a local structured snapshot in UTC 10-minute slots; the original text Usage Report is posted on its own only once per UTC 30-minute slot. Any run inside the slot posts if the ledger has no post for it yet, so a run skipped during sleep or a Discord request that never reached Discord is retried by the next run in the same slot. If Discord received the request but its reply was lost (timeout or dropped connection), the slot is recorded as posted to avoid a duplicate report. No trend or balance PNG is rendered or attached by the scheduled or manual output. Manual JSON-embed invocations remain independent of the history database. Reinstalling unloads the existing label before loading the new plist, so changing the interval is idempotent; if the new load fails, the prior plist and loaded/unloaded schedule are restored:
+The tracked installer requires Python 3 only, then renders and validates `~/Library/LaunchAgents/com.discord.usage-stats-poster.plist` with absolute paths to Python, Codex, the poster, and its logs. Pillow is not required: the scheduled and manual poster output is text-only, so installation never probes for image libraries, and a missing `python3` exits before touching LaunchAgents or the existing plist. The separate `scripts/usage-dashboard-renderer.py` trend renderer keeps Pillow as an optional dependency when it is invoked manually. The LaunchAgent is interval-only and runs every 600 seconds, so installation does not trigger an immediate post. Every automated run records a local structured snapshot in UTC 10-minute slots; the original text Usage Report is posted on its own only once per UTC 30-minute slot. Any run inside the slot posts if the ledger has no post for it yet, so a run skipped during sleep or a Discord request that never reached Discord is retried by the next run in the same slot. If Discord received the request but its reply was lost (timeout or dropped connection), the slot is recorded as posted to avoid a duplicate report. No trend or balance PNG is rendered or attached by the scheduled or manual output. Manual JSON-embed invocations never create, lock, or write the history database: they only read it, best effort, for Codex credits used, and post normally without those figures when it is missing or unreadable. Reinstalling unloads the existing label before loading the new plist, so changing the interval is idempotent; if the new load fails, the prior plist and loaded/unloaded schedule are restored:
 
 ```bash
 scripts/install-usage-stats-poster.sh                 # 600 seconds (10 minutes)
@@ -701,14 +702,43 @@ History is stored at `~/Library/Application Support/CCDM/usage-stats/history.sql
 ```
 
 The poster reports:
-- Claude Code limits from Anthropic OAuth APIs via the macOS Keychain credentials
+- Claude Code limits from Anthropic OAuth APIs via the macOS Keychain credentials:
+  the 5-hour session (absent on accounts that have none, such as Max), the
+  7-day allowance for all models, and one 7-day row per model that has its own
+  weekly allowance (today `7-Day (Fable)`), each with its reset time. When a
+  model row is shown, the all-models row reads `7-Day (all)`; an account
+  without one keeps the plain `7-Day` label. History stores each model row as
+  its own series (window `7-day (<model>)` with `scope`), never mixed into the
+  all-models `7-day` series
+- Claude limit resets (when Claude Code is installed and the account is
+  eligible) on one line, split by what each grant's `clears` list resets: a
+  grant that clears the all-models 7-day limit, or the 5-hour session without
+  any 7-day limit, is **general**; one that clears only a model-scoped weekly
+  limit takes the model its bucket names (such as `seven_day_opus`), else the
+  account's model-scoped row (today Fable), for example
+  `Resets: **1** general (use within 24d 8h) · **3** Fable (use within 112d 18h)`.
+  Each group has its own earliest use-by deadline; paused, expired, used-up,
+  and unrecognised grants (including any without `clears`) are left out, and a
+  group with none is omitted
 - ChatGPT/Codex limits for every alias in the top-level `codex_accounts`
   registry map, with `default_codex_account` shown first and the remaining
   aliases shown alphabetically
+- Codex credits for subscription accounts whose live rate-limit read reports
+  them: `Credits: **61,285** left`, or `unlimited`. The app-server reports only
+  the current balance, so credits used come from the poster's own history:
+  each scheduled snapshot stores the live balance as a plain number with a
+  16-character salted hash of the app-server account id (never the id), and
+  the line adds `used N in 24h · N in 7d`, the sum of balance decreases between
+  consecutive snapshots of the same account (increases are top-ups and are
+  ignored). A balance from another account under the same label, or without
+  an account hash, is never compared. A window starts from the last stored
+  balance at or before its start, at most 6 hours older, and is omitted
+  without one. When the weekly limit is reached and credits remain, the line
+  ends `running on credits`
 - Local token-usage fallback from each named Codex Home's `sessions` directory
   when live rate limits are unavailable
 
-Each automated Discord post sends only the original text Usage Report embed. Codex is displayed as a weekly allowance only. Claude API-key accounts have no comparable percentage limit, so their embed text shows sanitized local estimated Today and This month costs, request counts, and status. The credential-free trend renderer (`scripts/usage-dashboard-renderer.py`) is retained for back-compat but is no longer invoked by the posting workflow.
+Each automated Discord post sends only the original text Usage Report embed. A provider section longer than one embed field (1024 characters) continues in further fields named `Claude Code (cont.)` or `Codex (cont.)`, split only between account blocks, so no account is cut off; only a single block longer than a whole field is truncated, and an embed over Discord's 25-field or 6000-character limit drops trailing continuation fields (marking the last one kept as truncated) while each provider keeps its first field. Codex is displayed as a weekly allowance only. Claude API-key accounts have no comparable percentage limit, so their embed text shows sanitized local estimated Today and This month costs, request counts, and status. The credential-free trend renderer (`scripts/usage-dashboard-renderer.py`) is retained for back-compat but is no longer invoked by the posting workflow.
 
 The poster reads the same named-account registry configuration shown in
 [Codex Accounts](#codex-accounts); it does not need a separate list of Codex

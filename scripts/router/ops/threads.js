@@ -20,9 +20,13 @@ const ARCHIVE_DURATIONS = new Set([60, 1440, 4320, 10080]);
 const PAGE_LIMIT = 100;
 // Archived pages read per parent channel, at most, in one `thread_list`.
 const ARCHIVED_PAGES = 10;
+// Discord answers for a parent channel that `thread_list` skips: gone, or unreadable.
+const SKIPPABLE_CHANNEL = new Set([403, 404]);
 const ARCHIVE_ACTION = 111;
 const DISCORD_EPOCH = 1420070400000n;
 const PROVIDERS = new Set(["claude", "codex"]);
+// Discord's refusal to act in an archived thread.
+const ARCHIVED_THREAD_CODE = 50083;
 
 const isId = id => typeof id === "string" && /^[\w-]+$/.test(id);
 
@@ -123,12 +127,23 @@ async function threadList(ctx, args) {
     if (thread.type === PUBLIC_THREAD && route) threads.push(listed(thread, route));
   }
   const cutoff = days === undefined ? -Infinity : Date.now() - days * 24 * 60 * 60 * 1000;
+  const skipped = [];
   for (const route of parents) {
     let before;
     for (let page = 0; page < ARCHIVED_PAGES; page++) {
-      const result = await discordRequest("GET", `/channels/${route.channel_id}/threads/archived/public`, {
-        token: ctx.token, query: { limit: PAGE_LIMIT, ...(before ? { before } : {}) },
-      });
+      let result;
+      try {
+        result = await discordRequest("GET", `/channels/${route.channel_id}/threads/archived/public`, {
+          token: ctx.token, query: { limit: PAGE_LIMIT, ...(before ? { before } : {}) },
+        });
+      } catch (error) {
+        // A registered channel Discord no longer has (404), or root cannot
+        // read (403), loses only its own archived threads, never the list.
+        if (!(error instanceof DiscordError && SKIPPABLE_CHANNEL.has(error.status))) throw error;
+        skipped.push({ project: route.project, channel_id: route.channel_id, status: error.status });
+        logSkippedOnce(ctx, route, error);
+        break;
+      }
       const archived = (result.threads ?? []).map(thread => listed(thread, route));
       const recent = archived.filter(thread => Date.parse(thread.archive_timestamp) >= cutoff);
       threads.push(...recent);
@@ -136,7 +151,18 @@ async function threadList(ctx, args) {
       before = archived.at(-1).archive_timestamp;
     }
   }
-  return { threads };
+  return { threads, skipped_channels: skipped };
+}
+
+// A skipped channel is logged once per registry load, not on every reconcile.
+const skippedLogged = new WeakMap();
+function logSkippedOnce(ctx, route, error) {
+  const logged = skippedLogged.get(ctx.table) ?? new Set();
+  skippedLogged.set(ctx.table, logged);
+  if (logged.has(route.channel_id)) return;
+  logged.add(route.channel_id);
+  ctx.log?.(`thread_list_skipped project=${route.project} channel=${route.channel_id} status=${error.status} ` +
+    `error=${error.message}`);
 }
 
 async function threadHistory(ctx, args) {
@@ -187,18 +213,29 @@ async function threadArchiveActor(ctx, args) {
   return { entries };
 }
 
+// Adds or removes one of root's reactions. A message that is gone is
+// `not_found`, and an archived thread, where reactions cannot change, is
+// `thread_archived`: the supervisor's turn marks take both as settled.
 async function threadReact(ctx, args) {
   const route = await conversationTarget(ctx, args.channel_id);
   if (!isId(args.message_id)) throw new OpError("invalid_args", "message_id is required");
   if (typeof args.emoji !== "string" || !args.emoji) throw new OpError("invalid_args", "emoji is required");
-  await discordRequest(args.remove === true ? "DELETE" : "PUT",
-    `/channels/${route.channel_id}/messages/${args.message_id}/reactions/${encodeURIComponent(args.emoji)}/@me`,
-    { token: ctx.token });
+  try {
+    await discordRequest(args.remove === true ? "DELETE" : "PUT",
+      `/channels/${route.channel_id}/messages/${args.message_id}/reactions/${encodeURIComponent(args.emoji)}/@me`,
+      { token: ctx.token });
+  } catch (error) {
+    if (error instanceof DiscordError && error.status === 404) throw new OpError("not_found", `no message ${args.message_id}`);
+    if (error instanceof DiscordError && error.body?.code === ARCHIVED_THREAD_CODE) {
+      throw new OpError("thread_archived", `thread ${route.channel_id} is archived`);
+    }
+    throw error;
+  }
   return { message_id: args.message_id, emoji: args.emoji, removed: args.remove === true };
 }
 
 // Notices post as the root bot, never through the project webhook, so the
-// reminder service never counts them as agent replies.
+// reminder service never counts them as agent replies. They mention no one.
 async function threadNotice(ctx, args) {
   const route = await conversationTarget(ctx, args.channel_id);
   if (typeof args.text !== "string" || !args.text) throw new OpError("invalid_args", "text is required");
