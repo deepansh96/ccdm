@@ -135,7 +135,8 @@ test("deregistering a project stops its thread sessions and closes them as dereg
     delete registry.projects.demo;
   });
 
-  const row = await threadRow(workspace, THREAD_ID, current => current.state === "closed");
+  // The row closes in one write and takes its reason in the next, so both are waited for.
+  const row = await threadRow(workspace, THREAD_ID, current => current.state === "closed" && current.close_reason);
   assert.deepEqual([row.state, row.stop_reason, row.close_reason], ["closed", null, "deregistered"]);
   const sibling = await threadRow(workspace, SIBLING_ID, current => current.state === "closed");
   assert.equal(sibling.close_reason, "deregistered");
