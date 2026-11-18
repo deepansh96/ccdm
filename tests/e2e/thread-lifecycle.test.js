@@ -498,6 +498,8 @@ test("on Windows, an archive leaves no process carrying the thread's key file, n
   await waitFor(() => storedRuntime(workspace)[0] != null, () => "the launcher's result on the row");
   assert.equal(storedRuntime(workspace)[1], THREAD_TMUX);
   await waitFor(() => keyFileCarriers(workspace).length > 0, () => "the thread's channel server");
+  // An archive stops only a session whose turn has ended.
+  await idle(workspace);
 
   archive(workspace);
 
