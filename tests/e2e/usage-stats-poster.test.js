@@ -2639,7 +2639,7 @@ test("poster shows Codex credits left and records balances to report credits use
   );
   const responsesPath = path.join(workspace.tmpDir, "codex-stdio-responses.json");
   const respond = (balance, accountId = "fixture-chatgpt-account-a") => fs.writeFileSync(responsesPath, `${JSON.stringify({
-    [fs.realpathSync(codexHome)]: {
+    [codexHomeKey(codexHome)]: {
       accountId,
       rateLimits: {
         limitId: "codex",

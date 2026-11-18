@@ -203,7 +203,8 @@ test("no Discord credential reaches the thread session's environment, launch fil
 
   const state = readState(workspace.stateDir);
   const dir = launchDir(workspace);
-  const files = fs.readdirSync(dir);
+  // An activity.json write in flight leaves a lock and a temporary file for a moment.
+  const files = fs.readdirSync(dir).filter(name => !/\.(tmp|lock)$/.test(name));
   assert.ok(files.includes("mcp.json") && files.includes("settings.json") && files.includes("bootstrap.json"),
     JSON.stringify(files));
   const mcpConfig = JSON.parse(fs.readFileSync(path.join(dir, "mcp.json"), "utf8"));
