@@ -28,6 +28,8 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
+const { writeFileAtomicSync } = require("./platform/atomic.js");
+
 // How long a write waits for the lock, and when a lock is old enough to be a
 // crashed writer's.
 const LOCK_WAIT_MS = 2000;
@@ -71,14 +73,11 @@ function writeActivity(file, update) {
     process.stderr.write(`thread activity: ${file} is locked by another writer; this update is lost\n`);
     return;
   }
-  const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.tmp`);
   try {
     const activity = { ...readActivity(file) };
     update(activity);
-    fs.writeFileSync(temporary, `${JSON.stringify(activity)}\n`, { mode: 0o600 });
-    fs.renameSync(temporary, file);
+    writeFileAtomicSync(file, `${JSON.stringify(activity)}\n`, { mode: 0o600 });
   } catch (error) {
-    fs.rmSync(temporary, { force: true });
     process.stderr.write(`thread activity: ${file} could not be written: ${error.message}\n`);
   } finally {
     fs.rmSync(lockFile, { force: true });

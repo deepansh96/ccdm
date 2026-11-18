@@ -5,6 +5,7 @@ triggers:
   - "thread supervisor"
   - "thread conversation"
   - "threads.sh"
+  - "ccdm threads"
   - "thread permissions"
 edges:
   - target: context/session-management.md
@@ -13,7 +14,7 @@ edges:
     condition: for thread Session Scope, the supervisor's credential boundary, and root's thread permissions
   - target: patterns/operate-conversation-reminders.md
     condition: when a thread's reminders, acknowledgment, or closure look wrong
-last_updated: 2026-11-17
+last_updated: 2026-11-18
 ---
 
 # Operate The Thread Supervisor
@@ -21,31 +22,43 @@ last_updated: 2026-11-17
 ## Context
 Read `docs/thread-supervisor.md`. The supervisor is a Router client (`supervisor` role) with no Discord credential. It owns Thread Conversation lifecycle; the Router routes thread traffic. Its private state is `~/.local/state/ccdm/thread-supervisor/`.
 
+Thread sessions launch on both OSes, and the operator's thread commands run on both. The supervisor's service is a LaunchAgent on macOS and the scheduled task `\CCDM\ThreadSupervisor` on Windows; both run the same `run --supervised` worker.
+
 ## Steps
 1. Make sure root has Create Public Threads, Send Messages in Threads and Manage Threads in the project channels. View Audit Log on the guild is optional: it only lets the supervisor log who archived a thread. These are granted once by hand in Discord, never by a script.
-2. Install supervision only when the operator asks: `scripts/install-thread-supervisor.sh`. It runs the read-only `preflight` first and changes nothing if a check fails.
-3. Inspect with `scripts/thread-supervisor.py status` (worker, caps, `capacity.invalid`, bound threads with `whose_turn` and their wanted and shown turn marks, `mark_emoji` and `shown_emoji`) and `node scripts/router.js status` (`thread` lines, `supervisor:` line, `thread_permissions=` per project, `guild permissions (optional):`).
-4. Operate threads with `scripts/threads.sh list [<project>]`, `scripts/threads.sh create <project> <name> [flags] [message]`, and `scripts/threads.sh stop|restart|close [<project>] <name|link|id>`.
-5. To stop a project's thread sessions, run `scripts/stop-session.sh <project> --threads`; `--all` also stops the channel. A plain `stop-session.sh <project>` or "restart <project>" touches the channel only.
-6. To debug in the foreground, run `scripts/thread-supervisor.py disable`, then `scripts/thread-supervisor.py run`; `enable` clears the disabled marker but starts nothing, so rerun `scripts/install-thread-supervisor.sh` after it to relaunch the LaunchAgent.
+2. Install supervision only when the operator asks.
+   - macOS: run `scripts/install-thread-supervisor.sh`. It runs the read-only `preflight` first and changes nothing if a check fails.
+   - Windows: run `scripts/ccdm install-service thread-supervisor`. It runs the same read-only `preflight` first, prints each blocker, exits 2 and changes nothing if a check fails. It refuses while a worker started by hand is running. `scripts/ccdm uninstall-service thread-supervisor` removes the task and leaves thread sessions running.
+3. Inspect the supervisor and the Router.
+   - macOS: `scripts/thread-supervisor.py status` shows the worker, caps, `capacity.invalid` and bound threads with `whose_turn` and their wanted and shown turn marks, `mark_emoji` and `shown_emoji`.
+   - Windows: `py -3 scripts\thread-supervisor.py status` shows the same. `scripts/ccdm service-status thread-supervisor` shows the task (`running`, `backoff`, `crashloop`, `disabled`), and its logs are `~/.local/state/ccdm/services/thread-supervisor.log` and `.err`.
+   - Both: `node scripts/router.js status` shows the `thread` lines, the `supervisor:` line, `thread_permissions=` per project and `guild permissions (optional):`.
+4. Operate threads.
+   - macOS: `scripts/threads.sh list [<project>]`, `scripts/threads.sh create <project> <name> [flags] [message]`, and `scripts/threads.sh stop|restart|close [<project>] <name|link|id>`.
+   - Windows: `scripts/ccdm threads list [<project>]`, `scripts/ccdm threads create <project> <name> [flags]`, and `scripts/ccdm threads stop|restart|close [<project>] <name|link|id>`. Give `create` its first message on stdin with `--message-stdin`, or from a UTF-8 file with `--message-file <path>`, never as arguments; with neither, the thread is created and its session starts on the first owner or guest message.
+   - Both: the output and exit codes are the same. Exit 2 means nothing was done (bad usage, a bad flag or setting, or a thread nobody can name); exit 1 means no supervisor answered. A `stop`, `restart` or `close` run from inside the thread it names still takes effect, because the supervisor carries it out; the command itself ends with the session and prints nothing.
+5. To stop a project's thread sessions, run `scripts/ccdm stop-session <project> --threads`; `--all` also stops the channel. A plain `scripts/ccdm stop-session <project>` or "restart <project>" touches the channel only.
+6. Debug in the foreground.
+   - macOS: run `scripts/thread-supervisor.py disable`, then `scripts/thread-supervisor.py run`; `enable` clears the disabled marker but starts nothing, so rerun `scripts/install-thread-supervisor.sh` after it to relaunch the LaunchAgent.
+   - Windows: run `py -3 scripts\thread-supervisor.py disable`, then `py -3 scripts\thread-supervisor.py run`. The supervised worker exits 0 on `disable` and the task does not restart it. `enable` clears the marker but starts nothing, so rerun `scripts/ccdm install-service thread-supervisor` after it.
 
 ## Gotchas
-- Never edit `threads.sqlite3` by hand; use `threads.sh` or Discord actions (archive, delete, a new owner message).
-- `stopped/crashed`, `stopped/start-failed` and `stopped/operator` never restart automatically; the next owner or guest message, or `threads.sh restart`, starts them.
-- Only `/close` and `threads.sh close` archive a thread. The supervisor reverts any other archive at once and stops the session only if it is idle (`stopped/auto-archive`); without Manage Threads that revert fails and the thread stays archived.
+- Never edit `threads.sqlite3` by hand; use the thread commands in step 4 or Discord actions (archive, delete, a new owner message).
+- `stopped/crashed`, `stopped/start-failed` and `stopped/operator` never restart automatically; the next owner or guest message, or a thread restart from step 4, starts them.
+- Only `/close` and the operator's thread `close` command archive a thread. The supervisor reverts any other archive at once and stops the session only if it is idle (`stopped/auto-archive`); without Manage Threads that revert fails and the thread stays archived.
 - Turn status is root's reaction on the latest input (⏳, then ✅ or ⚠️). A `mark_emoji` that differs from `shown_emoji` for long means the Router keeps refusing `thread_react` (look for `adding`/`removing … failed` in the supervisor log); it retries on its own with backoff. There is no status channel and no owner ping any more.
 - A thread message that got 💤 while the supervisor was down is delivered once, through reconcile, only if it is an unanswered owner message.
 - Caps come from the registry's `thread_session_caps` (default Claude 6, Codex 8); an invalid value falls back and shows in `status`.
 
 ## Verify
 - [ ] `router status` shows `supervisor: connected` and `thread_permissions=ok` for every project.
-- [ ] `~/Library/LaunchAgents/com.ccdm.thread-supervisor.plist` holds paths only, with no tokens.
+- [ ] macOS: `~/Library/LaunchAgents/com.ccdm.thread-supervisor.plist` holds paths only, with no tokens.
 - [ ] A test thread under a project channel gets 👀 and ⏳ on the message, then a reply as `<project>-<provider> · N%` and ✅ on the message.
 
 ## Debug
 - Check `service.log` and `service.err` in the supervisor state dir.
 - A second worker exits with status 2 while `worker.lock` is held.
-- A thread that never starts: check `threads.sh list` for its state and reason, and the one-line start-failure notice in the thread.
+- A thread that never starts: check the thread list from step 4 for its state and reason, and the one-line start-failure notice in the thread.
 
 ## Update Scaffold
 - [ ] Update `.mex/ROUTER.md` state and `docs/thread-supervisor.md` if lifecycle or operator behaviour changes.

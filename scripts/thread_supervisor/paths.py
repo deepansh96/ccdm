@@ -6,6 +6,9 @@ import os
 from pathlib import Path
 import secrets
 
+from ccdmlib.platform import private_fs
+from ccdmlib.platform.paths import state_root
+
 
 SUPERVISOR_KEY_FILE = ".supervisor.key"
 
@@ -14,33 +17,18 @@ def default_state_dir() -> Path:
     override = os.environ.get("CCDM_THREAD_SUPERVISOR_STATE_DIR")
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".local" / "state" / "ccdm" / "thread-supervisor"
+    return state_root() / "thread-supervisor"
 
 
 def router_state_dir() -> Path:
     override = os.environ.get("CCDM_ROUTER_STATE_DIR")
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".local" / "state" / "ccdm" / "router"
+    return state_root() / "router"
 
 
-def private_directory(path: Path) -> None:
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(path, 0o700)
-
-
-def write_private(path: Path, content: str) -> None:
-    """Replace ``path`` atomically with a 0600 file."""
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as target:
-            target.write(content)
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
-    except OSError:
-        temporary.unlink(missing_ok=True)
-        raise
+private_directory = private_fs.ensure_private_dir
+write_private = private_fs.write_private
 
 
 def write_supervisor_key() -> Path:

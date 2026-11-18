@@ -11,12 +11,16 @@ import {
   OWNER_ID,
   connectSession,
   createRouterWorkspace,
+  listenAsRouter,
+  proofReply,
   routerEnv,
   routerRegistry,
   routerWithWebhooks,
   runRouterCli,
   waitFor,
 } from "./support/router.js";
+import { startFakeHost } from "./support/session-fixture.js";
+import { replaceFile } from "./support/platform.js";
 import { readState, updateState } from "./support/state.js";
 import { registerTeardownCallback } from "./support/teardown.js";
 import { cleanup } from "./support/teardown.js";
@@ -42,8 +46,7 @@ async function moveChannel(workspace, router, project, channelId) {
   const next = readRegistry(workspace);
   next.projects[project].channel_id = channelId;
   const file = path.join(workspace.repoDir, "registry.json");
-  fs.writeFileSync(`${file}.edit`, `${JSON.stringify(next, null, 2)}\n`);
-  fs.renameSync(`${file}.edit`, file);
+  replaceFile(file, `${JSON.stringify(next, null, 2)}\n`);
   await waitFor(() => reloads() > before, () => `registry reload:\n${router.stdout}\n${router.stderr}`);
 }
 
@@ -81,6 +84,13 @@ function seedHistories(workspace) {
   seedHistory(workspace, "moved-channel", history("moved-channel", "2001", "in the new channel"));
 }
 
+// On Windows the launcher goes through the fake ccdm-host, sharing the fixture's session table.
+async function launcherEnv(workspace) {
+  if (process.platform !== "win32") return routerEnv(workspace);
+  const host = await startFakeHost(workspace, { env: routerEnv(workspace) });
+  return routerEnv(workspace, host.env);
+}
+
 test("a connected listener and an op-only connection both adopt the moved channel from the Router", async () => {
   const workspace = createRouterWorkspace();
   seedHistories(workspace);
@@ -112,10 +122,23 @@ test("the client adopts scope changes only for its own project, with a channel, 
   fs.mkdirSync(workspace.routerStateDir, { recursive: true, mode: 0o700 });
   const frame = (value) => `${JSON.stringify(value)}\n`;
   const scopeChanged = (scope) => frame({ type: "event", event: "scope_changed", scope });
+  let secret = null;
+  const earlyScope = () => scopeChanged({ project: "demo", channel_id: "early-channel", type: "claude" });
   const server = net.createServer((socket) => {
-    // Before hello_ok: ignored.
-    socket.write(scopeChanged({ project: "demo", channel_id: "early-channel", type: "claude" }));
-    socket.once("data", () => {
+    // Before hello_ok: ignored. On Windows the server must prove itself first.
+    if (process.platform !== "win32") socket.write(earlyScope());
+    let buffer = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      if (!buffer.endsWith("\n")) return;
+      const incoming = JSON.parse(buffer);
+      buffer = "";
+      if (incoming.type === "server_proof") {
+        socket.write(frame(proofReply(incoming, secret)));
+        socket.write(earlyScope());
+        return;
+      }
       socket.write(frame({ type: "hello_ok", v: 1, scope: { project: "demo", channel_id: "demo-channel", type: "claude" } }));
       socket.write(scopeChanged({ project: "beta", channel_id: "beta-channel", type: "codex" }));
       socket.write(scopeChanged({ project: "demo", channel_id: "", type: "claude" }));
@@ -124,7 +147,7 @@ test("the client adopts scope changes only for its own project, with a channel, 
       socket.write(scopeChanged({ project: "demo", channel_id: "moved-channel", type: "claude" }));
     });
   });
-  await new Promise((resolve) => server.listen(workspace.socketPath, resolve));
+  secret = await listenAsRouter(workspace, server);
   registerTeardownCallback(() => new Promise((resolve) => server.close(resolve)));
   const { RouterClient } = createRequire(import.meta.url)(path.join(workspace.repoDir, "scripts/router/client.js"));
   const client = new RouterClient({ socketPath: workspace.socketPath, project: "demo", key: "demo-key" });
@@ -150,7 +173,8 @@ test("after a registry channel move, a Claude session hears the new channel and 
       { name: "export_message_range", arguments: { start_message_id: "2001" } },
     ];
   });
-  const started = await runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace) });
+  const started = await runScript(workspace, "scripts/start-session.sh",
+    { args: ["demo"], env: await launcherEnv(workspace), timeoutMs: 30000 });
   assert.equal(started.exitCode, 0, started.stderr || started.stdout);
 
   await moveChannel(workspace, router, "demo", "moved-channel");
@@ -188,7 +212,7 @@ test("after a registry channel move, a Codex bridge hears the new channel and it
   fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
   const router = await routerWithWebhooks(workspace, ["demo"]);
   const started = await runScript(workspace, "scripts/start-codex-session.sh",
-    { args: ["demo"], env: routerEnv(workspace), timeoutMs: 30000 });
+    { args: ["demo"], env: await launcherEnv(workspace), timeoutMs: 30000 });
   assert.equal(started.exitCode, 0, started.stderr || started.stdout);
 
   await moveChannel(workspace, router, "demo", "moved-channel");

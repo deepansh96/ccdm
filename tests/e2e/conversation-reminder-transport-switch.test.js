@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { PYTHON } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerEnv, runRouterCli, startRouter } from "./support/router.js";
 import { readState, updateState, writeState } from "./support/state.js";
@@ -59,7 +60,7 @@ async function event(context, type, id, time, fields) {
 }
 
 function sql(context, script) {
-  const result = spawnSync("python3", ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.commit()",
+  const result = spawnSync(PYTHON, ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); db.commit()",
     path.join(context.stateDir, "conversations.sqlite3"), script], { encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr);
 }
@@ -148,7 +149,10 @@ test("switching a pool conversation to the Router carries it to the webhook iden
   assert.notEqual(changed.assignment_generation, "gen-1");
   assert.equal(readRegistry(context).projects.demo.assignment_generation, changed.assignment_generation);
   // Either the change workflow or the running worker deletes it, always as root.
-  assert.deepEqual([...changed.retired_cleanup.completed, ...changed.retired_cleanup.inaccessible], ["pool-reminder"]);
+  // The workflow lists it only when it got there first, and leaves nothing pending.
+  const byWorkflow = [...changed.retired_cleanup.completed, ...changed.retired_cleanup.inaccessible];
+  if (byWorkflow.length) assert.deepEqual(byWorkflow, ["pool-reminder"]);
+  assert.deepEqual(changed.retired_cleanup.pending, []);
   await waitForStatus(context, (current) => current.retired_assignments?.find((row) =>
     row.assignment_generation === "gen-1")?.cleanup.completed.includes("pool-reminder"));
   assert.deepEqual([...new Set(deletes(context).map(String))], [["pool-reminder", `Bot ${ROOT_TOKEN}`]].map(String));
@@ -187,13 +191,28 @@ test("status and preflight name each missing router prerequisite with its fix, a
   };
   await service(context, "enable");
 
-  // No Router and no webhook yet.
-  const missing = [
+  // No Router and no webhook yet. Each fix is a command this OS has: Windows has
+  // no .sh installer, and runs a Node script through node.
+  const missing = process.platform === "win32" ? [
+    "demo: the Router is not reachable; start the Router (scripts/ccdm install-service router, or node scripts/router.js serve)",
+    "demo: the project's webhook is missing; run node scripts/router.js ensure-webhook demo",
+  ] : [
     "demo: the Router is not reachable; start the Router (scripts/install-router-service.sh, or scripts/router.js serve)",
     "demo: the project's webhook is missing; run scripts/router.js ensure-webhook demo",
   ];
-  assert.deepEqual(routerBlockers(await service(context, "status")),
+  const unstarted = await service(context, "status");
+  assert.deepEqual(routerBlockers(unstarted),
     { ready: false, blockers: missing.map((line) => line.slice("demo: ".length)) });
+  // No worker has run yet: both fixes name the installer this OS has, and what it supervises.
+  const [installer, relaunch] = process.platform === "win32"
+    ? ["scripts/ccdm install-service reminders", "start the scheduled task again"]
+    : ["scripts/install-conversation-reminder-service.sh", "relaunch the LaunchAgent"];
+  const unstartedBlockers = unstarted.readiness.projects.demo.blockers;
+  assert.ok(unstartedBlockers.includes(`foreground worker is not running; start \`run\` or rerun ${installer} to ${relaunch}`),
+    unstartedBlockers.join("\n"));
+  assert.ok(unstartedBlockers.some((line) => line.startsWith("history: untracked; ")
+    && line.includes(`then start the worker (\`run\`, or rerun ${installer}) so it records and discovers the channel`)),
+  unstartedBlockers.join("\n"));
   const blocked = await preflight();
   assert.equal(blocked.exitCode, 2);
   assert.equal(blocked.status, "blocked");

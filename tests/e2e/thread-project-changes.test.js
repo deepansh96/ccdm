@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
 import { injectDiscordMessage } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
-import { OWNER_ID, createRouterWorkspace, routerEnv, routerRegistry, routerWithWebhooks, runRouterCli,
+import { PYTHON, platformGate, replaceFile } from "./support/platform.js";
+import { OWNER_ID, createRouterWorkspace, routerRegistry, routerWithWebhooks, runRouterCli,
   waitFor } from "./support/router.js";
-import { readState, updateState } from "./support/state.js";
-import { cleanup } from "./support/teardown.js";
-import { startThreadSupervisor, supervisorStatus } from "./support/thread-supervisor.js";
+import { hostOps, tmuxCalls } from "./support/session-fixture.js";
+import { readState, seedTmuxSession, updateState } from "./support/state.js";
+import { cleanup, registerTeardownCallback } from "./support/teardown.js";
+import { assertSupervisorStops, startThreadHost, startThreadSupervisor, supervisorEnv, supervisorStateDir,
+  supervisorStatus } from "./support/thread-supervisor.js";
 
 test.afterEach(cleanup);
 
@@ -42,8 +46,7 @@ const readRegistry = workspace => JSON.parse(fs.readFileSync(registryFile(worksp
 function editRegistry(workspace, change) {
   const next = readRegistry(workspace);
   change(next);
-  fs.writeFileSync(`${registryFile(workspace)}.edit`, `${JSON.stringify(next, null, 2)}\n`);
-  fs.renameSync(`${registryFile(workspace)}.edit`, registryFile(workspace));
+  replaceFile(registryFile(workspace), `${JSON.stringify(next, null, 2)}\n`);
 }
 
 // An atomic registry replace, as router-channel-move.test.js makes, once the
@@ -132,7 +135,8 @@ test("deregistering a project stops its thread sessions and closes them as dereg
     delete registry.projects.demo;
   });
 
-  const row = await threadRow(workspace, THREAD_ID, current => current.state === "closed");
+  // The row closes in one write and takes its reason in the next, so both are waited for.
+  const row = await threadRow(workspace, THREAD_ID, current => current.state === "closed" && current.close_reason);
   assert.deepEqual([row.state, row.stop_reason, row.close_reason], ["closed", null, "deregistered"]);
   const sibling = await threadRow(workspace, SIBLING_ID, current => current.state === "closed");
   assert.equal(sibling.close_reason, "deregistered");
@@ -167,7 +171,7 @@ test("a channel move while the supervisor was down closes the project's threads 
       name: "idle sibling", ownerId: OWNER_ID, autoArchiveDuration: 10080, event: "create" });
   });
   await threadRow(workspace, SIBLING_ID);
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
 
   await changeRegistry(workspace, router, registry => {
     registry.projects.demo.channel_id = "moved-channel";
@@ -202,13 +206,13 @@ test("a project whose path becomes remote: has its thread sessions stopped and i
 });
 
 async function startChannel(workspace) {
-  const started = await runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace) });
+  const started = await runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: supervisorEnv(workspace) });
   assert.equal(started.exitCode, 0, started.stderr || started.stdout);
   return tmuxSessions(workspace)[CHANNEL_TMUX].pid;
 }
 
 async function stopSession(workspace, ...flags) {
-  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo", ...flags], env: routerEnv(workspace) });
+  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo", ...flags], env: supervisorEnv(workspace) });
   assert.equal(stopped.exitCode, 0, stopped.stderr || stopped.stdout);
   return stopped;
 }
@@ -270,7 +274,7 @@ test("--threads stops only the project's thread sessions as stopped/operator, an
   assert.equal(tmuxSessions(workspace)[CHANNEL_TMUX].pid, channelPid);
   assert.equal(readRegistry(workspace).projects.demo.pid, channelPid);
 
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
   await startThreadSupervisor(workspace);
   await settle(1500);
   for (const threadId of [THREAD_ID, SIBLING_ID]) {
@@ -309,7 +313,7 @@ test("--all still stops the thread sessions when the channel stop fails, and exi
   fs.writeFileSync(path.join(lock, "nonce"), "held-by-test\n");
 
   const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo", "--all"],
-    env: routerEnv(workspace, { CCDM_REGISTRY_LOCK_TIMEOUT_MS: "500" }), timeoutMs: 30000 });
+    env: supervisorEnv(workspace, { CCDM_REGISTRY_LOCK_TIMEOUT_MS: "500" }), timeoutMs: 30000 });
   fs.rmSync(lock, { recursive: true, force: true });
 
   assert.notEqual(stopped.exitCode, 0, stopped.stdout);
@@ -319,13 +323,29 @@ test("--all still stops the thread sessions when the channel stop fails, and exi
   assert.deepEqual([row.state, row.stop_reason], ["stopped", "operator"]);
 });
 
+test("with the supervisor down and a thread store that cannot be read, --threads says so under the command's own name", async () => {
+  const workspace = changesWorkspace();
+  const { supervisor } = await supervised(workspace);
+  await assertSupervisorStops(supervisor);
+  fs.writeFileSync(path.join(supervisorStateDir(workspace), "threads.sqlite3"), "not a database ".repeat(400));
+
+  const stopped = await stopSession(workspace, "--threads");
+
+  // The shim's name on macOS and Linux, the subcommand on Windows, where there is no stop-session.sh to run.
+  const prefix = process.platform === "win32" ? "ccdm stop-session: " : "stop-session.sh: ";
+  const errors = stopped.stderr.split(/\r?\n/).filter(Boolean);
+  assert.ok(errors.length > 0 && errors.every(line => line.startsWith(prefix)), stopped.stderr);
+  assert.ok(errors[0].startsWith(`${prefix}the thread store could not be read: `), stopped.stderr);
+  assert.match(stopped.stdout, /swept 0 thread session\(s\) for 'demo' by key path/);
+});
+
 test("with the supervisor down, --threads still stops the thread sessions by their key paths", async () => {
   const workspace = changesWorkspace();
   const { supervisor } = await supervised(workspace);
   const channelPid = await startChannel(workspace);
   const threadPid = await liveThread(workspace, THREAD_ID);
   const siblingPid = await liveThread(workspace, SIBLING_ID);
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
   assert.ok(alive(threadPid) && alive(siblingPid), "thread sessions outlive the supervisor");
 
   const stopped = await stopSession(workspace, "--threads");
@@ -339,6 +359,70 @@ test("with the supervisor down, --threads still stops the thread sessions by the
     assert.deepEqual([row.state, row.stop_reason], ["stopped", "operator"]);
   }
   assert.ok(alive(channelPid), "the channel session still runs");
+});
+
+// A process this test starts and holds, idling with `args` as its last arguments.
+function spawnWithArgs(args) {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", ...args],
+    { stdio: "ignore", windowsHide: true });
+  const exited = new Promise(resolve => child.once("exit", resolve));
+  registerTeardownCallback(async () => {
+    child.kill("SIGKILL");
+    await exited;
+  });
+  return { child, exited, running: () => child.exitCode === null && child.signalCode === null };
+}
+
+// The sweep and the lifecycle calls it is built from, run in one Python process
+// whose every way to start a program or send a signal is recorded and refused.
+const SWEEP_DRIVER = `import json, os, subprocess, sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, sys.argv[1])
+refused = []
+def no_program(args, *rest, **options):
+    refused.append(["spawn", args if isinstance(args, str) else list(args)])
+    raise OSError("no program may be started here")
+subprocess.Popen = no_program
+def no_signal(pid, signal_number):
+    refused.append(["kill", pid, int(signal_number)])
+    raise OSError("no signal may be sent here")
+os.kill = no_signal
+from pathlib import Path
+from thread_supervisor import lifecycle, operator_stop
+thread_id = sys.argv[4]
+running = lifecycle.session_running(thread_id)
+lifecycle.kill_listeners(lifecycle.key_path(thread_id))
+still = lifecycle.session_running(thread_id)
+stopped = operator_stop.sweep(Path(sys.argv[2]), Path(sys.argv[3]), "demo")
+print(json.dumps({"running": running, "still": still, "stopped": stopped, "refused": refused,
+                  "after": lifecycle.session_running(thread_id)}))`;
+
+test("on Windows, the sweep ends a thread's host session and key-file listener without ps, tmux or a signal", platformGate("win32", "POSIX sweeps with ps, signals and tmux"), async () => {
+  const workspace = changesWorkspace();
+  await startThreadHost(workspace);
+  const keyFile = path.join(workspace.routerStateDir, "keys", `.thread-${THREAD_ID}.key`);
+  const launchDir = path.join(workspace.routerStateDir, "launches", "demo", "threads", THREAD_ID);
+  fs.mkdirSync(path.dirname(keyFile), { recursive: true });
+  fs.mkdirSync(launchDir, { recursive: true });
+  fs.writeFileSync(keyFile, "thread-key\n");
+  // The session's own process, in the host's Job, and a listener that got outside it.
+  const inJob = spawnWithArgs(["--mcp-config", path.join(launchDir, "mcp.json")]);
+  const orphan = spawnWithArgs(["--ccdm-key-file", keyFile]);
+  const sibling = spawnWithArgs(["--ccdm-key-file", path.join(path.dirname(keyFile), `.thread-${SIBLING_ID}.key`)]);
+  seedTmuxSession(THREAD_TMUX, { pid: inJob.child.pid, job: [inJob.child.pid], kind: "thread" },
+    { stateDir: workspace.stateDir });
+
+  const result = JSON.parse(execFileSync(PYTHON, ["-c", SWEEP_DRIVER, path.join(workspace.repoDir, "scripts"),
+    workspace.repoDir, supervisorStateDir(workspace), THREAD_ID],
+  { cwd: workspace.tmpRoot, env: { ...workspace.env, ...supervisorEnv(workspace) }, encoding: "utf8" }));
+
+  assert.deepEqual(result, { running: true, still: true, stopped: [THREAD_ID], refused: [], after: false });
+  await Promise.all([inJob.exited, orphan.exited]);
+  assert.equal(sibling.running(), true, "a sibling thread's listener is not this thread's");
+  assert.equal(fs.existsSync(keyFile), false);
+  assert.deepEqual(hostOps(workspace).filter(call => call.op === "kill").map(call => call.name), [THREAD_TMUX]);
+  assert.deepEqual(tmuxCalls(workspace), []);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions[THREAD_TMUX], undefined);
 });
 
 // Claude keeps a conversation's transcript at

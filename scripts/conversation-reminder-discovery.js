@@ -125,8 +125,13 @@ async function runPass({ service, assignment, rootToken, rootUserId, isClose }) 
   for (;;) {
     const { request } = await service(["discovery-next"]);
     if (!request) return;
-    if (!checked.has(request.channel_id)) checked.set(request.channel_id, await assignment(request.channel_id));
-    const found = checked.get(request.channel_id);
+    // One check per channel and generation in a pass. assignment-changed can
+    // land while a pass is running, and the service then asks for the new
+    // generation in this same pass: an answer remembered for the old one would
+    // refuse that request and hold its scan back for the denied-history wait.
+    const key = `${request.channel_id}\0${request.assignment_generation}`;
+    if (!checked.has(key)) checked.set(key, await assignment(request.channel_id));
+    const found = checked.get(key);
     let result;
     if (!found || found.project !== request.project ||
         found.assignment_generation !== request.assignment_generation) {

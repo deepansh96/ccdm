@@ -4,9 +4,11 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { PYTHON, posixMode } from "./support/platform.js";
 import { createWorkspace, runScript } from "./support/runner.js";
 import { waitForState } from "./support/bridge.js";
 import { routerEnv, startRouter } from "./support/router.js";
+import { startFakeHost } from "./support/session-fixture.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -92,7 +94,7 @@ async function awaitingExchange(workspace, stateDir, fields = {}) {
 // prerequisite and drive every assignment transition through executable surfaces.
 function markReconciled(stateDir) {
   const database = path.join(stateDir, "conversations.sqlite3");
-  const seeded = spawnSync("python3", ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute(\"UPDATE conversations SET reconciliation_status='ready' WHERE project='demo'\"); db.commit()", database], { encoding: "utf8" });
+  const seeded = spawnSync(PYTHON, ["-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute(\"UPDATE conversations SET reconciliation_status='ready' WHERE project='demo'\"); db.commit()", database], { encoding: "utf8" });
   assert.equal(seeded.status, 0, seeded.stderr);
 }
 
@@ -343,7 +345,7 @@ test("the generation contract gives an identical re-registration a new generatio
   // before the registration workflow called the generation contract.
   assert.equal(await event(workspace, context.stateDir, "owner_activity", "queued-old", "2026-09-24T10:30:00Z",
     { actor_id: "owner", source_message_id: "queued-old-message", activity_kind: "message" }), "committed");
-  const before = fs.statSync(path.join(workspace.repoDir, "registry.json")).mode & 0o777;
+  const before = posixMode(path.join(workspace.repoDir, "registry.json"));
 
   const changed = await command(workspace, context.stateDir, "assignment-changed", { args: ["--project", "demo"] });
   assert.equal(changed.status, "changed");
@@ -352,7 +354,7 @@ test("the generation contract gives an identical re-registration a new generatio
   assert.equal(registry.projects.demo.assignment_generation, changed.assignment_generation);
   assert.notEqual(changed.assignment_generation, "generation-1");
   assert.equal(registry.projects.demo.webhook_id, "webhook");
-  assert.equal(fs.statSync(path.join(workspace.repoDir, "registry.json")).mode & 0o777, before);
+  assert.equal(posixMode(path.join(workspace.repoDir, "registry.json")), before);
   assert.doesNotMatch(JSON.stringify(changed), /fixture-root-token/);
 
   assert.equal(await event(workspace, context.stateDir, "turn_completed", "replayed-old", "2026-09-24T10:40:00Z", {
@@ -391,6 +393,10 @@ test("an observed deregistration blocks an identical re-add until a new generati
   assert.equal(blocked.conversations.demo.due_at, null);
   assert.equal(blocked.conversations.demo.last_ack_message_id, null);
   assert.match(blocked.assignment_guidance, /assignment-changed --project demo/);
+  // The guidance names the reminder command as this OS runs it.
+  const remindersCommand = process.platform === "win32" ? "scripts/ccdm reminders" : "scripts/conversation-reminder-service.py";
+  assert.ok(blocked.assignment_guidance.includes(`run ${remindersCommand} assignment-changed --project demo.`),
+    blocked.assignment_guidance);
 
   const changed = await command(workspace, context.stateDir, "assignment-changed", { args: ["--project", "demo"] });
   const renewed = await command(workspace, context.stateDir, "status");
@@ -474,7 +480,7 @@ test("project stop and root restart keep the independent service and closed stat
   const context = await setup(workspace);
   const registry = readRegistry(workspace);
   registry.projects.demo = { ...registry.projects.demo, path: path.join(workspace.tmpDir, "demo"),
-    screen_name: "demo_codex", ws_port: 18342, session_id: "existing-session", pid: null };
+    screen_name: "demo_codex", ws_port: 18742, session_id: "existing-session", pid: null };
   writeRegistry(workspace, registry);
   assert.equal(await event(workspace, context.stateDir, "close_requested", "close-before-stop",
     "2026-09-24T10:00:00Z", { actor_id: "owner", source_message_id: "close-message", command: "/close" }),
@@ -484,10 +490,14 @@ test("project stop and root restart keep the independent service and closed stat
   await waitForStatus(workspace, context.stateDir, current =>
     current.worker_running && current.conversations.demo?.state === "closed");
 
-  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"] });
+  // On Windows the launchers go through the fake ccdm-host.
+  const hostEnv = process.platform === "win32"
+    ? (await startFakeHost(workspace, { env: routerEnv(context.router) })).env : {};
+  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"], env: hostEnv });
   assert.equal(stopped.exitCode, 0, stopped.stderr || stopped.stdout);
   // Root Claude launches as a client of the Router the worker already observes through.
-  const restarted = await runScript(workspace, "restart-root-agent.sh", { env: routerEnv(context.router), timeoutMs: 20000 });
+  const restarted = await runScript(workspace, "restart-root-agent.sh", {
+    env: routerEnv(context.router, hostEnv), timeoutMs: 20000 });
   assert.equal(restarted.exitCode, 0, restarted.stderr || restarted.stdout);
 
   const current = await command(workspace, context.stateDir, "status");

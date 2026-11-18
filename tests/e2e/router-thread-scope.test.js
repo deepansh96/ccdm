@@ -5,6 +5,7 @@ import test from "node:test";
 
 import { OWNER_ID, connectSession, connectThread, createRouterWorkspace, routerRegistry, routerWithWebhooks, runRouterCli,
   seedThreads, waitFor, writeProjectKey, writeThreadKey } from "./support/router.js";
+import { replaceFile } from "./support/platform.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -209,8 +210,7 @@ async function editRegistry(workspace, router, edit) {
   edit(registry);
   const reloads = () => router.stdout.split("registry reloaded").length - 1;
   const before = reloads();
-  fs.writeFileSync(`${file}.edit`, `${JSON.stringify(registry, null, 2)}\n`);
-  fs.renameSync(`${file}.edit`, file);
+  replaceFile(file, `${JSON.stringify(registry, null, 2)}\n`);
   await waitFor(() => reloads() > before, () => `registry reload:\n${router.stdout}`);
 }
 

@@ -5,16 +5,26 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta, timezone
-import fcntl
 import importlib.util
 import json
 import os
 from pathlib import Path
 import sqlite3
-import stat
 import subprocess
+import sys
 import time
 import uuid
+
+sys.dont_write_bytecode = True  # no __pycache__ beside the scripts
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+from ccdmlib.platform import exe, filelock  # noqa: E402
+from ccdmlib.platform.paths import state_root  # noqa: E402
+from ccdmlib.platform.private_fs import fix_hint, is_private  # noqa: E402
+from ccdmlib.platform.services import service_installed  # noqa: E402
+from ccdmlib.platform import commands  # noqa: E402
 
 
 EVENTS_PATH = Path(__file__).with_name("conversation-reminder-events.py")
@@ -109,6 +119,12 @@ def store_path(state_dir: Path) -> Path:
     return state_dir / "conversations.sqlite3"
 
 
+# How long a command waits for another reminder process to let go of the store.
+# A write section ends in one flush to disk: hundredths of a second on macOS and
+# Linux, but up to three seconds measured on a loaded Windows machine.
+STORE_BUSY_SECONDS = 10
+
+
 def pool_bot_id(identity: str) -> str | None:
     """Return the pool bot a `pool:<botId>` identity sends as, if it is one."""
     return identity[len("pool:"):] if identity.startswith("pool:") else None
@@ -149,12 +165,12 @@ def connect(state_dir: Path, create: bool = False) -> sqlite3.Connection | None:
     existed = path.exists()
     if not existed and not create:
         return None
-    if existed and (stat.S_IMODE(path.stat().st_mode) & 0o077):
+    if existed and not is_private(path):
         raise ValueError("conversation store permissions are not private")
     if existed and path.stat().st_size == 0:
         raise ValueError("conversation store schema is unsupported")
     EVENTS.private_directory(state_dir)
-    db = sqlite3.connect(path, timeout=2, isolation_level=None)
+    db = sqlite3.connect(path, timeout=STORE_BUSY_SECONDS, isolation_level=None)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=FULL")
@@ -385,15 +401,26 @@ def clock_now() -> datetime:
     return iso(Path(clock_file).read_text(encoding="utf-8").strip()) if clock_file else datetime.now(timezone.utc)
 
 
+def query_events(path: Path, query: str, parameters: tuple = ()) -> list[sqlite3.Row]:
+    # The writer creates the database file just before its table, so a reader
+    # in that gap has no events yet. Any other database error still surfaces.
+    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as source:
+        source.row_factory = sqlite3.Row
+        try:
+            return source.execute(query, parameters).fetchall()
+        except sqlite3.OperationalError as error:
+            if str(error) != "no such table: events":
+                raise
+            return []
+
+
 def event_rows(state_dir: Path) -> list[sqlite3.Row]:
     path = EVENTS.database_path(state_dir)
     if not path.exists():
         return []
-    if stat.S_IMODE(path.stat().st_mode) & 0o077:
+    if not is_private(path):
         raise ValueError("event database permissions are not private")
-    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as source:
-        source.row_factory = sqlite3.Row
-        return source.execute("SELECT commit_order, event_id, payload_json FROM events ORDER BY commit_order").fetchall()
+    return query_events(path, "SELECT commit_order, event_id, payload_json FROM events ORDER BY commit_order")
 
 
 def usable_assignment(registry: dict, name: str) -> dict | None:
@@ -659,6 +686,11 @@ def sync(project_root: Path, state_dir: Path) -> dict:
     count = 0
     try:
         db.execute("BEGIN IMMEDIATE")
+        # Read again under the store's write lock. assignment-changed issues a
+        # generation in the registry inside its own transaction, so a registry
+        # read while waiting for the lock can be older than the store, and its
+        # old generation would retire the conversation that was just carried over.
+        registry = EVENTS.load_registry(project_root)
         projects = registry.get("projects")
         if not isinstance(projects, dict):
             raise ValueError("registry project assignments are invalid")
@@ -776,7 +808,8 @@ def cleanup_retired_now(project_root: Path, state_dir: Path, name: str) -> dict:
                                     str(Path(__file__).with_name("conversation-reminder-observer.js")),
                                     "--project-root", str(project_root), "--state-dir", str(state_dir),
                                     "--cleanup-retired-once", "--project", name],
-                                   env=env, capture_output=True, text=True, timeout=120)
+                                   env=env, capture_output=True, text=True, timeout=120,
+                                   creationflags=exe.child_console_flags())
         if completed.returncode == 0:
             outcome = json.loads(completed.stdout)
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
@@ -816,13 +849,13 @@ THREAD_PERMISSION_NAMES = {"CreatePublicThreads": "Create Public Threads",
                            "ManageThreads": "Manage Threads", "ViewAuditLog": "View Audit Log"}
 # Granted at the guild, not in a channel.
 GUILD_PERMISSIONS = {"ViewAuditLog"}
-THREAD_SUPERVISOR_PLIST = Path("Library") / "LaunchAgents" / "com.ccdm.thread-supervisor.plist"
 
 
 def threads_enabled(registry: dict, router: dict | None) -> bool:
     """Thread Conversations are enabled once the supervisor is installed, configured, or connected."""
-    return ((Path.home() / THREAD_SUPERVISOR_PLIST).exists() or "thread_session_caps" in registry or
-            bool(((router or {}).get("supervisor") or {}).get("connected")))
+    # The installed check comes last: on Windows it asks Task Scheduler.
+    return ("thread_session_caps" in registry or bool(((router or {}).get("supervisor") or {}).get("connected"))
+            or service_installed("thread-supervisor"))
 
 
 def router_prerequisites(registry: dict) -> dict:
@@ -835,31 +868,35 @@ def router_prerequisites(registry: dict) -> dict:
     try:
         completed = subprocess.run([os.environ.get("CCDM_REMINDER_NODE", "node"),
                                     str(Path(__file__).with_name("router.js")), "status", "--json"],
-                                   capture_output=True, text=True, timeout=45)
+                                   capture_output=True, text=True, timeout=45,
+                                   creationflags=exe.child_console_flags())
         router = json.loads(completed.stdout) if completed.returncode == 0 else None
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         router = None
     reported = {row.get("project"): row for row in (router or {}).get("projects") or [] if isinstance(row, dict)}
-    threads = threads_enabled(registry, router)
+    threads = None  # asked once, and only when a project has a thread permission to report
     result = {}
     for name in names:
         blockers = []
         row = reported.get(name)
         if router is None:
-            blockers.append("the Router is not reachable; start the Router "
-                            "(scripts/install-router-service.sh, or scripts/router.js serve)")
+            blockers.append(f"the Router is not reachable; start the Router ({commands.start_router_hint()})")
         if not projects[name].get("webhook_id") or (row is not None and not row.get("webhook")):
-            blockers.append(f"the project's webhook is missing; run scripts/router.js ensure-webhook {name}")
+            blockers.append("the project's webhook is missing; run "
+                            f"{commands.node_script_ref('router.js')} ensure-webhook {name}")
         if router is not None and row is not None:
             missing = row.get("missing_permissions")
             if missing is None:
                 blockers.append("the Router is not connected to Discord yet; retry once "
-                                "scripts/router.js status shows the gateway ready")
+                                f"{commands.node_script_ref('router.js')} status shows the gateway ready")
             for flag in missing or []:
                 label = ROOT_PERMISSION_NAMES.get(flag, flag)
                 blockers.append(f"root lacks {label} in the project channel; grant root permission {label} in "
                                 f"{projects[name].get('channel_id')}")
-            for flag in (row.get("missing_thread_permissions") or []) if threads and missing is not None else []:
+            missing_in_threads = (row.get("missing_thread_permissions") or []) if missing is not None else []
+            if missing_in_threads and threads is None:
+                threads = threads_enabled(registry, router)
+            for flag in missing_in_threads if threads else []:
                 label = THREAD_PERMISSION_NAMES.get(flag, flag)
                 blockers.append(f"root lacks {label} in the guild; grant root permission {label} in guild "
                                 f"{registry.get('guild_id')}" if flag in GUILD_PERMISSIONS else
@@ -899,9 +936,9 @@ def enablement_checks(project_root: Path, state_dir: Path, prepare: bool = True)
     # re-permissioned only after every other blocker has cleared.
     if prepare and not blockers:
         EVENTS.private_directory(state_dir)
-    private = state_dir.is_dir() and stat.S_IMODE(state_dir.stat().st_mode) & 0o077 == 0
+    private = state_dir.is_dir() and is_private(state_dir)
     if not prepare and state_dir.exists() and not private:
-        blockers.append("the reminder state directory is not private (expected mode 0700)")
+        blockers.append(f"the reminder state directory is not private ({fix_hint(state_dir, 'expected mode 0700')})")
     return {"blockers": blockers, "provider_prerequisites": prerequisites, "owner_configured": owner,
             "root_credentials": "present" if credentials else "missing",
             "state_dir_private": private,
@@ -959,13 +996,13 @@ def readiness_report(project_root: Path, state_dir: Path, db: sqlite3.Connection
             blockers.append("adapter: " + "; ".join(issues))
         if not running:
             blockers.append("foreground worker is not running; start `run` or rerun "
-                            "scripts/install-conversation-reminder-service.sh to relaunch the LaunchAgent")
+                            f"{commands.installer_ref('reminders')} to {commands.relaunch_service()}")
         elif observation != "ready-observe-only":
             blockers.append("observation: " + observation)
         if not conversation:
             blockers.append("history: untracked; no conversation state exists for this project yet. Clear the "
                             "adapter and assignment blockers, then start the worker (`run`, or rerun "
-                            "scripts/install-conversation-reminder-service.sh) so it records and discovers the "
+                            f"{commands.installer_ref('reminders')}) so it records and discovers the "
                             "channel; after a registration change run assignment-changed --project " + name)
         elif history != "ready":
             reason = (conversation.get("discovery") or {}).get("reason")
@@ -1004,15 +1041,14 @@ def status(state_dir: Path, project_root: Path | None = None) -> dict:
     running = False
     if lock_path.exists():
         with lock_path.open("r") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                fcntl.flock(lock, fcntl.LOCK_UN)
-            except BlockingIOError:
+            if filelock.try_lock(lock):
+                filelock.unlock(lock)
+            else:
                 running = True
     observer_channels = {}
     health_path = state_dir / "observer-health.json"
     if running and health_path.exists():
-        if stat.S_IMODE(health_path.stat().st_mode) & 0o077:
+        if not is_private(health_path):
             raise ValueError("observer health permissions are not private")
         health = json.loads(health_path.read_text(encoding="utf-8"))
         allowed = {"ready-observe-only", "blocked-assignment", "blocked-adapter-capability",
@@ -1096,7 +1132,7 @@ def status(state_dir: Path, project_root: Path | None = None) -> dict:
                 "conversations": conversations, "unresolved_intents": unresolved,
                 "pending_actions": pending, "retired_assignments": retired,
                 "assignment_guidance": ("Blocked projects reuse a retired assignment generation. After confirming "
-                                        "the registration, run scripts/conversation-reminder-service.py "
+                                        f"the registration, run {commands.reminders_ref()} "
                                         "assignment-changed --project " + ", ".join(sorted(blocked)) + "."
                                         if blocked else None),
                 "recovery_guidance": ("Run recover after restoring root's channel access. Recovery identifies a lost "
@@ -1200,7 +1236,7 @@ def supervisor_closed_threads(project: str) -> set[str]:
 
     Without a readable store nothing is known closed."""
     override = os.environ.get("CCDM_THREAD_SUPERVISOR_STATE_DIR")
-    state_dir = Path(override).expanduser() if override else Path.home() / ".local" / "state" / "ccdm" / "thread-supervisor"
+    state_dir = Path(override).expanduser() if override else state_root() / "thread-supervisor"
     path = state_dir / "threads.sqlite3"
     if not path.is_file():
         return set()
@@ -1339,10 +1375,8 @@ def rows_matching(state_dir: Path, project: str, generation: str, condition: str
     path = EVENTS.database_path(state_dir)
     if not path.exists():
         return []
-    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as source:
-        source.row_factory = sqlite3.Row
-        return source.execute(f"""SELECT interaction_id,source_message_id,event_time FROM events
-            WHERE project=? AND assignment_generation=? AND {condition}""", (project, generation)).fetchall()
+    return query_events(path, f"""SELECT interaction_id,source_message_id,event_time FROM events
+        WHERE project=? AND assignment_generation=? AND {condition}""", (project, generation))
 
 
 def pending_actions(state_dir: Path) -> dict:
@@ -1696,6 +1730,37 @@ def suspend_interrupted_sends(state_dir: Path) -> None:
         db.close()
 
 
+OBSERVER_STOP_SECONDS = 15
+
+
+def start_observer(observer_args: list, observer_env: dict) -> subprocess.Popen:
+    """Start the Node observer holding its stdin, which is how it is asked to stop."""
+    return subprocess.Popen([*observer_args, "--stop-on-stdin-end"], env=observer_env, stdin=subprocess.PIPE,
+                            creationflags=exe.child_console_flags())
+
+
+def stop_observer(observer: subprocess.Popen, wait_seconds: float = OBSERVER_STOP_SECONDS) -> int:
+    """Ask the observer to stop by closing its stdin; force it only if it stays.
+
+    The observer finishes an in-flight request (bounded by its 10-second Discord
+    timeout) before exiting. Closing stdin is the one request that works on
+    every OS: ``terminate()`` is a hard kill on Windows."""
+    try:
+        if observer.stdin is not None:
+            observer.stdin.close()
+    except OSError:
+        pass
+    try:
+        return observer.wait(timeout=wait_seconds)
+    except subprocess.TimeoutExpired:
+        observer.terminate()
+    try:
+        return observer.wait(timeout=wait_seconds)
+    except subprocess.TimeoutExpired:
+        observer.kill()
+        return observer.wait()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("sync", "status", "preflight", "disable", "enable", "run", "recover",
@@ -1786,9 +1851,7 @@ def main() -> int:
             EVENTS.private_directory(args.state_dir)
             with lock_path.open("a+") as lock:
                 os.chmod(lock_path, 0o600)
-                try:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
+                if not filelock.try_lock(lock):
                     raise ValueError("conversation observer is already running")
                 suspend_interrupted_sends(args.state_dir)
                 observer_env = {**os.environ, "CCDM_REMINDER_PROJECT_ROOT": str(args.project_root),
@@ -1800,7 +1863,8 @@ def main() -> int:
                     sync(args.project_root, args.state_dir)
                     try:
                         completed = subprocess.run([*observer_args, "--recover-once"], env=observer_env,
-                                                   capture_output=True, text=True, timeout=30)
+                                                   capture_output=True, text=True, timeout=30,
+                                                   creationflags=exe.child_console_flags())
                     except subprocess.TimeoutExpired as error:
                         raise ValueError("recovery timed out; retry after checking Discord access") from error
                     if completed.returncode:
@@ -1809,7 +1873,7 @@ def main() -> int:
                     result["readiness"] = status(args.state_dir, args.project_root)["readiness"]
                     print(json.dumps(result, sort_keys=True))
                     return 0
-                observer = subprocess.Popen(observer_args, env=observer_env)
+                observer = start_observer(observer_args, observer_env)
                 try:
                     while not is_disabled(args.state_dir):
                         sync(args.project_root, args.state_dir)
@@ -1817,14 +1881,7 @@ def main() -> int:
                             raise ValueError("conversation observer stopped")
                         time.sleep(0.5)
                 finally:
-                    # The observer finishes an in-flight request (bounded by its
-                    # 10-second Discord timeout) before exiting.
-                    observer.terminate()
-                    try:
-                        observer.wait(timeout=15)
-                    except subprocess.TimeoutExpired:
-                        observer.kill()
-                        observer.wait()
+                    stop_observer(observer)
             result = status(args.state_dir, args.project_root)
         print(json.dumps(result, sort_keys=True))
         return 0

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
@@ -8,7 +9,8 @@ import { injectDiscordMessage, startFakeCodexServer } from "./support/bridge.js"
 import { runScript } from "./support/runner.js";
 import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerRegistry, routerWithWebhooks, waitFor } from "./support/router.js";
 import { readState, updateState } from "./support/state.js";
-import { cleanup } from "./support/teardown.js";
+import { PYTHON } from "./support/platform.js";
+import { cleanup, workspaceOwnsPid } from "./support/teardown.js";
 import { startThreadSupervisor, supervisorEnv, supervisorStateDir, supervisorStatus,
   waitForThreadIdle } from "./support/thread-supervisor.js";
 
@@ -231,13 +233,29 @@ test("a /restart's bootstrap turn, with no input since the last end, changes no 
   assert.equal((await threadRow(workspace)).whose_turn, "owner");
 });
 
+// Ends every process of the thread's session at once, as a crash does. POSIX signals
+// the session's process group. Windows has none, so each process in the session's
+// Job is ended, and only one this workspace started.
+function killSession(workspace) {
+  const session = readState(workspace.stateDir).fixtures.tmux.sessions[THREAD_TMUX];
+  if (process.platform !== "win32") return process.kill(-session.pid, "SIGKILL");
+  for (const pid of session.job ?? [session.pid]) {
+    if (!workspaceOwnsPid(pid, workspace.tmpRoot)) continue;
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch (error) {
+      // Ending one process of the session can end another before its own turn comes.
+      if (error.code !== "ESRCH") throw error;
+    }
+  }
+}
+
 test("a session that crashes mid-turn turns its ⏳ into ⚠️", async () => {
   const workspace = threadWorkspace();
   await supervised(workspace);
   await busyThread(workspace);
 
-  const { pid } = readState(workspace.stateDir).fixtures.tmux.sessions[THREAD_TMUX];
-  process.kill(-pid, "SIGKILL");
+  killSession(workspace);
 
   await threadRow(workspace, row => row.state === "stopped" && row.stop_reason === "crashed");
   await shows(workspace, ["boot-message-1 ✅", "busy-message-1 ⚠️"]);
@@ -323,7 +341,9 @@ test("a deleted message counts as done: its mark is never retried", async () => 
 function reminderClosed(workspace) {
   const files = dir => (fs.existsSync(dir) ? fs.readdirSync(dir, { withFileTypes: true }) : []).flatMap(entry =>
     entry.isDirectory() ? files(path.join(dir, entry.name)) : [path.join(dir, entry.name)]);
-  return files(path.join(workspace.homeDir, ".local", "state", "ccdm", "conversation-reminders")).some(file => {
+  // On the fake ccdm-host (always on Windows) the state root is the host's own.
+  const roots = [path.join(workspace.homeDir, ".local", "state", "ccdm"), path.join(workspace.tmpRoot, "fake-host-state")];
+  return roots.flatMap(root => files(path.join(root, "conversation-reminders"))).some(file => {
     const text = fs.readFileSync(file).toString("latin1");
     return text.includes("conversation_closed") && text.includes(THREAD_ID);
   });
@@ -362,7 +382,7 @@ test("a Codex thread's completed turn turns its ⏳ into ✅", async () => {
     codexHome: path.join(workspace.homeDir, ".codex"), channelId: THREAD_ID, threadId: CODEX_THREAD_UUID,
     bootstrapPlan: { mcpReplyText: "on it" } });
   await supervised(workspace, { CCDM_THREAD_WS_PORT_BASE: "29620" });
-  execFileSync("python3", ["-c", `import sqlite3, sys
+  execFileSync(PYTHON, ["-c", `import sqlite3, sys
 db = sqlite3.connect(sys.argv[1], timeout=5)
 db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
   first_message, requester_id, requester_kind, status, thread_id, created_at)
@@ -386,7 +406,7 @@ db.commit()`, path.join(supervisorStateDir(workspace), "threads.sqlite3"), OWNER
 // The activity writer on its own: the hook ignores a `/` command typed into the
 // pane (no Stop may follow it), and concurrent writers never lose each other's fields.
 test("the activity hook skips / commands, and concurrent activity writers keep every field", async () => {
-  const dir = fs.mkdtempSync(path.join(fs.realpathSync(process.env.TMPDIR || "/tmp"), "ccdm-activity-"));
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "ccdm-activity-"));
   try {
     const file = path.join(dir, "activity.json");
     const script = path.resolve("scripts/thread-activity.js");

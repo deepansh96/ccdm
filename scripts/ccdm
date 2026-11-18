@@ -1,0 +1,74 @@
+#!/bin/sh
+# The `ccdm` command: finds Python and runs ccdm.py beside this file.
+# PowerShell and cmd run ccdm.cmd instead, and Python is found by the same rules
+# as pythonCommand() in scripts/platform/tools.js. Keep the three in step.
+
+# Otherwise Git Bash rewrites arguments such as /compact into Windows paths.
+MSYS_NO_PATHCONV=1
+PYTHONUTF8=1
+export MSYS_NO_PATHCONV PYTHONUTF8
+
+# Set by bash, which is what sh is in Git Bash; empty under dash.
+case "${OSTYPE:-}" in
+  msys*|cygwin*) windows=1 ;;
+  *) windows= ;;
+esac
+
+# On Windows a .cmd or .bat needs a shell, and the Store stub is not Python.
+unusable() {
+  case "$1" in
+    *.[Cc][Mm][Dd]|*.[Bb][Aa][Tt]|*[\\/][Ww][Ii][Nn][Dd][Oo][Ww][Ss][Aa][Pp][Pp][Ss][\\/]*) return 0 ;;
+  esac
+  return 1
+}
+
+use_override() {
+  [ -n "$2" ] || return 1
+  if [ -n "$windows" ] && unusable "$2"; then
+    echo "ccdm: ignoring $1=$2: it is a .cmd, a .bat or the Microsoft Store stub, not Python" >&2
+    return 1
+  fi
+  python=$2
+}
+
+# Only absolute PATH entries, so the choice cannot depend on the current directory.
+# `py` only finds the interpreter, which then runs without it.
+find_on_windows() {
+  name=$1
+  set -f
+  saved_ifs=$IFS
+  IFS=:
+  for directory in $PATH; do
+    IFS=$saved_ifs
+    case "$directory" in /*) ;; *) continue ;; esac
+    candidate="$directory/$name.exe"
+    if unusable "$candidate" || [ ! -e "$candidate" ]; then continue; fi
+    if [ "$name" = py ]; then
+      candidate=$("$candidate" -3 -c 'import sys; sys.stdout.write(sys.executable)' 2>/dev/null) || continue
+      if [ -z "$candidate" ] || unusable "$candidate"; then continue; fi
+    fi
+    python=$candidate
+    return 0
+  done
+  IFS=$saved_ifs
+  return 1
+}
+
+find_python() {
+  use_override CCDM_PYTHON "${CCDM_PYTHON:-}" && return 0
+  use_override CCDM_REMINDER_PYTHON "${CCDM_REMINDER_PYTHON:-}" && return 0
+  if [ -n "$windows" ]; then
+    find_on_windows py || find_on_windows python
+    return
+  fi
+  command -v python3 >/dev/null 2>&1 && python=python3
+}
+
+if ! find_python; then
+  echo "ccdm: No usable Python was found. Install Python, or set CCDM_PYTHON to its path." >&2
+  exit 127
+fi
+
+# With path conversion off, Windows Python cannot open a /c/... path, so `pwd -W`.
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && if [ -n "$windows" ]; then pwd -W; else pwd; fi) || exit 1
+exec "$python" "$here/ccdm.py" "$@"

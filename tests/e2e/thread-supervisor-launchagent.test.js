@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import test from "node:test";
+import nodeTest from "node:test";
 
+import { PYTHON, assertPrivate, suiteTest } from "./support/platform.js";
 import { createRouterWorkspace, routerWithWebhooks, runRouterCli } from "./support/router.js";
 import { runScript } from "./support/runner.js";
 import { readState, updateState } from "./support/state.js";
@@ -11,6 +12,8 @@ import { cleanup } from "./support/teardown.js";
 import {
   startThreadSupervisor, supervisorCli, supervisorEnv, supervisorStateDir, supervisorStatus,
 } from "./support/thread-supervisor.js";
+
+const test = suiteTest(nodeTest, import.meta.url);
 
 test.afterEach(cleanup);
 
@@ -186,7 +189,7 @@ const operations = workspace =>
   readState(workspace.stateDir).fixtures.launchctl.invocations.map(({ operation }) => operation);
 
 function renderedAgent(workspace) {
-  const parsed = spawnSync("python3", ["-c",
+  const parsed = spawnSync(PYTHON, ["-c",
     "import json,plistlib,sys; print(json.dumps(plistlib.load(open(sys.argv[1],'rb'))))", plistPath(workspace)],
   { encoding: "utf8" });
   assert.equal(parsed.status, 0, parsed.stderr);
@@ -256,9 +259,9 @@ test("installer renders a secret-free LaunchAgent for the supervised worker and 
   for (const text of [expected, result.stdout, result.stderr]) {
     assert.doesNotMatch(text, /root-bot-token|pool-bot-token|DISCORD_BOT_TOKEN|\.key\b/);
   }
-  assert.equal(fs.statSync(stateDir).mode & 0o777, 0o700);
-  assert.equal(fs.statSync(path.join(stateDir, "service.log")).mode & 0o777, 0o600);
-  assert.equal(fs.statSync(path.join(stateDir, "service.err")).mode & 0o777, 0o600);
+  assertPrivate(stateDir);
+  assertPrivate(path.join(stateDir, "service.log"));
+  assertPrivate(path.join(stateDir, "service.err"));
   assert.equal(fs.existsSync(path.join(stateDir, "threads.sqlite3")), false);
 
   // What launchd would run connects the worker to the Router.

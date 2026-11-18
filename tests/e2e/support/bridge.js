@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { WebSocketServer } from "ws";
 
 import { createWorkspace, scaledTimeout } from "./runner.js";
-import { readState, recordCommandInvocation, updateState } from "./state.js";
+import { readState, recordCommandInvocation, recordState, updateState } from "./state.js";
 import { registerTeardownCallback } from "./teardown.js";
 
 const overlayRoots = new WeakMap();
@@ -21,6 +22,11 @@ function writeOverlay(workspace) {
   return overlayRoot;
 }
 
+// NODE_OPTIONS splits on spaces, and a backslash escapes inside its quotes.
+function nodeOptionPath(file) {
+  return /\s/.test(file) ? `"${file.replaceAll("\\", "/")}"` : file;
+}
+
 export function bridgeChildEnv(workspace, extraEnv = {}) {
   const overlayRoot = overlayRoots.get(workspace) ?? writeOverlay(workspace);
   overlayRoots.set(workspace, overlayRoot);
@@ -28,10 +34,18 @@ export function bridgeChildEnv(workspace, extraEnv = {}) {
   return {
     ...workspace.env,
     CCDM_TEST_ACCELERATE_TYPING: "1",
-    NODE_OPTIONS: `--require ${path.join(workspace.repoDir, "tests/e2e/support/preload.cjs")}`,
+    NODE_OPTIONS: `--require ${nodeOptionPath(path.join(workspace.repoDir, "tests/e2e/support/preload.cjs"))}`,
     NODE_PATH: nodePath,
     ...extraEnv,
   };
+}
+
+// A client's way to the Router: the socket path on POSIX. On Windows a resolver
+// for RouterClient, since every Router start publishes a new pipe name and secret.
+function routerSocket(routerStateDir) {
+  if (process.platform !== "win32") return path.join(routerStateDir, "router.sock");
+  const { ipcEndpoint, readIpcSecret } = createRequire(import.meta.url)("../../../scripts/platform/ipc.js");
+  return () => ({ path: ipcEndpoint(routerStateDir, "router"), secret: readIpcSecret(routerStateDir, "router") });
 }
 
 // The Router's private state lives inside the Test Workspace; a short path
@@ -39,7 +53,7 @@ export function bridgeChildEnv(workspace, extraEnv = {}) {
 export function createBridgeWorkspace(options = {}) {
   const base = createWorkspace(options);
   const routerStateDir = path.join(base.tmpRoot, "router");
-  const workspace = Object.freeze({ ...base, routerStateDir, socketPath: path.join(routerStateDir, "router.sock") });
+  const workspace = Object.freeze({ ...base, routerStateDir, socketPath: routerSocket(routerStateDir) });
   overlayRoots.set(workspace, writeOverlay(workspace));
   return workspace;
 }
@@ -110,6 +124,7 @@ export function runPreloadProbe(workspace, code, extraEnv = {}) {
     detached: true,
     env,
     stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
   });
   const running = collectProcess(
     child,
@@ -120,7 +135,8 @@ export function runPreloadProbe(workspace, code, extraEnv = {}) {
 }
 
 function recordCodexEvent(workspace, event) {
-  updateState(workspace.stateDir, (state) => {
+  // An MCP tool child that ends after teardown reports here.
+  recordState(workspace.stateDir, (state) => {
     state.fixtures.codex.protocolEvents.push({ at: new Date().toISOString(), ...event });
   });
 }
@@ -139,7 +155,7 @@ function markCodexServer(workspace, port, values) {
 // the Test Workspace's.
 async function callRegisteredMcpTool(workspace, config, name, args) {
   const command = config.command === "node" ? process.execPath : config.command;
-  const child = spawn(command, config.args ?? [], { env: bridgeChildEnv(workspace, config.env ?? {}), stdio: ["pipe", "pipe", "pipe"] });
+  const child = spawn(command, config.args ?? [], { env: bridgeChildEnv(workspace, config.env ?? {}), stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
   let stderr = "";
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => {
@@ -498,19 +514,24 @@ export async function startFakeCodexServer(workspace, options = {}) {
           }
           break;
         }
-        case "thread/compact/start":
+        case "thread/compact/start": {
+          const completeCompaction = () => {
+            const threadId = message.params?.threadId ?? options.threadId ?? "thread-1";
+            const turnId = options.compactTurnId ?? "compact-turn";
+            notify("turn/started", { threadId, turn: { id: turnId } });
+            notify("thread/compacted", { threadId, turnId });
+            notify("item/completed", { threadId, turnId, item: { type: "contextCompaction" } });
+            notify("turn/completed", { threadId, turn: { id: turnId } });
+          };
+          // `compactComplete: "before-reply"` sends the completion ahead of the
+          // answer. A client that reads the answer and a completion right behind
+          // it in one go runs the completion's handler before whatever awaited
+          // the answer; this is that case made certain.
+          if (options.compactComplete === "before-reply") completeCompaction();
           reply({});
-          if (options.compactComplete) {
-            setTimeout(() => {
-              const threadId = message.params?.threadId ?? options.threadId ?? "thread-1";
-              const turnId = options.compactTurnId ?? "compact-turn";
-              notify("turn/started", { threadId, turn: { id: turnId } });
-              notify("thread/compacted", { threadId, turnId });
-              notify("item/completed", { threadId, turnId, item: { type: "contextCompaction" } });
-              notify("turn/completed", { threadId, turn: { id: turnId } });
-            }, 5);
-          }
+          if (options.compactComplete === true) setTimeout(completeCompaction, 5);
           break;
+        }
         case "thread/archive":
           reply({});
           break;
@@ -538,6 +559,10 @@ export async function startFakeCodexServer(workspace, options = {}) {
       const release = pendingTurnReleases.get(turnId);
       if (!release) throw new Error(`No pending fake turn release for ${turnId}`);
       release();
+    },
+    // Held turns not yet released, or released but not yet completed.
+    pendingReleases() {
+      return [...pendingTurnReleases.keys()];
     },
     async close() {
       await new Promise((resolve) => server.close(resolve));
@@ -592,6 +617,41 @@ export function injectDiscordReaction(workspace, reaction = {}) {
       },
     });
   });
+}
+
+// A bridge's output so far: what a bridge the test started has printed, or the
+// logs of every bridge a launcher started in the Test Workspace.
+function bridgeOutput(source) {
+  if (typeof source.stdout === "string") return source.stdout;
+  return fs.readdirSync(source.stateDir).filter((name) => /^codex-bridge-\d+\.log$/.test(name)).sort()
+    .map((name) => fs.readFileSync(path.join(source.stateDir, name), "utf8")).join("");
+}
+
+// Waits until the bridge has finished `count` turns, counting its startup
+// bootstrap turn. `source` is a bridge from `startBridge`, or the Test
+// Workspace of a bridge launched by start-codex-session.sh.
+//
+// A reply is visible in Discord before its turn has ended, and the bridge
+// steers a message or reaction that arrives during a turn into that turn. It
+// logs a turn's end only once it is idle, so what a test sends after this wait
+// starts a turn of its own.
+//
+// `codex`, when given, is the fake app-server the bridge talks to: a timeout then
+// also says what that server received and which held turns it still waits to
+// release, beside the bridge's stderr, where it reports a failed step.
+export async function waitForFinishedTurns(source, count, timeoutMs = 10000, codex = null) {
+  const finished = () => (bridgeOutput(source).match(/\[turn\] Finished /g) ?? []).length;
+  const deadline = Date.now() + scaledTimeout(timeoutMs);
+  while (finished() < count) {
+    if (Date.now() > deadline) {
+      const received = codex ? `\nfake app-server received: ${JSON.stringify(codex.clientMessages.map((message) =>
+        message.method ? `${message.method}${message.params?.keyPath ? ` ${message.params.keyPath}` : ""}` : `answer to ${message.id}`))}`
+        + `\nturns it still holds: ${JSON.stringify(codex.pendingReleases())}` : "";
+      throw new Error(`Timed out waiting for ${count} finished turn(s), saw ${finished()}; bridge output:\n${bridgeOutput(source)}`
+        + `${typeof source.stderr === "string" ? `\nbridge stderr:\n${source.stderr}` : ""}${received}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
 }
 
 export async function waitForState(workspace, predicate, timeoutMs = 5000) {

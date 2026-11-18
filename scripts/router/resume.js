@@ -16,13 +16,15 @@ const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { expandHome, samePath } = require("../platform/paths.js");
+const { pythonInvocation } = require("../platform/tools.js");
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const BRIDGE_ORIGINATOR = "codex-discord-bridge";
 // A rollout's first line (session metadata with base instructions) is read up to this size.
 const FIRST_LINE_LIMIT = 4 * 1024 * 1024;
 
-const expandHome = value => (value === "~" || value.startsWith("~/") ? path.join(os.homedir(), value.slice(1)) : value);
+const matchesAny = (dirs, dir) => dirs.some(candidate => samePath(candidate, dir));
 
 function sameDirectories(dir) {
   const dirs = [path.resolve(dir)];
@@ -55,7 +57,7 @@ function liveClaudeSession(home, entry, projectDir) {
   if (!Number.isInteger(pid) || pid <= 0 || !isAlive(pid)) return null;
   try {
     const session = JSON.parse(fs.readFileSync(path.join(home, "sessions", `${pid}.json`), "utf8"));
-    if (session.cwd && !sameDirectories(projectDir).includes(path.resolve(session.cwd))) return null;
+    if (session.cwd && !matchesAny(sameDirectories(projectDir), session.cwd)) return null;
     return session.sessionId || session.session_id || null;
   } catch {
     return null;
@@ -120,7 +122,7 @@ function rollouts(home) {
 
 function codexHome(project, registryFile) {
   const resolver = path.join(__dirname, "..", "resolve-codex-home.py");
-  const result = spawnSync("python3", [resolver, registryFile, project], { encoding: "utf8", env: process.env });
+  const result = spawnSync(...pythonInvocation([resolver, registryFile, project], { encoding: "utf8" }));
   if (result.status !== 0) {
     const reason = (result.stderr || result.stdout || "").trim().split("\n").filter(Boolean).at(-1);
     throw new Error(`the project's Codex home did not resolve${reason ? `: ${reason}` : ""}`);
@@ -146,7 +148,7 @@ function resolveCodex(project, entry, registryFile) {
   // A rollout names only its directory, so a directory another Codex thread
   // source also uses (another Codex project, or root's bridge in the CCDM
   // checkout) cannot say whose thread is newest.
-  const overlaps = dir => sameDirectories(dir).some(candidate => dirs.includes(candidate));
+  const overlaps = dir => sameDirectories(dir).some(candidate => matchesAny(dirs, candidate));
   if (overlaps(path.dirname(path.resolve(registryFile)))) {
     return { skip: "no recorded Codex thread id, and the project directory is the CCDM checkout, where root's bridge threads also run" };
   }
@@ -168,7 +170,7 @@ function resolveCodex(project, entry, registryFile) {
     const payload = meta?.type === "session_meta" ? meta.payload : null;
     // Subagent threads carry an object `source`; only the bridge's own thread counts.
     if (!payload || payload.originator !== BRIDGE_ORIGINATOR || typeof payload.source !== "string") continue;
-    if (!payload.cwd || !dirs.includes(path.resolve(payload.cwd))) continue;
+    if (!payload.cwd || !matchesAny(dirs, payload.cwd)) continue;
     const id = String(payload.id || "");
     if (UUID.test(id) && file.endsWith(`-${id}.jsonl`)) {
       return { id, source: `newest ${BRIDGE_ORIGINATOR} rollout for the project directory in ${home}` };

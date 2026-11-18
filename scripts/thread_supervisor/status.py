@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 from pathlib import Path
+
+from ccdmlib.platform import filelock
 
 from . import capacity, registry, store
 from .worker import health_path, lock_path
@@ -15,11 +16,9 @@ def running(state_dir: Path) -> bool:
     if not path.exists():
         return False
     with path.open("r") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        if not filelock.try_lock(lock):
             return True
-        fcntl.flock(lock, fcntl.LOCK_UN)
+        filelock.unlock(lock)
     return False
 
 

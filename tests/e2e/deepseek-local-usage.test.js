@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
+import { PYTHON } from "./support/platform.js";
 
 const repoDir = path.resolve(".");
 const script = path.join(repoDir, "scripts", "deepseek-local-usage.py");
@@ -102,7 +103,7 @@ function runCollector(homes, now = NOW, extraSetup = []) {
     "result = module.collect_month_usage([Path(home) for home in payload['homes']], now)",
     "print(json.dumps(result))",
   ].join("\n");
-  const run = spawnSync("python3", ["-c", probe], {
+  const run = spawnSync(PYTHON, ["-c", probe], {
     cwd: repoDir,
     input: JSON.stringify({ homes, now }),
     encoding: "utf8",
@@ -941,7 +942,7 @@ test("collector charges a discarded oversized line against the file byte budget"
 
   // The discarded remainder of the oversized line must be charged, not just the
   // yielded prefix, so the scan stops at the file budget before the valid turn.
-  const scan = spawnSync("python3", ["-c", [
+  const scan = spawnSync(PYTHON, ["-c", [
     "import importlib.util, json",
     `spec = importlib.util.spec_from_file_location("deepseek_local_usage", ${JSON.stringify(script)})`,
     "module = importlib.util.module_from_spec(spec)",

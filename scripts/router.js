@@ -12,9 +12,11 @@
 //   scripts/router.js probe <project>         post a connection notice through the project's webhook
 //   scripts/router.js migrate-root-config     copy root channels and users from root access.json
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
+const { stateRoot } = require("./platform/paths.js");
+const { onShutdown, processAlive } = require("./platform/process.js");
+const { serviceInstalled } = require("./platform/services.js");
 const { createAttachmentCache } = require("./router/attachments.js");
 const { RouterClient } = require("./router/client.js");
 const { discordRequest } = require("./router/discord-rest.js");
@@ -32,7 +34,6 @@ const { deleteWebhook, ensureWebhook } = require("./router/webhooks.js");
 const OFFLINE_EMOJI = "💤";
 // Thread bits granted at the guild rather than in a project channel: optional.
 const GUILD_THREAD_PERMISSIONS = ["ViewAuditLog"];
-const THREAD_SUPERVISOR_PLIST = path.join("Library", "LaunchAgents", "com.ccdm.thread-supervisor.plist");
 
 // How long `router status` waits for the status op.
 const STATUS_TIMEOUT_MS = 30000;
@@ -195,8 +196,8 @@ async function serve() {
     client.destroy();
     process.exit(0);
   };
-  process.on("SIGTERM", stop);
-  process.on("SIGINT", stop);
+  // POSIX keeps exactly these two: launchd relaunches a Router that dies by any other signal.
+  onShutdown(stop, process.platform === "win32" ? {} : { signals: ["SIGTERM", "SIGINT"] });
 
   await client.login(token);
   await ready;
@@ -204,6 +205,24 @@ async function serve() {
   gateway.state = "ready";
   markGatewayReady();
   log(`router ready: ${table.projects.size} router project(s), socket ${socketPath()}`);
+}
+
+// What the service host last wrote; on Windows there is no launchctl to ask.
+function reportServiceState() {
+  let recorded;
+  try {
+    recorded = JSON.parse(fs.readFileSync(path.join(stateRoot(), "services", "router.state.json"), "utf8"));
+  } catch {
+    return;
+  }
+  const alive = processAlive(recorded.host_pid, recorded.host_started_at ?? null);
+  if (recorded.state !== "disabled" && !alive) {
+    console.error(`service: not running (last state ${recorded.state})`);
+    return;
+  }
+  const next = Date.parse(recorded.next_start_at ?? "");
+  const wait = Number.isNaN(next) ? "" : ` (next start in ${Math.max(0, Math.ceil((next - Date.now()) / 1000))}s)`;
+  console.error(`service: ${recorded.state}${wait}`);
 }
 
 async function status(json = false) {
@@ -217,6 +236,7 @@ async function status(json = false) {
     result = await client.request("status");
   } catch (error) {
     console.error(`router unreachable at ${socketPath()}: ${error.message}`);
+    if (process.platform === "win32") reportServiceState();
     process.exitCode = 1;
     return;
   } finally {
@@ -270,7 +290,7 @@ async function status(json = false) {
 
 // Thread Conversations are enabled once the supervisor is installed, configured, or connected.
 function threadsEnabled(result) {
-  if (result.supervisor?.connected || fs.existsSync(path.join(os.homedir(), THREAD_SUPERVISOR_PLIST))) return true;
+  if (result.supervisor?.connected || serviceInstalled("thread-supervisor")) return true;
   try {
     return Object.hasOwn(JSON.parse(fs.readFileSync(registryPath(), "utf8")), "thread_session_caps");
   } catch {

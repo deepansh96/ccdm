@@ -2,7 +2,7 @@
 
 An owner or guest message in a registered or stopped thread, or an owner
 message in a closed one, gets 👀, sets the row `booting`, and launches
-start-thread-session.sh; a thread with a provider conversation resumes it
+the thread launcher; a thread with a provider conversation resumes it
 with `--resume`.
 Every owner or guest message the Router hands the supervisor while the thread
 boots is buffered. On `thread_session_live` the bootstrap, holding the
@@ -17,6 +17,8 @@ through its provider's session cap first; a queued thread buffers its
 messages until the queue starts it. A live session the Router loses
 (`thread_session_revoked`, other than `replaced`) is `stopped/crashed`, so the
 next eligible message resumes it.
+On the ccdm-host backend the worker's first launch waits, up to 90 seconds,
+for ccdm-host to answer: at logon the worker can be up before the host is.
 """
 
 from __future__ import annotations
@@ -27,9 +29,12 @@ import json
 import os
 from pathlib import Path
 import re
-import subprocess
 import sys
 import threading
+import time
+
+from ccdmlib.cli import start_thread_session
+from ccdmlib.platform import session_host
 
 from . import capacity, lifecycle, ports, registry, store, turns
 from .clock import now
@@ -42,9 +47,14 @@ DRIVERS = ("owner", "guest")
 # Thread commands are the supervisor's or the session's, never a boot trigger.
 COMMAND = re.compile(r"^/(?:close|config|model|restart|clear|compact|pause|unpause)(?:\s|$)")
 DEFAULT_BOOT_TIMEOUT_SECONDS = 120
-LAUNCHER = Path(__file__).resolve().parent.parent / "start-thread-session.sh"
 NOTICE_LIMIT = 300
+HOST_WAIT_SECONDS = 90
+HOST_POLL_SECONDS = 1.0
+# For tests only: divides the wait for ccdm-host and its poll interval.
+HOST_WAIT_TIME_SCALE_VARIABLE = "CCDM_THREAD_HOST_WAIT_TIME_SCALE"
 _boot_ids = itertools.count(1)
+_host_wait = threading.Lock()
+_host_waited = False
 
 
 @dataclass
@@ -97,6 +107,55 @@ def boot_timeout_seconds() -> float:
     except ValueError:
         seconds = DEFAULT_BOOT_TIMEOUT_SECONDS
     return seconds if seconds > 0 else DEFAULT_BOOT_TIMEOUT_SECONDS
+
+
+def _host_wait_time_scale() -> float:
+    try:
+        scale = float(os.environ.get(HOST_WAIT_TIME_SCALE_VARIABLE) or 1)
+    except ValueError:
+        return 1.0
+    return scale if scale > 0 else 1.0
+
+
+def _host_answers() -> bool:
+    try:
+        session_host.list_sessions()
+    except session_host.SessionHostError:
+        return False
+    return True
+
+
+def wait_for_session_host(env) -> None:
+    """Before this worker's first launch on the ccdm-host backend, wait until
+    ccdm-host answers, at most HOST_WAIT_SECONDS. The worker's task and the
+    host's both start at logon, in no order, and a launch with no host fails.
+    A host that answers at once costs no wait, and one that never answers
+    leaves the launch to fail as it would have. Launches that arrive during
+    the wait share it; no later launch waits. With tmux there is no host."""
+    global _host_waited
+    if _host_waited:
+        return
+    with _host_wait:
+        if _host_waited:
+            return
+        try:
+            hosted = session_host.backend_name(env) == "ccdm-host"
+        except session_host.SessionHostError:
+            hosted = False
+        if hosted and not _host_answers():
+            scale = _host_wait_time_scale()
+            _log(f"ccdm-host does not answer yet; waiting up to {HOST_WAIT_SECONDS} s before the first thread launch")
+            deadline = time.monotonic() + HOST_WAIT_SECONDS / scale
+            answered = False
+            while not answered:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(HOST_POLL_SECONDS / scale, remaining))
+                answered = _host_answers()
+            _log("ccdm-host answers; launching" if answered
+                 else f"ccdm-host did not answer after {HOST_WAIT_SECONDS} s; launching anyway")
+        _host_waited = True
 
 
 def bootstrap_path(project: str, thread_id: str) -> Path:
@@ -216,7 +275,7 @@ def start(context, row, trigger: dict | None, starter: str | None = None, backlo
             context, row, (trigger or {}).get("parent_channel_id") or row["parent_channel_id"])
     boot = Boot(next(_boot_ids), project, trigger_id, starter)
     context.boots[thread_id] = boot
-    args = [str(LAUNCHER), project, thread_id, "--provider", resolved["provider"]]
+    args = [project, thread_id, "--provider", resolved["provider"]]
     for field in ("account", "model", "effort"):
         if resolved[field]:
             args += [f"--{field}", resolved[field]]
@@ -235,10 +294,10 @@ def start(context, row, trigger: dict | None, starter: str | None = None, backlo
 
     def launch() -> None:
         try:
-            completed = subprocess.run(args, env=env, cwd=context.project_root, capture_output=True, text=True,
-                                       stdin=subprocess.DEVNULL)
-            result = {"returncode": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr}
-        except OSError as error:
+            wait_for_session_host(env)
+            returncode, stdout, stderr = start_thread_session.run(args, env, str(context.project_root))
+            result = {"returncode": returncode, "stdout": stdout, "stderr": stderr}
+        except Exception as error:  # The launch thread's frame must reach the worker whatever happens.
             result = {"returncode": 127, "stdout": "", "stderr": f"the thread launcher could not run: {error}"}
         context.link.post({"type": "internal", "event": "launch_exit", "thread_id": thread_id, "boot_id": boot.id,
                            **result})
