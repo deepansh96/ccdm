@@ -20,7 +20,8 @@ from .paths import default_state_dir
 USAGE = ("usage: threads.sh create <project> <name> [--provider claude|codex] [--account <alias>] "
          "[--model <model>] [--effort <effort>] [message…]\n"
          "       threads.sh list [<project>]\n"
-         "       threads.sh stop|restart|close [<project>] <name|link|id>")
+         "       threads.sh stop|close [<project>] <name|link|id>\n"
+         "       threads.sh restart [<project>] <name|link|id> [--provider|--account|--model|--effort]")
 RESOLVER = Path(__file__).resolve().parent.parent / "conversation-resolver.js"
 THREAD_OPS = {"stop": "stop_thread", "restart": "restart_thread", "close": "close_thread"}
 
@@ -115,13 +116,27 @@ def _resolve(project: str | None, target: str) -> dict | None:
 
 
 def thread_op(command: str, argv: list[str]) -> int:
-    if len(argv) not in (1, 2):
+    if not argv:
         return _refuse(USAGE)
-    project, target = (argv[0], argv[1]) if len(argv) == 2 else (None, argv[0])
+    project, target, rest = (argv[0], argv[1], argv[2:]) if len(argv) > 1 and not argv[1].startswith("--") \
+        else (None, argv[0], argv[1:])
+    if command != "restart" and rest:
+        return _refuse(USAGE)
+    flags = {}
+    while rest:
+        flag = rest[0][2:] if rest[0].startswith("--") else ""
+        if flag not in creation.FLAGS:
+            return _refuse(f"unknown flag {rest[0]}")
+        if len(rest) < 2:
+            return _refuse(f"{rest[0]} needs a value")
+        flags[flag], rest = rest[1], rest[2:]
     conversation = _resolve(project, target)
     if conversation is None:
         return 2
-    response = _request({"op": THREAD_OPS[command], "thread_id": conversation["thread_id"]})
+    payload = {"op": THREAD_OPS[command], "thread_id": conversation["thread_id"]}
+    if flags:
+        payload["flags"] = flags
+    response = _request(payload)
     if response is None:
         return 1
     if not response.get("ok"):
