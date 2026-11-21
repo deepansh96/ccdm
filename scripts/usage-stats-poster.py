@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Post a text-only Claude and Codex Usage Report to one Discord channel."""
+"""Post a text-only Claude, Codex and Antigravity Usage Report to one Discord channel."""
 
 import argparse
 import contextlib
@@ -13,6 +13,7 @@ import stat
 import queue
 import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -605,8 +606,10 @@ def load_registry(path):
     return registry
 
 
-def load_registry_data(path):
+def load_registry_data(path, require_token=True):
     registry = load_registry(path)
+    if not require_token:
+        return registry, None
     state_dir = Path(os.environ.get("ROOT_DISCORD_STATE_DIR") or "~/.claude/channels/discord").expanduser()
     try:
         lines = (state_dir / ".env").read_text().splitlines()
@@ -2487,6 +2490,235 @@ def collect_codex_metrics(
     )
 
 
+# Google Antigravity CLI (``agy``) subscription quota.  ``agy -p /usage`` is a
+# read-only print-mode slash command: it answers from the account's quota
+# summary without starting an agent turn, spending quota, or leaving a
+# conversation behind.  Its JSON form carries one group per model family
+# (Gemini, Claude + GPT, the separate Argon cap), each with 5-hour and/or
+# weekly buckets of ``remaining_fraction`` and a UTC ``reset_time``.
+AGY_BIN_ENV = "CCDM_AGY_BIN"
+AGY_TIMEOUT_ENV = "CCDM_AGY_TIMEOUT_SECONDS"
+AGY_DEFAULT_TIMEOUT_SECONDS = 30
+AGY_OUTPUT_MAX_BYTES = 256 * 1024
+AGY_PROVIDER = "antigravity"
+AGY_ACCOUNT = "agy"
+AGY_FIELD_NAME = "Antigravity"
+AGY_MAX_GROUPS = 8
+AGY_MAX_BUCKETS = 8
+# window -> (history window, display label, display order)
+AGY_WINDOWS = {"5h": ("5-hour", "5-Hour", 0), "weekly": ("weekly", "Weekly", 1)}
+AGY_NAME_PATTERN = re.compile(r"[^A-Za-z0-9 .,+&()-]")
+AGY_SIGN_IN_PATTERN = re.compile(
+    r"not (?:logged|signed) in|log ?in|sign ?in|unauthenticated|authenticat|re-?auth|oauth|token (?:expired|revoked)",
+    re.IGNORECASE,
+)
+
+
+def _agy_binary():
+    """Return ``(binary, expected)`` for the Antigravity CLI.
+
+    ``CCDM_AGY_BIN`` wins when set; otherwise ``agy`` on PATH, then the
+    installer's ``~/.local/bin/agy`` (LaunchAgents do not add it to PATH).
+    ``expected`` is true when agy was configured or its data directory exists,
+    so a machine that never used agy shows no section at all, while a missing
+    binary on a machine that did use it renders an unavailable line.
+    """
+    override = os.environ.get(AGY_BIN_ENV)
+    if override is not None and override.strip():
+        return Path(override.strip()).expanduser(), True
+    found = shutil.which("agy")
+    if found:
+        return Path(found), True
+    default = Path.home() / ".local" / "bin" / "agy"
+    if default.is_file():
+        return default, True
+    return None, (Path.home() / ".gemini" / "antigravity-cli").is_dir()
+
+
+def _agy_timeout():
+    try:
+        value = float(os.environ.get(AGY_TIMEOUT_ENV) or AGY_DEFAULT_TIMEOUT_SECONDS)
+    except ValueError:
+        value = AGY_DEFAULT_TIMEOUT_SECONDS
+    if not math.isfinite(value):
+        value = AGY_DEFAULT_TIMEOUT_SECONDS
+    return max(1.0, min(120.0, value))
+
+
+def _agy_name(value, limit=48):
+    """Return a short display-safe name from agy payload text, or ``None``."""
+    if not isinstance(value, str):
+        return None
+    cleaned = " ".join(AGY_NAME_PATTERN.sub("", value).split())[:limit].strip()
+    return cleaned or None
+
+
+def _read_agy_output(handle):
+    handle.seek(0)
+    return handle.read(AGY_OUTPUT_MAX_BYTES).decode("utf-8", "replace")
+
+
+def read_agy_usage(binary, timeout=None):
+    """Run ``agy -p /usage`` once and return ``(payload, None)`` or ``(None, reason)``.
+
+    agy runs with the repository as its workspace (never the home folder),
+    stdin closed, its log sent to /dev/null (no log file per run), and a
+    strict wall-clock limit; on timeout its whole process group is killed.
+    Output goes to temporary files so a lingering grandchild holding a pipe
+    cannot stall the poster.
+    """
+    timeout = timeout or _agy_timeout()
+    print_timeout = max(1, int(timeout) - 5)
+    args = [
+        str(binary), "-p", "/usage", "--output-format", "json",
+        "--print-timeout", f"{print_timeout}s", "--log-file", os.devnull,
+    ]
+    env = {**os.environ, "NO_COLOR": "1"}
+    try:
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            try:
+                process = subprocess.Popen(
+                    args, cwd=ROOT_DIR, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                    env=env, start_new_session=True,
+                )
+            except FileNotFoundError:
+                return None, "agy not found"
+            except OSError:
+                return None, "agy could not be started"
+            try:
+                code = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(OSError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                    process.wait(timeout=5)
+                return None, "timed out"
+            out_text = _read_agy_output(stdout)
+            err_text = _read_agy_output(stderr)
+    except OSError:
+        return None, "agy output unreadable"
+    if code == 3:
+        return None, "timed out"
+    payload = None
+    with contextlib.suppress(ValueError):
+        payload = json.loads(out_text)
+    detail = err_text
+    if isinstance(payload, dict):
+        detail = " ".join(str(payload.get(key) or "") for key in ("status", "error", "response")) + " " + err_text
+    if code != 0 or not isinstance(payload, dict) or payload.get("status") not in (None, "SUCCESS"):
+        if AGY_SIGN_IN_PATTERN.search(detail):
+            return None, "sign-in required (run agy to sign in)"
+        if code != 0:
+            return None, f"agy exited with code {code}"
+        return None, "unreadable agy output"
+    return payload, None
+
+
+def parse_agy_usage(payload):
+    """Return sanitized quota groups from ``agy -p /usage --output-format json``.
+
+    Each group is ``{"name", "limits"}``; a bucket's used percentage is
+    ``100 * (1 - remaining_fraction)``, and a bad fraction is unavailable,
+    never 0%.  Returns ``None`` when no group has a usable bucket.
+    """
+    command = payload.get("command") if isinstance(payload, dict) else None
+    data = command.get("data") if isinstance(command, dict) and command.get("name") == "usage" else None
+    groups = data.get("groups") if isinstance(data, dict) else None
+    if not isinstance(groups, list):
+        return None
+    result = []
+    for group in groups[:AGY_MAX_GROUPS]:
+        if not isinstance(group, dict) or not isinstance(group.get("buckets"), list):
+            continue
+        limits = []
+        for bucket in group["buckets"][:AGY_MAX_BUCKETS]:
+            if not isinstance(bucket, dict):
+                continue
+            known = AGY_WINDOWS.get(bucket.get("window"))
+            if known:
+                window, label, order = known
+            else:
+                label = _agy_name(bucket.get("name"), 32) or "Limit"
+                window, order = label.lower(), 2
+            remaining = bucket.get("remaining_fraction")
+            used = None
+            if not isinstance(remaining, bool) and isinstance(remaining, (int, float)) and math.isfinite(remaining):
+                used = round(100.0 * (1.0 - max(0.0, min(1.0, float(remaining)))), 4)
+            limits.append({
+                "label": label, "order": order, "window": window, "used_percent": used,
+                "resets_at": _normalise_reset_timestamp(bucket.get("reset_time")),
+            })
+        if limits:
+            limits.sort(key=lambda limit: limit["order"])
+            result.append({"name": _agy_name(group.get("name")) or "Models", "limits": limits})
+    return result or None
+
+
+def _agy_unavailable_metric(reason):
+    return {
+        "provider": AGY_PROVIDER, "account": AGY_ACCOUNT, "limits": [],
+        "status": "unavailable", "reason": reason,
+        "text": f"**{AGY_ACCOUNT}**\n*Usage unavailable: {reason}*",
+    }
+
+
+_AGY_UNSET = object()
+
+
+def collect_agy_metrics(now=None, binary=_AGY_UNSET):
+    """Return Antigravity quota metrics, one per model group; never raises.
+
+    A machine without agy (no binary, no data directory, no override) yields
+    no metrics, so the report has no Antigravity field.  Every failure after
+    that is one short unavailable block.
+    """
+    now = now or _utc_now()
+    if binary is _AGY_UNSET:
+        binary, expected = _agy_binary()
+        if binary is None:
+            return [_agy_unavailable_metric("agy not found")] if expected else []
+    try:
+        payload, reason = read_agy_usage(binary)
+        groups = parse_agy_usage(payload) if reason is None else None
+    except Exception:  # noqa: BLE001 - agy must never break the rest of the report
+        payload, reason, groups = None, "agy check failed", None
+    if reason is None and groups is None:
+        reason = "no quota data in agy output"
+    if reason is not None:
+        return [_agy_unavailable_metric(reason)]
+    metrics = []
+    for group in groups:
+        lines = [f"**{group['name']}**"]
+        limits = []
+        for limit in group["limits"]:
+            used = limit["used_percent"]
+            # An untouched bucket's reset_time is just now + its window (the
+            # window has not started), so like Claude's null reset it is hidden.
+            reset = fmt_reset(limit["resets_at"], now) if used else None
+            reset_part = f"  resets in {reset}" if reset else ""
+            lines.append(f"{limit['label']}: {text_bar(used) if used is not None else '*unavailable*'}{reset_part}")
+            limits.append({
+                "window": f"{limit['window']} ({group['name']})",
+                "scope": group["name"],
+                "available": used is not None,
+                "status": "available" if used is not None else "unavailable",
+                "reason": None if used is not None else "Usage percentage unavailable",
+                "used_percent": used,
+                "resets_at": limit["resets_at"],
+            })
+        metrics.append({
+            "provider": AGY_PROVIDER, "account": AGY_ACCOUNT, "group": group["name"],
+            "limits": limits, "text": "\n".join(lines),
+        })
+    return metrics
+
+
+def _agy_report_values(agy_metrics):
+    """Return the Antigravity field values, or ``None`` when there is no section."""
+    blocks = [metric["text"] for metric in agy_metrics or [] if isinstance(metric.get("text"), str) and metric["text"]]
+    return _pack_field_values(blocks) or None
+
+
 # Discord embed limits: a field value, the field count, and the whole embed.
 DISCORD_FIELD_VALUE_LIMIT = 1024
 DISCORD_EMBED_FIELD_LIMIT = 25
@@ -2537,7 +2769,7 @@ def _usage_report_values(claude_metrics, codex_metrics):
     return _pack_field_values(blocks(claude_metrics)) or [""], _pack_field_values(blocks(codex_metrics)) or None
 
 
-def _usage_report_embed(claude_value, codex_value=None):
+def _usage_report_embed(claude_value, codex_value=None, agy_value=None):
     """Return the original text-only Usage Report embed.
 
     Each value may be one string or a list of field values; a provider's
@@ -2554,7 +2786,7 @@ def _usage_report_embed(claude_value, codex_value=None):
         "footer": {"text": timestamp},
     }
     providers = []
-    for name, values in (("Claude Code", claude_value), ("Codex", codex_value)):
+    for name, values in (("Claude Code", claude_value), ("Codex", codex_value), (AGY_FIELD_NAME, agy_value)):
         if values is not None:
             providers.append([
                 {"name": name if index == 0 else f"{name} (cont.)", "value": value, "inline": True}
@@ -2578,9 +2810,9 @@ def _usage_report_embed(claude_value, codex_value=None):
     return embed
 
 
-def post_to_discord(config, bot_token, claude_value, codex_value=None):
+def post_to_discord(config, bot_token, claude_value, codex_value=None, agy_value=None):
     """Post the existing text-only Usage Report and return the Discord message id."""
-    embed = _usage_report_embed(claude_value, codex_value)
+    embed = _usage_report_embed(claude_value, codex_value, agy_value)
     request = Request(
         f"{config['discord_base_url'].rstrip('/')}/api/v10/channels/{config['discord_channel_id']}/messages",
         data=json.dumps({"embeds": [embed]}).encode("utf-8"),
@@ -3233,6 +3465,11 @@ def build_parser():
         help="run the LaunchAgent behavior: post the text Usage Report once per UTC 30-minute slot",
     )
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="collect and print the Usage Report to stdout without posting, reading the bot token, or writing history",
+    )
+    parser.add_argument(
         "--post-now",
         action="store_true",
         help="alias for --scheduled, kept for compatibility (the posts ledger still allows one post per slot)",
@@ -3250,10 +3487,21 @@ def main(argv=None):
         if args.validate_config:
             print("Poster configuration is valid")
             return 0
+        if args.dry_run:
+            # Collection only: no bot token, no post, and history is only
+            # read (best effort) for used credits, exactly like a manual post.
+            registry, _ = load_registry_data(REGISTRY_PATH, require_token=False)
+            claude_metrics = collect_claude_metrics(config)
+            codex_metrics = collect_codex_metrics(
+                registry, config, credit_history=_codex_credit_history(config, _utc_now())
+            )
+            claude_value, codex_value = _usage_report_values(claude_metrics, codex_metrics)
+            embed = _usage_report_embed(claude_value, codex_value, _agy_report_values(collect_agy_metrics()))
+            print("\n\n".join(f"## {field['name']}\n{field['value']}" for field in embed["fields"]))
+            print("\n(dry run: nothing was posted or recorded)")
+            return 0
         # Windows never posts, so it never reads root's bot token.
-        registry, bot_token = (
-            (load_registry(REGISTRY_PATH), None) if COLLECT_ONLY_PLATFORM else load_registry_data(REGISTRY_PATH)
-        )
+        registry, bot_token = load_registry_data(REGISTRY_PATH, require_token=not COLLECT_ONLY_PLATFORM)
         scheduled = (
             args.scheduled
             or args.post_now
@@ -3272,7 +3520,8 @@ def main(argv=None):
                 registry, config, credit_history=_codex_credit_history(config, _utc_now())
             )
             claude_value, codex_value = _usage_report_values(claude_metrics, codex_metrics)
-            message_id = post_to_discord(config, bot_token, claude_value, codex_value)
+            agy_value = _agy_report_values(collect_agy_metrics())
+            message_id = post_to_discord(config, bot_token, claude_value, codex_value, agy_value)
             print(f"Posted (message ID: {message_id})")
             return 0
 
@@ -3281,8 +3530,10 @@ def main(argv=None):
         codex_metrics = collect_codex_metrics(
             registry, config, now=now, credit_history=_codex_credit_history(config, now)
         )
-        metrics = claude_metrics + codex_metrics
+        agy_metrics = collect_agy_metrics(now=now)
+        metrics = claude_metrics + codex_metrics + agy_metrics
         claude_value, codex_value = _usage_report_values(claude_metrics, codex_metrics)
+        agy_value = _agy_report_values(agy_metrics)
         current_payload = {
             "schema_version": 1,
             "generated_at": _iso_utc(_floor_utc(now, 10)),
@@ -3309,7 +3560,7 @@ def main(argv=None):
                 # produced.  The retired renderer/upload helpers stay defined
                 # for API back-compat but are never invoked here.
                 try:
-                    message_id = post_to_discord(config, bot_token, claude_value, codex_value)
+                    message_id = post_to_discord(config, bot_token, claude_value, codex_value, agy_value)
                 except AmbiguousPostError:
                     # Prefer a possibly missed slot over a duplicate report:
                     # later runs in this slot must not post again.

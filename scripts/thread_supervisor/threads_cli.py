@@ -36,10 +36,11 @@ PREFIX = "ccdm threads" if WIN32 else "threads.sh"
 MESSAGE_STDIN = "--message-stdin"
 MESSAGE_FILE = "--message-file"
 MESSAGE_FORM = f"[{MESSAGE_STDIN}|{MESSAGE_FILE} <path>]" if WIN32 else "[message…]"
-USAGE = (f"usage: {COMMAND} create <project> <name> [--provider claude|codex] [--account <alias>] "
+USAGE = (f"usage: {COMMAND} create <project> <name> [--provider claude|codex|gemini] [--account <alias>] "
          f"[--model <model>] [--effort <effort>] {MESSAGE_FORM}\n"
          f"       {COMMAND} list [<project>]\n"
-         f"       {COMMAND} stop|restart|close [<project>] <name|link|id>")
+         f"       {COMMAND} stop|close [<project>] <name|link|id>\n"
+         f"       {COMMAND} restart [<project>] <name|link|id> [--provider|--account|--model|--effort]")
 RESOLVER = Path(__file__).resolve().parent.parent / "conversation-resolver.js"
 THREAD_OPS = {"stop": "stop_thread", "restart": "restart_thread", "close": "close_thread"}
 
@@ -161,13 +162,28 @@ def _resolve(project: str | None, target: str) -> dict | None:
 
 
 def thread_op(command: str, argv: list[str]) -> int:
-    if len(argv) not in (1, 2):
+    if not argv:
         return _refuse(USAGE)
-    project, target = (argv[0], argv[1]) if len(argv) == 2 else (None, argv[0])
+    project, target, rest = (argv[0], argv[1], argv[2:]) if len(argv) > 1 and not argv[1].startswith("--") \
+        else (None, argv[0], argv[1:])
+    # Anything after the thread is a restart's `--flag value` pairs; another word is bad usage.
+    if rest and (command != "restart" or not rest[0].startswith("--")):
+        return _refuse(USAGE)
+    flags = {}
+    while rest:
+        flag = rest[0][2:] if rest[0].startswith("--") else ""
+        if flag not in creation.FLAGS:
+            return _refuse(f"unknown flag {rest[0]}")
+        if len(rest) < 2:
+            return _refuse(f"{rest[0]} needs a value")
+        flags[flag], rest = rest[1], rest[2:]
     conversation = _resolve(project, target)
     if conversation is None:
         return 2
-    response = _request({"op": THREAD_OPS[command], "thread_id": conversation["thread_id"]})
+    payload = {"op": THREAD_OPS[command], "thread_id": conversation["thread_id"]}
+    if flags:
+        payload["flags"] = flags
+    response = _request(payload)
     if response is None:
         return 1
     if not response.get("ok"):

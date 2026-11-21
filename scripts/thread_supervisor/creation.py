@@ -21,14 +21,16 @@ from .link import LinkError
 
 
 FLAGS = ("provider", "account", "model", "effort")
-PROVIDERS = ("claude", "codex")
+PROVIDERS = ("claude", "codex", "gemini")
 EFFORTS = {
     "claude": ("low", "medium", "high", "xhigh", "max"),
     "codex": ("none", "minimal", "low", "medium", "high", "xhigh"),
+    # agy's thinking levels.
+    "gemini": ("low", "medium", "high", "xhigh"),
 }
 MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+\[\]-]{0,99}$")
 NAME_LIMIT = 100
-USAGE = ("usage: /thread <name> [--provider claude|codex] [--account <alias>] [--model <model>] "
+USAGE = ("usage: /thread <name> [--provider claude|codex|gemini] [--account <alias>] [--model <model>] "
          "[--effort <effort>] [first message]")
 FLAG = re.compile(r"--([^\s=]+)(?:=(\S+)|\s+(?!--)(\S+))?(?:\s+|$)")
 
@@ -81,7 +83,7 @@ def validate(current: dict, project: str | None, name: str | None, flags: dict) 
         raise Invalid(f"unknown flag --{unknown[0]}")
     overrides = {field: flags.get(field) or None for field in FLAGS}
     if overrides["provider"] is not None and overrides["provider"] not in PROVIDERS:
-        raise Invalid(f"provider '{overrides['provider']}' is not claude or codex")
+        raise Invalid(f"provider '{overrides['provider']}' is not claude, codex or gemini")
     provider = overrides["provider"] or entry.get("type") or "claude"
     if overrides["account"] is not None and overrides["account"] not in registry.accounts(current, provider):
         raise Invalid(f"'{overrides['account']}' is not an account alias in {provider}_accounts")

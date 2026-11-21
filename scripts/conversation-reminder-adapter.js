@@ -154,7 +154,8 @@ async function writeActiveContext(context) {
     ...(context.conversation_id ? { conversation_id: context.conversation_id } : {}),
     bot_id: context.bot_id,
     assignment_generation: context.assignment_generation,
-    provider: "codex",
+    // The bridge adapters: Codex, and Gemini through agy.
+    provider: context.provider === "gemini" ? "gemini" : "codex",
     provider_session_id: context.provider_session_id,
     provider_turn_id: context.provider_turn_id,
     interaction_id: context.interaction_id,
@@ -172,7 +173,7 @@ async function readActiveContext(targetChannelId) {
   try {
     const context = JSON.parse(await fs.readFile(CONTEXT_FILE, "utf8"));
     // A thread's replies go to the thread, its conversation.
-    if (context.schema_version !== 1 || context.provider !== "codex" ||
+    if (context.schema_version !== 1 || !["codex", "gemini"].includes(context.provider) ||
         (context.conversation_id || context.channel_id) !== targetChannelId) return null;
     for (const field of ["project", "owner_id", "channel_id", "bot_id", "assignment_generation", "provider_session_id", "provider_turn_id", "interaction_id"]) {
       if (typeof context[field] !== "string" || !context[field]) return null;

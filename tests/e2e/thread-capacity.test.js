@@ -181,11 +181,11 @@ test("at the Claude cap a new thread evicts the idle one with the pause notice a
 
 test("with no caps entry the defaults apply, and an invalid cap falls back to its default and shows in status", async () => {
   const defaults = capacityWorkspace();
-  assert.deepEqual((await supervisorStatus(defaults)).capacity, { caps: { claude: 6, codex: 8 }, invalid: [] });
+  assert.deepEqual((await supervisorStatus(defaults)).capacity, { caps: { claude: 6, codex: 8, gemini: 4 }, invalid: [] });
 
   const invalid = capacityWorkspace(capsRegistry({ claude: "lots", codex: 3 }));
   const { capacity } = await supervisorStatus(invalid);
-  assert.deepEqual(capacity.caps, { claude: 6, codex: 3 });
+  assert.deepEqual(capacity.caps, { claude: 6, codex: 3, gemini: 4 });
   assert.equal(capacity.invalid.length, 1);
   assert.match(capacity.invalid[0], /thread_session_caps\.claude/);
 });

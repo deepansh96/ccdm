@@ -54,7 +54,8 @@ function script(name, project, ...extra) {
   throw new Error(`${name} exited ${result.status ?? result.signal}${reason ? `: ${reason}` : ""}`);
 }
 
-const launcher = entry => (entry.type === "codex" ? "start-codex-session.sh" : "start-session.sh");
+const LAUNCHERS = { codex: "start-codex-session.sh", gemini: "start-gemini-session.sh" };
+const launcher = entry => LAUNCHERS[entry.type] || "start-session.sh";
 
 async function routerStatus(project) {
   const client = new RouterClient({ role: "status", timeoutMs: 5000 });
@@ -190,7 +191,7 @@ async function rollbackSteps(project, entry, { reassign: issue = true, resumeId 
 async function rollback(project) {
   await step("preflight", async () => {
     const entry = await projectEntry(project);
-    const provider = entry.type === "codex" ? "Codex" : "Claude";
+    const provider = { codex: "Codex", gemini: "Gemini" }[entry.type] || "Claude";
     throw new Error(`${project} is a ${provider} project, and ${provider} has no pool bot to return to`);
   });
 }

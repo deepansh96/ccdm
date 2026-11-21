@@ -89,7 +89,7 @@ export function createSessionFixture(context) {
 
   // `launch` is what parseTmuxLaunch returns, or the same shape from an argv.
   // `record` is the launch record; the fronts differ only in how it is filled.
-  function launchSession(name, launch, { command, shellCommand, record }) {
+  function launchSession(name, launch, { command, shellCommand, record, wrapperEnv }) {
     const tmuxState = readState().fixtures.tmux;
     const preexistingSession = tmuxState.sessions[name];
     const priorKillAttempts =
@@ -97,7 +97,7 @@ export function createSessionFixture(context) {
     // A CCDM channel launch runs the fake claude, which hosts the real channel
     // server once the development-channel confirmation is accepted.
     const routerChannel = launch.kind === "claude-listener" && launch.claudeArgs.includes("server:ccdm");
-    const routerBridge = launch.kind === "codex-bridge" && Boolean(launch.env.CCDM_ROUTER_KEY_FILE);
+    const routerBridge = ["codex-bridge", "gemini-bridge"].includes(launch.kind) && Boolean(launch.env.CCDM_ROUTER_KEY_FILE);
     const pid = routerChannel
       ? spawnRouterClaude(name, launch)
       : routerBridge ? spawnRouterBridge(launch) : spawnPlaceholder();
@@ -105,7 +105,9 @@ export function createSessionFixture(context) {
     const resumeIndex = launch.kind === "claude-listener" ? launch.claudeArgs.indexOf("--resume") : -1;
     const sessionId = resumeIndex >= 0 ? unquote(launch.claudeArgs[resumeIndex + 1]) : `fixture-session-${pid}`;
     const processCommand =
-      routerBridge
+      launch.kind === "gemini-bridge"
+        ? `node scripts/gemini-bridge.js CHANNEL_ID='${launch.env.CHANNEL_ID}' CCDM_ROUTER_KEY_FILE='${launch.env.CCDM_ROUTER_KEY_FILE}'`
+        : routerBridge
         ? `node scripts/codex-bridge.js CHANNEL_ID='${launch.env.CHANNEL_ID}' WS_PORT='${launch.env.WS_PORT}' CCDM_ROUTER_KEY_FILE='${launch.env.CCDM_ROUTER_KEY_FILE}'`
         : launch.kind === "codex-bridge"
         ? `node scripts/codex-bridge.js CHANNEL_ID='${launch.env.CHANNEL_ID}' BOT_APP_ID='${launch.env.BOT_APP_ID}' WS_PORT='${launch.env.WS_PORT}'`
@@ -116,7 +118,9 @@ export function createSessionFixture(context) {
     const trustPrompt = launch.kind === "claude-listener" && readState().fixtures.claude.trustPrompt ? "pending" : undefined;
     const autoModeOffer = launch.kind === "claude-listener" && readState().fixtures.claude.autoModeOffer ? "pending" : undefined;
     const launchedScreen =
-      launch.kind === "codex-bridge"
+      launch.kind === "gemini-bridge"
+        ? "Gemini-Discord bridge running\nListening in #channel-id\n"
+        : launch.kind === "codex-bridge"
         ? "Codex-Discord bridge running\nListening in #channel-id\n"
         : launch.kind === "generic"
           ? ""
@@ -138,6 +142,7 @@ export function createSessionFixture(context) {
       state.fixtures.tmux.sessions[name] = {
         name,
         command,
+        ...(wrapperEnv ? { wrapperEnv } : {}),
         cwd: launch.cwd,
         env: launch.env,
         bridgeCommand: launch.bridgeCommand,
@@ -163,7 +168,13 @@ export function createSessionFixture(context) {
       state.fixtures.sessionHost.launches.push({ ...record, pid });
       return state;
     });
-    if (launch.kind === "codex-bridge") {
+    if (launch.kind === "gemini-bridge") {
+      updateState((state) => {
+        state.fixtures.gemini = state.fixtures.gemini || { bridgeInvocations: [] };
+        state.fixtures.gemini.bridgeInvocations.push({ command: launch.bridgeCommand, cwd: launch.cwd, env: launch.env, pid });
+        return state;
+      });
+    } else if (launch.kind === "codex-bridge") {
       recordCodexBridgeInvocation({
         command: launch.bridgeCommand,
         cwd: launch.cwd,
@@ -254,11 +265,24 @@ export function createSessionFixture(context) {
     const name = args[args.indexOf("-s") + 1];
     const separatorIndex = args.indexOf("--");
     const command = args.slice(separatorIndex + 1);
-    if (!name || separatorIndex === -1 || command[0] !== "zsh" || command[1] !== "-ic" || !command[2]) {
+    // `env NAME=value … zsh -ic <command>`: the launchers switch off prompts in ~/.zshrc this way.
+    const wrapperEnv = {};
+    let shellIndex = 0;
+    if (command[shellIndex] === "env") {
+      shellIndex += 1;
+      while (shellIndex < command.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(command[shellIndex])) {
+        const assignment = command[shellIndex];
+        const equals = assignment.indexOf("=");
+        wrapperEnv[assignment.slice(0, equals)] = assignment.slice(equals + 1);
+        shellIndex += 1;
+      }
+    }
+    if (!name || separatorIndex === -1 || command[shellIndex] !== "zsh" ||
+        command[shellIndex + 1] !== "-ic" || !command[shellIndex + 2]) {
       console.error("unsupported tmux new-session invocation");
       process.exit(2);
     }
-    const shellCommand = command[2];
+    const shellCommand = command[shellIndex + 2];
     const refusal = launchRefusal(name);
     if (refusal?.early) process.exit(0);
     if (refusal) {
@@ -266,13 +290,15 @@ export function createSessionFixture(context) {
       process.exit(refusal.status);
     }
     const launch = parseTmuxLaunch(shellCommand);
-    const parsedArgv = launch.kind === "codex-bridge"
+    launch.env = { ...wrapperEnv, ...launch.env };
+    const parsedArgv = ["codex-bridge", "gemini-bridge"].includes(launch.kind)
       ? launch.bridgeCommand.split(" ")
       : launch.kind === "generic" ? launch.argv : ["claude", ...launch.claudeArgs.map(unquote)];
     launchSession(name, launch, {
       command,
       shellCommand,
       record: { front: "tmux", name, kind: null, argv: parsedArgv, cwd: launch.cwd, env: launch.env, pty: true, rawArgv: args },
+      wrapperEnv,
     });
     process.exit(0);
   }

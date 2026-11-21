@@ -129,10 +129,14 @@ async function tmuxPanePid(name) {
   return Number.parseInt(result.stdout.trim(), 10) || null;
 }
 
+const TMUX_SHELL = ["env", "DISABLE_AUTO_UPDATE=true", "DISABLE_UPDATE_PROMPT=true", "zsh", "-ic"];
+
 const tmuxBackend = {
   async start(name, options) {
     const { kind } = launchRequest(name, options);
-    const result = await tmux(["new-session", "-d", "-s", name, "--", "zsh", "-ic", tmuxLaunchCommand(name, options)]);
+    // zsh -i loads ~/.zshrc, so prompts there (oh-my-zsh's update prompt) must be
+    // switched off or a headless launch blocks before it starts anything.
+    const result = await tmux(["new-session", "-d", "-s", name, "--", ...TMUX_SHELL, tmuxLaunchCommand(name, options)]);
     if (result.status !== 0) {
       const code = /duplicate session/.test(result.stderr) ? ERRORS.DUPLICATE_SESSION : ERRORS.SPAWN_FAILED;
       throw new HostError(code, result.stderr.trim() || `tmux could not start session ${name}`);

@@ -10,7 +10,7 @@ edges:
     condition: always before changing session state
   - target: patterns/root-commands.md
     condition: for the trigger words and the one-line command for each request
-last_updated: 2026-11-10
+last_updated: 2026-11-21
 ---
 
 # Manage A Session
@@ -19,7 +19,7 @@ last_updated: 2026-11-10
 The commands are the same on macOS and Windows. Run them with the Bash tool from the CCDM checkout.
 
 1. Read the project from `registry.json`; treat a missing `type` as `claude`. `scripts/ccdm status <project>` shows whether its session is live.
-2. For start, run `scripts/ccdm start-session <project>` for Claude or `scripts/ccdm start-codex-session <project>` for Codex.
+2. For start, run `scripts/ccdm start-session <project>` for Claude, `scripts/ccdm start-codex-session <project>` for Codex, or `scripts/ccdm start-gemini-session <project>` for Gemini (macOS only).
 3. For stop, run `scripts/ccdm stop-session <project>`.
 4. For restart, run `scripts/ccdm restart-session <project>`. It stops fully before it starts. If it fails, read `~/.local/state/ccdm/logs/restart-<project>.log`.
 5. Read the session's screen with `scripts/ccdm session capture <screen_name>` and confirm the expected listener banner.

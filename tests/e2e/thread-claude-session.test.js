@@ -235,8 +235,14 @@ test("no Discord credential reaches the thread session's environment, launch fil
     assert.equal(launch.kind, "thread");
     assert.match(launch.argv.join(" "), trustFlag);
   } else {
-    assert.deepEqual(state.fixtures.tmux.sessions[THREAD_TMUX].command.slice(0, 2), ["zsh", "-ic"]);
-    assert.match(state.fixtures.tmux.sessions[THREAD_TMUX].command[2], trustFlag);
+    assert.deepEqual(state.fixtures.tmux.sessions[THREAD_TMUX].command.slice(0, 5), [
+      "env", "DISABLE_AUTO_UPDATE=true", "DISABLE_UPDATE_PROMPT=true", "zsh", "-ic",
+    ]);
+    assert.deepEqual(state.fixtures.tmux.sessions[THREAD_TMUX].wrapperEnv, {
+      DISABLE_AUTO_UPDATE: "true",
+      DISABLE_UPDATE_PROMPT: "true",
+    });
+    assert.match(state.fixtures.tmux.sessions[THREAD_TMUX].command[5], trustFlag);
   }
   const status = await runRouterCli(workspace, ["status"]);
   assert.match(status.stdout, new RegExp(`thread demo thread=${THREAD_ID} provider=claude connected=`));
@@ -532,7 +538,7 @@ test("run() gives the command's usage, exit code and id checks, with nothing on 
   const workspace = threadWorkspace();
   const usage = await launcherRun(workspace, ["demo"]);
   assert.equal(usage.returncode, 2);
-  assert.match(usage.stderr, /^Usage: .* <project> <thread_id> --provider claude\|codex /);
+  assert.match(usage.stderr, /^Usage: .* <project> <thread_id> --provider claude\|codex\|gemini /);
   const badId = await launcherRun(workspace, ["demo", "../evil", "--provider", "claude"]);
   assert.equal(badId.returncode, 2);
   assert.equal(badId.stderr.trim(), "Invalid thread id: '../evil'");

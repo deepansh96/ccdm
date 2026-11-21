@@ -15,7 +15,7 @@ edges:
     condition: when understanding how components connect during setup
   - target: context/discord-security.md
     condition: when configuring the root token, Session Scope, guest roles, or root channel permissions
-last_updated: 2026-11-10
+last_updated: 2026-11-21
 ---
 
 # Setup
@@ -71,8 +71,9 @@ Each service is opt-in. Install one only when the operator asks.
 - `scripts/ccdm list` - lists the projects and whether each session is live.
 - `scripts/ccdm start-session <project>` - starts a registered Claude project.
 - `scripts/ccdm start-codex-session <project>` - starts a registered Codex project.
-- `scripts/ccdm stop-session <project>` - stops either session type and clears runtime state.
-- `scripts/ccdm restart-session <project>` - stops, then starts, either session type.
+- `scripts/ccdm start-gemini-session <project> [--resume <session_id>]` - starts a registered Gemini project through the Antigravity CLI (`agy`, installed and signed in once). macOS only; Windows refuses it.
+- `scripts/ccdm stop-session <project>` - stops any session type and clears runtime state.
+- `scripts/ccdm restart-session <project>` - stops, then starts, any session type.
 - `node scripts/guest-access.js list [project]` - inspects project guest access.
 - `node scripts/router.js status` - reports Router health, sessions, scopes, webhooks, and scope violations.
 - `npx mex-agent check` - checks memory scaffold drift.
@@ -97,3 +98,7 @@ Each service is opt-in. Install one only when the operator asks.
 
 - macOS: it starts each tmux session through `zsh -ic`, so tools set up in `~/.zshrc` resolve.
 - Windows: `ccdm-host` gives each session the user's profile environment.
+
+**A session never starts and its launch times out:** read its screen with `scripts/ccdm session capture <screen_name>` (a thread's is `<screen_name>-t-<thread_id>`).
+
+- macOS: interactive shells load `~/.zshrc`, so a prompt there blocks the shell before the agent runs. oh-my-zsh's `Would you like to update? [Y/n]` is the known one, and the launchers pass `DISABLE_AUTO_UPDATE=true DISABLE_UPDATE_PROMPT=true` for it. Any other prompt belongs in the user's rc file.

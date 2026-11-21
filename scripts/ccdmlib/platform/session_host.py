@@ -114,6 +114,9 @@ def _shell_word(arg: str, index: int) -> str:
     return arg if bare else _shell_quote(arg)
 
 
+TMUX_SHELL = ("env", "DISABLE_AUTO_UPDATE=true", "DISABLE_UPDATE_PROMPT=true", "zsh", "-ic")
+
+
 def tmux_launch_command(
     name: str, argv: Sequence[str], cwd: str, env: Optional[Mapping[str, str]] = None, kind: str = "adhoc"
 ) -> str:
@@ -396,7 +399,9 @@ def start(
     request = _launch_request(name, argv, cwd, env, pty, str(kind))
     if _is_tmux():
         command = tmux_launch_command(name, argv, cwd, env, request["kind"])
-        result = _tmux(["new-session", "-d", "-s", name, "--", "zsh", "-ic", command])
+        # zsh -i loads ~/.zshrc, so prompts there (oh-my-zsh's update prompt) must be
+        # switched off or a headless launch blocks before it starts anything.
+        result = _tmux(["new-session", "-d", "-s", name, "--", *TMUX_SHELL, command])
         if result.returncode != 0:
             code = _DUPLICATE_SESSION if "duplicate session" in result.stderr else _SPAWN_FAILED
             raise SessionHostError(code, result.stderr.strip() or f"tmux could not start session {name}")

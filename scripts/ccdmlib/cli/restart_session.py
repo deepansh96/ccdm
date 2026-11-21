@@ -70,7 +70,8 @@ def _read_entry(project: str) -> Tuple[str, str]:
     """The project's session name and its start subcommand."""
     with (ROOT_DIR / "registry.json").open(encoding="utf-8") as source:
         entry = json.load(source)["projects"][project]
-    start = "start-codex-session" if entry.get("type", "claude") == "codex" else "start-session"
+    start = {"codex": "start-codex-session", "gemini": "start-gemini-session"}.get(
+        entry.get("type", "claude"), "start-session")
     return entry["screen_name"], start
 
 

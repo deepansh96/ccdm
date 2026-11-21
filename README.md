@@ -1,6 +1,6 @@
 # CCDM — Claude Code Discord Manager
 
-Manage multiple [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and Codex sessions from Discord through **one bot**. A local **Router** holds that bot's token and connects each project channel to the one session serving it.
+Manage multiple [Claude Code](https://docs.anthropic.com/en/docs/claude-code), Codex and Gemini sessions from Discord through **one bot**. A local **Router** holds that bot's token and connects each project channel to the one session serving it.
 
 ```
 Discord Server (one bot: root)
@@ -33,7 +33,7 @@ The root agent is a Claude Code or Codex session that is itself a Router client.
 - **Restart itself** without manual intervention
 - **Transcribe voice messages** using Whisper
 
-Each project has its own channel, its own session, and its own **Project Identity**: a per-channel webhook `ccdm-<project>` whose messages post as `<project>-<claude|codex> · N%`, with live context usage in the name. You chat with each project in its own channel, no `@mention` needed. The root agent listens in `#root` without `@mention`, and `@mentioning` the bot in a project channel reaches root only, never the project.
+Each project has its own channel, its own session, and its own **Project Identity**: a per-channel webhook `ccdm-<project>` whose messages post as `<project>-<claude|codex|gemini> · N%`, with live context usage in the name. You chat with each project in its own channel, no `@mention` needed. The root agent listens in `#root` without `@mention`, and `@mentioning` the bot in a project channel reaches root only, never the project.
 
 Each session has a **Session Scope**: the one channel it may read and act in. The Router rejects anything outside it with `scope_violation` and logs the attempt. A new launch writes a new key, which disconnects the previous listener, so two sessions never answer the same channel. Messages to a channel with no live session get 💤 and are not replayed later (a project not yet migrated, with no `webhook_id`, gets no 💤).
 
@@ -50,6 +50,7 @@ Each session has a **Session Scope**: the one channel it may read and act in. Th
 | Node.js 22.5+ | Yes | `brew install node`, then `npm install` in this repo (the Router, channel server, and Codex bridge) |
 | `jq` | Yes | `brew install jq` / `apt install jq` |
 | `whisper` | Optional | `pip install openai-whisper` (for voice messages) |
+| Google Antigravity CLI (`agy`) | Optional | For Gemini sessions; install it and sign in once with `agy` (see [Gemini sessions](#gemini-sessions-antigravity-cli)) |
 
 For Codex bridge sessions, voice-message transcription is on by default. The
 bridge transcribes `audio/*` attachments with local `whisper` and sends Codex
@@ -446,7 +447,7 @@ Message the root agent on Discord with any of these:
 | Command | Description |
 |---------|-------------|
 | `list` / `status` | Show all registered projects and their status |
-| `start <project>` | Start a project's Claude Code or Codex session |
+| `start <project>` | Start a project's Claude Code, Codex or Gemini session |
 | `stop <project>` | Stop a project's session |
 | `restart <project>` | Restart a project's session |
 | `register` / `setup` | Register a project to a channel (interactive — asks for channel, path, and provider) |
@@ -459,7 +460,7 @@ Message the root agent on Discord with any of these:
 | `restart yourself` | Self-restart the root agent |
 | `create a poll` | Create a native Discord poll in any channel |
 
-In a project channel, these plain commands are handled by that project's session for both Claude and Codex, never as an agent turn:
+In a project channel, these plain commands are handled by that project's session for Claude, Codex and Gemini, never as an agent turn:
 
 | Command | Description |
 |---------|-------------|
@@ -515,6 +516,54 @@ a missing transcript, a non-UUID, or an already running session is refused
 before anything starts. A resume launch that fails to reach the Router cleans up
 and exits non-zero instead of starting a fresh conversation.
 
+### Gemini sessions (Antigravity CLI)
+
+A project with `"type": "gemini"` runs Gemini through the Google Antigravity
+CLI, `agy`. Install it, run `agy` once to sign in with Google, then register
+the project with that type and start it:
+
+```bash
+scripts/start-gemini-session.sh my-project
+```
+
+`scripts/gemini-bridge.js` runs `agy acp`, agy's Agent Client Protocol server,
+in the project directory and talks to it over stdio. Like Codex, the bridge is
+a Router client with a launch key and no Discord token, and replies post as
+`my-project-gemini · N%`. The scoped Discord tools reach Gemini as an MCP
+server attached to that one agy session, so no agy config file is written.
+
+- **Model and thinking level:** `gemini_model` (or `model`) and
+  `gemini_effort` (`low`, `medium`, `high`, `xhigh`) in the project entry.
+  Unset, the bridge uses `gemini-4-neon` at `high`. Any model `agy models`
+  lists works, including a level suffix such as `gemini-4-neon-xhigh`, and an
+  unknown model fails the launch with the list agy offers.
+- **Messages during a turn:** ACP cannot steer a running turn. A message sent
+  while Gemini works gets ⏳, and every waiting message goes into the next turn
+  together.
+- **Commands:** `/pause`, `/unpause`, `/compact` (agy's own compaction),
+  `/clear` (cancels any turn and opens a fresh agy session) and `/restart` work
+  as for Codex.
+- **Tools:** agy's tool permission requests are approved automatically, the
+  way Codex sessions run with approvals off.
+- **Text replies:** a turn that ends with text but no successful `reply` call
+  posts that text, so an answer is never lost. Set `"text_reply_fallback": false`
+  in the project entry to turn this off, for the project and its Gemini threads.
+- **Resume:** the launch records the agy session id as the project's
+  `session_id`. `scripts/start-gemini-session.sh my-project --resume <session_id>`
+  continues it. It refuses an id with no conversation in
+  `~/.gemini/antigravity-cli/conversations`, and refuses while the project's
+  session still runs.
+- **`/clear` and `/restart`:** a turn that ignores `/clear`'s cancel for 15 s
+  stops the session (restart it) rather than leaving it stuck. `/restart`
+  waits for agy itself to exit before relaunching.
+- **Account:** agy uses the one Google account it is signed in with, so
+  Gemini has no account aliases. `CCDM_AGY_BIN` names another agy binary.
+
+A Thread Conversation can run Gemini too, under a project of any provider:
+`/thread <name> --provider gemini [--model <model>] [--effort <effort>]`.
+A project's plain `model` goes only to threads of the project's own provider,
+so a Claude or Codex thread of a Gemini project never inherits a Gemini model.
+
 ### Registering a New Project
 
 Once the root agent and the Router are running, message root in `#root`:
@@ -566,19 +615,20 @@ For users already in the server, use `grant` instead of `invite`. Use `revoke` t
 
 ## Thread Conversations
 
-Open a public thread under a registered project channel and type a task: it becomes a **Thread Conversation**, a fresh Claude Code or Codex conversation for that project, running in the project checkout. The Router scopes it to that thread alone, so the Channel Conversation and sibling threads never see its traffic. Replies post into the thread through the project's webhook as `<project>-<provider> · N%`. The owner and the channel's guests drive threads without an @mention. Full details are in [docs/thread-supervisor.md](docs/thread-supervisor.md).
+Open a public thread under a registered project channel and type a task: it becomes a **Thread Conversation**, a fresh Claude Code, Codex or Gemini conversation for that project, running in the project checkout. The Router scopes it to that thread alone, so the Channel Conversation and sibling threads never see its traffic. Replies post into the thread through the project's webhook as `<project>-<provider> · N%`. The owner and the channel's guests drive threads without an @mention. Full details are in [docs/thread-supervisor.md](docs/thread-supervisor.md).
 
-- **Create** by hand, with `/thread <name> [--provider claude|codex] [--account <alias>] [--model <model>] [--effort <effort>] [first message…]` in the project channel, from the channel agent's `create_thread` tool, or with `scripts/threads.sh create <project> <name> [flags] [message]`. Created threads auto-archive after a week.
+- **Create** by hand, with `/thread <name> [--provider claude|codex|gemini] [--account <alias>] [--model <model>] [--effort <effort>] [first message…]` in the project channel, from the channel agent's `create_thread` tool, or with `scripts/threads.sh create <project> <name> [flags] [message]`. Created threads auto-archive after a week.
+- **Configure and start an existing thread** with `scripts/threads.sh restart [<project>] <name|link|id> [flags]`. A provider or account change starts fresh; model and effort alone keep the current conversation.
 - **In a thread:**
-  - `/config` shows or changes the thread's provider, account, model and effort. A provider or account change applies only after your ✅.
+  - `/config` shows or changes the thread's provider, account, model and effort. A provider or account change applies only after your ✅. Switching provider also drops the thread's account, model and effort for the old provider, unless the same `/config` sets them.
   - `/model` shows the model, thinking level and account/home the thread runs with.
   - `/restart` resumes the conversation, and `/clear` starts a fresh one.
   - `/compact`, `/pause` and `/unpause` work as in a channel.
   - `/close` archives the thread, stops its session and closes its reminders.
 - **Lifecycle:** a thread stays open until `/close` (or `scripts/threads.sh close`), which archives it and closes the conversation. Any other archive, Discord's one-week inactivity auto-archive or one by hand, is reverted at once, and an idle session is stopped. Your next message resumes the same conversation, and only your message reopens a closed one.
 - **Status:** root reacts on your message instead of posting. ⏳ means the agent is working on it (only your latest message carries it), ✅ that the turn ended and it is your turn, and ⚠️ that the turn failed or the session crashed. A stop or `/close` takes the ⏳ off; ✅ and ⚠️ stay.
-- **Capacity:** live thread sessions are capped per provider by the registry's `thread_session_caps` (default `{"claude": 6, "codex": 8}`). At the cap the longest-idle session is paused, or the new one is queued.
-- **Accounts:** a thread may use an alias from `codex_accounts`, or from the new `claude_accounts` map (alias → Claude home).
+- **Capacity:** live thread sessions are capped per provider by the registry's `thread_session_caps` (default `{"claude": 6, "codex": 8, "gemini": 4}`). At the cap the longest-idle session is paused, or the new one is queued.
+- **Accounts:** a thread may use an alias from `codex_accounts`, or from the new `claude_accounts` map (alias → Claude home). Gemini threads use agy's one signed-in account.
 - **Operate:**
   - `scripts/threads.sh list|stop|restart|close` takes a thread name, link or id.
   - `scripts/stop-session.sh <project> --threads` stops only the thread sessions, and `--all` stops the channel too. A plain `stop-session.sh <project>`, or a channel restart, leaves threads alone.
@@ -737,8 +787,25 @@ The poster reports:
   ends `running on credits`
 - Local token-usage fallback from each named Codex Home's `sessions` directory
   when live rate limits are unavailable
+- Google Antigravity CLI (`agy`) subscription quota in its own `Antigravity`
+  field: one block per model group from `agy -p /usage --output-format json`
+  (today **Gemini Models** and **Claude and GPT models**, each with a 5-hour
+  and a weekly row, plus the separate **Gemini 4 Argon** weekly cap), shown as
+  percent used with the reset time; an untouched bucket shows no reset time,
+  because agy reports "now + window" for a window that has not started.
+  `/usage` is a read-only print-mode command: it starts no agent turn, spends
+  no quota, and leaves no conversation. The poster runs it once per run with
+  the repository as its workspace, stdin closed, the CLI log sent to
+  `/dev/null`, and a 30-second limit (`CCDM_AGY_TIMEOUT_SECONDS`) that kills
+  agy's process group. The binary is `CCDM_AGY_BIN` when set, else `agy` on
+  `PATH`, else `~/.local/bin/agy`. A machine with no agy binary and no
+  `~/.gemini/antigravity-cli` directory gets no Antigravity field; otherwise a
+  missing binary, an expired sign-in, a timeout, or unreadable output is one
+  short `*Usage unavailable: <reason>*` line and the rest of the report is
+  unchanged. Each row is recorded in history as its own series (provider
+  `antigravity`, window such as `weekly (Gemini Models)`, with `scope`)
 
-Each automated Discord post sends only the original text Usage Report embed. A provider section longer than one embed field (1024 characters) continues in further fields named `Claude Code (cont.)` or `Codex (cont.)`, split only between account blocks, so no account is cut off; only a single block longer than a whole field is truncated, and an embed over Discord's 25-field or 6000-character limit drops trailing continuation fields (marking the last one kept as truncated) while each provider keeps its first field. Codex is displayed as a weekly allowance only. Claude API-key accounts have no comparable percentage limit, so their embed text shows sanitized local estimated Today and This month costs, request counts, and status. The credential-free trend renderer (`scripts/usage-dashboard-renderer.py`) is retained for back-compat but is no longer invoked by the posting workflow.
+Each automated Discord post sends only the original text Usage Report embed. A provider section longer than one embed field (1024 characters) continues in further fields named `Claude Code (cont.)`, `Codex (cont.)`, or `Antigravity (cont.)`, split only between account (or model-group) blocks, so no account is cut off; only a single block longer than a whole field is truncated, and an embed over Discord's 25-field or 6000-character limit drops trailing continuation fields (marking the last one kept as truncated) while each provider keeps its first field. Codex is displayed as a weekly allowance only. Claude API-key accounts have no comparable percentage limit, so their embed text shows sanitized local estimated Today and This month costs, request counts, and status. The credential-free trend renderer (`scripts/usage-dashboard-renderer.py`) is retained for back-compat but is no longer invoked by the posting workflow.
 
 The poster reads the same named-account registry configuration shown in
 [Codex Accounts](#codex-accounts); it does not need a separate list of Codex
@@ -795,6 +862,12 @@ Run a live legacy JSON-embed post separately after validation; installation neve
 python3 scripts/usage-stats-poster.py
 ```
 
+Preview the report without posting with `--dry-run`: it collects every provider and prints each embed field to stdout, needs no bot token, never posts, and never creates or writes the history database (it only reads it, best effort, for Codex credits used, like a manual post). `--dry-run` wins over `CCDM_USAGE_STATS_AUTOMATED=1`.
+
+```bash
+python3 scripts/usage-stats-poster.py --dry-run
+```
+
 Configured Codex Homes that carry the `ccdm-deepseek.json` setup marker are reported from DeepSeek instead of the Codex rate-limit request. The poster reads the home's private `api-key` directly, fetches the account-wide balance from the fixed official `GET /user/balance` endpoint on `https://api.deepseek.com` (one request per distinct key per run), and pairs it with this month's local DeepSeek token totals from the DeepSeek session rollouts. The embed shows a compact `deepseek-flash (API)` block: a bold remaining balance, a paid/granted breakdown, this month's local token total and session count, an optional `Tokens:` split line, and a short `Balance: whole account · Usage: local Codex` footer instead of a technical coverage paragraph. No money history or spend figure is derived from the balance. A DeepSeek-backed root Codex session still runs through the Codex app-server; only this rate-limit query is skipped. Homes sharing a key are grouped under one labeled note, and a rollout copied between them is counted once; distinct keys stay separate because no account identifier is available. Reference: [Get User Balance](https://api-docs.deepseek.com/api/get-user-balance/).
 
 Coverage is this machine's local Codex sessions in the configured DeepSeek homes only. Other clients, other machines, ephemeral workers, and deleted rollouts are excluded, so the block never claims a provider-wide total. The API reports an account balance rather than spend or quota, so the balance is account-wide while the token totals stay local; responses that do not match DeepSeek's documented balance schema are reported as unavailable instead of shown.
@@ -824,7 +897,7 @@ rm ~/Library/LaunchAgents/com.discord.usage-stats-poster.plist
 
 ## Context Usage in the Project Identity
 
-Each project reply posts as `<project>-<claude|codex> · N%`, where `N` is the session's context window usage at send time. No bot nickname is changed.
+Each project reply posts as `<project>-<claude|codex|gemini> · N%`, where `N` is the session's context window usage at send time. No bot nickname is changed.
 
 - **Codex** sessions report `N` from the bridge's tracked token usage.
 - **Claude** sessions report it through Claude Code's `statusLine` setting: the status script writes the latest percentage to a private file in the project's Router launch directory, and the CCDM channel server sends it with each reply.
@@ -1413,7 +1486,8 @@ ccdm/
     install-router-service.sh # Install the com.ccdm.router LaunchAgent
     ccdm-channel-server.js   # CCDM channel server for Claude sessions (project and root)
     codex-bridge.js          # Codex app-server bridge (project and root) in Router mode
-    discord-mcp-server.js    # Scoped Discord tools for Codex, backed by the Router
+    gemini-bridge.js         # Gemini bridge: drives agy acp (project and thread) in Router mode
+    discord-mcp-server.js    # Scoped Discord tools for Codex and Gemini, backed by the Router
     migrate-to-router.sh     # One-project cutover onto the Router
     retire-pool.sh           # Remove leftover pool bots, state, role, and registry fields
     guest-access.js          # Project-scoped guest invites, grants, and revokes
@@ -1424,6 +1498,7 @@ ccdm/
     send-claude-command.sh   # Types /compact or /clear into a Claude tmux session
     start-session.sh         # Start a registered Claude project
     start-codex-session.sh   # Start a registered Codex project
+    start-gemini-session.sh  # Start a registered Gemini project (agy)
     stop-session.sh          # Stop any registered project (--threads, --all)
     start-thread-session.sh  # Start one Thread Conversation (run by the Thread Supervisor)
     thread-supervisor.py     # The Thread Supervisor worker and CLI (run, status, enable, disable, preflight)

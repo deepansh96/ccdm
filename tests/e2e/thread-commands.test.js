@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { assertPrivate } from "./support/platform.js";
+import { PYTHON, assertPrivate } from "./support/platform.js";
 import { collectProcess, injectDiscordMessage, injectDiscordReaction, startFakeCodexServer } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import { OWNER_ID, ROOT_TOKEN, connectSession, createRouterWorkspace, routerEnv, routerRegistry,
@@ -161,7 +161,7 @@ test("an invalid provider, a foreign or unknown account alias, or an invalid mod
   const workspace = commandWorkspace();
   await supervised(workspace);
   const commands = [
-    "/thread a --provider gemini hello",
+    "/thread a --provider llama hello",
     "/thread b --account nobody hello",
     // `work` is a Claude alias, not a Codex one.
     "/thread c --provider codex --account work hello",
@@ -181,7 +181,7 @@ test("an invalid provider, a foreign or unknown account alias, or an invalid mod
     assert.match(notice.content, /^Thread not created: /);
   }
   const texts = notices(workspace, "demo-channel").map(notice => notice.content);
-  assert.match(texts[0], /gemini/);
+  assert.match(texts[0], /llama/);
   assert.match(texts[1], /nobody/);
   assert.match(texts[2], /work/);
   assert.match(texts[3], /turbo/);
@@ -919,4 +919,25 @@ test("/model in a thread lists its overrides and project settings, for a guest t
   await settle(500);
   assert.equal((await threadRow(workspace, CREATED_THREAD_ID)).state, "registered");
   assert.deepEqual(claude(workspace).invocations, []);
+});
+
+test("/config provider=… drops the thread's account, model and effort for the old provider instead of refusing them", async () => {
+  const workspace = commandWorkspace();
+  await supervised(workspace);
+  await liveThread(workspace, THREAD_ID);
+  const { spawnSync } = await import("node:child_process");
+  const set = spawnSync(PYTHON, ["-c", `import sqlite3, sys
+db = sqlite3.connect(sys.argv[1], timeout=5)
+db.execute("UPDATE threads SET account = 'work', effort = 'max' WHERE thread_id = ?", (sys.argv[2],))
+db.commit()`, path.join(supervisorStateDir(workspace), "threads.sqlite3"), THREAD_ID], { encoding: "utf8" });
+  assert.equal(set.status, 0, set.stderr);
+
+  threadMessage(workspace, THREAD_ID, "config-provider", "/config provider=gemini");
+  await waitFor(() => notices(workspace, THREAD_ID).length === 1, () => `the warning: ${JSON.stringify(
+    notices(workspace, THREAD_ID))}`, 15000);
+
+  assert.equal(notices(workspace, THREAD_ID)[0].content, "Changing provider gemini · account default · effort default " +
+    "starts a fresh conversation in this thread. React ✅ to this message to apply it.");
+  const row = await threadRow(workspace, THREAD_ID);
+  assert.deepEqual([row.provider, row.account, row.effort], [null, "work", "max"]);
 });

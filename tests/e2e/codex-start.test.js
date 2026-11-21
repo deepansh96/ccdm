@@ -270,7 +270,10 @@ test("start-codex-session constructs a Router bridge tmux launch, removes stale 
     // The host starts a session with none of the caller's CCDM names, so a few more are passed.
     for (const [name, value] of Object.entries(expectedEnv)) assert.equal(session.env[name], value, name);
   } else {
-    assert.deepEqual(session.env, expectedEnv);
+    // tmux runs zsh through `env`, which switches off prompts in ~/.zshrc.
+    const wrapperEnv = { DISABLE_AUTO_UPDATE: "true", DISABLE_UPDATE_PROMPT: "true" };
+    assert.deepEqual(session.wrapperEnv, wrapperEnv);
+    assert.deepEqual(session.env, { ...wrapperEnv, ...expectedEnv });
     for (const forbidden of ["BOT_TOKEN", "DISCORD_STATE_DIR"]) {
       assert.equal(session.shellCommand.includes(forbidden), false, forbidden);
     }

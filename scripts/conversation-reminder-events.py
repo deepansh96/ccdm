@@ -38,6 +38,8 @@ EVENT_TYPES = {
     "conversation_deleted",
 }
 THREAD_LIFECYCLE_EVENTS = {"conversation_reset", "conversation_closed", "conversation_deleted"}
+# Providers whose project or thread adapters record lifecycle events.
+PROJECT_PROVIDERS = {"codex", "claude", "gemini"}
 ALLOWED_FIELDS = {
     "schema_version",
     "event_id",
@@ -254,12 +256,12 @@ def validate_event(event: object) -> dict:
         raise ValueError("event_time must include a timezone")
     normalized = dict(event)
     normalized["event_order"] = _event_order_key(event["event_order"])
-    if normalized["provider"] not in {"codex", "claude", "ccdm-root"}:
+    if normalized["provider"] not in {"codex", "claude", "gemini", "ccdm-root"}:
         raise ValueError("unsupported event provider")
     event_type = normalized["event_type"]
-    if event_type in {"response_delivered", "turn_completed", "input_needed", "work_resumed", "session_terminated"} and normalized["provider"] not in {"codex", "claude"}:
+    if event_type in {"response_delivered", "turn_completed", "input_needed", "work_resumed", "session_terminated"} and normalized["provider"] not in PROJECT_PROVIDERS:
         raise ValueError("provider lifecycle events require a project adapter")
-    if event_type in {"owner_activity", "close_requested"} and normalized["provider"] not in {"codex", "claude", "ccdm-root"}:
+    if event_type in {"owner_activity", "close_requested"} and normalized["provider"] not in {*PROJECT_PROVIDERS, "ccdm-root"}:
         raise ValueError("owner events require a registered CCDM adapter")
     if event_type in THREAD_LIFECYCLE_EVENTS and (
             normalized["provider"] != "ccdm-root"
@@ -316,7 +318,7 @@ def _assignment_result(registry: dict, event: dict) -> tuple[str | None, str | N
         return "stale", "project assignment generation changed"
     # A Thread Conversation runs its own provider, whatever its project's is.
     in_thread = event.get("conversation_id", event["channel_id"]) != event["channel_id"]
-    if (event["provider"] in {"codex", "claude"} and not in_thread
+    if (event["provider"] in PROJECT_PROVIDERS and not in_thread
             and (assignment["project"].get("type") or "claude") != event["provider"]):
         return "rejected", "adapter event targets a different project provider"
     if event["event_type"] in {"owner_activity", "close_requested"} and event.get("actor_id") != assignment["owner_id"]:

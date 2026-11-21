@@ -230,7 +230,7 @@ for (const language of LANGUAGES) {
       env: { CCDM_ROUTER_KEY_FILE: "/keys/a.key", CCDM_SESSION_NAME: "from-caller" },
       kind: "project",
     });
-    assert.deepEqual(tmuxCalls(workspace), [["new-session", "-d", "-s", "tm-a", "--", "zsh", "-ic",
+    assert.deepEqual(tmuxCalls(workspace), [["new-session", "-d", "-s", "tm-a", "--", "env", "DISABLE_AUTO_UPDATE=true", "DISABLE_UPDATE_PROMPT=true", "zsh", "-ic",
       `cd '${workspace.tmpDir}' && CCDM_ROUTER_KEY_FILE='/keys/a.key' CCDM_SESSION_NAME='tm-a' claude --dangerously-load-development-channels server:ccdm --dangerously-skip-permissions`]]);
     const [record] = launches(workspace);
     assert.equal(record.front, "tmux");

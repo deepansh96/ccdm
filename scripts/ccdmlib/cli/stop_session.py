@@ -53,7 +53,7 @@ _STOP_FAILED = "stop_failed"
 _KEY_FILE_FLAG = "--ccdm-key-file"
 # What a session's own processes can be. A launch-file path in anything else, an
 # editor for one, does not make that program part of the session.
-_LISTENER_PROGRAMS = frozenset(("claude", "node", "bun", "codex"))
+_LISTENER_PROGRAMS = frozenset(("claude", "node", "bun", "codex", "agy"))
 _APP_SERVER_PROGRAMS = frozenset(("node", "codex"))
 _LOWEST_USER_PID = 5
 
@@ -224,13 +224,18 @@ def _find_legacy_pool_pids(state_dir: str) -> List[str]:
 
 
 def _is_router_claude_listener(command: str) -> bool:
+    """A Claude listener (claude and its channel server) or a Gemini one (the bridge and its agy)."""
     argv = _argv_of(command)
     if not argv:
         return False
     exe = os.path.basename(argv[0])
     if exe == "claude":
         return "--dangerously-load-development-channels" in argv and "server:ccdm" in argv
-    return exe == "node" and any(os.path.basename(arg) == "ccdm-channel-server.js" for arg in argv[1:])
+    if exe == "agy":
+        return "acp" in argv
+    return exe == "node" and any(
+        os.path.basename(arg) in ("ccdm-channel-server.js", "gemini-bridge.js") for arg in argv[1:]
+    )
 
 
 def _find_router_claude_pids(key_file: Path) -> List[str]:
@@ -548,7 +553,9 @@ def _remove_claude_state(session: _Session) -> None:
                 if entry.name != "threads":
                     _remove_entry(entry)
             _remove_launch_dir_if_empty(launch)
-        _remove_entry(session.marker)
+        # The stopped launch no longer proves a verified Claude transport.
+        if session.session_type == "claude":
+            _remove_entry(session.marker)
     except OSError as error:
         if not proc.WIN32:
             raise

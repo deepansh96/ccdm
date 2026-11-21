@@ -282,7 +282,7 @@ if (!ROUTER_ROOT && !ROUTER_THREAD_ID) {
       type: "object",
       properties: withScopeToken({
         name: { type: "string", description: "Thread name (1-100 characters)" },
-        provider: { type: "string", enum: ["claude", "codex"], description: "Thread provider. Defaults to the project's." },
+        provider: { type: "string", enum: ["claude", "codex", "gemini"], description: "Thread provider. Defaults to the project's." },
         account: { type: "string", description: "An account alias from the provider's claude_accounts or codex_accounts" },
         model: { type: "string", description: "Model name for the thread's session" },
         effort: { type: "string", description: "Reasoning effort for the thread's session" },

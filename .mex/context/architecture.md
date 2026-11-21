@@ -12,7 +12,7 @@ edges:
     condition: when specific technology details are needed
   - target: context/decisions.md
     condition: when understanding why the architecture is structured this way
-last_updated: 2026-11-18
+last_updated: 2026-11-21
 ---
 
 # Architecture
@@ -25,9 +25,11 @@ Discord (one bot: root) <-> Router (scripts/router.js, holds the only token; a s
          root channels + bot mentions; start/stop/guest/registration scripts
     -> Claude project: ccdm-channel-server.js -> Claude Code in project directory
     -> Codex project: codex-bridge.js -> codex app-server in project directory
+    -> Gemini project: gemini-bridge.js -> agy acp (ACP over stdio) in project directory
     -> Conversation Reminder observer (read-only)
     -> Thread Conversation (thread role, one per live thread): ccdm start-thread-session ->
-         ccdm-channel-server.js (thread mode) -> Claude Code, or codex-bridge.js (thread mode) -> codex app-server
+         ccdm-channel-server.js (thread mode) -> Claude Code, codex-bridge.js (thread mode) -> codex app-server,
+         or gemini-bridge.js (thread mode, macOS only) -> agy acp
     -> Thread Supervisor link (supervisor role) <-> NDJSON stdio <-> Python worker
   replies -> project webhook ccdm-<project> as "<project>-<type> · N%" (in a thread: ?thread_id=, named for the thread's provider)
 ```
@@ -38,7 +40,8 @@ Every session runs in a session host: tmux on macOS, `ccdm-host` (`scripts/ccdm-
 
 ## Key Components
 - **`registry.json`** - source of truth for the owner, root channels and allowed users, project channels and `webhook_id`s, guests, session names, account homes, and runtime PIDs; local and untracked. It holds no bot or webhook token.
-- **Session commands** - `scripts/ccdm start-session`, `scripts/ccdm start-codex-session`, `scripts/ccdm stop-session` and `scripts/ccdm restart-session` enforce one listener per assignment and maintain registry runtime state on both OSes. `scripts/ccdm list`, `status`, `session` and `context report` read and drive sessions for root. The shell scripts with the same names are shims that run them.
+- **Session commands** - `scripts/ccdm start-session`, `scripts/ccdm start-codex-session`, `scripts/ccdm start-gemini-session`, `scripts/ccdm stop-session` and `scripts/ccdm restart-session` enforce one listener per assignment and maintain registry runtime state. `scripts/ccdm list`, `status`, `session` and `context report` read and drive sessions for root. The shell scripts with the same names are shims that run them, except the Gemini launcher, which is still the shell script that `scripts/ccdm start-gemini-session` runs, on macOS only.
+- **`scripts/gemini-bridge.js`** - connects Discord to a Gemini session in the Google Antigravity CLI (macOS only for now; Windows refuses Gemini projects and threads): it runs `agy acp --dangerously-skip-permissions` in the project directory and speaks the Agent Client Protocol (JSON-RPC over stdio) to it. It reuses the Router transport seam (`codex-bridge-transport.js`) and the scoped `discord-mcp-server.js`, which it attaches to its one agy session through `session/new` `mcpServers` (no agy config file is written, so no config lock), and appends the Discord transport instruction to the session's system prompt (`_meta.antigravity.systemPrompt.append`), so it needs no bootstrap turn. ACP cannot steer a running prompt, so mid-turn messages queue with ⏳ and go into the next turn together; tool permission requests are approved; a turn that ends with text but no successful `reply` (tracked by the tool call's `completed`/`failed` status) posts the text. Model and thinking level are ACP config options (`session/set_config_option` `model`, `thought_level`).
 - **Claude reminder events** - every Claude session's `ccdm-channel-server.js` records owner interactions and reply receipts itself; command hooks and the shared durable receiver record lifecycle events. The foreground service owns reminder delivery, bounded history discovery, restart/reconnect reconciliation, and globally spaced catch-up; `enable` opts in only when both provider adapters are installed.
 - **Conversation Reminder service** - `conversation-reminder-service.py run` observes every project channel as the Router's read-only `observer` client, with no Gateway login of its own and whatever the registry `transport` says. It identifies each project as `router:<webhook_id>`, sends every reminder, acknowledgment, and cleanup delete as root over REST (including deletes left by v7 `pool:` history rows), and detects agent replies by the project's `webhook_id`. It runs in the foreground or, on macOS, under the opt-in `com.discord.conversation-reminders` LaunchAgent. Both launches share one worker lock and the same reconciliation, independently of project and root coding sessions.
   - macOS: `install-conversation-reminder-service.sh` installs that LaunchAgent.
@@ -64,6 +67,7 @@ Every session runs in a session host: tmux on macOS, `ccdm-host` (`scripts/ccdm-
 - `Discord API / discord.js` - the Router's one gateway connection and REST (webhooks, messages, reactions), plus root admin REST for channels, roles, invites, and guest permission overrides. Isolation is the Router's Session Scope, not Discord permissions.
 - `Claude Code` - runs Claude project and root sessions with the CCDM development channel (`server:ccdm`), never the official Discord plugin.
 - `Codex CLI/app-server` - runs Codex project sessions; the bridge registers a scoped Discord MCP server dynamically.
+- `Google Antigravity CLI (agy)` - runs Gemini project and thread sessions through `agy acp` (macOS); signed in once with Google OAuth, and holds its conversations in `~/.gemini/antigravity-cli`.
 - `tmux` (macOS) or `ccdm-host` (Windows) - owns long-running local sessions and provides the Claude slash-command relay boundary.
 - `macOS Keychain / local auth files` - store agent credentials; never copy their contents into tracked files.
 

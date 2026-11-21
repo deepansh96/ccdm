@@ -214,7 +214,7 @@ test("send-claude-command's refusals read as they did, with this OS's word for a
 
   assert.deepEqual(await refusal(["alpha", "compact"]), [1, "", `Claude ${SESSION_WORD} 'alpha_session' for project 'alpha' is not running.\n`]);
   assert.deepEqual(await refusal(["beta", "/clear"]), [1, "", `Project 'beta' is remote (remote:vm-beta). Run /clear on the remote ${SESSION_WORD} instead.\n`]);
-  assert.deepEqual(await refusal(["gamma", "/compact"]), [1, "", "Project 'gamma' is type 'codex', not 'claude'. Codex sessions handle /compact and /clear directly in their project channel.\n"]);
+  assert.deepEqual(await refusal(["gamma", "/compact"]), [1, "", "Project 'gamma' is type 'codex', not 'claude'. Codex and Gemini sessions handle /compact and /clear directly in their project channel.\n"]);
   assert.deepEqual(await refusal(["unnamed", "/compact"]), [2, "", "Project unnamed has no screen_name in registry.json\n"]);
   assert.deepEqual(await refusal(["--channel", "channel-alpha", "/compact"]), [2, "", "Channel channel-alpha matches multiple projects: alpha, shared\n"]);
   assert.deepEqual(await refusal(["--project", "nowhere", "/compact"]), [2, "", "Unknown project: nowhere\n"]);

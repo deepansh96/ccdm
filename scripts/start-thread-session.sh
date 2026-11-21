@@ -1,5 +1,5 @@
 #!/bin/sh
-# Usage: ./scripts/start-thread-session.sh <project> <thread_id> --provider claude|codex
+# Usage: ./scripts/start-thread-session.sh <project> <thread_id> --provider claude|codex|gemini
 #          [--account <alias>] [--model <model>] [--effort <effort>] [--resume <id>] [--home <path>]
 # The command itself is scripts/ccdmlib/cli/start_thread_session.py.
 CCDM_INVOKED_AS=$0

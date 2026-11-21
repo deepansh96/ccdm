@@ -189,7 +189,7 @@ def _run(args: argparse.Namespace) -> int:
     if target.session_type != "claude":
         _fail(
             f"{subject_start} is type '{target.session_type}', not 'claude'. "
-            f"Codex sessions handle /compact and /clear directly in their {own_channel}.",
+            f"Codex and Gemini sessions handle /compact and /clear directly in their {own_channel}.",
             1,
         )
     if target.path.startswith("remote:"):

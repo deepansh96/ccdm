@@ -91,9 +91,9 @@ def build_readiness(project_name: str, project_root: Path, state_dir: Path) -> d
             "bot_id": assignment["bot_id"],
             "generation": assignment["generation"],
         }
-        if provider not in {"codex", "claude"}:
+        if provider not in {"codex", "claude", "gemini"}:
             unsupported_capabilities.append(f"provider {provider} has no reminder adapter")
-        if str(project.get("path") or "").startswith("remote:") and provider in {"codex", "claude"}:
+        if str(project.get("path") or "").startswith("remote:") and provider in {"codex", "claude", "gemini"}:
             # Local events cannot prove an authenticated adapter on the remote host.
             unsupported_capabilities.append(
                 f"remote {provider.capitalize()} adapter deployment is not verified by local readiness")
@@ -144,11 +144,11 @@ def build_readiness(project_name: str, project_root: Path, state_dir: Path) -> d
         "unsupported_capabilities": unsupported_capabilities,
         "assignment": assignment_summary,
         "capabilities": {
-            "scoped_reply_receipts": provider in {"codex", "claude"},
-            "attachment_reply_receipts": provider in {"codex", "claude"},
-            "successful_text_fallback_receipts": provider == "codex",
-            "progress_input_needed_disposition": provider in {"codex", "claude"},
-            "active_turn_resume_events": provider in {"codex", "claude"},
+            "scoped_reply_receipts": provider in {"codex", "claude", "gemini"},
+            "attachment_reply_receipts": provider in {"codex", "claude", "gemini"},
+            "successful_text_fallback_receipts": provider in {"codex", "gemini"},
+            "progress_input_needed_disposition": provider in {"codex", "claude", "gemini"},
+            "active_turn_resume_events": provider in {"codex", "claude", "gemini"},
             "owner_activity_events": True,
             "exact_close_interception": True,
             "durable_event_replay": receiver.get("available", False),
@@ -159,6 +159,8 @@ def build_readiness(project_name: str, project_root: Path, state_dir: Path) -> d
             "bridge_contract": (
                 "Claude Code 2.x from 2.1.281 command hooks and official Discord plugin 0.0.4 MCP stdio; local fake in the default E2E suite"
                 if provider == "claude" else
+                "agy ACP JSON-RPC over stdio; local fake in the default E2E suite"
+                if provider == "gemini" else
                 "Codex app-server JSON-RPC over WebSocket; local fake in the default E2E suite"
             ),
             "provider_login_used": False,

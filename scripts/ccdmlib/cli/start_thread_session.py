@@ -22,8 +22,14 @@ A Codex thread runs ``codex-bridge.js`` in thread mode, with its own app-server 
 the place of the project's ``codex_account`` in ``resolve-codex-home.py``, and its
 provider conversation id is the Codex thread uuid.
 
+A Gemini thread runs ``gemini-bridge.js`` in thread mode, driving its own ``agy
+acp`` over stdio (no port). Gemini has no account aliases; its provider
+conversation id is the agy session id, and its home is agy's data directory,
+``~/.gemini/antigravity-cli``. The Gemini bridge has not been ported to Windows,
+where a Gemini thread is refused.
+
 ``--resume`` continues the thread's provider conversation (``claude --resume``, or
-the bridge's Codex thread uuid) in the same home and cwd. ``--home`` names that
+the bridge's Codex thread uuid or agy session id) in the same home and cwd. ``--home`` names that
 home (the one the conversation started in, which the supervisor stored) when it
 differs from what the project resolves to now. A missing transcript or rollout
 fails the start before any key or session exists; it never starts a fresh
@@ -54,7 +60,7 @@ from .start_codex_session import _FORWARDED_ON_WINDOWS, _KEY_FILE_FLAG, _names_k
 WIN32 = sys.platform == "win32"
 _COMMAND = "start-thread-session"
 _ARGUMENT_FORM = (
-    "<project> <thread_id> --provider claude|codex [--account <alias>] [--model <model>] "
+    "<project> <thread_id> --provider claude|codex|gemini [--account <alias>] [--model <model>] "
     "[--effort <effort>] [--resume <id>] [--home <path>]"
 )
 _INVOKED_AS = "CCDM_INVOKED_AS"  # Set by scripts/start-thread-session.sh: its own $0, for the usage line.
@@ -62,6 +68,8 @@ _DEFAULT_INVOCATION = f"scripts/ccdm {_COMMAND}" if WIN32 else "scripts/start-th
 _OPTIONS = ("--provider", "--account", "--model", "--effort", "--resume", "--home")
 _ID = re.compile(r"[0-9A-Za-z_-]+")
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
+_GEMINI_EFFORTS = ("low", "medium", "high", "xhigh")
+_GEMINI_MODEL = re.compile(r"[A-Za-z0-9._:-]+")
 _DIGITS = re.compile(r"[0-9]+")
 _REFUSED_IN_ANY_HOME = "'\"$`\n"
 _DEFAULT_BOOT_TIMEOUT_S = 120.0
@@ -72,7 +80,8 @@ _PID_ROUND_S = 0.5
 _FAILED_BRIDGE_GRACE_MS = 3000
 _CHANNEL_SERVER = "ccdm-channel-server.js"
 _BRIDGE_SCRIPT = "scripts/codex-bridge.js"
-_POSIX_LISTENER_SCRIPTS = (_CHANNEL_SERVER, "codex-bridge.js")
+_GEMINI_BRIDGE_SCRIPT = "scripts/gemini-bridge.js"
+_POSIX_LISTENER_SCRIPTS = (_CHANNEL_SERVER, "codex-bridge.js", "gemini-bridge.js")
 # The two shared wait messages that need this launch's timeout in them.
 _TIMED_OUT = {
     _launch._CHANNEL_PROMPT_MISSING: "The development-channel confirmation never appeared within {}s",
@@ -163,8 +172,10 @@ class _ThreadLaunch:
         self.home_override = self.options.get("--home", "")
         if not _ID.fullmatch(self.thread_id):
             raise _Refused(f"Invalid thread id: '{self.thread_id}'", 2)
-        if self.provider not in ("claude", "codex"):
+        if self.provider not in ("claude", "codex", "gemini"):
             raise self._usage()
+        if self.provider == "gemini" and WIN32:
+            raise _Refused("Gemini thread sessions are not supported on Windows yet")
         if self.resume and not _ID.fullmatch(self.resume):
             raise _Refused(f"Invalid conversation id to resume: '{self.resume}'", 2)
         if self.home_override:
@@ -215,7 +226,9 @@ class _ThreadLaunch:
             self.claude_home = override
             config_dir = "" if os.path.normpath(override) == os.path.normpath(default_home) else override
         self.config_dir = config_dir
-        self.model = self.options.get("--model") or entry.get("model") or ""
+        # A project's plain `model` names its own provider's model.
+        own_model = entry.get("model") if (entry.get("type") or "claude") == "claude" else None
+        self.model = self.options.get("--model") or own_model or ""
         self.effort = self.options.get("--effort") or entry.get("claude_effort") or ""
         if self.effort and self.effort not in _EFFORTS:
             raise _Refused(f"Invalid effort '{self.effort}' (expected low, medium, high, xhigh, or max)")
@@ -224,7 +237,8 @@ class _ThreadLaunch:
         entry = registry["projects"][self.project]
         allowed = [registry.get("discord_user_id")] + list(entry.get("guest_user_ids") or [])
         self.allowed_user_ids = ",".join(dict.fromkeys(str(user) for user in allowed if user))
-        self.model = self.options.get("--model") or entry.get("codex_model") or entry.get("model") or ""
+        own_model = entry.get("model") if entry.get("type") == "codex" else None
+        self.model = self.options.get("--model") or entry.get("codex_model") or own_model or ""
         self.effort = (
             self.options.get("--effort") or entry.get("codex_reasoning_effort") or entry.get("model_reasoning_effort") or ""
         )
@@ -237,6 +251,20 @@ class _ThreadLaunch:
         self.ws_port = self.env.get("CCDM_THREAD_WS_PORT", "")
         if not _DIGITS.fullmatch(self.ws_port):
             raise _Refused(f"No ws_port was allocated for Codex thread {self.thread_id}")
+
+    def _read_gemini_settings(self, registry: Mapping[str, Any]) -> None:
+        entry = registry["projects"][self.project]
+        if self.account:
+            raise _Refused(f"Gemini has no account aliases (got '{self.account}')")
+        own_model = entry.get("model") if entry.get("type") == "gemini" else None
+        self.model = self.options.get("--model") or entry.get("gemini_model") or own_model or ""
+        if self.model and not _GEMINI_MODEL.fullmatch(self.model):
+            raise _Refused(f"Invalid model '{self.model}'")
+        self.effort = self.options.get("--effort") or entry.get("gemini_effort") or ""
+        if self.effort and self.effort not in _GEMINI_EFFORTS:
+            raise _Refused(f"Invalid effort '{self.effort}' (expected low, medium, high, or xhigh)")
+        self.text_reply_fallback_off = entry.get("text_reply_fallback") is False
+        self.gemini_home = self.home_override or os.path.join(self._home_dir(), ".gemini", "antigravity-cli")
 
     def _resolve_codex_home(self) -> str:
         resolver = self.root / "scripts" / "resolve-codex-home.py"
@@ -265,6 +293,10 @@ class _ThreadLaunch:
             if not any(os.path.isfile(path) for path in transcripts):
                 raise _Refused(f"The Claude transcript for conversation {self.resume} is missing from {self.claude_home}")
             return
+        if self.provider == "gemini":
+            if not os.path.isfile(os.path.join(self.gemini_home, "conversations", f"{self.resume}.db")):
+                raise _Refused(f"The agy conversation {self.resume} is missing from {self.gemini_home}")
+            return
         pattern = os.path.join(glob.escape(self.codex_home), "sessions", "**", f"rollout-*-{self.resume}.jsonl")
         if not glob.glob(pattern, recursive=True):
             raise _Refused(f"The Codex rollout for conversation {self.resume} is missing from {self.codex_home}")
@@ -290,6 +322,8 @@ class _ThreadLaunch:
             return _launch._is_claude_listener(argv)
         if program == "codex":
             return "app-server" in argv
+        if program == "agy":
+            return "acp" in argv
         return program == "node" and any(os.path.basename(arg) in _POSIX_LISTENER_SCRIPTS for arg in argv[1:])
 
     def _bridge_pid(self) -> Optional[int]:
@@ -302,7 +336,8 @@ class _ThreadLaunch:
         for pid, command in _launch._ps_rows():
             argv = _launch._split_command(command)
             if (
-                len(argv) >= 2 and os.path.basename(argv[0]) == "node" and argv[1].endswith("codex-bridge.js")
+                len(argv) >= 2 and os.path.basename(argv[0]) == "node"
+                and argv[1].endswith("gemini-bridge.js" if self.provider == "gemini" else "codex-bridge.js")
                 and _launch._carries_key_file(command, self.key_file)
             ):
                 return pid
@@ -369,8 +404,8 @@ class _ThreadLaunch:
         # The token first: from here on this launch owns the key and the launch dir.
         private_fs.write_private(launch / ".launch-token", self.token + "\n")
         private_fs.write_private(self.key_file, secrets.token_urlsafe(32) + "\n")
-        # A Codex bridge takes its settings from its session's environment instead.
-        if self.provider == "codex":
+        # A Codex or Gemini bridge takes its settings from its session's environment instead.
+        if self.provider in ("codex", "gemini"):
             return None
         scripts = self.root / "scripts"
         reminder_env = self._reminder_env()
@@ -506,8 +541,64 @@ class _ThreadLaunch:
             env["CODEX_RESUME_THREAD_ID"] = self.resume
         return env
 
-    def _wait_for_bridge(self) -> Dict[str, Any]:
-        """The bridge's ready.json once it says ok; it reports its Router hello and Codex thread uuid."""
+    def _gemini_env(self) -> Dict[str, str]:
+        launch = Path(self.launch_dir)
+        env = {
+            "CCDM_GEMINI_PROJECT": self.project,
+            "CCDM_ROUTER_STATE_DIR": self.router_state,
+            "CCDM_ROUTER_KEY_FILE": self.key_file,
+            "CCDM_CHANNEL_READY_FILE": str(launch / "ready.json"),
+            "CHANNEL_ID": self.thread_id,
+            "PROJECT_DIR": self.path_dir,
+            "CCDM_THREAD_ID": self.thread_id,
+            "CCDM_THREAD_PROVIDER": "gemini",
+            "CCDM_THREAD_BOOTSTRAP_FILE": self.bootstrap_file,
+            "CCDM_THREAD_ACTIVITY_FILE": str(launch / "activity.json"),
+        }
+        if self.model:
+            env["GEMINI_MODEL"] = self.model
+        if self.effort:
+            env["GEMINI_EFFORT"] = self.effort
+        if self.text_reply_fallback_off:
+            env["GEMINI_TEXT_REPLY_FALLBACK"] = "0"
+        if self.resume:
+            env["GEMINI_RESUME_SESSION_ID"] = self.resume
+        if self.env.get("CCDM_AGY_BIN"):
+            env["CCDM_AGY_BIN"] = self.env["CCDM_AGY_BIN"]
+        transcribe = self.env.get("CODEX_BRIDGE_TRANSCRIBE_AUDIO") or self.env.get("USE_AUDIO_TRANSCRIPTION_IN_BRIDGE") or ""
+        if transcribe:
+            env["CODEX_BRIDGE_TRANSCRIBE_AUDIO"] = transcribe
+        if self.env.get("CCDM_THREAD_BOOT_TIMEOUT_S"):
+            env["CCDM_THREAD_BOOT_TIMEOUT_S"] = self.env["CCDM_THREAD_BOOT_TIMEOUT_S"]
+        return env
+
+    def _start_gemini(self) -> int:
+        # The bridge runs from this checkout; agy and its turns run in the project path.
+        try:
+            session_host.start(self.name, ["node", _GEMINI_BRIDGE_SCRIPT], str(self.root), self._gemini_env(),
+                               pty=False, kind="thread")
+        except session_host.SessionHostError as error:
+            self._say(str(error))
+            return self._fail(self._could_not_start())
+        self._say(f"Started Gemini thread bridge in {_launch.session_word()} '{self.name}'")
+        # The bridge reports its Router hello, and its agy session id, once agy's session is open.
+        try:
+            outcome = self._wait_for_bridge("Gemini")
+        except _launch.LaunchFailed as error:
+            return self._give_up(str(error))
+        pid = None
+        for _ in range(_PID_ROUNDS):
+            pid = self._bridge_pid()
+            if pid:
+                break
+            time.sleep(_PID_ROUND_S)
+        if not pid:
+            return self._give_up("The thread session's Gemini bridge process could not be found")
+        return self._succeed({"pid": pid, "provider_conversation_id": outcome.get("provider_conversation_id"),
+                              "tmux": self.name, "provider_home": self.gemini_home}, None)
+
+    def _wait_for_bridge(self, label: str = "Codex") -> Dict[str, Any]:
+        """The bridge's ready.json once it says ok; it reports its Router hello and provider conversation id."""
         ready_file = os.path.join(self.launch_dir, "ready.json")
         retryable = (FileNotFoundError, json.JSONDecodeError, PermissionError) if WIN32 else (FileNotFoundError, json.JSONDecodeError)
         deadline = time.monotonic() + self.timeout
@@ -519,12 +610,12 @@ class _ThreadLaunch:
                 break
             except retryable:
                 if not session_host.is_live(self.name):
-                    raise _launch.LaunchFailed("The Codex bridge exited before its Router hello")
+                    raise _launch.LaunchFailed(f"The {label} bridge exited before its Router hello")
                 time.sleep(_READY_POLL_S)
         if outcome is None:
-            raise _launch.LaunchFailed(f"The Codex bridge did not say hello to the Router within {self.timeout:g}s")
+            raise _launch.LaunchFailed(f"The {label} bridge did not say hello to the Router within {self.timeout:g}s")
         if not outcome.get("ok"):
-            raise _launch.LaunchFailed(f"The Codex bridge failed to start: {outcome.get('error')}")
+            raise _launch.LaunchFailed(f"The {label} bridge failed to start: {outcome.get('error')}")
         return outcome
 
     def _start_codex(self) -> int:
@@ -576,6 +667,8 @@ class _ThreadLaunch:
         registry = self._read_registry()
         if self.provider == "claude":
             self._read_claude_settings(registry)
+        elif self.provider == "gemini":
+            self._read_gemini_settings(registry)
         else:
             self._read_codex_settings(registry)
         self._check_resume()
@@ -605,7 +698,9 @@ class _ThreadLaunch:
             self.stderr.write(traceback.format_exc())
             return self._fail("The thread launch files could not be written")
         try:
-            return self._start_claude(reminder_env) if self.provider == "claude" else self._start_codex()
+            if self.provider == "claude":
+                return self._start_claude(reminder_env)
+            return self._start_gemini() if self.provider == "gemini" else self._start_codex()
         except (session_host.SessionHostError, OSError, ValueError, KeyError) as error:
             return self._fail(str(error) or type(error).__name__)
 

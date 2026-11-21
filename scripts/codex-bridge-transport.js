@@ -65,7 +65,7 @@ const { createEmergencyGateway } = require("./router/emergency.js");
 // In the `thread` role (with `threadId`) it serves one Codex Thread
 // Conversation, whose Session Scope the Router never moves.
 function createRouterTransport({ project, role = "project", keyFile, launchDir, registryPath, primaryChannelId,
-  threadId = null }) {
+  threadId = null, provider = "codex" }) {
   let router = null;
   // Router operations, or root's direct ones while its fallback is engaged.
   let request = null;
@@ -141,7 +141,7 @@ function createRouterTransport({ project, role = "project", keyFile, launchDir, 
         fallback.watch(router);
         request = fallback.request(router);
       } else if (role === "thread") {
-        router = new RouterClient({ project, key, role: "thread", threadId, provider: "codex" });
+        router = new RouterClient({ project, key, role: "thread", threadId, provider });
         request = (op, args) => router.request(op, args);
       } else {
         router = new RouterClient({ project, key, role: "project" });

@@ -1,13 +1,13 @@
 ---
 name: agents
 description: Always-loaded project anchor for CCDM.
-last_updated: 2026-11-18
+last_updated: 2026-11-21
 ---
 
 # CCDM - Claude Code Discord Manager
 
 ## What This Is
-CCDM manages isolated Claude Code and Codex Discord sessions for multiple local projects from one root bot.
+CCDM manages isolated Claude Code, Codex and Gemini (Antigravity CLI) Discord sessions for multiple local projects from one root bot.
 
 ## Non-Negotiables
 - Read `.mex/ROUTER.md` before acting; load only the context and pattern files it routes to.
@@ -21,7 +21,8 @@ CCDM manages isolated Claude Code and Codex Discord sessions for multiple local 
   - Windows: `scripts/ccdm threads restart <name|link>`.
 - Root's thread permissions, Create Public Threads, Send Messages in Threads and Manage Threads (plus the optional guild View Audit Log, useful for logging who archived a thread), are granted once by hand; never PATCH them from a script. `router status` reports any that are missing.
 - A Thread Conversation stays unarchived until `/close` or the operator's thread `close` command: the Thread Supervisor reverts every other archive. Its turn status is root's reaction on the latest input (⏳ working, then ✅ answered or ⚠️ failed), never a post; no ⏳ outlives a stop, crash or `/close`.
-- Launch sessions only through `scripts/ccdm` (`start-session`, `start-codex-session`, `restart-session`, `session new`). It starts each session the right way for the OS: tmux on macOS, `ccdm-host` on Windows. Never start `claude`, the bridge, tmux or `ccdm-host` sessions by hand.
+- Launch sessions only through `scripts/ccdm` (`start-session`, `start-codex-session`, `start-gemini-session`, `restart-session`, `session new`). It starts each session the right way for the OS: tmux on macOS, `ccdm-host` on Windows. Never start `claude`, the bridge, tmux or `ccdm-host` sessions by hand.
+- macOS: tmux launches pass `DISABLE_AUTO_UPDATE=true DISABLE_UPDATE_PROMPT=true` to the interactive zsh, because an interactive prompt in `~/.zshrc` (oh-my-zsh's update check) blocks the launch until its boot timeout and no session ever starts.
 - To restart yourself, run `scripts/ccdm restart-root`; it detaches itself, so never use `nohup` or a background `&`.
 - Send free text (a login code, a message) to a session with `scripts/ccdm session send <name> --stdin` or `--file <path>`, never as a command argument.
 - Project Codex conversations can resume across homes/accounts: copy the verified rollout into the target home's matching `sessions/` path, then start with `--resume <thread_uuid>`.
@@ -31,7 +32,7 @@ CCDM manages isolated Claude Code and Codex Discord sessions for multiple local 
 - Test: `npm test`
 - All commands: `scripts/ccdm --help` (run in the Bash tool on both macOS and Windows)
 - List: `scripts/ccdm list`; one project: `scripts/ccdm status <project>`
-- Start: `scripts/ccdm start-session <project>` (Claude) or `scripts/ccdm start-codex-session <project>` (Codex)
+- Start: `scripts/ccdm start-session <project>` (Claude), `scripts/ccdm start-codex-session <project>` (Codex) or `scripts/ccdm start-gemini-session <project>` (Gemini, macOS only)
 - Stop: `scripts/ccdm stop-session <project>`
 - Restart: `scripts/ccdm restart-session <project>`
 - Root's command list with triggers: `.mex/patterns/root-commands.md`

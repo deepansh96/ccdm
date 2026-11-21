@@ -42,7 +42,7 @@ test("registry example documents Claude account aliases for thread overrides", (
 test("registry example documents the default thread session caps", () => {
   const registryExample = JSON.parse(fs.readFileSync("registry.example.json", "utf8"));
 
-  assert.deepEqual(registryExample.thread_session_caps, { claude: 6, codex: 8 });
+  assert.deepEqual(registryExample.thread_session_caps, { claude: 6, codex: 8, gemini: 4 });
 });
 
 test("registry example has no thread status channel or owner ping setting", () => {

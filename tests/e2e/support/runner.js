@@ -480,9 +480,31 @@ function parseGenericLaunch(shellCommand) {
   return { cwd: unescapeSingleQuotes(match[1]), env, argv };
 }
 
+// A Gemini launch runs the real gemini-bridge.js, which drives the agy
+// named by CCDM_AGY_BIN (tests point it at support/fake-agy.cjs).
+function parseGeminiBridgeLaunch(shellCommand) {
+  const match = /^cd '([^']*)' && ([\\s\\S]+) node scripts\\/gemini-bridge\\.js$/.exec(shellCommand);
+  if (!match) {
+    throw new Error(\`unsupported tmux launch command: \${shellCommand}\`);
+  }
+  const env = {};
+  for (const envMatch of match[2].matchAll(/([A-Z_]+)=(?:'([^']*)'|([^\\s]+))/g)) {
+    env[envMatch[1]] = envMatch[2] ?? envMatch[3];
+  }
+  for (const name of ["CCDM_ROUTER_KEY_FILE", "CCDM_GEMINI_PROJECT", "CCDM_ROUTER_STATE_DIR", "CHANNEL_ID", "PROJECT_DIR"]) {
+    if (!env[name]) {
+      throw new Error(\`\${name} is required for Gemini bridge launch\`);
+    }
+  }
+  return { cwd: match[1], env, bridgeCommand: "node scripts/gemini-bridge.js" };
+}
+
 function parseTmuxLaunch(shellCommand) {
   if (shellCommand.endsWith(" node scripts/codex-bridge.js")) {
     return { kind: "codex-bridge", ...parseCodexBridgeLaunch(shellCommand) };
+  }
+  if (shellCommand.endsWith(" node scripts/gemini-bridge.js")) {
+    return { kind: "gemini-bridge", ...parseGeminiBridgeLaunch(shellCommand) };
   }
   // Every Claude launch still goes through the listener checks.
   if (!shellCommand.includes(" claude ")) {
@@ -552,8 +574,9 @@ function spawnRouterClaude(name, launch) {
 // A router Codex launch runs the real bridge, detached like a tmux pane
 // process, against the fake Codex app-server registered for its port.
 function spawnRouterBridge(launch) {
-  const logFile = fs.openSync(path.join(stateDir, \`codex-bridge-\${Date.now()}.log\`), "a");
-  const child = spawn(process.execPath, [path.join(launch.cwd, "scripts/codex-bridge.js"), ...(launch.bridgeArgs ?? []), workspaceMarker], {
+  const script = launch.kind === "gemini-bridge" ? "gemini-bridge" : "codex-bridge";
+  const logFile = fs.openSync(path.join(stateDir, \`\${script}-\${Date.now()}.log\`), "a");
+  const child = spawn(process.execPath, [path.join(launch.cwd, \`scripts/\${script}.js\`), ...(launch.bridgeArgs ?? []), workspaceMarker], {
     cwd: launch.cwd,
     detached: true,
     // A tmux fixture has no stdin to hold open, so this bridge gets NUL and stops

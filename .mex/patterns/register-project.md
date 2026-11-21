@@ -10,7 +10,7 @@ edges:
     condition: for registry and lifecycle invariants
   - target: context/discord-security.md
     condition: for Session Scope, root permissions, and credentials
-last_updated: 2026-11-10
+last_updated: 2026-11-21
 ---
 
 # Register Or Deregister A Project
@@ -20,7 +20,7 @@ There is no bot to create, claim, rename, role, or give access files: every proj
 The steps are the same on macOS and Windows unless one says otherwise. Run the commands with the Bash tool from the CCDM checkout.
 
 ## Register
-1. Resolve the channel, absolute project path, session type (`claude` or `codex`), and project name. Allocate an unused `ws_port` for Codex.
+1. Resolve the channel, absolute project path, session type (`claude`, `codex` or `gemini`), and project name. Allocate an unused `ws_port` for Codex.
 2. When the user requested a new channel or category lookup, use the root bot's stored credentials (root state `.env`) through Discord REST, limited to the exact guild and category requested. The scoped Discord tools remain the reply/message surface; their lack of channel-administration tools is not a blocker and is not a reason to request the bot token from the user.
 3. Write the entry with `path`, `screen_name`, `channel_id`, and `type` (plus `ws_port` and any account/model overrides).
 4. Run `node scripts/router.js ensure-webhook <project>`. It finds or creates `ccdm-<project>`, records `webhook_id` in the registry, and keeps the token only in private Router state.
