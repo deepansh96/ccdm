@@ -567,6 +567,7 @@ For users already in the server, use `grant` instead of `invite`. Use `revoke` t
 Open a public thread under a registered project channel and type a task: it becomes a **Thread Conversation**, a fresh Claude Code or Codex conversation for that project, running in the project checkout. The Router scopes it to that thread alone, so the Channel Conversation and sibling threads never see its traffic. Replies post into the thread through the project's webhook as `<project>-<provider> · N%`. The owner and the channel's guests drive threads without an @mention. Full details are in [docs/thread-supervisor.md](docs/thread-supervisor.md).
 
 - **Create** by hand, with `/thread <name> [--provider claude|codex] [--account <alias>] [--model <model>] [--effort <effort>] [first message…]` in the project channel, from the channel agent's `create_thread` tool, or with `scripts/threads.sh create <project> <name> [flags] [message]`. Created threads auto-archive after a week.
+- **Configure and start an existing thread** with `scripts/threads.sh restart [<project>] <name|link|id> [flags]`. A provider or account change starts fresh; model and effort alone keep the current conversation.
 - **In a thread:**
   - `/config` shows or changes the thread's provider, account, model and effort. A provider or account change applies only after your ✅.
   - `/model` shows the model, thinking level and account/home the thread runs with.

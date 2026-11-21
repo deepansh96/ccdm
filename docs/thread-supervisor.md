@@ -138,7 +138,7 @@ The worker writes a fresh `keys/.supervisor.key` in the Router state on each sta
 - **Inspect** with `scripts/thread-supervisor.py status`. It shows the worker, the caps (and any invalid value) and every bound thread with its state.
 - **Disable / enable** with `scripts/thread-supervisor.py disable` and `enable`. While disabled, the supervised worker exits and launchd does not relaunch it. `enable` only clears the disabled marker; it does not start the worker. Rerun `scripts/install-thread-supervisor.sh` afterwards to relaunch the LaunchAgent.
 - **Debug in the foreground** with `scripts/thread-supervisor.py disable`, then `scripts/thread-supervisor.py run`. A second worker exits with status 2 while the lock is held.
-- **Operate threads** with `scripts/threads.sh list [<project>]` and `scripts/threads.sh stop|restart|close [<project>] <name|link|id>`. `send-claude-command.sh`, guest access (which acts on the parent project) and `export-discord-range.js` also accept a thread id.
+- **Operate threads** with `scripts/threads.sh list [<project>]` and `scripts/threads.sh stop|restart|close [<project>] <name|link|id>`. `restart` also accepts thread provider/account/model/effort overrides, applies them before starting the session, and starts fresh for a provider or account change. `send-claude-command.sh`, guest access (which acts on the parent project) and `export-discord-range.js` also accept a thread id.
 - **Router view:** `node scripts/router.js status` lists each `thread` connection, the supervisor line, and root's missing thread permissions while threads are enabled.
 
 ## Root permissions

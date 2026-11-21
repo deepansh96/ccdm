@@ -10,8 +10,9 @@ and queued thread sessions as `stopped/operator`, and answers
 answers `{"ok": true, "result": {"threads": [...]}}`, each with its provider
 and model, state, stop or close reason and idle seconds; `project` may be
 null for every project. `{"op": "stop_thread", "thread_id"}` stops one
-thread's session as `stopped/operator`, and `restart_thread` and
-`close_thread` run its `/restart` and `/close` as the owner, answering
+thread's session as `stopped/operator`. `{"op": "restart_thread", "thread_id",
+"flags"}` applies validated overrides and starts it, and `close_thread` runs
+its `/close` as the owner, answering
 `{"ok": true, "result": {"thread_id", "project", "name", ...}}`. The server thread
 hands each request to the worker loop as an internal `control` frame, so the
 store and the Router link are only ever used from that loop.
@@ -27,7 +28,8 @@ import queue
 import socket
 import threading
 
-from . import boot, capacity, commands, creation, lifecycle, registry, store
+from . import boot, capacity, commands, creation, lifecycle, registry, reminders, store, turns
+from .link import LinkError
 
 
 SOCKET_NAME = "control.sock"
@@ -192,7 +194,54 @@ def _as_owner(command: str):
     return run
 
 
-THREAD_OPS = {"stop_thread": stop_thread, "restart_thread": _as_owner("restart"), "close_thread": _as_owner("close")}
+def restart_thread(context, row, flags: dict | None) -> dict:
+    """Restart through the normal path, optionally applying overrides first.
+
+    A provider or account override starts a fresh provider conversation, as
+    the same change does through `/config`; model and effort alone keep the
+    current conversation and restart with `--resume`.
+    """
+    if flags is not None and not isinstance(flags, dict):
+        return _error("invalid", "flags must be an object")
+    flags = flags or {}
+    if set(flags) - set(creation.FLAGS):
+        return _error("invalid", f"unknown flag {sorted(set(flags) - set(creation.FLAGS))[0]}")
+    changes = {field: flags[field] for field in creation.FLAGS if flags.get(field) is not None}
+    if flags and not changes:
+        return _error("invalid", "at least one setting is required")
+    if not changes:
+        return _as_owner("restart")(context, row)
+
+    current = registry.load(context.project_root)
+    merged = {field: row[field] for field in creation.FLAGS}
+    merged.update(changes)
+    try:
+        creation.validate(current, row["project"], row["name"], merged)
+    except creation.Invalid as error:
+        return _error("invalid", str(error))
+
+    fresh = "provider" in changes or "account" in changes
+    if row["state"] in ("booting", "live"):
+        lifecycle.stop_session(context, row)
+    updates = {**changes, "pending_config": None}
+    if fresh:
+        updates["provider_conversation_id"] = None
+    store.update(context.db, row["thread_id"], **updates)
+    if fresh:
+        reminders.emit(context, "conversation_reset", row)
+        turns.reset(context, row["thread_id"])
+    listed = " · ".join(f"{field} {value}" for field, value in changes.items())
+    message = (f"Settings saved: {listed}. Starting a fresh conversation in this thread."
+               if fresh else f"Settings saved: {listed}. Restarting this thread's session.")
+    try:
+        context.link.call("thread_notice", {"channel_id": row["thread_id"], "text": message})
+    except LinkError:
+        pass
+    boot.start(context, store.thread(context.db, row["thread_id"]), None, starter="")
+    return _summary(context, row["thread_id"], restarting=True)
+
+
+THREAD_OPS = {"stop_thread": stop_thread, "close_thread": _as_owner("close")}
 
 
 def handle(context, request: dict) -> dict:
@@ -201,6 +250,12 @@ def handle(context, request: dict) -> dict:
         return stop_threads(context, request.get("project"))
     if op == "list":
         return list_threads(context, request.get("project"))
+    if op == "restart_thread":
+        thread_id = request.get("thread_id")
+        row = store.thread(context.db, thread_id) if isinstance(thread_id, str) else None
+        if not row:
+            return _error("invalid", f"no bound thread {thread_id!r}")
+        return restart_thread(context, row, request.get("flags") or {})
     if op in THREAD_OPS:
         thread_id = request.get("thread_id")
         row = store.thread(context.db, thread_id) if isinstance(thread_id, str) else None
@@ -222,11 +277,12 @@ def handle(context, request: dict) -> dict:
 
 def on_control(context, frame: dict) -> None:
     """The worker loop's side: answer one control request, always. A
-    `stop_thread` that arrives while the thread's launcher still runs waits
-    for it to exit, as an in-thread command does, so the stop finds the
-    session's tmux."""
+    `stop_thread` or `restart_thread` that arrives while the thread's launcher
+    still runs waits for it to exit, as an in-thread command does, so the
+    action never races the launch."""
     request = frame.get("request") or {}
-    thread_id = request.get("thread_id") if request.get("op") == "stop_thread" else None
+    thread_id = (request.get("thread_id")
+                 if request.get("op") in ("stop_thread", "restart_thread") else None)
     launching = context.boots.get(thread_id) if isinstance(thread_id, str) else None
     if launching and not launching.launched:
         launching.deferred_stops.append(frame)

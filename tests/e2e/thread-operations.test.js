@@ -264,6 +264,65 @@ test("threads.sh restart by name and by link relaunches the thread with --resume
   for (const notice of answered) assert.match(notice.content, /Restarting/);
 });
 
+test("threads.sh restart with settings configures and starts an existing registered thread fresh", async () => {
+  const workspace = operationsWorkspace();
+  const registryFile = path.join(workspace.repoDir, "registry.json");
+  const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+  registry.claude_accounts = { work: "~/.claude-work" };
+  fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
+  fs.mkdirSync(path.join(workspace.homeDir, ".claude-work"), { recursive: true });
+  await supervised(workspace);
+  await boundThread(workspace, THREAD_ID, "fix-login");
+
+  const restarted = await threadsCli(workspace, "restart", "demo", THREAD_ID,
+    "--account", "work", "--model", "claude-next", "--effort", "high");
+  assert.equal(restarted.exitCode, 0, restarted.stderr || restarted.stdout);
+  const row = await threadRow(workspace, THREAD_ID, current => current.state === "live" &&
+    current.provider_conversation_id != null);
+  assert.deepEqual([row.account, row.model, row.effort], ["work", "claude-next", "high"]);
+  const [launch] = launches(workspace, THREAD_ID);
+  assert.equal(resumeArg(launch), null);
+  assert.equal(launch.env.CLAUDE_CONFIG_DIR, path.join(workspace.homeDir, ".claude-work"));
+  assert.ok(launch.args.includes("'claude-next'"));
+  assert.ok(launch.args.includes("'high'"));
+  assert.match(notices(workspace, THREAD_ID).at(-1).content,
+    /Settings saved: account work · model claude-next · effort high\. Starting a fresh conversation/);
+});
+
+test("threads.sh restart with only model and effort keeps the conversation and resumes it", async () => {
+  const workspace = operationsWorkspace();
+  await supervised(workspace);
+  await liveThread(workspace, THREAD_ID, "fix-login");
+  const { provider_conversation_id: conversationId } = await threadRow(workspace, THREAD_ID);
+  writeClaudeTranscript(workspace, conversationId);
+
+  const restarted = await threadsCli(workspace, "restart", "fix-login", "--model", "claude-next", "--effort", "high");
+  assert.equal(restarted.exitCode, 0, restarted.stderr || restarted.stdout);
+  await waitFor(() => launches(workspace, THREAD_ID).length === 2, () => "the restarted launch", 15000);
+  const row = await threadRow(workspace, THREAD_ID, current => current.state === "live");
+  assert.deepEqual([row.model, row.effort, row.provider_conversation_id], ["claude-next", "high", conversationId]);
+  const launch = launches(workspace, THREAD_ID)[1];
+  assert.equal(resumeArg(launch), conversationId);
+  assert.ok(launch.args.includes("'claude-next'"));
+  assert.match(notices(workspace, THREAD_ID).at(-1).content,
+    /^Settings saved: model claude-next · effort high\. Restarting this thread's session\.$/);
+});
+
+test("threads.sh refuses bad restart flags, and flags on stop or close, without touching the thread", async () => {
+  const workspace = operationsWorkspace();
+  await supervised(workspace);
+  await liveThread(workspace, THREAD_ID, "fix-login");
+  for (const args of [["restart", "fix-login", "--colour", "red"], ["restart", "fix-login", "--model"],
+    ["stop", "fix-login", "--model", "x"], ["close", "demo", "fix-login", "--effort", "high"],
+    ["restart", "fix-login", "--account", "nobody"]]) {
+    const refused = await threadsCli(workspace, ...args);
+    assert.notEqual(refused.exitCode, 0, `${args.join(" ")}: ${refused.stdout}`);
+  }
+  const row = await threadRow(workspace, THREAD_ID);
+  assert.deepEqual([row.state, row.account, row.model, row.effort], ["live", null, null, null]);
+  assert.equal(launches(workspace, THREAD_ID).length, 1);
+});
+
 test("threads.sh close by name and by link archives the thread, stops its session and leaves closed/close-command, as /close does", async () => {
   const workspace = operationsWorkspace();
   await supervised(workspace);
