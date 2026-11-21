@@ -16,7 +16,7 @@ edges:
     condition: when performing a start, stop, or restart
   - target: patterns/register-project.md
     condition: when registering or deregistering a project (channel, webhook, registry entry)
-last_updated: 2026-11-20
+last_updated: 2026-11-21
 ---
 
 # Session Management
@@ -89,6 +89,12 @@ Root multi-channel sessions accept steering only from the active channel and aut
 Codex channels handle `/compact`, `/clear`, and `/restart` directly in the bridge.
 
 For an explicit history-preserving restart, use `scripts/start-codex-session.sh <project> --resume <thread_uuid>`. This resumes only at startup; `/clear` still creates a fresh thread. A resume launch requires the fresh Discord instruction request to be accepted and waits up to 60 seconds for listener readiness before reporting success. Failure or timeout returns nonzero and uses the common stop script to clean up listeners and registry runtime state instead of silently creating a new conversation. To change accounts while preserving history, identify and verify the current rollout's thread ID and project directory, stop the old session through the common stop script, copy that rollout into the target home's corresponding `sessions/` path without overwriting an existing file, update only the project's account selector, and start with `--resume`. Keep the original rollout and account selection for recovery. Credentials are never copied. Verify the resumed thread ID, selected process home, and channel listener. In-flight processes do not survive the restart.
+
+## Gemini Lifecycle
+
+Use `scripts/start-gemini-session.sh <project> [--resume <session_id>]` for a project with `type: "gemini"`. It refuses another type, a running tmux session, a live listener carrying the project's launch key path, or a project without `webhook_id`, then writes a fresh 0600 launch key and runs `gemini-bridge.js` in tmux (`zsh -ic`, with the oh-my-zsh prompt switched off) with `CCDM_GEMINI_PROJECT`, the key file path, `CHANNEL_ID`, `PROJECT_DIR` and the optional `GEMINI_MODEL` (`gemini_model`, else `model`), `GEMINI_EFFORT` (`gemini_effort`: `low|medium|high|xhigh`), `GEMINI_RESUME_SESSION_ID` and `CCDM_AGY_BIN`. Unset, the bridge pins `gemini-4-neon` at `high`; a model id with a level suffix (`gemini-4-neon-xhigh`) selects both, and a model agy does not offer fails the launch with agy's list. The bridge runs `agy acp --dangerously-skip-permissions` in the project directory, opens an ACP session with the scoped `discord-<channel>` MCP server (key path and scope token in its env, never a Discord credential) and the transport instruction appended to the system prompt, sets the model and thinking level, then says hello to the Router; the launcher waits for `ready.json` (`CCDM_GEMINI_LAUNCH_TIMEOUT_S`, default 120 s) and records the bridge PID and the agy session id as `session_id`. A failed launch kills the tmux session and its listeners, removes the key and launch files, and clears `pid`/`session_id`. `--resume` requires `~/.gemini/antigravity-cli/conversations/<id>.db` and uses ACP `session/resume`; it never falls back to a fresh session. `stop-session.sh` finds a Gemini session's bridge and `agy acp` by the launch key path in their environment, like Claude's.
+
+Replies post as `<project>-gemini · N%`, the percentage from ACP `usage_update` (`used`/`size`). Messages during a turn queue with ⏳ (removed when their turn starts) and run together as one prompt; `/pause`, `/unpause`, `/compact` (agy's `/compact` prompt), `/clear` (`session/cancel`, then a fresh `session/new`) and project-only `/restart` work as for Codex. Gemini Conversation Reminder events use provider `gemini` through the same adapter as Codex (active context file, MCP reply receipts, `turn_completed`). Gemini has no account aliases (`gemini_accounts` is never read): agy uses its one signed-in Google account. A Gemini Thread Conversation (`--provider gemini`, under a project of any type) runs the same bridge in thread mode with no `ws_port`, its agy session id as `provider_conversation_id`, `~/.gemini/antigravity-cli` as its home, and the thread cap `thread_session_caps.gemini` (default 4).
 
 ## Stop Invariant
 

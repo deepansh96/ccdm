@@ -24,7 +24,7 @@ const ARCHIVED_PAGES = 10;
 const SKIPPABLE_CHANNEL = new Set([403, 404]);
 const ARCHIVE_ACTION = 111;
 const DISCORD_EPOCH = 1420070400000n;
-const PROVIDERS = new Set(["claude", "codex"]);
+const PROVIDERS = new Set(["claude", "codex", "gemini"]);
 // Discord's refusal to act in an archived thread.
 const ARCHIVED_THREAD_CODE = 50083;
 

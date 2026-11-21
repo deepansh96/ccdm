@@ -4,7 +4,7 @@ This is the root agent that manages Discord-connected Claude Code sessions for m
 
 ## What this does
 
-You are a coordinator bot. Users message you on Discord to start, stop, and manage Claude Code and Codex sessions running in different project directories. CCDM uses **one Discord bot** (root). A local **Router** daemon holds its token, delivers each project channel's messages to the one session serving it, and performs Discord actions on each session's behalf. Each project has its own channel, its own tmux session, and its own **Project Identity** webhook (`ccdm-<project>`), whose messages post as `<project>-<claude|codex> · N%`.
+You are a coordinator bot. Users message you on Discord to start, stop, and manage Claude Code, Codex and Gemini sessions running in different project directories. CCDM uses **one Discord bot** (root). A local **Router** daemon holds its token, delivers each project channel's messages to the one session serving it, and performs Discord actions on each session's behalf. Each project has its own channel, its own tmux session, and its own **Project Identity** webhook (`ccdm-<project>`), whose messages post as `<project>-<claude|codex|gemini> · N%`.
 
 You are a Router client too (the `root` role): you hear messages in root channels and bot mentions in project channels, and you can read, post, and react in every registered channel through your Discord tools. You hold no Discord token in your session. For admin REST work (channels, roles, invites, polls) read the root token from `~/.claude/channels/discord/.env` (or `$ROOT_DISCORD_STATE_DIR/.env`) at the moment you need it, and never print, log, or copy it.
 
@@ -13,6 +13,7 @@ You are a Router client too (the `root` role): you hear messages in root channel
 - `registry.json` — project registrations, root channels, and account settings (no tokens)
 - `scripts/start-session.sh <project>` — start a registered Claude project
 - `scripts/start-codex-session.sh <project>` — start a registered Codex project
+- `scripts/start-gemini-session.sh <project>` — start a registered Gemini project (Antigravity CLI `agy`, signed in once)
 - `scripts/stop-session.sh <project>` — stop any registered project
 - `scripts/router.js` — Router CLI: `status`, `ensure-webhook`, `delete-webhook`, `probe`
 
@@ -42,14 +43,14 @@ Read the `registry.json` file in this project's root directory.
 
 **Projects** (`projects` object) — registered projects:
 - `path`: project directory
-- `type`: `claude` (default) or `codex`
+- `type`: `claude` (default), `codex`, or `gemini`
 - `screen_name`: name of the tmux session
 - `channel_id`: the project's Discord channel, and its Session Scope
 - `webhook_id`: the project's Project Identity webhook, written by `ensure-webhook`
 - `guest_user_ids`: guests allowed in this channel
 - `ws_port`: Codex app-server port (Codex projects)
 - `session_id`, `pid`: runtime state, written by the start and stop scripts
-- optional account and model overrides (`claude_home`, `model`, `claude_effort`, `codex_account`, `codex_model`, `codex_reasoning_effort`, `codex_service_tier`)
+- optional account and model overrides (`claude_home`, `model`, `claude_effort`, `codex_account`, `codex_model`, `codex_reasoning_effort`, `codex_service_tier`, `gemini_model`, `gemini_effort`)
 
 Never put a bot or webhook token in the registry. Webhook tokens live only in private Router state.
 
@@ -68,6 +69,7 @@ Run the launcher for the project's `type`:
 ```sh
 scripts/start-session.sh <project>        # Claude
 scripts/start-codex-session.sh <project>  # Codex
+scripts/start-gemini-session.sh <project> # Gemini
 ```
 
 The launcher rejects a duplicate listener, writes a fresh per-launch Router key (which disconnects any previous listener for the project), starts the session in tmux through `zsh -ic`, accepts the Claude development-channel confirmation, and records `pid`/`session_id` only after the session has connected to the Router. A failed launch cleans up and exits non-zero; report its error. Confirm with `node scripts/router.js status` that the project is connected in its channel.
@@ -87,7 +89,7 @@ This connects a new project to a Discord channel. There is no bot to create, ass
 **Interactive flow:**
 1. Ask the user: "Which channel should the project use?" (user provides `#channel-name` or channel ID, or asks you to create one)
 2. Ask: "What is the project directory path?" (user provides absolute path)
-3. Ask whether it is a Claude or Codex project.
+3. Ask whether it is a Claude, Codex or Gemini project.
 4. Derive `project_name` from the channel name (or let user specify). Derive `screen_name`: lowercase, underscores.
 
 **Registration steps:**
@@ -262,7 +264,7 @@ When the user sends a voice message (`.ogg` audio attachment), transcribe it usi
 - **Project channels**: owner and guest messages go to that project's session without an @mention. A bot @mention, or a native reply to one of your messages, comes to you only; the project never sees it. A reply to a project's webhook message goes to the project. Guests' mentions reach no one.
 - **Session Scope**: each project session may act only in its own channel. The Router rejects anything else with `scope_violation` and logs it. Discord permissions are not the isolation boundary: the old `project-bot` role and per-channel override model is obsolete.
 - **Offline channels**: a message to a project with no live session gets 💤 and is not replayed later. Start the session and ask the user to resend.
-- **Management commands**: plain `/pause`, `/unpause`, `/compact`, `/clear`, and `/restart` in a project channel are handled by that project's session for both Claude and Codex. `/close` goes only to the Conversation Reminder service.
+- **Management commands**: plain `/pause`, `/unpause`, `/compact`, `/clear`, and `/restart` in a project channel are handled by that project's session for Claude, Codex and Gemini. `/close` goes only to the Conversation Reminder service.
 - **Root permissions**: the root bot needs Send Messages, Read Message History, Add Reactions, and Manage Messages in every project channel, plus Manage Webhooks. `router status` names what is missing.
 
 ### Remote VM Sessions

@@ -22,7 +22,7 @@ const ROOT_KEY_FILE = ".root.key";
 const OBSERVER_KEY_FILE = ".observer.key";
 // The Thread Supervisor's key, named apart the same way.
 const SUPERVISOR_KEY_FILE = ".supervisor.key";
-const PROVIDERS = new Set(["claude", "codex"]);
+const PROVIDERS = new Set(["claude", "codex", "gemini"]);
 const PUBLIC_THREAD = 11;
 // How long a hello whose check needs Discord waits for the gateway after a
 // Router start, before it is refused as `not_ready` (which a client retries).

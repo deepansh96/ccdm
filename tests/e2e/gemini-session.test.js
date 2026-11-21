@@ -1,0 +1,240 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import test from "node:test";
+
+import { injectDiscordMessage, waitForState } from "./support/bridge.js";
+import { runScript } from "./support/runner.js";
+import { OWNER_ID, createRouterWorkspace, routerEnv, routerRegistry, routerWithWebhooks, runRouterCli } from "./support/router.js";
+import { readState } from "./support/state.js";
+import { cleanup } from "./support/teardown.js";
+
+test.afterEach(cleanup);
+
+// A Gemini project end to end: start-gemini-session.sh, the real Router and
+// gemini-bridge.js, driving the fake agy (support/fake-agy.cjs) over ACP. The
+// fake agy starts the session's real Discord MCP server, so replies travel
+// MCP server -> Router -> project webhook like a live session's.
+const SESSION_ID = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+const SECOND_SESSION_ID = "1b2c3d4e-5f6a-4b7c-9d8e-0f1a2b3c4d5e";
+// 262,144 of a 1,048,576-token window is 25%.
+const QUARTER_USAGE = { used: 262144, size: 1048576 };
+
+function geminiWorkspace(project = {}) {
+  const workspace = createRouterWorkspace(routerRegistry({
+    demo: { channel_id: "demo-channel", type: "gemini", transport: "router", guest_user_ids: ["guest-id"],
+      screen_name: "demo_gemini", session_id: null, pid: null, ...project },
+  }));
+  const registryFile = path.join(workspace.repoDir, "registry.json");
+  const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+  registry.projects.demo.path = workspace.tmpDir;
+  fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
+  return workspace;
+}
+
+// The fixture PATH has no node, so agy is a wrapper naming it.
+function fakeAgyBin(workspace) {
+  const bin = path.join(workspace.tmpRoot, "agy-bin", "agy");
+  fs.mkdirSync(path.dirname(bin), { recursive: true });
+  fs.writeFileSync(bin, `#!/bin/sh\nexec '${process.execPath}' '${path.join(workspace.repoDir, "tests/e2e/support/fake-agy.cjs")}' "$@"\n`);
+  fs.chmodSync(bin, 0o755);
+  return bin;
+}
+
+function agyPlan(workspace, plan) {
+  fs.writeFileSync(path.join(workspace.stateDir, "agy-plan.json"), `${JSON.stringify(plan)}\n`);
+}
+
+function agyEvents(workspace) {
+  const file = path.join(workspace.stateDir, "agy.ndjson");
+  return fs.existsSync(file) ? fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
+}
+
+const clientRequests = (workspace, method) => agyEvents(workspace)
+  .filter((event) => event.event === "client" && event.message.method === method).map((event) => event.message);
+const promptTexts = (workspace) => clientRequests(workspace, "session/prompt")
+  .map((message) => message.params.prompt.filter((block) => block.type === "text").map((block) => block.text).join("\n"));
+
+function startGemini(workspace, args = [], extraEnv = {}) {
+  return runScript(workspace, "scripts/start-gemini-session.sh", {
+    args: ["demo", ...args], env: routerEnv(workspace, { CCDM_AGY_BIN: fakeAgyBin(workspace), ...extraEnv }), timeoutMs: 30000,
+  });
+}
+
+const readRegistry = (workspace) => JSON.parse(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"));
+const webhookContents = (state) => state.fixtures.discord.messages.filter((message) => message.webhookId === "fake-webhook-1")
+  .map((message) => message.content);
+const botReactions = (state) => state.fixtures.discord.reactions.map(({ messageId, emoji }) => [messageId, decodeURIComponent(emoji)]);
+const ownerMessage = (workspace, id, content) =>
+  injectDiscordMessage(workspace, { id, channelId: "demo-channel", content, author: { id: OWNER_ID, username: "Owner" } });
+
+async function geminiSession(plan, project = {}) {
+  const workspace = geminiWorkspace(project);
+  agyPlan(workspace, { sessionIds: [SESSION_ID, SECOND_SESSION_ID], ...plan });
+  await routerWithWebhooks(workspace, ["demo"]);
+  const started = await startGemini(workspace);
+  assert.equal(started.exitCode, 0, started.stderr || started.stdout);
+  return workspace;
+}
+
+test("start-gemini-session runs agy acp in the project with the scoped Discord MCP server, and a reply posts as demo-gemini", async () => {
+  const workspace = await geminiSession({ turns: [{ usage: QUARTER_USAGE, reply: "tests pass" }] },
+    { gemini_model: "gemini-3.8-flash-low" });
+
+  const status = await runRouterCli(workspace, ["status"]);
+  assert.match(status.stdout, /sessions: 1\n  project demo scope=demo-channel connected=/);
+  const registry = readRegistry(workspace);
+  assert.equal(typeof registry.projects.demo.pid, "number");
+  assert.equal(registry.projects.demo.session_id, SESSION_ID);
+
+  const spawn = agyEvents(workspace).find((event) => event.event === "spawn");
+  assert.deepEqual(spawn.argv, ["acp", "--dangerously-skip-permissions"]);
+  assert.equal(fs.realpathSync(spawn.cwd), fs.realpathSync(workspace.tmpDir));
+  const [created] = clientRequests(workspace, "session/new");
+  assert.equal(created.params.cwd, workspace.tmpDir);
+  assert.deepEqual(created.params.mcpServers.map((server) => server.name), ["discord-demo-channel"]);
+  const mcpEnv = Object.fromEntries(created.params.mcpServers[0].env.map(({ name, value }) => [name, value]));
+  assert.equal(mcpEnv.CCDM_ROUTER_KEY_FILE, path.join(workspace.routerStateDir, "keys", "demo.key"));
+  assert.equal(mcpEnv.CCDM_CODEX_PROJECT, "demo");
+  assert.match(created.params._meta.antigravity.systemPrompt.append, /discord-demo-channel/);
+  for (const secret of ["root-bot-token", "fake-webhook-token", "DISCORD_BOT_TOKEN"]) {
+    assert.equal(JSON.stringify(created).includes(secret), false, secret);
+  }
+  // A model id with a thinking-level suffix selects that model and level.
+  assert.deepEqual(clientRequests(workspace, "session/set_config_option").map((message) => [message.params.configId, message.params.value]),
+    [["model", "gemini-3.8-flash"], ["thought_level", "low"]]);
+
+  ownerMessage(workspace, "owner-1", "please run the tests");
+  const done = await waitForState(workspace, (next) => webhookContents(next).length > 0, 15000);
+  assert.deepEqual(promptTexts(workspace), ["please run the tests"]);
+  assert.deepEqual(done.fixtures.discord.messages.map(({ channelId, content, username, webhookId }) => ({ channelId, content, username, webhookId })),
+    [{ channelId: "demo-channel", content: "tests pass", username: "demo-gemini · 25%", webhookId: "fake-webhook-1" }]);
+  // The MCP server's op-only connection did not replace the bridge as the listener.
+  const after = await runRouterCli(workspace, ["status"]);
+  assert.match(after.stdout, /sessions: 1\n  project demo scope=demo-channel connected=/);
+});
+
+test("messages sent during a Gemini turn wait with ⏳ and go into the next turn together", async () => {
+  const workspace = await geminiSession({ turns: [{ delayMs: 1500, reply: "first done" }, { reply: "both done" }] });
+
+  ownerMessage(workspace, "owner-1", "first task");
+  await waitForState(workspace, () => promptTexts(workspace).length === 1, 15000);
+  ownerMessage(workspace, "owner-2", "also this");
+  ownerMessage(workspace, "owner-3", "and that");
+  await waitForState(workspace, (next) => botReactions(next).filter(([, emoji]) => emoji === "⏳").length === 2, 15000);
+  const done = await waitForState(workspace, (next) => webhookContents(next).includes("both done"), 15000);
+
+  assert.deepEqual(promptTexts(workspace), [
+    "first task",
+    "[Queued message 1 of 2]\nalso this\n[Queued message 2 of 2]\nand that",
+  ]);
+  assert.deepEqual(webhookContents(done), ["first done", "both done"]);
+  const cleared = await waitForState(workspace, (next) => (next.fixtures.discord.reactionDeletes ?? []).length === 2, 15000);
+  assert.deepEqual(cleared.fixtures.discord.reactionDeletes.map(({ messageId, emoji }) => [messageId, decodeURIComponent(emoji)]),
+    [["owner-2", "⏳"], ["owner-3", "⏳"]]);
+});
+
+test("a Gemini turn that ends with text but no reply call posts that text", async () => {
+  const workspace = await geminiSession({ turns: [{ text: "Here is the answer." }] });
+
+  ownerMessage(workspace, "owner-1", "what is it?");
+  const done = await waitForState(workspace, (next) => webhookContents(next).length > 0, 15000);
+
+  assert.deepEqual(webhookContents(done), ["Here is the answer."]);
+});
+
+test("a failed Gemini prompt posts the error and the next message still runs", async () => {
+  const workspace = await geminiSession({ turns: [{ error: "quota exhausted" }, { reply: "recovered" }] });
+
+  ownerMessage(workspace, "owner-1", "first");
+  await waitForState(workspace, (next) => webhookContents(next).length > 0, 15000);
+  ownerMessage(workspace, "owner-2", "second");
+  const done = await waitForState(workspace, (next) => webhookContents(next).includes("recovered"), 15000);
+
+  assert.deepEqual(webhookContents(done), ["**Error:** quota exhausted", "recovered"]);
+});
+
+test("/clear cancels the running Gemini turn and opens a fresh agy session; /compact runs agy's compact", async () => {
+  const workspace = await geminiSession({ turns: [{ holdUntilCancel: true }, { reply: "fresh" }] });
+
+  ownerMessage(workspace, "owner-1", "long task");
+  await waitForState(workspace, () => promptTexts(workspace).length === 1, 15000);
+  ownerMessage(workspace, "cmd-clear", "/clear");
+  await waitForState(workspace, (next) => webhookContents(next).some((content) => content.startsWith("Conversation cleared")), 15000);
+  ownerMessage(workspace, "owner-2", "after clear");
+  await waitForState(workspace, (next) => webhookContents(next).includes("fresh"), 15000);
+  ownerMessage(workspace, "cmd-compact", "/compact");
+  const done = await waitForState(workspace, (next) => webhookContents(next).includes("Compaction complete."), 15000);
+
+  assert.deepEqual(clientRequests(workspace, "session/cancel").map((message) => message.params.sessionId), [SESSION_ID]);
+  assert.deepEqual(clientRequests(workspace, "session/new").length, 2);
+  assert.deepEqual(clientRequests(workspace, "session/prompt").map((message) => message.params.sessionId),
+    [SESSION_ID, SECOND_SESSION_ID, SECOND_SESSION_ID]);
+  assert.equal(promptTexts(workspace).at(-1), "/compact");
+  // The reply posts before its turn ends, so /compact may still be queued behind it.
+  assert.deepEqual(webhookContents(done).filter((content) => content !== "Compaction queued."), [
+    "Conversation cleared — fresh session started.", "fresh", "Compaction started.", "Compaction complete.",
+  ]);
+  assert.deepEqual(botReactions(done).filter(([id]) => id.startsWith("cmd-")), [["cmd-clear", "🔄"], ["cmd-compact", "🔄"]]);
+});
+
+test("stop-session stops the Gemini bridge and clears its key, launch files and registry runtime", async () => {
+  const workspace = await geminiSession({});
+  const pid = readRegistry(workspace).projects.demo.pid;
+
+  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"], env: routerEnv(workspace), timeoutMs: 30000 });
+
+  assert.equal(stopped.exitCode, 0, stopped.stderr || stopped.stdout);
+  assert.match(stopped.stdout, /Stopping recorded process tree for 'demo'/);
+  assert.throws(() => process.kill(pid, 0));
+  assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", "demo.key")), false);
+  assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "launches", "demo")), false);
+  assert.deepEqual([readRegistry(workspace).projects.demo.pid, readRegistry(workspace).projects.demo.session_id], [null, null]);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.demo_gemini, undefined);
+});
+
+test("a Gemini launch with a model agy does not offer fails, names the model, and cleans up", async () => {
+  const workspace = geminiWorkspace({ gemini_model: "gemini-9-ultra" });
+  agyPlan(workspace, {});
+  await routerWithWebhooks(workspace, ["demo"]);
+
+  const started = await startGemini(workspace);
+
+  assert.notEqual(started.exitCode, 0);
+  assert.match(started.stderr + started.stdout, /Unknown Gemini model 'gemini-9-ultra'/);
+  assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions.demo_gemini, undefined);
+  assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", "demo.key")), false);
+  assert.equal(readRegistry(workspace).projects.demo.pid, null);
+});
+
+test("start-gemini-session --resume continues a saved agy conversation and refuses a missing one", async () => {
+  const workspace = geminiWorkspace();
+  agyPlan(workspace, { turns: [{ reply: "resumed" }] });
+  await routerWithWebhooks(workspace, ["demo"]);
+
+  const missing = await startGemini(workspace, ["--resume", SESSION_ID]);
+  assert.equal(missing.exitCode, 1);
+  assert.match(missing.stderr, /agy conversation .* is missing/);
+  assert.deepEqual(agyEvents(workspace), []);
+
+  const conversations = path.join(workspace.homeDir, ".gemini", "antigravity-cli", "conversations");
+  fs.mkdirSync(conversations, { recursive: true });
+  fs.writeFileSync(path.join(conversations, `${SESSION_ID}.db`), "");
+  const resumed = await startGemini(workspace, ["--resume", SESSION_ID]);
+  assert.equal(resumed.exitCode, 0, resumed.stderr || resumed.stdout);
+  assert.deepEqual(clientRequests(workspace, "session/resume").map((message) => message.params.sessionId), [SESSION_ID]);
+  assert.equal(clientRequests(workspace, "session/new").length, 0);
+  ownerMessage(workspace, "owner-1", "where were we?");
+  const done = await waitForState(workspace, (next) => webhookContents(next).length > 0, 15000);
+  assert.deepEqual(webhookContents(done), ["resumed"]);
+});
+
+test("start-gemini-session refuses a project that is not a Gemini project", async () => {
+  const workspace = geminiWorkspace({ type: "codex" });
+
+  const started = await startGemini(workspace);
+
+  assert.equal(started.exitCode, 1);
+  assert.match(started.stderr, /is a codex project, not a gemini one/);
+  assert.deepEqual(agyEvents(workspace), []);
+});

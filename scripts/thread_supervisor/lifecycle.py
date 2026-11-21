@@ -57,7 +57,9 @@ def _is_listener(command: str) -> bool:
         return "--dangerously-load-development-channels" in argv and "server:ccdm" in argv
     if exe == "codex":
         return "app-server" in argv
-    return exe == "node" and any(os.path.basename(arg) in ("ccdm-channel-server.js", "codex-bridge.js")
+    if exe == "agy":
+        return "acp" in argv
+    return exe == "node" and any(os.path.basename(arg) in ("ccdm-channel-server.js", "codex-bridge.js", "gemini-bridge.js")
                                  for arg in argv[1:])
 
 

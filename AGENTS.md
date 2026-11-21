@@ -1,13 +1,13 @@
 ---
 name: agents
 description: Always-loaded project anchor for CCDM.
-last_updated: 2026-11-16
+last_updated: 2026-11-21
 ---
 
 # CCDM - Claude Code Discord Manager
 
 ## What This Is
-CCDM manages isolated Claude Code and Codex Discord sessions for multiple local projects from one root bot.
+CCDM manages isolated Claude Code, Codex and Gemini (Antigravity CLI) Discord sessions for multiple local projects from one root bot.
 
 ## Non-Negotiables
 - Read `.mex/ROUTER.md` before acting; load only the context and pattern files it routes to.
@@ -25,7 +25,7 @@ CCDM manages isolated Claude Code and Codex Discord sessions for multiple local 
 
 ## Commands
 - Test: `npm test`
-- Start: `scripts/start-session.sh <project>` or `scripts/start-codex-session.sh <project>`
+- Start: `scripts/start-session.sh <project>`, `scripts/start-codex-session.sh <project>` or `scripts/start-gemini-session.sh <project>`
 - Stop: `scripts/stop-session.sh <project>`
 - Mex check: `npx mex-agent check`
 

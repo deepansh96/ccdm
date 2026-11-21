@@ -178,6 +178,7 @@ function resolveCodex(project, entry, registryFile) {
 }
 
 function resolveResume(project, entry, { registryFile }) {
+  if (entry.type === "gemini") return { skip: "Gemini projects record no conversation id to resume" };
   return entry.type === "codex" ? resolveCodex(project, entry, registryFile) : resolveClaude(entry);
 }
 

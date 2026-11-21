@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Usage: ./scripts/start-thread-session.sh <project> <thread_id> --provider claude|codex
+# Usage: ./scripts/start-thread-session.sh <project> <thread_id> --provider claude|codex|gemini
 #          [--account <alias>] [--model <model>] [--effort <effort>] [--resume <id>] [--home <path>]
 # Starts one Thread Conversation's session, served through the Router as the
 # `thread` role. The Thread Supervisor runs it; on success the last stdout
@@ -22,6 +22,11 @@
 # provider conversation id is the Codex thread uuid, and its last stdout line
 # also carries `ws_port`.
 #
+# A Gemini thread runs gemini-bridge.js in thread mode, driving its own `agy
+# acp` over stdio (no port). Gemini has no account aliases; its provider
+# conversation id is the agy session id, and its home is agy's data
+# directory, ~/.gemini/antigravity-cli.
+#
 # --resume continues the thread's provider conversation (`claude --resume`,
 # or the bridge's Codex thread uuid) in the same home and cwd. --home names
 # that home (the one the conversation started in, which the supervisor
@@ -36,7 +41,7 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 REGISTRY="${CCDM_REGISTRY_PATH:-$ROOT_DIR/registry.json}"
 
 usage() {
-  echo "Usage: $0 <project> <thread_id> --provider claude|codex [--account <alias>] [--model <model>] [--effort <effort>] [--resume <id>] [--home <path>]" >&2
+  echo "Usage: $0 <project> <thread_id> --provider claude|codex|gemini [--account <alias>] [--model <model>] [--effort <effort>] [--resume <id>] [--home <path>]" >&2
   exit 2
 }
 
@@ -69,7 +74,7 @@ if [[ ! "$THREAD_ID" =~ '^[0-9A-Za-z_-]+$' ]]; then
   exit 2
 fi
 case "$PROVIDER" in
-  claude|codex) ;;
+  claude|codex|gemini) ;;
   *) usage ;;
 esac
 if [[ -n "$RESUME_ID" && ! "$RESUME_ID" =~ '^[0-9A-Za-z_-]+$' ]]; then
@@ -130,6 +135,31 @@ CONFIG_DIR_ENV=""
 [[ "$CONFIG_DIR" != "__NONE__" ]] && CONFIG_DIR_ENV=" CLAUDE_CONFIG_DIR='$CONFIG_DIR'"
 [[ "$MODEL" == "__NONE__" ]] && MODEL=""
 [[ "$EFFORT" == "__NONE__" ]] && EFFORT=""
+elif [[ "$PROVIDER" == "gemini" ]]; then
+if [[ -n "$ACCOUNT" ]]; then
+  echo "Gemini has no account aliases (got '$ACCOUNT')" >&2
+  exit 1
+fi
+LAUNCH_FIELDS="$(python3 - "$REGISTRY" "$PROJECT" "$MODEL" "$EFFORT" <<'PY'
+import json, os, sys
+registry_path, project, model, effort = sys.argv[1:5]
+registry = json.load(open(registry_path))
+entry = (registry.get("projects") or {}).get(project)
+if not isinstance(entry, dict) or not project or "/" in project or project.startswith("."):
+    sys.exit(f"Unknown project '{project}'")
+if not entry.get("webhook_id"):
+    sys.exit(f"Project '{project}' has no webhook_id, so its thread replies could not be posted")
+effort = effort or entry.get("gemini_effort") or ""
+if effort and effort not in ("low", "medium", "high", "xhigh"):
+    sys.exit(f"Invalid effort '{effort}' (expected low, medium, high, or xhigh)")
+fields = [os.path.expanduser(entry["path"]), entry["screen_name"], model or entry.get("gemini_model") or "", effort]
+print("\t".join(field or "__NONE__" for field in fields))
+PY
+)" || exit 1  # Python's reason is the last stderr line.
+IFS=$'\t' read -r PATH_DIR SCREEN_NAME MODEL EFFORT <<< "$LAUNCH_FIELDS"
+[[ "$MODEL" == "__NONE__" ]] && MODEL=""
+[[ "$EFFORT" == "__NONE__" ]] && EFFORT=""
+GEMINI_HOME_DIR="${HOME_OVERRIDE:-$HOME/.gemini/antigravity-cli}"
 else
 LAUNCH_FIELDS="$(python3 - "$REGISTRY" "$PROJECT" "$MODEL" "$EFFORT" <<'PY'
 import json, os, sys
@@ -175,6 +205,8 @@ fi
 if [[ -n "$RESUME_ID" ]]; then
   if [[ "$PROVIDER" == "claude" ]]; then
     RESUME_HOME="$CLAUDE_HOME"
+  elif [[ "$PROVIDER" == "gemini" ]]; then
+    RESUME_HOME="$GEMINI_HOME_DIR"
   else
     RESUME_HOME="$CODEX_HOME_DIR"
   fi
@@ -190,6 +222,10 @@ if provider == "claude":
         if os.path.isfile(os.path.join(home, "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd), f"{conversation_id}.jsonl")):
             sys.exit(0)
     sys.exit(f"The Claude transcript for conversation {conversation_id} is missing from {home}")
+if provider == "gemini":
+    if os.path.isfile(os.path.join(home, "conversations", f"{conversation_id}.db")):
+        sys.exit(0)
+    sys.exit(f"The agy conversation {conversation_id} is missing from {home}")
 if glob.glob(os.path.join(glob.escape(home), "sessions", "**", f"rollout-*-{conversation_id}.jsonl"), recursive=True):
     sys.exit(0)
 sys.exit(f"The Codex rollout for conversation {conversation_id} is missing from {home}")
@@ -234,7 +270,9 @@ def is_listener(command: str) -> bool:
         return "--dangerously-load-development-channels" in argv and "server:ccdm" in argv
     if exe == "codex":
         return "app-server" in argv
-    return exe == "node" and any(os.path.basename(arg) in ("ccdm-channel-server.js", "codex-bridge.js")
+    if exe == "agy":
+        return "acp" in argv
+    return exe == "node" and any(os.path.basename(arg) in ("ccdm-channel-server.js", "codex-bridge.js", "gemini-bridge.js")
                                  for arg in argv[1:])
 
 for line in ps.splitlines():
@@ -315,8 +353,8 @@ def write_private(path: Path, text: str) -> None:
 # The token first: from here on this launch owns the key and the launch dir.
 write_private(launch / ".launch-token", token + "\n")
 write_private(Path(key_file), secrets.token_urlsafe(32) + "\n")
-# A Codex bridge takes its settings from its tmux environment instead.
-if provider == "codex":
+# A Codex or Gemini bridge takes its settings from its tmux environment instead.
+if provider in ("codex", "gemini"):
     sys.exit(0)
 # The channel server and the command hooks record this thread's Conversation
 # Reminder events, with the thread as their conversation.
@@ -366,6 +404,100 @@ write_private(launch / "settings.json", json.dumps({
 }, indent=2) + "\n")
 write_private(launch / "reminder-env.json", json.dumps(reminder_env) + "\n")
 PY
+
+if [[ "$PROVIDER" == "gemini" ]]; then
+  GEMINI_ENV=""
+  [[ -n "$MODEL" ]] && GEMINI_ENV+=" GEMINI_MODEL='$MODEL'"
+  [[ -n "$EFFORT" ]] && GEMINI_ENV+=" GEMINI_EFFORT='$EFFORT'"
+  [[ -n "$RESUME_ID" ]] && GEMINI_ENV+=" GEMINI_RESUME_SESSION_ID='$RESUME_ID'"
+  [[ -n "${CCDM_AGY_BIN:-}" ]] && GEMINI_ENV+=" CCDM_AGY_BIN='$CCDM_AGY_BIN'"
+  TRANSCRIBE_AUDIO_FLAG="${CODEX_BRIDGE_TRANSCRIBE_AUDIO:-${USE_AUDIO_TRANSCRIPTION_IN_BRIDGE:-}}"
+  [[ -n "$TRANSCRIBE_AUDIO_FLAG" ]] && GEMINI_ENV+=" CODEX_BRIDGE_TRANSCRIBE_AUDIO='$TRANSCRIBE_AUDIO_FLAG'"
+  [[ -n "${CCDM_THREAD_BOOT_TIMEOUT_S:-}" ]] && GEMINI_ENV+=" CCDM_THREAD_BOOT_TIMEOUT_S='$CCDM_THREAD_BOOT_TIMEOUT_S'"
+  BOOTSTRAP_FILE="${CCDM_THREAD_BOOTSTRAP_FILE:-$LAUNCH_DIR/bootstrap.json}"
+  # The bridge runs from this checkout; agy and its turns run in the project path.
+  # zsh -i loads ~/.zshrc, so prompts there (oh-my-zsh's update prompt) must be
+  # switched off or a headless launch blocks before it starts anything.
+  if ! tmux new-session -d -s "$TMUX_NAME" -- env DISABLE_AUTO_UPDATE=true DISABLE_UPDATE_PROMPT=true zsh -ic "cd '$ROOT_DIR' && CCDM_GEMINI_PROJECT='$PROJECT' CCDM_ROUTER_STATE_DIR='$ROUTER_STATE' CCDM_ROUTER_KEY_FILE='$KEY_FILE' CCDM_CHANNEL_READY_FILE='$LAUNCH_DIR/ready.json' CHANNEL_ID='$THREAD_ID' PROJECT_DIR='$PATH_DIR' CCDM_THREAD_ID='$THREAD_ID' CCDM_THREAD_PROVIDER='gemini' CCDM_THREAD_BOOTSTRAP_FILE='$BOOTSTRAP_FILE' CCDM_THREAD_ACTIVITY_FILE='$LAUNCH_DIR/activity.json'$GEMINI_ENV node scripts/gemini-bridge.js" >&2; then
+    fail "tmux could not start the thread session"
+  fi
+  echo "Started Gemini thread bridge in tmux session '$TMUX_NAME'" >&2
+
+  # The bridge reports its Router hello outcome, and its agy session id, once
+  # agy's session is open.
+  RESULT="$(python3 - "$TMUX_NAME" "$LAUNCH_DIR/ready.json" "$KEY_FILE" "$GEMINI_HOME_DIR" <<'PY'
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+screen, ready_file, key_file, gemini_home = sys.argv[1:5]
+failure = Path(ready_file).with_name(".failure")
+timeout = float(os.environ.get("CCDM_THREAD_BOOT_TIMEOUT_S") or 120)
+deadline = time.monotonic() + timeout
+
+def give_up(reason: str) -> None:
+    failure.write_text(reason)
+    sys.exit(reason)
+
+outcome = None
+while time.monotonic() < deadline:
+    try:
+        with open(ready_file) as f:
+            outcome = json.load(f)
+        break
+    except (FileNotFoundError, json.JSONDecodeError):
+        if subprocess.run(["tmux", "has-session", "-t", f"={screen}"], capture_output=True).returncode != 0:
+            give_up("The Gemini bridge exited before its Router hello")
+        time.sleep(0.2)
+if outcome is None:
+    give_up(f"The Gemini bridge did not say hello to the Router within {timeout:g}s")
+if not outcome.get("ok"):
+    give_up(f"The Gemini bridge failed to start: {outcome.get('error')}")
+
+target = os.path.normpath(key_file)
+env_re = re.compile(r"""CCDM_ROUTER_KEY_FILE=(?:"([^"]+)"|'([^']+)'|([^\s]+))""")
+
+def find_pid():
+    try:
+        ps = subprocess.check_output(["ps", "axeww", "-o", "pid=,command="], text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        return None
+    for line in ps.splitlines():
+        pid_text, _, command = line.strip().partition(" ")
+        if not pid_text.isdigit() or "ps axeww" in command or "python3 -" in command:
+            continue
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            continue
+        if len(argv) < 2 or os.path.basename(argv[0]) != "node" or not argv[1].endswith("gemini-bridge.js"):
+            continue
+        keys = [next(g for g in m.groups() if g is not None) for m in env_re.finditer(command)]
+        if any(os.path.normpath(key) == target for key in keys):
+            return int(pid_text)
+    return None
+
+pid = None
+for _ in range(20):
+    pid = find_pid()
+    if pid:
+        break
+    time.sleep(0.5)
+if not pid:
+    give_up("The thread session's Gemini bridge process could not be found")
+print(json.dumps({"pid": pid, "provider_conversation_id": outcome.get("provider_conversation_id"), "tmux": screen,
+                  "provider_home": gemini_home}))
+PY
+)" || fail "$(cat "$LAUNCH_DIR/.failure" 2>/dev/null || echo "The thread session did not start")"
+  echo "Attach with: tmux attach -t $TMUX_NAME" >&2
+  echo "$RESULT"
+  exit 0
+fi
 
 if [[ "$PROVIDER" == "codex" ]]; then
   CODEX_ENV=" CODEX_SERVICE_TIER='$SERVICE_TIER'"

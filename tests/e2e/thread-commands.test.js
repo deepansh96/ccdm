@@ -142,7 +142,7 @@ test("an invalid provider, a foreign or unknown account alias, or an invalid mod
   const workspace = commandWorkspace();
   await supervised(workspace);
   const commands = [
-    "/thread a --provider gemini hello",
+    "/thread a --provider llama hello",
     "/thread b --account nobody hello",
     // `work` is a Claude alias, not a Codex one.
     "/thread c --provider codex --account work hello",
@@ -162,7 +162,7 @@ test("an invalid provider, a foreign or unknown account alias, or an invalid mod
     assert.match(notice.content, /^Thread not created: /);
   }
   const texts = notices(workspace, "demo-channel").map(notice => notice.content);
-  assert.match(texts[0], /gemini/);
+  assert.match(texts[0], /llama/);
   assert.match(texts[1], /nobody/);
   assert.match(texts[2], /work/);
   assert.match(texts[3], /turbo/);

@@ -10,6 +10,8 @@ const path = require("node:path");
 
 // How long registry writes must settle before a reload.
 const DEFAULT_RELOAD_DEBOUNCE_MS = 250;
+// A project's session provider: Claude Code, Codex, or Gemini through agy.
+const PROJECT_TYPES = ["claude", "codex", "gemini"];
 
 async function readRegistry(file) {
   return JSON.parse(await readFile(file, "utf8"));
@@ -41,8 +43,8 @@ function validateRegistry(registry) {
       continue;
     }
     if (!isId(project.channel_id)) problems.push(`project ${name}: channel_id must be a Discord ID`);
-    if (project.type != null && project.type !== "claude" && project.type !== "codex") {
-      problems.push(`project ${name}: type must be "claude" or "codex"`);
+    if (project.type != null && !PROJECT_TYPES.includes(project.type)) {
+      problems.push(`project ${name}: type must be "claude", "codex" or "gemini"`);
     }
     if (project.webhook_id != null && !isId(project.webhook_id)) problems.push(`project ${name}: webhook_id must be a Discord ID`);
     if (project.guest_user_ids != null && !(Array.isArray(project.guest_user_ids) && project.guest_user_ids.every(isId))) {
@@ -67,7 +69,7 @@ function buildRoutingTable(registry) {
     registered.set(String(project.channel_id), name);
     const route = {
       project: name,
-      type: project.type === "codex" ? "codex" : "claude",
+      type: PROJECT_TYPES.includes(project.type) ? project.type : "claude",
       transport: "router",
       channel_id: String(project.channel_id),
       webhook_id: project.webhook_id ? String(project.webhook_id) : null,

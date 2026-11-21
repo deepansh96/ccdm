@@ -38,7 +38,7 @@ def guests(registry: dict, name: str) -> list[str]:
 
 
 def accounts(registry: dict, provider: str) -> dict:
-    """A provider's account aliases: `claude_accounts` or `codex_accounts`."""
+    """A provider's account aliases: `claude_accounts` or `codex_accounts` (Gemini has none)."""
     values = registry.get(f"{provider}_accounts")
     return values if isinstance(values, dict) else {}
 
@@ -47,6 +47,16 @@ def resolved_settings(entry: dict, overrides) -> dict:
     """What a thread's session runs with: each override, else the project's setting."""
     provider = overrides["provider"] or entry.get("type") or "claude"
     codex = provider == "codex"
+    if provider == "gemini":
+        # A project's plain `model` names its own provider's model, so only a
+        # Gemini project lends it to a Gemini thread.
+        own = entry.get("type") == "gemini"
+        return {
+            "provider": provider,
+            "account": overrides["account"],
+            "model": overrides["model"] or entry.get("gemini_model") or (entry.get("model") if own else None),
+            "effort": overrides["effort"] or entry.get("gemini_effort"),
+        }
     return {
         "provider": provider,
         "account": overrides["account"],
