@@ -139,8 +139,6 @@ test("the budget is exactly the number of tests skipped on Windows", async () =>
 // Antigravity quota tests have not been ported to Windows yet.
 const CLOSED_CATEGORIES = ["darwin-only", "posix-signals", "tmux-backend", "posix-pair", "windows-refused-d2", "posix-only-behaviour"];
 const KNOWN_GAPS = [
-  "gemini-session.test.js :: *",
-  "thread-gemini-session.test.js :: *",
   "usage-stats-poster.test.js :: scheduled poster renders an Antigravity field beside Claude and records agy quota in history",
   "usage-stats-poster.test.js :: dry run prints the report, including Antigravity, without a token, a post, or history",
   "usage-stats-poster.test.js :: a missing agy degrades to one unavailable line, and a machine without agy has no Antigravity field",

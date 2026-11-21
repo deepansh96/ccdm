@@ -771,7 +771,7 @@ test("CLAUDE.md.example names POSIX-only commands only under macOS:, in the whol
 // Root's command entries, with the usage entry, "Discord Polls" and "Voice
 // Messages": the lines from "Commands" up to "Channel Routing Rules". They are
 // final. A change that rewrites one on purpose updates this hash with it.
-const ROOT_ENTRIES_SHA256 = "82a9d8ad885c5025ff6689575d79e7b045e3aeda4dcb68c2d52d406289dfd0f2";
+const ROOT_ENTRIES_SHA256 = "06cde4ffeb707d6e8d6c1042aab37d6d878987bb8d08acad6e4bfc8bb790731c";
 
 test("root's command, usage and voice entries in CLAUDE.md.example are unchanged", () => {
   const { lines } = wholeFile(ROOT_ENTRIES.file);

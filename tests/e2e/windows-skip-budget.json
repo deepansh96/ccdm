@@ -1,5 +1,5 @@
 {
-  "budget": 162,
+  "budget": 141,
   "skips": [
     {
       "file": "codex-start.test.js",
@@ -840,53 +840,39 @@
       "reason": "claude-usage.sh passes $HOME paths to python3, which a native Windows Python cannot open; ccdm-usage.test.js runs the corrupt-session case on `ccdm usage` on Windows"
     },
     {
-      "file": "gemini-session.test.js",
-      "test": "*",
-      "tag": "posix",
-      "category": "gap",
-      "reason": "the Gemini bridge (agy acp) has not been ported to Windows, which refuses Gemini projects and threads"
-    },
-    {
-      "file": "thread-gemini-session.test.js",
-      "test": "*",
-      "tag": "posix",
-      "category": "gap",
-      "reason": "the Gemini bridge (agy acp) has not been ported to Windows, which refuses Gemini projects and threads"
-    },
-    {
       "file": "usage-stats-poster.test.js",
       "test": "scheduled poster renders an Antigravity field beside Claude and records agy quota in history",
       "tag": "posix",
       "category": "gap",
-      "reason": "the Antigravity quota tests drive a POSIX shell fake agy and its process group; agy is not ported to Windows"
+      "reason": "the Antigravity quota tests drive a POSIX shell fake agy and its process group; a Windows fake agy is not written yet"
     },
     {
       "file": "usage-stats-poster.test.js",
       "test": "dry run prints the report, including Antigravity, without a token, a post, or history",
       "tag": "posix",
       "category": "gap",
-      "reason": "the Antigravity quota tests drive a POSIX shell fake agy and its process group; agy is not ported to Windows"
+      "reason": "the Antigravity quota tests drive a POSIX shell fake agy and its process group; a Windows fake agy is not written yet"
     },
     {
       "file": "usage-stats-poster.test.js",
       "test": "a missing agy degrades to one unavailable line, and a machine without agy has no Antigravity field",
       "tag": "posix",
       "category": "gap",
-      "reason": "the Antigravity quota tests drive a POSIX shell fake agy and its process group; agy is not ported to Windows"
+      "reason": "the Antigravity quota tests drive a POSIX shell fake agy and its process group; a Windows fake agy is not written yet"
     },
     {
       "file": "usage-stats-poster.test.js",
       "test": "agy sign-in, timeout, crash, and unreadable output each become one short unavailable block",
       "tag": "posix",
       "category": "gap",
-      "reason": "the Antigravity quota tests drive a POSIX shell fake agy and its process group; agy is not ported to Windows"
+      "reason": "the Antigravity quota tests drive a POSIX shell fake agy and its process group; a Windows fake agy is not written yet"
     },
     {
       "file": "usage-stats-poster.test.js",
       "test": "a long Antigravity section continues in extra fields and keeps the embed within Discord limits",
       "tag": "posix",
       "category": "gap",
-      "reason": "the Antigravity quota tests drive a POSIX shell fake agy and its process group; agy is not ported to Windows"
+      "reason": "the Antigravity quota tests drive a POSIX shell fake agy and its process group; a Windows fake agy is not written yet"
     }
   ]
 }

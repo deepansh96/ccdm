@@ -71,7 +71,7 @@ Each service is opt-in. Install one only when the operator asks.
 - `scripts/ccdm list` - lists the projects and whether each session is live.
 - `scripts/ccdm start-session <project>` - starts a registered Claude project.
 - `scripts/ccdm start-codex-session <project>` - starts a registered Codex project.
-- `scripts/ccdm start-gemini-session <project> [--resume <session_id>]` - starts a registered Gemini project through the Antigravity CLI (`agy`, installed and signed in once). macOS only; Windows refuses it.
+- `scripts/ccdm start-gemini-session <project> [--resume <session_id>]` - starts a registered Gemini project through the Antigravity CLI (`agy`, installed and signed in once).
 - `scripts/ccdm stop-session <project>` - stops any session type and clears runtime state.
 - `scripts/ccdm restart-session <project>` - stops, then starts, any session type.
 - `node scripts/guest-access.js list [project]` - inspects project guest access.

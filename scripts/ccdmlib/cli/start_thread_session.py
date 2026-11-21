@@ -25,8 +25,7 @@ provider conversation id is the Codex thread uuid.
 A Gemini thread runs ``gemini-bridge.js`` in thread mode, driving its own ``agy
 acp`` over stdio (no port). Gemini has no account aliases; its provider
 conversation id is the agy session id, and its home is agy's data directory,
-``~/.gemini/antigravity-cli``. The Gemini bridge has not been ported to Windows,
-where a Gemini thread is refused.
+``~/.gemini/antigravity-cli``.
 
 ``--resume`` continues the thread's provider conversation (``claude --resume``, or
 the bridge's Codex thread uuid or agy session id) in the same home and cwd. ``--home`` names that
@@ -174,8 +173,6 @@ class _ThreadLaunch:
             raise _Refused(f"Invalid thread id: '{self.thread_id}'", 2)
         if self.provider not in ("claude", "codex", "gemini"):
             raise self._usage()
-        if self.provider == "gemini" and WIN32:
-            raise _Refused("Gemini thread sessions are not supported on Windows yet")
         if self.resume and not _ID.fullmatch(self.resume):
             raise _Refused(f"Invalid conversation id to resume: '{self.resume}'", 2)
         if self.home_override:
@@ -355,7 +352,7 @@ class _ThreadLaunch:
         if current != self.token:
             self._say(f"Leaving thread {self.thread_id}'s launch files to its newer launch")
             return
-        grace = _FAILED_BRIDGE_GRACE_MS if self.provider == "codex" and not self.on_tmux else None
+        grace = _FAILED_BRIDGE_GRACE_MS if self.provider in ("codex", "gemini") and not self.on_tmux else None
         try:
             session_host.stop(self.name, grace)
         except session_host.SessionHostError:
@@ -544,6 +541,7 @@ class _ThreadLaunch:
     def _gemini_env(self) -> Dict[str, str]:
         launch = Path(self.launch_dir)
         env = {
+            **self._forwarded(),
             "CCDM_GEMINI_PROJECT": self.project,
             "CCDM_ROUTER_STATE_DIR": self.router_state,
             "CCDM_ROUTER_KEY_FILE": self.key_file,
@@ -575,8 +573,11 @@ class _ThreadLaunch:
     def _start_gemini(self) -> int:
         # The bridge runs from this checkout; agy and its turns run in the project path.
         try:
-            session_host.start(self.name, ["node", _GEMINI_BRIDGE_SCRIPT], str(self.root), self._gemini_env(),
-                               pty=False, kind="thread")
+            if WIN32:
+                argv = [exe.node()["command"], _GEMINI_BRIDGE_SCRIPT, _KEY_FILE_FLAG, self.key_file]
+            else:
+                argv = ["node", _GEMINI_BRIDGE_SCRIPT]
+            session_host.start(self.name, argv, str(self.root), self._gemini_env(), pty=False, kind="thread")
         except session_host.SessionHostError as error:
             self._say(str(error))
             return self._fail(self._could_not_start())
@@ -595,7 +596,8 @@ class _ThreadLaunch:
         if not pid:
             return self._give_up("The thread session's Gemini bridge process could not be found")
         return self._succeed({"pid": pid, "provider_conversation_id": outcome.get("provider_conversation_id"),
-                              "tmux": self.name, "provider_home": self.gemini_home}, None)
+                              "tmux": self.name, "provider_home": self.gemini_home},
+                             proc.start_time(pid) if WIN32 else None)
 
     def _wait_for_bridge(self, label: str = "Codex") -> Dict[str, Any]:
         """The bridge's ready.json once it says ok; it reports its Router hello and provider conversation id."""

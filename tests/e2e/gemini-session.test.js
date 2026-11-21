@@ -1,17 +1,15 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import nodeTest from "node:test";
+import test from "node:test";
 
 import { injectDiscordMessage, waitForState } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
+import { startFakeHost } from "./support/session-fixture.js";
 import { OWNER_ID, createRouterWorkspace, routerEnv, routerRegistry, routerWithWebhooks, runRouterCli } from "./support/router.js";
 import { readState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
-import { suiteTest } from "./support/platform.js";
 
-// Gemini runs on macOS and Linux only for now (see support/surfaces.js).
-const test = suiteTest(nodeTest, import.meta.url);
 
 test.afterEach(cleanup);
 
@@ -38,6 +36,9 @@ function geminiWorkspace(project = {}) {
 
 // The fixture PATH has no node, so agy is a wrapper naming it.
 function fakeAgyBin(workspace) {
+  const fake = path.join(workspace.repoDir, "tests/e2e/support/fake-agy.cjs");
+  // Windows: the bridge runs a JavaScript agy under its own Node.
+  if (process.platform === "win32") return fake;
   const bin = path.join(workspace.tmpRoot, "agy-bin", "agy");
   fs.mkdirSync(path.dirname(bin), { recursive: true });
   // Named agy in ps, as the real binary is, so listener detection sees it.
@@ -60,10 +61,24 @@ const clientRequests = (workspace, method) => agyEvents(workspace)
 const promptTexts = (workspace) => clientRequests(workspace, "session/prompt")
   .map((message) => message.params.prompt.filter((block) => block.type === "text").map((block) => block.text).join("\n"));
 
-function startGemini(workspace, args = [], extraEnv = {}) {
+// On Windows the launcher needs a session host; each Workspace gets one fake host.
+const fakeHosts = new WeakMap();
+async function backendEnv(workspace) {
+  if (process.platform !== "win32") return {};
+  if (!fakeHosts.has(workspace)) fakeHosts.set(workspace, await startFakeHost(workspace, { env: routerEnv(workspace) }));
+  return fakeHosts.get(workspace).env;
+}
+
+async function startGemini(workspace, args = [], extraEnv = {}) {
   return runScript(workspace, "scripts/start-gemini-session.sh", {
-    args: ["demo", ...args], env: routerEnv(workspace, { CCDM_AGY_BIN: fakeAgyBin(workspace), ...extraEnv }), timeoutMs: 30000,
+    args: ["demo", ...args],
+    env: routerEnv(workspace, { ...await backendEnv(workspace), CCDM_AGY_BIN: fakeAgyBin(workspace), ...extraEnv }),
+    timeoutMs: 30000,
   });
+}
+
+async function stopDemo(workspace) {
+  return runScript(workspace, "scripts/stop-session.sh", { args: ["demo"], env: routerEnv(workspace, await backendEnv(workspace)), timeoutMs: 30000 });
 }
 
 const readRegistry = (workspace) => JSON.parse(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"));
@@ -187,7 +202,7 @@ test("stop-session stops the Gemini bridge and clears its key, launch files and 
   const workspace = await geminiSession({});
   const pid = readRegistry(workspace).projects.demo.pid;
 
-  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"], env: routerEnv(workspace), timeoutMs: 30000 });
+  const stopped = await stopDemo(workspace);
 
   assert.equal(stopped.exitCode, 0, stopped.stderr || stopped.stdout);
   assert.match(stopped.stdout, /Stopping recorded process tree for 'demo'/);
@@ -335,7 +350,7 @@ test("stop-session takes the Gemini session's agy down too, found by its name an
   const [agyPid] = agyPids(workspace);
   assert.ok(alive(agyPid));
 
-  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"], env: routerEnv(workspace), timeoutMs: 30000 });
+  const stopped = await stopDemo(workspace);
 
   assert.equal(stopped.exitCode, 0, stopped.stderr || stopped.stdout);
   for (let i = 0; i < 50 && alive(agyPid); i++) await new Promise((resolve) => setTimeout(resolve, 100));

@@ -519,11 +519,12 @@ and exits non-zero instead of starting a fresh conversation.
 ### Gemini sessions (Antigravity CLI)
 
 A project with `"type": "gemini"` runs Gemini through the Google Antigravity
-CLI, `agy`. Install it, run `agy` once to sign in with Google, then register
-the project with that type and start it:
+CLI, `agy`. Install it (`~/.local/bin/agy` on macOS, `%LOCALAPPDATA%gyingy.exe`
+on Windows), run `agy` once to sign in with Google, then register the project
+with that type and start it:
 
 ```bash
-scripts/start-gemini-session.sh my-project
+scripts/ccdm start-gemini-session my-project
 ```
 
 `scripts/gemini-bridge.js` runs `agy acp`, agy's Agent Client Protocol server,
@@ -549,7 +550,7 @@ server attached to that one agy session, so no agy config file is written.
   posts that text, so an answer is never lost. Set `"text_reply_fallback": false`
   in the project entry to turn this off, for the project and its Gemini threads.
 - **Resume:** the launch records the agy session id as the project's
-  `session_id`. `scripts/start-gemini-session.sh my-project --resume <session_id>`
+  `session_id`. `scripts/ccdm start-gemini-session my-project --resume <session_id>`
   continues it. It refuses an id with no conversation in
   `~/.gemini/antigravity-cli/conversations`, and refuses while the project's
   session still runs.
@@ -797,8 +798,9 @@ The poster reports:
   no quota, and leaves no conversation. The poster runs it once per run with
   the repository as its workspace, stdin closed, the CLI log sent to
   `/dev/null`, and a 30-second limit (`CCDM_AGY_TIMEOUT_SECONDS`) that kills
-  agy's process group. The binary is `CCDM_AGY_BIN` when set, else `agy` on
-  `PATH`, else `~/.local/bin/agy`. A machine with no agy binary and no
+  agy's process group (its process tree on Windows). The binary is
+  `CCDM_AGY_BIN` when set, else `agy` on `PATH`, else `~/.local/bin/agy`
+  (`%LOCALAPPDATA%gyingy.exe` on Windows). A machine with no agy binary and no
   `~/.gemini/antigravity-cli` directory gets no Antigravity field; otherwise a
   missing binary, an expired sign-in, a timeout, or unreadable output is one
   short `*Usage unavailable: <reason>*` line and the rest of the report is

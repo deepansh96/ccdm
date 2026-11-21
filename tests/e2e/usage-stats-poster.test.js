@@ -4140,7 +4140,7 @@ test("osascript is never called on Windows", WINDOWS_ONLY, () => {
 });
 
 // Antigravity CLI (agy) quota: `agy -p /usage --output-format json` answered by a fake agy.
-const AGY_POSIX = platformGate("posix", "the Antigravity quota tests drive a POSIX shell fake agy and its process group; agy is not ported to Windows");
+const AGY_POSIX = platformGate("posix", "the Antigravity quota tests drive a POSIX shell fake agy and its process group; a Windows fake agy is not written yet");
 const AGY_NOW = "2026-11-21T07:52:00Z";
 const AGY_FIXTURE = path.join("tests", "fixtures", "agy-usage.json");
 const AGY_EXPECTED_VALUE = [

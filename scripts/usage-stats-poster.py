@@ -2518,7 +2518,8 @@ def _agy_binary():
     """Return ``(binary, expected)`` for the Antigravity CLI.
 
     ``CCDM_AGY_BIN`` wins when set; otherwise ``agy`` on PATH, then the
-    installer's ``~/.local/bin/agy`` (LaunchAgents do not add it to PATH).
+    installer's ``~/.local/bin/agy`` (LaunchAgents do not add it to PATH), or
+    ``%LOCALAPPDATA%\\agy\\bin\\agy.exe`` on Windows.
     ``expected`` is true when agy was configured or its data directory exists,
     so a machine that never used agy shows no section at all, while a missing
     binary on a machine that did use it renders an unavailable line.
@@ -2529,7 +2530,10 @@ def _agy_binary():
     found = shutil.which("agy")
     if found:
         return Path(found), True
-    default = Path.home() / ".local" / "bin" / "agy"
+    if WIN32:
+        default = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "agy" / "bin" / "agy.exe"
+    else:
+        default = Path.home() / ".local" / "bin" / "agy"
     if default.is_file():
         return default, True
     return None, (Path.home() / ".gemini" / "antigravity-cli").is_dir()
@@ -2558,12 +2562,34 @@ def _read_agy_output(handle):
     return handle.read(AGY_OUTPUT_MAX_BYTES).decode("utf-8", "replace")
 
 
+def _agy_spawn_options():
+    if WIN32:
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+    return {"start_new_session": True}
+
+
+def _kill_agy_tree(process):
+    """agy and everything it started: its process group, or on Windows its process tree."""
+    if WIN32:
+        taskkill = Path(os.environ.get("SystemRoot") or r"C:\Windows") / "System32" / "taskkill.exe"
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            subprocess.run([str(taskkill), "/T", "/F", "/PID", str(process.pid)], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+        with contextlib.suppress(OSError):
+            process.kill()
+        return
+    with contextlib.suppress(OSError):
+        os.killpg(process.pid, signal.SIGKILL)
+
+
 def read_agy_usage(binary, timeout=None):
     """Run ``agy -p /usage`` once and return ``(payload, None)`` or ``(None, reason)``.
 
     agy runs with the repository as its workspace (never the home folder),
     stdin closed, its log sent to /dev/null (no log file per run), and a
-    strict wall-clock limit; on timeout its whole process group is killed.
+    strict wall-clock limit; on timeout its whole process group (on Windows,
+    its process tree) is killed.
     Output goes to temporary files so a lingering grandchild holding a pipe
     cannot stall the poster.
     """
@@ -2579,7 +2605,7 @@ def read_agy_usage(binary, timeout=None):
             try:
                 process = subprocess.Popen(
                     args, cwd=ROOT_DIR, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
-                    env=env, start_new_session=True,
+                    env=env, **_agy_spawn_options(),
                 )
             except FileNotFoundError:
                 return None, "agy not found"
@@ -2588,8 +2614,7 @@ def read_agy_usage(binary, timeout=None):
             try:
                 code = process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                with contextlib.suppress(OSError):
-                    os.killpg(process.pid, signal.SIGKILL)
+                _kill_agy_tree(process)
                 with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                     process.wait(timeout=5)
                 return None, "timed out"

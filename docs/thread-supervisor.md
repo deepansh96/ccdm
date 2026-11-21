@@ -182,7 +182,7 @@ These steps run once after the thread work is merged and deployed. They touch re
 
 - [ ] **thread → Claude reply:** in a Claude project channel, open a public thread and type a task. Expect 👀 during boot, then a reply in the thread as `<project>-claude · N%`. The Channel Conversation receives nothing.
 - [ ] **thread → Codex reply:** repeat in a Codex project channel, or use `/thread smoke --provider codex hello` in a Claude one. Expect a reply in the thread as `<project>-codex · N%`.
-- [ ] **thread → Gemini reply (macOS only):** with agy installed and signed in, use `/thread smoke --provider gemini hello` in any project channel. Expect a reply in the thread as `<project>-gemini · N%`.
+- [ ] **thread → Gemini reply:** with agy installed and signed in, use `/thread smoke --provider gemini hello` in any project channel. Expect a reply in the thread as `<project>-gemini · N%`.
 - [ ] **`/close`:** send `/close` in one smoke thread. Expect the root-bot acknowledgement and the thread archived. The thread list shows it `closed/close-command`, and its session `<screen>-t-<thread_id>` is gone.
   - macOS: `scripts/threads.sh list`, then `tmux ls`.
   - Windows: `scripts\ccdm threads list`. The closed thread's session is absent from `scripts\ccdm list`, and it no longer answers `scripts\ccdm session capture <screen>-t-<thread_id>`.

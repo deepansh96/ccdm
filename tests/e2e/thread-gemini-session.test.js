@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import nodeTest from "node:test";
+import test from "node:test";
 
 import { injectDiscordMessage } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
@@ -10,10 +10,8 @@ import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerRegistry, routerWith
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 import { startThreadSupervisor, supervisorEnv, supervisorStateDir, supervisorStatus, waitForThreadIdle } from "./support/thread-supervisor.js";
-import { PYTHON, suiteTest } from "./support/platform.js";
+import { PYTHON } from "./support/platform.js";
 
-// Gemini runs on macOS and Linux only for now (see support/surfaces.js).
-const test = suiteTest(nodeTest, import.meta.url);
 
 test.afterEach(cleanup);
 
@@ -41,6 +39,9 @@ function threadWorkspace() {
 }
 
 function fakeAgyBin(workspace) {
+  const fake = path.join(workspace.repoDir, "tests/e2e/support/fake-agy.cjs");
+  // Windows: the bridge runs a JavaScript agy under its own Node.
+  if (process.platform === "win32") return fake;
   const bin = path.join(workspace.tmpRoot, "agy-bin", "agy");
   fs.mkdirSync(path.dirname(bin), { recursive: true });
   // Named agy in ps, as the real binary is, so listener detection sees it.
@@ -156,7 +157,11 @@ test("an owner message in a Gemini thread of a Claude project boots a Gemini bri
   const state = readState(workspace.stateDir);
   const session = state.fixtures.tmux.sessions[THREAD_TMUX];
   assert.ok(session, JSON.stringify(Object.keys(state.fixtures.tmux.sessions)));
-  assert.deepEqual(session.command.slice(0, 5), ["env", "DISABLE_AUTO_UPDATE=true", "DISABLE_UPDATE_PROMPT=true", "zsh", "-ic"]);
+  if (process.platform === "win32") {
+    assert.deepEqual(session.command.slice(1, 3), ["scripts/gemini-bridge.js", "--ccdm-key-file"]);
+  } else {
+    assert.deepEqual(session.command.slice(0, 5), ["env", "DISABLE_AUTO_UPDATE=true", "DISABLE_UPDATE_PROMPT=true", "zsh", "-ic"]);
+  }
   const launchDir = path.join(workspace.routerStateDir, "launches", "demo", "threads", THREAD_ID);
   const surfaces = [JSON.stringify(session), JSON.stringify(created),
     ...fs.readdirSync(launchDir).map((file) => fs.readFileSync(path.join(launchDir, file), "utf8"))];

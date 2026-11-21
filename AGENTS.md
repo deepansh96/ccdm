@@ -32,7 +32,7 @@ CCDM manages isolated Claude Code, Codex and Gemini (Antigravity CLI) Discord se
 - Test: `npm test`
 - All commands: `scripts/ccdm --help` (run in the Bash tool on both macOS and Windows)
 - List: `scripts/ccdm list`; one project: `scripts/ccdm status <project>`
-- Start: `scripts/ccdm start-session <project>` (Claude), `scripts/ccdm start-codex-session <project>` (Codex) or `scripts/ccdm start-gemini-session <project>` (Gemini, macOS only)
+- Start: `scripts/ccdm start-session <project>` (Claude), `scripts/ccdm start-codex-session <project>` (Codex) or `scripts/ccdm start-gemini-session <project>` (Gemini)
 - Stop: `scripts/ccdm stop-session <project>`
 - Restart: `scripts/ccdm restart-session <project>`
 - Root's command list with triggers: `.mex/patterns/root-commands.md`

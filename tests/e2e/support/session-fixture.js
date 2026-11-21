@@ -376,9 +376,11 @@ export function createSessionFixture(context) {
   function launchFromArgv({ argv, cwd, env }) {
     const program = path.basename(argv[0]).replace(/\.(exe|cmd)$/i, "");
     if (program === "claude") return { kind: "claude-listener", cwd, env, claudeArgs: argv.slice(1) };
-    if (program === "node" && argv.some(arg => path.basename(arg) === "codex-bridge.js")) {
-      const script = argv.findIndex(arg => path.basename(arg) === "codex-bridge.js");
-      return { kind: "codex-bridge", cwd, env, bridgeCommand: "node scripts/codex-bridge.js", bridgeArgs: argv.slice(script + 1) };
+    for (const bridge of ["codex-bridge", "gemini-bridge"]) {
+      const script = program === "node" ? argv.findIndex(arg => path.basename(arg) === `${bridge}.js`) : -1;
+      if (script !== -1) {
+        return { kind: bridge, cwd, env, bridgeCommand: `node scripts/${bridge}.js`, bridgeArgs: argv.slice(script + 1) };
+      }
     }
     return { kind: "generic", cwd, env };
   }

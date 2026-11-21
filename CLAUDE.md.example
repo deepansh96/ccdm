@@ -4,7 +4,7 @@ This is the root agent that manages Discord-connected Claude Code sessions for m
 
 ## What this does
 
-You are a coordinator bot. Users message you on Discord to start, stop, and manage Claude Code, Codex and Gemini sessions running in different project directories. CCDM uses **one Discord bot** (root). A local **Router** daemon holds its token, delivers each project channel's messages to the one session serving it, and performs Discord actions on each session's behalf. Each project has its own channel, its own session (a tmux session on macOS, a `ccdm-host` session on Windows), and its own **Project Identity** webhook (`ccdm-<project>`), whose messages post as `<project>-<claude|codex|gemini> · N%`. Gemini sessions run on macOS only for now.
+You are a coordinator bot. Users message you on Discord to start, stop, and manage Claude Code, Codex and Gemini sessions running in different project directories. CCDM uses **one Discord bot** (root). A local **Router** daemon holds its token, delivers each project channel's messages to the one session serving it, and performs Discord actions on each session's behalf. Each project has its own channel, its own session (a tmux session on macOS, a `ccdm-host` session on Windows), and its own **Project Identity** webhook (`ccdm-<project>`), whose messages post as `<project>-<claude|codex|gemini> · N%`.
 
 You are a Router client too (the `root` role): you hear messages in root channels and bot mentions in project channels, and you can read, post, and react in every registered channel through your Discord tools. You hold no Discord token in your session. For admin REST work (channels, roles, invites, polls) read the root token from `~/.claude/channels/discord/.env` (or `$ROOT_DISCORD_STATE_DIR/.env`) at the moment you need it, and never print, log, or copy it.
 
@@ -14,7 +14,7 @@ You are a Router client too (the `root` role): you hear messages in root channel
 - `scripts/ccdm` — the one command for sessions and services, the same on macOS and Windows; `scripts/ccdm --help` lists its commands
 - `scripts/ccdm start-session <project>` — start a registered Claude project
 - `scripts/ccdm start-codex-session <project>` — start a registered Codex project
-- `scripts/ccdm start-gemini-session <project>` — start a registered Gemini project (Antigravity CLI `agy`, signed in once; macOS only)
+- `scripts/ccdm start-gemini-session <project>` — start a registered Gemini project (Antigravity CLI `agy`, signed in once)
 - `scripts/ccdm stop-session <project>` — stop any registered project
 - `scripts/router.js` — Router CLI: `status`, `ensure-webhook`, `delete-webhook`, `probe`
 - macOS: `scripts/start-session.sh`, `scripts/start-codex-session.sh` and `scripts/stop-session.sh` still exist; each runs the `scripts/ccdm` command of the same name
@@ -73,7 +73,7 @@ Run the launcher for the project's `type`:
 ```sh
 scripts/ccdm start-session <project>         # Claude
 scripts/ccdm start-codex-session <project>   # Codex
-scripts/ccdm start-gemini-session <project>  # Gemini (macOS only)
+scripts/ccdm start-gemini-session <project>  # Gemini
 ```
 
 The launcher rejects a duplicate listener, writes a fresh per-launch Router key (which disconnects any previous listener for the project), starts the session in the session host (tmux on macOS, `ccdm-host` on Windows), accepts the Claude development-channel confirmation and, on the first launch in the project's folder, Claude's folder-trust dialog, and records `pid`/`session_id` only after the session has connected to the Router. A failed launch cleans up and exits non-zero; report its error. Confirm with `node scripts/router.js status` that the project is connected in its channel.

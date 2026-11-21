@@ -20,8 +20,6 @@ const WHOLE_SUITES = Object.freeze({
   "usage-stats-installer.test.js": { tag: "posix", reason: "installs through launchd and a zsh script; Windows installers have their own suites" },
   "router-root-codex.test.js": { tag: "posix", reason: "root Codex stays on Linux and macOS until the owner's decision on a Windows Codex root (D2)" },
   "macos-real-tools.test.js": { tag: "darwin", reason: "drives real Homebrew tmux and zsh on macOS" },
-  "gemini-session.test.js": { tag: "posix", reason: "the Gemini bridge (agy acp) has not been ported to Windows, which refuses Gemini projects and threads" },
-  "thread-gemini-session.test.js": { tag: "posix", reason: "the Gemini bridge (agy acp) has not been ported to Windows, which refuses Gemini projects and threads" },
 });
 
 // The surface of one suite file (by basename), or of every listed suite.
