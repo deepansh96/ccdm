@@ -12,7 +12,8 @@
   },
   "thread_session_caps": {
     "claude": 6,
-    "codex": 8
+    "codex": 8,
+    "gemini": 4
   },
   "category_ids": [],
   "projects": {

@@ -15,7 +15,7 @@ edges:
     condition: when understanding how components connect during setup
   - target: context/discord-security.md
     condition: when configuring the root token, Session Scope, guest roles, or root channel permissions
-last_updated: 2026-11-07
+last_updated: 2026-11-21
 ---
 
 # Setup
@@ -49,6 +49,7 @@ last_updated: 2026-11-07
 - `npm test` - runs serialized local-fake E2E tests.
 - `scripts/start-session.sh <project>` - starts a registered Claude project.
 - `scripts/start-codex-session.sh <project>` - starts a registered Codex project.
+- `scripts/start-gemini-session.sh <project> [--resume <session_id>]` - starts a registered Gemini project through the Antigravity CLI (`agy`, installed and signed in once).
 - `scripts/stop-session.sh <project>` - stops either session type and clears runtime state.
 - `scripts/guest-access.js list [project]` - inspects project guest access.
 - `node scripts/router.js status` - reports Router health, sessions, scopes, webhooks, and scope violations.

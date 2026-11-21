@@ -1,7 +1,7 @@
 """Per-provider caps on live thread sessions, with idle eviction and a FIFO queue.
 
 Caps come from the registry's `thread_session_caps`, read on each admission,
-defaulting to `{claude: 6, codex: 8}`; an invalid value falls back to its
+defaulting to `{claude: 6, codex: 8, gemini: 4}`; an invalid value falls back to its
 default and shows in `status`. Only `booting` and `live` thread rows count.
 At a provider's cap, the idle live row with the oldest owner activity is
 stopped as `stopped/evicted` with a pause notice in its thread. Idle means
@@ -29,7 +29,7 @@ from .link import LinkError
 from .paths import router_state_dir
 
 
-DEFAULT_CAPS = {"claude": 6, "codex": 8}
+DEFAULT_CAPS = {"claude": 6, "codex": 8, "gemini": 4}
 DEFAULT_IDLE_SECONDS = 30 * 60
 DEFAULT_STUCK_TURN_SECONDS = 6 * 3600
 RUNNING = ("booting", "live")

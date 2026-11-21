@@ -184,8 +184,9 @@ for line in ps.splitlines():
 PY
 }
 
-# Claude listeners carry their launch key file path (never the key) in their
-# environment: the claude process and its channel server.
+# Claude and Gemini listeners carry their launch key file path (never the key)
+# in their environment: the claude process and its channel server, or the
+# Gemini bridge and its agy process.
 find_router_claude_pids() {
   local key_file="$1"
   python3 - "$key_file" <<'PY'
@@ -212,7 +213,10 @@ def is_listener(command: str) -> bool:
     exe = os.path.basename(argv[0])
     if exe == "claude":
         return "--dangerously-load-development-channels" in argv and "server:ccdm" in argv
-    return exe == "node" and any(os.path.basename(arg) == "ccdm-channel-server.js" for arg in argv[1:])
+    if exe == "agy":
+        return "acp" in argv
+    return exe == "node" and any(os.path.basename(arg) in ("ccdm-channel-server.js", "gemini-bridge.js")
+                                 for arg in argv[1:])
 
 for line in ps.splitlines():
     pid_text, _, command = line.strip().partition(" ")
@@ -391,7 +395,7 @@ if launch.is_dir() and not launch.is_symlink():
 PY
 fi
 
-if [[ "$SESSION_TYPE" != "codex" ]]; then
+if [[ "$SESSION_TYPE" == "claude" ]]; then
   # The stopped launch no longer proves a verified Claude transport.
   python3 - "$PROJECT" <<'PY'
 import os

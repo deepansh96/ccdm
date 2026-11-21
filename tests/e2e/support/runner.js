@@ -420,9 +420,31 @@ function parseCodexBridgeLaunch(shellCommand) {
   };
 }
 
+// A Gemini launch runs the real gemini-bridge.js, which drives the agy
+// named by CCDM_AGY_BIN (tests point it at support/fake-agy.cjs).
+function parseGeminiBridgeLaunch(shellCommand) {
+  const match = /^cd '([^']*)' && ([\\s\\S]+) node scripts\\/gemini-bridge\\.js$/.exec(shellCommand);
+  if (!match) {
+    throw new Error(\`unsupported tmux launch command: \${shellCommand}\`);
+  }
+  const env = {};
+  for (const envMatch of match[2].matchAll(/([A-Z_]+)=(?:'([^']*)'|([^\\s]+))/g)) {
+    env[envMatch[1]] = envMatch[2] ?? envMatch[3];
+  }
+  for (const name of ["CCDM_ROUTER_KEY_FILE", "CCDM_GEMINI_PROJECT", "CCDM_ROUTER_STATE_DIR", "CHANNEL_ID", "PROJECT_DIR"]) {
+    if (!env[name]) {
+      throw new Error(\`\${name} is required for Gemini bridge launch\`);
+    }
+  }
+  return { cwd: match[1], env, bridgeCommand: "node scripts/gemini-bridge.js" };
+}
+
 function parseTmuxLaunch(shellCommand) {
   if (shellCommand.endsWith(" node scripts/codex-bridge.js")) {
     return { kind: "codex-bridge", ...parseCodexBridgeLaunch(shellCommand) };
+  }
+  if (shellCommand.endsWith(" node scripts/gemini-bridge.js")) {
+    return { kind: "gemini-bridge", ...parseGeminiBridgeLaunch(shellCommand) };
   }
   return { kind: "claude-listener", ...parseClaudeLaunch(shellCommand) };
 }
@@ -484,8 +506,9 @@ function spawnRouterClaude(name, launch) {
 // A router Codex launch runs the real bridge, detached like a tmux pane
 // process, against the fake Codex app-server registered for its port.
 function spawnRouterBridge(launch) {
-  const logFile = fs.openSync(path.join(stateDir, \`codex-bridge-\${Date.now()}.log\`), "a");
-  const child = spawn(process.execPath, [path.join(launch.cwd, "scripts/codex-bridge.js")], {
+  const script = launch.kind === "gemini-bridge" ? "gemini-bridge" : "codex-bridge";
+  const logFile = fs.openSync(path.join(stateDir, \`\${script}-\${Date.now()}.log\`), "a");
+  const child = spawn(process.execPath, [path.join(launch.cwd, \`scripts/\${script}.js\`)], {
     cwd: launch.cwd,
     detached: true,
     env: { ...process.env, ...launch.env },
@@ -704,7 +727,7 @@ function runTmux() {
     // A CCDM channel launch runs the fake claude, which hosts the real channel
     // server once the development-channel confirmation is accepted.
     const routerChannel = launch.kind === "claude-listener" && launch.claudeArgs.includes("server:ccdm");
-    const routerBridge = launch.kind === "codex-bridge" && Boolean(launch.env.CCDM_ROUTER_KEY_FILE);
+    const routerBridge = ["codex-bridge", "gemini-bridge"].includes(launch.kind) && Boolean(launch.env.CCDM_ROUTER_KEY_FILE);
     const pid = routerChannel
       ? spawnRouterClaude(name, launch)
       : routerBridge ? spawnRouterBridge(launch) : spawnPlaceholder();
@@ -712,14 +735,18 @@ function runTmux() {
     const resumeIndex = launch.kind === "claude-listener" ? launch.claudeArgs.indexOf("--resume") : -1;
     const sessionId = resumeIndex >= 0 ? unquote(launch.claudeArgs[resumeIndex + 1]) : \`fixture-session-\${pid}\`;
     const processCommand =
-      routerBridge
+      launch.kind === "gemini-bridge"
+        ? \`node scripts/gemini-bridge.js CHANNEL_ID='\${launch.env.CHANNEL_ID}' CCDM_ROUTER_KEY_FILE='\${launch.env.CCDM_ROUTER_KEY_FILE}'\`
+        : routerBridge
         ? \`node scripts/codex-bridge.js CHANNEL_ID='\${launch.env.CHANNEL_ID}' WS_PORT='\${launch.env.WS_PORT}' CCDM_ROUTER_KEY_FILE='\${launch.env.CCDM_ROUTER_KEY_FILE}'\`
         : launch.kind === "codex-bridge"
         ? \`node scripts/codex-bridge.js CHANNEL_ID='\${launch.env.CHANNEL_ID}' BOT_APP_ID='\${launch.env.BOT_APP_ID}' WS_PORT='\${launch.env.WS_PORT}'\`
         : \`claude \${launch.claudeArgs.join(" ")} CCDM_ROUTER_KEY_FILE='\${launch.env.CCDM_ROUTER_KEY_FILE}'\`;
     const devChannelPrompt = routerChannel ? (tmuxState.devChannelPrompt === "never" ? "never" : "pending") : undefined;
     const paneOutput =
-      launch.kind === "codex-bridge"
+      launch.kind === "gemini-bridge"
+        ? "Gemini-Discord bridge running\\nListening in #channel-id\\n"
+        : launch.kind === "codex-bridge"
         ? "Codex-Discord bridge running\\nListening in #channel-id\\n"
         : devChannelPrompt === "pending"
           ? DEV_CHANNEL_PROMPT
@@ -758,7 +785,13 @@ function runTmux() {
       });
       return state;
     });
-    if (launch.kind === "codex-bridge") {
+    if (launch.kind === "gemini-bridge") {
+      updateState((state) => {
+        state.fixtures.gemini = state.fixtures.gemini || { bridgeInvocations: [] };
+        state.fixtures.gemini.bridgeInvocations.push({ command: launch.bridgeCommand, cwd: launch.cwd, env: launch.env, pid });
+        return state;
+      });
+    } else if (launch.kind === "codex-bridge") {
       recordCodexBridgeInvocation({
         command: launch.bridgeCommand,
         cwd: launch.cwd,

@@ -1,6 +1,6 @@
 # Thread Conversations and the Thread Supervisor
 
-A **Thread Conversation** is a Project Conversation held in one public Discord thread under a registered project channel. It has its own Claude Code or Codex conversation, and optionally its own provider, account, model and effort. It is independent of the project's **Channel Conversation** and of sibling threads. The design is recorded in [ADR 0005](adr/0005-thread-conversations-on-the-router.md), on top of the one-bot Router of [ADR 0004](adr/0004-single-root-bot-router-replaces-bot-pool.md).
+A **Thread Conversation** is a Project Conversation held in one public Discord thread under a registered project channel. It has its own Claude Code, Codex or Gemini conversation, and optionally its own provider, account, model and effort. It is independent of the project's **Channel Conversation** and of sibling threads. The design is recorded in [ADR 0005](adr/0005-thread-conversations-on-the-router.md), on top of the one-bot Router of [ADR 0004](adr/0004-single-root-bot-router-replaces-bot-pool.md).
 
 The **Thread Supervisor** is the CCDM service that turns thread events from the Router into Thread Conversation lifecycle: start, stop, resume, close, and the live-session cap. It is an ordinary Router client and holds no Discord credential. Every Discord action it takes is a Router op, and the Router stays the only token holder.
 
@@ -25,7 +25,7 @@ The **Thread Supervisor** is the CCDM service that turns thread events from the 
 Create a thread in any of four ways. All four become one supervisor creation request:
 
 - by hand in Discord;
-- `/thread <name> [--provider claude|codex] [--account <alias>] [--model <model>] [--effort <effort>] [first message…]` in the project channel;
+- `/thread <name> [--provider claude|codex|gemini] [--account <alias>] [--model <model>] [--effort <effort>] [first message…]` in the project channel;
 - the Channel Conversation's `create_thread` tool, for its own channel only;
 - `scripts/threads.sh create <project> <name> [flags] [message]`.
 
@@ -40,7 +40,7 @@ The session starts on the first owner or guest message, or at once when a first 
 
 A stop that arrives while the launcher still runs (an archive, a delete, `/restart`, `/clear`, `/close`, an applied `/config`, a project change, or an operator stop) waits for the launcher to exit, so it never races the launch.
 
-Accounts are aliases only. Claude aliases live in the registry's `claude_accounts` map (alias → home), and Codex aliases in `codex_accounts`. A Discord message can name an alias, never a path. An unknown alias fails the start.
+Accounts are aliases only. Claude aliases live in the registry's `claude_accounts` map (alias → home), and Codex aliases in `codex_accounts`. Gemini has none: agy uses the one Google account it is signed in with, so `--account` with `--provider gemini` is refused. A Discord message can name an alias, never a path. An unknown alias fails the start.
 
 ## Commands in a thread
 
@@ -49,7 +49,7 @@ Accounts are aliases only. Claude aliases live in the registry's `claude_account
 | `/close` | owner | Posts the acknowledgement, archives the thread as root, stops the session, and makes it a **Closed Conversation** (`closed/close-command`). |
 | `/restart` | owner or guest | Relaunches the session with `--resume` into the same conversation. |
 | `/clear` | owner or guest | Relaunches the session as a fresh conversation. |
-| `/config` | owner | With no arguments, shows provider, account, model and effort. `model=` and `effort=` save and restart with resume. `provider=` and `account=` warn that the next conversation starts fresh, and apply only after the owner's ✅ on that warning. |
+| `/config` | owner | With no arguments, shows provider, account, model and effort. `model=` and `effort=` save and restart with resume. `provider=` and `account=` warn that the next conversation starts fresh, and apply only after the owner's ✅ on that warning. A `provider=` that changes the provider also clears the thread's account, model and effort overrides the same `/config` does not set, since they belong to the old provider. |
 | `/model` | owner or guest | Shows the provider, model, thinking level and account/home the thread's session runs with, each marked `(thread)`, `(project)` or `(home config)`. It changes nothing and starts no session. |
 | `/compact`, `/pause`, `/unpause` | owner or guest | Go to the live session. With no session, the supervisor answers `No live session in this thread.` |
 
@@ -60,11 +60,11 @@ Accounts are aliases only. Claude aliases live in the registry's `claude_account
 - **Archive:** a thread stays unarchived until it is closed. Only `/close` and `scripts/threads.sh close` archive it, and they close the conversation and stop its session. Any other archive is reverted at once: Discord's one-week inactivity auto-archive, the owner or a guest archiving it by hand, or a root archive outside the close flow. Reverting never closes the conversation. A live session that is not mid-turn stops as `stopped/auto-archive`, since a week without messages means it held a slot for nothing, and the next owner or guest message resumes it exactly. A booting session, one mid-turn, or a paused one (whose held messages would be lost) keeps running. A turn marked running whose `activity.json` has not changed for 6 hours (`CCDM_THREAD_STUCK_TURN_S`) counts as stuck, not running, here and for capacity eviction. A close that a crash interrupted after it recorded itself (`pending_close`) is finished by reconcile, or by the archive event: the thread is archived, the row closes as `close-command`, and the reminder service hears `conversation_closed`. With the optional View Audit Log the supervisor logs who archived the thread, from one audit-log read. Rows written by older versions may still show `closed/owner-archive`, `closed/root-archive` or `stopped/archive-actor-unknown`, but none of them is written any more.
 - **Unarchive:** an unarchive, including the supervisor's own revert, starts nothing.
 - **Delete:** stops the session and drops the supervisor row and the reminder state. Provider conversation files stay on disk.
-- **Resume:** an owner or guest message resumes a stopped thread. Only an owner message reopens a Closed Conversation. Either way it resumes the same provider conversation (`claude --resume`, or Codex `--resume <uuid>`) in the same cwd and the home the conversation started in, even if the project has since switched accounts. A missing transcript or rollout is a start failure with a one-line reason, never a silent fresh start.
+- **Resume:** an owner or guest message resumes a stopped thread. Only an owner message reopens a Closed Conversation. Either way it resumes the same provider conversation (`claude --resume`, Codex `--resume <uuid>`, or the agy session id for Gemini, from `~/.gemini/antigravity-cli`) in the same cwd and the home the conversation started in, even if the project has since switched accounts. A missing transcript or rollout is a start failure with a one-line reason, never a silent fresh start.
 
 ## Status: turn marks
 
-The supervisor tracks whose turn it is in every thread. It reads each live session's `activity.json`, which the CCDM channel server and the Codex bridge keep. That file records whether a turn is running, when the last one ended and how (`completed`, `failed`, or for Codex `interrupted`), whether the turn replied, and whether `/pause` holds new turns. Each write holds `activity.json.lock`, since the channel server or bridge and each hook run write it. A Claude thread's `UserPromptSubmit` hook marks a turn running, except for a prompt starting with `/` (a local command typed into the pane, which no Stop may follow). The supervisor combines that with its own copy of every thread message, timing each input by its Discord time, so a message the worker handles late still counts from when it was sent.
+The supervisor tracks whose turn it is in every thread. It reads each live session's `activity.json`, which the CCDM channel server and the Codex and Gemini bridges keep. That file records whether a turn is running, when the last one ended and how (`completed`, `failed`, or for Codex `interrupted`), whether the turn replied, and whether `/pause` holds new turns. Each write holds `activity.json.lock`, since the channel server or bridge and each hook run write it. A Claude thread's `UserPromptSubmit` hook marks a turn running, except for a prompt starting with `/` (a local command typed into the pane, which no Stop may follow). The supervisor combines that with its own copy of every thread message, timing each input by its Discord time, so a message the worker handles late still counts from when it was sent.
 
 It shows the turn as root's reaction on the input that started it, in the thread itself; it posts nothing:
 
@@ -81,7 +81,7 @@ The store keeps the mark root wants (`mark_message_id`, `mark_emoji`) apart from
 
 ## Capacity
 
-Live thread sessions are capped per provider by the registry's `thread_session_caps`, defaulting to Claude 6 and Codex 8. Only thread sessions count; Channel Conversations never do.
+Live thread sessions are capped per provider by the registry's `thread_session_caps`, defaulting to Claude 6, Codex 8 and Gemini 4. Only thread sessions count; Channel Conversations never do.
 
 - **Idle:** no turn running, and no owner message for 30 minutes.
 - **At the cap:** the longest-idle session is evicted with `Paused to free a session slot; send a message here to resume.` A session mid-turn or booting is never evicted.
@@ -167,6 +167,7 @@ These steps run once after the thread work is merged and deployed. They touch re
 
 - [ ] **thread → Claude reply:** in a Claude project channel, open a public thread and type a task. Expect 👀 during boot, then a reply in the thread as `<project>-claude · N%`. The Channel Conversation receives nothing.
 - [ ] **thread → Codex reply:** repeat in a Codex project channel, or use `/thread smoke --provider codex hello` in a Claude one. Expect a reply in the thread as `<project>-codex · N%`.
+- [ ] **thread → Gemini reply:** with agy installed and signed in, use `/thread smoke --provider gemini hello` in any project channel. Expect a reply in the thread as `<project>-gemini · N%`.
 - [ ] **`/close`:** send `/close` in one smoke thread. Expect the root-bot acknowledgement and the thread archived. `scripts/threads.sh list` shows it `closed/close-command`, and its tmux session is gone.
 - [ ] Optionally send another owner message in the closed thread. It should reopen and answer with the same conversation.
 - [ ] **turn marks:** your message in a smoke thread gets ⏳ while the agent works, and ✅ once it answers. Send a second message mid-turn: the ⏳ moves to it.

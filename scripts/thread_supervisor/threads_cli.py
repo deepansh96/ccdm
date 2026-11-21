@@ -17,7 +17,7 @@ from . import control, creation
 from .paths import default_state_dir
 
 
-USAGE = ("usage: threads.sh create <project> <name> [--provider claude|codex] [--account <alias>] "
+USAGE = ("usage: threads.sh create <project> <name> [--provider claude|codex|gemini] [--account <alias>] "
          "[--model <model>] [--effort <effort>] [message…]\n"
          "       threads.sh list [<project>]\n"
          "       threads.sh stop|close [<project>] <name|link|id>\n"

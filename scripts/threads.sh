@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Usage: ./scripts/threads.sh create <project> <name> [--provider claude|codex]
+# Usage: ./scripts/threads.sh create <project> <name> [--provider claude|codex|gemini]
 #          [--account <alias>] [--model <model>] [--effort <effort>] [message…]
 # Creates a Thread Conversation through the running Thread Supervisor's
 # private control socket, as `/thread` does in a project channel, with

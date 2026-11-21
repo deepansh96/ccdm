@@ -8,14 +8,14 @@ triggers:
 edges:
   - target: context/session-management.md
     condition: always before changing session state
-last_updated: 2026-09-29
+last_updated: 2026-11-21
 ---
 
 # Manage A Session
 
 ## Steps
 1. Read the project from `registry.json`; treat a missing `type` as `claude`.
-2. For start, run `scripts/start-session.sh <project>` or `scripts/start-codex-session.sh <project>` based on type.
+2. For start, run `scripts/start-session.sh <project>`, `scripts/start-codex-session.sh <project>` or `scripts/start-gemini-session.sh <project>` based on type (`claude`, `codex`, `gemini`).
 3. For stop, run `scripts/stop-session.sh <project>`. For restart, stop fully before starting.
 4. Capture the exact tmux pane and confirm the expected listener banner.
 5. Confirm `registry.json` contains the current PID/session state without displaying secrets.

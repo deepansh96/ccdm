@@ -19,7 +19,7 @@ async function probe({ project, registryFile, stateDir, token }) {
   if (secret.channel_id !== String(entry.channel_id)) {
     throw new Error(`${project}'s webhook posts to channel ${secret.channel_id}, not ${entry.channel_id}; run ensure-webhook ${project}`);
   }
-  const type = entry.type === "codex" ? "codex" : "claude";
+  const type = ["codex", "gemini"].includes(entry.type) ? entry.type : "claude";
   const message = await discordRequest("POST", `/webhooks/${secret.webhook_id}/${secret.token}`, {
     query: { wait: "true" },
     body: { content: PROBE_TEXT, username: webhookUsername(project, type), avatar_url: avatarUrl(type), allowed_mentions: { parse: [] } },

@@ -24,7 +24,7 @@ const ARCHIVED_PAGES = 10;
 const SKIPPABLE_CHANNEL = new Set([403, 404]);
 const ARCHIVE_ACTION = 111;
 const DISCORD_EPOCH = 1420070400000n;
-const PROVIDERS = new Set(["claude", "codex"]);
+const PROVIDERS = new Set(["claude", "codex", "gemini"]);
 // Discord's refusal to act in an archived thread.
 const ARCHIVED_THREAD_CODE = 50083;
 
@@ -269,7 +269,7 @@ async function createThread(ctx, args) {
     throw new OpError("invalid_args", "name must be 1-100 characters");
   }
   if (args.provider !== undefined && !PROVIDERS.has(args.provider)) {
-    throw new OpError("invalid_args", "provider must be claude or codex");
+    throw new OpError("invalid_args", "provider must be claude, codex or gemini");
   }
   const { project, channel_id: channelId } = ctx.session.route;
   const overrides = Object.assign({}, ...["provider", "account", "model", "effort", "first_message"]

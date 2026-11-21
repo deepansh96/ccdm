@@ -5,6 +5,7 @@ const MAX_USERNAME = 80;
 const AVATARS = {
   claude: "https://cdn.discordapp.com/embed/avatars/0.png",
   codex: "https://cdn.discordapp.com/embed/avatars/1.png",
+  gemini: "https://cdn.discordapp.com/embed/avatars/2.png",
 };
 
 // Discord rejects webhook names and usernames containing these words, and

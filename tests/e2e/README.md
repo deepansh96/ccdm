@@ -221,12 +221,13 @@ Thread Conversation scenarios run on the Router harness. They use:
 - the real `scripts/router.js` with the discord.js shim (thread channels with `type` and `parentId`, message types 0/18/19/21, `injectedThreads` for `threadCreate`/`threadUpdate`/`threadDelete`, and `shardResume`);
 - the preload REST fake (webhook execute and edit honouring `thread_id`, thread create/PATCH/list/history, message edits that read back and 404 once deleted, and audit logs with `auditLogEntries`, `auditLogForbidden` and fetch counters);
 - the real Thread Supervisor (`scripts/thread-supervisor.py run` plus its Node link, started by `startThreadSupervisor()` in `support/thread-supervisor.js`), the real `scripts/start-thread-session.sh`, the CCDM channel server and `codex-bridge.js`;
-- the fixture `claude`, `codex` and `tmux` binaries.
+- the fixture `claude`, `codex` and `tmux` binaries, and the fake agy (`support/fake-agy.cjs`, named by `CCDM_AGY_BIN`), which speaks ACP over stdio and runs each session's real Discord MCP server.
 
 Tests drive only Discord inputs and executable surfaces, and assert recorded Discord side effects, Router frames, CLI output and fixture-recorded turns. No test imports supervisor or Router internals. Expected values are literals from the decisions: usernames such as `demo-claude · 42%`, notice texts, caps 6 and 8, and the 10080-minute archive duration.
 
 - `router-threads.test.js` and `router-thread-scope.test.js`: classification, the `thread_session_live` exactly-once ordering, the type-18 drop, and thread `scope_violation`s.
 - `thread-supervisor.test.js`, `thread-claude-session.test.js` and `thread-codex-session.test.js`: binding, the boot handoff with 👀, replies with `thread_id`, start failures, and no token in any launch file.
+- `thread-gemini-session.test.js`: a Gemini thread under a Claude project boots `gemini-bridge.js` against `support/fake-agy.cjs`, takes the bootstrap as its first turn, resumes its agy session after a stop, and refuses Gemini account aliases and Claude-only efforts.
 - `thread-commands.test.js`, `thread-lifecycle.test.js`, `thread-capacity.test.js`, `thread-reconcile.test.js` and `thread-project-changes.test.js`: commands, archive and resume, caps, reconcile and registry changes.
 - `thread-operations.test.js` and `thread-supervisor-launchagent.test.js`: `threads.sh`, the resolver, thread ids in operator tools, `router status`, and the installer.
 - `conversation-reminder-threads.test.js`: the v8 reminder store and per-thread reminders.

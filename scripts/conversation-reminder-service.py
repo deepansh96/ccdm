@@ -97,6 +97,7 @@ PROVIDER_COMPONENTS = {
     "codex": ("scripts/codex-bridge.js", "scripts/discord-mcp-server.js", "scripts/conversation-reminder-adapter.js"),
     "claude": ("scripts/ccdm-channel-server.js", "scripts/claude-reminder-hook.js",
                "scripts/conversation-reminder-adapter.js"),
+    "gemini": ("scripts/gemini-bridge.js", "scripts/discord-mcp-server.js", "scripts/conversation-reminder-adapter.js"),
 }
 
 

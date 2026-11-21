@@ -81,7 +81,7 @@ class RouterClient extends EventEmitter {
   validScope(scope) {
     return Boolean(this.role === "project" && scope && typeof scope === "object" && !Array.isArray(scope)
       && scope.project === this.project && typeof scope.channel_id === "string" && scope.channel_id
-      && (scope.type === "claude" || scope.type === "codex"));
+      && ["claude", "codex", "gemini"].includes(scope.type));
   }
 
   // Adopts a validated scope; `scope_changed` fires only when it moved.

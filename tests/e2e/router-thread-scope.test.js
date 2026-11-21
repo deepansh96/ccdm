@@ -39,7 +39,7 @@ test("a thread hello is refused for a wrong key, wrong parent, private thread or
     privateThread: helloError(await connectThread(workspace, { threadId: "private-thread" })),
     unregistered: helloError(await connectThread(workspace, { project: "ghost", threadId: "demo-thread", key: "demo-thread-key" })),
     remote: helloError(await connectThread(workspace, { project: "far", threadId: "far-thread" })),
-    provider: helloError(await connectThread(workspace, { threadId: "demo-thread", key: "demo-thread-key", provider: "gemini" })),
+    provider: helloError(await connectThread(workspace, { threadId: "demo-thread", key: "demo-thread-key", provider: "llama" })),
   };
   assert.deepEqual(refusals, { wrongKey: "unauthorized", wrongParent: "not_a_project_thread",
     privateThread: "not_a_project_thread", unregistered: "unauthorized", remote: "not_a_project_thread",
