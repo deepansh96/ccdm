@@ -28,18 +28,18 @@ class ResolverError(Exception):
     """An actionable configuration failure."""
 
 
-def gemini_accounts(registry: dict[str, Any]) -> dict[str, str]:
+def account_home(registry: dict[str, Any], alias: str, label: str) -> str:
+    """The home path ``alias`` names; only the entry in use is checked, so a
+    bad entry never stops sessions that do not use it."""
     accounts = registry.get("gemini_accounts")
-    if accounts is None:
-        return {}
-    if not isinstance(accounts, dict):
+    if accounts is not None and not isinstance(accounts, dict):
         raise ResolverError("gemini_accounts must be an object mapping account aliases to home paths")
-    for alias, home in accounts.items():
-        if not isinstance(alias, str) or not alias.strip():
-            raise ResolverError("gemini_accounts must use non-empty alias names")
-        if not isinstance(home, str) or not home.strip():
-            raise ResolverError(f"gemini_accounts['{alias}'] must be a non-empty home path")
-    return accounts
+    if not accounts or alias not in accounts:
+        raise ResolverError(f"{label} '{alias}' is not an alias in gemini_accounts")
+    home = accounts[alias]
+    if not isinstance(home, str) or not home.strip():
+        raise ResolverError(f"gemini_accounts['{alias}'] must be a non-empty home path")
+    return home
 
 
 def expand(path: str) -> str:
@@ -60,7 +60,6 @@ def resolve_gemini_home(registry: dict[str, Any], project: str, account: str | N
     entry = projects.get(project) if isinstance(projects, dict) else None
     if not isinstance(entry, dict):
         raise ResolverError(f"project '{project}' is not present in registry.json")
-    accounts = gemini_accounts(registry)
     label = "thread account"
     if account is None:
         account = entry.get("gemini_account")
@@ -69,9 +68,7 @@ def resolve_gemini_home(registry: dict[str, Any], project: str, account: str | N
             raise ResolverError(f"{label} must be a non-empty alias")
     if account is None:
         return expand("~")
-    if account not in accounts:
-        raise ResolverError(f"{label} '{account}' is not an alias in gemini_accounts")
-    return validate_home(accounts[account], f"Gemini account '{account}'")
+    return validate_home(account_home(registry, account, label), f"Gemini account '{account}'")
 
 
 def main(argv: list[str]) -> int:

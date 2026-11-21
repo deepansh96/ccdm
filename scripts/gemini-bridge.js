@@ -36,7 +36,7 @@
 
 const { spawn } = require("child_process");
 const { randomBytes, randomUUID } = require("crypto");
-const { accessSync, constants: fsConstants, renameSync, writeFileSync } = require("fs");
+const { accessSync, closeSync, constants: fsConstants, openSync, readSync, renameSync, writeFileSync } = require("fs");
 const { mkdir, mkdtemp, readFile, rm, writeFile } = require("fs/promises");
 const os = require("os");
 const path = require("path");
@@ -252,8 +252,28 @@ function agyEnv() {
   };
 }
 
+// A bash or zsh script would read BASH_ENV or ZDOTDIR itself and get the
+// real home back before agy starts, so agy would run as the wrong account.
+function refuseShellWrapper(bin) {
+  const head = Buffer.alloc(128);
+  let fd;
+  try {
+    fd = openSync(bin, "r");
+    readSync(fd, head, 0, head.length, 0);
+  } catch {
+    return; // spawn reports a missing or unreadable binary
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  const shebang = head.toString("latin1").split("\n")[0];
+  if (/^#!.*\b(bash|zsh)\b/.test(shebang)) {
+    throw new Error(`${bin} is a bash or zsh script, which cannot run under the Gemini account home ${AGY_HOME}; point CCDM_AGY_BIN at the agy binary`);
+  }
+}
+
 function startAgy() {
   const bin = findAgyBinary();
+  if (AGY_HOME) refuseShellWrapper(bin);
   console.log(`Starting ${bin} acp in ${PROJECT_DIR}${AGY_HOME ? ` with home ${AGY_HOME}` : ""}`);
   agyProcess = spawn(bin, ["acp", "--dangerously-skip-permissions"], {
     cwd: PROJECT_DIR,

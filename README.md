@@ -569,8 +569,12 @@ server attached to that one agy session, so no agy config file is written.
   and keeps its conversations there. The shell commands its agent runs get
   your real home back (through `scripts/agy-shell`, as zsh's `ZDOTDIR` and
   bash's `BASH_ENV`), so git, gh, ssh and your other tools work as usual;
-  only a plain `sh` command still sees the account home.
-  `CCDM_AGY_BIN` names another agy binary.
+  only a plain `sh` command still sees the account home. A project's
+  `--resume` (and a Router migration's resume) looks in the home its
+  `gemini_account` names now, so after changing a project's account its old
+  conversation is not resumed; a thread keeps the home it started in.
+  `CCDM_AGY_BIN` names another agy binary; under an account it must be agy
+  itself, not a bash or zsh wrapper script (the launch refuses one).
 
 A Thread Conversation can run Gemini too, under a project of any provider:
 `/thread <name> --provider gemini [--account <alias>] [--model <model>] [--effort <effort>]`.

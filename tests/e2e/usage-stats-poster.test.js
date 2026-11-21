@@ -3901,6 +3901,7 @@ test("each Gemini account gets its own Antigravity blocks, asked with its home a
     "                                      'agy-same': sys.argv[4] + '/'}}),",
     "    'unnamed_main': [t.split('\\n')[0] for t in texts({'gemini_accounts': {'agy-work': sys.argv[4]}})],",
     "    'none': [t.split('\\n')[0] for t in texts({})],",
+    "    'collide': [n for n, _ in poster.discover_agy_accounts({'gemini_accounts': {'agy_work': sys.argv[4], 'agywork': sys.argv[4] + '-b', 'agy': sys.argv[4] + '-c'}})],",
     "}))",
   ].join("\n"), agy, home, workHome);
   assert.equal(probe.status, 0, probe.stderr || probe.stdout);
@@ -3915,6 +3916,8 @@ test("each Gemini account gets its own Antigravity blocks, asked with its home a
   // Without an alias for the user's own home it stays `agy`; with one account the groups are not prefixed.
   assert.deepEqual(out.unnamed_main, ["**agy · Gemini Models**", "**agy · Claude and GPT models**", "**agy · Gemini 4 Argon**", "**agy-work**"]);
   assert.deepEqual(out.none, ["**Gemini Models**", "**Claude and GPT models**", "**Gemini 4 Argon**"]);
+  // Aliases that clean to one name stay apart.
+  assert.deepEqual(out.collide, ["agy", "agywork", "agywork 2", "agy 2"]);
   // The same home under two aliases is asked once.
   assert.deepEqual(fs.readFileSync(path.join(dir, "homes.txt"), "utf8").trim().split("\n"), [home, workHome, home, workHome, home]);
 });

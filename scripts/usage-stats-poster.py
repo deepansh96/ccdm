@@ -2456,18 +2456,28 @@ def discover_agy_accounts(registry):
     then each other home in ``gemini_accounts``, in registry order."""
     named = registry.get("gemini_accounts") if isinstance(registry, dict) else None
     real = os.path.normpath(str(Path.home()))
-    main, others, seen = AGY_ACCOUNT, [], {real}
+    main, others, seen = None, [], {real}
     for alias, raw in (named.items() if isinstance(named, dict) else ()):
         name = _agy_name(alias)
         if not name or not isinstance(raw, str) or not raw.strip():
             continue
         home = os.path.normpath(os.path.expanduser(raw.strip()))
         if home == real:
-            main = name if main == AGY_ACCOUNT else main
+            main = main or name
         elif home not in seen:
             seen.add(home)
             others.append((name, Path(home)))
-    return [(main, None), *others]
+    accounts = [(main or AGY_ACCOUNT, None), *others]
+    # Two aliases that clean to one name (agy_work, agywork) stay apart in
+    # the report and in history.
+    names, unique = set(), []
+    for name, home in accounts:
+        label, n = name, 2
+        while label in names:
+            label, n = f"{name} {n}", n + 1
+        names.add(label)
+        unique.append((label, home))
+    return unique
 
 
 def read_agy_usage(binary, timeout=None, home=None):

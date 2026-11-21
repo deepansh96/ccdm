@@ -446,3 +446,21 @@ test("a Router migration resumes a Gemini project's conversation from its gemini
   withGeminiAccounts(workspace, {});
   assert.match(resolve().skip, /Gemini home unresolved: .*'agy-work' is not an alias in gemini_accounts/);
 });
+
+test("a Gemini account session refuses a bash agy wrapper, which would hand agy the real home back", async () => {
+  const workspace = geminiWorkspace({ gemini_account: "agy-work" });
+  const accountHome = path.join(workspace.tmpRoot, "agy-work-home");
+  fs.mkdirSync(accountHome);
+  withGeminiAccounts(workspace, { "agy-work": accountHome });
+  await routerWithWebhooks(workspace, ["demo"]);
+  const wrapper = path.join(workspace.tmpRoot, "bash-agy", "agy");
+  fs.mkdirSync(path.dirname(wrapper));
+  fs.writeFileSync(wrapper, `#!/bin/bash\nexec -a agy '${process.execPath}' '${path.join(workspace.repoDir, "tests/e2e/support/fake-agy.cjs")}' "$@"\n`);
+  fs.chmodSync(wrapper, 0o755);
+
+  const started = await startGemini(workspace, [], { CCDM_AGY_BIN: wrapper });
+
+  assert.equal(started.exitCode, 1);
+  assert.match(started.stderr + started.stdout, /is a bash or zsh script, which cannot run under the Gemini account home/);
+  assert.deepEqual(agyEvents(workspace), []);
+});

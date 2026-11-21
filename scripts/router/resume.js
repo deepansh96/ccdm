@@ -14,7 +14,8 @@
 // another Codex project or the CCDM checkout (root's threads) is ambiguous and skipped.
 // Gemini: the registry's `session_id`, whose agy conversation
 // `<home>/.gemini/antigravity-cli/conversations/<id>.db` must exist under the
-// home the project's `gemini_account` resolves to (resolve-gemini-home.py).
+// home the project's `gemini_account` resolves to now (resolve-gemini-home.py),
+// so a conversation from before an account change is not resumed.
 const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
