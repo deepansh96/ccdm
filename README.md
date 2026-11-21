@@ -736,8 +736,25 @@ The poster reports:
   ends `running on credits`
 - Local token-usage fallback from each named Codex Home's `sessions` directory
   when live rate limits are unavailable
+- Google Antigravity CLI (`agy`) subscription quota in its own `Antigravity`
+  field: one block per model group from `agy -p /usage --output-format json`
+  (today **Gemini Models** and **Claude and GPT models**, each with a 5-hour
+  and a weekly row, plus the separate **Gemini 4 Argon** weekly cap), shown as
+  percent used with the reset time; an untouched bucket shows no reset time,
+  because agy reports "now + window" for a window that has not started.
+  `/usage` is a read-only print-mode command: it starts no agent turn, spends
+  no quota, and leaves no conversation. The poster runs it once per run with
+  the repository as its workspace, stdin closed, the CLI log sent to
+  `/dev/null`, and a 30-second limit (`CCDM_AGY_TIMEOUT_SECONDS`) that kills
+  agy's process group. The binary is `CCDM_AGY_BIN` when set, else `agy` on
+  `PATH`, else `~/.local/bin/agy`. A machine with no agy binary and no
+  `~/.gemini/antigravity-cli` directory gets no Antigravity field; otherwise a
+  missing binary, an expired sign-in, a timeout, or unreadable output is one
+  short `*Usage unavailable: <reason>*` line and the rest of the report is
+  unchanged. Each row is recorded in history as its own series (provider
+  `antigravity`, window such as `weekly (Gemini Models)`, with `scope`)
 
-Each automated Discord post sends only the original text Usage Report embed. A provider section longer than one embed field (1024 characters) continues in further fields named `Claude Code (cont.)` or `Codex (cont.)`, split only between account blocks, so no account is cut off; only a single block longer than a whole field is truncated, and an embed over Discord's 25-field or 6000-character limit drops trailing continuation fields (marking the last one kept as truncated) while each provider keeps its first field. Codex is displayed as a weekly allowance only. Claude API-key accounts have no comparable percentage limit, so their embed text shows sanitized local estimated Today and This month costs, request counts, and status. The credential-free trend renderer (`scripts/usage-dashboard-renderer.py`) is retained for back-compat but is no longer invoked by the posting workflow.
+Each automated Discord post sends only the original text Usage Report embed. A provider section longer than one embed field (1024 characters) continues in further fields named `Claude Code (cont.)`, `Codex (cont.)`, or `Antigravity (cont.)`, split only between account (or model-group) blocks, so no account is cut off; only a single block longer than a whole field is truncated, and an embed over Discord's 25-field or 6000-character limit drops trailing continuation fields (marking the last one kept as truncated) while each provider keeps its first field. Codex is displayed as a weekly allowance only. Claude API-key accounts have no comparable percentage limit, so their embed text shows sanitized local estimated Today and This month costs, request counts, and status. The credential-free trend renderer (`scripts/usage-dashboard-renderer.py`) is retained for back-compat but is no longer invoked by the posting workflow.
 
 The poster reads the same named-account registry configuration shown in
 [Codex Accounts](#codex-accounts); it does not need a separate list of Codex
@@ -792,6 +809,12 @@ Run a live legacy JSON-embed post separately after validation; installation neve
 
 ```bash
 python3 scripts/usage-stats-poster.py
+```
+
+Preview the report without posting with `--dry-run`: it collects every provider and prints each embed field to stdout, needs no bot token, never posts, and never creates or writes the history database (it only reads it, best effort, for Codex credits used, like a manual post). `--dry-run` wins over `CCDM_USAGE_STATS_AUTOMATED=1`.
+
+```bash
+python3 scripts/usage-stats-poster.py --dry-run
 ```
 
 Configured Codex Homes that carry the `ccdm-deepseek.json` setup marker are reported from DeepSeek instead of the Codex rate-limit request. The poster reads the home's private `api-key` directly, fetches the account-wide balance from the fixed official `GET /user/balance` endpoint on `https://api.deepseek.com` (one request per distinct key per run), and pairs it with this month's local DeepSeek token totals from the DeepSeek session rollouts. The embed shows a compact `deepseek-flash (API)` block: a bold remaining balance, a paid/granted breakdown, this month's local token total and session count, an optional `Tokens:` split line, and a short `Balance: whole account · Usage: local Codex` footer instead of a technical coverage paragraph. No money history or spend figure is derived from the balance. A DeepSeek-backed root Codex session still runs through the Codex app-server; only this rate-limit query is skipped. Homes sharing a key are grouped under one labeled note, and a rollout copied between them is counted once; distinct keys stay separate because no account identifier is available. Reference: [Get User Balance](https://api-docs.deepseek.com/api/get-user-balance/).

@@ -129,7 +129,7 @@ A raw Codex home path retained for compatibility with configurations that predat
 _Avoid_: Codex Account Alias, named account
 
 **Usage Stats Poster**:
-The scheduled CCDM executable that reports configured Claude and Codex account usage to one Discord channel.
+The scheduled CCDM executable that reports configured Claude and Codex account usage, and the local Antigravity CLI (`agy`) subscription quota when agy is installed, to one Discord channel.
 _Avoid_: local poster script, usage daemon
 
 **Router**:
