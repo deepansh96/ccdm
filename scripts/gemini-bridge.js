@@ -102,7 +102,9 @@ let sessionId = null;
 let configOptions = [];
 let turnActive = false;
 let turnReplied = false;
+let turnReplyCalls = new Map();
 let turnText = "";
+let pendingThreadPreamble = "";
 let pendingCompactionChannelId = null;
 let sessionResetting = false;
 let bridgePaused = false;
@@ -136,7 +138,20 @@ function createAcpConnection(child, { onNotification, onRequest }) {
   let nextId = 1;
   let buffer = "";
   const pending = new Map();
-  const write = (message) => child.stdin.write(`${JSON.stringify(message)}\n`);
+  // A write to an agy that has exited fails here instead of crashing the
+  // bridge with EPIPE; the exit handler takes the bridge down.
+  const write = (message) => {
+    if (!child.stdin.writable || child.exitCode !== null || child.signalCode !== null) throw new Error("agy is not running");
+    child.stdin.write(`${JSON.stringify(message)}\n`);
+  };
+  const tryWrite = (message) => {
+    try {
+      write(message);
+    } catch (error) {
+      console.error(`[acp] ${message.method || `response ${message.id}`} not sent: ${error.message}`);
+    }
+  };
+  child.stdin.on("error", (error) => console.error(`[agy stdin] ${error.message}`));
 
   child.stdout.setEncoding("utf8");
   child.stdout.on("data", (chunk) => {
@@ -155,8 +170,8 @@ function createAcpConnection(child, { onNotification, onRequest }) {
       }
       if (message.method && message.id !== undefined && message.id !== null) {
         Promise.resolve(onRequest(message)).then(
-          (result) => write({ jsonrpc: "2.0", id: message.id, result }),
-          (error) => write({ jsonrpc: "2.0", id: message.id, error: { code: error.code || -32603, message: error.message || String(error) } }),
+          (result) => tryWrite({ jsonrpc: "2.0", id: message.id, result }),
+          (error) => tryWrite({ jsonrpc: "2.0", id: message.id, error: { code: error.code || -32603, message: error.message || String(error) } }),
         );
       } else if (message.method) {
         onNotification(message);
@@ -180,11 +195,17 @@ function createAcpConnection(child, { onNotification, onRequest }) {
         }, timeoutMs) : null;
         timer?.unref?.();
         pending.set(id, { resolve, reject, timer });
-        write({ jsonrpc: "2.0", id, method, params });
+        try {
+          write({ jsonrpc: "2.0", id, method, params });
+        } catch (error) {
+          pending.delete(id);
+          clearTimeout(timer);
+          reject(error);
+        }
       });
     },
     notify(method, params) {
-      write({ jsonrpc: "2.0", method, params });
+      tryWrite({ jsonrpc: "2.0", method, params });
     },
     failAll(error) {
       for (const { reject, timer } of pending.values()) {
@@ -242,6 +263,19 @@ async function handleAgentRequest(message) {
   throw Object.assign(new Error(`Method not supported by the CCDM bridge: ${message.method}`), { code: -32601 });
 }
 
+// agy names an MCP tool call `mcp_<server>_<tool>` (title `Run …`); any
+// separator after the server name is accepted, in case that changes.
+function isReplyTool(name) {
+  const text = String(name || "");
+  const at = text.indexOf(DISCORD_MCP_NAME);
+  return at >= 0 && /^[^A-Za-z0-9]*reply\b/.test(text.slice(at + DISCORD_MCP_NAME.length));
+}
+
+// A `reply` call that has not failed counts as answered: one still running
+// (or one agy never reported finished) may have posted already, and a
+// duplicate is worse than relying on it.
+const turnReplyAttempted = () => turnReplied || [...turnReplyCalls.values()].some((status) => status !== "failed");
+
 function handleNotification(message) {
   if (message.method !== "session/update") return;
   const params = message.params || {};
@@ -253,10 +287,16 @@ function handleNotification(message) {
       break;
     case "tool_call":
     case "tool_call_update": {
-      const name = String(update.name || update.title || "");
-      if (turnActive && name.includes(DISCORD_MCP_NAME) && /(?:^|_)reply$/.test(name.replace(/^Run /, ""))) {
+      if (!turnActive) break;
+      const id = update.toolCallId || "";
+      if (isReplyTool(update.name || update.title) && !turnReplyCalls.has(id)) turnReplyCalls.set(id, "pending");
+      if (!turnReplyCalls.has(id)) break;
+      if (update.status === "completed") {
+        turnReplyCalls.set(id, "completed");
         if (!turnReplied) markReplied(THREAD_ACTIVITY_FILE);
         turnReplied = true;
+      } else if (update.status === "failed") {
+        turnReplyCalls.set(id, "failed");
       }
       break;
     }
@@ -371,6 +411,8 @@ async function openSession(resumeId = "") {
     _meta: { antigravity: { systemPrompt: { append: SYSTEM_INSTRUCTION } } },
   };
   let result;
+  // Options may also arrive as config_option_update while the request runs.
+  configOptions = [];
   if (resumeId) {
     // session/resume continues without replaying history; session/load replays
     // it as updates, which no turn is listening to.
@@ -382,7 +424,7 @@ async function openSession(resumeId = "") {
     sessionId = result?.sessionId;
   }
   if (!sessionId) throw new Error("agy returned no session id");
-  configOptions = Array.isArray(result?.configOptions) ? result.configOptions : [];
+  if (Array.isArray(result?.configOptions)) configOptions = result.configOptions;
   await applyModelSettings();
 }
 
@@ -410,12 +452,15 @@ async function sendToDiscord(text, channelId = activeOutputChannelId || projectC
   return await discordTransport.send(channelId, splitMessage(text));
 }
 
+// Where the running turn's output goes, following a Router channel move.
+const outputChannelId = () => activeOutputChannelId || projectChannelId;
+
 async function startTyping(channelId) {
   stopTyping();
   const channel = await discordTransport.fetchChannel(channelId);
   if (!channel) return;
   discordTransport.sendTyping(channel.id).catch(() => {});
-  typingInterval = setInterval(() => discordTransport.sendTyping(channel.id).catch(() => {}), 8000);
+  typingInterval = setInterval(() => discordTransport.sendTyping(outputChannelId()).catch(() => {}), 8000);
 }
 
 function stopTyping() {
@@ -469,13 +514,21 @@ async function exitAfterRuntimeLoss(reason) {
 // ---- turns ---------------------------------------------------------------
 
 // One ACP prompt. `source` is the owner message it answers, for Conversation
-// Reminders; `suppress` hides its text (a /compact).
+// Reminders; `suppress` hides its text (a /compact). The caller has checked
+// that no other prompt runs: ACP takes one at a time per session.
 async function runTurn(blocks, channelId, source = null, { suppress = false } = {}) {
   turnActive = true;
   turnReplied = false;
+  turnReplyCalls = new Map();
   turnText = "";
   activeOutputChannelId = channelId;
   const turnId = randomUUID();
+  // A thread restarted without new messages tells the agent where it is in
+  // its next turn, instead of a turn of its own the agent would answer.
+  const prompt = !suppress && pendingThreadPreamble
+    ? [{ type: "text", text: pendingThreadPreamble }, ...blocks]
+    : blocks;
+  if (!suppress) pendingThreadPreamble = "";
   markTurn(THREAD_ACTIVITY_FILE, true);
   if (source?.reminderAssignment) {
     activeReminderContext = {
@@ -497,7 +550,11 @@ async function runTurn(blocks, channelId, source = null, { suppress = false } = 
   let outcome = "completed";
   let errorText = null;
   try {
-    const result = await acp.request("session/prompt", { sessionId, prompt: blocks });
+    // A /clear or stop that began while this turn was setting up has
+    // already sent its cancel, so the prompt never starts.
+    const result = sessionResetting || bridgeStopping
+      ? { stopReason: "cancelled" }
+      : await acp.request("session/prompt", { sessionId, prompt });
     const stopReason = result?.stopReason;
     if (stopReason === "cancelled") outcome = "interrupted";
     else if (stopReason === "refusal") {
@@ -513,9 +570,11 @@ async function runTurn(blocks, channelId, source = null, { suppress = false } = 
   stopTyping();
 
   const context = activeReminderContext;
-  if (!suppress && outcome === "completed" && !turnReplied && TEXT_REPLY_FALLBACK && turnText.trim()) {
+  const quiet = bridgeStopping || sessionResetting;
+  if (!suppress && !quiet && outcome === "completed" && !turnReplyAttempted() && TEXT_REPLY_FALLBACK && turnText.trim()) {
     try {
-      const sent = await sendToDiscord(turnText.trim(), channelId);
+      const sent = await sendToDiscord(turnText.trim(), outputChannelId());
+      if (sent.length) markReplied(THREAD_ACTIVITY_FILE);
       if (context) {
         for (const message of sent) await reminderAdapter.recordDeliveredReply(context, message.id).catch(() => {});
       }
@@ -523,8 +582,8 @@ async function runTurn(blocks, channelId, source = null, { suppress = false } = 
       console.error(`Text reply fallback failed: ${error.code || error.message}`);
     }
   }
-  if (errorText && !bridgeStopping && !sessionResetting) {
-    await sendToDiscord(`**Error:** ${errorText}`, channelId).catch(() => {});
+  if (errorText && !quiet) {
+    await sendToDiscord(`**Error:** ${errorText}`, outputChannelId()).catch(() => {});
   }
   if (context) {
     const receipts = await reminderAdapter.receiptsForTurn(context.provider_session_id, context.provider_turn_id);
@@ -548,6 +607,9 @@ async function runTurn(blocks, channelId, source = null, { suppress = false } = 
   return outcome;
 }
 
+// Whether a new prompt may start now.
+const canPrompt = () => !bridgePaused && !sessionResetting && !bridgeStopping && !turnActive && Boolean(sessionId);
+
 function startTurn(blocks, channelId, source, options) {
   activeTurnPromise = runTurn(blocks, channelId, source, options)
     .catch((error) => console.error("Turn failed:", error))
@@ -559,7 +621,9 @@ function startTurn(blocks, channelId, source, options) {
 }
 
 async function afterTurn() {
-  if (pendingCompactionChannelId) {
+  // A /clear or a stop takes over from here.
+  if (bridgeStopping || sessionResetting || !sessionId) return;
+  if (pendingCompactionChannelId && !turnActive) {
     const channelId = pendingCompactionChannelId;
     pendingCompactionChannelId = null;
     await startCompaction(channelId);
@@ -571,7 +635,7 @@ async function afterTurn() {
 // Every queued message goes into one turn, in arrival order; it answers the
 // owner's latest queued message.
 function processQueue() {
-  if (bridgePaused || sessionResetting || turnActive || !sessionId || messageQueue.length === 0) return;
+  if (!canPrompt() || messageQueue.length === 0) return;
   const queued = messageQueue;
   messageQueue = [];
   for (const item of queued) {
@@ -588,7 +652,8 @@ function processQueue() {
 }
 
 async function routeInput(blocks, msg, channelId) {
-  if (bridgePaused || sessionResetting || turnActive || !sessionId) {
+  if (bridgeStopping) return;
+  if (!canPrompt()) {
     messageQueue.push({ blocks, msg, channelId });
     if (msg && !msg.synthetic) await discordTransport.react(msg, "⏳").catch(() => {});
     return;
@@ -597,23 +662,40 @@ async function routeInput(blocks, msg, channelId) {
 }
 
 async function startCompaction(channelId) {
+  // The turn is claimed before the notice posts, so a message arriving
+  // meanwhile queues instead of starting a second prompt.
+  turnActive = true;
   await sendToDiscord("Compaction started.", channelId).catch(() => {});
+  if (bridgeStopping || sessionResetting || !sessionId) {
+    turnActive = false;
+    return;
+  }
   const outcome = await new Promise((resolve) => {
     activeTurnPromise = runTurn([{ type: "text", text: "/compact" }], channelId, null, { suppress: true })
       .then(resolve, () => resolve("failed"))
       .finally(() => { activeTurnPromise = null; });
   });
-  await sendToDiscord(outcome === "completed" ? "Compaction complete." : "**Error:** Compaction failed.", channelId).catch(() => {});
-  processQueue();
+  if (bridgeStopping || sessionResetting || outcome === "interrupted") return;
+  await sendToDiscord(outcome === "completed" ? "Compaction complete." : "**Error:** Compaction failed.",
+    projectChannelId).catch(() => {});
+  await afterTurn();
 }
 
+// Cancels the running prompt and waits for it to end. A prompt that ignores
+// the cancel fails the caller: the session cannot take another prompt.
+const CANCEL_TIMEOUT_MS = Number(process.env.GEMINI_CANCEL_TIMEOUT_MS) || 15000;
 async function cancelActiveTurn() {
   if (!turnActive || !sessionId) return;
   acp.notify("session/cancel", { sessionId });
   const pending = activeTurnPromise;
-  if (pending) {
-    await Promise.race([pending, new Promise((resolve) => setTimeout(resolve, 15000))]);
-  }
+  if (!pending) return;
+  let timer;
+  const stopped = await Promise.race([
+    pending.then(() => true, () => true),
+    new Promise((resolve) => { timer = setTimeout(() => resolve(false), CANCEL_TIMEOUT_MS); }),
+  ]);
+  clearTimeout(timer);
+  if (!stopped) throw new Error(`the running turn did not stop within ${Math.round(CANCEL_TIMEOUT_MS / 1000)} s of a cancel`);
 }
 
 // ---- input ---------------------------------------------------------------
@@ -682,7 +764,7 @@ async function buildBlocks(msg, text) {
   for (const delivered of msg.attachments || []) {
     const att = { ...delivered, url: await discordTransport.attachmentUrl(msg, delivered) };
     try {
-      if (att.contentType?.startsWith("image/")) {
+      if (att.contentType?.startsWith("image/") && agentCapabilities.promptCapabilities?.image !== false) {
         const fetched = await fetchBuffer(att.url);
         if (fetched) blocks.push({ type: "image", mimeType: att.contentType, data: fetched.data.toString("base64") });
       } else if (AUDIO_TRANSCRIPTION_ENABLED && isAudioFile(att)) {
@@ -730,7 +812,8 @@ async function findCurrentProject() {
 function scheduleRestart(projectName, screenName) {
   const logPath = path.join(os.tmpdir(), `ccdm-restart-${projectName.replace(/[^a-zA-Z0-9._-]/g, "_")}.log`);
   const command = [
-    `while kill -0 ${process.pid} 2>/dev/null; do sleep 1; done`,
+    // The launcher refuses while this bridge or its agy still runs.
+    `while kill -0 ${process.pid} 2>/dev/null${agyProcess?.pid ? ` || kill -0 ${agyProcess.pid} 2>/dev/null` : ""}; do sleep 1; done`,
     `tmux kill-session -t ${shellQuote(`=${screenName}`)} 2>/dev/null || true`,
     `cd ${shellQuote(ROOT_DIR)} && ./scripts/start-gemini-session.sh ${shellQuote(projectName)} >> ${shellQuote(logPath)} 2>&1`,
   ].join("; ");
@@ -748,8 +831,16 @@ async function noteManagementCommand(msg, channelId) {
 }
 
 async function clearSession(channelId) {
+  if (sessionResetting) {
+    await sendToDiscord("A /clear is already running.", channelId).catch(() => {});
+    return;
+  }
   sessionResetting = true;
+  const dropped = messageQueue;
   messageQueue = [];
+  for (const item of dropped) {
+    if (item.msg && !item.msg.synthetic) discordTransport.removeOwnReaction(item.msg, "⏳").catch(() => {});
+  }
   pendingCompactionChannelId = null;
   try {
     await cancelActiveTurn();
@@ -757,6 +848,9 @@ async function clearSession(channelId) {
     sessionTerminationPromise = null;
     const previous = sessionId;
     sessionId = null;
+    pendingInputNeededResumeTurnId = null;
+    pendingThreadPreamble = threadPreamble;
+    discordTransport.setContextPct(0);
     await openSession();
     console.log(`New Gemini session after /clear: ${sessionId} (was ${previous})`);
     await sendToDiscord("Conversation cleared — fresh session started.", channelId);
@@ -786,11 +880,14 @@ async function handleCommand(msg, text, channelId) {
       return;
     case "/compact":
       await discordTransport.react(msg, "🔄").catch(() => {});
-      if (turnActive) {
+      if (sessionResetting || !sessionId) {
+        await sendToDiscord("Compaction skipped: the conversation is being cleared.", channelId);
+      } else if (turnActive) {
         pendingCompactionChannelId = channelId;
         await sendToDiscord("Compaction queued.", channelId);
       } else {
-        await startCompaction(channelId);
+        // Not awaited: later messages are handled (and queued) meanwhile.
+        void startCompaction(channelId);
       }
       return;
     case "/clear":
@@ -818,8 +915,17 @@ const COMMANDS = new Set(["/pause", "/unpause", "/compact", "/clear", "/restart"
 
 // ---- Discord input -------------------------------------------------------
 
+// Discord events are handled one at a time, in arrival order: a slow one (a
+// voice note being transcribed) never lets a later message overtake it.
+let ingress = Promise.resolve();
+const inOrder = (handler) => (event) => {
+  const run = ingress.then(() => handler(event));
+  ingress = run.catch((error) => console.error("Discord event failed:", error));
+  return run;
+};
+
 async function onDiscordMessage(msg) {
-  if (msg.author.bot || msg.channel.id !== projectChannelId) return;
+  if (bridgeStopping || msg.author.bot || msg.channel.id !== projectChannelId) return;
   const channelId = msg.channel.id;
   const text = (msg.content || "").trim();
   if (text === "/close") {
@@ -852,7 +958,7 @@ async function onDiscordMessage(msg) {
 }
 
 async function onDiscordReaction(event) {
-  if (event.user.bot || event.channelId !== projectChannelId) return;
+  if (bridgeStopping || event.user.bot || event.channelId !== projectChannelId) return;
   let reaction;
   try {
     reaction = await event.load();
@@ -925,6 +1031,7 @@ function threadBootstrapText(bootstrap) {
 }
 
 let heldThreadEvents = THREAD_MODE ? [] : null;
+let threadPreamble = "";
 const holdUntilBootstrap = (kind, handler) => async (event) => {
   if (heldThreadEvents) heldThreadEvents.push([kind, handler, event]);
   else await handler(event);
@@ -940,13 +1047,24 @@ async function startThreadConversation() {
       ? { id: asked.message_id, author: { id: asked.author.id }, reminderAssignment: assignment, synthetic: true }
       : null;
     if (source) lastOwnerInteraction = { id: source.id, assignment_generation: assignment.assignment_generation };
-    const text = threadBootstrapText(bootstrap);
-    if (text) startTurn([{ type: "text", text }], projectChannelId, source);
+    threadPreamble = String(bootstrap.preamble || "");
+    const hasInput = Boolean(bootstrap.starter) || (Array.isArray(bootstrap.messages) && bootstrap.messages.length > 0);
+    if (hasInput) {
+      startTurn([{ type: "text", text: threadBootstrapText(bootstrap) }], projectChannelId, source);
+    } else {
+      // A restart (/restart, /clear, /config) brings no message to answer:
+      // the preamble rides along with the next one instead.
+      pendingThreadPreamble = threadPreamble;
+    }
   }
   const included = new Set(bootstrap?.included_message_ids ?? []);
-  const pending = heldThreadEvents.filter(([kind, , event]) => !(kind === "message" && included.has(event.id)));
+  // Events that arrive while the held ones drain join the end of the line.
+  while (heldThreadEvents.length) {
+    const [kind, handler, event] = heldThreadEvents.shift();
+    if (kind === "message" && included.has(event.id)) continue;
+    await handler(event);
+  }
   heldThreadEvents = null;
-  for (const [, handler, event] of pending) await handler(event);
 }
 
 // ---- lifecycle -----------------------------------------------------------
@@ -976,14 +1094,31 @@ async function shutdown(code = 0) {
   await recordSessionTermination();
   await reminderAdapter.clearActiveContext().catch(() => {});
   discordTransport.destroy();
-  if (agyProcess && agyProcess.exitCode === null) agyProcess.kill();
+  await stopAgy();
   process.exit(code);
+}
+
+// agy gets a moment to close its conversation and MCP servers; one that
+// lingers is killed, so a relaunch never finds it still running.
+async function stopAgy(graceMs = 5000) {
+  const child = agyProcess;
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  child.kill("SIGTERM");
+  let timer;
+  const done = await Promise.race([exited.then(() => true),
+    new Promise((resolve) => { timer = setTimeout(() => resolve(false), graceMs); })]);
+  clearTimeout(timer);
+  if (!done) {
+    child.kill("SIGKILL");
+    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 1000))]);
+  }
 }
 
 async function connectDiscord() {
   discordTransport.onScopeChange(applyProjectScope);
-  discordTransport.onMessage(holdUntilBootstrap("message", onDiscordMessage));
-  discordTransport.onReaction(holdUntilBootstrap("reaction", onDiscordReaction));
+  discordTransport.onMessage(holdUntilBootstrap("message", inOrder(onDiscordMessage)));
+  discordTransport.onReaction(holdUntilBootstrap("reaction", inOrder(onDiscordReaction)));
   const { userTag, scope } = await discordTransport.connect();
   console.log(`Discord connected as ${userTag}`);
   if (!THREAD_MODE && scope?.channel_id) applyProjectScope(scope);

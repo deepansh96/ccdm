@@ -49,7 +49,7 @@ Accounts are aliases only. Claude aliases live in the registry's `claude_account
 | `/close` | owner | Posts the acknowledgement, archives the thread as root, stops the session, and makes it a **Closed Conversation** (`closed/close-command`). |
 | `/restart` | owner or guest | Relaunches the session with `--resume` into the same conversation. |
 | `/clear` | owner or guest | Relaunches the session as a fresh conversation. |
-| `/config` | owner | With no arguments, shows provider, account, model and effort. `model=` and `effort=` save and restart with resume. `provider=` and `account=` warn that the next conversation starts fresh, and apply only after the owner's ✅ on that warning. |
+| `/config` | owner | With no arguments, shows provider, account, model and effort. `model=` and `effort=` save and restart with resume. `provider=` and `account=` warn that the next conversation starts fresh, and apply only after the owner's ✅ on that warning. A `provider=` that changes the provider also clears the thread's account, model and effort overrides the same `/config` does not set, since they belong to the old provider. |
 | `/model` | owner or guest | Shows the provider, model, thinking level and account/home the thread's session runs with, each marked `(thread)`, `(project)` or `(home config)`. It changes nothing and starts no session. |
 | `/compact`, `/pause`, `/unpause` | owner or guest | Go to the live session. With no session, the supervisor answers `No live session in this thread.` |
 

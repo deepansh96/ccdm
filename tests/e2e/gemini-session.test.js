@@ -36,7 +36,8 @@ function geminiWorkspace(project = {}) {
 function fakeAgyBin(workspace) {
   const bin = path.join(workspace.tmpRoot, "agy-bin", "agy");
   fs.mkdirSync(path.dirname(bin), { recursive: true });
-  fs.writeFileSync(bin, `#!/bin/sh\nexec '${process.execPath}' '${path.join(workspace.repoDir, "tests/e2e/support/fake-agy.cjs")}' "$@"\n`);
+  // Named agy in ps, as the real binary is, so listener detection sees it.
+  fs.writeFileSync(bin, `#!/bin/bash\nexec -a agy '${process.execPath}' '${path.join(workspace.repoDir, "tests/e2e/support/fake-agy.cjs")}' "$@"\n`);
   fs.chmodSync(bin, 0o755);
   return bin;
 }
@@ -236,5 +237,123 @@ test("start-gemini-session refuses a project that is not a Gemini project", asyn
 
   assert.equal(started.exitCode, 1);
   assert.match(started.stderr, /is a codex project, not a gemini one/);
+  assert.deepEqual(agyEvents(workspace), []);
+});
+
+const overlaps = (workspace) => agyEvents(workspace).filter((event) => event.event === "overlap");
+const agyPids = (workspace) => [...new Set(agyEvents(workspace).filter((event) => event.event === "spawn").map((event) => event.pid))];
+const alive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+test("agy's tool permission requests get allow_always, and a reply call that fails falls back to the turn's text", async () => {
+  const workspace = await geminiSession({ turns: [
+    { permission: true, reply: "ran it" },
+    { replyFails: true, reply: "never posted", text: "Fallback answer." },
+  ] });
+
+  ownerMessage(workspace, "owner-1", "run the build");
+  await waitForState(workspace, (next) => webhookContents(next).includes("ran it"), 15000);
+  ownerMessage(workspace, "owner-2", "and summarize");
+  const done = await waitForState(workspace, (next) => webhookContents(next).includes("Fallback answer."), 15000);
+
+  const [permission] = agyEvents(workspace).filter((event) => event.event === "permission");
+  assert.deepEqual(permission.answer, { outcome: { outcome: "selected", optionId: "always" } });
+  assert.deepEqual(webhookContents(done), ["ran it", "Fallback answer."]);
+});
+
+test("a message sent while /compact runs waits for it, so two Gemini prompts never run at once", async () => {
+  const workspace = await geminiSession({ compactDelayMs: 1500, turns: [{ reply: "after compact" }] });
+
+  // The message lands while the bridge is still posting "Compaction started.".
+  ownerMessage(workspace, "cmd-compact", "/compact");
+  ownerMessage(workspace, "owner-1", "next task");
+  const done = await waitForState(workspace, (next) => webhookContents(next).includes("after compact"), 15000);
+
+  assert.deepEqual(overlaps(workspace), []);
+  assert.deepEqual(promptTexts(workspace), ["/compact", "next task"]);
+  assert.deepEqual(webhookContents(done), ["Compaction started.", "Compaction complete.", "after compact"]);
+  assert.ok(botReactions(done).some(([id, emoji]) => id === "owner-1" && emoji === "⏳"));
+});
+
+test("a /clear whose running turn ignores the cancel stops the Gemini session instead of leaving it stuck", async () => {
+  const workspace = geminiWorkspace();
+  agyPlan(workspace, { sessionIds: [SESSION_ID, SECOND_SESSION_ID], turns: [{ holdUntilCancel: true, ignoreCancel: true }] });
+  await routerWithWebhooks(workspace, ["demo"]);
+  const started = await startGemini(workspace, [], { GEMINI_CANCEL_TIMEOUT_MS: "1000" });
+  assert.equal(started.exitCode, 0, started.stderr || started.stdout);
+  const pid = readRegistry(workspace).projects.demo.pid;
+
+  ownerMessage(workspace, "owner-1", "long task");
+  await waitForState(workspace, () => promptTexts(workspace).length === 1, 15000);
+  ownerMessage(workspace, "cmd-clear", "/clear");
+  const done = await waitForState(workspace, (next) => webhookContents(next).some((content) => content.startsWith("**Error:** Failed to clear")), 15000);
+
+  assert.deepEqual(webhookContents(done), [
+    "**Error:** Failed to clear — the running turn did not stop within 1 s of a cancel. The session is stopping; restart it.",
+  ]);
+  for (let i = 0; i < 100 && alive(pid); i++) await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(alive(pid), false, "the bridge exited");
+  assert.equal(clientRequests(workspace, "session/new").length, 1);
+});
+
+test("/restart waits for a slow-exiting agy before relaunching the Gemini project", async () => {
+  const workspace = await geminiSession({ exitDelayMs: 4000 });
+  const before = readRegistry(workspace).projects.demo.pid;
+  const [firstAgy] = agyPids(workspace);
+
+  ownerMessage(workspace, "cmd-restart", "/restart");
+  const deadline = Date.now() + 30000;
+  for (;;) {
+    const after = readRegistry(workspace).projects.demo.pid;
+    if (typeof after === "number" && after !== before && agyPids(workspace).length === 2) {
+      const status = await runRouterCli(workspace, ["status"]);
+      if (/sessions: 1\n  project demo scope=demo-channel connected=/.test(status.stdout)) break;
+    }
+    assert.ok(Date.now() < deadline, `demo never relaunched: ${JSON.stringify({ before, after, agy: agyPids(workspace) })}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+
+  assert.equal(alive(firstAgy), false, "the first agy exited");
+  assert.equal(alive(before), false, "the first bridge exited");
+  const state = readState(workspace.stateDir);
+  assert.deepEqual(webhookContents(state), ["Restarting session — fresh session coming up."]);
+  assert.deepEqual(botReactions(state), [["cmd-restart", "🔄"]]);
+});
+
+test("stop-session takes the Gemini session's agy down too, found by its name and launch key", async () => {
+  const workspace = await geminiSession({});
+  const [agyPid] = agyPids(workspace);
+  assert.ok(alive(agyPid));
+
+  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"], env: routerEnv(workspace), timeoutMs: 30000 });
+
+  assert.equal(stopped.exitCode, 0, stopped.stderr || stopped.stdout);
+  for (let i = 0; i < 50 && alive(agyPid); i++) await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(alive(agyPid), false);
+});
+
+test("start-gemini-session --resume refuses while the project's session already runs", async () => {
+  const workspace = await geminiSession({});
+
+  const resumed = await startGemini(workspace, ["--resume", SESSION_ID]);
+
+  assert.equal(resumed.exitCode, 1);
+  assert.match(resumed.stderr, /Refusing to resume 'demo': session 'demo_gemini' is already running/);
+  assert.equal(clientRequests(workspace, "session/resume").length, 0);
+});
+
+test("start-gemini-session refuses a gemini_effort agy has no level for, before launching", async () => {
+  const workspace = geminiWorkspace({ gemini_effort: "max" });
+
+  const started = await startGemini(workspace);
+
+  assert.equal(started.exitCode, 1);
+  assert.match(started.stderr, /Invalid gemini_effort 'max' for 'demo'/);
   assert.deepEqual(agyEvents(workspace), []);
 });

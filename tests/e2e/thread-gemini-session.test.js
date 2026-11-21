@@ -39,7 +39,8 @@ function threadWorkspace() {
 function fakeAgyBin(workspace) {
   const bin = path.join(workspace.tmpRoot, "agy-bin", "agy");
   fs.mkdirSync(path.dirname(bin), { recursive: true });
-  fs.writeFileSync(bin, `#!/bin/sh\nexec '${process.execPath}' '${path.join(workspace.repoDir, "tests/e2e/support/fake-agy.cjs")}' "$@"\n`);
+  // Named agy in ps, as the real binary is, so listener detection sees it.
+  fs.writeFileSync(bin, `#!/bin/bash\nexec -a agy '${process.execPath}' '${path.join(workspace.repoDir, "tests/e2e/support/fake-agy.cjs")}' "$@"\n`);
   fs.chmodSync(bin, 0o755);
   return bin;
 }
@@ -198,4 +199,64 @@ test("threads.sh create refuses Gemini account aliases and Claude-only efforts, 
   assert.equal(withEffort.exitCode, 2, withEffort.stderr || withEffort.stdout);
   assert.match(withEffort.stderr + withEffort.stdout, /effort 'max' is not valid for gemini \(expected low, medium, high, xhigh\)/);
   assert.deepEqual(discord(workspace).threadCreates ?? [], []);
+});
+
+test("a restarted Gemini thread sends no turn of its own: its preamble rides along with the next owner message", async () => {
+  const workspace = threadWorkspace();
+  agyPlan(workspace, { sessionIds: [SESSION_ID], turns: [{ reply: "first" }, { reply: "second" }] });
+  await supervised(workspace);
+  requestThread(workspace);
+  await threadRow(workspace, (row) => row.provider === "gemini");
+  threadMessage(workspace, "boot-message-1", "start");
+  await waitFor(() => webhookPosts(workspace).length === 1, () => "the first reply", 20000);
+  await threadRow(workspace, (row) => row.provider_conversation_id === SESSION_ID);
+  await waitForThreadIdle(workspace, "demo", THREAD_ID);
+
+  const restarted = await runScript(workspace, "scripts/threads.sh", { args: ["restart", THREAD_ID], env: supervisorEnv(workspace) });
+  assert.equal(restarted.exitCode, 0, restarted.stderr || restarted.stdout);
+  await waitFor(() => clientRequests(workspace, "session/resume").length === 1, () => "the resumed session", 20000);
+  await threadRow(workspace, (row) => row.state === "live", 20000);
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  assert.equal(promptTexts(workspace).length, 1, JSON.stringify(promptTexts(workspace)));
+
+  threadMessage(workspace, "after-restart-1", "carry on");
+  await waitFor(() => webhookPosts(workspace).length === 2, () => "the reply after the restart", 20000);
+  const [preamble, message] = clientRequests(workspace, "session/prompt")[1].params.prompt.map((block) => block.text);
+  assert.match(preamble, new RegExp(`serving the Discord thread "Fix flaky test" \\(thread ${THREAD_ID}\\)`));
+  assert.equal(message, "carry on");
+  assert.deepEqual(webhookPosts(workspace).map((post) => post.content), ["first", "second"]);
+});
+
+test("a project's plain model goes only to threads of its own provider, and /model shows a Gemini model's own level", () => {
+  const scripts = path.resolve("scripts");
+  const out = execFileSync("python3", ["-c", `import json, sys
+sys.path.insert(0, sys.argv[1])
+from thread_supervisor import config, model_info, registry
+none = dict.fromkeys(("provider", "account", "model", "effort"))
+gemini_project = {"type": "gemini", "model": "gemini-4-argon"}
+print(json.dumps({
+  "claude_under_gemini": registry.resolved_settings(gemini_project, {**none, "provider": "claude"})["model"],
+  "codex_under_gemini": registry.resolved_settings(gemini_project, {**none, "provider": "codex"})["model"],
+  "gemini_under_gemini": registry.resolved_settings(gemini_project, none)["model"],
+  "gemini_under_claude": registry.resolved_settings({"type": "claude", "model": "opus"}, {**none, "provider": "gemini"})["model"],
+  "claude_under_claude": registry.resolved_settings({"type": "claude", "model": "opus"}, none)["model"],
+  "suffixed": model_info.describe({}, "demo", {"type": "gemini", "gemini_model": "gemini-3.8-flash-low"}),
+  "plain": model_info.describe({}, "demo", {"type": "gemini", "gemini_model": "gemini-4-argon"}),
+  "default": model_info.describe({}, "demo", {"type": "gemini"}),
+  "accounts": registry.accounts({"gemini_accounts": {"x": "~/.x"}}, "gemini"),
+  "switch": config.provider_reset({"provider": None, "account": "work", "model": "opus", "effort": "max"},
+                                  {"type": "claude"}, {"provider": "gemini"}),
+  "same": config.provider_reset({"provider": None, "account": "work", "model": None, "effort": None},
+                                {"type": "claude"}, {"provider": "claude", "effort": "low"}),
+}))`, scripts], { encoding: "utf8" });
+  const result = JSON.parse(out);
+
+  assert.deepEqual([result.claude_under_gemini, result.codex_under_gemini, result.gemini_under_gemini,
+    result.gemini_under_claude, result.claude_under_claude], [null, null, "gemini-4-argon", null, "opus"]);
+  assert.deepEqual([result.suffixed.effort, result.suffixed.effort_source], ["low", "bridge default"]);
+  assert.deepEqual([result.plain.effort, result.plain.effort_source], [null, null]);
+  assert.deepEqual([result.default.model, result.default.effort], ["gemini-4-neon", "high"]);
+  assert.deepEqual(result.accounts, {});
+  assert.deepEqual(result.switch, { account: null, model: null, effort: null, provider: "gemini" });
+  assert.deepEqual(result.same, { provider: "claude", effort: "low" });
 });

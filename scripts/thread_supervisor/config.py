@@ -5,7 +5,10 @@ and where each comes from, the thread's override or the project. `model=` and
 `effort=` are validated by `/thread`'s rules, saved as the thread's overrides,
 and a running session restarts into the same provider conversation.
 `provider=` and `account=` start a fresh conversation, so they only post a
-warning with ✅ on it and store `pending_config`, which any later `/config`
+warning with ✅ on it. A `provider=` that changes the provider also drops the
+thread's account, model and effort overrides it does not set again, since
+they name the old provider's; the new one then uses the project's settings
+or its own defaults and store `pending_config`, which any later `/config`
 with arguments drops; the owner's ✅ on that exact
 message (a `thread_reaction`) applies the whole change, clears
 `provider_conversation_id`, and starts a running session afresh. In a
@@ -49,6 +52,19 @@ def parse(args: str) -> dict:
             raise Invalid(f"{field} needs a value, as {field}=<value>")
         changes[field] = value
     return changes
+
+
+def provider_reset(row, entry: dict, changes: dict) -> dict:
+    """``changes`` plus a cleared override (None) for each account, model and
+    effort the thread set for a provider it is switching away from."""
+    if "provider" not in changes or changes["provider"] == (row["provider"] or entry.get("type") or "claude"):
+        return changes
+    return {**changes,
+            **{field: None for field in ("account", "model", "effort") if row[field] and field not in changes}}
+
+
+def listing(changes: dict) -> str:
+    return " · ".join(f"{field} {value or 'default'}" for field, value in changes.items())
 
 
 def _log(message: str) -> None:
@@ -105,11 +121,11 @@ def on_thread_config(context, row, owner: bool, event: dict) -> None:
     if row["pending_config"]:
         store.update(context.db, thread_id, pending_config=None)
     try:
-        changes = parse(args)
+        changes = provider_reset(row, entry, parse(args))
         creation.validate(current, row["project"], row["name"], {**{field: row[field] for field in FIELDS}, **changes})
     except (Invalid, creation.Invalid) as error:
         return _notice(context, thread_id, f"Settings not changed: {error}")
-    listed = " · ".join(f"{field} {value}" for field, value in changes.items())
+    listed = listing(changes)
     if not any(field in changes for field in FRESH):
         return _apply(context, row, changes, f"Settings saved: {listed}.")
     warning = _notice(context, thread_id, f"Changing {listed} starts a fresh conversation in this thread. "
@@ -150,8 +166,7 @@ def on_thread_reaction(context, event: dict) -> None:
         creation.validate(current, row["project"], row["name"], {**{field: row[field] for field in FIELDS}, **changes})
     except creation.Invalid as error:  # The registry changed since the warning.
         return _notice(context, thread_id, f"Settings not changed: {error}")
-    listed = " · ".join(f"{field} {value}" for field, value in changes.items())
-    _apply(context, row, changes, f"Settings saved: {listed}.", fresh=True)
+    _apply(context, row, changes, f"Settings saved: {listing(changes)}.", fresh=True)
 
 
 def _apply(context, row, changes: dict, saved: str, fresh: bool = False) -> None:

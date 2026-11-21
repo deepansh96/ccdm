@@ -25,6 +25,7 @@ DEFAULT_CLAUDE_HOME = "~/.claude"
 # agy keeps its conversations here; the Gemini bridge pins its own defaults.
 GEMINI_HOME = "~/.gemini/antigravity-cli"
 GEMINI_DEFAULTS = {"model": "gemini-4-neon", "effort": "high"}
+GEMINI_LEVEL_SUFFIX = re.compile(r"^(.+)-(low|medium|high|xhigh)$")
 # A top-level `key = "value"` in config.toml, before its first [table].
 TOML_STRING = re.compile(r'^\s*([A-Za-z0-9_-]+)\s*=\s*"((?:[^"\\]|\\.)*)"\s*(?:#.*)?$')
 TOML_TABLE = re.compile(r"^\s*\[")
@@ -129,6 +130,12 @@ def describe(current: dict, project: str, entry: dict, overrides: dict | None = 
         home = named or entry.get("claude_home") or DEFAULT_CLAUDE_HOME
     defaults = GEMINI_DEFAULTS if gemini else (
         (codex_home_defaults(home) if codex else claude_home_defaults(home)) if home else {})
+
+    if gemini and (overrides.get("model") or project_settings["model"]):
+        # As the bridge: a configured model brings no default thinking level,
+        # only the one its id may end with (gemini-4-neon-xhigh).
+        suffixed = GEMINI_LEVEL_SUFFIX.match(overrides.get("model") or project_settings["model"])
+        defaults = {"effort": suffixed.group(2)} if suffixed else {}
 
     def pick(field: str) -> tuple[str | None, str | None]:
         if overrides.get(field):

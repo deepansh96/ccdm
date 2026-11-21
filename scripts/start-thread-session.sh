@@ -122,7 +122,8 @@ home = config_dir or default_home
 if home_override and os.path.normpath(home_override) != os.path.normpath(home):
     home = home_override
     config_dir = "" if os.path.normpath(home_override) == os.path.normpath(default_home) else home_override
-model = model or entry.get("model") or ""
+# A project's plain `model` names its own provider's model.
+model = model or (entry.get("model") if (entry.get("type") or "claude") == "claude" else None) or ""
 effort = effort or entry.get("claude_effort") or ""
 if effort and effort not in ("low", "medium", "high", "xhigh", "max"):
     sys.exit(f"Invalid effort '{effort}' (expected low, medium, high, xhigh, or max)")
@@ -141,7 +142,7 @@ if [[ -n "$ACCOUNT" ]]; then
   exit 1
 fi
 LAUNCH_FIELDS="$(python3 - "$REGISTRY" "$PROJECT" "$MODEL" "$EFFORT" <<'PY'
-import json, os, sys
+import json, os, re, sys
 registry_path, project, model, effort = sys.argv[1:5]
 registry = json.load(open(registry_path))
 entry = (registry.get("projects") or {}).get(project)
@@ -149,16 +150,22 @@ if not isinstance(entry, dict) or not project or "/" in project or project.start
     sys.exit(f"Unknown project '{project}'")
 if not entry.get("webhook_id"):
     sys.exit(f"Project '{project}' has no webhook_id, so its thread replies could not be posted")
+# A project's plain `model` names its own provider's model.
+model = model or entry.get("gemini_model") or (entry.get("model") if entry.get("type") == "gemini" else None) or ""
+if model and not re.fullmatch(r"[A-Za-z0-9._:-]+", model):
+    sys.exit(f"Invalid model '{model}'")
 effort = effort or entry.get("gemini_effort") or ""
 if effort and effort not in ("low", "medium", "high", "xhigh"):
     sys.exit(f"Invalid effort '{effort}' (expected low, medium, high, or xhigh)")
-fields = [os.path.expanduser(entry["path"]), entry["screen_name"], model or entry.get("gemini_model") or "", effort]
+fields = [os.path.expanduser(entry["path"]), entry["screen_name"], model, effort,
+          "0" if entry.get("text_reply_fallback") is False else ""]
 print("\t".join(field or "__NONE__" for field in fields))
 PY
 )" || exit 1  # Python's reason is the last stderr line.
-IFS=$'\t' read -r PATH_DIR SCREEN_NAME MODEL EFFORT <<< "$LAUNCH_FIELDS"
+IFS=$'\t' read -r PATH_DIR SCREEN_NAME MODEL EFFORT TEXT_REPLY_FALLBACK <<< "$LAUNCH_FIELDS"
 [[ "$MODEL" == "__NONE__" ]] && MODEL=""
 [[ "$EFFORT" == "__NONE__" ]] && EFFORT=""
+[[ "$TEXT_REPLY_FALLBACK" == "__NONE__" ]] && TEXT_REPLY_FALLBACK=""
 GEMINI_HOME_DIR="${HOME_OVERRIDE:-$HOME/.gemini/antigravity-cli}"
 else
 LAUNCH_FIELDS="$(python3 - "$REGISTRY" "$PROJECT" "$MODEL" "$EFFORT" <<'PY'
@@ -173,7 +180,7 @@ if not entry.get("webhook_id"):
 allowed = [registry.get("discord_user_id")] + list(entry.get("guest_user_ids") or [])
 fields = [
     os.path.expanduser(entry["path"]), entry["screen_name"],
-    model or entry.get("codex_model") or entry.get("model") or "",
+    model or entry.get("codex_model") or (entry.get("model") if entry.get("type") == "codex" else None) or "",
     effort or entry.get("codex_reasoning_effort") or entry.get("model_reasoning_effort") or "",
     entry.get("codex_service_tier") or entry.get("service_tier") or "default",
     "1" if entry.get("text_reply_fallback") is True else "",
@@ -409,6 +416,7 @@ if [[ "$PROVIDER" == "gemini" ]]; then
   GEMINI_ENV=""
   [[ -n "$MODEL" ]] && GEMINI_ENV+=" GEMINI_MODEL='$MODEL'"
   [[ -n "$EFFORT" ]] && GEMINI_ENV+=" GEMINI_EFFORT='$EFFORT'"
+  [[ "$TEXT_REPLY_FALLBACK" == "0" ]] && GEMINI_ENV+=" GEMINI_TEXT_REPLY_FALLBACK='0'"
   [[ -n "$RESUME_ID" ]] && GEMINI_ENV+=" GEMINI_RESUME_SESSION_ID='$RESUME_ID'"
   [[ -n "${CCDM_AGY_BIN:-}" ]] && GEMINI_ENV+=" CCDM_AGY_BIN='$CCDM_AGY_BIN'"
   TRANSCRIBE_AUDIO_FLAG="${CODEX_BRIDGE_TRANSCRIBE_AUDIO:-${USE_AUDIO_TRANSCRIPTION_IN_BRIDGE:-}}"

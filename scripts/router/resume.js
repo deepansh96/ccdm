@@ -177,8 +177,19 @@ function resolveCodex(project, entry, registryFile) {
   return { skip: `no recorded Codex thread id, and no ${BRIDGE_ORIGINATOR} rollout for the project directory in ${home}/sessions` };
 }
 
+// Gemini: the registry's session_id (the agy session the launcher recorded),
+// whose conversation database must exist under ~/.gemini/antigravity-cli.
+function resolveGemini(entry) {
+  const id = String(entry.session_id || "");
+  if (!id) return { skip: "no recorded Gemini session_id" };
+  if (!UUID.test(id)) return { skip: `registry session_id ${id} is not a canonical UUID` };
+  const db = path.join(os.homedir(), ".gemini", "antigravity-cli", "conversations", `${id}.db`);
+  if (!fs.existsSync(db)) return { skip: `conversation ${id} is missing from ~/.gemini/antigravity-cli` };
+  return { id, source: "registry session_id" };
+}
+
 function resolveResume(project, entry, { registryFile }) {
-  if (entry.type === "gemini") return { skip: "Gemini projects record no conversation id to resume" };
+  if (entry.type === "gemini") return resolveGemini(entry);
   return entry.type === "codex" ? resolveCodex(project, entry, registryFile) : resolveClaude(entry);
 }
 

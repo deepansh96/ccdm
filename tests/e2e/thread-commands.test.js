@@ -851,3 +851,24 @@ test("/model in a thread lists its overrides and project settings, for a guest t
   assert.equal((await threadRow(workspace, CREATED_THREAD_ID)).state, "registered");
   assert.deepEqual(claude(workspace).invocations, []);
 });
+
+test("/config provider=… drops the thread's account, model and effort for the old provider instead of refusing them", async () => {
+  const workspace = commandWorkspace();
+  await supervised(workspace);
+  await liveThread(workspace, THREAD_ID);
+  const { spawnSync } = await import("node:child_process");
+  const set = spawnSync("python3", ["-c", `import sqlite3, sys
+db = sqlite3.connect(sys.argv[1], timeout=5)
+db.execute("UPDATE threads SET account = 'work', effort = 'max' WHERE thread_id = ?", (sys.argv[2],))
+db.commit()`, path.join(supervisorStateDir(workspace), "threads.sqlite3"), THREAD_ID], { encoding: "utf8" });
+  assert.equal(set.status, 0, set.stderr);
+
+  threadMessage(workspace, THREAD_ID, "config-provider", "/config provider=gemini");
+  await waitFor(() => notices(workspace, THREAD_ID).length === 1, () => `the warning: ${JSON.stringify(
+    notices(workspace, THREAD_ID))}`, 15000);
+
+  assert.equal(notices(workspace, THREAD_ID)[0].content, "Changing provider gemini · account default · effort default " +
+    "starts a fresh conversation in this thread. React ✅ to this message to apply it.");
+  const row = await threadRow(workspace, THREAD_ID);
+  assert.deepEqual([row.provider, row.account, row.effort], [null, "work", "max"]);
+});

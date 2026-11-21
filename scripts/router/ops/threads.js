@@ -269,7 +269,7 @@ async function createThread(ctx, args) {
     throw new OpError("invalid_args", "name must be 1-100 characters");
   }
   if (args.provider !== undefined && !PROVIDERS.has(args.provider)) {
-    throw new OpError("invalid_args", "provider must be claude or codex");
+    throw new OpError("invalid_args", "provider must be claude, codex or gemini");
   }
   const { project, channel_id: channelId } = ctx.session.route;
   const overrides = Object.assign({}, ...["provider", "account", "model", "effort", "first_message"]

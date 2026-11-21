@@ -16,9 +16,18 @@
 //                  usage      {used, size} sent as a usage_update
 //                  delayMs    a wait before the turn ends
 //                  holdUntilCancel  the turn ends only on session/cancel
+//                  ignoreCancel     with holdUntilCancel: the turn never ends
+//                  permission the turn first asks session/request_permission
+//                             and logs the bridge's answer
+//                  replyFails the `reply` tool call is reported failed (no post)
 //                  error      the prompt fails with this JSON-RPC error
 //                  stopReason the stop reason (default end_turn)
 //                A prompt past the script replies "echo: <its text>".
+//   compactDelayMs  how long a `/compact` prompt takes
+//   exitDelayMs     how long SIGTERM takes to stop this agy
+//
+// A prompt that starts while another runs on the same session is logged as
+// an `overlap` event: ACP runs one prompt at a time.
 const { spawn } = require("node:child_process");
 const { randomUUID } = require("node:crypto");
 const fs = require("node:fs");
@@ -71,6 +80,15 @@ function nextTurn() {
 function send(message) {
   process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
 }
+
+// Requests this agent sends the client, by id.
+let nextAgentRequestId = 1;
+const agentRequests = new Map();
+const askClient = (method, params) => new Promise((resolve) => {
+  const id = `agent-${nextAgentRequestId++}`;
+  agentRequests.set(id, resolve);
+  send({ id, method, params });
+});
 
 const update = (sessionId, body) => send({ method: "session/update", params: { sessionId, update: body } });
 
@@ -142,13 +160,40 @@ function openSession(sessionId, params) {
 async function prompt(params) {
   const session = sessions.get(params.sessionId);
   if (!session) throw Object.assign(new Error("unknown session"), { code: -32602 });
+  session.running = (session.running || 0) + 1;
+  if (session.running > 1) log({ event: "overlap", sessionId: session.id });
+  try {
+    return await runPrompt(session, params);
+  } finally {
+    session.running -= 1;
+  }
+}
+
+async function runPrompt(session, params) {
   const text = (params.prompt || []).filter((block) => block.type === "text").map((block) => block.text).join("\n");
-  if (text.trim() === "/compact") return { stopReason: "end_turn" };
+  if (text.trim() === "/compact") {
+    const delay = readPlan().compactDelayMs;
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    return { stopReason: "end_turn" };
+  }
   const turn = nextTurn() || { reply: `echo: ${text}` };
   if (turn.error) throw Object.assign(new Error(turn.error), { code: -32603 });
   if (turn.usage) update(session.id, { sessionUpdate: "usage_update", ...turn.usage });
   const cancelled = new Promise((resolve) => { session.cancel = resolve; });
+  if (turn.permission) {
+    const answer = await askClient("session/request_permission", {
+      sessionId: session.id,
+      toolCall: { toolCallId: randomUUID(), title: "Run shell command", kind: "execute", status: "pending" },
+      options: [
+        { optionId: "reject", name: "Reject", kind: "reject_once" },
+        { optionId: "once", name: "Allow once", kind: "allow_once" },
+        { optionId: "always", name: "Always allow", kind: "allow_always" },
+      ],
+    });
+    log({ event: "permission", answer });
+  }
   if (turn.holdUntilCancel) {
+    if (turn.ignoreCancel) await new Promise(() => {});
     await cancelled;
     session.cancel = null;
     return { stopReason: "cancelled" };
@@ -168,8 +213,12 @@ async function prompt(params) {
     const toolName = `mcp_${discord?.name}_reply`;
     const toolCallId = randomUUID();
     update(session.id, { sessionUpdate: "tool_call", toolCallId, name: toolName, title: `Run ${toolName}`, status: "in_progress", kind: "other" });
-    await discord?.call("reply", { text: turn.reply, scope_token: session.scopeToken });
-    update(session.id, { sessionUpdate: "tool_call_update", toolCallId, name: toolName, status: "completed", kind: "other" });
+    if (turn.replyFails) {
+      update(session.id, { sessionUpdate: "tool_call_update", toolCallId, name: toolName, status: "failed", kind: "other" });
+    } else {
+      await discord?.call("reply", { text: turn.reply, scope_token: session.scopeToken });
+      update(session.id, { sessionUpdate: "tool_call_update", toolCallId, name: toolName, status: "completed", kind: "other" });
+    }
   }
   return { stopReason: turn.stopReason || "end_turn" };
 }
@@ -220,6 +269,11 @@ process.stdin.on("data", (chunk) => {
       sessions.get(message.params?.sessionId)?.cancel?.();
       continue;
     }
+    if (message.id !== undefined && !message.method && agentRequests.has(message.id)) {
+      agentRequests.get(message.id)(message.result ?? { error: message.error });
+      agentRequests.delete(message.id);
+      continue;
+    }
     if (message.id === undefined || !message.method) continue;
     handle(message).then(
       (result) => send({ id: message.id, result }),
@@ -227,11 +281,16 @@ process.stdin.on("data", (chunk) => {
     );
   }
 });
-process.stdin.on("end", () => {
+// Stdin closing (the bridge exited) or SIGTERM stops it, after exitDelayMs.
+let exiting = false;
+function exitSoon(reason) {
+  if (exiting) return;
+  exiting = true;
+  log({ event: "exit", reason });
   for (const session of sessions.values()) for (const server of session.mcp) server.close();
-  process.exit(0);
-});
-process.on("SIGTERM", () => {
-  for (const session of sessions.values()) for (const server of session.mcp) server.close();
-  process.exit(0);
-});
+  const delay = readPlan().exitDelayMs;
+  if (delay) setTimeout(() => process.exit(0), delay);
+  else process.exit(0);
+}
+process.stdin.on("end", () => exitSoon("stdin closed"));
+process.on("SIGTERM", () => exitSoon("SIGTERM"));

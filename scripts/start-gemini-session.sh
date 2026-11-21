@@ -82,24 +82,33 @@ for line in ps.splitlines():
 PY
 }
 
-IFS=$'\t' read -r PATH_DIR SCREEN_NAME CHANNEL_ID PROJECT_TYPE GEMINI_MODEL_VALUE GEMINI_EFFORT_VALUE WEBHOOK_ID <<< "$(python3 - "$REGISTRY" "$PROJECT" <<'PY'
-import json, os, sys
+LAUNCH_FIELDS="$(python3 - "$REGISTRY" "$PROJECT" <<'PY'
+import json, os, re, sys
 registry_path, project = sys.argv[1:3]
 r = json.load(open(registry_path))
 p = (r.get("projects") or {}).get(project)
 if not isinstance(p, dict) or not project or "/" in project or project.startswith("."):
     sys.exit(f"Unknown project '{project}'")
+# Both go into the tmux command line, so only plain values pass.
+model = p.get("gemini_model") or p.get("model")
+if model and not re.fullmatch(r"[A-Za-z0-9._:-]+", str(model)):
+    sys.exit(f"Invalid gemini_model '{model}' for '{project}'")
+effort = p.get("gemini_effort")
+if effort and effort not in ("low", "medium", "high", "xhigh"):
+    sys.exit(f"Invalid gemini_effort '{effort}' for '{project}' (expected low, medium, high, or xhigh)")
 print("\t".join(str(value) if value not in (None, "") else "__NONE__" for value in [
     os.path.expanduser(p["path"]),
     p["screen_name"],
     p["channel_id"],
     p.get("type") or "claude",
-    p.get("gemini_model") or p.get("model"),
-    p.get("gemini_effort"),
+    model,
+    effort,
     p.get("webhook_id"),
+    "0" if p.get("text_reply_fallback") is False else "",
 ]))
 PY
-)"
+)" || exit 1  # Python's reason is the last stderr line.
+IFS=$'\t' read -r PATH_DIR SCREEN_NAME CHANNEL_ID PROJECT_TYPE GEMINI_MODEL_VALUE GEMINI_EFFORT_VALUE WEBHOOK_ID TEXT_REPLY_FALLBACK_VALUE <<< "$LAUNCH_FIELDS"
 
 if [[ "$PROJECT_TYPE" != "gemini" ]]; then
   echo "Refusing to start '$PROJECT': it is a $PROJECT_TYPE project, not a gemini one." >&2
@@ -107,6 +116,11 @@ if [[ "$PROJECT_TYPE" != "gemini" ]]; then
 fi
 
 if tmux has-session -t "=$SCREEN_NAME" 2>/dev/null; then
+  # A requested resume did not happen, so it is not a success.
+  if [[ -n "$RESUME_SESSION_ID" ]]; then
+    echo "Refusing to resume '$PROJECT': session '$SCREEN_NAME' is already running. Stop it first with scripts/stop-session.sh '$PROJECT'." >&2
+    exit 1
+  fi
   echo "Session '$SCREEN_NAME' is already running."
   exit 0
 fi
@@ -128,6 +142,7 @@ fi
 GEMINI_ENV=""
 [[ "$GEMINI_MODEL_VALUE" != "__NONE__" ]] && GEMINI_ENV+=" GEMINI_MODEL='$GEMINI_MODEL_VALUE'"
 [[ "$GEMINI_EFFORT_VALUE" != "__NONE__" ]] && GEMINI_ENV+=" GEMINI_EFFORT='$GEMINI_EFFORT_VALUE'"
+[[ "$TEXT_REPLY_FALLBACK_VALUE" == "0" ]] && GEMINI_ENV+=" GEMINI_TEXT_REPLY_FALLBACK='0'"
 [[ -n "$RESUME_SESSION_ID" ]] && GEMINI_ENV+=" GEMINI_RESUME_SESSION_ID='$RESUME_SESSION_ID'"
 [[ -n "${CCDM_AGY_BIN:-}" ]] && GEMINI_ENV+=" CCDM_AGY_BIN='$CCDM_AGY_BIN'"
 TRANSCRIBE_AUDIO_FLAG="${CODEX_BRIDGE_TRANSCRIBE_AUDIO:-${USE_AUDIO_TRANSCRIPTION_IN_BRIDGE:-}}"

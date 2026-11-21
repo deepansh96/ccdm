@@ -543,18 +543,24 @@ server attached to that one agy session, so no agy config file is written.
   as for Codex.
 - **Tools:** agy's tool permission requests are approved automatically, the
   way Codex sessions run with approvals off.
-- **Text replies:** a turn that ends with text but no `reply` call posts that
-  text, so an answer is never lost. Set `GEMINI_TEXT_REPLY_FALLBACK=0` on the
-  bridge to turn this off.
+- **Text replies:** a turn that ends with text but no successful `reply` call
+  posts that text, so an answer is never lost. Set `"text_reply_fallback": false`
+  in the project entry to turn this off, for the project and its Gemini threads.
 - **Resume:** the launch records the agy session id as the project's
   `session_id`. `scripts/start-gemini-session.sh my-project --resume <session_id>`
-  continues it, and refuses an id with no conversation in
-  `~/.gemini/antigravity-cli/conversations`.
+  continues it. It refuses an id with no conversation in
+  `~/.gemini/antigravity-cli/conversations`, and refuses while the project's
+  session still runs.
+- **`/clear` and `/restart`:** a turn that ignores `/clear`'s cancel for 15 s
+  stops the session (restart it) rather than leaving it stuck. `/restart`
+  waits for agy itself to exit before relaunching.
 - **Account:** agy uses the one Google account it is signed in with, so
   Gemini has no account aliases. `CCDM_AGY_BIN` names another agy binary.
 
 A Thread Conversation can run Gemini too, under a project of any provider:
 `/thread <name> --provider gemini [--model <model>] [--effort <effort>]`.
+A project's plain `model` goes only to threads of the project's own provider,
+so a Claude or Codex thread of a Gemini project never inherits a Gemini model.
 
 ### Registering a New Project
 
@@ -612,7 +618,7 @@ Open a public thread under a registered project channel and type a task: it beco
 - **Create** by hand, with `/thread <name> [--provider claude|codex|gemini] [--account <alias>] [--model <model>] [--effort <effort>] [first message…]` in the project channel, from the channel agent's `create_thread` tool, or with `scripts/threads.sh create <project> <name> [flags] [message]`. Created threads auto-archive after a week.
 - **Configure and start an existing thread** with `scripts/threads.sh restart [<project>] <name|link|id> [flags]`. A provider or account change starts fresh; model and effort alone keep the current conversation.
 - **In a thread:**
-  - `/config` shows or changes the thread's provider, account, model and effort. A provider or account change applies only after your ✅.
+  - `/config` shows or changes the thread's provider, account, model and effort. A provider or account change applies only after your ✅. Switching provider also drops the thread's account, model and effort for the old provider, unless the same `/config` sets them.
   - `/model` shows the model, thinking level and account/home the thread runs with.
   - `/restart` resumes the conversation, and `/clear` starts a fresh one.
   - `/compact`, `/pause` and `/unpause` work as in a channel.

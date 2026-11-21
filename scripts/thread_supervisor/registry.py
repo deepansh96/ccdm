@@ -39,6 +39,8 @@ def guests(registry: dict, name: str) -> list[str]:
 
 def accounts(registry: dict, provider: str) -> dict:
     """A provider's account aliases: `claude_accounts` or `codex_accounts` (Gemini has none)."""
+    if provider == "gemini":
+        return {}
     values = registry.get(f"{provider}_accounts")
     return values if isinstance(values, dict) else {}
 
@@ -57,10 +59,12 @@ def resolved_settings(entry: dict, overrides) -> dict:
             "model": overrides["model"] or entry.get("gemini_model") or (entry.get("model") if own else None),
             "effort": overrides["effort"] or entry.get("gemini_effort"),
         }
+    # A project's plain `model` names its own provider's model.
+    own_model = entry.get("model") if (entry.get("type") or "claude") == provider else None
     return {
         "provider": provider,
         "account": overrides["account"],
-        "model": overrides["model"] or (entry.get("codex_model") if codex else None) or entry.get("model"),
+        "model": overrides["model"] or (entry.get("codex_model") if codex else None) or own_model,
         "effort": overrides["effort"] or (entry.get("codex_reasoning_effort") or entry.get("model_reasoning_effort")
                                           if codex else entry.get("claude_effort")),
     }

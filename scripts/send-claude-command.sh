@@ -163,7 +163,7 @@ else
 fi
 
 if [[ "$SESSION_TYPE" != "claude" ]]; then
-  echo "$SUBJECT_START is type '$SESSION_TYPE', not 'claude'. Codex sessions handle /compact and /clear directly in their $OWN_CHANNEL." >&2
+  echo "$SUBJECT_START is type '$SESSION_TYPE', not 'claude'. Codex and Gemini sessions handle /compact and /clear directly in their $OWN_CHANNEL." >&2
   exit 1
 fi
 
