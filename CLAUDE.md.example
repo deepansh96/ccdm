@@ -321,7 +321,7 @@ To unload: `launchctl unload ~/Library/LaunchAgents/com.claude.root-agent.plist`
 
 ### Usage Stats Poster
 
-Automated Discord usage reports run through the opt-in `scripts/install-usage-stats-poster.sh` LaunchAgent, independently of project sessions, and report both Claude Code and Codex usage from the configured accounts. The poster posts with the root bot token from root's state directory.
+Automated Discord usage reports run through the opt-in `scripts/install-usage-stats-poster.sh` LaunchAgent, independently of project sessions, and report Claude Code and Codex usage from the configured accounts, plus Antigravity CLI (`agy`) subscription quota when agy is installed. The poster posts with the root bot token from root's state directory.
 
 For local operational paths, channel IDs, and LaunchAgent details, keep sensitive setup notes in `CLAUDE.local.md`.
 

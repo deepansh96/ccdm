@@ -3631,3 +3631,246 @@ test("DeepSeek block keeps amount-only output when the balance or local usage is
   assert.match(probe.stdout, /^no_balance Balance: \*unavailable \(DeepSeek balance unavailable \(HTTP 401\)\)\*$/m);
   assert.match(probe.stdout, /^no_balance_usage This month: \*\*1\.3k tokens\*\* · 1 session · partial$/m);
 });
+
+// Antigravity CLI (agy) quota: `agy -p /usage --output-format json` answered by a fake agy.
+const AGY_NOW = "2026-11-21T07:52:00Z";
+const AGY_FIXTURE = path.join("tests", "fixtures", "agy-usage.json");
+const AGY_EXPECTED_VALUE = [
+  "**Gemini Models**",
+  "5-Hour: `[############...]` **82%**  resets in 4h 40m",
+  "Weekly: `[######.........]` **38%**  resets in 6d 23h",
+  "",
+  "**Claude and GPT models**",
+  "5-Hour: `[...............]` **0%**",
+  "Weekly: `[##.............]` **10%**  resets in 6d 23h",
+  "",
+  "**Gemini 4 Argon**",
+  "Weekly: `[####...........]` **25%**  resets in 6d 23h",
+].join("\n");
+
+function writeFakeAgy(dir, body) {
+  const file = path.join(dir, "agy");
+  fs.writeFileSync(
+    file,
+    `#!/bin/sh\nprintf '%s\\n' "$PWD" "$@" > "${path.join(dir, "agy-invocation.txt")}"\n${body}\n`,
+    { mode: 0o755 },
+  );
+  return file;
+}
+
+function tempAgyDir() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-agy-"));
+  registerTeardownCallback(async () => fs.rmSync(dir, { force: true, recursive: true }));
+  return dir;
+}
+
+function postedEmbed(api) {
+  return JSON.parse(api.requests.find((request) => request.method === "POST").body).embeds[0];
+}
+
+test("scheduled poster renders an Antigravity field beside Claude and records agy quota in history", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const historyPath = path.join(workspace.homeDir, "history", "history.sqlite3");
+  seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
+  const agy = writeFakeAgy(workspace.homeDir, `exec /bin/cat "${path.join(workspace.repoDir, AGY_FIXTURE)}"`);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+    args: ["--scheduled"],
+    cwd: workspace.tmpDir,
+    env: { CCDM_USAGE_STATS_NOTIFY: "0", CCDM_AGY_BIN: agy, CCDM_USAGE_STATS_NOW: AGY_NOW },
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const embed = postedEmbed(api);
+  assert.deepEqual(embed.fields.map(({ name }) => name), ["Claude Code", "Antigravity"]);
+  assert.match(embed.fields[0].value, /^\*\*claude-p\*\* \(Pro\)\n5-Hour: /);
+  assert.equal(embed.fields[1].value, AGY_EXPECTED_VALUE);
+  assert.equal(embed.fields[1].inline, true);
+  assertEmbedWithinDiscordLimits(embed);
+
+  // agy runs once, read-only, from the poster's repository (never home or the caller's cwd).
+  const [cwd, ...args] = fs.readFileSync(path.join(workspace.homeDir, "agy-invocation.txt"), "utf8").trimEnd().split("\n");
+  assert.equal(fs.realpathSync(cwd), fs.realpathSync(workspace.repoDir));
+  assert.deepEqual(args, ["-p", "/usage", "--output-format", "json", "--print-timeout", "25s", "--log-file", "/dev/null"]);
+
+  const probe = spawnSync("python3", ["-c", [
+    "import sqlite3, sys",
+    "connection = sqlite3.connect(sys.argv[1])",
+    "print(connection.execute('select payload_json from snapshots').fetchone()[0])",
+  ].join("\n"), historyPath], { encoding: "utf8" });
+  assert.equal(probe.status, 0, probe.stderr);
+  assert.doesNotMatch(probe.stdout, /Models within this group|remaining_fraction|description/);
+  const cards = JSON.parse(probe.stdout).cards.filter((card) => card.provider === "antigravity");
+  assert.deepEqual(cards.map(({ account, window, scope, used_percent: used, resets_at: reset }) => ({ account, window, scope, used, reset })), [
+    { account: "agy", window: "5-hour (Gemini Models)", scope: "Gemini Models", used: 81.96, reset: "2026-11-21T12:32:37Z" },
+    { account: "agy", window: "weekly (Gemini Models)", scope: "Gemini Models", used: 37.87, reset: "2026-11-28T07:32:37Z" },
+    { account: "agy", window: "5-hour (Claude and GPT models)", scope: "Claude and GPT models", used: 0, reset: "2026-11-21T12:50:53Z" },
+    { account: "agy", window: "weekly (Claude and GPT models)", scope: "Claude and GPT models", used: 10, reset: "2026-11-28T07:50:53Z" },
+    { account: "agy", window: "weekly (Gemini 4 Argon)", scope: "Gemini 4 Argon", used: 25, reset: "2026-11-28T07:50:53Z" },
+  ]);
+});
+
+test("dry run prints the report, including Antigravity, without a token, a post, or history", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const historyPath = path.join(workspace.homeDir, "history", "history.sqlite3");
+  seedPosterWorkspace(workspace, api.baseUrl, { history_db_path: historyPath });
+  fs.rmSync(path.join(workspace.homeDir, ".claude", "channels", "discord", ".env"));
+  const agy = writeFakeAgy(workspace.homeDir, `exec /bin/cat "${path.join(workspace.repoDir, AGY_FIXTURE)}"`);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py", {
+    args: ["--dry-run"],
+    env: { CCDM_AGY_BIN: agy, CCDM_USAGE_STATS_NOW: AGY_NOW, CCDM_USAGE_STATS_AUTOMATED: "1" },
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /^## Claude Code\n\*\*claude-p\*\* \(Pro\)\n/);
+  assert.ok(result.stdout.includes(`\n\n## Antigravity\n${AGY_EXPECTED_VALUE}\n`), result.stdout);
+  assert.match(result.stdout, /\(dry run: nothing was posted or recorded\)\n$/);
+  assert.equal(api.requests.filter((request) => request.method === "POST").length, 0);
+  assert.equal(fs.existsSync(path.dirname(historyPath)), false);
+});
+
+test("a missing agy degrades to one unavailable line, and a machine without agy has no Antigravity field", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  seedPosterWorkspace(workspace, api.baseUrl);
+  const run = (env) => runScript(workspace, "scripts/usage-stats-poster.py", { env });
+
+  // No binary anywhere and no agy data directory: the report is unchanged.
+  const absent = await run({});
+  assert.equal(absent.exitCode, 0, absent.stderr || absent.stdout);
+  // A configured binary that is missing, or agy's data directory without a binary.
+  const configured = await run({ CCDM_AGY_BIN: path.join(workspace.homeDir, "missing", "agy") });
+  assert.equal(configured.exitCode, 0, configured.stderr || configured.stdout);
+  fs.mkdirSync(path.join(workspace.homeDir, ".gemini", "antigravity-cli"), { recursive: true });
+  const dataOnly = await run({});
+  assert.equal(dataOnly.exitCode, 0, dataOnly.stderr || dataOnly.stdout);
+
+  const posts = api.requests.filter((request) => request.method === "POST").map((request) => JSON.parse(request.body).embeds[0]);
+  assert.equal(posts.length, 3);
+  assert.deepEqual(posts[0].fields.map(({ name }) => name), ["Claude Code"]);
+  for (const embed of posts.slice(1)) {
+    assert.deepEqual(embed.fields.map(({ name }) => name), ["Claude Code", "Antigravity"]);
+    assert.match(embed.fields[0].value, /^\*\*claude-p\*\* \(Pro\)\n5-Hour: /);
+    assert.equal(embed.fields[1].value, "**agy**\n*Usage unavailable: agy not found*");
+  }
+});
+
+test("agy sign-in, timeout, crash, and unreadable output each become one short unavailable block", () => {
+  const dir = tempAgyDir();
+  const pidFile = path.join(dir, "grandchild.pid");
+  const agy = writeFakeAgy(dir, [
+    "case \"$AGY_FAKE_MODE\" in",
+    "  signin) echo 'Error: You are not logged into Antigravity. Run agy to sign in.' >&2; exit 1 ;;",
+    "  signin_json) echo '{\"conversation_id\":\"\",\"status\":\"ERROR\",\"error\":\"authentication required: please log in\"}'; exit 1 ;;",
+    "  garbage) echo 'definitely not json'; exit 0 ;;",
+    "  print_timeout) exit 3 ;;",
+    "  crash) echo 'panic: boom' >&2; exit 7 ;;",
+    "  empty) echo '{\"status\":\"SUCCESS\",\"command\":{\"name\":\"usage\",\"data\":{\"groups\":[]}}}' ;;",
+    "  other_command) echo '{\"status\":\"SUCCESS\",\"command\":{\"name\":\"credits\",\"data\":{\"remaining_credits\":0}}}' ;;",
+    "  bad_fraction) echo '{\"status\":\"SUCCESS\",\"command\":{\"name\":\"usage\",\"data\":{\"groups\":[{\"name\":\"**Gem`ini** <Models>\",\"buckets\":[{\"window\":\"5h\",\"remaining_fraction\":\"lots\",\"reset_time\":\"2026-11-21T12:32:37Z\"},{\"window\":\"weekly\",\"remaining_fraction\":true},{\"window\":\"weekly\",\"remaining_fraction\":1.7,\"reset_time\":\"2026-11-28T07:32:37Z\"}]}]}}}' ;;",
+    `  hang) /bin/sleep 30 & echo $! > "${pidFile}"; /bin/sleep 30 ;;`,
+    "esac",
+  ].join("\n"));
+  const probe = probePosterTimed(60000, [
+    "import json, os, time",
+    "from datetime import datetime, timezone",
+    "from pathlib import Path",
+    "now = datetime(2026, 11, 21, 7, 52, tzinfo=timezone.utc)",
+    "out = {}",
+    "for mode in ['signin', 'signin_json', 'garbage', 'print_timeout', 'crash', 'empty', 'other_command', 'bad_fraction', 'hang']:",
+    "    os.environ['AGY_FAKE_MODE'] = mode",
+    "    os.environ['CCDM_AGY_TIMEOUT_SECONDS'] = '1' if mode == 'hang' else '20'",
+    "    started = time.monotonic()",
+    "    metrics = poster.collect_agy_metrics(now=now, binary=Path(sys.argv[2]))",
+    "    out[mode] = {'texts': [m['text'] for m in metrics], 'seconds': time.monotonic() - started,",
+    "                 'cards': poster._safe_history_cards(metrics)}",
+    "pid = int(Path(sys.argv[3]).read_text())",
+    "try:",
+    "    os.kill(pid, 0)",
+    "    out['grandchild_alive'] = True",
+    "except ProcessLookupError:",
+    "    out['grandchild_alive'] = False",
+    "print(json.dumps(out))",
+  ].join("\n"), agy, pidFile);
+  assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+  const out = JSON.parse(probe.stdout);
+  const unavailable = (reason) => [`**agy**\n*Usage unavailable: ${reason}*`];
+  assert.deepEqual(out.signin.texts, unavailable("sign-in required (run agy to sign in)"));
+  assert.deepEqual(out.signin_json.texts, unavailable("sign-in required (run agy to sign in)"));
+  assert.deepEqual(out.garbage.texts, unavailable("unreadable agy output"));
+  assert.deepEqual(out.print_timeout.texts, unavailable("timed out"));
+  assert.deepEqual(out.crash.texts, unavailable("agy exited with code 7"));
+  assert.deepEqual(out.empty.texts, unavailable("no quota data in agy output"));
+  assert.deepEqual(out.other_command.texts, unavailable("no quota data in agy output"));
+  assert.deepEqual(out.hang.texts, unavailable("timed out"));
+  assert.ok(out.hang.seconds < 10, `hang took ${out.hang.seconds}s`);
+  // The timeout kills agy's whole process group, including background children.
+  assert.equal(out.grandchild_alive, false);
+  // A bad fraction is unavailable, never 0%; an over-range one is clamped; markup is stripped.
+  assert.deepEqual(out.bad_fraction.texts, [[
+    "**Gemini Models**",
+    "5-Hour: *unavailable*",
+    "Weekly: *unavailable*",
+    "Weekly: `[...............]` **0%**",
+  ].join("\n")]);
+  assert.deepEqual(out.bad_fraction.cards.map(({ available, used_percent: used }) => ({ available, used })), [
+    { available: false, used: undefined },
+    { available: false, used: undefined },
+    { available: true, used: 0 },
+  ]);
+  // Failures are recorded as one unavailable history card with the short reason.
+  assert.deepEqual(out.signin.cards, [{
+    provider: "antigravity", account: "agy", window: "rate limits", available: false,
+    status: "unavailable", reason: "sign-in required (run agy to sign in)",
+  }]);
+});
+
+test("a long Antigravity section continues in extra fields and keeps the embed within Discord limits", () => {
+  const dir = tempAgyDir();
+  const name = "Very Long Model Family Name ".repeat(5);
+  const groups = Array.from({ length: 10 }, (_, group) => ({
+    name: `${group} ${name}`,
+    buckets: Array.from({ length: 10 }, (_, bucket) => ({
+      window: `custom-${bucket}`,
+      name: `Bucket ${bucket} ${"x".repeat(40)}`,
+      remaining_fraction: 0.5,
+      reset_time: "2026-11-21T12:32:37Z",
+    })),
+  }));
+  const fixture = path.join(dir, "agy-long.json");
+  fs.writeFileSync(fixture, JSON.stringify({ status: "SUCCESS", command: { name: "usage", data: { groups } } }));
+  const agy = writeFakeAgy(dir, `exec /bin/cat "${fixture}"`);
+  const probe = probePosterTimed(60000, [
+    "import json",
+    "from datetime import datetime, timezone",
+    "from pathlib import Path",
+    "now = datetime(2026, 11, 21, 7, 52, tzinfo=timezone.utc)",
+    "metrics = poster.collect_agy_metrics(now=now, binary=Path(sys.argv[2]))",
+    "values = poster._agy_report_values(metrics)",
+    "line = 'x' * 60",
+    "many = [{'text': '**acct-%02d** (Pro)\\n' % i + '\\n'.join([line] * 12)} for i in range(20)]",
+    "claude, codex = poster._usage_report_values(many, [{'text': '**codex** (ChatGPT)\\nWeekly: 1%'}])",
+    "print(json.dumps({'groups': len(metrics), 'rows': [len(m['limits']) for m in metrics], 'values': values,",
+    "  'alone': poster._usage_report_embed('claude', None, values), 'crowded': poster._usage_report_embed(claude, codex, values),",
+    "  'none': poster._agy_report_values([])}))",
+  ].join("\n"), agy);
+  assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+  const result = JSON.parse(probe.stdout);
+  // At most 8 groups of 8 buckets are read; names are capped.
+  assert.equal(result.groups, 8);
+  assert.deepEqual(result.rows, Array(8).fill(8));
+  assert.ok(result.values.length > 1);
+  for (const value of result.values) assert.ok(value.length <= 1024, `${value.length}`);
+  for (const value of result.values) assert.doesNotMatch(value, /truncated/);
+  assert.equal(result.none, null);
+  const names = result.alone.fields.map(({ name: fieldName }) => fieldName);
+  assert.deepEqual(names, ["Claude Code", "Antigravity", ...Array(result.values.length - 1).fill("Antigravity (cont.)")]);
+  assertEmbedWithinDiscordLimits(result.alone);
+  // Crowded with Claude and Codex, every provider keeps at least its first field.
+  assertEmbedWithinDiscordLimits(result.crowded);
+  const crowdedNames = result.crowded.fields.map(({ name: fieldName }) => fieldName);
+  for (const provider of ["Claude Code", "Codex", "Antigravity"]) assert.ok(crowdedNames.includes(provider), provider);
+});
