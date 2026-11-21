@@ -105,7 +105,7 @@ Scenario `PATH` contains only harness-owned fixture binaries and approved host w
 The tmux/process fixture contract covers the Claude start surface:
 
 - `tmux has-session` returns the current fixture session state with production-compatible exit codes.
-- `tmux new-session -d -s <name> -- zsh -ic <command>` validates the Claude Router launch shape (the `server:ccdm` channel with `CCDM_ROUTER_KEY_FILE`, never the official plugin or `DISCORD_STATE_DIR`), records the session command, cwd, environment, and pane output, and runs a fake `claude` that hosts the real channel server.
+- `tmux new-session -d -s <name> -- [env <NAME=value>...] zsh -ic <command>` validates the Claude Router launch shape (the `server:ccdm` channel with `CCDM_ROUTER_KEY_FILE`, never the official plugin or `DISCORD_STATE_DIR`), records the session command, wrapper environment, cwd, launch environment, and pane output, and runs a fake `claude` that hosts the real channel server.
 - `tmux capture-pane` returns recorded pane output, and `tmux send-keys` is recorded so tests can assert the current start surface does not send trust-dialog keys.
 - `ps axeww -o pid=,command=` and `pgrep -P <pid>` expose only rows owned by the current `$CCDM_TEST_STATE`; fabricated or foreign PID rows in fixture state are omitted.
 - `pkill -TERM -P <pid>` sends SIGTERM only to harness-owned child rows exposed by the same process model.
@@ -114,7 +114,7 @@ The tmux/process fixture contract covers the Claude start surface:
 
 The same tmux/process contract covers the Codex startup surface:
 
-- `tmux new-session -d -s <name> -- zsh -ic <command>` validates the Router bridge launch shape and records `CODEX_HOME`, `CCDM_CODEX_PROJECT`, `CCDM_ROUTER_STATE_DIR`, `CCDM_ROUTER_KEY_FILE`, `CCDM_CHANNEL_READY_FILE`, `CHANNEL_ID`, `PROJECT_DIR`, `WS_PORT`, and `ALLOWED_USER_IDS`; no Discord token, bot app id, or bot display name reaches the launch.
+- `tmux new-session -d -s <name> -- [env <NAME=value>...] zsh -ic <command>` validates the Router bridge launch shape and records `CODEX_HOME`, `CCDM_CODEX_PROJECT`, `CCDM_ROUTER_STATE_DIR`, `CCDM_ROUTER_KEY_FILE`, `CCDM_CHANNEL_READY_FILE`, `CHANNEL_ID`, `PROJECT_DIR`, `WS_PORT`, and `ALLOWED_USER_IDS`; no Discord token, bot app id, or bot display name reaches the launch.
 - Codex startup tests seed registries with `type: "codex"`, `ws_port`, named `codex_accounts`/ `default_codex_account` fields or optional legacy `codex_home`, channel IDs, and Discord user/guild values. The only (placeholder) bot token is root's, in fixture root Discord state, and only the Router reads it; each launch writes the project's 0600 Router launch key.
 - `scripts/resolve-codex-home.py` validates named and legacy selectors and supports the root restart's `ROOT_CODEX_HOME` → top-level named/raw selector → ambient `CODEX_HOME` → `~/.codex` precedence through the same executable surface. It expands `~`, normalizes path components without resolving symlinks, and requires a usable home plus any present `config.toml` before project startup mutates MCP config, or before either launch path mutates tmux or registry state.
 - Named-account startup scenarios seed `codex_accounts`, `default_codex_account`, and project `codex_account` selectors, then assert project overrides, Default Codex Account inheritance, root selection, `ROOT_CODEX_HOME` precedence, and registry re-read through the recorded `CODEX_HOME`.

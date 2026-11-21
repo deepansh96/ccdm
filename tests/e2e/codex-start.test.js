@@ -242,8 +242,14 @@ test("start-codex-session constructs a Router bridge tmux launch, removes stale 
     CODEX_HOME: codexHome,
     CODEX_SERVICE_TIER: "default",
     CODEX_RESUME_THREAD_ID: "",
+    DISABLE_AUTO_UPDATE: "true",
+    DISABLE_UPDATE_PROMPT: "true",
     PROJECT_DIR: path.join(workspace.tmpDir, 'project with spaces and "quotes"'),
     WS_PORT: String(codex.port),
+  });
+  assert.deepEqual(session.wrapperEnv, {
+    DISABLE_AUTO_UPDATE: "true",
+    DISABLE_UPDATE_PROMPT: "true",
   });
   for (const forbidden of ["BOT_TOKEN", "DISCORD_STATE_DIR"]) {
     assert.equal(session.shellCommand.includes(forbidden), false, forbidden);

@@ -225,7 +225,9 @@ with os.fdopen(fd, "w") as f:
 os.replace(tmp, key_file)
 PY
 
-  tmux new-session -d -s "$SCREEN_NAME" -- zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' CCDM_CODEX_PROJECT='$PROJECT' CCDM_ROUTER_STATE_DIR='$router_state' CCDM_ROUTER_KEY_FILE='$key_file' CCDM_CHANNEL_READY_FILE='$ready_file' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$DISCORD_USER_IDS'$AUDIO_TRANSCRIPTION_ENV$TEXT_REPLY_FALLBACK_ENV$CODEX_MODEL_ENV$CODEX_REASONING_ENV$CODEX_SERVICE_TIER_ENV node scripts/codex-bridge.js"
+  # zsh -i loads ~/.zshrc, so prompts there (oh-my-zsh's update prompt) must be
+  # switched off or a headless launch blocks before it starts anything.
+  tmux new-session -d -s "$SCREEN_NAME" -- env DISABLE_AUTO_UPDATE=true DISABLE_UPDATE_PROMPT=true zsh -ic "cd '$ROOT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' CCDM_CODEX_PROJECT='$PROJECT' CCDM_ROUTER_STATE_DIR='$router_state' CCDM_ROUTER_KEY_FILE='$key_file' CCDM_CHANNEL_READY_FILE='$ready_file' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$PATH_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$DISCORD_USER_IDS'$AUDIO_TRANSCRIPTION_ENV$TEXT_REPLY_FALLBACK_ENV$CODEX_MODEL_ENV$CODEX_REASONING_ENV$CODEX_SERVICE_TIER_ENV node scripts/codex-bridge.js"
   echo "Started Codex Router bridge in tmux session '$SCREEN_NAME'"
 
   # The bridge reports its hello outcome once Codex is up and bootstrapped.

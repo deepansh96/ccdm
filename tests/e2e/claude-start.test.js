@@ -94,6 +94,9 @@ test("tmux and process fixtures expose Claude Router sessions without host PID l
     "-s",
     "project_session",
     "--",
+    "env",
+    "DISABLE_AUTO_UPDATE=true",
+    "DISABLE_UPDATE_PROMPT=true",
     "zsh",
     "-ic",
     launchCommand,
@@ -137,6 +140,12 @@ test("tmux and process fixtures expose Claude Router sessions without host PID l
   assert.match(claudeVersion.stdout, /Claude Code fixture/);
 
   assert.equal(state.fixtures.tmux.sessions.project_session.shellCommand, launchCommand);
+  assert.deepEqual(state.fixtures.tmux.sessions.project_session.wrapperEnv, {
+    DISABLE_AUTO_UPDATE: "true",
+    DISABLE_UPDATE_PROMPT: "true",
+  });
+  assert.equal(state.fixtures.claude.invocations[0].env.DISABLE_AUTO_UPDATE, "true");
+  assert.equal(state.fixtures.claude.invocations[0].env.DISABLE_UPDATE_PROMPT, "true");
   assert.equal(state.fixtures.claude.invocations[0].env.CCDM_ROUTER_KEY_FILE, keyFile);
 });
 
@@ -172,6 +181,10 @@ test("a Claude project with no transport field starts through the Router and rec
 
   const session = readState(workspace.stateDir).fixtures.tmux.sessions.alpha_session;
   assert.equal(session.cwd, projectPath);
+  assert.deepEqual(session.wrapperEnv, {
+    DISABLE_AUTO_UPDATE: "true",
+    DISABLE_UPDATE_PROMPT: "true",
+  });
   assert.equal(session.env.CCDM_ROUTER_KEY_FILE, path.join(workspace.routerStateDir, "keys", "alpha.key"));
   assert.deepEqual(session.sendKeys, [["Enter"]]);
   const mcpConfigPath = path.join(launchDir(workspace), "mcp.json");

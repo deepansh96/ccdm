@@ -194,7 +194,13 @@ test("no Discord credential reaches the Codex thread's environment, launch files
   const state = readState(workspace.stateDir);
   const session = state.fixtures.tmux.sessions[THREAD_TMUX];
   assert.ok(session, JSON.stringify(Object.keys(state.fixtures.tmux.sessions)));
-  assert.deepEqual(session.command.slice(0, 2), ["zsh", "-ic"]);
+  assert.deepEqual(session.command.slice(0, 5), [
+    "env", "DISABLE_AUTO_UPDATE=true", "DISABLE_UPDATE_PROMPT=true", "zsh", "-ic",
+  ]);
+  assert.deepEqual(session.wrapperEnv, {
+    DISABLE_AUTO_UPDATE: "true",
+    DISABLE_UPDATE_PROMPT: "true",
+  });
   assert.equal(session.env.CCDM_ROUTER_KEY_FILE, path.join(workspace.routerStateDir, "keys", `.thread-${THREAD_ID}.key`));
   assert.equal(session.env.CHANNEL_ID, THREAD_ID);
   assert.equal(session.env.PROJECT_DIR, workspace.tmpDir);

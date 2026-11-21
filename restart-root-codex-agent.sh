@@ -278,7 +278,9 @@ with os.fdopen(fd, "w") as f:
 os.replace(tmp, key_file)
 PY
 
-if ! tmux new-session -d -s root_agent -- zsh -ic "cd '$SCRIPT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' CCDM_ROUTER_ROLE='root' CCDM_ROUTER_STATE_DIR='$ROUTER_STATE_DIR' CCDM_ROUTER_KEY_FILE='$ROOT_KEY_FILE' CCDM_CHANNEL_READY_FILE='$ROOT_READY_FILE' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$SCRIPT_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$ALLOWED_USER_IDS' ROOT_BOT_APP_ID='$BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' node scripts/codex-bridge.js"; then
+# zsh -i loads ~/.zshrc, so a headless launch must switch off prompts there
+# (oh-my-zsh's update prompt blocks `read` and no session ever starts).
+if ! tmux new-session -d -s root_agent -- env DISABLE_AUTO_UPDATE=true DISABLE_UPDATE_PROMPT=true zsh -ic "cd '$SCRIPT_DIR' && CODEX_HOME='$CODEX_HOME_DIR' CCDM_ROUTER_ROLE='root' CCDM_ROUTER_STATE_DIR='$ROUTER_STATE_DIR' CCDM_ROUTER_KEY_FILE='$ROOT_KEY_FILE' CCDM_CHANNEL_READY_FILE='$ROOT_READY_FILE' CHANNEL_ID='$CHANNEL_ID' PROJECT_DIR='$SCRIPT_DIR' WS_PORT='$WS_PORT' ALLOWED_USER_IDS='$ALLOWED_USER_IDS' ROOT_BOT_APP_ID='$BOT_APP_ID' BOT_APP_ID='$BOT_APP_ID' node scripts/codex-bridge.js"; then
   echo "Failed to create tmux session 'root_agent'" >&2
   python3 -c 'import sys; from pathlib import Path; Path(sys.argv[1]).unlink(missing_ok=True)' "$ROOT_KEY_FILE"
   exit 1
