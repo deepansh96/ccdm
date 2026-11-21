@@ -25,9 +25,14 @@
 // thread id in thread mode), PROJECT_DIR; optional GEMINI_MODEL and
 // GEMINI_EFFORT (agy's model and thinking level; a model id with a level
 // suffix such as gemini-4-neon-high also works), GEMINI_RESUME_SESSION_ID,
-// CCDM_AGY_BIN, CCDM_CHANNEL_READY_FILE, and the thread variables
+// CCDM_AGY_HOME, CCDM_AGY_BIN, CCDM_CHANNEL_READY_FILE, and the thread variables
 // CCDM_THREAD_ID, CCDM_THREAD_BOOTSTRAP_FILE, CCDM_THREAD_ACTIVITY_FILE and
 // CCDM_THREAD_BOOT_TIMEOUT_S, which work as in the Codex bridge.
+//
+// CCDM_AGY_HOME is a Gemini account's home (scripts/resolve-gemini-home.py):
+// agy runs with it as HOME, so it uses that home's sign-in and data. The
+// agent's shell commands get the real home back through scripts/agy-shell
+// (ZDOTDIR and BASH_ENV), and the Discord MCP server is given it directly.
 
 const { spawn } = require("child_process");
 const { randomBytes, randomUUID } = require("crypto");
@@ -68,6 +73,10 @@ const DEFAULT_EFFORT = "high";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || DEFAULT_MODEL;
 const GEMINI_EFFORT = process.env.GEMINI_EFFORT || (process.env.GEMINI_MODEL ? "" : DEFAULT_EFFORT);
 const RESUME_SESSION_ID = process.env.GEMINI_RESUME_SESSION_ID || "";
+const REAL_HOME = os.homedir();
+const AGY_HOME = process.env.CCDM_AGY_HOME && path.resolve(process.env.CCDM_AGY_HOME) !== path.resolve(REAL_HOME)
+  ? path.resolve(process.env.CCDM_AGY_HOME) : "";
+const AGY_SHELL_DIR = path.join(__dirname, "agy-shell");
 const TEXT_REPLY_FALLBACK = process.env.GEMINI_TEXT_REPLY_FALLBACK !== "0";
 const AUDIO_TRANSCRIPTION_ENABLED = !["0", "false", "no", "off"].includes(
   String(process.env.CODEX_BRIDGE_TRANSCRIBE_AUDIO || "").toLowerCase());
@@ -229,13 +238,27 @@ function findAgyBinary() {
   return path.join(os.homedir(), ".local", "bin", "agy");
 }
 
+// agy's environment: under a Gemini account, that account's home as HOME,
+// with the real home (and ZDOTDIR) handed to its shells to restore.
+function agyEnv() {
+  if (!AGY_HOME) return { ...process.env };
+  return {
+    ...process.env,
+    HOME: AGY_HOME,
+    ZDOTDIR: AGY_SHELL_DIR,
+    BASH_ENV: path.join(AGY_SHELL_DIR, "bashenv"),
+    CCDM_SHELL_HOME: REAL_HOME,
+    CCDM_SHELL_ZDOTDIR: process.env.ZDOTDIR || "",
+  };
+}
+
 function startAgy() {
   const bin = findAgyBinary();
-  console.log(`Starting ${bin} acp in ${PROJECT_DIR}`);
+  console.log(`Starting ${bin} acp in ${PROJECT_DIR}${AGY_HOME ? ` with home ${AGY_HOME}` : ""}`);
   agyProcess = spawn(bin, ["acp", "--dangerously-skip-permissions"], {
     cwd: PROJECT_DIR,
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env },
+    env: agyEnv(),
   });
   agyProcess.stderr.setEncoding("utf8");
   agyProcess.stderr.on("data", (data) => console.log(`[agy stderr] ${data.trim()}`));
@@ -317,6 +340,8 @@ function handleNotification(message) {
 
 function discordMcpServer() {
   const env = {
+    // agy may run under a Gemini account's home; the server uses the real one.
+    HOME: REAL_HOME,
     CCDM_ROUTER_KEY_FILE: ROUTER_KEY_FILE,
     CCDM_ROUTER_STATE_DIR: routerPaths.stateDir(),
     // The scoped MCP server names its project with the Codex variable.

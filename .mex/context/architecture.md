@@ -12,7 +12,7 @@ edges:
     condition: when specific technology details are needed
   - target: context/decisions.md
     condition: when understanding why the architecture is structured this way
-last_updated: 2026-11-21
+last_updated: 2026-11-22
 ---
 
 # Architecture
@@ -58,7 +58,7 @@ The root agent coordinates lifecycle and access. Each project session works only
 - `Discord API / discord.js` - the Router's one gateway connection and REST (webhooks, messages, reactions), plus root admin REST for channels, roles, invites, and guest permission overrides. Isolation is the Router's Session Scope, not Discord permissions.
 - `Claude Code` - runs Claude project and root sessions with the CCDM development channel (`server:ccdm`), never the official Discord plugin.
 - `Codex CLI/app-server` - runs Codex project sessions; the bridge registers a scoped Discord MCP server dynamically.
-- `Google Antigravity CLI (agy)` - runs Gemini project and thread sessions through `agy acp`; signed in once with Google OAuth, and holds its conversations in `~/.gemini/antigravity-cli`.
+- `Google Antigravity CLI (agy)` - runs Gemini project and thread sessions through `agy acp`; signed in once with Google OAuth per home, and holds its conversations in `<home>/.gemini/antigravity-cli`; each `gemini_accounts` alias is another home with its own sign-in, which agy runs under as `HOME`.
 - `tmux` - owns long-running local sessions and provides the Claude slash-command relay boundary.
 - `macOS Keychain / local auth files` - store agent credentials; never copy their contents into tracked files.
 

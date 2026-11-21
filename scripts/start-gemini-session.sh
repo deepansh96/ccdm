@@ -7,8 +7,10 @@
 #
 # The model and thinking level come from the project's `gemini_model` (or
 # `model`) and `gemini_effort`; unset, the bridge uses gemini-4-neon at high.
-# --resume continues an agy conversation, which must exist in
-# ~/.gemini/antigravity-cli/conversations; it never falls back to a fresh one.
+# The project's `gemini_account`, an alias in `gemini_accounts`, names the
+# home agy runs under (its sign-in); unset, agy runs under the user's home.
+# --resume continues an agy conversation, which must exist in that home's
+# .gemini/antigravity-cli/conversations; it never falls back to a fresh one.
 
 set -euo pipefail
 
@@ -29,10 +31,6 @@ if (( $# > 1 )); then
   RESUME_SESSION_ID="$3"
   if [[ ! "$RESUME_SESSION_ID" =~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' ]]; then
     echo "Resume session must be a canonical UUID" >&2
-    exit 1
-  fi
-  if [[ ! -f "$HOME/.gemini/antigravity-cli/conversations/$RESUME_SESSION_ID.db" ]]; then
-    echo "The agy conversation $RESUME_SESSION_ID is missing from ~/.gemini/antigravity-cli/conversations" >&2
     exit 1
   fi
 fi
@@ -115,6 +113,13 @@ if [[ "$PROJECT_TYPE" != "gemini" ]]; then
   exit 1
 fi
 
+# An unknown alias or missing home fails the start; the reason is the last stderr line.
+AGY_HOME="$(python3 "$SCRIPT_DIR/resolve-gemini-home.py" "$REGISTRY" "$PROJECT")" || exit 1
+if [[ -n "$RESUME_SESSION_ID" && ! -f "$AGY_HOME/.gemini/antigravity-cli/conversations/$RESUME_SESSION_ID.db" ]]; then
+  echo "The agy conversation $RESUME_SESSION_ID is missing from $AGY_HOME/.gemini/antigravity-cli/conversations" >&2
+  exit 1
+fi
+
 if tmux has-session -t "=$SCREEN_NAME" 2>/dev/null; then
   # A requested resume did not happen, so it is not a success.
   if [[ -n "$RESUME_SESSION_ID" ]]; then
@@ -139,7 +144,7 @@ if [[ "$WEBHOOK_ID" == "__NONE__" ]]; then
   exit 1
 fi
 
-GEMINI_ENV=""
+GEMINI_ENV=" CCDM_AGY_HOME='$AGY_HOME'"
 [[ "$GEMINI_MODEL_VALUE" != "__NONE__" ]] && GEMINI_ENV+=" GEMINI_MODEL='$GEMINI_MODEL_VALUE'"
 [[ "$GEMINI_EFFORT_VALUE" != "__NONE__" ]] && GEMINI_ENV+=" GEMINI_EFFORT='$GEMINI_EFFORT_VALUE'"
 [[ "$TEXT_REPLY_FALLBACK_VALUE" == "0" ]] && GEMINI_ENV+=" GEMINI_TEXT_REPLY_FALLBACK='0'"

@@ -2384,6 +2384,11 @@ def collect_codex_metrics(
 # conversation behind.  Its JSON form carries one group per model family
 # (Gemini, Claude + GPT, the separate Argon cap), each with 5-hour and/or
 # weekly buckets of ``remaining_fraction`` and a UTC ``reset_time``.
+#
+# Each home in registry ``gemini_accounts`` is a separate agy sign-in (agy
+# keeps it under ``$HOME/.gemini``), so each is asked with that home as HOME
+# and gets its own blocks, headed by its alias.  The user's own home is the
+# alias that names it, else ``agy``.
 AGY_BIN_ENV = "CCDM_AGY_BIN"
 AGY_TIMEOUT_ENV = "CCDM_AGY_TIMEOUT_SECONDS"
 AGY_DEFAULT_TIMEOUT_SECONDS = 30
@@ -2446,14 +2451,33 @@ def _read_agy_output(handle):
     return handle.read(AGY_OUTPUT_MAX_BYTES).decode("utf-8", "replace")
 
 
-def read_agy_usage(binary, timeout=None):
+def discover_agy_accounts(registry):
+    """Return ``[(alias, home)]``: the user's own agy (home ``None``) first,
+    then each other home in ``gemini_accounts``, in registry order."""
+    named = registry.get("gemini_accounts") if isinstance(registry, dict) else None
+    real = os.path.normpath(str(Path.home()))
+    main, others, seen = AGY_ACCOUNT, [], {real}
+    for alias, raw in (named.items() if isinstance(named, dict) else ()):
+        name = _agy_name(alias)
+        if not name or not isinstance(raw, str) or not raw.strip():
+            continue
+        home = os.path.normpath(os.path.expanduser(raw.strip()))
+        if home == real:
+            main = name if main == AGY_ACCOUNT else main
+        elif home not in seen:
+            seen.add(home)
+            others.append((name, Path(home)))
+    return [(main, None), *others]
+
+
+def read_agy_usage(binary, timeout=None, home=None):
     """Run ``agy -p /usage`` once and return ``(payload, None)`` or ``(None, reason)``.
 
     agy runs with the repository as its workspace (never the home folder),
     stdin closed, its log sent to /dev/null (no log file per run), and a
     strict wall-clock limit; on timeout its whole process group is killed.
     Output goes to temporary files so a lingering grandchild holding a pipe
-    cannot stall the poster.
+    cannot stall the poster.  ``home``, a Gemini account's home, is agy's HOME.
     """
     timeout = timeout or _agy_timeout()
     print_timeout = max(1, int(timeout) - 5)
@@ -2461,7 +2485,7 @@ def read_agy_usage(binary, timeout=None):
         str(binary), "-p", "/usage", "--output-format", "json",
         "--print-timeout", f"{print_timeout}s", "--log-file", os.devnull,
     ]
-    env = {**os.environ, "NO_COLOR": "1"}
+    env = {**os.environ, "NO_COLOR": "1", **({"HOME": str(home)} if home else {})}
     try:
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
             try:
@@ -2542,41 +2566,55 @@ def parse_agy_usage(payload):
     return result or None
 
 
-def _agy_unavailable_metric(reason):
+def _agy_unavailable_metric(reason, account=AGY_ACCOUNT):
     return {
-        "provider": AGY_PROVIDER, "account": AGY_ACCOUNT, "limits": [],
+        "provider": AGY_PROVIDER, "account": account, "limits": [],
         "status": "unavailable", "reason": reason,
-        "text": f"**{AGY_ACCOUNT}**\n*Usage unavailable: {reason}*",
+        "text": f"**{account}**\n*Usage unavailable: {reason}*",
     }
 
 
 _AGY_UNSET = object()
 
 
-def collect_agy_metrics(now=None, binary=_AGY_UNSET):
-    """Return Antigravity quota metrics, one per model group; never raises.
+def collect_agy_metrics(now=None, binary=_AGY_UNSET, registry=None):
+    """Return Antigravity quota metrics, one per account and model group; never raises.
 
-    A machine without agy (no binary, no data directory, no override) yields
-    no metrics, so the report has no Antigravity field.  Every failure after
-    that is one short unavailable block.
+    A machine without agy (no binary, no data directory, no override, no
+    other account) yields no metrics, so the report has no Antigravity field.
+    Every failure after that is one short unavailable block per account.
     """
     now = now or _utc_now()
+    try:
+        accounts = discover_agy_accounts(registry)
+    except Exception:  # noqa: BLE001 - a bad registry entry must not hide the user's own agy
+        accounts = [(AGY_ACCOUNT, None)]
     if binary is _AGY_UNSET:
         binary, expected = _agy_binary()
         if binary is None:
-            return [_agy_unavailable_metric("agy not found")] if expected else []
+            return [_agy_unavailable_metric("agy not found", accounts[0][0])] if expected or len(accounts) > 1 else []
+    metrics = []
+    for account, home in accounts:
+        metrics += _collect_agy_account(now, binary, account, home, len(accounts) > 1)
+    return metrics
+
+
+def _collect_agy_account(now, binary, account, home, named):
+    """One account's metrics; ``named`` heads each group with the account's alias."""
+    if home is not None and not home.is_dir():
+        return [_agy_unavailable_metric("account home missing", account)]
     try:
-        payload, reason = read_agy_usage(binary)
+        payload, reason = read_agy_usage(binary, home=home)
         groups = parse_agy_usage(payload) if reason is None else None
     except Exception:  # noqa: BLE001 - agy must never break the rest of the report
         payload, reason, groups = None, "agy check failed", None
     if reason is None and groups is None:
         reason = "no quota data in agy output"
     if reason is not None:
-        return [_agy_unavailable_metric(reason)]
+        return [_agy_unavailable_metric(reason, account)]
     metrics = []
     for group in groups:
-        lines = [f"**{group['name']}**"]
+        lines = [f"**{account} · {group['name']}**" if named else f"**{group['name']}**"]
         limits = []
         for limit in group["limits"]:
             used = limit["used_percent"]
@@ -2595,7 +2633,7 @@ def collect_agy_metrics(now=None, binary=_AGY_UNSET):
                 "resets_at": limit["resets_at"],
             })
         metrics.append({
-            "provider": AGY_PROVIDER, "account": AGY_ACCOUNT, "group": group["name"],
+            "provider": AGY_PROVIDER, "account": account, "group": group["name"],
             "limits": limits, "text": "\n".join(lines),
         })
     return metrics
@@ -3353,7 +3391,7 @@ def main(argv=None):
                 registry, config, credit_history=_codex_credit_history(config, _utc_now())
             )
             claude_value, codex_value = _usage_report_values(claude_metrics, codex_metrics)
-            embed = _usage_report_embed(claude_value, codex_value, _agy_report_values(collect_agy_metrics()))
+            embed = _usage_report_embed(claude_value, codex_value, _agy_report_values(collect_agy_metrics(registry=registry)))
             print("\n\n".join(f"## {field['name']}\n{field['value']}" for field in embed["fields"]))
             print("\n(dry run: nothing was posted or recorded)")
             return 0
@@ -3376,7 +3414,7 @@ def main(argv=None):
                 registry, config, credit_history=_codex_credit_history(config, _utc_now())
             )
             claude_value, codex_value = _usage_report_values(claude_metrics, codex_metrics)
-            agy_value = _agy_report_values(collect_agy_metrics())
+            agy_value = _agy_report_values(collect_agy_metrics(registry=registry))
             message_id = post_to_discord(config, bot_token, claude_value, codex_value, agy_value)
             print(f"Posted (message ID: {message_id})")
             return 0
@@ -3386,7 +3424,7 @@ def main(argv=None):
         codex_metrics = collect_codex_metrics(
             registry, config, now=now, credit_history=_codex_credit_history(config, now)
         )
-        agy_metrics = collect_agy_metrics(now=now)
+        agy_metrics = collect_agy_metrics(now=now, registry=registry)
         metrics = claude_metrics + codex_metrics + agy_metrics
         claude_value, codex_value = _usage_report_values(claude_metrics, codex_metrics)
         agy_value = _agy_report_values(agy_metrics)

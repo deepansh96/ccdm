@@ -7,7 +7,9 @@
 // discord-mcp-server.js and the Router to the fake Discord.
 //
 // It reads its script from <dir>/agy-plan.json and appends every event to
-// <dir>/agy.ndjson, where <dir> is CCDM_FAKE_AGY_DIR or CCDM_TEST_STATE:
+// <dir>/agy.ndjson, where <dir> is CCDM_FAKE_AGY_DIR or CCDM_TEST_STATE.
+// At start it logs its home and a `shell` event with the $HOME a zsh and a
+// bash command it runs would see. The script:
 //
 //   sessionIds   ids handed out by session/new, in order (else random UUIDs)
 //   turns        one entry per session/prompt across every agy process:
@@ -49,7 +51,19 @@ const readPlan = () => {
   }
 };
 
-log({ event: "spawn", argv: args, cwd: process.cwd() });
+log({ event: "spawn", argv: args, cwd: process.cwd(), home: os.homedir() });
+// The home the agent's shell commands would see, under zsh and bash.
+if (args[0] === "acp") {
+  const { execFileSync } = require("node:child_process");
+  const shellHome = (shell) => {
+    try {
+      return execFileSync(shell, ["-c", 'printf %s "$HOME"'], { encoding: "utf8", timeout: 5000 });
+    } catch (error) {
+      return `error: ${error.message}`;
+    }
+  };
+  log({ event: "shell", zsh: shellHome("/bin/zsh"), bash: shellHome("/bin/bash") });
+}
 if (args[0] !== "acp") {
   process.stderr.write(`fake agy supports only acp, not ${args.join(" ")}\n`);
   process.exit(2);
