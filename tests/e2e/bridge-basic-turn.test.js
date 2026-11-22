@@ -94,7 +94,7 @@ test("discord.js overlay exports the bridge surface and emits injected gateway m
       const { Client, GatewayIntentBits, Partials } = require("discord.js");
       if (!GatewayIntentBits.Guilds || !Partials.Message) throw new Error("missing discord shim exports");
       const client = new Client({ intents: [GatewayIntentBits.Guilds], partials: [Partials.Message] });
-      client.on("ready", () => console.log("ready:" + client.user.tag));
+      client.on("clientReady", () => console.log("ready:" + client.user.tag));
       client.on("messageCreate", async (msg) => {
         await msg.channel.sendTyping?.();
         console.log("message:" + msg.content);
