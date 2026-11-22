@@ -101,7 +101,7 @@ function createEmergencyGateway({ onMessage, primaryChannelId = null, markerFile
       const routed = classifyMessage(table, message);
       if (routed?.root && table.rootChannels.has(routed.event.channel_id)) onMessage(routed.event);
     });
-    const ready = new Promise(resolve => next.once("ready", resolve));
+    const ready = new Promise(resolve => next.once("clientReady", resolve));
     client = next;
     await next.login(token);
     await ready;

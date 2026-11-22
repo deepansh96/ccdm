@@ -398,7 +398,7 @@ Each provider keeps its login, configuration and saved conversations in a **home
 
 ### Claude homes
 
-A project's `claude_home` is the `CLAUDE_CONFIG_DIR` its session runs with. Log in to an extra home by running `claude` once with `CLAUDE_CONFIG_DIR` set to it. The top-level `claude_accounts` map (alias → Claude home) exists so a thread's `--account` or `/config account=` can name a home by alias; a thread without one uses the project's `claude_home`, then the default.
+A project's `claude_home` is the `CLAUDE_CONFIG_DIR` its session runs with. Log in to an extra home by running `claude` once with `CLAUDE_CONFIG_DIR` set to it. The top-level `claude_accounts` map (alias → Claude home) lets a thread's `--account` or `/config account=` name a home by alias, and names that home in the Usage Report; a thread without one uses the project's `claude_home`, then the default.
 
 ### Codex Accounts
 
@@ -811,7 +811,7 @@ Each post is one text embed, with no image. A provider section longer than one e
 
 - Limits come from Anthropic's OAuth APIs with the macOS Keychain credentials: the 5-hour session (absent on accounts that have none), the 7-day allowance for all models, and one 7-day row per model with its own weekly allowance (today `7-Day (Fable)`), each with its reset time. When a model row is shown, the all-models row reads `7-Day (all)`; otherwise it stays `7-Day`. History stores each model row as its own series.
 - Limit resets appear on one line, split by what each grant's `clears` list resets. A grant that clears the all-models 7-day limit, or the 5-hour session without any 7-day limit, is **general**. One that clears only a model-scoped weekly limit takes the model its bucket names (such as `seven_day_opus`), else the account's model-scoped row. Example: `Resets: **1** general (use within 24d 8h) · **3** Fable (use within 112d 18h)`. Each group has its own earliest use-by deadline. Paused, expired, used-up and unrecognised grants (including any without `clears`) are left out, and a group with none is omitted.
-- Accounts are discovered from the default `~/.claude` login and valid extra `~/.claude-*` config directories. The report labels `~/.claude` as **claude-p** and `~/.claude-<name>` as **claude-<name>** (for example **claude-work**). Each extra directory must have a `.claude.json` with an `oauthAccount`, which also records the email that home is logged in to.
+- Accounts are discovered from the default `~/.claude` login and valid extra `~/.claude-*` config directories. Each home is labelled by its alias in the registry's `claude_accounts` (alias → home); a home with no alias is labelled **claude** for `~/.claude` and **claude-<name>** for `~/.claude-<name>` (for example **claude-work**). Report history is keyed by that label, so renaming an alias starts a new history series. Each extra directory must have a `.claude.json` with an `oauthAccount`, which also records the email that home is logged in to.
 - Keychain lookup: a home's Keychain service is derived from the first eight hex characters of the SHA-256 hash of its config-directory path. The plain `Claude Code-credentials` item holds whichever account a session without `CLAUDE_CONFIG_DIR` last logged in to, so it can belong to any home. The poster tries a home's hashed item and the plain item, freshest first, and reports only a login whose profile email matches that home's `.claude.json`. When none matches, it shows that home's re-login command instead of another account's usage.
 
 **Claude API-key accounts** have no comparable percentage limit, so the report shows sanitized local estimates: Today and This month costs, request counts and status.
@@ -953,7 +953,7 @@ CCDM needs your machine to stay awake. If it sleeps, the Router and all tmux ses
 | `codex_accounts` | Codex Account Alias → Codex Home |
 | `default_codex_account` | The alias new Codex projects and root Codex use |
 | `codex_home` | Legacy Codex Home Override (a raw path); not allowed beside `default_codex_account` |
-| `claude_accounts` | Alias → Claude home, for thread `--account` |
+| `claude_accounts` | Alias → Claude home, for thread `--account` and Usage Report labels |
 | `gemini_accounts` | Alias → the home agy runs under |
 | `thread_session_caps` | Live thread sessions per provider; default `{"claude": 6, "codex": 8, "gemini": 4}`. An invalid value falls back to its default |
 | `projects` | Object keyed by project name |

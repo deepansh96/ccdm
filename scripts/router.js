@@ -90,7 +90,7 @@ async function serve() {
       GatewayIntentBits.GuildMessageReactions, GatewayIntentBits.MessageContent],
     partials: [Partials.Message, Partials.Reaction, Partials.User],
   });
-  const ready = new Promise(resolve => client.once("ready", resolve));
+  const ready = new Promise(resolve => client.once("clientReady", resolve));
   discord.client = client;
 
   const markOffline = (channelId, messageId) => discordRequest("PUT",

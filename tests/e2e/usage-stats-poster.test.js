@@ -247,7 +247,7 @@ test("poster posts a Claude usage embed through the configured Discord endpoint"
   assert.deepEqual(payload.embeds[0].fields, [
     {
       name: "Claude Code",
-      value: "**claude-p** (Pro)\n5-Hour: `[######.........]` **37%**\n7-Day: `[#########......]` **62%**\nExtra usage: **$12.50** spent",
+      value: "**claude** (Pro)\n5-Hour: `[######.........]` **37%**\n7-Day: `[#########......]` **62%**\nExtra usage: **$12.50** spent",
       inline: true,
     },
   ]);
@@ -392,7 +392,7 @@ test("poster refreshes a rejected Claude login once and retries", async () => {
   assert.deepEqual(nativeClaudeRuns(workspace).map((run) => [run.configDir, run.service]), [[null, "Claude Code-credentials"]]);
   assert.ok(!readState(workspace.stateDir).fixtures.security.credentials[defaultService]);
   const claudeValue = JSON.parse(api.requests.find((request) => request.method === "POST").body).embeds[0].fields[0].value;
-  assert.match(claudeValue, /^\*\*claude-p\*\* \(Pro\)\n5-Hour: /);
+  assert.match(claudeValue, /^\*\*claude\*\* \(Pro\)\n5-Hour: /);
 });
 
 test("poster keeps the expired-login notice when Claude Code cannot refresh it", async () => {
@@ -660,7 +660,7 @@ test("scheduled poster shows Claude 7-day usage for all models and for Fable, an
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const lines = postedClaudeValue(api).split("\n");
-  assert.equal(lines[0], "**claude-p** (Pro)");
+  assert.equal(lines[0], "**claude** (Pro)");
   assert.match(lines[1], /^5-Hour: `\[#######\.{8}\]` \*\*45%\*\*  resets in 3h \d+m$/);
   assert.match(lines[2], /^7-Day \(all\): `\[######\.{9}\]` \*\*39%\*\*  resets in 4d 4h$/);
   assert.match(lines[3], /^7-Day \(Fable\): `\[######\.{9}\]` \*\*40%\*\*  resets in 4d 4h$/);
@@ -701,7 +701,7 @@ test("poster shows a Max account's all-models and Fable weekly limits without a 
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const lines = postedClaudeValue(api).split("\n");
-  assert.equal(lines[0], "**claude-p** (Claude Max)");
+  assert.equal(lines[0], "**claude** (Claude Max)");
   assert.match(lines[1], /^7-Day \(all\): `\[############\.{3}\]` \*\*80%\*\*  resets in 2d 2h$/);
   assert.match(lines[2], /^7-Day \(Fable\): `\[#############\.{2}\]` \*\*89%\*\*  resets in 2d 2h$/);
   assert.equal(lines.length, 3);
@@ -1291,6 +1291,35 @@ test("missing Claude API config keeps the unavailable/manual status", () => {
   assert.match(result.note.lines.join("\n"), /Local usage unavailable/);
 });
 
+test("poster labels each Claude home with its claude_accounts alias, else claude / the folder name", async () => {
+  const workspace = createWorkspace();
+  const api = await startPosterApi();
+  const teamDir = path.join(workspace.homeDir, ".claude-team");
+  const otherDir = path.join(workspace.homeDir, ".claude-other");
+  for (const dir of [teamDir, otherDir]) {
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, ".claude.json"), `${JSON.stringify({ oauthAccount: { organizationName: "Fixture Org" } })}\n`);
+  }
+  seedPosterWorkspace(workspace, api.baseUrl);
+  // The default home and .claude-team have aliases (one written as an absolute
+  // path); .claude-other has none, and a malformed entry is ignored.
+  fs.writeFileSync(path.join(workspace.repoDir, "registry.json"), `${JSON.stringify({
+    claude_accounts: { "claude-main": "~/.claude", "claude-work": teamDir, "broken": 42 },
+    projects: {},
+  }, null, 2)}\n`);
+  const state = readState(workspace.stateDir);
+  for (const dir of [teamDir, otherDir]) state.fixtures.security.credentials[serviceFor(dir)] = { claudeAiOauth: { accessToken: "fixture-oauth-token" } };
+  writeState(state, workspace.stateDir);
+
+  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const claudeValue = JSON.parse(api.requests.find((request) => request.method === "POST").body).embeds[0].fields[0].value;
+  assert.deepEqual(claudeValue.split("\n\n").map((block) => block.split("\n")[0].replace(/^\*\*([^*]+)\*\*.*$/, "$1")), [
+    "claude-main", "claude-other", "claude-work",
+  ]);
+});
+
 test("poster discovers labeled extra Claude OAuth config directories with derived Keychain services", async () => {
   const workspace = createWorkspace();
   const api = await startPosterApi();
@@ -1328,7 +1357,7 @@ test("poster discovers labeled extra Claude OAuth config directories with derive
   const post = api.requests.find((request) => request.method === "POST");
   assert.ok(post);
   const claudeValue = JSON.parse(post.body).embeds[0].fields[0].value;
-  assert.match(claudeValue, /\*\*claude-p\*\* \(Pro\)/);
+  assert.match(claudeValue, /\*\*claude\*\* \(Pro\)/);
   assert.match(claudeValue, /\*\*claude-email\*\* \(Pro\)/);
   assert.match(claudeValue, /\*\*claude-organization\*\* \(Pro\)/);
   assert.deepEqual(
@@ -1388,7 +1417,7 @@ test("poster gives each Claude OAuth HTTP 401 an account-specific login action",
   const post = api.requests.find((request) => request.method === "POST");
   assert.ok(post);
   const claudeValue = JSON.parse(post.body).embeds[0].fields[0].value;
-  assert.match(claudeValue, /\*\*claude-p\*\*[\s\S]*Needs re-login: `CLAUDE_CONFIG_DIR=~\/\.claude claude \/login`/);
+  assert.match(claudeValue, /\*\*claude\*\*[\s\S]*Needs re-login: `CLAUDE_CONFIG_DIR=~\/\.claude claude \/login`/);
   assert.match(claudeValue, /\*\*claude-login\*\*[\s\S]*Needs re-login: `CLAUDE_CONFIG_DIR=~\/\.claude-login claude \/login`/);
   assert.match(claudeValue, /\*\*claude-refresh\*\*[\s\S]*Auth expired — start a session on this account to refresh/);
   assert.deepEqual(
@@ -1425,7 +1454,7 @@ test("poster reads a default-home login saved only in the hashed Keychain item",
     [hashedService]: { claudeAiOauth: { accessToken: "fixture-oauth-token" } },
   }));
 
-  assert.match(claudeValue, /\*\*claude-p\*\* \(Pro\)/);
+  assert.match(claudeValue, /\*\*claude\*\* \(Pro\)/);
   assert.deepEqual(oauthAuthorizations, ["Bearer fixture-oauth-token", "Bearer fixture-oauth-token"]);
 });
 
@@ -1442,7 +1471,7 @@ test("poster uses whichever default-home Keychain item expires last", async () =
     (hashedService) => ({ [hashedService]: fresh, "Claude Code-credentials": stale }),
   ]) {
     const { claudeValue, oauthAuthorizations } = await runPosterWithDefaultHomeCredentials(credentialsFor);
-    assert.match(claudeValue, /\*\*claude-p\*\* \(Pro\)/);
+    assert.match(claudeValue, /\*\*claude\*\* \(Pro\)/);
     assert.doesNotMatch(claudeValue, /expired/);
     assert.deepEqual(oauthAuthorizations, ["Bearer fixture-oauth-token", "Bearer fixture-oauth-token"]);
   }
@@ -1465,7 +1494,7 @@ test("poster falls back to the other unexpired Keychain item when the API reject
       claudeAiOauth: { accessToken: "fixture-oauth-token", expiresAt: Date.now() + 60 * 60 * 1000 },
     },
   }));
-  assert.match(fallback.claudeValue, /\*\*claude-p\*\* \(Pro\)/);
+  assert.match(fallback.claudeValue, /\*\*claude\*\* \(Pro\)/);
   assert.deepEqual(fallback.oauthAuthorizations, [
     "Bearer fixture-revoked-token",
     "Bearer fixture-oauth-token",
@@ -1479,7 +1508,7 @@ test("poster falls back to the other unexpired Keychain item when the API reject
       claudeAiOauth: { accessToken: "fixture-oauth-token", expiresAt: Date.now() - 60 * 60 * 1000 },
     },
   }));
-  assert.match(noFallback.claudeValue, /\*\*claude-p\*\*[\s\S]*Needs re-login: `CLAUDE_CONFIG_DIR=~\/\.claude claude \/login`/);
+  assert.match(noFallback.claudeValue, /\*\*claude\*\*[\s\S]*Needs re-login: `CLAUDE_CONFIG_DIR=~\/\.claude claude \/login`/);
   assert.deepEqual(noFallback.oauthAuthorizations, ["Bearer fixture-revoked-token"]);
 });
 
@@ -1513,7 +1542,7 @@ test("poster reports each Claude home only with a login that belongs to its acco
   const post = api.requests.find((request) => request.method === "POST");
   assert.ok(post);
   const claudeValue = JSON.parse(post.body).embeds[0].fields[0].value;
-  assert.match(claudeValue, /\*\*claude-p\*\* \(Pro\)\n5-Hour: `[^`]*` \*\*37%\*\*/);
+  assert.match(claudeValue, /\*\*claude\*\* \(Pro\)\n5-Hour: `[^`]*` \*\*37%\*\*/);
   assert.match(claudeValue, /\*\*claude-work\*\* \(Pro\)\n5-Hour: `[^`]*` \*\*5%\*\*/);
   // A home whose account has no readable login is never shown another account's usage.
   assert.match(claudeValue, /\*\*claude-other\*\*\n\*Needs re-login: `CLAUDE_CONFIG_DIR=~\/\.claude-other claude \/login`\*/);
@@ -1533,7 +1562,7 @@ test("poster uses N/A when the Claude organization value is malformed", async ()
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const post = api.requests.find((request) => request.method === "POST");
   assert.ok(post);
-  assert.match(JSON.parse(post.body).embeds[0].fields[0].value, /^\*\*claude-p\*\* \(N\/A\)/);
+  assert.match(JSON.parse(post.body).embeds[0].fields[0].value, /^\*\*claude\*\* \(N\/A\)/);
 });
 
 test("poster falls back when Codex JSON-RPC returns a non-object response", async () => {
@@ -2347,8 +2376,8 @@ test("poster splits long Claude sections into extra fields at account boundaries
   assert.ok(embed.fields.every(({ inline }) => inline === true));
   const blocks = embed.fields.flatMap(({ value }) => value.split("\n\n"));
   assert.doesNotMatch(blocks.join("\n"), /truncated/);
-  // claude-p first, then every API account, each block whole and in order.
-  assert.match(blocks[0], /^\*\*claude-p\*\* \(Pro\)/);
+  // The default home first, then every API account, each block whole and in order.
+  assert.match(blocks[0], /^\*\*claude\*\* \(Pro\)/);
   assert.deepEqual(
     blocks.slice(1).map((block) => block.match(/^\*\*Configured Claude API account (\d+) /)?.[1]),
     accounts.map((_, index) => String(index)),
@@ -2425,7 +2454,7 @@ test("poster shows every block of three Fable accounts and three busy API accoun
   const blocks = claudeFields.flatMap(({ value }) => value.split("\n\n"));
   assert.doesNotMatch(blocks.join("\n"), /truncated/);
   assert.deepEqual(blocks.map((block) => block.split("\n")[0].replace(/^\*\*([^*]+)\*\*.*$/, "$1")), [
-    "claude-p", "claude-af", "claude-iv", "claude-t4d-api", "claude-iv-api", "claude-p-api",
+    "claude", "claude-af", "claude-iv", "claude-t4d-api", "claude-iv-api", "claude-p-api",
   ]);
   for (const block of blocks.slice(0, 3)) {
     assert.deepEqual(block.split("\n").slice(1).map((line) => line.split(":")[0]), [
@@ -2566,7 +2595,7 @@ test("scheduled poster posts the original text report once per 30-minute slot wi
   assert.equal(dashboardPayload.embeds.length, 1);
   assert.equal(dashboardPayload.embeds[0].title, "Usage Report");
   assert.deepEqual(dashboardPayload.embeds[0].fields.map(({ name }) => name), ["Claude Code", "Codex"]);
-  assert.match(dashboardPayload.embeds[0].fields[0].value, /\*\*claude-p\*\* \(Pro\)/);
+  assert.match(dashboardPayload.embeds[0].fields[0].value, /\*\*claude\*\* \(Pro\)/);
   assert.match(dashboardPayload.embeds[0].fields[0].value, /5-Hour:/);
   assert.match(dashboardPayload.embeds[0].fields[0].value, /7-Day:/);
   assert.match(dashboardPayload.embeds[0].fields[1].value, /\*\*codex-scheduled\*\* \(ChatGPT\)/);
@@ -4192,7 +4221,7 @@ test("scheduled poster renders an Antigravity field beside Claude and records ag
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const embed = postedEmbed(api);
   assert.deepEqual(embed.fields.map(({ name }) => name), ["Claude Code", "Antigravity"]);
-  assert.match(embed.fields[0].value, /^\*\*claude-p\*\* \(Pro\)\n5-Hour: /);
+  assert.match(embed.fields[0].value, /^\*\*claude\*\* \(Pro\)\n5-Hour: /);
   assert.equal(embed.fields[1].value, AGY_EXPECTED_VALUE);
   assert.equal(embed.fields[1].inline, true);
   assertEmbedWithinDiscordLimits(embed);
@@ -4233,7 +4262,7 @@ test("dry run prints the report, including Antigravity, without a token, a post,
   });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  assert.match(result.stdout, /^## Claude Code\n\*\*claude-p\*\* \(Pro\)\n/);
+  assert.match(result.stdout, /^## Claude Code\n\*\*claude\*\* \(Pro\)\n/);
   assert.ok(result.stdout.includes(`\n\n## Antigravity\n${AGY_EXPECTED_VALUE}\n`), result.stdout);
   assert.match(result.stdout, /\(dry run: nothing was posted or recorded\)\n$/);
   assert.equal(api.requests.filter((request) => request.method === "POST").length, 0);
@@ -4261,7 +4290,7 @@ test("a missing agy degrades to one unavailable line, and a machine without agy 
   assert.deepEqual(posts[0].fields.map(({ name }) => name), ["Claude Code"]);
   for (const embed of posts.slice(1)) {
     assert.deepEqual(embed.fields.map(({ name }) => name), ["Claude Code", "Antigravity"]);
-    assert.match(embed.fields[0].value, /^\*\*claude-p\*\* \(Pro\)\n5-Hour: /);
+    assert.match(embed.fields[0].value, /^\*\*claude\*\* \(Pro\)\n5-Hour: /);
     assert.equal(embed.fields[1].value, "**agy**\n*Usage unavailable: agy not found*");
   }
 });

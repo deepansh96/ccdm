@@ -819,7 +819,7 @@ def cleanup_retired_now(project_root: Path, state_dir: Path, name: str) -> dict:
               "pending": pending_retired_cleanup(state_dir, name)}
     if result["pending"]:
         result["guidance"] = ("Retired cleanup could not run now. Start the worker, or run recover with the worker "
-                              "stopped, to retry it with the retired bot; or delete the listed messages in Discord.")
+                              "stopped, to retry it as root; or delete the listed messages in Discord.")
     return result
 
 
@@ -1144,8 +1144,8 @@ def status(state_dir: Path, project_root: Path | None = None) -> dict:
                                       "resend or reset state. Observation/history gaps remain a separate delivery gate."
                                       if unresolved else "No unresolved delivery intents."),
                 "retired_cleanup_guidance": ("Messages under retired_assignments[].cleanup.inaccessible could not be "
-                                             "deleted with the retired assignment's own bot. CCDM never borrows "
-                                             "another bot or widens permissions; delete them manually in Discord."
+                                             "deleted by root (it needs Manage Messages in that channel). CCDM never "
+                                             "widens permissions; delete them manually in Discord."
                                              if any(row["cleanup"]["inaccessible"] for row in retired) else None)}
     finally:
         db.close()
