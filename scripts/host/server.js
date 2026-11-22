@@ -63,9 +63,12 @@ function acquireHostLock(hostDir) {
       fd = fs.openSync(lockPath, "wx", 0o600);
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
-      const held = fs.readFileSync(lockPath, "utf8").trim().split(/\s+/);
+      const text = fs.readFileSync(lockPath, "utf8").trim();
+      const held = text.split(/\s+/);
       const holder = Number.parseInt(held[0], 10);
-      if (processAlive(holder, held[1] ?? null)) {
+      // An empty lock is one another daemon has created and not yet written.
+      const fresh = !text && Date.now() - fs.statSync(lockPath).mtimeMs < 5000;
+      if (fresh || processAlive(holder, held[1] ?? null)) {
         throw new Error(`another ccdm-host is already running (pid ${holder}); stop it before starting a new one`);
       }
       fs.rmSync(lockPath, { force: true });
@@ -100,12 +103,22 @@ function createHost({ hostDir, env = process.env, log = () => {}, keepAwake = nu
   const journalPath = path.join(hostDir, "sessions.json");
 
   // Runs at every change to the set of live sessions, so the keep-awake count
-  // follows the same moments as the journal.
+  // follows the same moments as the journal. A failure is logged, never thrown:
+  // it runs from session-end handlers, where a throw would end the daemon and
+  // every session with it.
   function writeJournal() {
     const live = [...sessions.values()].filter(session => session.exit === null && !session.released)
       .map(({ name, kind, pid, startedAt, created, pty, log: logFile }) => ({ name, kind, pid, startedAt, created, pty, log: logFile }));
-    keepAwake?.update(live);
-    writeFileAtomicSync(journalPath, `${JSON.stringify({ version: 1, sessions: live }, null, 2)}\n`);
+    try {
+      keepAwake?.update(live);
+    } catch (error) {
+      log(`keep-awake update failed: ${error.message}`);
+    }
+    try {
+      writeFileAtomicSync(journalPath, `${JSON.stringify({ version: 1, sessions: live }, null, 2)}\n`);
+    } catch (error) {
+      log(`could not write ${journalPath}: ${error.message}`);
+    }
   }
 
   const liveSession = name => {
@@ -277,6 +290,9 @@ function createHost({ hostDir, env = process.env, log = () => {}, keepAwake = nu
       }
     }
     await Promise.race([session.done, sleep(JOB_EXIT_WAIT_MS)]);
+    if (session.exit === null) log(`session ${session.name}: still running after kill-session; released anyway`);
+    // Attached clients go before the console does, so none of them uses it after.
+    if (session.viewers?.length) endViewers(session);
     session.released = true;
     session.tail = "";
     session.console = null;
@@ -485,6 +501,10 @@ async function serve({ allowInJob = false } = {}) {
   }
   const hostDir = path.join(stateRoot(), "host");
   const log = line => process.stdout.write(`ccdm-host: ${line}\n`);
+  // Every session's Job closes with this process, so an unexpected error is
+  // logged and the daemon keeps serving instead of taking them all down.
+  process.on("unhandledRejection", reason => log(`unhandled rejection: ${reason?.stack || reason}`));
+  process.on("uncaughtException", error => log(`uncaught exception: ${error?.stack || error}`));
   const host = createHost({ hostDir, log, keepAwake: keepAwakeFromEnv(process.env, log) });
   try {
     await host.start();

@@ -274,9 +274,8 @@ def _write_claude_launch_files(root: Path, files: _Files) -> None:
     # The official Discord plugin must not load beside the CCDM channel.
     settings: Dict[str, Any] = {"enabledPlugins": {"discord@claude-plugins-official": False}}
     if WIN32:
-        settings["statusLine"] = _launch.status_line_setting(root, _launch.effective_claude_home(""))
+        settings["statusLine"] = _launch.status_line_setting(root, _launch.effective_claude_home("", inherit=True))
     private_fs.write_private(files.settings, json.dumps(settings, indent=2) + "\n")
-    _write_fresh_key(files)
 
 
 def _claude_session_env(claude: Sequence[Any], files: _Files) -> Dict[str, str]:
@@ -316,7 +315,15 @@ def _restart_claude(args: argparse.Namespace) -> int:
         _complain("Root Claude Router launch preparation failed")
         return 1
 
+    # The key is replaced only once the old root is gone: a stop that fails
+    # leaves the running root its key, so a failed restart never leaves no root.
     _stop_running_root(files)
+    try:
+        _write_fresh_key(files)
+    except OSError as error:
+        _complain(str(error))
+        _complain("Root Claude Router launch preparation failed")
+        return 1
 
     program, leading, _ = claude
     argv = [
@@ -340,7 +347,7 @@ def _restart_claude(args: argparse.Namespace) -> int:
     try:
         dialogs = _launch.accept_dialogs(_ROOT_SESSION, str(root), str(root), deadline)
         _launch.wait_ready(_ROOT_SESSION, files.ready_file, deadline, dialogs, exited=exited)
-    except _launch.LaunchFailed as error:
+    except (_launch.LaunchFailed, session_host.SessionHostError) as error:
         _complain(_root_wording(str(error)))
         _complain("Root launch failed; cleaning up")
         try:
@@ -659,6 +666,10 @@ def _handler(args: argparse.Namespace) -> int:
         return _restart_codex(args) if args.provider == "codex" else _restart_claude(args)
     except _Refused as refusal:
         _complain(str(refusal))
+        return 1
+    except session_host.SessionHostError as error:
+        _complain(str(error))
+        _complain(f"The running root could not be stopped; {_launch.session_word()} '{_ROOT_SESSION}' was not restarted.")
         return 1
 
 

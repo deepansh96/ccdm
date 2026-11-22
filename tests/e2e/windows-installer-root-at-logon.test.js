@@ -341,7 +341,7 @@ test("on macOS and Linux install-service root-at-logon is refused and reaches no
 test("the macOS root LaunchAgent in the README and the restart-root-agent.sh shim are as they were", () => {
   const readme = fs.readFileSync(path.join(REPO, "README.md"), "utf8");
   assert.match(readme, /cat > ~\/Library\/LaunchAgents\/com\.claude\.root-agent\.plist/);
-  assert.match(readme, /The Launch Agent runs `restart-root-agent\.sh` on login/);
+  assert.match(readme, /<string>\/path\/to\/ccdm\/restart-root-agent\.sh<\/string>/);
   const shim = fs.readFileSync(path.join(REPO, "restart-root-agent.sh"), "utf8");
   assert.match(shim, /^exec "\$\(cd "\$\(dirname "\$0"\)" && pwd\)\/scripts\/ccdm" restart-root "\$@"$/m);
   assert.doesNotMatch(shim, /root-at-logon/);

@@ -59,7 +59,9 @@ function resolveProgram(program, env, cwd) {
   const directories = path.basename(program) === program
     ? (env[pathKey] ?? "").split(";").filter(Boolean)
     : [cwd];
-  const names = path.extname(program) ? [program] : [program, `${program}.exe`];
+  // program.exe first: npm puts an extensionless sh script beside each .cmd,
+  // which CreateProcess cannot run (error 193).
+  const names = path.extname(program) ? [program] : [`${program}.exe`, program];
   for (const directory of directories) {
     for (const name of names) {
       const candidate = path.resolve(directory, name);

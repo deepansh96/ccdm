@@ -380,10 +380,17 @@ function sweepOldTmpDirs(root, prefix) {
 
 // A fresh private directory. Windows' temp directory is shared with what the user
 // runs, so there it lives under <stateRoot>/tmp.
+// The root is made private once per process, and again only if it is gone; the
+// Router calls this for every large read, and each icacls run blocks its loop.
+const privateTmpRoots = new Set();
+
 function privateTmpDir(prefix) {
   if (!WIN32) return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   const root = path.join(stateRoot(), "tmp");
-  ensurePrivateDirSync(root);
+  if (!privateTmpRoots.has(root) || !fs.existsSync(root)) {
+    ensurePrivateDirSync(root);
+    privateTmpRoots.add(root);
+  }
   sweepOldTmpDirs(root, prefix);
   const dir = fs.mkdtempSync(path.join(root, prefix));
   ensurePrivateDirSync(dir);

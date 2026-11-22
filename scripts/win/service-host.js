@@ -171,6 +171,17 @@ function requestDaemonStop(child, logs) {
   }
 }
 
+// A lock younger than this with no holder written yet is still being taken.
+const FRESH_LOCK_MS = 5000;
+
+function lockIsFresh(file) {
+  try {
+    return Date.now() - fs.statSync(file).mtimeMs < FRESH_LOCK_MS;
+  } catch {
+    return false;
+  }
+}
+
 function acquireLock(file) {
   const content = () => {
     const { pid, startedAt } = processIdentity();
@@ -188,6 +199,8 @@ function acquireLock(file) {
       } catch {
         continue;
       }
+      // An empty lock is one another host has created and not yet written.
+      if (!holder && lockIsFresh(file)) return null;
       const [pid, startedAt] = holder.split(/\s+/);
       if (processAlive(Number.parseInt(pid, 10), startedAt ?? null)) return null;
       fs.rmSync(file, { force: true });
@@ -212,11 +225,21 @@ function hostPaths(config) {
   };
 }
 
+// A periodic run's task ignores a new start while one runs, so a run that hangs
+// would block every later one. Task Scheduler's own limit would end only the
+// conhost above this host, so the host ends the run's tree itself.
+const ONCE_LIMIT_MS = Number(process.env.CCDM_SERVICE_ONCE_LIMIT_MS) || 30 * 60 * 1000;
+
 async function runOnce(config) {
   const paths = hostPaths(config);
   const logs = { out: createRotatingLog(paths.log), err: createRotatingLog(paths.err) };
-  const { exited } = startDaemon(config, logs);
+  const { child, exited } = startDaemon(config, logs);
+  const limit = setTimeout(() => {
+    logs.err.write(`service-host: the run passed ${ONCE_LIMIT_MS / 1000} s; ending it\n`);
+    killTree(child).catch(() => {});
+  }, ONCE_LIMIT_MS);
   const code = await exited;
+  clearTimeout(limit);
   logs.out.close();
   logs.err.close();
   return code;

@@ -62,8 +62,8 @@ function keyList(keys) {
 
 const shellQuote = value => `'${String(value).replace(/'/g, "'\\''")}'`;
 
-// Today's launch strings quote every value but leave these two words bare.
-const BARE_WORDS = new Set(["server:ccdm", "scripts/codex-bridge.js"]);
+// Today's launch strings quote every value but leave these words bare.
+const BARE_WORDS = new Set(["server:ccdm", "scripts/codex-bridge.js", "scripts/gemini-bridge.js"]);
 const BARE_PROGRAM = /^[A-Za-z0-9_./-]+$/;
 const BARE_FLAG = /^--?[A-Za-z0-9-]+$/;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;

@@ -187,11 +187,11 @@ def _claude_argv(claude: Sequence[Any], project: _Project, launch: _Launch, resu
 
 def _session_env(claude: Sequence[Any], project: _Project, launch: _Launch, reminder_env: Dict[str, str]) -> Dict[str, str]:
     env = {"CCDM_ROUTER_KEY_FILE": launch.key_file, **reminder_env}
+    # No claude_home is the default home. ccdm-host builds the session's
+    # environment from nothing but this, so the caller's own CLAUDE_CONFIG_DIR
+    # (root's account, say) never decides a project's account.
     if project.claude_home:
         env["CLAUDE_CONFIG_DIR"] = project.claude_home
-    elif session_host.backend_name() != "tmux" and os.environ.get("CLAUDE_CONFIG_DIR"):
-        # ccdm-host builds the session's environment from nothing but this.
-        env["CLAUDE_CONFIG_DIR"] = os.environ["CLAUDE_CONFIG_DIR"]
     if session_host.backend_name() != "tmux":
         # The session's channel server finds this same host for /restart and the relay.
         env.update({name: os.environ[name] for name in _HOST_VARIABLES if os.environ.get(name)})
@@ -287,7 +287,9 @@ def _start(project_name: str, resume: str, project: _Project, root: Path, regist
     try:
         dialogs = _launch.accept_dialogs(name, project.path, project.path, deadline)
         outcome = _launch.wait_ready(name, launch.ready_file, deadline, dialogs)
-    except _launch.LaunchFailed as error:
+    except (_launch.LaunchFailed, session_host.SessionHostError) as error:
+        # A host that stops answering mid-launch is a failed launch too: the
+        # session, its key and its launch files go, so the next start is clean.
         print(str(error), file=sys.stderr, flush=True)
         _cleanup_failed_launch(project_name, launch, name)
         return 1

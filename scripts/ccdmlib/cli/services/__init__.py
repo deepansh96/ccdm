@@ -62,6 +62,8 @@ _DEFAULT_WAIT_SECONDS = 30.0
 _POLL_SECONDS = 0.25
 _SCHTASKS_TIMEOUT_SECONDS = 60
 _RUNNING_STATUS = "running"
+# How long a fresh install watches its daemon for an immediate failure.
+_SETTLE_SECONDS = 2.0
 _LIVE_STATES = ("running", "backoff", "crashloop")
 _PLACEHOLDER = re.compile(r"__[A-Z_]+__")
 
@@ -302,6 +304,22 @@ def _wait_running(context: Context, since: float) -> bool:
     return False
 
 
+def _failed_at_once(context: Context, since: float) -> Optional[str]:
+    """The state a daemon reached if it ended or failed within a moment of its
+    start (Task Scheduler reports the task running as soon as its conhost is)."""
+    deadline = time.monotonic() + min(_SETTLE_SECONDS, _wait_seconds())
+    while time.monotonic() < deadline:
+        state = _read_state(context)
+        try:
+            fresh = context.state_file.stat().st_mtime >= since
+        except OSError:
+            fresh = False
+        if state and fresh and state.get("state") not in ("running", None):
+            return str(state.get("state"))
+        time.sleep(_POLL_SECONDS)
+    return None
+
+
 # Rendering.
 
 
@@ -481,6 +499,9 @@ def _install_windows(name: str, options: Sequence[str]) -> int:
         return roll_back(f"schtasks could not start the task: {_decode(started.stderr).strip()}")
     if not _wait_running(context, started_at):
         return roll_back(f"task {context.task} did not reach running")
+    failed = _failed_at_once(context, started_at)
+    if failed:
+        return roll_back(f"task {context.task} started, but its daemon went to {failed} at once; see {context.err}")
     print(f"Task {context.task} installed and running")
     print(f"State directory: {context.service_dir}")
     print(f"Standard output log: {context.log}")

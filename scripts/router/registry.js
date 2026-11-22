@@ -384,6 +384,9 @@ async function commitRegistry(file, registry) {
     `.${path.basename(file)}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`);
   const handle = await open(temporary, "wx", mode);
   try {
+    // Private before it holds anything: Windows ignores the mode above, and
+    // the new file would take its directory's access.
+    await makeFilePrivate(temporary);
     try {
       await handle.writeFile(`${JSON.stringify(registry, null, 2)}\n`);
       await handle.sync();
@@ -391,8 +394,6 @@ async function commitRegistry(file, registry) {
       await handle.close();
     }
     await chmod(temporary, mode);
-    // Windows ignores the mode above; the new file would take its directory's access.
-    await makeFilePrivate(temporary);
     await testHold();
     await renameWithRetry(temporary, file, { budgetMs: COMMIT_BUDGET_MS });
   } catch (error) {

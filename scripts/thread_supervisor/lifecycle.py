@@ -229,7 +229,8 @@ def _end_windows_listeners(thread_id: str) -> None:
             return
         if time.monotonic() >= deadline:
             pids = " ".join(str(pid) for pid, _ in remaining)
-            return _log(f"thread {thread_id}: process(es) still carry its key file after the stop: {pids}")
+            return _log(f"thread {thread_id}: process(es) still carry its key file after the stop: {pids}; "
+                        f"its next boot is refused until they end (retry: threads stop {thread_id})")
         for pid, started in remaining:
             proc.kill_tree(pid, 0.0, started_at=started)
         time.sleep(0.1)

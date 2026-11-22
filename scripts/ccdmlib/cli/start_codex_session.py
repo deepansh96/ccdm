@@ -295,9 +295,8 @@ def _router_state_dir() -> str:
     configured = os.environ.get("CCDM_ROUTER_STATE_DIR")
     if configured:
         return configured
-    if WIN32:
-        return str(state_root() / "router")
-    return f"{os.environ.get('HOME', '')}/.local/state/ccdm/router"
+    # CCDM_STATE_ROOT moves it on every OS, as it does for the Router and stop-session.
+    return str(state_root() / "router")
 
 
 def _write_launch_key(project: str, router_state: str, launch_dir: str, key_file: str) -> None:

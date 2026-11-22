@@ -22,8 +22,9 @@ function leave(viewer) {
   session.viewers.splice(session.viewers.indexOf(viewer), 1);
   if (!viewer.size || session.exit !== null) return;
   const remaining = session.viewers.findLast(other => other.size);
-  if (remaining) session.console.resize(...remaining.size);
-  else session.console.resetSize();
+  // A released session has no console left to size.
+  if (remaining) session.console?.resize(...remaining.size);
+  else session.console?.resetSize();
 }
 
 function resize(viewer, size) {
@@ -32,7 +33,7 @@ function resize(viewer, size) {
   // The end of the list is the last writer, which matters when this one leaves.
   session.viewers.splice(session.viewers.indexOf(viewer), 1);
   session.viewers.push(viewer);
-  session.console.resize(...size);
+  session.console?.resize(...size);
 }
 
 function onStreamFrame(viewer, frame) {
@@ -41,7 +42,7 @@ function onStreamFrame(viewer, frame) {
     return;
   }
   if (viewer.readOnly || viewer.session.exit !== null) return;
-  if (typeof frame.in === "string") viewer.session.console.send([frame.in], true);
+  if (typeof frame.in === "string") viewer.session.console?.send([frame.in], true);
   else if (validSize(frame.resize)) resize(viewer, frame.resize);
 }
 

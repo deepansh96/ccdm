@@ -217,9 +217,8 @@ class _ThreadLaunch:
         # The default home leaves CLAUDE_CONFIG_DIR unset, as Claude's own default.
         config_dir = self._expand(home) if home else ""
         default_home = os.path.join(self._home_dir(), ".claude")
-        if not self.on_tmux and not config_dir and self.env.get("CLAUDE_CONFIG_DIR"):
-            # ccdm-host builds the session's environment from nothing but the launch's.
-            config_dir = default_home = self._expand(self.env["CLAUDE_CONFIG_DIR"])
+        # On ccdm-host the session starts from a clean environment, so no alias
+        # and no claude_home is ~/.claude, never the supervisor's own home.
         self.claude_home = config_dir or default_home
         # A resumed conversation stays in the home it started in.
         override = self.home_override

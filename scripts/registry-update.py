@@ -285,13 +285,14 @@ def _commit(registry_path: Path, registry: dict) -> None:
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as target:
+            # Private before it holds anything: Windows ignores the mode above,
+            # and the new file would take its directory's access.
+            private_fs.make_file_private(temporary)
             json.dump(registry, target, indent=2)
             target.write("\n")
             target.flush()
             os.fsync(target.fileno())
         os.chmod(temporary, mode)
-        # Windows ignores the mode above; the new file would take its directory's access.
-        private_fs.make_file_private(temporary)
         _test_hold()
         atomic.replace_with_retry(temporary, registry_path, COMMIT_BUDGET_MS)
     except BaseException:

@@ -99,8 +99,8 @@ def _shell_quote(value: str) -> str:
     return "'" + str(value).replace("'", "'\\''") + "'"
 
 
-# Today's launch strings quote every value but leave these two words bare.
-_BARE_WORDS = frozenset(("server:ccdm", "scripts/codex-bridge.js"))
+# Today's launch strings quote every value but leave these words bare.
+_BARE_WORDS = frozenset(("server:ccdm", "scripts/codex-bridge.js", "scripts/gemini-bridge.js"))
 _BARE_PROGRAM = re.compile(r"^[A-Za-z0-9_./-]+$")
 _BARE_FLAG = re.compile(r"^--?[A-Za-z0-9-]+$")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")

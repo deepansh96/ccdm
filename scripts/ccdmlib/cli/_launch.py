@@ -119,9 +119,19 @@ def expand_path(value: str) -> str:
     return os.path.normpath(expanded) if WIN32 else expanded
 
 
-def effective_claude_home(claude_home: str) -> str:
-    """The folder Claude uses: the project's ``claude_home``, ``CLAUDE_CONFIG_DIR``, or ``~/.claude``."""
-    return expand_path(claude_home or os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(str(Path.home()), ".claude"))
+def effective_claude_home(claude_home: str, inherit: Optional[bool] = None) -> str:
+    """The folder Claude uses: the project's ``claude_home``, else the inherited
+    ``CLAUDE_CONFIG_DIR``, else ``~/.claude``.
+
+    A tmux session inherits the caller's ``CLAUDE_CONFIG_DIR``; a ccdm-host
+    session starts from a clean environment, so a project with no
+    ``claude_home`` runs on ``~/.claude`` whoever starts it. ``inherit``
+    overrides that, for root, which keeps the home it was started with.
+    """
+    if inherit is None:
+        inherit = session_host.backend_name() == "tmux"
+    inherited = os.environ.get("CLAUDE_CONFIG_DIR") if inherit else None
+    return expand_path(claude_home or inherited or os.path.join(str(Path.home()), ".claude"))
 
 
 def transcript_paths(claude_home: str, cwd: str, session_id: str) -> List[str]:
@@ -483,17 +493,39 @@ def listener_pids(key_file: str, launch_dir: Optional[str] = None) -> List[int]:
     return found
 
 
+# The start time each Windows listener had when its command line was read, so a
+# later kill reaches that process and never one that took its PID since.
+_VERIFIED_STARTS: Dict[int, str] = {}
+
+
+def _verified_command_line(pid: int) -> Tuple[Optional[str], List[str]]:
+    """The start time and arguments of one process, read so both are the same process's."""
+    started = proc.start_time(pid)
+    if started is None:
+        return None, []
+    try:
+        argv = proc.command_line(pid)
+    except OSError:
+        return None, []
+    if argv is None or proc.start_time(pid) != started:
+        return None, []
+    return started, list(argv)
+
+
 def _win32_listener_pids(key_file: str, launch_dir: Optional[str]) -> List[int]:
     own = os.getpid()
     mcp_config = os.path.join(launch_dir, "mcp.json") if launch_dir else None
     found = []
     for row in proc.find(lambda process: process.pid != own):
-        argv = proc.command_line(row.pid) or []
+        started, argv = _verified_command_line(row.pid)
+        if started is None:
+            continue
         key = _argument_after(argv, _KEY_FILE_FLAG)
         config = _argument_after(argv, _MCP_CONFIG_FLAG)
         if (key is not None and paths.same_path(key, key_file)) or (
             mcp_config is not None and config is not None and paths.same_path(config, mcp_config)
         ):
+            _VERIFIED_STARTS[row.pid] = started
             found.append(row.pid)
     return found
 
@@ -503,8 +535,10 @@ def stop_listeners(pids: List[int]) -> None:
     for pid in pids:
         try:
             if WIN32:
-                # Each PID was verified by its command line just now.
-                proc.kill_tree(pid, started_at=proc.start_time(pid))
+                # Only a PID verified by its command line, as the same process it was then.
+                started = _VERIFIED_STARTS.pop(pid, None)
+                if started is not None:
+                    proc.kill_tree(pid, started_at=started)
             else:
                 os.kill(pid, signal.SIGTERM)
         except OSError:

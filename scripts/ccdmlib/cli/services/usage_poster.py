@@ -86,7 +86,7 @@ def _check_poster_config(python: str) -> None:
 
 
 def _task_path(tools: Sequence[Dict]) -> str:
-    system_root = os.environ.get("SystemRoot") or "C:\Windows"
+    system_root = os.environ.get("SystemRoot") or r"C:\Windows"
     directories: List[str] = []
     for directory in (*(os.path.dirname(tool["command"]) for tool in tools), os.path.join(system_root, "System32"), system_root):
         if directory not in directories:

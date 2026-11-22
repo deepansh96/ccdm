@@ -144,6 +144,11 @@ def stop_thread(context, row) -> dict:
     running = row["state"] in ("booting", "live", "queued")
     if running:
         _operator_stop(context, row)
+    elif lifecycle.session_running(row["thread_id"]):
+        # A stopped thread whose processes survived an earlier stop: end them,
+        # so a retried stop frees the thread for its next boot.
+        lifecycle.stop_session(context, row)
+        running = True
     return _summary(context, row["thread_id"], stopped=running)
 
 

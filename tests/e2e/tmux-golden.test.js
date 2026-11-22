@@ -105,8 +105,10 @@ test("the six launchers issue today's exact tmux new-session strings", platformG
     const result = await runScript(workspace, launcher.script, { args: launcher.args, env: routerEnv(workspace, launcher.env?.(port) ?? {}), timeoutMs: 30000 });
     const calls = tmuxCalls(workspace).slice(before).filter(args => args[0] === "new-session");
     assert.equal(calls.length, 1, `${launcher.key} issued ${calls.length} new-session calls: ${result.stderr || result.stdout}`);
-    const [, , , name, separator, shell, flag, command] = calls[0];
-    assert.deepEqual([calls[0][0], calls[0][1], calls[0][2], name, separator, shell, flag], ["new-session", "-d", "-s", launcher.session, "--", "zsh", "-ic"]);
+    const [, , , name, separator, ...wrapper] = calls[0];
+    const command = wrapper.pop();
+    assert.deepEqual([calls[0][0], calls[0][1], calls[0][2], name, separator, ...wrapper],
+      ["new-session", "-d", "-s", launcher.session, "--", "env", "DISABLE_AUTO_UPDATE=true", "DISABLE_UPDATE_PROMPT=true", "zsh", "-ic"]);
     seen[launcher.key] = withoutSessionName(normalized(workspace, command), launcher.session);
   }
   assert.deepEqual(seen, GOLDEN);
