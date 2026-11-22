@@ -264,7 +264,9 @@ class Client extends EventEmitter {
         state.fixtures.discord.ready.push({ tag: this.user.tag });
       });
       this._ready = true;
+      // discord.js 14.22+ emits both names; v15 drops `ready`.
       this.emit("ready");
+      this.emit("clientReady");
       this._startPolling();
     }, delay);
     return Promise.resolve(token);

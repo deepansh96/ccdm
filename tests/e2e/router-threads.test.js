@@ -130,7 +130,7 @@ test("the Gateway shim exposes thread channels and emits thread and shard lifecy
     client.on('shardResume', () => events.push(['resume']));
     const done = new Promise(resolve => client.on('shardReady', () => { events.push(['ready']); resolve(); }));
     const keepAlive = setTimeout(() => { throw new Error('Missing Gateway events'); }, 2000);
-    const ready = new Promise(resolve => client.once('ready', resolve));
+    const ready = new Promise(resolve => client.once('clientReady', resolve));
     await client.login('root-bot-token');
     // As with discord.js, a thread channel resolves only once the gateway is ready.
     await ready;
