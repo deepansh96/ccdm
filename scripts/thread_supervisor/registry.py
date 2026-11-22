@@ -38,9 +38,7 @@ def guests(registry: dict, name: str) -> list[str]:
 
 
 def accounts(registry: dict, provider: str) -> dict:
-    """A provider's account aliases: `claude_accounts` or `codex_accounts` (Gemini has none)."""
-    if provider == "gemini":
-        return {}
+    """A provider's account aliases: `claude_accounts`, `codex_accounts` or `gemini_accounts`."""
     values = registry.get(f"{provider}_accounts")
     return values if isinstance(values, dict) else {}
 

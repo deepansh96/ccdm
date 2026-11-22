@@ -23,9 +23,12 @@ the place of the project's ``codex_account`` in ``resolve-codex-home.py``, and i
 provider conversation id is the Codex thread uuid.
 
 A Gemini thread runs ``gemini-bridge.js`` in thread mode, driving its own ``agy
-acp`` over stdio (no port). Gemini has no account aliases; its provider
-conversation id is the agy session id, and its home is agy's data directory,
-``~/.gemini/antigravity-cli``.
+acp`` over stdio (no port). Its account alias (a ``gemini_accounts`` home, see
+``ccdmlib/gemini_home.py``) takes the place of the project's ``gemini_account``;
+agy runs with that home as ``HOME`` (``CCDM_AGY_HOME``). Its provider
+conversation id is the agy session id, and its provider home is agy's data
+directory under that home, ``<home>/.gemini/antigravity-cli``. Windows refuses
+an account home that is not the user's own.
 
 ``--resume`` continues the thread's provider conversation (``claude --resume``, or
 the bridge's Codex thread uuid or agy session id) in the same home and cwd. ``--home`` names that
@@ -52,6 +55,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, TextIO, Tuple
 from uuid import uuid4
 
+from .. import gemini_home
 from ..platform import atomic, exe, hooks, paths, private_fs, proc, session_host
 from . import _launch
 from .start_codex_session import _FORWARDED_ON_WINDOWS, _KEY_FILE_FLAG, _names_key_file, _program
@@ -251,8 +255,6 @@ class _ThreadLaunch:
 
     def _read_gemini_settings(self, registry: Mapping[str, Any]) -> None:
         entry = registry["projects"][self.project]
-        if self.account:
-            raise _Refused(f"Gemini has no account aliases (got '{self.account}')")
         own_model = entry.get("model") if entry.get("type") == "gemini" else None
         self.model = self.options.get("--model") or entry.get("gemini_model") or own_model or ""
         if self.model and not _GEMINI_MODEL.fullmatch(self.model):
@@ -261,7 +263,26 @@ class _ThreadLaunch:
         if self.effort and self.effort not in _GEMINI_EFFORTS:
             raise _Refused(f"Invalid effort '{self.effort}' (expected low, medium, high, or xhigh)")
         self.text_reply_fallback_off = entry.get("text_reply_fallback") is False
-        self.gemini_home = self.home_override or os.path.join(self._home_dir(), ".gemini", "antigravity-cli")
+        self.agy_home = self._resolve_agy_home(registry)
+        self.gemini_home = gemini_home.data_dir(self.agy_home)
+
+    def _resolve_agy_home(self, registry: Mapping[str, Any]) -> str:
+        if self.home_override:
+            # A resumed conversation stays in the agy data directory it started in.
+            data_dir = os.path.normpath(self.home_override)
+            parent, leaf = os.path.split(data_dir)
+            if leaf != "antigravity-cli" or os.path.basename(parent) != ".gemini":
+                raise _Refused(f"The conversation's home {self.home_override} is not an agy data directory "
+                               "(<home>/.gemini/antigravity-cli)")
+            home = os.path.dirname(parent)
+            if WIN32 and os.path.normcase(home) != os.path.normcase(gemini_home.user_home()):
+                raise _Refused(f"The conversation's home {self.home_override} is not under your own home; "
+                               "agy on Windows runs only under the account it is signed in with")
+            return home
+        try:
+            return gemini_home.resolve(dict(registry), self.project, self.account or None)
+        except gemini_home.GeminiHomeError as error:
+            raise _Refused(str(error)) from None
 
     def _resolve_codex_home(self) -> str:
         resolver = self.root / "scripts" / "resolve-codex-home.py"
@@ -548,6 +569,7 @@ class _ThreadLaunch:
             "CCDM_CHANNEL_READY_FILE": str(launch / "ready.json"),
             "CHANNEL_ID": self.thread_id,
             "PROJECT_DIR": self.path_dir,
+            "CCDM_AGY_HOME": self.agy_home,
             "CCDM_THREAD_ID": self.thread_id,
             "CCDM_THREAD_PROVIDER": "gemini",
             "CCDM_THREAD_BOOTSTRAP_FILE": self.bootstrap_file,

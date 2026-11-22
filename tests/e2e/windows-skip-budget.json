@@ -1,5 +1,5 @@
 {
-  "budget": 141,
+  "budget": 146,
   "skips": [
     {
       "file": "codex-start.test.js",
@@ -870,6 +870,53 @@
     {
       "file": "usage-stats-poster.test.js",
       "test": "a long Antigravity section continues in extra fields and keeps the embed within Discord limits",
+      "tag": "posix",
+      "category": "gap",
+      "reason": "the Antigravity quota tests drive a POSIX shell fake agy and its process group; a Windows fake agy is not written yet"
+    },
+    {
+      "file": "gemini-session.test.js",
+      "test": "a project's gemini_account runs agy under that account's home, with the real home kept for its shells",
+      "tag": "posix",
+      "category": "posix-pair",
+      "reason": "agy on Windows does not take its account from HOME, so an account home other than the user's own is refused there",
+      "windows_test": {
+        "file": "gemini-session.test.js",
+        "test": "Windows refuses a gemini_account whose home is not the user's own, before launching"
+      }
+    },
+    {
+      "file": "gemini-session.test.js",
+      "test": "a Router migration resumes a Gemini project's conversation from its gemini_account's home",
+      "tag": "posix",
+      "category": "posix-pair",
+      "reason": "agy on Windows does not take its account from HOME, so an account home other than the user's own is refused there",
+      "windows_test": {
+        "file": "gemini-session.test.js",
+        "test": "Windows refuses a gemini_account whose home is not the user's own, before launching"
+      }
+    },
+    {
+      "file": "gemini-session.test.js",
+      "test": "a Gemini account session refuses a bash agy wrapper, which would hand agy the real home back",
+      "tag": "posix",
+      "category": "posix-only-behaviour",
+      "reason": "drives a bash agy wrapper, which Windows cannot run"
+    },
+    {
+      "file": "thread-gemini-session.test.js",
+      "test": "a Gemini thread with --account runs agy under that account's home, resumes there, and /model names it",
+      "tag": "posix",
+      "category": "posix-pair",
+      "reason": "agy on Windows does not take its account from HOME, so an account home other than the user's own is refused there",
+      "windows_test": {
+        "file": "gemini-session.test.js",
+        "test": "Windows refuses a gemini_account whose home is not the user's own, before launching"
+      }
+    },
+    {
+      "file": "usage-stats-poster.test.js",
+      "test": "each Gemini account gets its own Antigravity blocks, asked with its home as HOME",
       "tag": "posix",
       "category": "gap",
       "reason": "the Antigravity quota tests drive a POSIX shell fake agy and its process group; a Windows fake agy is not written yet"

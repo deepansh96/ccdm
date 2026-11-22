@@ -4382,3 +4382,50 @@ test("a long Antigravity section continues in extra fields and keeps the embed w
   const crowdedNames = result.crowded.fields.map(({ name: fieldName }) => fieldName);
   for (const provider of ["Claude Code", "Codex", "Antigravity"]) assert.ok(crowdedNames.includes(provider), provider);
 });
+
+test("each Gemini account gets its own Antigravity blocks, asked with its home as HOME", AGY_POSIX, () => {
+  const dir = tempAgyDir();
+  const home = path.join(dir, "home");
+  const workHome = path.join(dir, "agy-work");
+  fs.mkdirSync(home);
+  fs.mkdirSync(workHome);
+  const fixture = path.resolve(AGY_FIXTURE);
+  // The user's own agy answers with the fixture; the work account is signed out.
+  const agy = writeFakeAgy(dir, [
+    `echo "$HOME" >> "${path.join(dir, "homes.txt")}"`,
+    `if [ "$HOME" = "${workHome}" ]; then echo 'Error: not signed in' >&2; exit 1; fi`,
+    `exec /bin/cat "${fixture}"`,
+  ].join("\n"));
+  const probe = probePosterTimed(60000, [
+    "import json, os",
+    "from datetime import datetime, timezone",
+    "from pathlib import Path",
+    "os.environ['HOME'] = sys.argv[3]",
+    "now = datetime(2026, 11, 21, 7, 52, tzinfo=timezone.utc)",
+    "def texts(registry):",
+    "    return [m['text'] for m in poster.collect_agy_metrics(now=now, binary=Path(sys.argv[2]), registry=registry)]",
+    "print(json.dumps({",
+    "    'two': texts({'gemini_accounts': {'agy-main': '~', 'agy-work': sys.argv[4], 'agy-gone': sys.argv[4] + '-gone',",
+    "                                      'agy-same': sys.argv[4] + '/'}}),",
+    "    'unnamed_main': [t.split('\\n')[0] for t in texts({'gemini_accounts': {'agy-work': sys.argv[4]}})],",
+    "    'none': [t.split('\\n')[0] for t in texts({})],",
+    "    'collide': [n for n, _ in poster.discover_agy_accounts({'gemini_accounts': {'agy_work': sys.argv[4], 'agywork': sys.argv[4] + '-b', 'agy': sys.argv[4] + '-c'}})],",
+    "}))",
+  ].join("\n"), agy, home, workHome);
+  assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+  const out = JSON.parse(probe.stdout);
+  assert.deepEqual(out.two, [
+    "**agy-main · Gemini Models**\n5-Hour: `[############...]` **82%**  resets in 4h 40m\nWeekly: `[######.........]` **38%**  resets in 6d 23h",
+    "**agy-main · Claude and GPT models**\n5-Hour: `[...............]` **0%**\nWeekly: `[##.............]` **10%**  resets in 6d 23h",
+    "**agy-main · Gemini 4 Argon**\nWeekly: `[####...........]` **25%**  resets in 6d 23h",
+    "**agy-work**\n*Usage unavailable: sign-in required (run agy to sign in)*",
+    "**agy-gone**\n*Usage unavailable: account home missing*",
+  ]);
+  // Without an alias for the user's own home it stays `agy`; with one account the groups are not prefixed.
+  assert.deepEqual(out.unnamed_main, ["**agy · Gemini Models**", "**agy · Claude and GPT models**", "**agy · Gemini 4 Argon**", "**agy-work**"]);
+  assert.deepEqual(out.none, ["**Gemini Models**", "**Claude and GPT models**", "**Gemini 4 Argon**"]);
+  // Aliases that clean to one name stay apart.
+  assert.deepEqual(out.collide, ["agy", "agywork", "agywork 2", "agy 2"]);
+  // The same home under two aliases is asked once.
+  assert.deepEqual(fs.readFileSync(path.join(dir, "homes.txt"), "utf8").trim().split("\n"), [home, workHome, home, workHome, home]);
+});

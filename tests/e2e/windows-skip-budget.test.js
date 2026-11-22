@@ -135,8 +135,8 @@ test("the budget is exactly the number of tests skipped on Windows", async () =>
 //   posix-only-behaviour  behaviour Windows does not have, such as file mode bits
 // `gap` is a test that should run on Windows and does not yet. Only the entries
 // named in KNOWN_GAPS ("<file> :: <test>") may carry it, so a new gap cannot be
-// added in the budget alone. Gemini is the one today: the Gemini bridge and the
-// Antigravity quota tests have not been ported to Windows yet.
+// added in the budget alone. The Antigravity quota tests are the ones today:
+// they drive a POSIX shell fake agy, and a Windows fake is not written yet.
 const CLOSED_CATEGORIES = ["darwin-only", "posix-signals", "tmux-backend", "posix-pair", "windows-refused-d2", "posix-only-behaviour"];
 const KNOWN_GAPS = [
   "usage-stats-poster.test.js :: scheduled poster renders an Antigravity field beside Claude and records agy quota in history",
@@ -144,6 +144,7 @@ const KNOWN_GAPS = [
   "usage-stats-poster.test.js :: a missing agy degrades to one unavailable line, and a machine without agy has no Antigravity field",
   "usage-stats-poster.test.js :: agy sign-in, timeout, crash, and unreadable output each become one short unavailable block",
   "usage-stats-poster.test.js :: a long Antigravity section continues in extra fields and keeps the embed within Discord limits",
+  "usage-stats-poster.test.js :: each Gemini account gets its own Antigravity blocks, asked with its home as HOME",
 ];
 
 // The name of every test a suite declares, as its source writes it: a name built

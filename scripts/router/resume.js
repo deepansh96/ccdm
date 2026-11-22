@@ -12,6 +12,10 @@
 // `codex-discord-bridge` rollout for the project directory in the project's
 // resolved Codex home, whose rollout file must exist. A directory shared with
 // another Codex project or the CCDM checkout (root's threads) is ambiguous and skipped.
+// Gemini: the registry's `session_id`, whose agy conversation
+// `<home>/.gemini/antigravity-cli/conversations/<id>.db` must exist under the
+// home the project's `gemini_account` resolves to now (resolve-gemini-home.py),
+// so a conversation from before an account change is not resumed.
 const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -181,17 +185,30 @@ function resolveCodex(project, entry, registryFile) {
 
 // Gemini: the registry's session_id (the agy session the launcher recorded),
 // whose conversation database must exist under ~/.gemini/antigravity-cli.
-function resolveGemini(entry) {
+function geminiHome(project, registryFile) {
+  const resolver = path.join(__dirname, "..", "resolve-gemini-home.py");
+  const result = spawnSync(...pythonInvocation([resolver, registryFile, project], { encoding: "utf8" }));
+  if (result.status !== 0) throw new Error((result.stderr || "").trim().split("\n").pop() || "the Gemini home did not resolve");
+  return result.stdout.trim();
+}
+
+function resolveGemini(project, entry, registryFile) {
   const id = String(entry.session_id || "");
   if (!id) return { skip: "no recorded Gemini session_id" };
   if (!UUID.test(id)) return { skip: `registry session_id ${id} is not a canonical UUID` };
-  const db = path.join(os.homedir(), ".gemini", "antigravity-cli", "conversations", `${id}.db`);
-  if (!fs.existsSync(db)) return { skip: `conversation ${id} is missing from ~/.gemini/antigravity-cli` };
+  let home;
+  try {
+    home = geminiHome(project, registryFile);
+  } catch (error) {
+    return { skip: `Gemini home unresolved: ${error.message}` };
+  }
+  const dataDir = path.join(home, ".gemini", "antigravity-cli");
+  if (!fs.existsSync(path.join(dataDir, "conversations", `${id}.db`))) return { skip: `conversation ${id} is missing from ${dataDir}` };
   return { id, source: "registry session_id" };
 }
 
 function resolveResume(project, entry, { registryFile }) {
-  if (entry.type === "gemini") return resolveGemini(entry);
+  if (entry.type === "gemini") return resolveGemini(project, entry, registryFile);
   return entry.type === "codex" ? resolveCodex(project, entry, registryFile) : resolveClaude(entry);
 }
 

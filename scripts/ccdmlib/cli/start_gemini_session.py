@@ -12,8 +12,12 @@ with the agy session id as ``session_id``.
 
 The model and thinking level come from the project's ``gemini_model`` (or
 ``model``) and ``gemini_effort``; unset, the bridge uses its own default.
-``--resume`` continues an agy conversation, which must exist in
-``~/.gemini/antigravity-cli/conversations``; it never falls back to a fresh one.
+The project's ``gemini_account``, an alias in ``gemini_accounts``, names the
+home agy runs under (its sign-in, see ``ccdmlib/gemini_home.py``); unset, agy
+runs under the user's home. Windows refuses an account home that is not the
+user's own. ``--resume`` continues an agy conversation, which must exist in
+that home's ``.gemini/antigravity-cli/conversations``; it never falls back to a
+fresh one.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
+from .. import gemini_home
 from ..platform import commands, exe, proc, session_host
 from ..platform.paths import expand_home
 from ._detach import detach_if_self
@@ -86,6 +91,7 @@ class _Project(NamedTuple):
     effort: str
     webhook_id: str
     text_reply_fallback_off: bool
+    agy_home: str
 
 
 def _read_project(registry_path: str, project: str) -> _Project:
@@ -102,6 +108,12 @@ def _read_project(registry_path: str, project: str) -> _Project:
     effort = str(entry.get("gemini_effort") or "")
     if effort and effort not in _EFFORTS:
         raise _Refused(f"Invalid gemini_effort '{effort}' for '{project}' (expected low, medium, high, or xhigh)")
+    agy_home = ""
+    if (entry.get("type") or "claude") == "gemini":
+        try:
+            agy_home = gemini_home.resolve(registry, project)
+        except gemini_home.GeminiHomeError as error:
+            raise _Refused(str(error)) from None
     return _Project(
         path=expand_home(entry["path"]) if WIN32 else os.path.expanduser(entry["path"]),
         screen_name=entry["screen_name"],
@@ -111,12 +123,8 @@ def _read_project(registry_path: str, project: str) -> _Project:
         effort=effort,
         webhook_id=str(entry.get("webhook_id") or ""),
         text_reply_fallback_off=entry.get("text_reply_fallback") is False,
+        agy_home=agy_home,
     )
-
-
-def _agy_home() -> str:
-    home = os.environ.get("USERPROFILE" if WIN32 else "HOME") or str(Path.home())
-    return os.path.join(home, ".gemini", "antigravity-cli")
 
 
 # --- finding the bridge and its agy --------------------------------------
@@ -180,6 +188,7 @@ def _bridge_env(project: _Project, name: str, router_state: str, key_file: str, 
         "CCDM_CHANNEL_READY_FILE": ready_file,
         "CHANNEL_ID": project.channel_id,
         "PROJECT_DIR": project.path,
+        "CCDM_AGY_HOME": project.agy_home,
     })
     if project.model:
         env["GEMINI_MODEL"] = project.model
@@ -288,9 +297,6 @@ def _parse(arguments: List[str]) -> Tuple[Optional[int], str, str]:
         if not _is_canonical_uuid(resume):
             _complain("Resume session must be a canonical UUID")
             return 1, "", ""
-        if not os.path.isfile(os.path.join(_agy_home(), "conversations", f"{resume}.db")):
-            _complain(f"The agy conversation {resume} is missing from ~/.gemini/antigravity-cli/conversations")
-            return 1, "", ""
     return None, project, resume
 
 
@@ -317,6 +323,10 @@ def handler(args: argparse.Namespace) -> int:
         return 1
     if project.type != "gemini":
         _complain(f"Refusing to start '{project_name}': it is a {project.type} project, not a gemini one.")
+        return 1
+    conversations = os.path.join(gemini_home.data_dir(project.agy_home), "conversations")
+    if resume and not os.path.isfile(os.path.join(conversations, f"{resume}.db")):
+        _complain(f"The agy conversation {resume} is missing from {conversations}")
         return 1
     name = project.screen_name
 
