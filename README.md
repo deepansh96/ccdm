@@ -576,6 +576,29 @@ server attached to that one agy session, so no agy config file is written.
   `CCDM_AGY_BIN` names another agy binary; under an account it must be agy
   itself, not a bash or zsh wrapper script (the launch refuses one).
 
+  On macOS, give each extra account home its own keychain. agy saves its
+  token through `/usr/bin/security`, which finds no default keychain under a
+  bare home. Each token refresh then pops a "Keychain Not Found … store
+  'antigravity'" dialog, then falls back to the token file after 5 s (click
+  Cancel, never Reset To Defaults). Create the keychain with the account
+  home as `HOME`, so it joins only that home's keychain list and never your
+  own:
+
+  ```sh
+  H=~/.agy-work; mkdir -p "$H/Library/Keychains"
+  (umask 077; openssl rand -hex 24 > "$H/.keychain-password")
+  HOME=$H security create-keychain -p "$(cat "$H/.keychain-password")" "$H/Library/Keychains/login.keychain-db"
+  HOME=$H security set-keychain-settings "$H/Library/Keychains/login.keychain-db"  # no auto-lock
+  ```
+
+  The keychain starts each boot locked, and a locked one prompts for its
+  password. Unlock it at login, for example with a LaunchAgent (`RunAtLoad`)
+  running `HOME=$H security unlock-keychain -p "$(cat "$H/.keychain-password")"
+  "$H/Library/Keychains/login.keychain-db"`. `unlock-keychain` may print
+  "passphrase … not correct" and exit 51 even when the unlock worked. The
+  password file is no weaker than the plaintext token file agy already keeps
+  in that home.
+
 A Thread Conversation can run Gemini too, under a project of any provider:
 `/thread <name> --provider gemini [--account <alias>] [--model <model>] [--effort <effort>]`.
 Without `--account` it uses the project's `gemini_account`; `/config account=`
