@@ -2,8 +2,9 @@
 
 The supervisor tells the reminder service's durable event receiver when a
 thread's reminder tracking resets (an accepted provider or account switch;
-`/clear` is not one), when the thread closes (an owner archive or its
-`/close`), and when it is deleted. Each event is spooled to the receiver's
+`/clear` is not one), when the thread closes (its `/close` or `threads.sh
+close`; any other archive is reverted and keeps tracking), and when it is
+deleted. Each event is spooled to the receiver's
 private outbox, exactly as the provider adapters spool theirs, and drained
 at once; one the receiver cannot take yet stays in the outbox for the next
 drain.

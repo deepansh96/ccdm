@@ -1,38 +1,122 @@
-# Claude Project Conversation readiness adapter
+# Claude Conversation Reminder adapter
 
-This prerequisite observes Claude Project Conversations and filters `/close` before Claude receives it. It does not close conversation state, send ✅, schedule or send Conversation Reminders, or enable delivery. Use the [readiness command](conversation-reminder-codex-adapter.md#readiness) to inspect committed events and pending outbox entries.
+This adapter observes a registered Claude Project Conversation. It does not schedule or send Conversation Reminders, close conversation state, or acknowledge `/close` with a checkmark; the [Conversation Reminder service](conversation-reminders.md) does that for every provider.
+
+The adapter has two parts. Both run in every Claude project session:
+
+- `scripts/ccdm-channel-server.js` is the session's channel. It is a Router client and holds no Discord credential. It records owner messages, delivered replies, input requests, and resumed work.
+- `scripts/claude-reminder-hook.js` runs as Claude Code command hooks. It records turn completion and session end.
+
+Both write events through `scripts/conversation-reminder-adapter.js`, following the shared [event contract](conversation-reminder-codex-adapter.md#event-contract).
 
 ## Launch
 
-The adapter accepts Claude Code 2.x from `2.1.281` (launches verified with `2.1.281` on 2026-09-24, `2.1.282` on 2026-09-25, and `2.1.283` on 2026-09-26), so Claude Code auto-updates keep working, with the official `discord@claude-plugins-official` plugin `0.0.4` (its MCP server reports `1.0.0`), Bun `1.3.11`, Node `22.20.0`, and Python `3.10.4`. `start-session.sh` rejects an older Claude Code, a different major version, or a missing pinned plugin before tmux starts. The MCP proxy rejects a changed server identity or missing channel/reply capabilities. The default E2E proof uses protocol fakes; it does not log in to Claude or Discord. If an update changes the plugin contract, the MCP proxy rejects the launch and readiness stays blocked; pin or fix it then.
-
-For a registered local Claude project, install the official plugin in the selected Claude home, then start the opt-in launch:
+A plain launch provides the adapter. There is no opt-in variable and no plugin to install:
 
 ```sh
-CCDM_CLAUDE_REMINDER_ADAPTER=1 scripts/start-session.sh <project>
+scripts/start-session.sh <project>
 python3 scripts/conversation-reminder-readiness.py <project> --json
 ```
 
-Stop its existing session first with `scripts/stop-session.sh <project>`; duplicate-listener checks reject a replacement while the old project listener exists. The project launcher preserves `claude_home`, model, effort, `zsh -ic`, and the read-only Discord MCP server. It generates private MCP and command-hook settings in the assigned bot state directory. `--dangerously-load-development-channels server:discord` loads the filtered channel during Claude's research preview; its first-use consent may need an operator. The launch settings disable the separately installed official Discord MCP server for that one session, so the maintained proxy owns the sole official plugin child/Gateway connection. The proxy runs the installed `server.ts` directly through Bun, without the package `start` script's install step; the plugin cache is read but never edited.
+Stop an existing session first with `scripts/stop-session.sh <project>`. The launcher refuses to start while a listener still uses the project's launch key file, and it refuses a project without `webhook_id`.
 
-The root Claude restart script accepts the same opt-in variable for root-management routing in registered project channels. Its preflight checks precede root teardown. It loads the filtered channel with the root bot identity derived from root state (or `root_bot_app_id`) and disables the parallel plugin server for that launch. The root path has no project lifecycle hooks; it filters project-channel `/close` before root management sees it. Neither launcher changes Discord permissions or starts an additional project Gateway listener.
+`start-session.sh` writes private launch files (mode `0600`) under the Router state directory, in `launches/<project>/`:
 
-`python3 scripts/conversation-reminder-readiness.py <project> --json` reports `ready-observe-only` only when the current assignment has a verified local Claude transport marker written by a running adapter launch, the pinned plugin/server contract and discovered `reply` tool schema, a private launch settings file containing command hooks, a single-listener configuration, an assigned bot credential, and the durable receiver. It reports blocked assignments and pending events without printing credentials or conversation bodies. The marker records the adapter's launch ID and process ID. It is removed when that process exits, by `scripts/stop-session.sh`, and by every `scripts/start-session.sh` launch before a new adapter can write it. Readiness also checks that the recorded process is still the adapter. A plain restart without `CCDM_CLAUDE_REMINDER_ADAPTER=1` runs the unfiltered official plugin and reports `Claude launch-scoped transport is not verified`; a dead adapter reports `is not running`. A ready result proves the running local launch contract, not a current Discord connection or remote deployment. `delivery_enabled` and `reminders_enabled` remain `false`.
+- `mcp.json` defines one MCP server, `ccdm`, which runs `node scripts/ccdm-channel-server.js`. Its environment carries the launch key file path, the Router state directory, and the reminder context: project, channel ID, a new launch ID, the reminder state directory, the receipts directory, and the path of the settings file.
+- `settings.json` disables `discord@claude-plugins-official` for this session and installs command hooks for `SessionStart`, `Stop`, `StopFailure`, and `SessionEnd`. Each hook runs `node scripts/claude-reminder-hook.js`. No hook invokes a model.
+- `reminder-env.json` holds the same reminder context. The launcher exports it to the `claude` process so the hooks share the channel server's launch ID.
 
-## Transport and hook contract
+Claude starts in tmux with `--dangerously-load-development-channels server:ccdm`, `--mcp-config`, and `--settings`. The launch keeps the project's `claude_home`, model, and effort, and uses `zsh -ic`. The launcher accepts the development-channel confirmation itself, then waits for the channel server's Router hello (60 seconds by default, `CCDM_CLAUDE_LAUNCH_TIMEOUT_S`). A failed launch is cleaned up: the tmux session, launch key, launch files, and capability marker are removed.
 
-The official plugin applies its own Discord access gate, then emits MCP `notifications/claude/channel` with `content` and `meta.chat_id`, `meta.message_id`, and `meta.user_id`. The launch-scoped stdio proxy receives these actual notifications. It permits normal gated messages in the assigned project channel, records owner activity, and drops an exact trimmed `/close` before forwarding. The assigned or root bot mention may precede `/close` with whitespace; guests' allowed `/close` messages are consumed without an owner event. A root Claude launch applies the same filter to registered project channels. Project tool calls and inbound notifications are confined to the assigned channel. The proxy does not classify natural language or rely on a prompt hook to intercept commands.
+The launcher does not check a Claude Code version. The repository requires Node `>=22.5` (`package.json`). The scripts call `python3`; `CCDM_REMINDER_PYTHON` selects another interpreter for the event receiver.
 
-The proxy extends the official `reply` tool schema with required `conversation_interaction_id`, copied from the inbound owner `message_id`, and optional `conversation_disposition` (`progress` by default or `input-needed`). It removes those fields before the official plugin handles the call. Only a successful official `reply` result with Discord message IDs creates `response_delivered`; an `input-needed` receipt also creates `input_needed` while Claude may still be active. Failed replies, edits, reactions, and tool starts do not qualify. Replies lacking a valid interaction ID can still be delivered, but they do not qualify completion. Receipt IDs and metadata are persisted privately through the shared version-1 event outbox and assignment-bound receiver.
+A Claude Thread Conversation (`scripts/start-thread-session.sh`) runs the same channel server and hook. Its events name the thread as the conversation. It writes no capability marker, so only the channel session proves the project's readiness.
 
-Launch settings install **command hooks only**; no hook invokes a model. `SessionStart` receives `session_id` and binds it to the unique launch ID and assignment generation. `Stop` receives `session_id`, `stop_hook_active`, `background_tasks`, and `session_crons`. It emits `turn_completed` for confirmed replies only when both task arrays are present and empty. Missing task-registry fields or ongoing background work are treated as unfinished. `StopFailure` discards pending completion markers. `SessionEnd` emits `session_terminated`. New owner input after a still-active input-needed receipt emits `work_resumed`; once a Stop hook clears that receipt marker, later owner input does not claim active resumption. Hook payload text and transcript bodies are never stored.
+## Readiness
 
-The receiver can return committed, duplicate, stale, rejected, or retryable failure. The adapter writes an outbox record before ingestion; a receiver outage leaves that record private for `scripts/conversation-reminder-events.py drain` or the next adapter run. As with the Codex prerequisite, `close_requested` is a command event, not a completed closure or acknowledgment.
+After its Router hello, the channel server writes a capability marker at `capabilities/<project>.json` in the reminder state directory. The marker records the project, channel ID, assignment generation, `transport: "ccdm-channel-server"`, `server_version: "1.0.0"`, `hooks_configured`, `reply_tool_verified`, the launch ID, and the server's process ID. It holds no credentials or message text.
 
-## Remote projects and compatibility
+`hooks_configured` is true only when the launch settings file is private (no group or other access), disables `discord@claude-plugins-official`, and has this checkout's `claude-reminder-hook.js` as a command hook for all four events.
 
-A remote Claude runtime needs this same maintained checkout, pinned Claude/plugin versions, Node/Bun/Python, the opt-in launch configuration, its assigned bot state and access policy, an assignment-bound private registry entry, and a secure route for its durable events to the shared consumer. The operator must deploy and verify those pieces on that host; local registration does not install the adapter remotely. A remote channel without them is unsupported for reminder delivery. Do not copy root or other project credentials to fill in a missing remote assignment, and do not treat a local readiness marker as proof of a remote runtime.
+The marker is removed:
 
-If the pinned CLI, plugin channel protocol, hook payloads, development-channel policy, or single-listener setting cannot be verified for an operator's deployment, keep readiness blocked and leave reminder enablement off. The tested local fake proof establishes completion, progress, input-needed, `/close`, resumed work, receiver replay, version rejection, and project/root routing; a separately opted-in live smoke test would be needed to establish real provider and Discord compatibility.
+- by every `scripts/start-session.sh` launch, before the new server can write its own;
+- by `scripts/stop-session.sh`;
+- by the channel server when it exits or its Router session ends.
+
+If the Router moves the session to another channel, the server rewrites the marker for the new channel. If the registry no longer assigns that channel to this Claude project, the server removes it.
+
+`python3 scripts/conversation-reminder-readiness.py <project> --json` reports `ready-observe-only` (exit status 0) only when all of these hold:
+
+- the project is registered with an owner, a channel, and a `webhook_id`, and no other project uses its channel;
+- the project's `path` does not start with `remote:`;
+- the marker matches the current assignment generation and channel, names the `ccdm-channel-server` transport and server version `1.0.0`, and has `hooks_configured` and `reply_tool_verified` set to true;
+- the marker's process is still running and is `ccdm-channel-server.js`;
+- the durable event receiver is available.
+
+Otherwise it reports `blocked` (exit status 2) and lists the reasons under `assignment_mismatches` and `unsupported_capabilities`. A missing or mismatched marker reads `Claude launch-scoped transport is not verified for this assignment`. A dead server reads `is not running`. Both name the fix: `scripts/start-session.sh <project>`.
+
+The report also lists recent committed events and the pending outbox count. It never prints credentials or message bodies. A ready result proves the running local launch, not a current Discord connection. `delivery_enabled` and `reminders_enabled` are always `false` in this report; delivery state is in `scripts/conversation-reminder-service.py status`. See [Provider readiness](conversation-reminders.md#provider-readiness) for how the service uses the result.
+
+## What the adapter observes
+
+### Owner activity
+
+The Router delivers a project channel's messages to that project's session only. For each message whose author is the registered owner, the channel server emits `owner_activity` with the message ID and an `activity_kind` of `message` or `attachment`. It also remembers the message as an interaction that a reply can name. Guest messages reach Claude but emit no owner event.
+
+The channel server forwards reactions to Claude without recording them. Management commands (`/pause`, `/unpause`, `/compact`, `/clear`, `/restart`) arrive as Router commands, not messages, and the server records nothing for them. The reminder service's observer records owner reactions and management commands itself, through the Router.
+
+### `/close`
+
+The Router drops an exact trimmed `/close` in a project channel before any session sees it. This applies to the owner and to guests, so Claude never receives it. The reminder service's observer sees the message through the Router and emits `close_requested` for the registered owner only. As with the Codex adapter, `close_requested` is a command event, not a completed closure or acknowledgment.
+
+An owner message that mentions the root bot goes to root, not to the project session. The observer also treats a root mention followed by whitespace and `/close` as a close request. Nothing classifies natural language, and no prompt hook intercepts commands.
+
+### Replies
+
+The `reply` tool schema requires `chat_id`, `text`, and `conversation_interaction_id`. It accepts optional `conversation_disposition`: `progress` (the default) or `input-needed`. The server's instructions tell Claude to copy `conversation_interaction_id` from the owner `message_id` being answered, and to set `input-needed` only when the delivered reply asks the owner for input. The server strips both fields before it sends the reply to the Router.
+
+A reply qualifies only when all of these hold:
+
+- the Router confirms delivery and returns Discord message IDs;
+- `conversation_interaction_id` names an owner message this session received;
+- `chat_id` is that conversation's channel.
+
+Each delivered message ID then emits `response_delivered` and leaves a private receipt marker in `claude-receipts/`. A reply split into several messages emits one receipt per part. With `input-needed`, only the last part carries that disposition and also emits `input_needed`.
+
+A reply without a valid interaction ID is still delivered, but it creates no receipt. Failed replies, `edit_message`, `react`, and tool starts create none either. Attachment replies use the same `reply` path.
+
+If the owner sends a new message while an `input-needed` receipt marker still exists, the server emits `work_resumed`. Once a `Stop` or `StopFailure` hook has cleared that marker, later owner input does not claim resumed work.
+
+### Hook events
+
+The hooks ignore subagent events and any payload without `session_id`. They store no hook payload text and no transcript content.
+
+- `SessionStart` binds the Claude `session_id` to the launch ID and assignment generation in a private file. It emits no event. The other hooks act only when their `session_id` and the current assignment generation match that binding.
+- `Stop` emits `turn_completed` only when `background_tasks` and `session_crons` are both present and empty. It emits one event per interaction that has receipts, with the confirmed `delivered_message_ids`, then removes those receipts. Missing fields or running background work count as unfinished: nothing is emitted and the receipts stay for a later `Stop`. A turn without receipts emits nothing.
+- `StopFailure` removes pending receipts and emits nothing.
+- `SessionEnd` emits `session_terminated`, removes pending receipts without promoting them to a completion, and removes the binding.
+
+## Outbox and receiver
+
+Every event is written to the private `outbox/` directory before the adapter asks the receiver (`scripts/conversation-reminder-events.py`) to commit it. The receiver checks the event against the current registered assignment and returns `committed`, `duplicate`, `stale`, `rejected`, or `retryable_failure`. It rejects an `input_needed` or `turn_completed` event that has no matching `response_delivered` receipt, and a Claude event for a project that is now registered to another provider.
+
+During a receiver outage the event stays in the outbox. The adapter drains the outbox after each new event, and the channel server drains it at startup. `scripts/conversation-reminder-events.py drain --project-root <root> --state-dir <dir>` drains it by hand. Stale and rejected records move to a private `rejected/` directory.
+
+State lives under `~/.local/state/ccdm/conversation-reminders` by default; `CCDM_REMINDER_STATE_DIR` selects another private directory. Events hold IDs, timestamps, dispositions, and assignment metadata, never conversation text or credentials.
+
+## Root
+
+Root Claude (`restart-root-agent.sh`) runs the same channel server with `CCDM_ROUTER_ROLE=root`. In that role the server records no Conversation Reminder events and writes no capability marker, and its `reply` tool does not require `conversation_interaction_id`. Its launch settings disable the official Discord plugin and install no reminder hooks.
+
+Root receives the owner's root-bot mentions from project channels, including a mention followed by `/close`. The project session never sees those messages. The reminder service's observer classifies them.
+
+Reminders themselves are sent by the Conversation Reminder service with root's credentials. No Claude session sends one.
+
+## Remote projects and tests
+
+A project whose `path` starts with `remote:` stays blocked. Local readiness cannot verify an adapter on another host, and nothing here installs one remotely.
+
+The default E2E suite (`tests/e2e/conversation-reminder-claude.test.js` and `tests/e2e/conversation-reminder-router-claude.test.js`) proves this behaviour with Local Fakes. It does not log in to Claude or Discord. A real provider and Discord check belongs to the opt-in Live Smoke Suite.
 
 References: [Claude channels contract](https://code.claude.com/docs/en/channels-reference), [Claude command-hook payloads](https://code.claude.com/docs/en/hooks), [Claude settings precedence](https://code.claude.com/docs/en/settings).
