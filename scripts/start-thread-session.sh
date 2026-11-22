@@ -23,9 +23,11 @@
 # also carries `ws_port`.
 #
 # A Gemini thread runs gemini-bridge.js in thread mode, driving its own `agy
-# acp` over stdio (no port). Gemini has no account aliases; its provider
-# conversation id is the agy session id, and its home is agy's data
-# directory, ~/.gemini/antigravity-cli.
+# acp` over stdio (no port). Its account alias (a `gemini_accounts` home, see
+# resolve-gemini-home.py) takes the place of the project's gemini_account;
+# agy runs with that home as HOME. Its provider conversation id is the agy
+# session id, and its provider home is agy's data directory under that home,
+# <home>/.gemini/antigravity-cli.
 #
 # --resume continues the thread's provider conversation (`claude --resume`,
 # or the bridge's Codex thread uuid) in the same home and cwd. --home names
@@ -137,10 +139,6 @@ CONFIG_DIR_ENV=""
 [[ "$MODEL" == "__NONE__" ]] && MODEL=""
 [[ "$EFFORT" == "__NONE__" ]] && EFFORT=""
 elif [[ "$PROVIDER" == "gemini" ]]; then
-if [[ -n "$ACCOUNT" ]]; then
-  echo "Gemini has no account aliases (got '$ACCOUNT')" >&2
-  exit 1
-fi
 LAUNCH_FIELDS="$(python3 - "$REGISTRY" "$PROJECT" "$MODEL" "$EFFORT" <<'PY'
 import json, os, re, sys
 registry_path, project, model, effort = sys.argv[1:5]
@@ -166,7 +164,20 @@ IFS=$'\t' read -r PATH_DIR SCREEN_NAME MODEL EFFORT TEXT_REPLY_FALLBACK <<< "$LA
 [[ "$MODEL" == "__NONE__" ]] && MODEL=""
 [[ "$EFFORT" == "__NONE__" ]] && EFFORT=""
 [[ "$TEXT_REPLY_FALLBACK" == "__NONE__" ]] && TEXT_REPLY_FALLBACK=""
-GEMINI_HOME_DIR="${HOME_OVERRIDE:-$HOME/.gemini/antigravity-cli}"
+if [[ -n "$HOME_OVERRIDE" ]]; then
+  # A resumed conversation stays in the agy data directory it started in.
+  if [[ "$HOME_OVERRIDE" != */.gemini/antigravity-cli ]]; then
+    echo "The conversation's home $HOME_OVERRIDE is not an agy data directory (<home>/.gemini/antigravity-cli)" >&2
+    exit 1
+  fi
+  AGY_HOME="${HOME_OVERRIDE%/.gemini/antigravity-cli}"
+else
+  ACCOUNT_ARGS=()
+  [[ -n "$ACCOUNT" ]] && ACCOUNT_ARGS=(--account "$ACCOUNT")
+  # An unknown alias is a start failure; the resolver's reason is its last stderr line.
+  AGY_HOME="$(python3 "$SCRIPT_DIR/resolve-gemini-home.py" "$REGISTRY" "$PROJECT" "${ACCOUNT_ARGS[@]}")" || exit 1
+fi
+GEMINI_HOME_DIR="$AGY_HOME/.gemini/antigravity-cli"
 else
 LAUNCH_FIELDS="$(python3 - "$REGISTRY" "$PROJECT" "$MODEL" "$EFFORT" <<'PY'
 import json, os, sys
@@ -413,7 +424,7 @@ write_private(launch / "reminder-env.json", json.dumps(reminder_env) + "\n")
 PY
 
 if [[ "$PROVIDER" == "gemini" ]]; then
-  GEMINI_ENV=""
+  GEMINI_ENV=" CCDM_AGY_HOME='$AGY_HOME'"
   [[ -n "$MODEL" ]] && GEMINI_ENV+=" GEMINI_MODEL='$MODEL'"
   [[ -n "$EFFORT" ]] && GEMINI_ENV+=" GEMINI_EFFORT='$EFFORT'"
   [[ "$TEXT_REPLY_FALLBACK" == "0" ]] && GEMINI_ENV+=" GEMINI_TEXT_REPLY_FALLBACK='0'"

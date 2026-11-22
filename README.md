@@ -548,17 +548,38 @@ server attached to that one agy session, so no agy config file is written.
   in the project entry to turn this off, for the project and its Gemini threads.
 - **Resume:** the launch records the agy session id as the project's
   `session_id`. `scripts/start-gemini-session.sh my-project --resume <session_id>`
-  continues it. It refuses an id with no conversation in
-  `~/.gemini/antigravity-cli/conversations`, and refuses while the project's
+  continues it. It refuses an id with no conversation in the account home's
+  `.gemini/antigravity-cli/conversations`, and refuses while the project's
   session still runs.
 - **`/clear` and `/restart`:** a turn that ignores `/clear`'s cancel for 15 s
   stops the session (restart it) rather than leaving it stuck. `/restart`
   waits for agy itself to exit before relaunching.
-- **Account:** agy uses the one Google account it is signed in with, so
-  Gemini has no account aliases. `CCDM_AGY_BIN` names another agy binary.
+- **Accounts:** agy keeps its Google sign-in under `$HOME/.gemini`, so a
+  second account is a second home folder. Sign in there once with
+  `mkdir ~/.agy-work && HOME=~/.agy-work agy`, trust the CCDM checkout when
+  asked, then name both homes in the registry and pick one per project with
+  `gemini_account` (unset, agy runs under your own home):
+
+  ```json
+  "gemini_accounts": { "agy-main": "~", "agy-work": "~/.agy-work" },
+  "projects": { "my-project": { "type": "gemini", "gemini_account": "agy-work" } }
+  ```
+
+  The session's agy runs with that home as `HOME`, so it uses that sign-in
+  and keeps its conversations there. The shell commands its agent runs get
+  your real home back (through `scripts/agy-shell`, as zsh's `ZDOTDIR` and
+  bash's `BASH_ENV`), so git, gh, ssh and your other tools work as usual;
+  only a plain `sh` command still sees the account home. A project's
+  `--resume` (and a Router migration's resume) looks in the home its
+  `gemini_account` names now, so after changing a project's account its old
+  conversation is not resumed; a thread keeps the home it started in.
+  `CCDM_AGY_BIN` names another agy binary; under an account it must be agy
+  itself, not a bash or zsh wrapper script (the launch refuses one).
 
 A Thread Conversation can run Gemini too, under a project of any provider:
-`/thread <name> --provider gemini [--model <model>] [--effort <effort>]`.
+`/thread <name> --provider gemini [--account <alias>] [--model <model>] [--effort <effort>]`.
+Without `--account` it uses the project's `gemini_account`; `/config account=`
+switches a Gemini thread's account (a fresh conversation, after your ✅).
 A project's plain `model` goes only to threads of the project's own provider,
 so a Claude or Codex thread of a Gemini project never inherits a Gemini model.
 
@@ -626,7 +647,7 @@ Open a public thread under a registered project channel and type a task: it beco
 - **Lifecycle:** a thread stays open until `/close` (or `scripts/threads.sh close`), which archives it and closes the conversation. Any other archive, Discord's one-week inactivity auto-archive or one by hand, is reverted at once, and an idle session is stopped. Your next message resumes the same conversation, and only your message reopens a closed one.
 - **Status:** root reacts on your message instead of posting. ⏳ means the agent is working on it (only your latest message carries it), ✅ that the turn ended and it is your turn, and ⚠️ that the turn failed or the session crashed. A stop or `/close` takes the ⏳ off; ✅ and ⚠️ stay.
 - **Capacity:** live thread sessions are capped per provider by the registry's `thread_session_caps` (default `{"claude": 6, "codex": 8, "gemini": 4}`). At the cap the longest-idle session is paused, or the new one is queued.
-- **Accounts:** a thread may use an alias from `codex_accounts`, or from the new `claude_accounts` map (alias → Claude home). Gemini threads use agy's one signed-in account.
+- **Accounts:** a thread may use an alias from `codex_accounts`, from the `claude_accounts` map (alias → Claude home), or from `gemini_accounts` (alias → the home agy runs under, see [Gemini sessions](#gemini-sessions-antigravity-cli)).
 - **Operate:**
   - `scripts/threads.sh list|stop|restart|close` takes a thread name, link or id.
   - `scripts/stop-session.sh <project> --threads` stops only the thread sessions, and `--all` stops the channel too. A plain `stop-session.sh <project>`, or a channel restart, leaves threads alone.
@@ -792,12 +813,16 @@ The poster reports:
   percent used with the reset time; an untouched bucket shows no reset time,
   because agy reports "now + window" for a window that has not started.
   `/usage` is a read-only print-mode command: it starts no agent turn, spends
-  no quota, and leaves no conversation. The poster runs it once per run with
+  no quota, and leaves no conversation. The poster runs it once per account per run, with
   the repository as its workspace, stdin closed, the CLI log sent to
   `/dev/null`, and a 30-second limit (`CCDM_AGY_TIMEOUT_SECONDS`) that kills
   agy's process group. The binary is `CCDM_AGY_BIN` when set, else `agy` on
-  `PATH`, else `~/.local/bin/agy`. A machine with no agy binary and no
-  `~/.gemini/antigravity-cli` directory gets no Antigravity field; otherwise a
+  `PATH`, else `~/.local/bin/agy`. Each other home in `gemini_accounts` is
+  asked too, with that home as `HOME`; with more than one account every block
+  is headed `<alias> · <group>` (your own home is the alias naming `~`, else
+  `agy`), and a missing home is one unavailable line. A machine with no agy
+  binary, no `~/.gemini/antigravity-cli` directory and no other account gets
+  no Antigravity field; otherwise a
   missing binary, an expired sign-in, a timeout, or unreadable output is one
   short `*Usage unavailable: <reason>*` line and the rest of the report is
   unchanged. Each row is recorded in history as its own series (provider
@@ -1063,6 +1088,8 @@ ccdm/
     start-session.sh         # Start a registered Claude project
     start-codex-session.sh   # Start a registered Codex project
     start-gemini-session.sh  # Start a registered Gemini project (agy)
+    resolve-gemini-home.py   # The home a Gemini session's agy runs under (gemini_accounts)
+    agy-shell/               # Gives a Gemini account session's shell commands the real home back
     stop-session.sh          # Stop any registered project (--threads, --all)
     start-thread-session.sh  # Start one Thread Conversation (run by the Thread Supervisor)
     thread-supervisor.py     # The Thread Supervisor worker and CLI (run, status, enable, disable, preflight)

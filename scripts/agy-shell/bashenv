@@ -1,0 +1,4 @@
+# BASH_ENV for a Gemini account session's agent: bash's counterpart of
+# scripts/agy-shell/.zshenv, restoring the user's real home and ZDOTDIR.
+export HOME="${CCDM_SHELL_HOME:-$HOME}"
+if [ -n "${CCDM_SHELL_ZDOTDIR:-}" ]; then export ZDOTDIR="$CCDM_SHELL_ZDOTDIR"; else unset ZDOTDIR; fi

@@ -21,9 +21,11 @@ from .link import LinkError
 
 
 RESOLVER = Path(__file__).resolve().parents[1] / "resolve-codex-home.py"
+GEMINI_RESOLVER = Path(__file__).resolve().parents[1] / "resolve-gemini-home.py"
 DEFAULT_CLAUDE_HOME = "~/.claude"
-# agy keeps its conversations here; the Gemini bridge pins its own defaults.
-GEMINI_HOME = "~/.gemini/antigravity-cli"
+# agy keeps its conversations here, under the home it runs with; the Gemini
+# bridge pins its own defaults.
+GEMINI_DATA_DIR = os.path.join(".gemini", "antigravity-cli")
 GEMINI_DEFAULTS = {"model": "gemini-4-neon", "effort": "high"}
 GEMINI_LEVEL_SUFFIX = re.compile(r"^(.+)-(low|medium|high|xhigh)$")
 # A top-level `key = "value"` in config.toml, before its first [table].
@@ -74,11 +76,34 @@ def claude_home_defaults(home: str) -> dict:
     return {"model": pick("model"), "effort": pick("effortLevel")}
 
 
-def _resolver():
-    spec = importlib.util.spec_from_file_location("ccdm_resolve_codex_home", RESOLVER)
+def _resolver(path: Path = RESOLVER, name: str = "ccdm_resolve_codex_home"):
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def gemini_home(current: dict, project: str, account: str | None) -> str | None:
+    """agy's data directory for a session of ``project``, under the home its launcher resolves."""
+    try:
+        home = _resolver(GEMINI_RESOLVER, "ccdm_resolve_gemini_home").resolve_gemini_home(current, project, account)
+    except Exception as error:  # A broken home is reported as unknown, not raised.
+        _log(f"{project}: resolving the Gemini home failed: {error}")
+        return None
+    return os.path.join(home, GEMINI_DATA_DIR)
+
+
+def gemini_alias(current: dict, entry: dict, account: str | None, data_dir: str | None) -> str | None:
+    """The `gemini_accounts` alias in use: the thread's, the project's, or the one naming the home."""
+    if account:
+        return account
+    alias = entry.get("gemini_account")
+    if isinstance(alias, str) and alias:
+        return alias
+    for alias, path in registry.accounts(current, "gemini").items():
+        if data_dir and isinstance(path, str) and path and _expand(os.path.join(path, GEMINI_DATA_DIR)) == _expand(data_dir):
+            return alias
+    return None
 
 
 def codex_home(current: dict, project: str, account: str | None) -> str | None:
@@ -122,7 +147,7 @@ def describe(current: dict, project: str, entry: dict, overrides: dict | None = 
     if provider_home:
         home = provider_home
     elif gemini:
-        home = GEMINI_HOME
+        home = gemini_home(current, project, resolved["account"])
     elif codex:
         home = codex_home(current, project, resolved["account"])
     else:
@@ -148,8 +173,13 @@ def describe(current: dict, project: str, entry: dict, overrides: dict | None = 
 
     model, model_source = pick("model")
     effort, effort_source = pick("effort")
-    alias = None if gemini else codex_alias(current, entry, resolved["account"]) if codex else (
-        resolved["account"] or (claude_alias(current, home) if home else None))
+    if gemini:
+        # A resumed conversation's home may be another account's than the project's now.
+        alias = (gemini_alias(current, {}, None, home) if provider_home
+                 else gemini_alias(current, entry, resolved["account"], home))
+    else:
+        alias = codex_alias(current, entry, resolved["account"]) if codex else (
+            resolved["account"] or (claude_alias(current, home) if home else None))
     return {
         "provider": provider,
         "provider_override": bool(overrides.get("provider")),

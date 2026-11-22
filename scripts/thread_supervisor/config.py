@@ -81,6 +81,9 @@ def _notice(context, channel_id: str, text: str) -> dict:
 
 def project_account(current: dict, entry: dict, provider: str) -> str | None:
     """The project's account alias for ``provider``; a Claude project names a home path, never shown."""
+    if provider == "gemini":
+        alias = entry.get("gemini_account")
+        return alias if isinstance(alias, str) and alias else None
     if provider != "codex":
         return None
     alias = entry.get("codex_account") or current.get("default_codex_account")
