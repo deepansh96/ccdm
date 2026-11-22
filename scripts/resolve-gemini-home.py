@@ -8,6 +8,10 @@ second home folder: ``gemini_accounts`` maps an alias to one, such as
 wins, then the project's ``gemini_account``; with neither, agy runs under the
 user's own home.
 
+agy on Windows does not take its account from HOME (it reads the user
+profile), so there an alias must name the user's own home; any other home is
+refused rather than silently running as the account agy is signed in with.
+
 Usage: resolve-gemini-home.py <registry.json> <project> [--account <alias>]
 Prints the absolute home; exits 1 with the reason as the last stderr line.
 """
@@ -20,7 +24,9 @@ import re
 import sys
 from typing import Any
 
+WIN32 = sys.platform == "win32"
 # The home goes into the session's tmux shell command, so only plain paths pass.
+# Windows starts the bridge with no shell and allows only the user's own home.
 UNSAFE = re.compile(r"[\s'\"$`\\]")
 
 
@@ -46,8 +52,17 @@ def expand(path: str) -> str:
     return os.path.normpath(os.path.expanduser(path))
 
 
+def user_home() -> str:
+    return expand("~")
+
+
 def validate_home(raw: str, label: str) -> str:
     home = expand(raw)
+    if WIN32:
+        if os.path.normcase(home) != os.path.normcase(user_home()):
+            raise ResolverError(f"{label} home '{raw}' is not your own home; agy on Windows does not take "
+                                "its account from HOME, so a Gemini account there must name ~")
+        return user_home()
     if not os.path.isabs(home) or UNSAFE.search(home):
         raise ResolverError(f"{label} home '{raw}' must be a plain absolute path")
     if not os.path.isdir(home):
@@ -67,7 +82,7 @@ def resolve_gemini_home(registry: dict[str, Any], project: str, account: str | N
         if account is not None and (not isinstance(account, str) or not account.strip()):
             raise ResolverError(f"{label} must be a non-empty alias")
     if account is None:
-        return expand("~")
+        return user_home()
     return validate_home(account_home(registry, account, label), f"Gemini account '{account}'")
 
 

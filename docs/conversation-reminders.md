@@ -4,7 +4,7 @@ This service sends Conversation Reminders. It records owner acknowledgment, `/cl
 
 The service covers each registered project channel (its Channel Conversation) and each of its Thread Conversations.
 
-Run it in the foreground, or supervise the same worker with the opt-in macOS LaunchAgent described below. It runs independently of coding sessions: stopping or restarting a project session or the root agent does not stop it or change conversation state.
+Run it in the foreground, or supervise the same worker with the opt-in macOS LaunchAgent described below. On Windows, see [Windows](#windows). It runs independently of coding sessions: stopping or restarting a project session or the root agent does not stop it or change conversation state.
 
 Reminders are opt-in. A registered channel reports `suspended-incomplete-discovery` and sends nothing until `enable` has run and discovery marks it `ready`.
 
@@ -42,6 +42,34 @@ If a check fails, `enable` exits with status 2, lists the blockers under `prefli
 On success it clears `disabled`, requests discovery of older conversations, and sends every previously ready channel back through restart reconciliation.
 
 `run` starts the foreground worker. `enable` does not check the Router or root's channel permissions. `status` and `preflight` do, per project; see [Router prerequisites](#router-prerequisites).
+
+Windows: run the same commands as `scripts/ccdm reminders enable` and `scripts/ccdm reminders run`. See [Windows](#windows).
+
+## Windows
+
+Windows: every operator command goes through `scripts/ccdm reminders`, which also works on macOS and Linux:
+
+```sh
+scripts/ccdm reminders preflight
+scripts/ccdm reminders enable
+scripts/ccdm reminders run
+scripts/ccdm reminders status
+scripts/ccdm reminders disable
+scripts/ccdm reminders discover
+scripts/ccdm reminders recover
+scripts/ccdm reminders assignment-changed --project <project>
+```
+
+Each one runs `conversation-reminder-service.py` with the Python that CCDM resolves, and passes through its JSON and its exit status. Everything in this document applies on Windows, with these differences:
+
+- **Supervised worker.** `scripts/ccdm install-service reminders` installs the opt-in scheduled task `\CCDM\Reminders`. It starts the same `run` worker at logon and restarts it after a failure. The install runs the read-only `preflight` first; on a blocker it prints each one, exits 2 and changes nothing. It then prints whether reminders are disabled, not yet enabled or enabled. It refuses while a worker started by hand is running, because the two share one lock. Without the task, keep `scripts/ccdm reminders run` running in a terminal. The LaunchAgent section below is macOS only.
+- **Disable and enable under the task.** After `scripts/ccdm reminders disable` the worker exits 0 and the task does not restart it. `scripts/ccdm reminders enable` only clears the marker: run `scripts/ccdm install-service reminders` again to start the worker. An install while disabled registers the task and starts nothing. `scripts/ccdm uninstall-service reminders` stops the worker and removes the task.
+- **Logs.** The task's worker writes to `~/.local/state/ccdm/services/reminders.log` and `reminders.err`; there is no `service.log` in the state directory on Windows. `scripts/ccdm service-status reminders` shows the task's state.
+- **Stopping.** Run `scripts/ccdm reminders disable`. The worker then asks its Node observer to stop by closing the observer's standard input, waits up to 15 seconds for a Discord request in flight to finish and be recorded, and exits with status 0. Only an observer that is still there after that is ended by force. If the worker itself is ended some other way, the observer sees its input close, finishes the same way, and exits; no observer is left behind. The worker stops its observer the same way on macOS and Linux, where the observer also still stops on `SIGTERM` and `SIGINT`.
+- **Claude readiness.** A Claude channel is ready only while the channel server named in its capability marker is running. Windows proves that from the process table: the marker records the server's process ID and start time, and both must match a live `ccdm-channel-server.js` process. A process ID that now belongs to another program, or to a process with another start time, is not ready. A marker without a start time is judged by its process ID and command line alone.
+- **Blockers that name a shell script.** Where `status` names a `.sh` script as the fix, run the `scripts/ccdm` command of the same name, for example `scripts/ccdm start-session <project>`.
+- **Private state.** The state directory is private by its access list, not a mode: it takes no permissions from its parent folder and gives access only to your account and SYSTEM. `enable` creates it that way. If the directory inherits permissions again, `status` and the worker refuse the conversation store, the event database, and the observer's health file with a `permissions are not private` reason.
+- **Thread permissions.** `status` reports root's missing thread permissions once Thread Conversations are enabled: when `thread_session_caps` is configured, when the Thread Supervisor is connected to the Router, or when its scheduled task exists (`\CCDM\ThreadSupervisor`, or `CCDM-ThreadSupervisor`). On macOS the third signal is the supervisor's LaunchAgent plist, as before.
 
 ## Supervised LaunchAgent (macOS)
 

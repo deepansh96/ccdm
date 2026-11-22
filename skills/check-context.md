@@ -1,33 +1,44 @@
-Check your own context usage. The method depends on whether you're a Claude Code session or a Codex bridge session.
+Check how much of your context window you have used. This works for a Claude or Codex session, in a project channel or a thread, on macOS and on Windows.
+
+Every session gets its percentage from a small file, its launch record. A Claude session can also get a breakdown by category.
 
 ## Steps
 
-1. **Find your tmux session name.** Run:
-   ```bash
-   tmux list-panes -a -F '#{session_name} #{pane_pid}'
+1. **Find out which session you are.** Print these three variables:
+   ```sh
+   echo "session=$CCDM_SESSION_NAME claude_project=$CCDM_CLAUDE_PROJECT codex_project=$CCDM_CODEX_PROJECT"
    ```
-   Then find which session owns your process. Your process runs inside a tmux pane — match by checking which `pane_pid` is an ancestor of your process. You can cross-reference with `pgrep -P <pane_pid>` to find the session that has your process tree.
+   A Codex session on Windows runs its commands in PowerShell: print `$env:CCDM_SESSION_NAME` and `$env:CCDM_CODEX_PROJECT` there.
+   - Your project is the value of `claude_project` or `codex_project`, whichever is set. If `claude_project` is set you are a Claude session; if `codex_project` is set you are a Codex session.
+   - Session that ends in `-t-` and a number, for example `alpha-t-1234567890`: you are a **thread session**. The number is your thread id.
+   - Session `root_agent`: you are **root**.
+   - Any other session name: you are a **project session**.
+   - If the values are empty, you cannot find your launch record. Tell the user the percentage is not available from here, and that it is shown after `·` in the name on each of your Discord replies.
 
-2. **Determine your session type.** Look up your project in registry.json (at the CCDM root directory) and check the `type` field. If `type` is `"codex"`, you're a Codex session. Otherwise you're Claude Code.
+2. **Read the percentage from your launch record.** Read this file with your file-reading tool:
+   - Project session: `~/.local/state/ccdm/router/launches/<project>/context.json`
+   - Thread session: `~/.local/state/ccdm/router/launches/<project>/threads/<thread id>/context.json`
+   - Root: `~/.local/state/ccdm/router/launches/.root/context.json`
 
-3. **Get context usage.**
+   The path is the same on macOS and Windows. If the variable `CCDM_ROUTER_STATE_DIR` is set, use its value in place of `~/.local/state/ccdm/router`. Otherwise, if `CCDM_STATE_ROOT` is set, use its value in place of `~/.local/state/ccdm`.
 
-   **If Claude Code session:**
-   Send the `/context` command to your tmux session:
-   ```bash
-   tmux send-keys -t <your_session_name> '/context' Enter
+   The file holds one number, `context_pct`: the percentage of your context window in use, for example `{"context_pct": 37}`. It is updated while the session works.
+
+   If the file does not exist, nothing has been recorded for this session. Say that the percentage is not recorded. Do not make up a number.
+
+3. **Claude session only: ask for the breakdown by category.** Skip this step if you are a Codex session, or if the user only wants the percentage.
+
+   Type `/context` into your own session:
+   ```sh
+   scripts/ccdm session send "$CCDM_SESSION_NAME" --literal /context --enter
    ```
-   This queues the command — it will execute after your current turn ends. Inform the user they need to send one more message so you get a new turn and can read the output. When they do, read the `/context` output from the conversation history.
+   `scripts/ccdm` is a file in the CCDM checkout, not in your project folder. The checkout is the folder in the variable `CCDM_REMINDER_PROJECT_ROOT`, so run it with the Bash tool as `"$CCDM_REMINDER_PROJECT_ROOT/scripts/ccdm" session send "$CCDM_SESSION_NAME" --literal /context --enter`. If you are root, the checkout is your working directory. The command is the same on macOS and Windows.
 
-   **If Codex session:**
-   The Codex bridge logs context % updates to the tmux pane whenever `thread/tokenUsage/updated` notifications arrive. Capture the pane output:
-   ```bash
-   tmux capture-pane -t <your_session_name> -p | grep -i "nickname\|context\|token"
-   ```
-   The most recent "Nickname updated: <name> · X%" line shows the current context usage. If no nickname updates have been logged yet, the session hasn't processed enough messages to have meaningful token usage — report it as near 0%.
+   The command only types the text. `/context` runs when your current turn ends, so you cannot read its output in this turn.
 
-4. **Report the results** back to the user with a clean summary:
-   - Total tokens used vs available (if known)
-   - Percentage used
-   - Breakdown by category (Claude Code only — system prompt, tools, messages, etc.)
-   - How much free space remains
+   Never run `scripts/ccdm session context` on your own session. It waits for the context grid, and the grid cannot appear until your turn ends, so it times out.
+
+4. **Report to the user.**
+   - Give the percentage from step 2, and how much is free (100 minus the percentage).
+   - If you ran step 3, tell the user: "The breakdown appears after your next message. Send one more message and I will read it." When their next message arrives, read the `/context` output in your conversation and report the tokens used and total, the percentage, the breakdown by category (system prompt, tools, messages and so on) and the free space.
+   - If you are a Codex session, say that the breakdown by category is only available for Claude sessions.

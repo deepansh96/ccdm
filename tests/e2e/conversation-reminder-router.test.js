@@ -17,6 +17,7 @@ import {
 } from "./support/router.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
+import { startThreadHost, supervisorEnv } from "./support/thread-supervisor.js";
 
 test.afterEach(async () => {
   await cleanup();
@@ -221,8 +222,13 @@ test("a router Codex reply is reminded as root with a nonce, deduped, cleared by
     seed.fixtures.discord.history = { "demo-channel": [], "beta-channel": [] };
   });
   await routerWithWebhooks(workspace, ["demo", "beta"]);
+  // On Windows the bridge runs on the fake ccdm-host, whose env moves the state
+  // root, so the reminder state is named.
+  if (process.platform === "win32") await startThreadHost(workspace);
   const started = await runScript(workspace, "scripts/start-codex-session.sh", {
-    args: ["demo"], env: routerEnv(workspace), timeoutMs: 30000,
+    args: ["demo"], timeoutMs: 30000,
+    env: process.platform === "win32"
+      ? supervisorEnv(workspace, { CCDM_REMINDER_STATE_DIR: context.stateDir, PYTHONUTF8: "1" }) : routerEnv(workspace),
   });
   assert.equal(started.exitCode, 0, started.stderr || started.stdout);
 

@@ -10,6 +10,8 @@ import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerRegistry, routerWith
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 import { startThreadSupervisor, supervisorEnv, supervisorStateDir, supervisorStatus, waitForThreadIdle } from "./support/thread-supervisor.js";
+import { PYTHON, platformGate } from "./support/platform.js";
+
 
 test.afterEach(cleanup);
 
@@ -37,6 +39,9 @@ function threadWorkspace() {
 }
 
 function fakeAgyBin(workspace) {
+  const fake = path.join(workspace.repoDir, "tests/e2e/support/fake-agy.cjs");
+  // Windows: the bridge runs a JavaScript agy under its own Node.
+  if (process.platform === "win32") return fake;
   const bin = path.join(workspace.tmpRoot, "agy-bin", "agy");
   fs.mkdirSync(path.dirname(bin), { recursive: true });
   // Named agy in ps, as the real binary is, so listener detection sees it.
@@ -69,7 +74,7 @@ async function supervised(workspace) {
 // stores one.
 function requestThread(workspace, { provider = "gemini", model = null, effort = null, account = null } = {}) {
   const store = path.join(supervisorStateDir(workspace), "threads.sqlite3");
-  execFileSync("python3", ["-c", `import sqlite3, sys
+  execFileSync(PYTHON, ["-c", `import sqlite3, sys
 db = sqlite3.connect(sys.argv[1], timeout=5)
 db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
   first_message, requester_id, requester_kind, status, thread_id, created_at)
@@ -155,7 +160,11 @@ test("an owner message in a Gemini thread of a Claude project boots a Gemini bri
   const state = readState(workspace.stateDir);
   const session = state.fixtures.tmux.sessions[THREAD_TMUX];
   assert.ok(session, JSON.stringify(Object.keys(state.fixtures.tmux.sessions)));
-  assert.deepEqual(session.command.slice(0, 5), ["env", "DISABLE_AUTO_UPDATE=true", "DISABLE_UPDATE_PROMPT=true", "zsh", "-ic"]);
+  if (process.platform === "win32") {
+    assert.deepEqual(session.command.slice(1, 3), ["scripts/gemini-bridge.js", "--ccdm-key-file"]);
+  } else {
+    assert.deepEqual(session.command.slice(0, 5), ["env", "DISABLE_AUTO_UPDATE=true", "DISABLE_UPDATE_PROMPT=true", "zsh", "-ic"]);
+  }
   const launchDir = path.join(workspace.routerStateDir, "launches", "demo", "threads", THREAD_ID);
   const surfaces = [JSON.stringify(session), JSON.stringify(created),
     ...fs.readdirSync(launchDir).map((file) => fs.readFileSync(path.join(launchDir, file), "utf8"))];
@@ -232,7 +241,7 @@ test("a restarted Gemini thread sends no turn of its own: its preamble rides alo
 
 test("a project's plain model goes only to threads of its own provider, and /model shows a Gemini model's own level", () => {
   const scripts = path.resolve("scripts");
-  const out = execFileSync("python3", ["-c", `import json, sys
+  const out = execFileSync(PYTHON, ["-c", `import json, sys
 sys.path.insert(0, sys.argv[1])
 from thread_supervisor import config, model_info, registry
 none = dict.fromkeys(("provider", "account", "model", "effort"))
@@ -263,12 +272,12 @@ print(json.dumps({
   assert.deepEqual([result.default.model, result.default.effort], ["gemini-4-neon", "high"]);
   assert.deepEqual(result.accounts, { x: "~/.x" });
   // With no account named, agy runs under the user's own home, shown by the alias naming it.
-  assert.deepEqual([result.main_account.account, result.main_account.home], ["agy-main", "~/.gemini/antigravity-cli"]);
+  assert.deepEqual([result.main_account.account, result.main_account.home], ["agy-main", path.join("~", ".gemini", "antigravity-cli")]);
   assert.deepEqual(result.switch, { account: null, model: null, effort: null, provider: "gemini" });
   assert.deepEqual(result.same, { provider: "claude", effort: "low" });
 });
 
-test("a Gemini thread with --account runs agy under that account's home, resumes there, and /model names it", async () => {
+test("a Gemini thread with --account runs agy under that account's home, resumes there, and /model names it", platformGate("posix", "agy on Windows does not take its account from HOME, so an account home other than the user's own is refused there"), async () => {
   const workspace = threadWorkspace();
   const accountHome = path.join(workspace.tmpRoot, "agy-work-home");
   fs.mkdirSync(accountHome);
@@ -284,7 +293,7 @@ test("a Gemini thread with --account runs agy under that account's home, resumes
   await waitFor(() => webhookPosts(workspace).length === 1, () => "the first reply", 20000);
   const dataDir = path.join(accountHome, ".gemini", "antigravity-cli");
   await threadRow(workspace, (current) => current.provider_conversation_id === SESSION_ID);
-  const stored = execFileSync("python3", ["-c", `import sqlite3, sys
+  const stored = execFileSync(PYTHON, ["-c", `import sqlite3, sys
 print(sqlite3.connect(sys.argv[1]).execute("SELECT provider_home FROM threads WHERE thread_id = ?", (sys.argv[2],)).fetchone()[0])`,
   path.join(supervisorStateDir(workspace), "threads.sqlite3"), THREAD_ID], { encoding: "utf8" }).trim();
   assert.equal(stored, dataDir);

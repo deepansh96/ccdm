@@ -3,8 +3,8 @@
 
 // Claude Code command hooks receive JSON on stdin. No prompt/agent hook is used.
 const fs = require("node:fs/promises");
-const os = require("node:os");
 const path = require("node:path");
+const { stateRoot } = require("./platform/paths.js");
 const reminder = require("./conversation-reminder-adapter.js");
 
 const root = process.env.CCDM_REMINDER_PROJECT_ROOT || path.resolve(__dirname, "..");
@@ -14,7 +14,7 @@ const launchId = process.env.CCDM_CLAUDE_LAUNCH_ID;
 // A thread session's conversation is its thread; a channel session's is the channel.
 const threadId = process.env.CCDM_CLAUDE_CONVERSATION_ID && process.env.CCDM_CLAUDE_CONVERSATION_ID !== channel
   ? process.env.CCDM_CLAUDE_CONVERSATION_ID : "";
-const stateDir = process.env.CCDM_REMINDER_STATE_DIR || path.join(os.homedir(), ".local", "state", "ccdm", "conversation-reminders");
+const stateDir = process.env.CCDM_REMINDER_STATE_DIR || path.join(stateRoot(), "conversation-reminders");
 const receiptsDir = process.env.CCDM_REMINDER_RECEIPTS_DIR || path.join(stateDir, "claude-receipts");
 const bindingPath = path.join(stateDir, "claude-sessions", `${launchId}.json`);
 

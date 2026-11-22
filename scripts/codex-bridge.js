@@ -2,17 +2,35 @@
 
 const { spawn } = require("child_process");
 const { createHmac, randomBytes } = require("crypto");
-const { writeFile, mkdir, mkdtemp, readFile, rm } = require("fs/promises");
+const { writeFile, mkdir, readFile, rm } = require("fs/promises");
 const { renameSync, rmSync, writeFileSync } = require("fs");
+const net = require("net");
 const os = require("os");
 const path = require("path");
 const WebSocket = require("ws");
+const { writeFileAtomic } = require("./platform/atomic.js");
+const { safeFileName, samePath, stateRoot } = require("./platform/paths.js");
+const { privateTmpDir } = require("./platform/privacy.js");
+const { killTree, killTreeSync, onShutdown, processIdentity, rememberSpawn } = require("./platform/process.js");
+const { resolveCommand } = require("./platform/tools.js");
+
+const WIN32 = process.platform === "win32";
+// Ctrl+Break also reaches the app-server, which may exit first. Its exit counts
+// as a lost runtime only if no stop request follows within this time.
+const WIN32_RUNTIME_LOSS_GRACE_MS = 500;
 
 const MCP_SERVER_SCRIPT = path.resolve(__dirname, "discord-mcp-server.js");
 const ROOT_DIR = path.resolve(__dirname, "..");
 const REGISTRY_PATH = path.join(ROOT_DIR, "registry.json");
-const REMINDER_STATE_DIR = process.env.CCDM_REMINDER_STATE_DIR || path.join(os.homedir(), ".local", "state", "ccdm", "conversation-reminders");
-const REMINDER_CONTEXT_FILE = path.join(REMINDER_STATE_DIR, `active-codex-${process.pid}.json`);
+const REMINDER_STATE_DIR = process.env.CCDM_REMINDER_STATE_DIR || path.join(stateRoot(), "conversation-reminders");
+// Named for the launch, not this process, so the next start of the same launch
+// can remove what a hard kill left behind.
+function reminderContextFileName() {
+  if (process.env.CCDM_ROUTER_ROLE === "root") return "active-codex-.root.json";
+  const thread = process.env.CCDM_THREAD_ID ? `.thread.${process.env.CCDM_THREAD_ID}` : "";
+  return safeFileName(`active-codex-${process.env.CCDM_CODEX_PROJECT || ""}${thread}.json`);
+}
+const REMINDER_CONTEXT_FILE = path.join(REMINDER_STATE_DIR, reminderContextFileName());
 const REMINDER_RECEIPTS_DIR = path.join(REMINDER_STATE_DIR, "receipts");
 process.env.CCDM_REMINDER_PROJECT_ROOT = ROOT_DIR;
 process.env.CCDM_REMINDER_STATE_DIR = REMINDER_STATE_DIR;
@@ -20,6 +38,8 @@ process.env.CCDM_REMINDER_CONTEXT_FILE = REMINDER_CONTEXT_FILE;
 process.env.CCDM_REMINDER_RECEIPTS_DIR = REMINDER_RECEIPTS_DIR;
 const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { createRouterTransport } = require("./codex-bridge-transport.js");
+const { arrivalOrder } = require("./lib/arrival-order.js");
+const { scheduleProjectRestart, scheduleRootRestart: scheduleRootRestartHelper } = require("./lib/restart-helper.js");
 const { markPaused, markReplied, markTurn } = require("./thread-activity.js");
 const modelInfo = require("./model-info.js");
 const routerPaths = require("./router/paths.js");
@@ -52,8 +72,6 @@ const AUDIO_TRANSCRIPTION_ENABLED = envFlag(
   "CODEX_BRIDGE_TRANSCRIBE_AUDIO",
   "USE_AUDIO_TRANSCRIPTION_IN_BRIDGE"
 );
-const AUDIO_TRANSCRIPTION_COMMAND =
-  process.env.CODEX_BRIDGE_AUDIO_TRANSCRIPTION_COMMAND || "whisper";
 const AUDIO_TRANSCRIPTION_MODEL =
   process.env.CODEX_BRIDGE_AUDIO_TRANSCRIPTION_MODEL || "turbo";
 const AUDIO_TRANSCRIPTION_LANGUAGE =
@@ -96,6 +114,17 @@ const LAUNCH_READY_FILE = process.env.CCDM_CHANNEL_READY_FILE || "";
 if (!ROUTER_KEY_FILE || (!ROUTER_ROOT && !ROUTER_PROJECT) || !CHANNEL_ID || !PROJECT_DIR) {
   console.error("Missing required env vars: CCDM_ROUTER_KEY_FILE, CCDM_CODEX_PROJECT, CHANNEL_ID, PROJECT_DIR");
   process.exit(1);
+}
+
+// A marker for stop and restart, which on Windows find a bridge by its command
+// line. The key is still read from CCDM_ROUTER_KEY_FILE.
+const keyFileFlag = process.argv.indexOf("--ccdm-key-file", 2);
+if (keyFileFlag !== -1) {
+  const flagged = process.argv[keyFileFlag + 1];
+  if (!flagged || !samePath(flagged, ROUTER_KEY_FILE)) {
+    console.error(`--ccdm-key-file names ${flagged || "no file"}, but CCDM_ROUTER_KEY_FILE names ${ROUTER_KEY_FILE}`);
+    process.exit(1);
+  }
 }
 
 let ws = null;
@@ -179,10 +208,6 @@ function envFlag(defaultValue, ...names) {
   return defaultValue;
 }
 
-function shellQuote(value) {
-  return `'${String(value).replaceAll("'", "'\"'\"'")}'`;
-}
-
 async function findCurrentProject() {
   const registry = JSON.parse(await readFile(REGISTRY_PATH, "utf8"));
   const project = registry.projects?.[ROUTER_PROJECT];
@@ -192,36 +217,17 @@ async function findCurrentProject() {
   return { projectName: ROUTER_PROJECT, screenName: project.screen_name };
 }
 
-function scheduleRestart(projectName, screenName) {
-  const safeName = projectName.replace(/[^a-zA-Z0-9._-]/g, "_");
-  const logPath = path.join(os.tmpdir(), `ccdm-restart-${safeName}.log`);
-  const command = [
-    `while kill -0 ${process.pid} 2>/dev/null; do sleep 1; done`,
-    `tmux kill-session -t ${shellQuote(`=${screenName}`)} 2>/dev/null || true`,
-    `cd ${shellQuote(ROOT_DIR)} && ./scripts/start-codex-session.sh ${shellQuote(projectName)} >> ${shellQuote(logPath)} 2>&1`,
-  ].join("; ");
-  const child = spawn("/bin/sh", ["-c", command], {
-    detached: true,
-    env: process.env,
-    stdio: "ignore",
-  });
-  child.unref();
-  return logPath;
+// The helper waits for this process to exit, so this bridge finishes its own cleanup first.
+function scheduleRestart(projectName) {
+  const { pid, startedAt } = processIdentity();
+  return scheduleProjectRestart(projectName, { afterPid: pid, afterStartedAt: startedAt });
 }
 
+// Root restarts through its own command, `ccdm restart-root`, as a helper outside
+// this session. It waits for this process too.
 function scheduleRootRestart() {
-  const logPath = path.join(os.tmpdir(), "ccdm-restart-root-codex.log");
-  const command = [
-    `while kill -0 ${process.pid} 2>/dev/null; do sleep 1; done`,
-    `cd ${shellQuote(ROOT_DIR)} && ./restart-root-codex-agent.sh ${shellQuote(CHANNEL_ID)} >> ${shellQuote(logPath)} 2>&1`,
-  ].join("; ");
-  const child = spawn("/bin/sh", ["-c", command], {
-    detached: true,
-    env: process.env,
-    stdio: "ignore",
-  });
-  child.unref();
-  return logPath;
+  const { pid, startedAt } = processIdentity();
+  return scheduleRootRestartHelper(CHANNEL_ID, { afterPid: pid, afterStartedAt: startedAt });
 }
 
 // With `timeoutMs`, a request the app-server never answers rejects instead
@@ -306,9 +312,9 @@ function isCurrentTurnNotification(msg) {
 
 async function initializeDiscordChannelScope() {
   if (!ROOT_MULTI_CHANNEL) return;
-  discordChannelScopeDir = await mkdtemp(path.join(os.tmpdir(), "codex-discord-scope-"));
+  discordChannelScopeDir = privateTmpDir("codex-discord-scope-");
   discordChannelScopeFile = path.join(discordChannelScopeDir, "active");
-  await writeFile(discordChannelScopeFile, "", { mode: 0o600 });
+  await writeFileAtomic(discordChannelScopeFile, "");
 }
 
 function createDiscordChannelScopeToken(msg) {
@@ -328,12 +334,12 @@ async function activateDiscordChannelScope(token) {
   if (!discordChannelScopeFile || !token) {
     throw new Error("Missing Discord channel scope for root turn");
   }
-  await writeFile(discordChannelScopeFile, token, { mode: 0o600 });
+  await writeFileAtomic(discordChannelScopeFile, token);
 }
 
 async function clearDiscordChannelScope() {
   if (ROOT_MULTI_CHANNEL && discordChannelScopeFile) {
-    await writeFile(discordChannelScopeFile, "", { mode: 0o600 });
+    await writeFileAtomic(discordChannelScopeFile, "");
   }
 }
 
@@ -593,9 +599,11 @@ function startCodexServer() {
       (CODEX_REASONING_EFFORT ? ` reasoning=${CODEX_REASONING_EFFORT}` : "") +
       (CODEX_SERVICE_TIER ? ` service_tier=${CODEX_SERVICE_TIER}` : "")
   );
+  const codex = resolveCommand("codex");
   codexProcess = spawn(
-    "codex",
+    codex.command,
     [
+      ...codex.args,
       "app-server",
       ...configArgs,
       "--listen",
@@ -604,9 +612,11 @@ function startCodexServer() {
     {
       cwd: PROJECT_DIR,
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env },
+      env: { ...process.env, ...codex.env },
+      windowsHide: true,
     }
   );
+  rememberSpawn(codexProcess);
 
   codexProcess.stdout.on("data", (data) => {
     console.log(`[codex stdout] ${data.toString().trim()}`);
@@ -617,14 +627,16 @@ function startCodexServer() {
   });
 
   codexProcess.on("exit", (code) => {
-    void exitAfterRuntimeLoss(`Codex app-server exited with code ${code}`);
+    const reportLoss = () => void exitAfterRuntimeLoss(`Codex app-server exited with code ${code}`);
+    if (WIN32) setTimeout(reportLoss, WIN32_RUNTIME_LOSS_GRACE_MS);
+    else reportLoss();
   });
 }
 
 // Every exit (a failed hello, a lost Router, a fatal error) takes the
 // app-server with it, so none is left holding the port.
 process.on("exit", () => {
-  if (codexProcess && codexProcess.exitCode === null && codexProcess.signalCode === null) codexProcess.kill();
+  if (codexProcess) killTreeSync(codexProcess);
 });
 
 async function connectWebSocket() {
@@ -1137,13 +1149,23 @@ async function sendBootstrapInstructionTurn(reason, { required = false } = {}) {
   }
 }
 
+// Settles once the latest `startCompaction` has posted its outcome: "Compaction
+// started.", or the error if it could not start. Settled while none is starting.
+let compactionStartPosted = Promise.resolve();
+
 async function onContextCompactionCompleted() {
   if (turnActive) {
     pendingBootstrapInstructionReason = "compact";
   } else {
     await sendBootstrapInstructionTurn("compact");
   }
-  await sendToDiscord("Compaction complete.");
+  // The channel as it is now: the compaction's turn can end during the wait.
+  const channelId = activeOutputChannelId || projectChannelId;
+  // "Compaction started." is posted only after the app-server has answered the
+  // request, and the completion can arrive together with that answer. Posting
+  // this only once that post has settled keeps the two in order.
+  await compactionStartPosted;
+  await sendToDiscord("Compaction complete.", channelId);
   activeOutputChannelId = null;
 }
 
@@ -1152,6 +1174,8 @@ async function startCompaction(channelId) {
   suppressTurnOutput = true;
   activeOutputChannelId = channelId;
   resetActiveTurnId();
+  let posted;
+  compactionStartPosted = new Promise((resolve) => { posted = resolve; });
   try {
     await sendRequest("thread/compact/start", { threadId });
     await sendToDiscord("Compaction started.", channelId);
@@ -1162,6 +1186,8 @@ async function startCompaction(channelId) {
     await sendToDiscord(`**Error:** Failed to compact — ${err.message || err}`, channelId);
     activeOutputChannelId = null;
     processQueue();
+  } finally {
+    posted();
   }
 }
 
@@ -1220,7 +1246,8 @@ async function downloadAttachment(url, filename) {
 }
 
 async function downloadTempAttachment(url, filename) {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "codex-bridge-audio-"));
+  // The temp directory on POSIX; on Windows a protected one under the state root.
+  const dir = privateTmpDir("codex-bridge-audio-");
   const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_") || "audio";
   const filePath = path.join(dir, safeName);
   const res = await fetch(url);
@@ -1235,7 +1262,7 @@ async function downloadTempAttachment(url, filename) {
 
 function runCommand(command, args) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8");
@@ -1279,7 +1306,10 @@ async function transcribeAudioAttachment(att) {
     if (AUDIO_TRANSCRIPTION_LANGUAGE) {
       args.push("--language", AUDIO_TRANSCRIPTION_LANGUAGE);
     }
-    await runCommand(AUDIO_TRANSCRIPTION_COMMAND, args);
+    // CODEX_BRIDGE_AUDIO_TRANSCRIPTION_COMMAND, or whisper. On Windows a missing
+    // whisper.exe throws here, and the turn gets the "could not be transcribed" text.
+    const whisper = resolveCommand("whisper");
+    await runCommand(whisper.command, [...whisper.args, ...args]);
     const transcriptPath = path.join(
       outputDir,
       `${path.parse(downloaded.filePath).name}.txt`
@@ -1471,7 +1501,7 @@ async function writeDiscordMcpConfig(mcpName) {
     keyPath: `mcp_servers.${mcpName}`,
     mergeStrategy: "replace",
     value: {
-      command: "node",
+      command: process.execPath,
       args: [MCP_SERVER_SCRIPT],
       // Codex stops waiting for a tool after 60 s by default; large reads and
       // exports may take up to the Router's longest per-op deadline.
@@ -1572,10 +1602,22 @@ function threadBootstrapText(bootstrap) {
 
 // Live events held until the bootstrap is sent, as [kind, handler, event].
 let heldThreadEvents = THREAD_MODE ? [] : null;
-const holdUntilBootstrap = (kind, handler) => async (event) => {
+const holdUntilBootstrap = (kind, handler) => async (event, next) => {
   if (heldThreadEvents) heldThreadEvents.push([kind, handler, event]);
-  else await handler(event);
+  else await handler(event, next);
 };
+
+// The transport delivers each Discord event without waiting for the handler of
+// the one before it, and a handler awaits several steps (attachments, reminder
+// events) before it acts. So each event waits here for the previous one: it
+// starts once that one has finished, or has called `next()` because what it
+// decided is in place and only app-server work remains. Messages and commands
+// then take effect in arrival order, and a stuck turn holds back no later one.
+// A handler that hangs before that point stops holding the others after the
+// limit, so a stuck download or helper cannot make the bridge deaf.
+const inArrivalOrder = arrivalOrder({
+  timeoutMs: Number(process.env.CCDM_CODEX_EVENT_ORDER_TIMEOUT_MS) || 30000,
+});
 
 async function startThreadConversation() {
   const bootstrap = await awaitThreadBootstrap();
@@ -1595,12 +1637,13 @@ async function startThreadConversation() {
   const included = new Set(bootstrap?.included_message_ids ?? []);
   const pending = heldThreadEvents.filter(([kind, , event]) => !(kind === "message" && included.has(event.id)));
   heldThreadEvents = null;
-  for (const [, handler, event] of pending) await handler(event);
+  // Lined up in one go, so a live event that arrives meanwhile runs after them.
+  await Promise.all(pending.map(([kind, handler, event]) => inArrivalOrder(kind, handler)(event)));
 }
 
 function startDiscordBot() {
   discordTransport.onScopeChange(applyProjectScope);
-  discordTransport.onReaction(holdUntilBootstrap("reaction", async (event) => {
+  discordTransport.onReaction(inArrivalOrder("reaction", holdUntilBootstrap("reaction", async (event, next = () => {}) => {
     if (!(await shouldHandleDiscordReaction(event.channelId, event.user))) return;
     let reaction;
     try {
@@ -1640,10 +1683,12 @@ function startDiscordBot() {
       lastOwnerInteraction?.assignment_generation === assignment.assignment_generation
       ? { id: lastOwnerInteraction.id, author: user, reminderAssignment: assignment, synthetic: true }
       : null;
-    await routeInput(input, reactionSource, channelId, channelScopeToken);
-  }));
+    const routed = routeInput(input, reactionSource, channelId, channelScopeToken);
+    next();
+    await routed;
+  })));
 
-  discordTransport.onMessage(holdUntilBootstrap("message", async (msg) => {
+  discordTransport.onMessage(inArrivalOrder("message", holdUntilBootstrap("message", async (msg, next = () => {}) => {
     if (!msg.author.bot && isCloseCommand(msg.content)) {
       // Root management routing reserves /close in every registered project
       // channel, whichever provider serves it; a project bridge only its own.
@@ -1711,7 +1756,9 @@ function startDiscordBot() {
         pendingCompactionChannelId = channelId;
         await sendToDiscord("Compaction queued.", channelId);
       } else {
-        await startCompaction(channelId);
+        const compaction = startCompaction(channelId);
+        next();
+        await compaction;
       }
       return;
     }
@@ -1726,6 +1773,8 @@ function startDiscordBot() {
       try {
         messageQueue = [];
         pendingCompactionChannelId = null;
+        // From here later messages queue for the new thread.
+        next();
         if (previousThreadId && (previousTurnId || turnActive)) {
           try {
             const interruptParams = { threadId: previousThreadId };
@@ -1790,14 +1839,14 @@ function startDiscordBot() {
       await discordTransport.react(msg, "🔄");
       try {
         if (ROOT_MULTI_CHANNEL) {
-          const logPath = scheduleRootRestart();
+          const logPath = await scheduleRootRestart();
           await sendToDiscord("Restarting root session — fresh thread coming up.", channelId);
           console.log(`Root restart scheduled; log: ${logPath}`);
           cleanup();
           return;
         }
         const { projectName, screenName } = await findCurrentProject();
-        const logPath = scheduleRestart(projectName, screenName);
+        const logPath = await scheduleRestart(projectName);
         await sendToDiscord("Restarting session — fresh thread coming up.", channelId);
         console.log(`Restart scheduled for '${projectName}' (${screenName}); log: ${logPath}`);
         cleanup();
@@ -1832,8 +1881,10 @@ function startDiscordBot() {
 
     console.log(`[discord] ${msg.author.username}: ${text || "(attachment)"} [${input.length} part(s)]`);
 
-    await routeInput(input, msg, channelId, channelScopeToken);
-  }));
+    const routed = routeInput(input, msg, channelId, channelScopeToken);
+    next();
+    await routed;
+  })));
 
   void (async () => {
     try {
@@ -1867,19 +1918,26 @@ function startDiscordBot() {
     await reminderAdapter.clearActiveContext().catch(() => {});
     discordTransport.destroy();
     if (ws) ws.close();
-    if (codexProcess) codexProcess.kill();
+    if (codexProcess) await killTree(codexProcess);
     if (discordChannelScopeDir) {
       rmSync(discordChannelScopeDir, { recursive: true, force: true });
     }
     process.exit(0);
   }
 
-  process.on("SIGTERM", cleanup);
-  process.on("SIGINT", cleanup);
-  process.on("SIGHUP", cleanup);
+  // Windows has no SIGTERM to send, so a launcher stops the bridge by closing
+  // its stdin. NUL, or no stdin at all, reads as EOF at once and is no request.
+  onShutdown(cleanup, { stdinEof: WIN32 && stdinIsPipe() });
+}
+
+// Node reports a Windows named pipe as neither FIFO nor file, so fs.fstat cannot tell.
+function stdinIsPipe() {
+  return process.stdin instanceof net.Socket && !process.stdin.isTTY;
 }
 
 async function main() {
+  // A hard kill skips clearActiveContext; its file must not outlive that turn.
+  await reminderAdapter.clearActiveContext();
   await loadRootAccess();
   await reminderAdapter.drainOutbox();
   await initializeDiscordChannelScope();

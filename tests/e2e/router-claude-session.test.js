@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { assertPrivate, platformGate } from "./support/platform.js";
 import { injectDiscordMessage, waitForState } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import {
@@ -13,6 +14,7 @@ import {
   routerWithWebhooks,
   runRouterCli,
 } from "./support/router.js";
+import { startFakeHost } from "./support/session-fixture.js";
 import { readState, seedTmuxSession, updateState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -35,8 +37,16 @@ function claudeRouterWorkspace() {
   return workspace;
 }
 
-function startSession(workspace, extraEnv = {}) {
-  return runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace, extraEnv) });
+// On Windows the launcher goes through the fake ccdm-host, sharing the fixture's session table.
+const fakeHosts = new WeakMap();
+async function launcherEnv(workspace) {
+  if (process.platform !== "win32") return {};
+  if (!fakeHosts.has(workspace)) fakeHosts.set(workspace, await startFakeHost(workspace, { env: routerEnv(workspace) }));
+  return fakeHosts.get(workspace).env;
+}
+
+async function startSession(workspace, extraEnv = {}) {
+  return runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace, { ...(await launcherEnv(workspace)), ...extraEnv }), timeoutMs: 30000 });
 }
 
 test("start-session launches a router Claude project whose channel server says hello to the Router", async () => {
@@ -114,11 +124,14 @@ test("no Discord bot or webhook token reaches the session environment, launch fi
     }
   }
   assert.deepEqual(Object.keys(mcpConfig.mcpServers), ["ccdm"]);
-  assert.deepEqual(mcpConfig.mcpServers.ccdm.args, [path.join(workspace.repoDir, "scripts", "ccdm-channel-server.js")]);
+  // A Windows temp folder can carry a short (8.3) name; the `ccdm` entry starts Python from the long one.
+  const repoAsLaunched = process.platform === "win32" ? fs.realpathSync.native(workspace.repoDir) : workspace.repoDir;
+  assert.equal(path.resolve(mcpConfig.mcpServers.ccdm.args[0]), path.join(repoAsLaunched, "scripts", "ccdm-channel-server.js"));
+  assert.deepEqual(mcpConfig.mcpServers.ccdm.args.slice(1), process.platform === "win32" ? ["--ccdm-key-file", path.join(workspace.routerStateDir, "keys", "demo.key")] : []);
   for (const file of fs.readdirSync(launchDir)) {
-    assert.equal(fs.statSync(path.join(launchDir, file)).mode & 0o777, 0o600, file);
+    assertPrivate(path.join(launchDir, file), file);
   }
-  assert.equal(fs.statSync(path.join(workspace.routerStateDir, "keys", "demo.key")).mode & 0o777, 0o600);
+  assertPrivate(path.join(workspace.routerStateDir, "keys", "demo.key"));
 });
 
 function assertLaunchCleanedUp(workspace) {
@@ -240,7 +253,7 @@ test("the statusline's context percentage rides on the next reply's Project Iden
   assert.equal(await ownerMessageReply(workspace, "owner-message-2", 2), "demo-claude · 57%");
 
   const context = path.join(workspace.routerStateDir, "launches", "demo", "context.json");
-  assert.equal(fs.statSync(context).mode & 0o777, 0o600);
+  assertPrivate(context);
 
   const nicknames = await runStatusline(workspace, "scripts/cc-discord-nicknames.sh", 61);
   assert.equal(nicknames.exitCode, 0, nicknames.stderr || nicknames.stdout);
@@ -320,9 +333,9 @@ test("an owner's image and text file reach Claude as metadata and download_attac
   assert.match(path.basename(notes), /^\d+-att-2\.txt$/);
   assert.equal(fs.readFileSync(shot, "utf8"), "fake png bytes");
   assert.equal(fs.readFileSync(notes, "utf8"), "remember the milk\n");
-  assert.equal(fs.statSync(shot).mode & 0o777, 0o600);
-  assert.equal(fs.statSync(notes).mode & 0o777, 0o600);
-  assert.equal(fs.statSync(inbox).mode & 0o777, 0o700);
+  assertPrivate(shot);
+  assertPrivate(notes);
+  assertPrivate(inbox);
 });
 
 test("a reply with a file and reply_to posts as demo with the upload and a jump-link first line", async () => {
@@ -442,13 +455,13 @@ test("export_message_range returns the supplementary Discord MCP's exported-to l
 
   const [exported] = await toolResults(workspace, 1);
   const exportText = exported.result.content[0].text;
-  assert.match(exportText, /^exported to \//, JSON.stringify(exported));
+  assert.match(exportText, /^exported to (?:\/|[A-Za-z]:\\)/, JSON.stringify(exported));
   const exportPath = exportText.replace(/^exported to /, "");
   const text = fs.readFileSync(exportPath, "utf8");
   assert.match(text, /Message ID: 102/);
   assert.match(text, /Message ID: 103/);
   assert.doesNotMatch(text, /Message ID: 101/);
-  assert.equal(fs.statSync(exportPath).mode & 0o777, 0o600);
+  assertPrivate(exportPath);
 });
 
 test("a read past 100 messages returns the supplementary Discord MCP's saved-transcript line", async () => {
@@ -467,13 +480,13 @@ test("a read past 100 messages returns the supplementary Discord MCP's saved-tra
 
   const [read] = await toolResults(workspace, 1);
   const text = read.result.content[0].text;
-  assert.match(text, /^saved 120 messages to \//, JSON.stringify(read));
+  assert.match(text, /^saved 120 messages to (?:\/|[A-Za-z]:\\)/, JSON.stringify(read));
   const transcript = text.replace(/^saved 120 messages to /, "");
   const lines = fs.readFileSync(transcript, "utf8").trim().split("\n");
   assert.equal(lines.length, 120);
   assert.equal(lines[0], "[2026-09-27T10:00:00.000Z] Alice: message 1030 (id: 1030)");
   assert.equal(lines.at(-1), "[2026-09-27T10:00:00.000Z] Alice: message 1149 (id: 1149)");
-  assert.equal(fs.statSync(transcript).mode & 0o777, 0o600);
+  assertPrivate(transcript);
 });
 
 test("tool calls aimed at another channel surface scope_violation to Claude and touch nothing in Discord", async () => {
@@ -572,8 +585,33 @@ function demoRuntime(workspace) {
   return { pid: registry.projects.demo.pid, key: fs.existsSync(keyFile) ? fs.readFileSync(keyFile, "utf8") : null };
 }
 
-// Restarts demo with `author`'s /restart and waits for the relaunched session
-// to hold a new PID record and a new key, with root's pane untouched.
+// Waits for the relaunched session to hold a new PID record and a new key and
+// to be connected to the Router again.
+async function waitForRelaunch(workspace, before) {
+  const deadline = Date.now() + 20000;
+  for (;;) {
+    const after = demoRuntime(workspace);
+    if (typeof after.pid === "number" && after.pid !== before.pid && after.key && after.key !== before.key) {
+      const status = await runRouterCli(workspace, ["status"]);
+      if (/sessions: 1\n  project demo scope=demo-channel connected=/.test(status.stdout)) return;
+    }
+    assert.ok(Date.now() < deadline, `demo never relaunched: ${JSON.stringify({ before, after })}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+async function waitForRestartLog(file) {
+  const deadline = Date.now() + 20000;
+  for (;;) {
+    const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+    if (/start-session exited 0/.test(text)) return text;
+    assert.ok(Date.now() < deadline, `the restart never finished: ${text}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+// Restarts demo with `author`'s /restart and waits for the relaunched session,
+// with root's pane untouched.
 async function assertRestartsOnlyDemo(workspace, author) {
   await routerWithWebhooks(workspace, ["demo"]);
   const started = await startSession(workspace);
@@ -583,16 +621,10 @@ async function assertRestartsOnlyDemo(workspace, author) {
 
   command(workspace, "cmd-restart", "/restart", author);
 
-  const deadline = Date.now() + 20000;
-  for (;;) {
-    const after = demoRuntime(workspace);
-    if (typeof after.pid === "number" && after.pid !== before.pid && after.key && after.key !== before.key) {
-      const status = await runRouterCli(workspace, ["status"]);
-      if (/sessions: 1\n  project demo scope=demo-channel connected=/.test(status.stdout)) break;
-    }
-    assert.ok(Date.now() < deadline, `demo never relaunched: ${JSON.stringify({ before, after })}`);
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
+  await waitForRelaunch(workspace, before);
+  const hostEnv = await launcherEnv(workspace);
+  const stateRoot = hostEnv.CCDM_STATE_ROOT ?? path.join(workspace.homeDir, ".local", "state", "ccdm");
+  assert.match(await waitForRestartLog(path.join(stateRoot, "logs", "restart-demo.log")), /stop-session exited 0/);
   const state = readState(workspace.stateDir);
   assert.equal(state.fixtures.tmux.lastKilledSessions.demo_claude.killAttempts, 1);
   assert.equal(state.fixtures.tmux.sessions.demo_claude.devChannelPrompt, "accepted");
@@ -611,4 +643,32 @@ test("/restart in demo's channel relaunches only demo, which reconnects with a n
 
 test("a guest's /restart follows the Codex bridge's allowed-user policy: demo restarts and root never does", async () => {
   await assertRestartsOnlyDemo(claudeRouterWorkspace(), { id: "guest-id", username: "Guest" });
+});
+
+test("on Windows the /restart helper is a host child outside the old session's Job and outlives it", platformGate("win32", "Jobs are a Windows facility"), async () => {
+  const workspace = claudeRouterWorkspace();
+  await routerWithWebhooks(workspace, ["demo"]);
+  const started = await startSession(workspace);
+  assert.equal(started.exitCode, 0, started.stderr || started.stdout);
+  const hostEnv = await launcherEnv(workspace);
+  const oldJob = readState(workspace.stateDir).fixtures.tmux.sessions.demo_claude.job;
+  assert.ok(oldJob.length > 0, "the fake host models the session's Job");
+  const before = demoRuntime(workspace);
+
+  command(workspace, "cmd-restart", "/restart", { id: OWNER_ID, username: "Owner" });
+
+  await waitForRelaunch(workspace, before);
+  const { detached } = readState(workspace.stateDir).fixtures.sessionHost;
+  assert.equal(detached.length, 1, JSON.stringify(detached));
+  const [helper] = detached;
+  assert.deepEqual(helper.argv.slice(-2), ["restart-session", "demo"]);
+  assert.equal(oldJob.includes(helper.pid), false, `helper ${helper.pid} is in the old Job ${oldJob}`);
+  assert.equal(helper.env.CCDM_ROUTER_STATE_DIR, workspace.routerStateDir);
+  assert.equal(helper.env.CCDM_STATE_ROOT, hostEnv.CCDM_STATE_ROOT);
+  assert.equal(helper.env.CCDM_DETACHED, "1");
+  assert.equal(Object.keys(helper.env).some((name) => name.toUpperCase() === "CCDM_SESSION_NAME"), false);
+  assert.equal(helper.log, path.join(hostEnv.CCDM_STATE_ROOT, "logs", "restart-demo.log"));
+  // The helper finished the start, which runs only after the old session ended.
+  const log = await waitForRestartLog(helper.log);
+  assert.ok(log.indexOf("stop-session exited 0") < log.indexOf("running start-session"), log);
 });

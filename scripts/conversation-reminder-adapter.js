@@ -3,13 +3,15 @@
 const { execFile } = require("node:child_process");
 const { createHash, randomUUID } = require("node:crypto");
 const fs = require("node:fs/promises");
-const os = require("node:os");
 const path = require("node:path");
 const { promisify } = require("node:util");
+const { stateRoot } = require("./platform/paths.js");
+
+const { pythonInvocation } = require("./platform/tools.js");
 
 const execFileAsync = promisify(execFile);
 const PROJECT_ROOT = process.env.CCDM_REMINDER_PROJECT_ROOT || path.resolve(__dirname, "..");
-const STATE_DIR = process.env.CCDM_REMINDER_STATE_DIR || path.join(os.homedir(), ".local", "state", "ccdm", "conversation-reminders");
+const STATE_DIR = process.env.CCDM_REMINDER_STATE_DIR || path.join(stateRoot(), "conversation-reminders");
 const OUTBOX_DIR = path.join(STATE_DIR, "outbox");
 const CONTEXT_FILE = process.env.CCDM_REMINDER_CONTEXT_FILE || "";
 const RECEIPTS_DIR = process.env.CCDM_REMINDER_RECEIPTS_DIR || "";
@@ -123,11 +125,10 @@ async function spoolEvent(event) {
 
 async function drainOutbox() {
   try {
-    const { stdout } = await execFileAsync(
-      process.env.CCDM_REMINDER_PYTHON || "python3",
+    const { stdout } = await execFileAsync(...pythonInvocation(
       [EVENT_RECEIVER, "drain", "--project-root", PROJECT_ROOT, "--state-dir", STATE_DIR],
       { encoding: "utf8", maxBuffer: 1024 * 1024 },
-    );
+    ));
     return JSON.parse(stdout);
   } catch {
     return { status: "retryable_failure" };

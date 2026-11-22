@@ -4,19 +4,30 @@ import path from "node:path";
 import test from "node:test";
 
 import { injectDiscordMessage } from "./support/bridge.js";
+import { PYTHON, platformGate } from "./support/platform.js";
 import { runNodeEntrypoint, runScript } from "./support/runner.js";
 import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerRegistry, routerWithWebhooks,
   waitFor } from "./support/router.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
-import { startThreadSupervisor, supervisorEnv, supervisorStatus } from "./support/thread-supervisor.js";
+import { assertSupervisorStops, startThreadSupervisor, supervisorEnv, supervisorStatus } from "./support/thread-supervisor.js";
 
 test.afterEach(cleanup);
 
 // Operator thread management, end to end: the real Router, Thread
 // Supervisor, start-thread-session.sh and CCDM channel server, with the
 // fixture claude and tmux. Discord inputs, the conversation resolver CLI and
-// threads.sh go in.
+// threads.sh go in; on Windows, where the sessions run on the fake ccdm-host,
+// `scripts/ccdm threads` does.
+const WIN = process.platform === "win32";
+// What the command calls itself in its usage and in front of each message.
+const COMMAND = WIN ? "scripts/ccdm threads" : "threads.sh";
+const PREFIX = WIN ? "ccdm threads" : "threads.sh";
+const USAGE = `usage: ${COMMAND} create <project> <name> [--provider claude|codex|gemini] [--account <alias>] ` +
+  `[--model <model>] [--effort <effort>] ${WIN ? "[--message-stdin|--message-file <path>]" : "[message…]"}\n` +
+  `       ${COMMAND} list [<project>]\n` +
+  `       ${COMMAND} stop|close [<project>] <name|link|id>\n` +
+  `       ${COMMAND} restart [<project>] <name|link|id> [--provider|--account|--model|--effort]\n`;
 const THREAD_ID = "1700000000000610001";
 const THREAD_TMUX = `demo_claude-t-${THREAD_ID}`;
 const SIBLING_ID = "1700000000000610002";
@@ -68,6 +79,8 @@ const notices = (workspace, threadId) => posts(workspace, threadId).filter(messa
   .map(({ content, authorization }) => ({ content, authorization }));
 const launches = (workspace, threadId) => claude(workspace).invocations
   .filter(invocation => invocation.env.CCDM_ROUTER_KEY_FILE?.endsWith(`.thread-${threadId}.key`));
+// A launch's arguments as Claude got them: tmux's are shell-quoted, the host's are not.
+const plainArgs = invocation => invocation.args.map(arg => arg.replace(/^'|'$/g, ""));
 const resumeArg = invocation => {
   const index = invocation.args.indexOf("--resume");
   return index < 0 ? null : invocation.args[index + 1].replace(/^'|'$/g, "");
@@ -113,9 +126,16 @@ async function resolve(workspace, ...args) {
   return { ...result, json: result.exitCode === 0 ? JSON.parse(result.stdout) : null };
 }
 
-function threadsCli(workspace, ...args) {
-  return runScript(workspace, "scripts/threads.sh", { args, env: supervisorEnv(workspace) });
+// The operator's thread command: the shim on macOS and Linux, `scripts/ccdm threads`
+// on Windows, where Python ends each printed line with CRLF.
+const unixLines = text => text.replace(/\r\n/g, "\n");
+async function threadsCommand(workspace, args, options = {}) {
+  const result = await runScript(workspace, WIN ? "scripts/ccdm" : "scripts/threads.sh",
+    { args: WIN ? ["threads", ...args] : args, env: supervisorEnv(workspace), ...options });
+  return { ...result, stdout: unixLines(result.stdout), stderr: unixLines(result.stderr) };
 }
+
+const threadsCli = (workspace, ...args) => threadsCommand(workspace, args);
 
 test("the resolver maps a channel id, a thread id and a thread link, and exits 2 on unknown or ambiguous input", async () => {
   const workspace = operationsWorkspace();
@@ -222,8 +242,7 @@ test("a threads.sh stop and an in-thread /restart that both arrive during a boot
   await threadRow(workspace, THREAD_ID, row => row.state === "booting");
 
   const started = Date.now();
-  const stopping = runScript(workspace, "scripts/threads.sh", { args: ["stop", THREAD_ID], env: supervisorEnv(workspace),
-    timeoutMs: 90000 });
+  const stopping = threadsCommand(workspace, ["stop", THREAD_ID], { timeoutMs: 90000 });
   // The stop is waiting on the launcher before the /restart arrives.
   await new Promise(resolve => setTimeout(resolve, 1500));
   injectDiscordMessage(workspace, { id: "restart-command", channelId: THREAD_ID, content: "/restart", author: OWNER });
@@ -283,8 +302,8 @@ test("threads.sh restart with settings configures and starts an existing registe
   const [launch] = launches(workspace, THREAD_ID);
   assert.equal(resumeArg(launch), null);
   assert.equal(launch.env.CLAUDE_CONFIG_DIR, path.join(workspace.homeDir, ".claude-work"));
-  assert.ok(launch.args.includes("'claude-next'"));
-  assert.ok(launch.args.includes("'high'"));
+  assert.ok(plainArgs(launch).includes("claude-next"));
+  assert.ok(plainArgs(launch).includes("high"));
   assert.match(notices(workspace, THREAD_ID).at(-1).content,
     /Settings saved: account work · model claude-next · effort high\. Starting a fresh conversation/);
 });
@@ -303,7 +322,7 @@ test("threads.sh restart with only model and effort keeps the conversation and r
   assert.deepEqual([row.model, row.effort, row.provider_conversation_id], ["claude-next", "high", conversationId]);
   const launch = launches(workspace, THREAD_ID)[1];
   assert.equal(resumeArg(launch), conversationId);
-  assert.ok(launch.args.includes("'claude-next'"));
+  assert.ok(plainArgs(launch).includes("claude-next"));
   assert.match(notices(workspace, THREAD_ID).at(-1).content,
     /^Settings saved: model claude-next · effort high\. Restarting this thread's session\.$/);
 });
@@ -355,15 +374,144 @@ test("every threads.sh subcommand fails clearly when the supervisor is down", as
   const workspace = operationsWorkspace();
   const supervisor = await supervised(workspace);
   await boundThread(workspace, THREAD_ID, "fix-login");
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
 
   for (const args of [["list"], ["list", "demo"], ["stop", "fix-login"], ["restart", link(THREAD_ID)],
     ["close", "demo", THREAD_ID], ["create", "demo", "x"]]) {
     const result = await threadsCli(workspace, ...args);
     assert.equal(result.exitCode, 1, `${args.join(" ")}: ${result.stdout}`);
     assert.match(result.stderr, /thread supervisor is not reachable/, args.join(" "));
+    assert.ok(result.stderr.startsWith(`${PREFIX}: `), `${args.join(" ")}: ${result.stderr}`);
+    if (WIN) assert.doesNotMatch(result.stderr, /threads\.sh/, args.join(" "));
   }
   assert.deepEqual(launches(workspace, THREAD_ID), []);
+});
+
+test("bad usage exits 2 with the usage text, and every message names threads.sh on macOS and Linux and scripts/ccdm threads on Windows", async () => {
+  const workspace = operationsWorkspace();
+  await supervised(workspace);
+  await boundThread(workspace, THREAD_ID, "fix-login");
+  const printed = [];
+
+  for (const args of [[], ["bogus"], ["create", "demo"], ["list", "demo", "extra"], ["stop"],
+    ["restart", "demo", "fix-login", "extra"]]) {
+    const refused = await threadsCli(workspace, ...args);
+    printed.push(refused);
+    assert.deepEqual([refused.exitCode, refused.stdout, refused.stderr], [2, "", `${PREFIX}: ${USAGE}`], args.join(" "));
+  }
+  for (const [args, reason] of [
+    [["create", "demo", "x", "--colour", "red"], "unknown flag --colour"],
+    [["create", "demo", "x", "--effort"], "--effort needs a value"],
+    [["create", "demo", "x", "--message-file"], "--message-file needs a value"],
+    [["create", "demo", "x", "--message-stdin", "--message-stdin"], "--message-stdin and --message-file give the first message once"],
+    [["create", "demo", "x", "--message-stdin", "some", "words"], "--message-stdin gives the first message, so no message words may follow it"],
+    [["list", "nowhere"], "unknown project 'nowhere'"],
+    [["close", "demo-channel"], "'demo-channel' is the channel of project 'demo', not a thread"],
+  ]) {
+    const refused = await threadsCli(workspace, ...args);
+    printed.push(refused);
+    assert.deepEqual([refused.exitCode, refused.stdout, refused.stderr], [2, "", `${PREFIX}: ${reason}\n`], args.join(" "));
+  }
+  // A thread nobody can name: the resolver's own reason, exit 2.
+  const unknown = await threadsCli(workspace, "stop", "no-such-thread");
+  printed.push(unknown);
+  assert.equal(unknown.exitCode, 2, unknown.stdout);
+  assert.match(unknown.stderr, /^conversation-resolver: .+/);
+
+  // The one form that is not an error: the usage alone, on stdout.
+  const help = await threadsCli(workspace, "--help");
+  printed.push(help);
+  assert.deepEqual([help.exitCode, help.stdout, help.stderr], [0, USAGE, ""]);
+  // The same after a verb: `--help` is not taken for a thread, a project or a name, and nothing is asked.
+  for (const args of [["create", "--help"], ["list", "--help"], ["stop", "--help"], ["restart", "-h"], ["close", "--help"]]) {
+    const verbHelp = await threadsCli(workspace, ...args);
+    printed.push(verbHelp);
+    assert.deepEqual([verbHelp.exitCode, verbHelp.stdout, verbHelp.stderr], [0, USAGE, ""], args.join(" "));
+  }
+
+  if (WIN) {
+    for (const { stdout, stderr } of printed) assert.doesNotMatch(stdout + stderr, /threads\.sh/);
+  }
+  assert.deepEqual(launches(workspace, THREAD_ID), []);
+  assert.equal((await threadRow(workspace, THREAD_ID)).state, "registered");
+});
+
+test("the shim and scripts/ccdm threads give the same output and exit codes", async () => {
+  const workspace = operationsWorkspace();
+  await supervised(workspace);
+  const env = supervisorEnv(workspace);
+  // No thread is bound, so `list` prints its header alone and no idle time can tick between the two runs.
+  for (const args of [[], ["--help"], ["stop", "--help"], ["list"], ["list", "nowhere"], ["stop", "no-such-thread"],
+    ["create", "demo", "x", "--colour", "red"]]) {
+    const shim = await runScript(workspace, "scripts/threads.sh", { args, env });
+    const direct = await runScript(workspace, "scripts/ccdm", { args: ["threads", ...args], env });
+    assert.deepEqual([direct.exitCode, direct.stdout, direct.stderr], [shim.exitCode, shim.stdout, shim.stderr],
+      args.join(" "));
+    assert.notEqual(shim.stdout + shim.stderr, "", args.join(" "));
+  }
+});
+
+// A command run inside a thread's session is ended with that session: on Windows
+// by the session's Job, or because it carries the thread's key file. Here a
+// stand-in for such a command carries the key-file pair, so the stop finds it.
+function inThreadCommand(workspace, threadId, verb) {
+  const standIn = path.join(workspace.tmpDir, "in-thread-command.cjs");
+  fs.writeFileSync(standIn, [
+    'const { spawnSync } = require("node:child_process");',
+    "const [program, ...args] = process.argv.slice(4);",
+    'const done = spawnSync(program, args, { encoding: "utf8", windowsHide: true });',
+    "process.stdout.write(JSON.stringify({ status: done.status, stdout: done.stdout, stderr: done.stderr }));",
+    "",
+  ].join("\n"));
+  const key = path.join(workspace.routerStateDir, "keys", `.thread-${threadId}.key`);
+  return runNodeEntrypoint(workspace, path.relative(workspace.repoDir, standIn), {
+    args: ["--ccdm-key-file", key, PYTHON, path.join(workspace.repoDir, "scripts", "ccdm.py"), "threads", verb, threadId],
+    env: supervisorEnv(workspace, { PYTHONUTF8: "1" }), timeoutMs: 30000,
+  });
+}
+
+test("on Windows, a stop and a restart run from inside the thread's own session are carried out by the supervisor, though the caller ends with the session", platformGate("win32", "POSIX ends a session's commands with its tmux session, which the fixture tmux does not model"), async () => {
+  const workspace = operationsWorkspace();
+  await supervised(workspace);
+  const firstPid = await liveThread(workspace, THREAD_ID, "fix-login");
+  const siblingPid = await liveThread(workspace, SIBLING_ID, "write-docs");
+  const { provider_conversation_id: conversationId } = await threadRow(workspace, THREAD_ID);
+  writeClaudeTranscript(workspace, conversationId);
+
+  // Restart: the old session and the caller are gone, and the thread is live again in the same conversation.
+  const restarting = await inThreadCommand(workspace, THREAD_ID, "restart");
+  assert.equal(restarting.stdout, "", `the caller was ended before it heard back: ${restarting.stdout}`);
+  await waitFor(() => launches(workspace, THREAD_ID).length === 2, () => "the restarted launch", 15000);
+  const restarted = await threadRow(workspace, THREAD_ID, row => row.state === "live");
+  assert.equal(restarted.provider_conversation_id, conversationId);
+  assert.equal(resumeArg(launches(workspace, THREAD_ID)[1]), conversationId);
+  assert.ok(!alive(firstPid), "the first session's process is gone");
+  assert.deepEqual(notices(workspace, THREAD_ID).map(notice => notice.content), ["Restarting this thread's session."]);
+  const secondPid = tmuxSessions(workspace)[THREAD_TMUX].pid;
+  assert.notEqual(secondPid, firstPid);
+
+  // Stop: the session and the caller are gone, the row is stopped/operator, and nothing restarts it.
+  const stopping = await inThreadCommand(workspace, THREAD_ID, "stop");
+  assert.equal(stopping.stdout, "", `the caller was ended before it heard back: ${stopping.stdout}`);
+  await gone(workspace, secondPid, THREAD_TMUX);
+  const row = await threadRow(workspace, THREAD_ID, current => current.state === "stopped");
+  assert.deepEqual([row.state, row.stop_reason, row.close_reason], ["stopped", "operator", null]);
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  assert.equal(launches(workspace, THREAD_ID).length, 2);
+  assert.equal((await threadRow(workspace, THREAD_ID)).state, "stopped");
+
+  assert.ok(alive(siblingPid), "the sibling thread's session still runs");
+  assert.equal((await threadRow(workspace, SIBLING_ID)).state, "live");
+
+  // Close, in the sibling: archived, its session gone, closed/close-command.
+  const closing = await inThreadCommand(workspace, SIBLING_ID, "close");
+  assert.equal(closing.stdout, "", `the caller was ended before it heard back: ${closing.stdout}`);
+  const closed = await threadRow(workspace, SIBLING_ID, current => current.state === "closed");
+  assert.deepEqual([closed.state, closed.stop_reason, closed.close_reason], ["closed", null, "close-command"]);
+  await gone(workspace, siblingPid, SIBLING_TMUX);
+  assert.deepEqual((discord(workspace).threadPatches ?? []).filter(patch => "archived" in patch.body)
+    .map(({ body, threadId }) => ({ body, threadId })), [{ body: { archived: true }, threadId: SIBLING_ID }]);
+  for (const caller of [restarting, stopping, closing]) assert.notEqual(caller.exitCode, 0, "the caller did not finish");
 });
 
 const relay = (workspace, ...args) => runScript(workspace, "scripts/send-claude-command.sh", { args,
@@ -379,7 +527,7 @@ test("send-claude-command.sh given a thread id or link sends the command only to
 
   const byId = await relay(workspace, THREAD_ID, "/compact");
   assert.equal(byId.exitCode, 0, byId.stderr || byId.stdout);
-  assert.match(byId.stdout, new RegExp(`Sent /compact to Claude thread ${THREAD_ID} in project 'demo' \\(tmux session '${THREAD_TMUX}'\\)`));
+  assert.match(byId.stdout, new RegExp(`Sent /compact to Claude thread ${THREAD_ID} in project 'demo' \\(${WIN ? "" : "tmux "}session '${THREAD_TMUX}'\\)`));
   const byLink = await relay(workspace, "--channel", link(THREAD_ID), "clear");
   assert.equal(byLink.exitCode, 0, byLink.stderr || byLink.stdout);
 

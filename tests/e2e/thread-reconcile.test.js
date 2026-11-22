@@ -6,9 +6,12 @@ import test from "node:test";
 import { injectDiscordMessage } from "./support/bridge.js";
 import { OWNER_ID, createRouterWorkspace, routerRegistry, routerWithWebhooks, runRouterCli, seedThreads,
   startRouter, waitFor } from "./support/router.js";
+import { PYTHON, platformGate } from "./support/platform.js";
+import { callSeam } from "./support/session-fixture.js";
 import { readState, updateState } from "./support/state.js";
-import { cleanup } from "./support/teardown.js";
-import { startThreadSupervisor, supervisorStatus } from "./support/thread-supervisor.js";
+import { cleanup, workspaceOwnsPid } from "./support/teardown.js";
+import { assertSupervisorStops, expectLateThreadHost, startThreadHost, startThreadSupervisor, supervisorEnv,
+  supervisorStatus } from "./support/thread-supervisor.js";
 
 test.afterEach(cleanup);
 
@@ -82,18 +85,48 @@ async function threadRows(workspace) {
   return (await supervisorStatus(workspace)).projects?.demo?.threads ?? {};
 }
 
-async function threadRow(workspace, threadId, predicate = () => true, timeoutMs = 15000) {
+const settle = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// The worker's own account of itself: whether it runs, its Router link, its rows.
+const account = status => JSON.stringify({ running: status?.running, router: status?.router,
+  threads: status?.projects?.demo?.threads ?? {} });
+
+// `explain`, when given, adds what else a failed wait should show.
+async function threadRow(workspace, threadId, predicate = () => true, timeoutMs = 15000, explain = null) {
   const deadline = Date.now() + timeoutMs;
   let last;
   while (Date.now() < deadline) {
-    last = await threadRows(workspace);
-    if (last[threadId] && predicate(last[threadId])) return last[threadId];
-    await new Promise(resolve => setTimeout(resolve, 50));
+    last = await supervisorStatus(workspace);
+    const row = last.projects?.demo?.threads?.[threadId];
+    if (row && predicate(row)) return row;
+    await settle(50);
   }
-  throw new Error(`thread ${threadId} never matched: ${JSON.stringify(last)}`);
+  throw new Error(`thread ${threadId} never matched: ${account(last)}${explain ? `\n${await explain()}` : ""}`);
 }
 
-const settle = ms => new Promise(resolve => setTimeout(resolve, ms));
+// Waits until the worker reports its Router link as `wanted` ("connected" or "disconnected").
+async function linkReports(workspace, wanted, explain, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  let last;
+  while (Date.now() < deadline) {
+    last = await supervisorStatus(workspace);
+    if (last.running && last.router === wanted) return;
+    await settle(50);
+  }
+  throw new Error(`the worker never reported its Router link as ${wanted}: ${account(last)}\n${await explain()}`);
+}
+
+// What a failed wait on a Router restart saw besides the rows: the Router's view of
+// its connections, each Router's log, and what the worker wrote, which it gives
+// up only when it ends, so the worker is stopped here.
+async function restartEvidence(workspace, supervisor, routers) {
+  const parts = [`router status:\n${(await runRouterCli(workspace, ["status"])).stdout}`];
+  routers.forEach((router, index) => parts.push(`router ${index + 1} log:\n${router.stdout}${router.stderr}`));
+  const ended = await Promise.race([supervisor.stop(), settle(10000).then(() => null)]);
+  parts.push(ended ? `worker exit ${ended.exitCode}, stderr:\n${ended.stderr}` : "the worker did not stop within 10 s");
+  return parts.join("\n");
+}
+
 const discord = workspace => readState(workspace.stateDir).fixtures.discord;
 const claude = workspace => readState(workspace.stateDir).fixtures.claude;
 const notifications = (workspace, threadId) => (claude(workspace).channelNotifications ?? [])
@@ -114,6 +147,30 @@ async function liveThread(workspace, raw) {
   await waitFor(() => threadPosts(workspace, raw.id).length === 1, () => "the bootstrap reply", 15000);
 }
 
+// Ends every process of a thread's session at once, as a crash does. POSIX signals
+// the session's process group. Windows has none, so each process in the session's
+// Job is ended, and only one this workspace started.
+function killSession(workspace, threadId) {
+  const session = readState(workspace.stateDir).fixtures.tmux.sessions[tmuxName(threadId)];
+  if (process.platform !== "win32") return process.kill(-session.pid, "SIGKILL");
+  for (const pid of session.job ?? [session.pid]) {
+    if (!workspaceOwnsPid(pid, workspace.tmpRoot)) continue;
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch (error) {
+      // Ending one process of the session can end another before its own turn comes.
+      if (error.code !== "ESRCH") throw error;
+    }
+  }
+}
+
+// The live sessions the session host lists: tmux, or ccdm-host on Windows.
+async function hostSessions(workspace) {
+  const listed = await callSeam(workspace, "python", "list", { env: supervisorEnv(workspace), python: PYTHON });
+  assert.equal(listed.ok, true, listed.message);
+  return listed.value.map(session => session.name);
+}
+
 async function disconnected(workspace, threadId) {
   const deadline = Date.now() + 15000;
   while (await threadConnected(workspace, threadId)) {
@@ -128,7 +185,7 @@ test("with the supervisor stopped, an owner message in a thread with no session 
   const raw = thread("1700000000000310001");
   threadEvent(workspace, raw, "create");
   await threadRow(workspace, raw.id);
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
 
   threadMessage(workspace, raw.id, "while-down", "anyone there?");
 
@@ -139,7 +196,7 @@ test("with the supervisor stopped, an owner message in a thread with no session 
 test("on restart, a thread created during the downtime binds, and a stranger's does not", async () => {
   const workspace = reconcileWorkspace();
   const { supervisor } = await supervised(workspace);
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
   const created = thread("1700000000000320001");
   const stranger = thread("1700000000000320002", { ownerId: "stranger-id" });
   threadEvent(workspace, created, "create");
@@ -160,7 +217,7 @@ test("on restart, an owner archive during the downtime is reverted and stops the
   const { supervisor } = await supervised(workspace);
   const raw = thread("1700000000000330001");
   await liveThread(workspace, raw);
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
 
   const snowflake = String((BigInt(Date.now()) - 1420070400000n) << 22n);
   updateState(workspace.stateDir, state => {
@@ -189,10 +246,9 @@ test("on restart, a killed session's row becomes stopped/crashed and is not rest
   const { supervisor } = await supervised(workspace);
   const raw = thread("1700000000000340001");
   await liveThread(workspace, raw);
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
 
-  const { pid } = readState(workspace.stateDir).fixtures.tmux.sessions[tmuxName(raw.id)];
-  process.kill(-pid, "SIGKILL");
+  killSession(workspace, raw.id);
   await disconnected(workspace, raw.id);
   threadMessage(workspace, raw.id, "after-crash", "are you still there?");
   await waitFor(() => reactions(workspace, raw.id).some(reaction => reaction.emoji === SLEEPING), () => "the 💤 mark");
@@ -209,6 +265,32 @@ test("on restart, a killed session's row becomes stopped/crashed and is not rest
     ["stopped", "crashed"]);
 });
 
+test("stopping the supervisor leaves a live thread session running, and a restarted supervisor keeps its row bound and starts nothing", async () => {
+  const workspace = reconcileWorkspace();
+  const { supervisor } = await supervised(workspace);
+  const raw = thread("1700000000000390001");
+  await liveThread(workspace, raw);
+  const conversationId = (await threadRows(workspace))[raw.id].provider_conversation_id;
+
+  await assertSupervisorStops(supervisor);
+
+  assert.ok((await hostSessions(workspace)).includes(tmuxName(raw.id)), "the session host still lists the session");
+  assert.equal(await threadConnected(workspace, raw.id), true);
+
+  await startThreadSupervisor(workspace, { env: ENV });
+  // The session the row is bound to hears the next message; no new one is launched for it.
+  threadMessage(workspace, raw.id, "after-restart", "still with me?");
+  await waitFor(() => notifications(workspace, raw.id).some(notification =>
+    String(notification.content).includes("still with me?")), () => "the message in the running session", 15000);
+  await settle(1500);
+
+  const row = (await threadRows(workspace))[raw.id];
+  assert.deepEqual([row.state, row.stop_reason, row.provider_conversation_id], ["live", null, conversationId]);
+  assert.equal(claude(workspace).invocations.length, 1);
+  assert.ok((await hostSessions(workspace)).includes(tmuxName(raw.id)), "the session host still lists the session");
+  assert.equal(await threadConnected(workspace, raw.id), true);
+});
+
 test("on restart, only a thread whose newest owner message is newer than the last agent reply starts, with the messages after that reply in its bootstrap exactly once", async () => {
   const workspace = reconcileWorkspace();
   const { supervisor } = await supervised(workspace);
@@ -217,7 +299,7 @@ test("on restart, only a thread whose newest owner message is newer than the las
   const guestOnly = thread("1700000000000350003");
   for (const raw of [waiting, answered, guestOnly]) threadEvent(workspace, raw, "create");
   for (const raw of [waiting, answered, guestOnly]) await threadRow(workspace, raw.id);
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
 
   // The owner's last message reached nobody, so the Router marked it.
   threadMessage(workspace, waiting.id, "waiting-owner-2", "and update the docs too");
@@ -276,16 +358,22 @@ test("an injected shardResume (gateway_resumed) runs the same reconcile", async 
 
 test("a Router restart (link reconnect) runs the same reconcile", async () => {
   const workspace = reconcileWorkspace();
-  const { router } = await supervised(workspace);
-  process.kill(-router.child.pid, "SIGKILL");
+  const { router, supervisor } = await supervised(workspace);
+  const routers = [router];
+  const evidence = () => restartEvidence(workspace, supervisor, routers);
+  if (process.platform === "win32") router.child.kill("SIGKILL");
+  else process.kill(-router.child.pid, "SIGKILL");
   await router.closed;
+  // The reconcile under test runs on the link's next hello, so the link must have lost this one.
+  await linkReports(workspace, "disconnected", evidence);
   const missed = thread("1700000000000370001");
   seedThreads(workspace, { [missed.id]: missed });
   seedHistory(workspace, missed.id, [["missed-owner-1", owner, "look at the flaky test"]]);
 
-  await startRouter(workspace);
+  routers.push(await startRouter(workspace));
 
-  await threadRow(workspace, missed.id, row => row.state === "live");
+  await linkReports(workspace, "connected", evidence);
+  await threadRow(workspace, missed.id, row => row.state === "live", 15000, evidence);
   await waitFor(() => notifications(workspace, missed.id).length === 1, () => "the bootstrap", 15000);
   assert.equal(occurrences(notifications(workspace, missed.id)[0].content, "look at the flaky test"), 1);
 });
@@ -297,8 +385,7 @@ test("a session that crashes while the supervisor runs is stopped/crashed, and t
   await liveThread(workspace, raw);
   const conversationId = (await threadRows(workspace))[raw.id].provider_conversation_id;
 
-  const { pid } = readState(workspace.stateDir).fixtures.tmux.sessions[tmuxName(raw.id)];
-  process.kill(-pid, "SIGKILL");
+  killSession(workspace, raw.id);
   await disconnected(workspace, raw.id);
   const crashed = await threadRow(workspace, raw.id, current => current.state === "stopped");
   assert.deepEqual([crashed.state, crashed.stop_reason], ["stopped", "crashed"]);
@@ -325,7 +412,7 @@ test("on restart, an owner's native reply to a root-bot message is root's and st
   const raw = thread("1700000000000380001");
   threadEvent(workspace, raw, "create");
   await threadRow(workspace, raw.id);
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
 
   // Newest first, as Discord returns it: the owner replied to root's message after the agent's reply.
   const root = { id: "fixture-bot-user-id", username: "root", bot: true };
@@ -351,6 +438,67 @@ test("on restart, an owner's native reply to a root-bot message is root's and st
 
   assert.equal((await threadRows(workspace))[raw.id].state, "registered");
   assert.deepEqual(claude(workspace).invocations ?? [], []);
+});
+
+// At logon the worker's task and ccdm-host's start in no order, so the worker's
+// first launch waits for the host, 90 s at most. The scale divides that.
+const beforeHost = platformGate("win32", "only the ccdm-host backend has a host to wait for");
+const hostWait = scale => ({ ...ENV, CCDM_THREAD_HOST_WAIT_TIME_SCALE: String(scale) });
+const notices = (workspace, threadId) => threadPosts(workspace, threadId).filter(message => !message.webhookId)
+  .map(message => message.content);
+
+// A bound thread whose owner message nobody answered, and no ccdm-host yet.
+async function unansweredWithNoHost(workspace, raw) {
+  expectLateThreadHost(workspace);
+  await routerWithWebhooks(workspace, ["demo"]);
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.replyText = "on it";
+  });
+  const first = await startThreadSupervisor(workspace, { env: ENV });
+  threadEvent(workspace, raw, "create");
+  await threadRow(workspace, raw.id);
+  await assertSupervisorStops(first);
+  threadMessage(workspace, raw.id, "before-host", "is the build green?");
+  await waitFor(() => reactions(workspace, raw.id).length === 1, () => "the 💤 mark");
+  seedHistory(workspace, raw.id, [["before-host", owner, "is the build green?"]]);
+}
+
+test("a worker that starts before ccdm-host holds its first launch until the host answers, then starts the unanswered thread with no failure notice", beforeHost, async () => {
+  const workspace = reconcileWorkspace();
+  const raw = thread("1700000000000390001");
+  await unansweredWithNoHost(workspace, raw);
+
+  const supervisor = await startThreadSupervisor(workspace, { env: hostWait(3) });
+  await threadRow(workspace, raw.id, row => row.state === "booting");
+  await settle(2000);
+  assert.equal((await threadRows(workspace))[raw.id].state, "booting");
+  assert.deepEqual(claude(workspace).invocations ?? [], []);
+  await startThreadHost(workspace);
+
+  await threadRow(workspace, raw.id, row => row.state === "live");
+  await waitFor(() => threadPosts(workspace, raw.id).length === 1, () => "the bootstrap reply", 15000);
+  assert.deepEqual(notices(workspace, raw.id), []);
+  assert.deepEqual(notifications(workspace, raw.id).map(notification => notification.meta.message_id), ["before-host"]);
+  assert.deepEqual(await hostSessions(workspace), [tmuxName(raw.id)]);
+  const { stderr } = await assertSupervisorStops(supervisor);
+  assert.equal(occurrences(stderr, "ccdm-host does not answer yet; waiting up to 90 s"), 1, stderr);
+  assert.equal(occurrences(stderr, "ccdm-host answers; launching"), 1, stderr);
+});
+
+test("when ccdm-host never answers, the first launch goes ahead after the bounded wait and fails with the usual notice", beforeHost, async () => {
+  const workspace = reconcileWorkspace();
+  const raw = thread("1700000000000390002");
+  await unansweredWithNoHost(workspace, raw);
+
+  const supervisor = await startThreadSupervisor(workspace, { env: hostWait(30) });
+
+  const row = await threadRow(workspace, raw.id, current => current.state === "stopped");
+  assert.deepEqual([row.state, row.stop_reason], ["stopped", "start-failed"]);
+  await waitFor(() => notices(workspace, raw.id).length === 1, () => "the start-failure notice", 15000);
+  assert.match(notices(workspace, raw.id)[0], /^Thread session failed to start: /);
+  assert.deepEqual(claude(workspace).invocations ?? [], []);
+  const { stderr } = await assertSupervisorStops(supervisor);
+  assert.equal(occurrences(stderr, "ccdm-host did not answer after 90 s; launching anyway"), 1, stderr);
 });
 
 test("on restart, a registered project whose channel Discord no longer has does not stop reconcile", async () => {

@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -107,17 +108,22 @@ _PERCENT_KEYS = (
     "percentage",
     "value",
 )
+_WINDOWS_FONT_DIR = os.path.join(os.environ.get("WINDIR") or "C:\\Windows", "Fonts")
 _FONT_PATHS = (
     "/System/Library/Fonts/SFNS.ttf",
     "/System/Library/Fonts/Supplemental/Arial.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    os.path.join(_WINDOWS_FONT_DIR, "segoeui.ttf"),
+    os.path.join(_WINDOWS_FONT_DIR, "arial.ttf"),
 )
 _BOLD_FONT_PATHS = (
     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
     "/System/Library/Fonts/SFNS.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    os.path.join(_WINDOWS_FONT_DIR, "segoeuib.ttf"),
+    os.path.join(_WINDOWS_FONT_DIR, "arialbd.ttf"),
 )
 
 

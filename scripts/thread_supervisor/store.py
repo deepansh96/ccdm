@@ -16,9 +16,10 @@ from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import sqlite3
-import stat
 import time
 import uuid
+
+from ccdmlib.platform.private_fs import is_private
 
 from .paths import private_directory
 
@@ -182,7 +183,7 @@ def _migrate(db: sqlite3.Connection, state_dir: Path, version: int) -> None:
 
 
 def _check_private(path: Path) -> None:
-    if stat.S_IMODE(path.stat().st_mode) & 0o077:
+    if not is_private(path):
         raise ValueError("thread store permissions are not private")
 
 

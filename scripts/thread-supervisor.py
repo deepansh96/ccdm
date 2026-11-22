@@ -17,18 +17,21 @@ import sys
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from ccdmlib.platform import commands  # noqa: E402
 from thread_supervisor.paths import default_state_dir  # noqa: E402
 from thread_supervisor import service  # noqa: E402
 from thread_supervisor.worker import AlreadyRunning, LinkStopped, run  # noqa: E402
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    # The service is a LaunchAgent on macOS and a scheduled task on Windows.
+    supervised_by = commands.service_noun()
+    parser = argparse.ArgumentParser(description=__doc__.replace("the LaunchAgent's", f"the {supervised_by}'s"))
     parser.add_argument("command", choices=("run", "status", "enable", "disable", "preflight"))
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--state-dir", type=Path, default=None)
     parser.add_argument("--supervised", action="store_true",
-                        help="with run: exit while the supervisor is disabled (the LaunchAgent's mode)")
+                        help=f"with run: exit while the supervisor is disabled (the {supervised_by}'s mode)")
     args = parser.parse_args()
     state_dir = args.state_dir or default_state_dir()
     try:

@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerRegistry, routerWithWebhooks,
   waitFor } from "./support/router.js";
+import { PYTHON, assertPrivate } from "./support/platform.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 import { startThreadSupervisor, supervisorCli, supervisorStateDir, supervisorStatus } from "./support/thread-supervisor.js";
@@ -57,18 +59,17 @@ async function fence(workspace, id = "fence-thread") {
   await waitFor(() => patches(workspace).some(patch => patch.threadId === id), () => `the ${id} PATCH`);
 }
 
+// A state directory the store accepts: mode 0700, or a protected DACL on Windows.
+function privateDir(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (process.platform === "win32") {
+    createRequire(import.meta.url)("../../scripts/platform/privacy.js").ensurePrivateDirSync(dir);
+  }
+}
+
 // A bound thread that has had no input yet has no turn status.
 const NO_TURN_YET = { whose_turn: null, last_input_class: null, turn_outcome: null, mark_message_id: null,
   mark_emoji: null, shown_message_id: null, shown_emoji: null };
-
-function modes(dir) {
-  const result = { [path.basename(dir)]: (fs.statSync(dir).mode & 0o777).toString(8) };
-  for (const name of fs.readdirSync(dir)) {
-    const file = path.join(dir, name);
-    if (fs.statSync(file).isFile()) result[name] = (fs.statSync(file).mode & 0o777).toString(8);
-  }
-  return result;
-}
 
 test("an owner-created thread binds, shows in status, and is PATCHed to a one-week auto-archive", async () => {
   const { workspace } = await supervisedWorkspace();
@@ -126,7 +127,7 @@ test("a bot-created thread binds only for a pending creation request, taking its
   const first = await startThreadSupervisor(workspace);
   assert.equal((await first.stop()).exitCode, 0);
   const store = path.join(supervisorStateDir(workspace), "threads.sqlite3");
-  execFileSync("python3", ["-c", `import sqlite3, sys
+  execFileSync(PYTHON, ["-c", `import sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
 db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
   first_message, requester_id, requester_kind, status, thread_id, created_at)
@@ -157,7 +158,7 @@ test("a request matches the thread whose id it recorded, and a stale unrecorded 
   const store = path.join(supervisorStateDir(workspace), "threads.sqlite3");
   // request-1 already recorded its thread; request-2's creation never got
   // that far, an hour ago.
-  execFileSync("python3", ["-c", `import sqlite3, sys
+  execFileSync(PYTHON, ["-c", `import sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
 db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
   first_message, requester_id, requester_kind, status, thread_id, created_at)
@@ -196,19 +197,17 @@ test(".supervisor.key is rewritten on each start, and the state is private", asy
   const keyFile = path.join(workspace.routerStateDir, "keys/.supervisor.key");
   const first = await startThreadSupervisor(workspace);
   const firstKey = fs.readFileSync(keyFile, "utf8");
-  assert.equal((fs.statSync(keyFile).mode & 0o777).toString(8), "600");
+  assertPrivate(keyFile);
   assert.equal((await first.stop()).exitCode, 0);
   await startThreadSupervisor(workspace);
   const secondKey = fs.readFileSync(keyFile, "utf8");
   assert.notEqual(secondKey, firstKey);
   assert.match(secondKey.trim(), /^[0-9a-f]{32,}$/);
   const stateDir = supervisorStateDir(workspace);
-  const stateModes = modes(stateDir);
-  assert.equal(stateModes["thread-supervisor"], "700");
-  assert.ok(stateModes["threads.sqlite3"], JSON.stringify(stateModes));
-  for (const [name, mode] of Object.entries(stateModes)) {
-    if (name !== "thread-supervisor") assert.equal(mode, "600", `${name}: ${JSON.stringify(stateModes)}`);
-  }
+  assertPrivate(stateDir);
+  const stateFiles = fs.readdirSync(stateDir).filter(name => fs.statSync(path.join(stateDir, name)).isFile());
+  assert.ok(stateFiles.includes("threads.sqlite3"), JSON.stringify(stateFiles));
+  for (const name of stateFiles) assertPrivate(path.join(stateDir, name), name);
 });
 
 // A process's environment: /proc/<pid>/environ on Linux, `ps -E` on macOS.
@@ -227,6 +226,7 @@ test("the supervisor holds no Discord token and sends nothing to Discord but Rou
   await waitFor(() => patches(workspace).length === 1, () => "the auto-archive PATCH");
   for (const pid of [supervisor.workerPid, supervisor.linkPid]) {
     assert.ok(Number.isInteger(pid), `pid ${pid}`);
+    if (process.platform === "win32") continue;  // Another process's environment cannot be read there.
     const environment = processEnvironment(pid);
     // The Router state override proves the environment was read.
     assert.match(environment, /CCDM_ROUTER_STATE_DIR=/);
@@ -237,6 +237,7 @@ test("the supervisor holds no Discord token and sends nothing to Discord but Rou
   const stateDir = supervisorStateDir(workspace);
   // Every file, past the control socket.
   for (const name of fs.readdirSync(stateDir).filter(name => fs.statSync(path.join(stateDir, name)).isFile())) {
+    if (process.platform === "win32" && name === "worker.lock") continue;  // Held under a mandatory lock; it stays empty.
     const content = fs.readFileSync(path.join(stateDir, name));
     assert.ok(!content.includes(ROOT_TOKEN), `${name} holds the token`);
   }
@@ -256,11 +257,11 @@ test("the store reports user_version 3, and an unexpected column is refused", as
   assert.deepEqual((await supervisorStatus(workspace)).store, { user_version: 3 });
   assert.equal((await supervisor.stop()).exitCode, 0);
   const store = path.join(supervisorStateDir(workspace), "threads.sqlite3");
-  const version = execFileSync("python3", ["-c",
+  const version = execFileSync(PYTHON, ["-c",
     "import sqlite3, sys; print(sqlite3.connect(sys.argv[1]).execute('PRAGMA user_version').fetchone()[0])", store],
   { encoding: "utf8" });
   assert.equal(version.trim(), "3");
-  execFileSync("python3", ["-c", "import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); " +
+  execFileSync(PYTHON, ["-c", "import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); " +
     "db.execute('ALTER TABLE threads ADD COLUMN runtime_bot TEXT'); db.commit()", store]);
   const status = await supervisorCli(workspace, "status");
   assert.equal(status.exitCode, 2, status.stdout);
@@ -268,6 +269,33 @@ test("the store reports user_version 3, and an unexpected column is refused", as
   const run = await supervisorCli(workspace, "run", { timeoutMs: 15000 });
   assert.equal(run.exitCode, 2, run.stdout);
   assert.match(run.json.reason, /thread store schema is unsupported/);
+});
+
+test("status answers with no worker, and reads an existing store in a protected state dir", async () => {
+  const workspace = createRouterWorkspace({ ...routerRegistry(), root_channels: ["root-channel"] });
+  const stateDir = supervisorStateDir(workspace);
+  const before = await supervisorStatus(workspace);
+  assert.deepEqual([before.running, before.router, before.store], [false, "not-running", null]);
+  execFileSync(PYTHON, ["-c", "import sys; sys.dont_write_bytecode = True; from pathlib import Path; " +
+    "sys.path.insert(0, sys.argv[1]); from thread_supervisor import store; " +
+    "store.connect(Path(sys.argv[2]), create=True).close()", path.join(process.cwd(), "scripts"), stateDir]);
+  assertPrivate(stateDir);
+  const after = await supervisorStatus(workspace);
+  assert.deepEqual([after.running, after.store], [false, { user_version: 3 }]);
+});
+
+test("--help says whose mode --supervised is: the LaunchAgent's, and on Windows the scheduled task's", async () => {
+  const workspace = createRouterWorkspace({ ...routerRegistry(), root_channels: ["root-channel"] });
+
+  const help = await supervisorCli(workspace, "--help");
+
+  assert.equal(help.exitCode, 0, help.stderr);
+  const text = help.stdout.replace(/\s+/g, " ");
+  const service = process.platform === "win32" ? "scheduled task" : "LaunchAgent";
+  assert.ok(text.includes(`\`run --supervised\` is the ${service}'s, which exits while \`disable\` is in force`), text);
+  assert.ok(text.includes(`exit while the supervisor is disabled (the ${service}'s mode)`), text);
+  if (process.platform === "win32") assert.doesNotMatch(text, /LaunchAgent/);
+  assert.equal(fs.existsSync(supervisorStateDir(workspace)), false, "help creates no state");
 });
 
 test("a status racing the store's creation never sees a half-made store", () => {
@@ -299,7 +327,7 @@ for round in range(30):
 print(json.dumps({"errors": errors, "reads": reads}))
 `;
   try {
-    const result = JSON.parse(execFileSync("python3", ["-c", race, scripts, base], { encoding: "utf8" }));
+    const result = JSON.parse(execFileSync(PYTHON, ["-c", race, scripts, base], { encoding: "utf8" }));
     assert.deepEqual(result.errors, []);
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
@@ -309,9 +337,9 @@ print(json.dumps({"errors": errors, "reads": reads}))
 // A schema-v1 store, as the supervisor wrote it before turn status, with one thread.
 function writeV1Store(workspace) {
   const state = supervisorStateDir(workspace);
-  fs.mkdirSync(state, { recursive: true, mode: 0o700 });
+  privateDir(state);
   const file = path.join(state, "threads.sqlite3");
-  execFileSync("python3", ["-c", `import os, sys
+  execFileSync(PYTHON, ["-c", `import os, sys
 sys.path.insert(0, sys.argv[1])
 import sqlite3
 from thread_supervisor import store
@@ -345,9 +373,9 @@ const V2_THREADS = `thread_id TEXT PRIMARY KEY, project TEXT NOT NULL, name TEXT
 
 function writeV2Store(workspace) {
   const state = supervisorStateDir(workspace);
-  fs.mkdirSync(state, { recursive: true, mode: 0o700 });
+  privateDir(state);
   const file = path.join(state, "threads.sqlite3");
-  execFileSync("python3", ["-c", `import os, sys
+  execFileSync(PYTHON, ["-c", `import os, sys
 sys.path.insert(0, sys.argv[1])
 import sqlite3
 from thread_supervisor import store
@@ -377,7 +405,7 @@ db.commit()`, path.join(process.cwd(), "scripts"), file, OWNER_ID, V2_THREADS]);
   return file;
 }
 
-const inspectStore = file => JSON.parse(execFileSync("python3", ["-c", `import json, sqlite3, sys
+const inspectStore = file => JSON.parse(execFileSync(PYTHON, ["-c", `import json, sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
 db.row_factory = sqlite3.Row
 print(json.dumps({"version": db.execute("PRAGMA user_version").fetchone()[0],
@@ -410,7 +438,7 @@ test("a v1 store is readable as it is, and migrates to v3 on the worker's start 
   for (const column of DROPPED_COLUMNS) assert.ok(!migrated.columns.includes(column), column);
   assert.deepEqual(migrated.rows, [["v1-thread", "stopped", "evicted"]]);
   const backup = path.join(supervisorStateDir(workspace), "threads.v1.backup.sqlite3");
-  assert.equal(fs.statSync(backup).mode & 0o777, 0o600);
+  assertPrivate(backup);
   const saved = inspectStore(backup);
   assert.equal(saved.version, 1);
   assert.deepEqual(saved.rows, [["v1-thread", "stopped", "evicted"]]);
@@ -438,7 +466,7 @@ test("a v2 store migrates to v3 keeping every row, without its board, ping or bo
   for (const row of migrated.threads) assert.deepEqual(MARK_COLUMNS.map(column => row[column]), [null, null, null, null]);
   assert.deepEqual([migrated.requests, migrated.buffers], [original.requests, original.buffers]);
   const backup = path.join(supervisorStateDir(workspace), "threads.v2.backup.sqlite3");
-  assert.equal(fs.statSync(backup).mode & 0o777, 0o600);
+  assertPrivate(backup);
   const saved = inspectStore(backup);
   assert.equal(saved.version, 2);
   assert.ok(saved.tables.includes("status_board"));
@@ -465,7 +493,7 @@ test("a failed migration leaves the v1 store as it was, and a newer store is ref
   assert.ok(!kept.columns.includes("mark_emoji"));
   assert.deepEqual(kept.rows, [["v1-thread", "stopped", "evicted"]]);
 
-  execFileSync("python3", ["-c", "import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); " +
+  execFileSync(PYTHON, ["-c", "import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); " +
     "db.execute('PRAGMA user_version=4'); db.commit()", file]);
   const status = await supervisorCli(workspace, "status");
   assert.equal(status.exitCode, 2, status.stdout);

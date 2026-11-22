@@ -5,8 +5,10 @@ import os from "node:os";
 import path from "node:path";
 
 import { assertIsolatedPath, buildCommandDiagnostics } from "./diagnostics.js";
+import { fixtureLauncher, gitBashTool, hookShell, interpreterFor, PYTHON, withoutGitBashTmpWarning } from "./platform.js";
 import { readState, recordCommandInvocation, writeState } from "./state.js";
-import { registerTeardownCallback } from "./teardown.js";
+import { createWorkspaceJob, registerTeardownCallback, workspaceOwnsPid } from "./teardown.js";
+import { retireStateDir } from "./state.js";
 
 // Deadlines are upper bounds that a passing test never waits out, so they
 // scale with load: parallel files on a busy machine run slower than one file
@@ -15,6 +17,8 @@ export const TIMEOUT_SCALE = Number(process.env.CCDM_E2E_TIMEOUT_SCALE) || 4;
 export function scaledTimeout(ms) {
   return ms * TIMEOUT_SCALE;
 }
+
+const WIN = process.platform === "win32";
 
 const FORBIDDEN_WORKSPACE_ARTIFACTS = [
   "registry.json",
@@ -35,6 +39,7 @@ const FIXTURE_TOOLS = new Set([
   "pgrep",
   "pkill",
   "ps",
+  "schtasks",
   "security",
   "sleep",
   "tmux",
@@ -57,12 +62,15 @@ const HOST_WRAPPERS = new Map([
   ["sed", null],
   ["tr", "/usr/bin/tr"],
   ["wc", "/usr/bin/wc"],
+  // On Windows the production resolver looks for `py` and `python`, never `python3`.
+  ...(WIN ? [["python", null]] : []),
 ]);
 
 function sourceRoot() {
   const result = spawnSync("git", ["rev-parse", "--show-toplevel"], {
     cwd: process.cwd(),
     encoding: "utf8",
+    windowsHide: true,
   });
   if (result.status !== 0) {
     throw new Error(result.stderr || "Unable to resolve git root");
@@ -74,6 +82,7 @@ function gitSourceFiles(root) {
   const result = spawnSync("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], {
     cwd: root,
     encoding: "buffer",
+    windowsHide: true,
   });
   if (result.status !== 0) {
     throw new Error(result.stderr.toString("utf8") || "Unable to list source files");
@@ -128,16 +137,21 @@ function shellQuote(value) {
 }
 
 function hostCommandPath(name) {
-  if (name === "python3") {
-    const python = spawnSync("python3", ["-c", "import sys; print(sys.executable)"], {
+  if (name === "python3" || name === "python") {
+    const python = spawnSync(PYTHON, ["-c", "import sys; print(sys.executable)"], {
       encoding: "utf8",
+      windowsHide: true,
     });
     if (python.status === 0 && python.stdout.trim()) {
       return python.stdout.trim();
     }
   }
+  if (WIN) {
+    return gitBashTool(name);
+  }
   const result = spawnSync("/bin/sh", ["-lc", `command -v ${name}`], {
     encoding: "utf8",
+    windowsHide: true,
   });
   if (result.status !== 0) {
     return null;
@@ -145,17 +159,28 @@ function hostCommandPath(name) {
   return result.stdout.trim() || null;
 }
 
+// The shell and flags Claude Code runs a hook command with on this OS: Git Bash
+// on Windows, or PowerShell when Git is absent.
+function fixtureHookShell() {
+  if (!WIN) return [hookShell(), "-c"];
+  const bash = gitBashTool("bash");
+  if (bash) return [bash, "-c"];
+  const windowsDir = process.env.SystemRoot || "C:\\Windows";
+  return [path.join(windowsDir, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"), "-NoProfile", "-Command"];
+}
+
 function createFixtureRuntime(fixtureDir) {
   const runtime = path.join(fixtureDir, "fixture-runtime.cjs");
   fs.copyFileSync(new URL("./state-lock.cjs", import.meta.url), path.join(fixtureDir, "state-lock.cjs"));
+  fs.copyFileSync(new URL("./session-fixture.js", import.meta.url), path.join(fixtureDir, "session-fixture.mjs"));
   writeExecutable(
     runtime,
     `#!/usr/bin/env node
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const { withStateLock } = require("./state-lock.cjs");
+const { replaceStateFile, withStateLock } = require("./state-lock.cjs");
 
 const tool = process.argv[2];
 const args = process.argv.slice(3);
@@ -167,6 +192,12 @@ if (!stateDir) {
 }
 
 const stateFile = path.join(stateDir, "state.json");
+
+// Teardown signals a recorded PID only when its command line holds this path.
+const workspaceMarker = path.dirname(stateDir);
+
+// The shell Claude Code runs hook commands with on this OS.
+const HOOK_SHELL = ${JSON.stringify(fixtureHookShell())};
 
 function initialState() {
   return {
@@ -217,6 +248,7 @@ function initialState() {
       },
       network: { blocked: [] },
       launchctl: { invocations: [], loaded: [], loadFailuresRemaining: 0, unloadFailuresRemaining: 0 },
+      schtasks: { definitions: {}, failures: {}, invocations: [], running: {}, tasks: [] },
       npm: { invocations: [] },
       npx: { invocations: [] },
       processes: [],
@@ -300,6 +332,13 @@ function normalizeState(value) {
         unloadFailuresRemaining: value?.fixtures?.launchctl?.unloadFailuresRemaining || 0,
       },
       processes: value?.fixtures?.processes || [],
+      schtasks: {
+        definitions: value?.fixtures?.schtasks?.definitions || {},
+        failures: value?.fixtures?.schtasks?.failures || {},
+        invocations: value?.fixtures?.schtasks?.invocations || [],
+        running: value?.fixtures?.schtasks?.running || {},
+        tasks: value?.fixtures?.schtasks?.tasks || [],
+      },
       security: {
         credentials: value?.fixtures?.security?.credentials || {},
         invocations: value?.fixtures?.security?.invocations || [],
@@ -326,7 +365,7 @@ function writeState(nextState) {
   fs.mkdirSync(stateDir, { recursive: true });
   const tmp = path.join(stateDir, \`.state.\${process.pid}.\${Date.now()}.tmp\`);
   fs.writeFileSync(tmp, \`\${JSON.stringify(normalizeState(nextState), null, 2)}\\n\`);
-  fs.renameSync(tmp, stateFile);
+  replaceStateFile(tmp, stateFile);
 }
 
 function updateState(updater) {
@@ -360,13 +399,14 @@ function activeOwnedProcesses(state) {
 }
 
 function spawnPlaceholder() {
-  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", workspaceMarker], {
     detached: true,
     env: {
       CCDM_FIXTURE_PLACEHOLDER: "1",
       CCDM_TEST_STATE: stateDir,
     },
     stdio: "ignore",
+    windowsHide: true,
   });
   child.unref();
   return child.pid;
@@ -390,16 +430,21 @@ function parseClaudeLaunch(shellCommand) {
   };
 }
 
+// A quoted launch-string value, as the shell would read it.
+function unescapeSingleQuotes(value) {
+  return value === undefined ? undefined : value.replace(/'\\\\''/g, "'");
+}
+
 function parseCodexBridgeLaunch(shellCommand) {
-  const match = /^cd '([^']*)' && ([\\s\\S]+) node scripts\\/codex-bridge\\.js$/.exec(shellCommand);
+  const match = /^cd '((?:[^']|'\\\\'')*)' && ([\\s\\S]+) node scripts\\/codex-bridge\\.js$/.exec(shellCommand);
   if (!match) {
     throw new Error(\`unsupported tmux launch command: \${shellCommand}\`);
   }
   const env = {};
   const envText = match[2];
-  const envRe = /([A-Z_]+)=(?:'([^']*)'|([^\\s]+))/g;
+  const envRe = /([A-Z_]+)=(?:'((?:[^']|'\\\\'')*)'|([^\\s]+))/g;
   for (const envMatch of envText.matchAll(envRe)) {
-    env[envMatch[1]] = envMatch[2] ?? envMatch[3];
+    env[envMatch[1]] = unescapeSingleQuotes(envMatch[2]) ?? envMatch[3];
   }
   // Every Codex launch is a Router launch: it carries the launch key file path
   // instead of any bot identity; root's names no project.
@@ -414,10 +459,25 @@ function parseCodexBridgeLaunch(shellCommand) {
     }
   }
   return {
-    cwd: match[1],
+    cwd: unescapeSingleQuotes(match[1]),
     env,
     bridgeCommand: "node scripts/codex-bridge.js",
   };
+}
+
+// An ad-hoc launch, such as a login: the seam's quoted form of any other program.
+function parseGenericLaunch(shellCommand) {
+  const match = /^cd '((?:[^']|'\\'')*)' && ((?:[A-Za-z_][A-Za-z0-9_]*='(?:[^']|'\\'')*' )*)(.+)$/.exec(shellCommand);
+  if (!match) {
+    throw new Error(\`unsupported tmux launch command: \${shellCommand}\`);
+  }
+  const env = {};
+  for (const envMatch of match[2].matchAll(/([A-Za-z_][A-Za-z0-9_]*)='((?:[^']|'\\'')*)'/g)) {
+    env[envMatch[1]] = unescapeSingleQuotes(envMatch[2]);
+  }
+  const argv = match[3].match(/'(?:[^']|'\\'')*'|[^\\s]+/g)
+    .map(word => (word.startsWith("'") ? unescapeSingleQuotes(word.slice(1, -1)) : word));
+  return { cwd: unescapeSingleQuotes(match[1]), env, argv };
 }
 
 // A Gemini launch runs the real gemini-bridge.js, which drives the agy
@@ -445,6 +505,10 @@ function parseTmuxLaunch(shellCommand) {
   }
   if (shellCommand.endsWith(" node scripts/gemini-bridge.js")) {
     return { kind: "gemini-bridge", ...parseGeminiBridgeLaunch(shellCommand) };
+  }
+  // Every Claude launch still goes through the listener checks.
+  if (!shellCommand.includes(" claude ")) {
+    return { kind: "generic", ...parseGenericLaunch(shellCommand) };
   }
   return { kind: "claude-listener", ...parseClaudeLaunch(shellCommand) };
 }
@@ -493,11 +557,15 @@ const DEV_CHANNEL_PROMPT = "WARNING: Loading development channels\\n\\n--dangero
 
 // The fake claude for a CCDM channel launch, detached like a tmux pane process.
 function spawnRouterClaude(name, launch) {
-  const child = spawn(process.execPath, [__filename, "claude", ...launch.claudeArgs], {
+  // Through the workspace's link to this file: __filename is in the shared
+  // fixture directory, which holds no workspace path.
+  const runtime = path.join(workspaceMarker, "fixtures", path.basename(__filename));
+  const child = spawn(process.execPath, [runtime, "claude", ...launch.claudeArgs], {
     cwd: launch.cwd,
     detached: true,
     env: { ...process.env, ...launch.env, CCDM_FIXTURE_TMUX_SESSION: name },
     stdio: "ignore",
+    windowsHide: true,
   });
   child.unref();
   return child.pid;
@@ -508,11 +576,18 @@ function spawnRouterClaude(name, launch) {
 function spawnRouterBridge(launch) {
   const script = launch.kind === "gemini-bridge" ? "gemini-bridge" : "codex-bridge";
   const logFile = fs.openSync(path.join(stateDir, \`\${script}-\${Date.now()}.log\`), "a");
-  const child = spawn(process.execPath, [path.join(launch.cwd, \`scripts/\${script}.js\`)], {
+  const child = spawn(process.execPath, [path.join(launch.cwd, \`scripts/\${script}.js\`), ...(launch.bridgeArgs ?? []), workspaceMarker], {
     cwd: launch.cwd,
     detached: true,
-    env: { ...process.env, ...launch.env },
+    // A tmux fixture has no stdin to hold open, so this bridge gets NUL and stops
+    // only when killed. On Windows PATH alone cannot name the fixture Codex.
+    env: {
+      ...process.env,
+      ...launch.env,
+      ...(process.platform === "win32" ? { CCDM_CODEX_PATH: path.join(workspaceMarker, "fixtures", "codex.exe") } : {}),
+    },
     stdio: ["ignore", logFile, logFile],
+    windowsHide: true,
   });
   fs.closeSync(logFile);
   child.unref();
@@ -538,10 +613,20 @@ function runRouterClaudeHost() {
   // \`fixtures.claude.holdHellosIn\` keeps a thread's channel server (and so its
   // Router hello) from starting until the thread's id leaves the list.
   const heldThread = String(process.env.CCDM_ROUTER_KEY_FILE || "").match(/\\.thread-([^/]+)\\.key$/)?.[1];
+  // new-session starts this process before it records the session, so a session
+  // that is missing is only gone once it has been seen. The limit ends the wait
+  // when new-session failed after starting it.
+  const recordedWithinMs = 30000;
+  const waitingSince = Date.now();
+  let sessionSeen = false;
   const waitForAccept = setInterval(() => {
     const state = readState();
     const session = state.fixtures.tmux.sessions[sessionName];
-    if (!session) process.exit(0);
+    if (!session) {
+      if (sessionSeen || Date.now() - waitingSince > recordedWithinMs) process.exit(0);
+      return;
+    }
+    sessionSeen = true;
     if (session.devChannelPrompt !== "accepted") return;
     if (heldThread && (state.fixtures.claude.holdHellosIn || []).includes(heldThread)) return;
     clearInterval(waitForAccept);
@@ -555,13 +640,13 @@ function runRouterClaudeHost() {
   } catch {
     // No settings, no hooks.
   }
-  const hookEnv = { ...process.env, PATH: \`\${path.dirname(process.execPath)}:\${process.env.PATH || ""}\` };
+  const hookEnv = { ...process.env, PATH: \`\${path.dirname(process.execPath)}\${path.delimiter}\${process.env.PATH || ""}\` };
   async function runHooks(event, fields = {}) {
     const input = JSON.stringify({ hook_event_name: event, session_id: sessionId, ...fields });
     for (const hook of (hooks[event] || []).flatMap((group) => group.hooks || [])) {
       if (hook.type !== "command") continue;
       const exitCode = await new Promise((done) => {
-        const child = spawn("/bin/sh", ["-c", hook.command], { env: hookEnv, stdio: ["pipe", "ignore", "ignore"] });
+        const child = spawn(HOOK_SHELL[0], [...HOOK_SHELL.slice(1), hook.command], { env: hookEnv, stdio: ["pipe", "ignore", "ignore"], windowsHide: true });
         child.on("exit", done);
         child.stdin.end(input);
       });
@@ -580,6 +665,7 @@ function runRouterClaudeHost() {
     const child = spawn(command, server.args || [], {
       env: serverEnv,
       stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
     });
     const logFile = path.join(stateDir, \`claude-channel-\${process.pid}.log\`);
     child.stderr.on("data", (chunk) => fs.appendFileSync(logFile, chunk));
@@ -641,8 +727,15 @@ function runRouterClaudeHost() {
             }
             if (toolScript) await runToolScript(toolScript, meta);
             // \`fixtures.claude.holdTurnsIn\` keeps a thread's turns running until its id leaves the list.
-            while ((readState().fixtures.claude.holdTurnsIn || []).includes(serverEnv.CCDM_THREAD_ID)) {
-              await new Promise((done) => setTimeout(done, 50));
+            // A held turn records its release and whether a second read still lists it, so a
+            // release that came from a misread of the state shows in the test's failure text.
+            const held = () => (readState().fixtures.claude.holdTurnsIn || []).includes(serverEnv.CCDM_THREAD_ID);
+            if (held()) {
+              while (held()) {
+                await new Promise((done) => setTimeout(done, 50));
+              }
+              record("turnHolds", { threadId: serverEnv.CCDM_THREAD_ID, releasedAt: new Date().toISOString(),
+                stillListed: held() });
             }
             // \`fixtures.claude.failTurnsIn\` ends a thread's turns with StopFailure, as an API error does.
             if ((readState().fixtures.claude.failTurnsIn || []).includes(serverEnv.CCDM_THREAD_ID)) {
@@ -662,233 +755,42 @@ function runRouterClaudeHost() {
   }
 }
 
+// tmux and the fake ccdm-host are the two fronts of one session model:
+// tests/e2e/support/session-fixture.js, copied beside this file.
+async function sessionFixture() {
+  const { createSessionFixture } = await import("./session-fixture.mjs");
+  return createSessionFixture({
+    DEV_CHANNEL_PROMPT, isAlive, normalizeSessionTarget, parseTmuxLaunch, readState,
+    recordClaudeInvocation, recordCodexBridgeInvocation, spawnPlaceholder, spawnRouterBridge, spawnRouterClaude,
+    stateDir, unquote, updateState, writeClaudeSession,
+  });
+}
+
+function fixtureFailure(error) {
+  console.error(error);
+  process.exit(1);
+}
+
 function runTmux() {
-  const subcommand = args[0];
-  if (subcommand === "has-session") {
-    const targetIndex = args.indexOf("-t");
-    const name = normalizeSessionTarget(args[targetIndex + 1]);
-    const session = readState().fixtures.tmux.sessions[name];
-    if (session?.startupMode === "exit") {
-      updateState((state) => { delete state.fixtures.tmux.sessions[name]; return state; });
-      process.exit(1);
-    }
-    process.exit(session ? 0 : 1);
-  }
+  sessionFixture().then((fixture) => fixture.runTmux(args)).catch(fixtureFailure);
+}
 
-  if (subcommand === "new-session") {
-    const sessionIndex = args.indexOf("-s");
-    const separatorIndex = args.indexOf("--");
-    const name = args[sessionIndex + 1];
-    const command = args.slice(separatorIndex + 1);
-    const wrapperEnv = {};
-    let shellIndex = 0;
-    if (command[shellIndex] === "env") {
-      shellIndex += 1;
-      while (shellIndex < command.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(command[shellIndex])) {
-        const assignment = command[shellIndex];
-        const equals = assignment.indexOf("=");
-        wrapperEnv[assignment.slice(0, equals)] = assignment.slice(equals + 1);
-        shellIndex += 1;
-      }
-    }
-    if (!name || separatorIndex === -1 || command[shellIndex] !== "zsh" ||
-        command[shellIndex + 1] !== "-ic" || !command[shellIndex + 2]) {
-      console.error("unsupported tmux new-session invocation");
-      process.exit(2);
-    }
-    const shellCommand = command[shellIndex + 2];
-    const tmuxState = readState().fixtures.tmux;
-    const preexistingSession = tmuxState.sessions[name];
-    if (tmuxState.newSessionFailures?.[name]) {
-      updateState((state) => {
-        state.fixtures.tmux.newSessionFailures[name] -= 1;
-        return state;
-      });
-      console.error("fixture tmux new-session failure");
-      process.exit(1);
-    }
-    // \`earlyExits[name]\` launches start and exit at once: the session is gone
-    // before anything can look at its pane.
-    if (tmuxState.earlyExits?.[name]) {
-      updateState((state) => {
-        state.fixtures.tmux.earlyExits[name] -= 1;
-        return state;
-      });
-      process.exit(0);
-    }
-    if (preexistingSession?.newSessionStatus) {
-      console.error("fixture tmux new-session failure");
-      process.exit(preexistingSession.newSessionStatus);
-    }
-    const priorKillAttempts =
-      tmuxState.lastKilledSessions?.[name]?.killAttempts ?? preexistingSession?.killAttempts ?? 0;
-    const launch = parseTmuxLaunch(shellCommand);
-    launch.env = { ...wrapperEnv, ...launch.env };
-    // A CCDM channel launch runs the fake claude, which hosts the real channel
-    // server once the development-channel confirmation is accepted.
-    const routerChannel = launch.kind === "claude-listener" && launch.claudeArgs.includes("server:ccdm");
-    const routerBridge = ["codex-bridge", "gemini-bridge"].includes(launch.kind) && Boolean(launch.env.CCDM_ROUTER_KEY_FILE);
-    const pid = routerChannel
-      ? spawnRouterClaude(name, launch)
-      : routerBridge ? spawnRouterBridge(launch) : spawnPlaceholder();
-    // A \`--resume <id>\` launch continues that session, as Claude does.
-    const resumeIndex = launch.kind === "claude-listener" ? launch.claudeArgs.indexOf("--resume") : -1;
-    const sessionId = resumeIndex >= 0 ? unquote(launch.claudeArgs[resumeIndex + 1]) : \`fixture-session-\${pid}\`;
-    const processCommand =
-      launch.kind === "gemini-bridge"
-        ? \`node scripts/gemini-bridge.js CHANNEL_ID='\${launch.env.CHANNEL_ID}' CCDM_ROUTER_KEY_FILE='\${launch.env.CCDM_ROUTER_KEY_FILE}'\`
-        : routerBridge
-        ? \`node scripts/codex-bridge.js CHANNEL_ID='\${launch.env.CHANNEL_ID}' WS_PORT='\${launch.env.WS_PORT}' CCDM_ROUTER_KEY_FILE='\${launch.env.CCDM_ROUTER_KEY_FILE}'\`
-        : launch.kind === "codex-bridge"
-        ? \`node scripts/codex-bridge.js CHANNEL_ID='\${launch.env.CHANNEL_ID}' BOT_APP_ID='\${launch.env.BOT_APP_ID}' WS_PORT='\${launch.env.WS_PORT}'\`
-        : \`claude \${launch.claudeArgs.join(" ")} CCDM_ROUTER_KEY_FILE='\${launch.env.CCDM_ROUTER_KEY_FILE}'\`;
-    const devChannelPrompt = routerChannel ? (tmuxState.devChannelPrompt === "never" ? "never" : "pending") : undefined;
-    const paneOutput =
-      launch.kind === "gemini-bridge"
-        ? "Gemini-Discord bridge running\\nListening in #channel-id\\n"
-        : launch.kind === "codex-bridge"
-        ? "Codex-Discord bridge running\\nListening in #channel-id\\n"
-        : devChannelPrompt === "pending"
-          ? DEV_CHANNEL_PROMPT
-          : devChannelPrompt === "never"
-            ? "Starting Claude Code\\n"
-            : "Listening for channel messages\\n";
-
-    updateState((state) => {
-      if (state.fixtures.tmux.sessions[name]) {
-        const existing = state.fixtures.tmux.sessions[name];
-        if (existing.killFailuresRemaining || existing.newSessionStatus) {
-          throw new Error(\`duplicate tmux session: \${name}\`);
-        }
-      }
-      state.fixtures.tmux.sessions[name] = {
-        name,
-        command,
-        wrapperEnv,
-        cwd: launch.cwd,
-        env: launch.env,
-        bridgeCommand: launch.bridgeCommand,
-        paneOutput,
-        ...(devChannelPrompt ? { devChannelPrompt } : {}),
-        pid,
-        killAttempts: priorKillAttempts,
-        shellCommand,
-        startupMode: tmuxState.startupMode,
-      };
-      state.fixtures.processes.push({
-        command: processCommand,
-        kind: launch.kind,
-        owned: true,
-        ownerStateDir: stateDir,
-        pid,
-        ppid: process.pid,
-      });
-      return state;
-    });
-    if (launch.kind === "gemini-bridge") {
-      updateState((state) => {
-        state.fixtures.gemini = state.fixtures.gemini || { bridgeInvocations: [] };
-        state.fixtures.gemini.bridgeInvocations.push({ command: launch.bridgeCommand, cwd: launch.cwd, env: launch.env, pid });
-        return state;
-      });
-    } else if (launch.kind === "codex-bridge") {
-      recordCodexBridgeInvocation({
-        command: launch.bridgeCommand,
-        cwd: launch.cwd,
-        env: launch.env,
-        pid,
-      });
-    } else {
-      recordClaudeInvocation({
-        args: launch.claudeArgs,
-        cwd: launch.cwd,
-        env: launch.env,
-        pid,
-        sessionId,
-      });
-      // \`fixtures.claude.omitSessionFile\`: Claude never writes its session file.
-      if (!readState().fixtures.claude.omitSessionFile) writeClaudeSession(pid, sessionId, launch.env.CLAUDE_CONFIG_DIR);
-    }
-    process.exit(0);
-  }
-
-  if (subcommand === "kill-session") {
-    const targetIndex = args.indexOf("-t");
-    const name = normalizeSessionTarget(args[targetIndex + 1]);
-    const state = readState();
-    const session = state.fixtures.tmux.sessions[name];
-    if (!session) {
-      process.exit(1);
-    }
-    updateState((nextState) => {
-      const nextSession = nextState.fixtures.tmux.sessions[name];
-      nextSession.killAttempts = (nextSession.killAttempts || 0) + 1;
-      if (nextSession.killFailuresRemaining > 0) {
-        nextSession.killFailuresRemaining -= 1;
-      } else {
-        nextState.fixtures.tmux.lastKilledSessions = {
-          ...(nextState.fixtures.tmux.lastKilledSessions || {}),
-          [name]: { killAttempts: nextSession.killAttempts },
-        };
-        delete nextState.fixtures.tmux.sessions[name];
-      }
-      return nextState;
-    });
-    process.exit(session.killFailuresRemaining > 0 ? 1 : 0);
-  }
-
-  if (subcommand === "display-message") {
-    const targetIndex = args.indexOf("-t");
-    const name = normalizeSessionTarget(args[targetIndex + 1]);
-    const session = readState().fixtures.tmux.sessions[name];
-    if (!session) {
-      process.exit(1);
-    }
-    if (args.includes("#{pane_pid}")) {
-      process.stdout.write(session.panePid ? \`\${session.panePid}\\n\` : "");
-      process.exit(0);
-    }
-    console.error(\`unsupported tmux display-message format: \${args.join(" ")}\`);
-    process.exit(2);
-  }
-
-  if (subcommand === "capture-pane") {
-    const targetIndex = args.indexOf("-t");
-    const name = normalizeSessionTarget(args[targetIndex + 1]);
-    const session = readState().fixtures.tmux.sessions[name];
-    if (!session) {
-      process.exit(1);
-    }
-    process.stdout.write(session.paneOutput || "");
-    process.exit(0);
-  }
-
-  if (subcommand === "send-keys") {
-    const targetIndex = args.indexOf("-t");
-    const name = normalizeSessionTarget(args[targetIndex + 1]);
-    updateState((state) => {
-      const session = state.fixtures.tmux.sessions[name] || { name };
-      session.sendKeys = [...(session.sendKeys || []), args.slice(targetIndex + 2)];
-      if (session.devChannelPrompt === "pending" && args[targetIndex + 2] === "Enter") {
-        session.devChannelPrompt = "accepted";
-        session.paneOutput = "Listening for channel messages from: server:ccdm\\n";
-      }
-      state.fixtures.tmux.sessions[name] = session;
-      return state;
-    });
-    process.exit(0);
-  }
-
-  console.error(\`unsupported tmux command: \${args.join(" ")}\`);
-  process.exit(2);
+function runFakeHost() {
+  sessionFixture().then((fixture) => fixture.runFakeHost()).catch(fixtureFailure);
 }
 
 function runPs() {
+  if (args.join(" ") === "-axo pid=,ppid=") {
+    for (const row of reportableProcesses(readState())) {
+      process.stdout.write(\`\${String(row.pid).padStart(5, " ")} \${String(row.ppid).padStart(5, " ")}\\n\`);
+    }
+    return;
+  }
   if (args.join(" ") !== "axeww -o pid=,command=") {
     console.error("unsupported ps invocation");
     process.exit(2);
   }
-  const rows = activeOwnedProcesses(readState());
+  const rows = reportableProcesses(readState());
   for (const row of rows) {
     process.stdout.write(\`\${String(row.pid).padStart(5, " ")} \${row.command}\\n\`);
   }
@@ -900,28 +802,75 @@ function runPgrep() {
     process.exit(2);
   }
   const parentPid = Number(args[1]);
-  const rows = activeOwnedProcesses(readState()).filter((row) => row.ppid === parentPid);
+  const rows = reportableProcesses(readState()).filter((row) => row.ppid === parentPid);
   for (const row of rows) {
     process.stdout.write(\`\${row.pid}\\n\`);
   }
   process.exit(rows.length > 0 ? 0 : 1);
 }
 
+// PID to command line, for those of \`pids\` still running.
+function commandLinesOf(pids) {
+  const found = new Map();
+  if (process.platform === "win32" && pids.length > 0) {
+    const powershell = path.join(process.env.SystemRoot || "C:\\\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    const filter = pids.map((pid) => \`ProcessId=\${pid}\`).join(" OR ");
+    // A WMI query by type name, not Get-CimInstance. Under a workspace's empty
+    // profile PowerShell has no module cache, and on a CI runner finding that
+    // cmdlet's module outlasted the 60 seconds below, so nothing was signalled.
+    const script = \`[Console]::OutputEncoding=[Text.Encoding]::UTF8;foreach ($row in ([wmisearcher]'SELECT ProcessId, CommandLine FROM Win32_Process WHERE \${filter}').Get()) { [string]$row.ProcessId + ' ' + $row.CommandLine }\`;
+    const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 60000, windowsHide: true });
+    for (const line of String(result.stdout || "").split(/\\r?\\n/)) {
+      const match = /^(\\d+) (.*)$/.exec(line);
+      if (match) found.set(Number(match[1]), match[2]);
+    }
+    return found;
+  }
+  const ps = fs.existsSync("/bin/ps") ? "/bin/ps" : "ps";
+  for (const pid of pids) {
+    const result = spawnSync(ps, ["-ww", "-o", "command=", "-p", String(pid)], { encoding: "utf8", timeout: 15000, windowsHide: true });
+    if (result.status === 0) found.set(pid, result.stdout.trim());
+  }
+  return found;
+}
+
+// What \`ps\` and \`pgrep\` report, which production code goes on to signal. Windows
+// reuses PIDs quickly, so there a row must also still hold this workspace's path.
+function reportableProcesses(state) {
+  const rows = activeOwnedProcesses(state);
+  if (process.platform !== "win32") return rows;
+  const commandLines = commandLinesOf(rows.map((row) => row.pid));
+  return rows.filter((row) => commandLines.get(row.pid)?.includes(workspaceMarker));
+}
+
 function runPkill() {
+  fs.appendFileSync(path.join(stateDir, "session-calls.ndjson"), \`\${JSON.stringify({ front: "pkill", args })}\\n\`);
   if (args[0] !== "-TERM" || args[1] !== "-P" || !args[2] || args.length !== 3) {
     console.error("unsupported pkill invocation");
     process.exit(2);
   }
   const parentPid = Number(args[2]);
   const rows = activeOwnedProcesses(readState()).filter((row) => row.ppid === parentPid);
+  const commandLines = commandLinesOf(rows.map((row) => row.pid));
+  let signalled = 0;
   for (const row of rows) {
+    // A recorded PID may have been reused; signal only what holds this workspace's path.
+    if (!commandLines.get(row.pid)?.includes(workspaceMarker)) {
+      updateState((state) => {
+        state.fixtures.pkillSkips = [...(state.fixtures.pkillSkips || []), { marker: workspaceMarker, pid: row.pid }];
+        return state;
+      });
+      console.error(\`ccdm-fixture-pkill skipped pid \${row.pid}: its command line does not hold \${workspaceMarker}\`);
+      continue;
+    }
     try {
       process.kill(row.pid, "SIGTERM");
+      signalled += 1;
     } catch {
       // The process may have already exited.
     }
   }
-  process.exit(rows.length > 0 ? 0 : 1);
+  process.exit(signalled > 0 ? 0 : 1);
 }
 
 function runClaude() {
@@ -1304,6 +1253,7 @@ function runCodex() {
       env: { WS_PORT: process.env.WS_PORT },
       pid: process.pid,
       port,
+      startedAt: processModule().processStartTime(process.pid),
     });
     return nextState;
   });
@@ -1315,13 +1265,156 @@ function runCodex() {
   if (server.exitImmediately) {
     process.exit(server.exitCode ?? 1);
   }
-  process.on("SIGTERM", () => process.exit(0));
-  process.on("SIGINT", () => process.exit(0));
+  // Fields on the server record, for tests of how this process was stopped.
+  const markServer = (values) => updateState((nextState) => {
+    Object.assign(nextState.fixtures.codex.servers[port], values(nextState.fixtures.codex.servers[port]));
+    return nextState;
+  });
+  // A held port lets a test see that this process's sockets went with it. The
+  // protocol server is the test's own and stays up throughout.
+  if (server.heldPort) require("node:net").createServer().listen(server.heldPort, "127.0.0.1");
+  const onSignal = (signal) => {
+    if (!server.recordSignals) process.exit(0);
+    markServer((record) => ({ signals: [...(record.signals || []), signal] }));
+    setTimeout(() => process.exit(0), 300);
+  };
+  process.on("SIGTERM", () => onSignal("SIGTERM"));
+  process.on("SIGINT", () => onSignal("SIGINT"));
+  // For a test of teardown, which must also stop a fake that does not go by itself.
+  if (server.outliveBridge) {
+    setInterval(() => {}, 1000);
+    return;
+  }
   // Like a pane process, it goes when its bridge does, never left orphaned.
-  const parent = process.ppid;
+  watchBridge(() => {
+    try {
+      markServer(() => ({ watchdogFired: true }));
+    } finally {
+      // Teardown may already have removed the workspace; go regardless.
+      process.exit(0);
+    }
+  });
+}
+
+function processModule() {
+  return require(path.join(workspaceMarker, "repo", "scripts", "platform", "process.js"));
+}
+
+// The process that started \`pid\`, whether or not that one is still running.
+function parentPidOf(pid) {
+  const koffi = require("koffi");
+  const HANDLE = koffi.pointer(koffi.opaque());
+  const kernel32 = koffi.load("kernel32.dll");
+  const OpenProcess = kernel32.func("__stdcall", "OpenProcess", HANDLE, ["uint32_t", "int", "uint32_t"]);
+  const CloseHandle = kernel32.func("__stdcall", "CloseHandle", "int", [HANDLE]);
+  const BasicInformation = koffi.struct({
+    exitStatus: "uintptr_t", peb: "uintptr_t", affinity: "uintptr_t", priority: "uintptr_t", pid: "uintptr_t", parent: "uintptr_t",
+  });
+  const NtQueryInformationProcess = koffi.load("ntdll.dll").func("__stdcall", "NtQueryInformationProcess", "int32_t",
+    [HANDLE, "int32_t", koffi.out(koffi.pointer(BasicInformation)), "uint32_t", koffi.pointer("uint32_t")]);
+  const handle = OpenProcess(0x1000, 0, pid);
+  if (!handle) return null;
+  try {
+    const information = {};
+    const status = NtQueryInformationProcess(handle, 0, information, koffi.sizeof(BasicInformation), null);
+    return status === 0 ? Number(information.parent) : null;
+  } finally {
+    CloseHandle(handle);
+  }
+}
+
+// Calls \`onGone\` when the bridge that started this fake is gone. POSIX reparents
+// an orphan, so its ppid changes. On Windows ppid never changes, and the parent
+// is the fixture launcher, which lives as long as this process; the bridge is
+// the launcher's parent. A PID can be reused, so it is paired with its start time.
+function watchBridge(onGone) {
+  if (process.platform !== "win32") {
+    const parent = process.ppid;
+    setInterval(() => {
+      if (process.ppid !== parent) onGone();
+    }, 500);
+    return;
+  }
+  const { processStartTime } = processModule();
+  const launcherStarted = processStartTime(process.ppid);
+  const bridge = parentPidOf(process.ppid);
+  const bridgeStarted = bridge === null ? null : processStartTime(bridge);
+  // A process younger than the launcher took the dead bridge's PID.
+  if (bridgeStarted === null || launcherStarted === null || BigInt(bridgeStarted) > BigInt(launcherStarted)) {
+    onGone();
+    return;
+  }
+  // The bridge runs as this user, so a start time that cannot be read means the
+  // PID now belongs to something else; only an exact match counts as the bridge.
   setInterval(() => {
-    if (process.ppid !== parent) process.exit(0);
+    if (processStartTime(bridge) !== bridgeStarted) onGone();
   }, 500);
+}
+
+// Task Scheduler for one workspace. \`/create\` keeps the XML; \`/run\` only records
+// the call, because a task's process must outlive this launcher, so the test starts
+// it; \`/query\` reports Running while the pid in \`running\` is alive.
+function schtasksFlag(flag) {
+  const at = args.findIndex((arg) => arg.toLowerCase() === flag);
+  return at < 0 ? null : args[at + 1];
+}
+
+function runSchtasks() {
+  const verb = (args[0] || "").toLowerCase();
+  const name = schtasksFlag("/tn");
+  const asXml = args.some((arg) => arg.toLowerCase() === "/xml");
+  if (!name || !["/query", "/create", "/delete", "/run", "/end"].includes(verb)) {
+    console.error("unsupported schtasks invocation");
+    process.exit(2);
+  }
+  updateState((nextState) => {
+    nextState.fixtures.schtasks.invocations.push({ name, verb, args });
+    return nextState;
+  });
+  const state = readState().fixtures.schtasks;
+  const failuresLeft = state.failures[verb] || 0;
+  if (failuresLeft > 0) {
+    updateState((nextState) => {
+      nextState.fixtures.schtasks.failures[verb] = failuresLeft - 1;
+      return nextState;
+    });
+    console.error("ERROR: The fixture was told to fail.");
+    process.exit(1);
+  }
+  const known = state.tasks.includes(name);
+  if (verb === "/query") {
+    if (!known) process.exit(1);
+    if (asXml) {
+      process.stdout.write(state.definitions[name] || "");
+    } else if ((schtasksFlag("/fo") || "").toLowerCase() === "csv") {
+      const running = state.running[name];
+      const status = running && isAlive(running) ? "Running" : "Ready";
+      process.stdout.write(\`"\${name}","N/A","\${status}"\n\`);
+    }
+    process.exit(0);
+  }
+  if (verb === "/create") {
+    const xmlFile = schtasksFlag("/xml");
+    const xml = fs.readFileSync(xmlFile).toString("utf16le").replace(/^\\uFEFF/, "");
+    updateState((nextState) => {
+      const fixture = nextState.fixtures.schtasks;
+      fixture.definitions[name] = xml;
+      if (!fixture.tasks.includes(name)) fixture.tasks.push(name);
+      return nextState;
+    });
+    process.exit(0);
+  }
+  if (verb === "/delete") {
+    updateState((nextState) => {
+      const fixture = nextState.fixtures.schtasks;
+      fixture.tasks = fixture.tasks.filter((task) => task !== name);
+      delete fixture.definitions[name];
+      delete fixture.running[name];
+      return nextState;
+    });
+    process.exit(known ? 0 : 1);
+  }
+  process.exit(known ? 0 : 1);
 }
 
 function runLaunchctl() {
@@ -1369,6 +1462,9 @@ switch (tool) {
   case "tmux":
     runTmux();
     break;
+  case "ccdm-host-fake":
+    runFakeHost();
+    break;
   case "ps":
     runPs();
     break;
@@ -1386,6 +1482,9 @@ switch (tool) {
     break;
   case "launchctl":
     runLaunchctl();
+    break;
+  case "schtasks":
+    runSchtasks();
     break;
   case "curl":
     runCurl();
@@ -1417,7 +1516,18 @@ switch (tool) {
   return runtime;
 }
 
-function createFixtureBin(fixtureDir, runtime, name) {
+// The Windows form of a fixture tool: the launcher, and the .shim it reads to
+// know what to start. One copy per tool, so hard links stay under NTFS's limit.
+function createWindowsFixture(fixtureDir, launcher, name, shimLines) {
+  fs.copyFileSync(launcher, path.join(fixtureDir, `${name}.exe`));
+  fs.writeFileSync(path.join(fixtureDir, `${name}.shim`), `${shimLines.join("\n")}\n`);
+}
+
+function createFixtureBin(fixtureDir, runtime, name, launcher) {
+  if (WIN) {
+    createWindowsFixture(fixtureDir, launcher, name, [process.execPath, runtime, name]);
+    return;
+  }
   writeExecutable(
     path.join(fixtureDir, name),
     `#!/bin/sh
@@ -1426,9 +1536,14 @@ exec ${shellQuote(process.execPath)} ${shellQuote(runtime)} ${shellQuote(name)} 
   );
 }
 
-function createHostWrapper(fixtureDir, name, target) {
-  const resolvedTarget = target ?? hostCommandPath(name);
+function createHostWrapper(fixtureDir, name, target, launcher) {
+  // The table's POSIX paths mean nothing on Windows; it finds each tool itself.
+  const resolvedTarget = WIN ? hostCommandPath(name) : target ?? hostCommandPath(name);
   if (!resolvedTarget || !fs.existsSync(resolvedTarget)) {
+    return;
+  }
+  if (WIN) {
+    createWindowsFixture(fixtureDir, launcher, name, [resolvedTarget]);
     return;
   }
   writeExecutable(
@@ -1442,23 +1557,30 @@ exec ${shellQuote(resolvedTarget)} "$@"
 function buildFixtures(fixtureDir, runtimeDir, exclude, hostPaths) {
   fs.mkdirSync(fixtureDir, { recursive: true });
   createFixtureRuntime(fixtureDir);
+  // Test-only seam: fails once the staging dir has content, on every OS.
+  if (process.env.CCDM_E2E_FAIL_FIXTURE_BUILD === "1") {
+    throw new Error("Forced fixture build failure");
+  }
   const runtime = path.join(runtimeDir, "fixture-runtime.cjs");
+  const launcher = WIN ? fixtureLauncher() : null;
   for (const tool of FIXTURE_TOOLS) {
     if (!exclude.has(tool)) {
-      if (tool === "sleep") {
+      if (tool === "sleep" && WIN) {
+        createWindowsFixture(fixtureDir, launcher, tool, [":noop"]);
+      } else if (tool === "sleep") {
         const truePath = ["/usr/bin/true", "/bin/true"].find((candidate) => fs.existsSync(candidate));
         if (!truePath) {
           throw new Error("Unable to create sleep fixture: true binary not found");
         }
         fs.symlinkSync(truePath, path.join(fixtureDir, tool));
       } else {
-        createFixtureBin(fixtureDir, runtime, tool);
+        createFixtureBin(fixtureDir, runtime, tool, launcher);
       }
     }
   }
   for (const [name, target] of hostPaths) {
     if (!exclude.has(name)) {
-      createHostWrapper(fixtureDir, name, target);
+      createHostWrapper(fixtureDir, name, target, launcher);
     }
   }
 }
@@ -1481,14 +1603,21 @@ function sharedFixtureDir(exclude) {
   const digest = createHash("sha256")
     .update(fs.readFileSync(new URL(import.meta.url)))
     .update(fs.readFileSync(new URL("./state-lock.cjs", import.meta.url)))
+    .update(fs.readFileSync(new URL("./session-fixture.js", import.meta.url)))
+    .update(fs.readFileSync(new URL("./fixture-shim.cs", import.meta.url)))
     .update(JSON.stringify([process.execPath, key, hostPaths]))
     .digest("hex")
     .slice(0, 16);
   const dir = path.join(os.tmpdir(), `ccdm-e2e-fixtures-${digest}`);
   if (!fs.existsSync(path.join(dir, ".complete"))) {
     const staging = fs.mkdtempSync(`${dir}.staging-`);
-    buildFixtures(staging, dir, exclude, hostPaths);
-    fs.writeFileSync(path.join(staging, ".complete"), "");
+    try {
+      buildFixtures(staging, dir, exclude, hostPaths);
+      fs.writeFileSync(path.join(staging, ".complete"), "");
+    } catch (error) {
+      fs.rmSync(staging, { recursive: true, force: true });
+      throw error;
+    }
     try {
       fs.renameSync(staging, dir);
     } catch (error) {
@@ -1501,11 +1630,24 @@ function sharedFixtureDir(exclude) {
   return dir;
 }
 
+// Windows needs no developer rights for a hard link. A copy only when a file has
+// reached NTFS's 1023 links (many kept workspaces).
+function linkOrCopy(source, destination) {
+  try {
+    fs.linkSync(source, destination);
+  } catch (error) {
+    if (error.code !== "EMLINK") throw error;
+    fs.copyFileSync(source, destination);
+  }
+}
+
 function createFixtures(fixtureDir, options = {}) {
   const shared = sharedFixtureDir(new Set(options.excludeFixtures ?? []));
   fs.mkdirSync(fixtureDir, { recursive: true });
   for (const name of fs.readdirSync(shared)) {
-    if (name !== ".complete") fs.symlinkSync(path.join(shared, name), path.join(fixtureDir, name));
+    if (name === ".complete") continue;
+    if (WIN) linkOrCopy(path.join(shared, name), path.join(fixtureDir, name));
+    else fs.symlinkSync(path.join(shared, name), path.join(fixtureDir, name));
   }
 }
 
@@ -1513,9 +1655,10 @@ function nodePath(root) {
   return path.join(root, "node_modules");
 }
 
+// Windows has no process groups, so there the group is the one process.
 function processGroupExists(pid) {
   try {
-    process.kill(-pid, 0);
+    process.kill(process.platform === "win32" ? pid : -pid, 0);
     return true;
   } catch {
     return false;
@@ -1533,8 +1676,19 @@ async function waitForProcessGroupExit(pid, timeoutMs = 5000) {
   return !processGroupExists(pid);
 }
 
-async function terminateProcessGroup(pid, timeoutMs = 5000) {
+// `leaderExited`: the process itself is gone, so its PID may be someone else's
+// now; only what is left of its group is signalled.
+async function terminateProcessGroup(pid, timeoutMs = 5000, { leaderExited = false } = {}) {
   if (!Number.isInteger(pid)) {
+    return;
+  }
+  if (process.platform === "win32") {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // The process may already be gone.
+    }
+    await waitForProcessGroupExit(pid, timeoutMs);
     return;
   }
   try {
@@ -1542,10 +1696,12 @@ async function terminateProcessGroup(pid, timeoutMs = 5000) {
   } catch {
     // The process group may already be gone.
   }
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch {
-    // The process may already be gone.
+  if (!leaderExited) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // The process may already be gone.
+    }
   }
   if (await waitForProcessGroupExit(pid, timeoutMs)) {
     return;
@@ -1555,12 +1711,83 @@ async function terminateProcessGroup(pid, timeoutMs = 5000) {
   } catch {
     // The process group may already be gone.
   }
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {
-    // The process may already be gone.
+  if (!leaderExited) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // The process may already be gone.
+    }
   }
   await waitForProcessGroupExit(pid, 1000);
+}
+
+// A handle the harness holds needs no marker check while the process lives.
+// On Windows an exited child's PID can already belong to something else.
+async function stopHeldChild(child) {
+  const exited = child.exitCode !== null || child.signalCode !== null;
+  if (process.platform !== "win32") {
+    await terminateProcessGroup(child.pid, 5000, { leaderExited: exited });
+    return;
+  }
+  if (exited || !Number.isInteger(child.pid)) return;
+  await new Promise((resolve) => {
+    const timer = setTimeout(resolve, scaledTimeout(5000));
+    child.once("close", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    child.kill();
+  });
+}
+
+// Node's os.homedir() reads USERPROFILE on Windows and os.tmpdir() reads TEMP/TMP;
+// Python reads USERPROFILE and tries TMPDIR before TEMP/TMP. SystemRoot, windir
+// and ComSpec come from the host because Windows programs fail to start without them.
+function workspaceEnv({ root, homeDir, tmpDir, stateDir, fixtureDir, platform = process.platform, hostEnv = process.env }) {
+  const env = {
+    CCDM_TEST_STATE: stateDir,
+    HOME: homeDir,
+    NODE_OPTIONS: "",
+    NODE_PATH: nodePath(root),
+    PATH: fixtureDir,
+    // The source tree's copy: tests list the workspace repo exactly, and Python
+    // writes bytecode beside this file. __pycache__ is gitignored there.
+    PYTHONPATH: path.join(root, "tests", "e2e", "support", "pysafe"),
+    TMPDIR: tmpDir,
+  };
+  if (platform !== "win32") {
+    return env;
+  }
+  const homeDrive = path.win32.parse(homeDir).root.replace(/\\$/, "");
+  Object.assign(env, {
+    APPDATA: path.win32.join(homeDir, "AppData", "Roaming"),
+    HOMEDRIVE: homeDrive,
+    HOMEPATH: homeDir.slice(homeDrive.length),
+    LOCALAPPDATA: path.win32.join(homeDir, "AppData", "Local"),
+    PATHEXT: ".COM;.EXE",
+    TEMP: tmpDir,
+    TMP: tmpDir,
+    USERPROFILE: homeDir,
+  });
+  for (const key of ["SystemRoot", "windir", "ComSpec"]) {
+    if (hostEnv[key] !== undefined) env[key] = hostEnv[key];
+  }
+  return env;
+}
+
+// On Windows a process killed a moment ago can keep the directory for a little
+// while longer, and rmSync does not retry that error itself.
+async function removeWorkspaceRoot(root) {
+  const deadline = Date.now() + scaledTimeout(1000);
+  for (;;) {
+    try {
+      fs.rmSync(root, { force: true, recursive: true });
+      return;
+    } catch (error) {
+      if (!WIN || Date.now() >= deadline || !["EBUSY", "EPERM", "ENOTEMPTY"].includes(error.code)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
 }
 
 export const createWorkspace = Object.freeze(function createWorkspace(options = {}) {
@@ -1568,31 +1795,60 @@ export const createWorkspace = Object.freeze(function createWorkspace(options = 
   const files = gitSourceFiles(root);
   rejectForbiddenSourceArtifacts(files);
 
-  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-e2e-"));
-  const repoDir = path.join(tmpRoot, "repo");
+  // Registered before anything exists, so a throw below leaves nothing behind after cleanup().
+  let tmpRoot;
+  let stateDir;
+  let workspaceJob;
+  registerTeardownCallback(async () => {
+    if (tmpRoot === undefined) return;
+    const stopping = workspaceJob?.stop();
+    if (stopping) await stopping;
+    try {
+      const state = readState(stateDir);
+      for (const row of state.fixtures.processes ?? []) {
+        // What the job ended is gone by now; the marker check is for what it never held.
+        if (WIN && Number.isInteger(row?.pid) && !processGroupExists(row.pid)) continue;
+        if (row?.owned === true && row.ownerStateDir === stateDir && Number.isInteger(row.pid)
+            && workspaceOwnsPid(row.pid, tmpRoot)) {
+          await terminateProcessGroup(row.pid, 5000);
+        }
+      }
+    } catch {
+      // Workspace removal should still proceed if fixture cleanup cannot read state.
+    }
+    // With CCDM_E2E_KEEP_FAILED=1 the runner decides, once it knows the file's result.
+    if (process.env.CCDM_E2E_KEEP_FAILED !== "1") {
+      // From here a child that ends late has nowhere to record itself.
+      retireStateDir(stateDir);
+      await removeWorkspaceRoot(tmpRoot);
+    }
+  });
+
+  tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-e2e-"));
+  // tests/run-e2e.mjs reads this line to remove workspaces a killed file left behind.
+  process.stderr.write(`ccdm-e2e-workspace ${tmpRoot}\n`);
+  stateDir = path.join(tmpRoot, "state");
+  const repoDir = path.join(tmpRoot, options.repoDirName ?? "repo");
   const homeDir = path.join(tmpRoot, "home");
   const tmpDir = path.join(tmpRoot, "tmp");
-  const stateDir = path.join(tmpRoot, "state");
   const fixtureDir = path.join(tmpRoot, "fixtures");
-  fs.mkdirSync(repoDir, { recursive: true });
-  fs.mkdirSync(homeDir, { recursive: true });
-  fs.mkdirSync(tmpDir, { recursive: true });
-  fs.mkdirSync(stateDir, { recursive: true });
+  const env = workspaceEnv({ root, homeDir, tmpDir, stateDir, fixtureDir });
+  for (const dir of [repoDir, homeDir, tmpDir, stateDir, env.APPDATA, env.LOCALAPPDATA]) {
+    if (dir) fs.mkdirSync(dir, { recursive: true });
+  }
 
   copySourceFiles(root, repoDir, files);
+  // The fixture runtime finds the checkout at <tmpRoot>/repo.
+  if (options.repoDirName) fs.symlinkSync(repoDir, path.join(tmpRoot, "repo"), "junction");
   assertWorkspaceClean(repoDir);
   createFixtures(fixtureDir, options);
+  if (WIN) {
+    workspaceJob = createWorkspaceJob(fixtureDir, { killWaitMs: scaledTimeout(3000), launcherWaitMs: scaledTimeout(4000) });
+  }
   writeState(undefined, stateDir);
 
   const workspace = Object.freeze({
-    env: Object.freeze({
-      CCDM_TEST_STATE: stateDir,
-      HOME: homeDir,
-      NODE_OPTIONS: "",
-      NODE_PATH: nodePath(root),
-      PATH: fixtureDir,
-      TMPDIR: tmpDir,
-    }),
+    env: Object.freeze(env),
     fixtureDir,
     homeDir,
     repoDir,
@@ -1602,28 +1858,16 @@ export const createWorkspace = Object.freeze(function createWorkspace(options = 
     tmpRoot,
   });
 
-  registerTeardownCallback(async () => {
-    try {
-      const state = readState(stateDir);
-      for (const row of state.fixtures.processes ?? []) {
-        if (row?.owned === true && row.ownerStateDir === stateDir && Number.isInteger(row.pid)) {
-          await terminateProcessGroup(row.pid, 5000);
-        }
-      }
-    } catch {
-      // Workspace removal should still proceed if fixture cleanup cannot read state.
-    }
-    fs.rmSync(tmpRoot, { force: true, recursive: true });
-  });
-
   return workspace;
 });
 
 function buildEnv(workspace, extraEnv = {}) {
-  return {
-    ...workspace.env,
-    ...extraEnv,
-  };
+  const env = { ...workspace.env, ...extraEnv };
+  // A test's own PYTHONPATH must not take away the os.kill(pid, 0) guard.
+  if (WIN && extraEnv.PYTHONPATH && workspace.env.PYTHONPATH) {
+    env.PYTHONPATH = `${workspace.env.PYTHONPATH}${path.delimiter}${extraEnv.PYTHONPATH}`;
+  }
+  return env;
 }
 
 function runProcess(workspace, command, args, options = {}) {
@@ -1631,15 +1875,16 @@ function runProcess(workspace, command, args, options = {}) {
   assertIsolatedPath(workspace, workspace.tmpDir);
   const env = buildEnv(workspace, options.env);
   const cwd = options.cwd ?? workspace.repoDir;
-  const child = spawn(command, args, {
+  // `command` stays what the test named; only how it starts differs on Windows.
+  const [program, ...interpreterArgs] = interpreterFor(command);
+  const child = spawn(program, [...interpreterArgs, ...args], {
     cwd,
     detached: true,
     env,
     stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
   });
-  registerTeardownCallback(async () => {
-    await terminateProcessGroup(child.pid, 5000);
-  });
+  registerTeardownCallback(() => stopHeldChild(child));
   if (options.input) {
     child.stdin.end(options.input);
   } else {
@@ -1660,7 +1905,8 @@ function runProcess(workspace, command, args, options = {}) {
   return new Promise((resolve) => {
     const timeout = setTimeout(() => {
       try {
-        process.kill(-child.pid, "SIGTERM");
+        if (process.platform === "win32") child.kill("SIGTERM");
+        else process.kill(-child.pid, "SIGTERM");
       } catch {
         // The process may have already exited.
       }
@@ -1675,7 +1921,7 @@ function runProcess(workspace, command, args, options = {}) {
         env,
         exitCode,
         signal,
-        stderr,
+        stderr: withoutGitBashTmpWarning(stderr),
         stdout,
       };
       recordCommandInvocation(result, { stateDir: workspace.stateDir });
@@ -1697,4 +1943,5 @@ export const runNodeEntrypoint = Object.freeze(async function runNodeEntrypoint(
 
 export const runnerInternals = Object.freeze({
   FORBIDDEN_WORKSPACE_ARTIFACTS,
+  workspaceEnv,
 });

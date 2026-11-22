@@ -5,10 +5,11 @@ import path from "node:path";
 import test from "node:test";
 
 import { injectDiscordMessage, startFakeCodexServer } from "./support/bridge.js";
+import { PYTHON } from "./support/platform.js";
 import { OWNER_ID, createRouterWorkspace, routerRegistry, routerWithWebhooks, waitFor } from "./support/router.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
-import { startThreadSupervisor, supervisorStateDir, supervisorStatus } from "./support/thread-supervisor.js";
+import { assertSupervisorStops, startThreadSupervisor, supervisorStateDir, supervisorStatus } from "./support/thread-supervisor.js";
 
 test.afterEach(cleanup);
 
@@ -71,7 +72,34 @@ async function threadRow(workspace, thread, predicate = () => true, timeoutMs = 
     if (row && predicate(row)) return row;
     await new Promise(resolve => setTimeout(resolve, 50));
   }
-  throw new Error(`thread ${thread.id} never matched: ${JSON.stringify(last)}`);
+  throw new Error(`thread ${thread.id} never matched: ${JSON.stringify(last)}\n${turnAccount(workspace)}`);
+}
+
+// What decides idleness and eviction, for a failure: each thread's activity.json,
+// the Stop hooks run, the held turns released (and whether the hold list still
+// named them on a second read), and every post per thread.
+function turnAccount(workspace) {
+  const activity = {};
+  const posted = {};
+  for (const thread of Object.values(THREADS)) {
+    try {
+      activity[thread.name] = JSON.parse(fs.readFileSync(activityFile(workspace, thread), "utf8"));
+    } catch (error) {
+      activity[thread.name] = error.code ?? error.message;
+    }
+    posted[thread.name] = posts(workspace, thread).map(post => ({ webhook: Boolean(post.webhookId), content: post.content }));
+  }
+  const fixture = claude(workspace);
+  return JSON.stringify({ activity, posted, stopHooks: stopHooks(workspace), holdTurnsIn: fixture.holdTurnsIn ?? [],
+    turnHolds: fixture.turnHolds ?? [] });
+}
+
+// turnAccount plus the worker's own log (a failed notice is logged there), which it
+// gives up only when it ends, so the worker is stopped here.
+async function workerAccount(workspace, supervisor) {
+  const ended = await Promise.race([supervisor.stop(), new Promise(resolve => setTimeout(() => resolve(null), 10000))]);
+  return `${turnAccount(workspace)}\n${ended ? `worker exit ${ended.exitCode}, stderr:\n${ended.stderr}`
+    : "the worker did not stop within 10 s"}`;
 }
 
 const discord = workspace => readState(workspace.stateDir).fixtures.discord;
@@ -81,7 +109,7 @@ const replies = (workspace, thread) => posts(workspace, thread).filter(post => p
 const notices = (workspace, thread) => posts(workspace, thread).filter(post => !post.webhookId).map(post => post.content);
 const stopHooks = workspace => (claude(workspace).hookRuns ?? []).filter(run => run.event === "Stop").length;
 const invocationsFor = (workspace, thread) =>
-  claude(workspace).invocations.filter(invocation => invocation.args.some(arg => arg.includes(`/threads/${thread.id}/`)));
+  claude(workspace).invocations.filter(invocation => invocation.args.some(arg => arg.replaceAll("\\", "/").includes(`/threads/${thread.id}/`)));
 const resumeArg = invocation => {
   const index = invocation.args.indexOf("--resume");
   return index < 0 ? null : invocation.args[index + 1].replace(/^'|'$/g, "");
@@ -165,7 +193,7 @@ test("with no caps entry the defaults apply, and an invalid cap falls back to it
 test("a session mid-turn or without activity.json is never evicted: new threads queue, and drain FIFO as slots free", async () => {
   const workspace = capacityWorkspace(capsRegistry({ claude: 2 }));
   await supervised(workspace);
-  holdTurns(workspace, THREADS.a);
+  holdTurns(workspace, THREADS.a, THREADS.c);  // An idle C could be evicted for D, the queue head.
   await liveClaudeThread(workspace, THREADS.a);
   await idleClaudeThread(workspace, THREADS.b);
   // B's turn ended, but with its activity file lost it counts as busy.
@@ -232,7 +260,7 @@ test("under the production 30-minute threshold a session whose turn just ended i
 
 // A pending creation request the root bot fulfils: the PRD's store schema.
 function requestCodexThread(workspace, thread) {
-  execFileSync("python3", ["-c", `import sqlite3, sys
+  execFileSync(PYTHON, ["-c", `import sqlite3, sys
 db = sqlite3.connect(sys.argv[1], timeout=5)
 db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
   first_message, requester_id, requester_kind, status, thread_id, created_at)
@@ -260,7 +288,7 @@ async function liveCodexThread(workspace, thread, port, uuid) {
 
 test("Codex and Claude caps are independent, and a Codex session idle after turn/completed is evicted", async () => {
   const workspace = capacityWorkspace(capsRegistry({ claude: 1, codex: 1 }));
-  await supervised(workspace, { CCDM_THREAD_WS_PORT_BASE: "29700" });
+  const supervisor = await supervised(workspace, { CCDM_THREAD_WS_PORT_BASE: "29700" });
   holdTurns(workspace, THREADS.a);
   await liveClaudeThread(workspace, THREADS.a);
 
@@ -273,7 +301,8 @@ test("Codex and Claude caps are independent, and a Codex session idle after turn
   await liveCodexThread(workspace, THREADS.y, 29701, "0199a5c4-7e1b-7c3d-9f2a-4b8e6d1c3a62");
   const x = await threadRow(workspace, THREADS.x);
   assert.deepEqual([x.state, x.stop_reason], ["stopped", "evicted"]);
-  assert.deepEqual(notices(workspace, THREADS.x), [PAUSED]);
+  const xNotices = notices(workspace, THREADS.x);
+  assert.deepEqual(xNotices, [PAUSED], xNotices.length === 1 ? undefined : await workerAccount(workspace, supervisor));
   assert.equal((await threadRow(workspace, THREADS.a)).state, "live");
 
   // A Codex slot is not a Claude one: Claude B still queues behind busy A.
@@ -323,7 +352,7 @@ test("a queued creation request keeps its first message across a supervisor rest
     content: "/thread queued-task please look at the flaky parser test", author: { id: OWNER_ID, username: "Owner" } });
   await threadRow(workspace, created, row => row.state === "queued");
 
-  assert.equal((await supervisor.stop()).exitCode, 0);
+  await assertSupervisorStops(supervisor);
   await startThreadSupervisor(workspace, { env: NO_IDLE_WAIT });
   // /close frees A's slot for the queued thread.
   injectDiscordMessage(workspace, { id: "a-close", channelId: THREADS.a.id, content: "/close",

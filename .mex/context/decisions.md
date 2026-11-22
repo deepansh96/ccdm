@@ -16,10 +16,18 @@ edges:
     condition: when changing lifecycle or process ownership
   - target: context/discord-security.md
     condition: when changing channel isolation or reply authority
-last_updated: 2026-09-29
+last_updated: 2026-11-10
 ---
 
 # Decisions
+
+### One `scripts/ccdm` command line for macOS and Windows
+**Date:** 2026-11-10
+**Status:** Active
+**Decision:** Root's runbook (`AGENTS.md`, `.mex/`, and root's command entries in `CLAUDE.md.example`) names `scripts/ccdm` subcommands on both OSes. Sessions run in a session host: tmux on macOS, `ccdm-host` on Windows. A command only macOS can run stays in the runbook under a `macOS:` line, and a Windows step that does not exist yet reads `Windows: pending` with its issue.
+**Reasoning:** Root is instruction-only and follows the text literally. One command per request means no second runbook to keep in step, and the macOS meaning stays visible beside the Windows one.
+**Alternatives considered:** A separate Windows runbook, or PowerShell commands for Windows; rejected because two texts drift apart, and root's Bash tool on Windows is Git Bash, where the same line already runs.
+**Consequences:** `tests/e2e/documentation-audit.test.js` fails on a POSIX-only command outside `macOS:` and on a `scripts/ccdm` command that `--help` does not list. This file is the decision log and is exempt from that rule; "Use tmux for local session ownership" below still describes macOS.
 
 ### Keep the legacy Usage Report beside provider dashboards
 **Date:** 2026-08-23

@@ -38,8 +38,15 @@ const { spawn } = require("child_process");
 const { randomBytes, randomUUID } = require("crypto");
 const { accessSync, closeSync, constants: fsConstants, openSync, readSync, renameSync, writeFileSync } = require("fs");
 const { mkdir, mkdtemp, readFile, rm, writeFile } = require("fs/promises");
+const net = require("net");
 const os = require("os");
 const path = require("path");
+const { samePath } = require("./platform/paths.js");
+const { killTree, killTreeSync, onShutdown, processIdentity, rememberSpawn } = require("./platform/process.js");
+const { resolveCommand } = require("./platform/tools.js");
+const { scheduleProjectRestart } = require("./lib/restart-helper.js");
+
+const WIN32 = process.platform === "win32";
 
 const ROOT_DIR = path.resolve(__dirname, "..");
 const REGISTRY_PATH = path.join(ROOT_DIR, "registry.json");
@@ -60,6 +67,17 @@ const PROVIDER = "gemini";
 const CHANNEL_ID = process.env.CHANNEL_ID || "";
 const PROJECT_DIR = process.env.PROJECT_DIR || "";
 const ROUTER_KEY_FILE = process.env.CCDM_ROUTER_KEY_FILE || "";
+
+// A marker for stop and restart, which on Windows find a bridge by its command
+// line. The key is still read from CCDM_ROUTER_KEY_FILE.
+const keyFileFlag = process.argv.indexOf("--ccdm-key-file", 2);
+if (keyFileFlag !== -1) {
+  const flagged = process.argv[keyFileFlag + 1];
+  if (!flagged || !samePath(flagged, ROUTER_KEY_FILE)) {
+    console.error(`--ccdm-key-file names ${flagged || "no file"}, but CCDM_ROUTER_KEY_FILE names ${ROUTER_KEY_FILE}`);
+    process.exit(1);
+  }
+}
 const ROUTER_PROJECT = process.env.CCDM_GEMINI_PROJECT || "";
 const DISCORD_THREAD_ID = process.env.CCDM_THREAD_ID || "";
 const THREAD_MODE = Boolean(DISCORD_THREAD_ID);
@@ -226,16 +244,24 @@ function createAcpConnection(child, { onNotification, onRequest }) {
   };
 }
 
+// agy's own installers: ~/.local/bin on macOS and Linux, %LOCALAPPDATA%\agy\bin on Windows.
 function findAgyBinary() {
   if (process.env.CCDM_AGY_BIN) return process.env.CCDM_AGY_BIN;
+  const name = WIN32 ? "agy.exe" : "agy";
   for (const dir of (process.env.PATH || "").split(path.delimiter).filter(Boolean)) {
-    const candidate = path.join(dir, "agy");
+    const candidate = path.join(dir, name);
     try {
-      accessSync(candidate, fsConstants.X_OK);
+      accessSync(candidate, WIN32 ? fsConstants.F_OK : fsConstants.X_OK);
       return candidate;
     } catch { /* not here */ }
   }
+  if (WIN32) return path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "agy", "bin", name);
   return path.join(os.homedir(), ".local", "bin", "agy");
+}
+
+// A JavaScript agy (the tests' fake) runs under this Node, which Windows cannot start from the file alone.
+function agyCommand(bin, args) {
+  return /\.[cm]?js$/i.test(bin) ? [process.execPath, [bin, ...args]] : [bin, args];
 }
 
 // agy's environment: under a Gemini account, that account's home as HOME,
@@ -249,6 +275,11 @@ function agyEnv() {
     BASH_ENV: path.join(AGY_SHELL_DIR, "bashenv"),
     CCDM_SHELL_HOME: REAL_HOME,
     CCDM_SHELL_ZDOTDIR: process.env.ZDOTDIR || "",
+    // A bash whose stdin is a socket (Node's stdio pipes are socketpairs) and
+    // whose SHLVL comes out below 2 takes itself for an rshd/sshd command and
+    // skips BASH_ENV. A bridge started with no SHLVL (from sh and Python rather
+    // than a shell that sets it) would hand that to agy's shells.
+    SHLVL: String(Math.max(1, Number.parseInt(process.env.SHLVL, 10) || 0)),
   };
 }
 
@@ -275,11 +306,13 @@ function startAgy() {
   const bin = findAgyBinary();
   if (AGY_HOME) refuseShellWrapper(bin);
   console.log(`Starting ${bin} acp in ${PROJECT_DIR}${AGY_HOME ? ` with home ${AGY_HOME}` : ""}`);
-  agyProcess = spawn(bin, ["acp", "--dangerously-skip-permissions"], {
+  const [command, args] = agyCommand(bin, ["acp", "--dangerously-skip-permissions"]);
+  agyProcess = rememberSpawn(spawn(command, args, {
     cwd: PROJECT_DIR,
     stdio: ["pipe", "pipe", "pipe"],
     env: agyEnv(),
-  });
+    windowsHide: true,
+  }));
   agyProcess.stderr.setEncoding("utf8");
   agyProcess.stderr.on("data", (data) => console.log(`[agy stderr] ${data.trim()}`));
   agyProcess.on("error", (error) => void exitAfterRuntimeLoss(`agy could not start: ${error.message}`));
@@ -291,7 +324,10 @@ function startAgy() {
 }
 
 process.on("exit", () => {
-  if (agyProcess && agyProcess.exitCode === null && agyProcess.signalCode === null) agyProcess.kill();
+  if (agyProcess && agyProcess.exitCode === null && agyProcess.signalCode === null) {
+    if (WIN32) killTreeSync(agyProcess);
+    else agyProcess.kill();
+  }
 });
 
 // The agent asks before running a tool; every request is approved, the way
@@ -776,7 +812,8 @@ async function saveAttachment(url, filename) {
 
 function runCommand(command, args) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const resolved = WIN32 && command === "whisper" ? resolveCommand("whisper") : command;
+    const child = spawn(resolved, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     let stderr = "";
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk) => { stderr += chunk; });
@@ -854,7 +891,13 @@ async function findCurrentProject() {
   return { projectName: ROUTER_PROJECT, screenName: project.screen_name };
 }
 
-function scheduleRestart(projectName, screenName) {
+// Windows: `ccdm restart-session`, as a helper outside this session that waits for
+// this process to exit, as the Codex bridge restarts.
+async function scheduleRestart(projectName, screenName) {
+  if (WIN32) {
+    const { pid, startedAt } = processIdentity();
+    return scheduleProjectRestart(projectName, { afterPid: pid, afterStartedAt: startedAt });
+  }
   const logPath = path.join(os.tmpdir(), `ccdm-restart-${projectName.replace(/[^a-zA-Z0-9._-]/g, "_")}.log`);
   const command = [
     // The launcher refuses while this bridge or its agy still runs.
@@ -943,7 +986,7 @@ async function handleCommand(msg, text, channelId) {
       await discordTransport.react(msg, "🔄").catch(() => {});
       try {
         const { projectName, screenName } = await findCurrentProject();
-        const logPath = scheduleRestart(projectName, screenName);
+        const logPath = await scheduleRestart(projectName, screenName);
         await sendToDiscord("Restarting session — fresh session coming up.", channelId);
         console.log(`Restart scheduled for '${projectName}' (${screenName}); log: ${logPath}`);
         await shutdown(0);
@@ -1149,6 +1192,20 @@ async function stopAgy(graceMs = 5000) {
   const child = agyProcess;
   if (!child || child.exitCode !== null || child.signalCode !== null) return;
   const exited = new Promise((resolve) => child.once("exit", resolve));
+  if (WIN32) {
+    // No SIGTERM on Windows: closing its stdin ends agy's ACP server, and a tree
+    // kill takes down whatever is left, its MCP servers included.
+    child.stdin?.end();
+    let timer;
+    const done = await Promise.race([exited.then(() => true),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(false), graceMs); })]);
+    clearTimeout(timer);
+    if (!done) {
+      await killTree(child);
+      await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 1000))]);
+    }
+    return;
+  }
   child.kill("SIGTERM");
   let timer;
   const done = await Promise.race([exited.then(() => true),
@@ -1189,7 +1246,14 @@ async function main() {
 }
 
 // A stop during startup still takes agy down and records the session's end.
-for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(signal, () => void shutdown(0));
+// Windows has no SIGTERM to send, so a launcher stops the bridge by closing its
+// stdin. NUL, or no stdin at all, reads as EOF at once and is no request.
+onShutdown(() => void shutdown(0), { stdinEof: WIN32 && stdinIsPipe() });
+
+// Node reports a Windows named pipe as neither FIFO nor file, so fs.fstat cannot tell.
+function stdinIsPipe() {
+  return process.stdin instanceof net.Socket && !process.stdin.isTTY;
+}
 
 main().catch((error) => {
   console.error("Fatal:", error);

@@ -24,8 +24,10 @@
 // this process's pid) for root Codex's separate MCP server, which answers the
 // same way through `directRequester` while `emergencyEngaged(markerFile)`.
 const { readFileSync } = require("node:fs");
-const { rm, writeFile } = require("node:fs/promises");
+const { rm } = require("node:fs/promises");
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
+const { writeFileAtomic } = require("../platform/atomic.js");
+const { processAlive, processIdentity } = require("../platform/process.js");
 const { discordRequest } = require("./discord-rest.js");
 const { classifyMessage } = require("./inbound.js");
 const { OpError } = require("./ops/errors.js");
@@ -56,9 +58,8 @@ function directDispatcher({ token, botId, rootChannels }) {
 // Whether a live process has recorded an engaged fallback in `markerFile`.
 function emergencyEngaged(markerFile) {
   try {
-    const { pid } = JSON.parse(readFileSync(markerFile, "utf8"));
-    process.kill(pid, 0);
-    return true;
+    const { pid, startedAt = null } = JSON.parse(readFileSync(markerFile, "utf8"));
+    return processAlive(pid, startedAt);
   } catch {
     return false;
   }
@@ -106,7 +107,7 @@ function createEmergencyGateway({ onMessage, primaryChannelId = null, markerFile
     await ready;
     dispatch = directDispatcher({ token, botId: next.user.id, rootChannels: table.rootChannels });
     if (markerFile) {
-      await writeFile(markerFile, `${JSON.stringify({ pid: process.pid })}\n`, { mode: 0o600 })
+      await writeFileAtomic(markerFile, `${JSON.stringify(processIdentity())}\n`)
         .catch(error => log(`emergency marker not written: ${error.message}`));
     }
     log(`emergency direct gateway engaged after ${thresholdMs}ms without the Router`);

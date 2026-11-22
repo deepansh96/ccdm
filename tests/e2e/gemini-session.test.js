@@ -5,9 +5,12 @@ import test from "node:test";
 
 import { injectDiscordMessage, waitForState } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
+import { startFakeHost } from "./support/session-fixture.js";
 import { OWNER_ID, createRouterWorkspace, routerEnv, routerRegistry, routerWithWebhooks, runRouterCli } from "./support/router.js";
 import { readState } from "./support/state.js";
+import { platformGate } from "./support/platform.js";
 import { cleanup } from "./support/teardown.js";
+
 
 test.afterEach(cleanup);
 
@@ -34,6 +37,9 @@ function geminiWorkspace(project = {}) {
 
 // The fixture PATH has no node, so agy is a wrapper naming it.
 function fakeAgyBin(workspace) {
+  const fake = path.join(workspace.repoDir, "tests/e2e/support/fake-agy.cjs");
+  // Windows: the bridge runs a JavaScript agy under its own Node.
+  if (process.platform === "win32") return fake;
   const bin = path.join(workspace.tmpRoot, "agy-bin", "agy");
   fs.mkdirSync(path.dirname(bin), { recursive: true });
   // Named agy in ps, as the real binary is, so listener detection sees it.
@@ -59,10 +65,24 @@ const clientRequests = (workspace, method) => agyEvents(workspace)
 const promptTexts = (workspace) => clientRequests(workspace, "session/prompt")
   .map((message) => message.params.prompt.filter((block) => block.type === "text").map((block) => block.text).join("\n"));
 
-function startGemini(workspace, args = [], extraEnv = {}) {
+// On Windows the launcher needs a session host; each Workspace gets one fake host.
+const fakeHosts = new WeakMap();
+async function backendEnv(workspace) {
+  if (process.platform !== "win32") return {};
+  if (!fakeHosts.has(workspace)) fakeHosts.set(workspace, await startFakeHost(workspace, { env: routerEnv(workspace) }));
+  return fakeHosts.get(workspace).env;
+}
+
+async function startGemini(workspace, args = [], extraEnv = {}) {
   return runScript(workspace, "scripts/start-gemini-session.sh", {
-    args: ["demo", ...args], env: routerEnv(workspace, { CCDM_AGY_BIN: fakeAgyBin(workspace), ...extraEnv }), timeoutMs: 30000,
+    args: ["demo", ...args],
+    env: routerEnv(workspace, { ...await backendEnv(workspace), CCDM_AGY_BIN: fakeAgyBin(workspace), ...extraEnv }),
+    timeoutMs: 30000,
   });
+}
+
+async function stopDemo(workspace) {
+  return runScript(workspace, "scripts/stop-session.sh", { args: ["demo"], env: routerEnv(workspace, await backendEnv(workspace)), timeoutMs: 30000 });
 }
 
 const readRegistry = (workspace) => JSON.parse(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"));
@@ -186,7 +206,7 @@ test("stop-session stops the Gemini bridge and clears its key, launch files and 
   const workspace = await geminiSession({});
   const pid = readRegistry(workspace).projects.demo.pid;
 
-  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"], env: routerEnv(workspace), timeoutMs: 30000 });
+  const stopped = await stopDemo(workspace);
 
   assert.equal(stopped.exitCode, 0, stopped.stderr || stopped.stdout);
   assert.match(stopped.stdout, /Stopping recorded process tree for 'demo'/);
@@ -334,7 +354,7 @@ test("stop-session takes the Gemini session's agy down too, found by its name an
   const [agyPid] = agyPids(workspace);
   assert.ok(alive(agyPid));
 
-  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"], env: routerEnv(workspace), timeoutMs: 30000 });
+  const stopped = await stopDemo(workspace);
 
   assert.equal(stopped.exitCode, 0, stopped.stderr || stopped.stdout);
   for (let i = 0; i < 50 && alive(agyPid); i++) await new Promise((resolve) => setTimeout(resolve, 100));
@@ -363,6 +383,8 @@ test("start-gemini-session refuses a gemini_effort agy has no level for, before 
 
 // A second Google account is a second agy home: agy runs with it as HOME,
 // while the agent's shell commands and the Discord MCP server keep the real one.
+const ACCOUNT_HOMES = platformGate("posix", "agy on Windows does not take its account from HOME, so an account home other than the user's own is refused there");
+
 function withGeminiAccounts(workspace, accounts) {
   const registryFile = path.join(workspace.repoDir, "registry.json");
   const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
@@ -370,7 +392,7 @@ function withGeminiAccounts(workspace, accounts) {
   fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
 }
 
-test("a project's gemini_account runs agy under that account's home, with the real home kept for its shells", async () => {
+test("a project's gemini_account runs agy under that account's home, with the real home kept for its shells", ACCOUNT_HOMES, async () => {
   const workspace = geminiWorkspace({ gemini_account: "agy-work" });
   const accountHome = path.join(workspace.tmpRoot, "agy-work-home");
   fs.mkdirSync(accountHome);
@@ -425,12 +447,14 @@ test("start-gemini-session refuses an unknown gemini_account or a missing accoun
   withGeminiAccounts(missing, { "agy-work": path.join(missing.tmpRoot, "never-signed-in") });
   const absent = await startGemini(missing);
   assert.equal(absent.exitCode, 1);
-  assert.match(absent.stderr, /Gemini account 'agy-work' home '.*never-signed-in' is missing; sign in there first/);
+  assert.match(absent.stderr, process.platform === "win32"
+    ? /Gemini account 'agy-work' home '.*never-signed-in' is not your own home; agy on Windows does not take its account from HOME/
+    : /Gemini account 'agy-work' home '.*never-signed-in' is missing; sign in there first/);
   assert.deepEqual(agyEvents(unknown), []);
   assert.deepEqual(agyEvents(missing), []);
 });
 
-test("a Router migration resumes a Gemini project's conversation from its gemini_account's home", async () => {
+test("a Router migration resumes a Gemini project's conversation from its gemini_account's home", ACCOUNT_HOMES, async () => {
   const { createRequire } = await import("node:module");
   const { resolveResume } = createRequire(import.meta.url)("../../scripts/router/resume.js");
   const workspace = geminiWorkspace({ gemini_account: "agy-work", session_id: SESSION_ID });
@@ -448,7 +472,7 @@ test("a Router migration resumes a Gemini project's conversation from its gemini
   assert.match(resolve().skip, /Gemini home unresolved: .*'agy-work' is not an alias in gemini_accounts/);
 });
 
-test("a Gemini account session refuses a bash agy wrapper, which would hand agy the real home back", async () => {
+test("a Gemini account session refuses a bash agy wrapper, which would hand agy the real home back", platformGate("posix", "drives a bash agy wrapper, which Windows cannot run"), async () => {
   const workspace = geminiWorkspace({ gemini_account: "agy-work" });
   const accountHome = path.join(workspace.tmpRoot, "agy-work-home");
   fs.mkdirSync(accountHome);
@@ -463,5 +487,19 @@ test("a Gemini account session refuses a bash agy wrapper, which would hand agy 
 
   assert.equal(started.exitCode, 1);
   assert.match(started.stderr + started.stdout, /is a bash or zsh script, which cannot run under the Gemini account home/);
+  assert.deepEqual(agyEvents(workspace), []);
+});
+
+test("Windows refuses a gemini_account whose home is not the user's own, before launching", platformGate("win32", "the refusal exists only on Windows"), async () => {
+  const workspace = geminiWorkspace({ gemini_account: "agy-work" });
+  const accountHome = path.join(workspace.tmpRoot, "agy-work-home");
+  fs.mkdirSync(accountHome);
+  withGeminiAccounts(workspace, { "agy-work": accountHome });
+  await routerWithWebhooks(workspace, ["demo"]);
+
+  const refused = await startGemini(workspace);
+
+  assert.equal(refused.exitCode, 1);
+  assert.match(refused.stderr, /Gemini account 'agy-work' home '.*agy-work-home' is not your own home; agy on Windows does not take its account from HOME/);
   assert.deepEqual(agyEvents(workspace), []);
 });

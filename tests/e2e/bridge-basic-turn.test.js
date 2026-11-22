@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import childProcess from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import test from "node:test";
 import WebSocket from "ws";
@@ -11,11 +13,17 @@ import {
   injectDiscordReaction,
   runPreloadProbe,
   startFakeCodexServer,
+  waitForFinishedTurns,
   waitForState,
 } from "./support/bridge.js";
-import { runRouterCli, startBridge } from "./support/router.js";
+import { assertPrivate, platformGate, privateTempRoot } from "./support/platform.js";
+import { routerEnv, runRouterCli, startBridge } from "./support/router.js";
+import { startFakeHost } from "./support/session-fixture.js";
 import { readState, seedRegistry, updateState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
+
+const { killTree, killTreeSync, rememberSpawn } = createRequire(import.meta.url)("../../scripts/platform/process.js");
+const WIN32 = process.platform === "win32";
 
 test.afterEach(async () => {
   await cleanup();
@@ -1154,7 +1162,9 @@ test("bridge forwards thumbs-up and thumbs-down reactions on its own messages", 
     (state) => replyContents(state).includes("up received"),
     5000,
   );
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  // The reply posts before the turn ends; the second reaction must start its own
+  // turn. Two turns: the bootstrap, then the thumbs-up.
+  await waitForFinishedTurns(bridge, 2);
 
   const state = await injectReactionUntil(
     workspace,
@@ -1247,6 +1257,7 @@ test("bridge sends the bootstrap instruction turn after idle compact completion"
 
 test("bridge restarts its own Codex session from slash command", async () => {
   const workspace = createBridgeWorkspace();
+  const hostEnv = process.platform === "win32" ? (await startFakeHost(workspace, { env: routerEnv(workspace) })).env : {};
   const codex = await startFakeCodexServer(workspace);
   seedRegistry(workspace, {
     root_bot_app_id: ROOT_BOT_USER_ID,
@@ -1265,7 +1276,7 @@ test("bridge restarts its own Codex session from slash command", async () => {
     },
   });
   fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
-  const bridge = await startBridge(workspace, { port: codex.port });
+  const bridge = await startBridge(workspace, { port: codex.port, env: hostEnv });
 
   await bridge.waitForOutput(/Listening in #alpha/, 7000);
   await injectMessageUntil(
@@ -1688,6 +1699,15 @@ test("bridge transcribes audio attachments by default", async () => {
   assert.match(userTurns[0][2].text, /--- File: notes\.txt ---\ntext attachment/);
   assert.equal(userTurns[0].some((part) => part.text?.includes(".discord-attachments")), false);
   assert.equal(state.fixtures.whisper.invocations[0].inputExists, true);
+  // The audio and whisper's output sat in one private temp directory, gone after the turn.
+  const whisperArgs = state.fixtures.whisper.invocations[0].args;
+  const audioDir = path.dirname(whisperArgs[0]);
+  assert.equal(path.dirname(audioDir), privateTempRoot(workspace));
+  assert.match(path.basename(audioDir), /^codex-bridge-audio-/);
+  assert.equal(whisperArgs[whisperArgs.indexOf("--output_dir") + 1], path.join(audioDir, "out"));
+  assert.equal(fs.existsSync(audioDir), false);
+  assert.deepEqual(fs.readdirSync(privateTempRoot(workspace)).filter((name) => name.startsWith("codex-bridge-audio-")), []);
+  if (process.platform === "win32") assertPrivate(privateTempRoot(workspace));
   assert.deepEqual(
     state.fixtures.discord.attachmentFetches.map((entry) => entry.url).sort(),
     [
@@ -1695,6 +1715,53 @@ test("bridge transcribes audio attachments by default", async () => {
       "https://cdn.discordapp.com/attachments/channel/message/voice-message.ogg",
     ],
   );
+  await bridge.stop();
+});
+
+test("with no whisper the turn says the audio could not be transcribed, and the bridge keeps serving", async () => {
+  const workspace = createBridgeWorkspace({ excludeFixtures: ["whisper"] });
+  const voiceUrl = "https://cdn.discordapp.com/attachments/channel/message/voice-message.ogg";
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.attachments[voiceUrl] = { body: "fixture audio body", contentType: "audio/ogg" };
+  writeState(seed, workspace.stateDir);
+
+  const codex = await startFakeCodexServer(workspace, {
+    turns: [{ delta: "could not hear it" }, { delta: "still here" }],
+  });
+  const bridge = await startBridge(workspace, {
+    port: codex.port,
+    env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
+
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
+  await injectMessageUntil(
+    workspace,
+    {
+      id: "voice-message",
+      content: "",
+      attachments: [{ id: "voice-att", contentType: "audio/ogg", name: "voice-message.ogg", size: 18, url: voiceUrl }],
+    },
+    (nextState) => replyContents(nextState).includes("could not hear it"),
+    15000,
+  );
+  // The reply is posted just before the turn ends, and a message sent before the
+  // bridge is idle would steer that turn. Idle twice: the bootstrap, then this turn.
+  await bridge.waitForOutput(/(?:bridge idle[^]*){2}/, 15000);
+  await injectMessageUntil(
+    workspace,
+    { id: "typed-message", content: "typed instead" },
+    (nextState) => replyContents(nextState).includes("still here"),
+    15000,
+  );
+
+  const userTurns = codex.clientMessages.filter((message) => message.method === "turn/start").map((message) => message.params.input)
+    .filter((input) => !input[0]?.text?.startsWith("You are communicating with the user via Discord"));
+  assert.equal(userTurns.length, 2);
+  assert.equal(userTurns[0].length, 1);
+  assert.ok(userTurns[0][0].text.startsWith("[Audio attachment could not be transcribed: voice-message.ogg ("), userTurns[0][0].text);
+  assert.equal(userTurns[1][0].text, "typed instead");
+  // The downloaded audio is removed even though nothing transcribed it.
+  assert.deepEqual(fs.readdirSync(privateTempRoot(workspace)).filter((name) => name.startsWith("codex-bridge-audio-")), []);
   await bridge.stop();
 });
 
@@ -1746,7 +1813,7 @@ test("bridge fixture resolves ws from the harness NODE_PATH before launch", asyn
   const result = await runPreloadProbe(workspace, "console.log(require.resolve('ws'))");
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  assert.match(result.stdout, /node_modules\/ws\/index\.js/);
+  assert.match(result.stdout, /node_modules[\\/]ws[\\/]index\.js/);
 });
 
 async function waitFor(predicate, timeoutMs = 1000) {
@@ -1757,15 +1824,6 @@ async function waitFor(predicate, timeoutMs = 1000) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error("Timed out waiting for condition");
-}
-
-// The bridge logs each turn's end once it is idle and will start, not steer, a turn.
-async function waitForFinishedTurns(bridge, count, timeoutMs = 10000) {
-  const deadline = Date.now() + timeoutMs;
-  while ((bridge.stdout.match(/\[turn\] Finished /g) ?? []).length < count) {
-    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${count} finished turn(s); stdout:\n${bridge.stdout}`);
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
 }
 
 async function injectMessageUntil(workspace, message, predicate, timeoutMs = 5000) {
@@ -1876,6 +1934,67 @@ test("root steers only the active channel and author, retaining the active grant
   await bridge.stop();
 });
 
+test("root's channel scope file is private and each rewrite replaces it whole under a concurrent reader", async () => {
+  const workspace = createBridgeWorkspace();
+  seedRegistry(workspace, {
+    discord_user_id: "allowed-user-id",
+    guild_id: "guild-id",
+    root_channels: ["root-channel"],
+    projects: {},
+  });
+  const TURNS = 5;
+  const codex = await startFakeCodexServer(workspace, {
+    turns: Array.from({ length: TURNS }, (_, index) => ({ delta: `turn ${index} done` })),
+  });
+  const bridge = await startBridge(workspace, {
+    root: true, allowedUserIds: ["allowed-user-id"], botAppId: ROOT_BOT_USER_ID, rootBotAppId: ROOT_BOT_USER_ID,
+    channelId: "root-channel", port: codex.port, env: { CODEX_BRIDGE_TEXT_REPLY_FALLBACK: "1" },
+  });
+  await bridge.waitForOutput(/Root routing active for 1 configured channel/, 7000);
+  const scopeFile = codex.clientMessages
+    .find((m) => m.method === "config/value/write" && m.params.keyPath === "mcp_servers.discord-root")
+    .params.value.env.DISCORD_CHANNEL_SCOPE_FILE;
+  const scopeDir = path.dirname(scopeFile);
+  assert.equal(path.dirname(scopeDir), privateTempRoot(workspace));
+  assert.match(path.basename(scopeDir), /^codex-discord-scope-/);
+  assertPrivate(scopeFile);
+
+  const seen = new Set();
+  const inodes = new Set();
+  let reading = true;
+  const reader = (async () => {
+    while (reading) {
+      seen.add(await fs.promises.readFile(scopeFile, "utf8"));
+      inodes.add((await fs.promises.stat(scopeFile, { bigint: true })).ino);
+    }
+  })();
+  const turns = () => codex.clientMessages.filter((m) => m.method === "turn/start" &&
+    m.params.input?.[0]?.text?.startsWith("Discord routing metadata:"));
+  const replied = (state, index) => state.fixtures.discord.messages.some((m) => m.content === `turn ${index} done`);
+  for (let index = 0; index < TURNS; index += 1) {
+    await injectMessageUntil(workspace, { channelId: "root-channel", content: `go ${index}`, id: `scope-${index}` },
+      (state) => replied(state, index), 15000);
+  }
+  await waitForFinishedTurns(bridge, TURNS);
+  reading = false;
+  await reader;
+
+  const grants = turns().map((turn) => turn.params.input[0].text.match(/channel_scope_token: (\S+)/)[1]);
+  assert.equal(grants.length, TURNS);
+  for (const value of seen) assert.ok(value === "" || grants.includes(value), `torn scope read: ${value}`);
+  assert.ok(inodes.size > 1, "the scope file was rewritten in place");
+  // A rewrite after the last turn may be mid-rename, so one clean listing is the
+  // evidence: a temporary file that truly leaked would be in every listing.
+  let entries = fs.readdirSync(scopeDir);
+  for (let attempt = 0; attempt < 100 && entries.length > 1; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    entries = fs.readdirSync(scopeDir);
+  }
+  assert.deepEqual(entries, ["active"]);
+  assertPrivate(scopeFile);
+  await bridge.stop();
+});
+
 test("Discord MCP readiness follows data pages and waits for the reply tool before starting a thread", async () => {
   const workspace = createBridgeWorkspace();
   const codex = await startFakeCodexServer(workspace, { staleMcpName: "discord-stale", mcpReadyAfter: 5, paginatedMcp: true });
@@ -1945,4 +2064,101 @@ test("failed bootstrap completion without a separate error event fails startup",
   assert.equal(result.exitCode, 1);
   assert.match(result.stderr, /provider bootstrap failure/);
   assert.doesNotMatch(result.stdout, /Discord bot logged in|Listening in/);
+});
+
+test("the MCP server is registered with the absolute path of the running Node", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace);
+  const bridge = await startBridge(workspace, { port: codex.port });
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
+  const config = codex.clientMessages.find((message) => message.method === "config/value/write" && message.params.keyPath === "mcp_servers.discord-channel-id");
+  assert.equal(config.params.value.command, process.execPath);
+  await bridge.stop();
+});
+
+test("the bridge starts the Codex that CCDM_CODEX_PATH names", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace);
+  const missing = path.join(workspace.tmpDir, process.platform === "win32" ? "no-such-codex.exe" : "no-such-codex");
+  const bridge = await startBridge(workspace, { port: codex.port, env: { CCDM_CODEX_PATH: missing } });
+  const result = await bridge.closed;
+  assert.notEqual(result.exitCode, 0);
+  assert.ok(result.stderr.includes(missing), result.stderr);
+  assert.equal(readState(workspace.stateDir).fixtures.codex.appServerInvocations.length, 0);
+});
+
+test("the bridge never runs a .cmd as Codex", platformGate("win32", "only Windows has .cmd files"), async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace);
+  const shim = path.join(workspace.tmpDir, "codex.cmd");
+  fs.writeFileSync(shim, "@exit /b 0\r\n");
+  const bridge = await startBridge(workspace, { port: codex.port, env: { CCDM_CODEX_PATH: shim } });
+  const result = await bridge.closed;
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /ignoring CCDM_CODEX_PATH=.*a \.cmd or \.bat cannot be started without a shell/);
+  assert.match(result.stderr, /Codex was not found/);
+});
+
+test("--ccdm-key-file naming the launch key behaves like no flag", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace);
+  const keyFile = path.join(workspace.routerStateDir, "keys", "alpha.key");
+  const bridge = await startBridge(workspace, { args: ["--ccdm-key-file", keyFile], port: codex.port });
+  await bridge.waitForOutput(/Listening in #alpha/, 7000);
+  await bridge.stop();
+});
+
+test("--ccdm-key-file naming a different file stops the bridge and names both", async () => {
+  const workspace = createBridgeWorkspace();
+  const codex = await startFakeCodexServer(workspace);
+  const other = path.join(workspace.tmpDir, "other.key");
+  const keyFile = path.join(workspace.routerStateDir, "keys", "alpha.key");
+  const bridge = await startBridge(workspace, { args: ["--ccdm-key-file", other], port: codex.port });
+  const result = await bridge.closed;
+  assert.notEqual(result.exitCode, 0);
+  assert.ok(result.stderr.includes(other), result.stderr);
+  assert.ok(result.stderr.includes(keyFile), result.stderr);
+  assert.equal(readState(workspace.stateDir).fixtures.codex.appServerInvocations.length, 0);
+});
+
+// A stand-in for a ChildProcess, whose `kill` must never reach a real process.
+function fakeChild(values) {
+  return { exitCode: null, kill() { this.kills = (this.kills ?? 0) + 1; }, pid: 999999, signalCode: null, ...values };
+}
+
+function exitedChild() {
+  const child = childProcess.spawn(process.execPath, ["-e", ""], { stdio: "ignore", windowsHide: true });
+  rememberSpawn(child);
+  return new Promise((resolve) => child.once("close", () => resolve(child)));
+}
+
+test("an exited app-server gets no kill, and no taskkill on Windows", async (t) => {
+  const spawnSync = t.mock.method(childProcess, "spawnSync", () => ({ status: 0 }));
+  const spawn = t.mock.method(childProcess, "spawn", () => { throw new Error("spawn must not run"); });
+  const exited = fakeChild({ exitCode: 0 });
+  killTreeSync(exited);
+  await killTree(exited);
+  const signalled = fakeChild({ signalCode: "SIGTERM" });
+  killTreeSync(signalled);
+  assert.equal(spawnSync.mock.callCount(), 0);
+  assert.equal(spawn.mock.callCount(), 0);
+  assert.equal(exited.kills, undefined);
+  assert.equal(signalled.kills, undefined);
+});
+
+test("a freed PID is not killed even though the handle still looks running", platformGate("win32", "PID reuse is guarded by creation time on Windows"), async (t) => {
+  const child = await exitedChild();
+  const reused = fakeChild({ pid: child.pid });
+  const spawnSync = t.mock.method(childProcess, "spawnSync", () => ({ status: 0 }));
+  killTreeSync(reused);
+  killTreeSync(Object.assign(child, { exitCode: null, signalCode: null }));
+  assert.equal(spawnSync.mock.callCount(), 0);
+});
+
+test("the POSIX stop is one SIGTERM to the child, however many paths ask", platformGate("posix", "Windows stops a tree with taskkill"), async () => {
+  const signals = [];
+  const child = fakeChild({ kill: (signal) => signals.push(signal) });
+  await killTree(child);
+  killTreeSync(child);
+  assert.deepEqual(signals, ["SIGTERM"]);
 });

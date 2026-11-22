@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import test from "node:test";
 
+import { platformGate } from "./support/platform.js";
 import { runNodeEntrypoint, runScript } from "./support/runner.js";
 import { injectDiscordMessage, waitForState } from "./support/bridge.js";
 import {
@@ -17,8 +19,13 @@ import {
 } from "./support/router.js";
 import { readState, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
+import { startThreadHost, supervisorEnv } from "./support/thread-supervisor.js";
 
 test.afterEach(async () => { await cleanup(); });
+
+const require = createRequire(import.meta.url);
+const { hookCommand } = require("../../scripts/platform/hooks.js");
+const { ensurePrivateDirSync } = require("../../scripts/platform/privacy.js");
 
 // Conversation Reminder events of a Claude project session. Every Claude
 // session is served through the Router, and its CCDM channel server records
@@ -64,9 +71,12 @@ let launchCounter = 0;
 // connected to the Router. `root` runs it in root's role.
 async function startChannel(workspace, options = {}) {
   launchCounter += 1;
-  const hookSettings = path.join(workspace.tmpDir, `claude-reminder-hooks-${launchCounter}.json`);
+  // The server trusts the hook settings only from a private directory.
+  const hookDir = path.join(workspace.tmpDir, "claude-hook-settings");
+  ensurePrivateDirSync(hookDir);
+  const hookSettings = path.join(hookDir, `claude-reminder-hooks-${launchCounter}.json`);
   if (!options.noHooksConfig) {
-    const command = `node '${path.join(workspace.repoDir, "scripts", "claude-reminder-hook.js")}'`;
+    const command = hookCommand(path.join(workspace.repoDir, "scripts", "claude-reminder-hook.js"));
     fs.writeFileSync(hookSettings, JSON.stringify({
       ...(options.noSingleListenerConfig ? {} : { enabledPlugins: { "discord@claude-plugins-official": false } }),
       hooks: Object.fromEntries(
@@ -162,6 +172,19 @@ async function readiness(workspace) {
 }
 
 const eventTypes = report => report.events.map(event => event.event_type);
+// How readiness names the launcher in its fix: the script on macOS and Linux, the subcommand on Windows.
+const START_SESSION = process.platform === "win32" ? "scripts/ccdm start-session" : "scripts/start-session.sh";
+const windowsOnly = platformGate("win32", "POSIX readiness keeps os.kill and ps, and its marker carries no start time");
+
+// The channel server records its events one after another, each through a
+// Python child, and stopping it discards any it has not written yet. Wait for
+// them to be committed before a stop; with the receiver out, for them to be spooled.
+async function recorded(workspace, count, { spooled = false } = {}) {
+  await waitFor(async () => {
+    const { report } = await readiness(workspace);
+    return (spooled ? report.event_receiver.pending_count : report.events.length) >= count;
+  }, () => `${count} ${spooled ? "spooled" : "committed"} reminder events`, 15000);
+}
 
 async function runHook(workspace, hook_event_name, fields = {}, extraEnv = {}) {
   return runNodeEntrypoint(workspace, "scripts/claude-reminder-hook.js", {
@@ -224,9 +247,13 @@ test("Claude project channel forwards normal owner input", async () => {
   const { workspace } = await claudeWorkspace();
   const channel = await startChannel(workspace);
   await deliver(workspace, channel, { id: "owner-message-1", content: "please continue" }, { notified: true });
-  const { exitCode, stderr, report } = await readiness(workspace);
+  // This is the store's first event. Readiness asked while the receiver is still
+  // creating the database waits for the events table, not for the event itself,
+  // so wait until the event is recorded.
+  await recorded(workspace, 1);
+  const { exitCode, report } = await readiness(workspace);
   await channel.stop();
-  assert.equal(exitCode, 0, stderr);
+  assert.equal(exitCode, 0, JSON.stringify(report));
   assert.deepEqual(eventTypes(report), ["owner_activity"]);
 });
 
@@ -307,6 +334,7 @@ test("owner continuation after an active Claude question records resumed work", 
   const channel = await startChannel(workspace);
   await answeredTurn(workspace, channel);
   await deliver(workspace, channel, { id: "owner-message-2", content: "Option A" }, { notified: true });
+  await recorded(workspace, 5);
   await channel.stop();
   const { report } = await readiness(workspace);
   assert.deepEqual(eventTypes(report), [
@@ -330,8 +358,9 @@ for (const [name, change] of [
     const { exitCode, report } = await readiness(workspace);
     await channel.stop();
     assert.equal(exitCode, 2);
-    assert.match(report.unsupported_capabilities.join(" "),
-      /Claude launch-scoped transport is not verified for this assignment; restart the session with scripts\/start-session\.sh demo/);
+    assert.ok(report.unsupported_capabilities.join(" ").includes(
+      `Claude launch-scoped transport is not verified for this assignment; restart the session with ${START_SESSION} demo`),
+    report.unsupported_capabilities.join(" "));
   });
 }
 
@@ -398,6 +427,7 @@ test("a failed Claude reply cannot supply an input-needed receipt", async () => 
   seed.fixtures.discord.restFailures = [{ method: "POST", path: WEBHOOK_EXECUTE, status: 500 }];
   writeState(seed, workspace.stateDir);
   const result = await channel.call("reply", replyArgs());
+  await recorded(workspace, 1);
   await channel.stop();
   assert.equal(result.isError, true, JSON.stringify(result));
   assert.equal(readState(workspace.stateDir).fixtures.discord.restFailureUses.length, 1);
@@ -420,7 +450,9 @@ test("Claude channel instructions name the relayed commands and how to type any 
   await channel.stop();
   const { instructions } = channel.initialize.result;
   assert.match(instructions, /relays only \/pause, \/unpause, \/compact, \/clear and \/restart as commands/);
-  assert.match(instructions, /tmux send-keys -t "\$TMUX_PANE"/);
+  assert.match(instructions, process.platform === "win32"
+    ? /scripts\/ccdm" session send "\$CCDM_SESSION_NAME" --literal/
+    : /tmux send-keys -t "\$TMUX_PANE"/);
 });
 
 test("Claude reply tool exposes explicit interaction and input-needed fields", async () => {
@@ -432,10 +464,39 @@ test("Claude reply tool exposes explicit interaction and input-needed fields", a
   assert.deepEqual(reply.inputSchema.properties.conversation_disposition.enum, ["progress", "input-needed"]);
 });
 
+test("the adapter drains an event into the reminder store through the resolved Python", async () => {
+  const workspace = createRouterWorkspace({
+    discord_user_id: OWNER_ID,
+    guild_id: "guild-id",
+    projects: { demo: { type: "claude", transport: "router", channel_id: "channel-1", assignment_generation: "generation-1",
+      webhook_id: WEBHOOK_ID, session_id: null, pid: null } },
+  });
+  const stateDir = reminderStateDir(workspace);
+  const drain = path.join(workspace.tmpDir, "drain-one-event.js");
+  fs.writeFileSync(drain, `
+const adapter = require(${JSON.stringify(path.join(workspace.repoDir, "scripts", "conversation-reminder-adapter.js"))});
+adapter.emitEvent("owner_activity", {
+  project: "demo", owner_id: ${JSON.stringify(OWNER_ID)}, channel_id: "channel-1",
+  bot_id: "router:${WEBHOOK_ID}", assignment_generation: "generation-1", provider: "claude",
+}, { actor_id: ${JSON.stringify(OWNER_ID)}, source_message_id: "owner-message-1", activity_kind: "message" })
+  .then(() => adapter.drainOutbox())
+  .then(result => process.stdout.write(JSON.stringify(result)));
+`);
+  const result = await runNodeEntrypoint(workspace, path.relative(workspace.repoDir, drain), {
+    env: { CCDM_REMINDER_PROJECT_ROOT: workspace.repoDir, CCDM_REMINDER_STATE_DIR: stateDir },
+  });
+  assert.equal(result.exitCode, 0, result.stderr);
+  // The first drain is emitEvent's own, so this one has nothing left to do.
+  assert.deepEqual(JSON.parse(result.stdout), { status: "complete", committed: 0, duplicates: 0, rejected: 0, stale: 0, pending: 0, outcomes: [] });
+  assert.equal(fs.readdirSync(path.join(stateDir, "outbox")).length, 0);
+  assert.ok(fs.existsSync(path.join(stateDir, "events.sqlite3")));
+});
+
 test("Claude event outbox replays after a receiver outage", async () => {
   const { workspace } = await claudeWorkspace();
   const channel = await startChannel(workspace, { receiverOutage: true });
   await deliver(workspace, channel, { id: "owner-message-1", content: "hello" }, { notified: true });
+  await recorded(workspace, 1, { spooled: true });
   await channel.stop();
   const before = await readiness(workspace);
   assert.equal(before.report.event_receiver.pending_count, 1);
@@ -452,6 +513,7 @@ test("Claude channel startup replays an outbox event without new conversation in
   const { workspace } = await claudeWorkspace();
   const outage = await startChannel(workspace, { receiverOutage: true });
   await deliver(workspace, outage, { id: "owner-message-1", content: "hello" }, { notified: true });
+  await recorded(workspace, 1, { spooled: true });
   await outage.stop();
   const relaunched = await startChannel(workspace);
   await waitFor(() => fs.readdirSync(path.join(reminderStateDir(workspace), "outbox"), { recursive: true })
@@ -467,6 +529,7 @@ test("Claude SessionEnd reports termination without promoting progress to comple
   assert.equal((await runHook(workspace, "SessionStart")).exitCode, 0);
   const channel = await startChannel(workspace);
   await deliver(workspace, channel, { id: "owner-message-1", content: "hello" }, { notified: true });
+  await recorded(workspace, 1);
   await channel.stop();
   const ended = await runHook(workspace, "SessionEnd", { reason: "logout" });
   assert.equal(ended.exitCode, 0, ended.stderr);
@@ -505,6 +568,7 @@ test("Claude project reply cannot target an unassigned channel", async () => {
   const channel = await startChannel(workspace);
   await deliver(workspace, channel, { id: "owner-message-1", content: "hello" }, { notified: true });
   const result = await channel.call("reply", replyArgs({ chat_id: "channel-elsewhere" }));
+  await recorded(workspace, 1);
   await channel.stop();
   assert.equal(result.isError, true);
   assert.match(result.content[0].text, /scope_violation/);
@@ -542,8 +606,17 @@ test("shared receiver rejects a Claude owner event after provider reassignment",
   assert.equal(JSON.parse(result.stdout).status, "rejected");
 });
 
-function startSession(workspace) {
-  return runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace), timeoutMs: 30000 });
+// What a launcher runs with. On Windows the session runs on the fake ccdm-host,
+// whose env moves the state root, so the reminder state is named; and the Bash
+// launchers read UTF-8 pane text through Python, which defaults to the ANSI code page.
+async function launcherEnv(workspace) {
+  if (process.platform !== "win32") return routerEnv(workspace);
+  await startThreadHost(workspace);
+  return supervisorEnv(workspace, { CCDM_REMINDER_STATE_DIR: reminderStateDir(workspace), PYTHONUTF8: "1" });
+}
+
+async function startSession(workspace) {
+  return runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: await launcherEnv(workspace), timeoutMs: 30000 });
 }
 
 test("Claude launcher, channel server, command hooks and readiness share one launch identity", async () => {
@@ -569,7 +642,7 @@ test("Claude launcher, channel server, command hooks and readiness share one lau
   const marker = path.join(reminderStateDir(workspace), "capabilities", "demo.json");
   assert.equal(JSON.parse(fs.readFileSync(marker, "utf8")).launch_id, launchEnv.CCDM_CLAUDE_LAUNCH_ID);
 
-  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"], env: routerEnv(workspace) });
+  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"], env: await launcherEnv(workspace) });
   assert.equal(stopped.exitCode, 0, stopped.stderr || stopped.stdout);
   assert.equal(fs.existsSync(marker), false, "stopping the launch removes its capability marker");
   const exited = await readiness(workspace);
@@ -591,10 +664,15 @@ test("a killed Claude channel server never leaves a stale ready transport", asyn
   assert.equal(fs.existsSync(marker), true);
   const dead = await readiness(workspace);
   assert.equal(dead.exitCode, 2);
-  assert.match(dead.report.unsupported_capabilities.join(" "),
-    /Claude launch-scoped transport is not running for this assignment; restart the session with scripts\/start-session\.sh demo/);
+  assert.ok(dead.report.unsupported_capabilities.join(" ").includes(
+    `Claude launch-scoped transport is not running for this assignment; restart the session with ${START_SESSION} demo`),
+  dead.report.unsupported_capabilities.join(" "));
+  // The plain report points at the reminder command as this OS runs it.
+  const plain = await runScript(workspace, "scripts/conversation-reminder-readiness.py", { args: ["demo"], env: routerEnv(workspace) });
+  const remindersCommand = process.platform === "win32" ? "scripts/ccdm reminders" : "scripts/conversation-reminder-service.py";
+  assert.ok(plain.stdout.split(/\r?\n/).includes(`Reminder delivery: see ${remindersCommand} status`), plain.stdout);
 
-  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"], env: routerEnv(workspace) });
+  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"], env: await launcherEnv(workspace) });
   assert.equal(stopped.exitCode, 0, stopped.stderr || stopped.stdout);
   assert.equal(fs.existsSync(marker), false, "stop-session removes the launch's capability marker");
   // A relaunch replaces any earlier marker with its own live channel server's.
@@ -603,6 +681,72 @@ test("a killed Claude channel server never leaves a stale ready transport", asyn
   assert.equal(relaunched.exitCode, 0, relaunched.stderr || relaunched.stdout);
   assert.equal(JSON.parse(fs.readFileSync(marker, "utf8")).transport, "ccdm-channel-server");
   assert.equal((await readiness(workspace)).exitCode, 0);
+});
+
+// Signal 0 is Ctrl+C for a whole console group on Windows, so the marker's PID
+// is proven there through the process table, together with its start time.
+test("Windows readiness proves the channel server by its PID and start time, without os.kill or ps", windowsOnly, async () => {
+  const { workspace } = await claudeWorkspace();
+  const channel = await startChannel(workspace);
+  const markerPath = path.join(reminderStateDir(workspace), "capabilities", "demo.json");
+  const marker = JSON.parse(fs.readFileSync(markerPath, "utf8"));
+  assert.equal(marker.pid, channel.pid);
+  assert.match(marker.started_at, /^[0-9]+$/);
+  assert.equal((await readiness(workspace)).exitCode, 0);
+  const plant = change => fs.writeFileSync(markerPath, JSON.stringify({ ...marker, ...change }), { mode: 0o600 });
+  const notRunning = /Claude launch-scoped transport is not running for this assignment/;
+
+  // The same live PID with another start time is a later process, not this launch.
+  plant({ started_at: String(BigInt(marker.started_at) + 10000000n) });
+  const reused = await readiness(workspace);
+  assert.equal(reused.exitCode, 2);
+  assert.match(reused.report.unsupported_capabilities.join(" "), notRunning);
+  // A marker with no start time is judged by its PID and command line alone.
+  plant({ started_at: null });
+  assert.equal((await readiness(workspace)).exitCode, 0);
+
+  // The answers themselves, with os.kill and every child process refused.
+  const driver = path.join(workspace.tmpDir, "readiness-liveness.py");
+  fs.writeFileSync(driver, [
+    "import importlib.util, json, os, subprocess, sys",
+    "spec = importlib.util.spec_from_file_location('readiness', sys.argv[1])",
+    "readiness = importlib.util.module_from_spec(spec)",
+    "spec.loader.exec_module(readiness)",
+    "refused = []",
+    "def refuse(name):",
+    "    def call(*args, **kwargs):",
+    "        refused.append(name)",
+    "        raise RuntimeError(name + ' must not run on Windows')",
+    "    return call",
+    "os.kill = refuse('os.kill')",
+    "subprocess.run = refuse('subprocess.run')",
+    "subprocess.Popen = refuse('subprocess.Popen')",
+    "pid, started = int(sys.argv[2]), sys.argv[3]",
+    "live = readiness.adapter_process_live",
+    "print(json.dumps({",
+    "    'live': live(pid, started_at=started),",
+    "    'no_start_time': live(pid),",
+    "    'other_start_time': live(pid, started_at=str(int(started) + 1)),",
+    "    'other_program': live(os.getpid()),",
+    "    'refused': refused,",
+    "}))",
+    "",
+  ].join("\n"));
+  const probe = await runScript(workspace, path.relative(workspace.repoDir, driver), {
+    args: [path.join(workspace.repoDir, "scripts", "conversation-reminder-readiness.py"), String(marker.pid), marker.started_at],
+    env: routerEnv(workspace),
+  });
+  assert.equal(probe.exitCode, 0, probe.stderr);
+  assert.deepEqual(JSON.parse(probe.stdout), {
+    live: true, no_start_time: true, other_start_time: false, other_program: false, refused: [],
+  });
+
+  // Once the channel server is gone, its own marker no longer proves anything.
+  await channel.stop();
+  plant({});
+  const dead = await readiness(workspace);
+  assert.equal(dead.exitCode, 2);
+  assert.match(dead.report.unsupported_capabilities.join(" "), notRunning);
 });
 
 test("a Claude input-needed receipt replayed after downtime gets one catch-up from root", async () => {

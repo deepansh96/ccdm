@@ -10,6 +10,7 @@
 //   scripts/migrate-to-router.sh --rollback <project>
 const { spawnSync } = require("node:child_process");
 const path = require("node:path");
+const { pythonInvocation } = require("../platform/tools.js");
 const { RouterClient } = require("./client.js");
 const { registryPath, rootToken, socketPath, stateDir } = require("./paths.js");
 const { probe } = require("./probe.js");
@@ -43,7 +44,10 @@ async function step(name, action) {
 // A lifecycle script, run to completion; its last error line (or, lacking
 // one, its last output line) explains a failure.
 function script(name, project, ...extra) {
-  const result = spawnSync(path.join(SCRIPTS, name), [project, ...extra], { encoding: "utf8", env: process.env });
+  // Windows cannot start a shell shim: there the same command runs through ccdm.py.
+  const result = process.platform === "win32"
+    ? spawnSync(...pythonInvocation([path.join(SCRIPTS, "ccdm.py"), path.basename(name, ".sh"), project, ...extra], { encoding: "utf8" }))
+    : spawnSync(path.join(SCRIPTS, name), [project, ...extra], { encoding: "utf8", env: process.env });
   if (result.status === 0) return;
   const lastLine = text => (text || "").trim().split("\n").filter(Boolean).at(-1);
   const reason = lastLine(result.stderr) || lastLine(result.stdout);

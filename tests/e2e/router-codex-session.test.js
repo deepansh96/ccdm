@@ -3,7 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { injectDiscordMessage, injectDiscordReaction, startFakeCodexServer, waitForState } from "./support/bridge.js";
+import { assertPrivate, platformGate, replaceFile } from "./support/platform.js";
+import { injectDiscordMessage, injectDiscordReaction, startFakeCodexServer, waitForFinishedTurns, waitForState } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import {
   OWNER_ID,
@@ -14,6 +15,7 @@ import {
   runRouterCli,
   waitFor,
 } from "./support/router.js";
+import { startFakeHost } from "./support/session-fixture.js";
 import { readState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
 
@@ -37,8 +39,16 @@ function codexRouterWorkspace(port) {
   return workspace;
 }
 
-function startCodexSession(workspace, extraEnv = {}) {
-  return runScript(workspace, "scripts/start-codex-session.sh", { args: ["demo"], env: routerEnv(workspace, extraEnv), timeoutMs: 30000 });
+// On Windows the launcher goes through the fake ccdm-host, sharing the fixture's session table.
+const fakeHosts = new WeakMap();
+async function launcherEnv(workspace) {
+  if (process.platform !== "win32") return {};
+  if (!fakeHosts.has(workspace)) fakeHosts.set(workspace, startFakeHost(workspace, { env: routerEnv(workspace) }));
+  return (await fakeHosts.get(workspace)).env;
+}
+
+async function startCodexSession(workspace, extraEnv = {}) {
+  return runScript(workspace, "scripts/start-codex-session.sh", { args: ["demo"], env: routerEnv(workspace, { ...(await launcherEnv(workspace)), ...extraEnv }), timeoutMs: 30000 });
 }
 
 function readRegistry(workspace) {
@@ -89,8 +99,7 @@ function updateRegistry(workspace, change) {
   const registryFile = path.join(workspace.repoDir, "registry.json");
   const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
   change(registry);
-  fs.writeFileSync(`${registryFile}.edit`, `${JSON.stringify(registry, null, 2)}\n`);
-  fs.renameSync(`${registryFile}.edit`, registryFile);
+  replaceFile(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
 }
 
 function setPort(workspace, port, fields = {}) {
@@ -164,9 +173,9 @@ test("no Discord bot or webhook token reaches the Codex session environment, lau
   }
   assert.equal(mcpWrites[0].message.params.value.env.CCDM_ROUTER_KEY_FILE, path.join(workspace.routerStateDir, "keys", "demo.key"));
   for (const file of fs.readdirSync(launchDir)) {
-    assert.equal(fs.statSync(path.join(launchDir, file)).mode & 0o777, 0o600, file);
+    assertPrivate(path.join(launchDir, file), file);
   }
-  assert.equal(fs.statSync(path.join(workspace.routerStateDir, "keys", "demo.key")).mode & 0o777, 0o600);
+  assertPrivate(path.join(workspace.routerStateDir, "keys", "demo.key"));
 });
 
 test("a router Codex launch whose Router hello fails exits non-zero and cleans up", async () => {
@@ -267,6 +276,37 @@ test("/pause queues router Codex messages and /unpause runs them in order", asyn
   ]);
 });
 
+test("a paused voice message keeps its place ahead of a text message sent after it", async () => {
+  const voice = signedUrl("voice-message.ogg", "ffffffff");
+  const { workspace, codex } = await routerCodexSession([
+    { turnId: "voice-turn", mcpReplyText: "voice done" },
+    { turnId: "text-turn", mcpReplyText: "text done" },
+  ]);
+  const seed = readState(workspace.stateDir);
+  seed.fixtures.discord.attachments[voice] = { body: "fixture audio body", contentType: "audio/ogg" };
+  seed.fixtures.whisper.transcriptions["voice-message.ogg"] = "spoken first";
+  writeState(seed, workspace.stateDir);
+
+  ownerMessage(workspace, { id: "cmd-pause", content: "/pause" });
+  await waitForState(workspace, (next) => webhookContents(next).includes("Bridge paused. New messages will be queued."), 15000);
+  // The bridge downloads and transcribes the voice message, so it is ready later than the text.
+  ownerMessage(workspace, {
+    id: "2001", content: "listen",
+    attachments: [{ id: "att-voice", name: "voice-message.ogg", contentType: "audio/ogg", size: 18, url: voice }],
+  });
+  ownerMessage(workspace, { id: "typed-second", content: "typed second" });
+  await waitForState(workspace, (next) => botReactions(next).filter(([, emoji]) => emoji === "⏳").length === 2, 15000);
+
+  ownerMessage(workspace, { id: "cmd-unpause", content: "/unpause" });
+  const done = await waitForState(workspace, (next) => webhookContents(next).includes("text done"), 15000);
+
+  assert.deepEqual(userTurnInputs(codex).map((input) => input.map((part) => part.text)), [
+    ["listen", "--- Audio transcription: voice-message.ogg ---\nspoken first\n--- End audio transcription ---"],
+    ["typed second"],
+  ]);
+  assert.deepEqual(botReactions(done).filter(([, emoji]) => emoji === "⏳"), [["2001", "⏳"], ["typed-second", "⏳"]]);
+});
+
 test("/compact and /clear compact and replace the router Codex thread with webhook acknowledgments", async () => {
   const { workspace, codex } = await routerCodexSession([], {
     compactComplete: true, threadIds: ["thread-before-clear", "thread-after-clear"],
@@ -285,9 +325,35 @@ test("/compact and /clear compact and replace the router Codex thread with webho
   assert.deepEqual(userTurnInputs(codex), []);
 });
 
+// With real Codex a compaction takes seconds. Here it is over before the
+// app-server has even answered the request to start it.
+test("a compaction that completes at once still posts its start before its completion", async () => {
+  const { workspace, codex } = await routerCodexSession([], { compactComplete: "before-reply" });
+
+  ownerMessage(workspace, { id: "cmd-compact", content: "/compact" });
+  const done = await waitForState(workspace, (next) =>
+    ["Compaction started.", "Compaction complete."].every((content) => webhookContents(next).includes(content)), 15000);
+
+  assert.deepEqual(webhookContents(done), ["Compaction started.", "Compaction complete."]);
+  assert.equal(clientMessages(codex, "thread/compact/start").length, 1);
+});
+
 function demoRuntime(workspace) {
   const keyFile = path.join(workspace.routerStateDir, "keys", "demo.key");
   return { pid: readRegistry(workspace).projects.demo.pid, key: fs.existsSync(keyFile) ? fs.readFileSync(keyFile, "utf8") : null };
+}
+
+async function waitForRelaunch(workspace, before) {
+  const deadline = Date.now() + 30000;
+  for (;;) {
+    const after = demoRuntime(workspace);
+    if (typeof after.pid === "number" && after.pid !== before.pid && after.key && after.key !== before.key) {
+      const status = await runRouterCli(workspace, ["status"]);
+      if (/sessions: 1\n  project demo scope=demo-channel connected=/.test(status.stdout)) return;
+    }
+    assert.ok(Date.now() < deadline, `demo never relaunched: ${JSON.stringify({ before, after })}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
 }
 
 test("/restart relaunches only the router Codex project, which reconnects with a new key", async () => {
@@ -296,21 +362,34 @@ test("/restart relaunches only the router Codex project, which reconnects with a
 
   ownerMessage(workspace, { id: "cmd-restart", content: "/restart" });
 
-  const deadline = Date.now() + 30000;
-  for (;;) {
-    const after = demoRuntime(workspace);
-    if (typeof after.pid === "number" && after.pid !== before.pid && after.key && after.key !== before.key) {
-      const status = await runRouterCli(workspace, ["status"]);
-      if (/sessions: 1\n  project demo scope=demo-channel connected=/.test(status.stdout)) break;
-    }
-    assert.ok(Date.now() < deadline, `demo never relaunched: ${JSON.stringify({ before, after })}`);
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
+  await waitForRelaunch(workspace, before);
   const state = readState(workspace.stateDir);
   assert.deepEqual(webhookContents(state), ["Restarting session — fresh thread coming up."]);
   assert.deepEqual(botReactions(state), [["cmd-restart", "🔄"]]);
   assert.equal(state.fixtures.tmux.sessions.demo_codex.env.CCDM_ROUTER_KEY_FILE, path.join(workspace.routerStateDir, "keys", "demo.key"));
   assert.equal(state.fixtures.tmux.sessions.root_agent, undefined);
+});
+
+test("on Windows the Codex /restart helper waits for this bridge by PID and start time, outside its Job", platformGate("win32", "Jobs and start times are Windows facilities"), async () => {
+  const { workspace } = await routerCodexSession([]);
+  const hostEnv = await launcherEnv(workspace);
+  const registered = readRegistry(workspace).projects.demo;
+  const oldJob = readState(workspace.stateDir).fixtures.tmux.sessions.demo_codex.job;
+  const before = demoRuntime(workspace);
+
+  ownerMessage(workspace, { id: "cmd-restart", content: "/restart" });
+
+  await waitForRelaunch(workspace, before);
+  const [helper, ...others] = readState(workspace.stateDir).fixtures.sessionHost.detached;
+  assert.deepEqual(others, []);
+  assert.equal(oldJob.includes(helper.pid), false, `helper ${helper.pid} is in the old Job ${oldJob}`);
+  assert.deepEqual(helper.argv.slice(-6), ["restart-session", "demo", "--after-pid", String(before.pid), "--after-started-at", registered.pid_started_at]);
+  assert.equal(helper.env.CCDM_ROUTER_STATE_DIR, workspace.routerStateDir);
+  assert.equal(Object.keys(helper.env).some((name) => name.toUpperCase() === "CCDM_SESSION_NAME"), false);
+  assert.equal(helper.log, path.join(hostEnv.CCDM_STATE_ROOT, "logs", "restart-demo.log"));
+  const log = fs.readFileSync(helper.log, "utf8");
+  assert.match(log, new RegExp(`pid ${before.pid} has exited`));
+  assert.match(log, /stop-session exited 0/);
 });
 
 // Signed CDN URLs carry their expiry as hex Unix seconds in `ex`.
@@ -350,6 +429,15 @@ test("an image, a file, and a voice attachment reach the router Codex turn throu
   assert.equal(fs.readFileSync(saved[1], "utf8"), "binary body");
   assert.equal(input[3].text, "--- Audio transcription: voice-message.ogg ---\nplease add audio support\n--- End audio transcription ---");
   assert.equal(done.fixtures.whisper.invocations.length, 1);
+  // whisper read the audio from the private temp root, and the directory is gone after the turn.
+  const audioDir = path.dirname(done.fixtures.whisper.invocations[0].args[0]);
+  const tempRoot = process.platform === "win32"
+    ? path.join((await launcherEnv(workspace)).CCDM_STATE_ROOT, "tmp")
+    : workspace.tmpDir;
+  assert.equal(path.dirname(audioDir), tempRoot);
+  assert.match(path.basename(audioDir), /^codex-bridge-audio-/);
+  assert.equal(fs.existsSync(audioDir), false);
+  if (process.platform === "win32") assertPrivate(tempRoot);
   assert.deepEqual(done.fixtures.discord.attachmentFetches.map(({ url }) => url).sort(), [archive, shot, voice].sort());
   assert.deepEqual(done.fixtures.discord.messageFetches.map(({ authorization, messageId }) => [authorization, messageId]),
     [["Bot root-bot-token", "2001"]]);
@@ -418,6 +506,9 @@ test("a guest granted after a router Codex launch reaches the thread without a r
   injectDiscordMessage(workspace, { id: "guest-message", channelId: "demo-channel", content: "can you help?", author: guest });
   const replied = await waitForState(workspace, (next) => webhookContents(next).includes("hello guest"), 15000);
   const [reply] = replied.fixtures.discord.messages;
+  // The reply is visible before its turn ends, and a reaction sent before the
+  // bridge is idle would steer that turn. Two turns: the bootstrap, then this one.
+  await waitForFinishedTurns(workspace, 2);
   injectDiscordReaction(workspace, {
     id: "guest-thumbs-up", channelId: "demo-channel", emoji: "👍", messageId: reply.id, user: guest,
     message: { author: { bot: true, id: "fake-webhook-1", username: "demo-codex" }, webhookId: "fake-webhook-1", content: "hello guest" },
@@ -458,8 +549,8 @@ function sharedCodexHomeWorkspace() {
   return { workspace, codexHome: path.join(workspace.homeDir, ".codex") };
 }
 
-function startCodexProject(workspace, project) {
-  return runScript(workspace, "scripts/start-codex-session.sh", { args: [project], env: routerEnv(workspace), timeoutMs: 30000 });
+async function startCodexProject(workspace, project) {
+  return runScript(workspace, "scripts/start-codex-session.sh", { args: [project], env: routerEnv(workspace, await launcherEnv(workspace)), timeoutMs: 30000 });
 }
 
 function codexServerRecord(workspace, port) {

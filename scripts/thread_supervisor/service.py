@@ -12,9 +12,12 @@ import json
 import os
 from pathlib import Path
 import sqlite3
-import stat
 import subprocess
 import sys
+
+from ccdmlib.platform import exe
+from ccdmlib.platform.private_fs import fix_hint, is_private
+from ccdmlib.platform.commands import start_router_hint
 
 from . import registry, store
 from .paths import private_directory, write_private
@@ -44,7 +47,7 @@ def _interpreter_blockers() -> list[str]:
         blockers.append(f"python {'.'.join(map(str, MINIMUM_PYTHON))} or newer is required")
     try:
         completed = subprocess.run([_node(), "-p", "process.versions.node.split('.')[0]"], capture_output=True,
-                                   text=True, timeout=15)
+                                   text=True, timeout=15, creationflags=exe.child_console_flags())
         major = int(completed.stdout.strip()) if completed.returncode == 0 else 0
     except (OSError, subprocess.TimeoutExpired, ValueError):
         major = 0
@@ -67,8 +70,8 @@ def _configuration_blockers(project_root: Path, state_dir: Path) -> list[str]:
             blockers.append("registry.json has no CCDM owner (discord_user_id)")
         if not isinstance(current.get("guild_id"), str) or not current["guild_id"]:
             blockers.append("registry.json has no guild_id")
-    if state_dir.exists() and stat.S_IMODE(state_dir.stat().st_mode) & 0o077:
-        blockers.append("the thread supervisor state directory is not private (expected mode 0700)")
+    if state_dir.exists() and not is_private(state_dir):
+        blockers.append(f"the thread supervisor state directory is not private ({fix_hint(state_dir, 'expected mode 0700')})")
     try:
         store.inspect(state_dir)
     except (OSError, ValueError, sqlite3.Error) as error:
@@ -79,12 +82,11 @@ def _configuration_blockers(project_root: Path, state_dir: Path) -> list[str]:
 def _router_blockers() -> list[str]:
     try:
         completed = subprocess.run([_node(), str(ROUTER_SCRIPT), "status", "--json"], capture_output=True,
-                                   text=True, timeout=45)
+                                   text=True, timeout=45, creationflags=exe.child_console_flags())
         reachable = completed.returncode == 0 and isinstance(json.loads(completed.stdout), dict)
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         reachable = False
-    return [] if reachable else ["the Router is not reachable; start the Router "
-                                 "(scripts/install-router-service.sh, or scripts/router.js serve)"]
+    return [] if reachable else [f"the Router is not reachable; start the Router ({start_router_hint()})"]
 
 
 def preflight(project_root: Path, state_dir: Path) -> dict:

@@ -12,6 +12,13 @@ import subprocess
 import sys
 
 
+sys.dont_write_bytecode = True  # no __pycache__ beside the scripts
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+from ccdmlib.platform import commands, proc  # noqa: E402
+
 _EVENTS_PATH = Path(__file__).with_name("conversation-reminder-events.py")
 _SPEC = importlib.util.spec_from_file_location("ccdm_conversation_reminder_events", _EVENTS_PATH)
 if _SPEC is None or _SPEC.loader is None:
@@ -20,10 +27,27 @@ _EVENTS = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_EVENTS)
 
 
-def adapter_process_live(pid: object, script: str = "ccdm-channel-server.js") -> bool:
+def _windows_process_live(pid: int, started_at: object, script: str) -> bool:
+    """The Windows answer, from the process table alone.
+
+    ``os.kill(pid, 0)`` must never run here: signal 0 is ``CTRL_C_EVENT`` on
+    Windows and can stop a whole console process group. A marker without a
+    start time (an older channel server) is checked by PID and command line.
+    """
+    started = started_at if isinstance(started_at, str) and started_at else None
+    if not proc.alive(pid, started):
+        return False
+    arguments = proc.command_line(pid)
+    # A reused PID belongs to some other program, never the channel server.
+    return arguments is not None and any(script in argument for argument in arguments)
+
+
+def adapter_process_live(pid: object, script: str = "ccdm-channel-server.js", started_at: object = None) -> bool:
     """True only while the recorded launch-scoped Claude channel server is running."""
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
+    if sys.platform == "win32":
+        return _windows_process_live(pid, started_at, script)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -88,11 +112,11 @@ def build_readiness(project_name: str, project_root: Path, state_dir: Path) -> d
                 and capability.get("hooks_configured") is True
                 and capability.get("reply_tool_verified") is True
             )
-            relaunch = f"; restart the session with scripts/start-session.sh {project_name}"
+            relaunch = f"; restart the session with {commands.script_ref('start-session')} {project_name}"
             if not verified:
                 unsupported_capabilities.append(
                     "Claude launch-scoped transport is not verified for this assignment" + relaunch)
-            elif not adapter_process_live(capability.get("pid")):
+            elif not adapter_process_live(capability.get("pid"), started_at=capability.get("started_at")):
                 # An exited channel server no longer records owner activity or replies.
                 unsupported_capabilities.append(
                     "Claude launch-scoped transport is not running for this assignment" + relaunch)
@@ -158,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{readiness['provider'].capitalize()} Conversation Reminder adapter: {readiness['status']}")
         print(f"Project: {readiness['project']}")
         print(f"Event receiver: {'available' if readiness['event_receiver']['available'] else 'unavailable'}")
-        print("Reminder delivery: see scripts/conversation-reminder-service.py status")
+        print(f"Reminder delivery: see {commands.reminders_ref()} status")
         if readiness["missing_credentials"]:
             print("Missing credentials: " + ", ".join(readiness["missing_credentials"]))
         if readiness["assignment_mismatches"]:

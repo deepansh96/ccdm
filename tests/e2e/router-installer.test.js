@@ -1,16 +1,19 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import test from "node:test";
+import nodeTest from "node:test";
 
 import { spawnSync } from "node:child_process";
 
+import { PYTHON, assertPrivate, suiteTest } from "./support/platform.js";
 import { runNodeEntrypoint, runScript } from "./support/runner.js";
 import {
   ROOT_TOKEN, createRouterWorkspace, routerEnv, runRouterCli, startRouter,
 } from "./support/router.js";
 import { readState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
+
+const test = suiteTest(nodeTest, import.meta.url);
 
 test.afterEach(async () => cleanup());
 
@@ -32,7 +35,7 @@ const operations = workspace =>
   readState(workspace.stateDir).fixtures.launchctl.invocations.map(({ operation }) => operation);
 
 function renderedAgent(workspace) {
-  const parsed = spawnSync("python3", ["-c",
+  const parsed = spawnSync(PYTHON, ["-c",
     "import json,plistlib,sys; print(json.dumps(plistlib.load(open(sys.argv[1],'rb'))))", plistPath(workspace)],
   { encoding: "utf8" });
   assert.equal(parsed.status, 0, parsed.stderr);
@@ -109,9 +112,9 @@ test("installer renders a secret-free LaunchAgent with private logs that relaunc
   for (const text of [expected, result.stdout, result.stderr]) {
     assert.doesNotMatch(text, new RegExp(`${ROOT_TOKEN}|pool-bot-token|DISCORD_BOT_TOKEN`));
   }
-  assert.equal(fs.statSync(workspace.routerStateDir).mode & 0o777, 0o700);
-  assert.equal(fs.statSync(path.join(workspace.routerStateDir, "router.log")).mode & 0o777, 0o600);
-  assert.equal(fs.statSync(path.join(workspace.routerStateDir, "router.err")).mode & 0o777, 0o600);
+  assertPrivate(workspace.routerStateDir);
+  assertPrivate(path.join(workspace.routerStateDir, "router.log"));
+  assertPrivate(path.join(workspace.routerStateDir, "router.err"));
   assert.deepEqual(fs.readdirSync(path.dirname(plistPath(workspace))), [`${LABEL}.plist`]);
 });
 

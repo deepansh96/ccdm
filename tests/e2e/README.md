@@ -1,5 +1,29 @@
 # CCDM Local-Fake E2E Harness
 
+## Windows Checkout
+
+On Windows, turn on Developer Mode and run `git config --global core.symlinks true` **before** cloning. `CLAUDE.md` and `.mex/AGENTS.md` are committed as symlinks to `AGENTS.md`; without symlink support Git checks them out as small text files holding the link target, so the root agent loads no runbook. A clone made earlier keeps the text files: clone again after changing the setting. `tests/e2e/checkout-contract.test.js` fails, naming the file and this fix, when either file is neither a symlink to `AGENTS.md` nor a copy of it.
+
+`.gitattributes` checks every text file out with LF, whatever `core.autocrlf` says, and `*.cmd` and `*.ps1` with CRLF.
+
+## Running on Windows
+
+The suite needs Git for Windows, Python 3 and the .NET Framework `csc.exe` that ships with Windows. `npm test` stops before starting any file, with one message, when one of them is missing.
+
+Each fixture tool is `<tool>.exe` plus `<tool>.shim`, hard-linked into each workspace. The `.exe` is a launcher compiled from `tests/e2e/support/fixture-shim.cs` once per content hash and cached in a `ccdm-fixture-launcher-<hash>` temp directory. The `.shim` is UTF-8, one item per line: the program to start (or `:noop`, which exits 0 and is how `sleep` works), then any leading arguments. The launcher copies the caller's arguments from the raw command line, so the child parses exactly what the caller wrote.
+
+`tests/e2e/support/platform.js` holds what differs by OS:
+
+- `PYTHON`: `CCDM_PYTHON`, else `python3` on POSIX; on Windows the interpreter `py -3` runs, else `python`, never the Microsoft Store stub. Tests use this and never call `python3` directly. The `python3` fixture forwards to it, so `python3` inside a fixture or shell script still works.
+- `interpreterFor(script)`: how to start a script. POSIX uses its shebang; Windows names the interpreter. `runScript()` goes through it.
+- `platformGate(tag, reason)`: test options for an OS tag. `posix` runs on Linux and macOS and is skipped on Windows. `darwin` runs only on macOS and only for a test that needs a real macOS facility; a test that passes on Linux with fixtures is never `darwin`. `win32` runs only on Windows.
+
+Write the gate on the `test(` line, directly or through a `const` holding it, so the budget check can read it. A suite gated as a whole goes in `tests/e2e/support/surfaces.js`, whose `runSurface()` records which suites run on which OS, and the file takes its `test` from `suiteTest(nodeTest, import.meta.url)`.
+
+Every test skipped on Windows needs an entry in `tests/e2e/windows-skip-budget.json` with its file, test name, tag and reason, and the total must fit `budget`. `tests/e2e/windows-skip-budget.test.js` fails on an unlisted skip, a stale entry, or a count over budget.
+
+Seams: `CCDM_E2E_CSC` and `CCDM_E2E_GIT_SH` name the compiler and `sh.exe`; a path that does not exist counts as missing.
+
 ## Run Commands
 
 Run the default suite with:
@@ -9,13 +33,29 @@ npm test
 npm run test:e2e
 ```
 
-Both run `tests/run-e2e.mjs`, which runs test files in parallel (`CCDM_E2E_JOBS`, default CPU count minus 2), longest first by the previous run's timings. A file that fails under parallel load is rerun alone; if it then passes it is reported as `FLAKY` and the run still succeeds. Pass test files to run only those. `npm run test:serial` runs one file at a time:
+Both run `tests/run-e2e.mjs`, which runs test files in parallel (`CCDM_E2E_JOBS`, default CPU count minus 2; see Runner Settings and Reports below), longest first by the previous run's timings. A file that fails under parallel load is rerun alone; if it then passes it is reported as `FLAKY` and the run still succeeds. Pass test files to run only those. `npm run test:serial` runs one file at a time:
 
 ```sh
 node --test --test-concurrency=1 tests/e2e/**/*.test.js
 ```
 
-Harness deadlines (`waitFor`, `waitForState`, the `runProcess` kill timer) are multiplied by `CCDM_E2E_TIMEOUT_SCALE` (default 4) so parallel load does not kill healthy runs; a passing test never waits them out. Fixture binaries are built once per content in a shared temp directory and linked into each workspace, and the repo's executable scripts are hard-linked rather than copied: macOS XProtect scans every newly written executable on first run, one at a time, which otherwise serializes parallel files.
+Harness deadlines (`waitFor`, `waitForState`, the `runProcess` kill timer) are multiplied by `CCDM_E2E_TIMEOUT_SCALE` (default 4) so parallel load does not kill healthy runs; a passing test never waits them out. Fixture binaries are built once per content in a shared temp directory and linked into each workspace (symlinks on POSIX, hard links on Windows), and the repo's executable scripts are hard-linked rather than copied: macOS XProtect scans every newly written executable on first run, one at a time, which otherwise serializes parallel files.
+
+### Runner Settings and Reports
+
+`tests/run-e2e.mjs` reads these environment variables. On macOS and Linux the defaults keep the behaviour above; Windows gets a deadline, fewer jobs and no rerun by default (the `windows-required` CI job sets `CCDM_E2E_NO_RERUN=0`; see CI Behavior).
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CCDM_E2E_JOBS` | POSIX: CPU count minus 2, at least 2. Windows: CPU count minus 2, between 1 and 8 | Parallel test files. |
+| `CCDM_E2E_FILE_TIMEOUT_MS` | POSIX: none. Windows: `600000` (10 min) | Per-file deadline; `0` turns it off. A file past it is killed and reported as `TIMED OUT`. Only the process the runner started for that file is killed, with its children: its process group on POSIX (SIGTERM, then SIGKILL after 5 s), its process tree on Windows (`taskkill /T /F`). Timed-out files are not rerun. |
+| `CCDM_E2E_REPORT_DIR` | unset | Writes one TAP file per test file (`tests__e2e__<name>.test.js.tap`) and `summary.json`: per file its label, status, exit code, signal, tests, pass, fail, skipped, duration, timed out, crashed, rerun, flaky and workspace dirs, plus totals. Use an empty directory. |
+| `CCDM_E2E_KEEP_FAILED` | unset | `1` keeps the TAP output and workspace dirs of every file that did not pass, and prints them as `# kept workspace:`. Without `CCDM_E2E_REPORT_DIR` the TAP files go to a new `ccdm-e2e-report-*` temp dir, printed as `# report:`. |
+| `CCDM_E2E_NO_RERUN` | POSIX: unset (rerun on). Windows: `1` | `1` skips the rerun-alone step; `0` turns it back on. |
+
+Each file ends as passed, failed, crashed or timed out, and the summary counts each apart. A file is crashed when it was killed by a signal, printed no `# tests` line, or exited or threw outside a test: `node --test` reports that as a `not ok` named after the file with `exitCode:` or `signal:` in its YAML block, and exits 1 with `# fail 1`, so the exit code alone cannot tell.
+
+`createWorkspace()` prints `ccdm-e2e-workspace <dir>` on stderr. The runner removes those dirs after each file, so a killed file, whose own teardown never ran, leaves nothing behind; under `CCDM_E2E_KEEP_FAILED=1` the workspace teardown leaves its dir for the runner to decide. The runner's own tests use the fixture files in `tests/fixtures/runner/`, which the default run does not pick up.
 
 ## Harness Architecture
 
@@ -30,6 +70,10 @@ Test Workspaces are assembled from Git-visible source files: tracked files plus 
 `runScript()` spawns shell scripts from the Test Workspace in a detached process group with the injected environment and optional `args`. `runNodeEntrypoint()` does the same for Node entrypoints through `process.execPath`.
 
 The teardown manager exposes `registerTeardownCallback(fn)` and `cleanup()`. Callbacks run idempotently in LIFO order on normal test cleanup and through process-level handlers for assertion failure, uncaught exception, unhandled rejection, `SIGINT`, `SIGTERM`, and process exit. Cleanup failures are recorded in fixture diagnostics.
+
+On Windows every workspace owns a job object. `createWorkspace()` creates it, keeps its only handle in the test process, and writes its name to `.job` in the fixtures dir. Each fixture launcher (`fixture-shim.cs`) puts its child in that job and in a job of its own, before the child runs, so every descendant is a member. Killing a launcher ends its tree. When a launcher's child exits by itself the launcher exits too, and a detached grandchild (a fixture tmux session) stays running in the workspace job until teardown, as it would on POSIX.
+
+Teardown sets the workspace's stop event. Each running launcher forwards `CTRL_BREAK_EVENT` to its child's process group, waits 2 seconds, then ends its tree; a launcher also does this on a real Ctrl+Break. The harness then waits for `.live` (one delete-on-close file per running launcher) to empty, terminates the job and closes it. If the test process dies, the kernel closes the job and the tree goes with it. A process is signalled this way only because a launcher of this workspace put it in the job, so no PID or command line is consulted. Recorded PIDs still running afterwards, which the job never held, keep the old path: stopped only when their command line holds the workspace marker.
 
 ## Fixture State
 
@@ -147,6 +191,7 @@ The Codex bridge/basic-turn scenarios add child-scoped JavaScript interception. 
 The Discord MCP JSON-RPC scenarios drive `scripts/discord-mcp-server.js` directly through stdin/stdout with the same child-scoped preload. Every Codex MCP server is a Router client: the scenarios start a real Router serving a router-transport Codex project (its webhook and launch key in place) and give the server `CCDM_ROUTER_KEY_FILE`, `CCDM_CODEX_PROJECT`, and `CHANNEL_ID`, or `CCDM_ROUTER_ROLE=root` with root's key. The server holds no Discord token; stdin stays open until each call's response arrives, since a Router-backed server exits when Codex closes stdin:
 
 - The fake Discord REST store also covers channel webhooks for the Router: `POST/GET /channels/:channel/webhooks` with the bot token, and `POST /webhooks/:id/:token` execute with `wait=true`, username and avatar overrides, and rejection (recorded in `webhookRejections`) of names or usernames containing `discord` or `clyde` or longer than 80 characters. Executed messages are stored in `messages` with their `webhookId` and `username`. Multipart executes (`payload_json` plus `files[n]`) record `uploads`, and content over 2000 characters is rejected. `PATCH /webhooks/:id/:token/messages/:message` edits only that webhook's messages (recorded in `webhookEdits`, username unchanged), `GET /channels/:channel/messages/:message` answers 404 for a sent or injected message that lives in another channel, and `POST /channels/:channel/typing` and reaction `DELETE .../@me` are recorded in `typing` and `reactionDeletes`. Single-message GETs also find seeded `history` messages in their channel, return injected messages' attachments (with `refreshedUrl` standing in for Discord re-signing a stale URL), and are all recorded in `messageFetches`. Scripted `rateLimits` rules (`{ method, path, count, retryAfter, bucket, global }`, `count: null` for a route that never recovers) answer matching requests with Discord's 429 shape (`Retry-After`, `X-RateLimit-Bucket`, `X-RateLimit-Remaining: 0`, `X-RateLimit-Reset-After`, and `X-RateLimit-Global` for global limits) and record each 429 in `rateLimitHits`; unlike `restFailures`, any rule may match, so other routes keep working.
+- For guest access the fake Discord REST store answers `GET /channels/:channel` for a channel seeded in `channels`, with its current `permission_overwrites` (the seeded ones, then every overwrite written or deleted since), and `DELETE /channels/:channel/permissions/:id` (recorded in `permissionOverwriteDeletes`; 404 for an overwrite the channel does not have). A test that seeds `requestLog: []` gets every Discord REST request, in order, as `{ method, path, authorization, body }`.
 - The fake Discord REST store covers `POST/PATCH/GET /channels/:channel/messages`, `PUT /reactions/:emoji/@me`, single-message attachment lookup, scripted 400/401/403/404/429/5xx API failures, and CDN attachment downloads.
 - `tests/e2e/support/form-data-shim.cjs` is installed by the preload as the workspace-local `form-data` package so dynamic `import("form-data")` resolves without the real dependency. Its `FormData.prototype.submit()` implementation routes Discord uploads into fixture state and blocks non-Discord submit targets as `form-data` egress. The Router's own uploads are multipart webhook executes through the fake `fetch`, recorded as `uploads` on the webhook message.
 - MCP tests cover `initialize`, `notifications/initialized`, `tools/list`, unknown methods, malformed JSON input, missing env (no Router key file, or a key file without a project), the bridge scope token, root multi-channel mode as the Router root role with a signed channel scope (and its refusal for a project-role server or outside root's Router scope), Claude's read-only mode (only the recent-message reader and range export, using the state-directory token), and each public tool as a Router operation: `reply`, `edit_message`, `react`, `fetch_messages`, `read_last_x_messages_in_channel`, `export_message_range`, and `download_attachment`. Router failures surface as MCP error content `Router <op> failed: <code>` (`invalid_args`, `not_found`, `scope_violation`, `discord_error`, `rate_limited`), with the Discord status in the Router's `op_failed` log line.
@@ -160,6 +205,7 @@ The Claude usage-report scenarios drive `scripts/claude-usage.sh` with fixture h
 - The `curl` fixture records method, URL, path, query, headers, and body under `$CCDM_TEST_STATE`, matches extensible route entries by method/hostname/path/url, supports JSON and raw-body response modes, and blocks unapproved targets as network egress.
 - OAuth profile and usage routes are faked through `https://api.anthropic.com/api/oauth/{profile,usage}`. Malformed API responses are covered as current graceful warning behavior.
 - The `launchctl` fixture records LaunchAgent `unload`, `load`, and `list` calls under `$CCDM_TEST_STATE`; installer scenarios never touch the real user's LaunchAgents directory.
+- The script is the macOS and Linux report. On Windows the scenarios that need it to read the fixture home's history or more than one Keychain item are skipped (`posix`); `ccdm-usage.test.js` runs the same scenarios on `scripts/ccdm usage`, the Windows report.
 
 The tracked `scripts/usage-stats-poster.py` scenarios drive the manual Discord posting surface with the same Test Workspace and Keychain fixture plus a local HTTP fake for Anthropic and Discord:
 
@@ -196,6 +242,7 @@ The Conversation Reminder scenarios drive `scripts/conversation-reminder-service
 
 - The foreground worker runs against the stateful Discord fake in `preload.cjs`. That fake provides per-channel `history` with pagination, reaction membership, nonce-checked sends, deletions, and scripted failures. `CCDM_REMINDER_CLOCK_FILE` is a controllable clock, so expected times come from literal timelines instead of hour-long sleeps.
 - The fake Gateway hands each injected message to only one client. Scenarios that need both a coding adapter and the root observer run the adapter while the worker is stopped. The durable event ledger carries its events into the worker's restart reconciliation.
+- The worker suites are split by topic so that each file fits the per-file time limit on Windows, with their shared setup in `support/reminder-service.js`, `support/reminder-discovery.js` and `support/reminder-restart.js`. `conversation-reminder-service.test.js` covers sending, replacement and cleanup; `conversation-reminder-recovery.test.js` lost responses, crashes and operator recovery; `conversation-reminder-state.test.js` acknowledgment, closure and refused stores; `conversation-reminder-store.test.js` the event ledger, streaks, store migrations, the observer process and the Windows file permissions. `conversation-reminder-discovery.test.js` covers scanning and `conversation-reminder-discovery-eligibility.test.js` what history arms. `conversation-reminder-restart.test.js` covers catch-up after downtime, `conversation-reminder-restart-queue.test.js` the catch-up queue, reconnects and re-enable, and `conversation-reminder-restart-enable.test.js` restart state and enablement.
 - `conversation-reminder-launchagent.test.js` installs through the `launchctl` fixture, then launches the rendered plist's `ProgramArguments` with its rendered environment. It keeps the harness fixture `PATH` so the worker cannot fall through to host tools. It proves the single-worker lock across supervised and foreground launches, disable and re-enable, private state, and the both-provider reply, reminder, and reply-or-close workflow with stopped coding agents. No scenario loads a real LaunchAgent or contacts Discord.
 
 `thread-supervisor-launchagent.test.js` installs `scripts/install-thread-supervisor.sh` through the `launchctl` fixture and launches the rendered `ProgramArguments` against the harness Router. It covers `enable`, `disable`, `status`, `preflight`, the foreground `run` after `disable`, and `router status` thread permission lines, with root's permissions denied by literal name through the fake's `permissionDenials`.
@@ -229,8 +276,8 @@ Tests drive only Discord inputs and executable surfaces, and assert recorded Dis
 - `thread-supervisor.test.js`, `thread-claude-session.test.js` and `thread-codex-session.test.js`: binding, the boot handoff with 👀, replies with `thread_id`, start failures, and no token in any launch file.
 - `thread-gemini-session.test.js`: a Gemini thread under a Claude project boots `gemini-bridge.js` against `support/fake-agy.cjs`, takes the bootstrap as its first turn, resumes its agy session after a stop, and refuses Gemini account aliases and Claude-only efforts.
 - `thread-commands.test.js`, `thread-lifecycle.test.js`, `thread-capacity.test.js`, `thread-reconcile.test.js` and `thread-project-changes.test.js`: commands, archive and resume, caps, reconcile and registry changes.
-- `thread-operations.test.js` and `thread-supervisor-launchagent.test.js`: `threads.sh`, the resolver, thread ids in operator tools, `router status`, and the installer.
-- `conversation-reminder-threads.test.js`: the v8 reminder store and per-thread reminders.
+- `thread-operations.test.js` and `thread-supervisor-launchagent.test.js`: the operator's thread command (`scripts/threads.sh` on macOS and Linux, `scripts/ccdm threads` on Windows), the resolver, thread ids in operator tools, `router status`, and the installer.
+- `conversation-reminder-threads.test.js` and `conversation-reminder-thread-lifecycle.test.js`: the v8 reminder store and per-thread reminders; then nested `status`, reset, closure, delete, readiness and enable discovery. Their shared setup is `support/reminder-threads.js`.
 - `thread-turn-reactions.test.js`: root's ⏳, ✅ and ⚠️ turn marks on thread inputs, with the status tick and settle window shortened through `CCDM_THREAD_STATUS_TICK_S` and `CCDM_THREAD_STATUS_SETTLE_S`. Other thread tests run with `CCDM_THREAD_TURN_MARKS=0` (the `supervisorEnv()` default), so no mark changes their reaction counts.
 - `thread-conversation-journey.test.js` is the one cross-component test. With the Router, the Thread Supervisor, a Claude thread session and the Conversation Reminder worker all running, the owner creates a thread and gets a reply, the reminder fires in the thread after the turn, the owner's reply acknowledges it, `/close` archives the thread, closes its reminders and stops the session, and the next owner message reopens it with the same Claude conversation.
 
@@ -285,7 +332,24 @@ Without the Live Gate the test is reported skipped before it creates anything. `
 
 ## CI Behavior
 
-GitHub Actions runs the Default CI Suite on `push` and `pull_request` with Node 22, `npm ci`, zsh, python3, jq, and `npm test`. CI executes the same local-fake command shown above and does not require live Discord, Claude, Codex, tmux, Keychain, OAuth, or npm-network credentials during scenario execution.
+GitHub Actions runs on `push` and `pull_request`. Port PRs target the `windows-port` integration branch, which reaches `main` only after the end canary passes. Every job uses Local Fakes and needs no live Discord, Claude, Codex, Keychain, OAuth, or npm-network credentials. `tests/e2e/ci-contract.test.js` asserts each job's shape.
+
+| Job | Runs on | What it does | Can fail the PR |
+| --- | --- | --- | --- |
+| `local-fake-e2e` | Linux, Node 22, Python 3.11 | Full suite, with `npm ci --omit=optional` | Yes |
+| `windows-e2e` | Windows, Node 22 and 24, Python 3.11 | Full suite; uploads the per-file report from `CCDM_E2E_REPORT_DIR` | No, it only warns (`continue-on-error`) |
+| `windows-required` | Windows, Node 22, Python 3.11 | Only the files in `tests/e2e/windows-required.txt`, with `CCDM_E2E_NO_RERUN=0` so a failed file is rerun alone once | Yes |
+| `macos-e2e` | macOS, Node 22, `/usr/bin/python3` 3.9 | Python floor checks, then the full suite, with `npm ci --omit=optional` | Yes |
+
+The Linux and macOS jobs fail if `koffi` or another native Windows package is installed.
+
+`windows-required` turns the rerun-alone step on (`CCDM_E2E_NO_RERUN=0`), so it handles an intermittent failure the way the Linux and macOS jobs do: a file that fails in the parallel pass is rerun once, alone, and one that then passes is printed as `=== FLAKY` and recorded with `flaky: true` in `summary.json`, and the job stays green. Reruns run one after another after the parallel pass, each with the per-file deadline again (10 minutes by default on Windows), and the runner has no cap on how many files it reruns. A file that timed out is not rerun. `windows-e2e` (informational) leaves the rerun off on purpose, so it shows every intermittent failure.
+
+`macos-e2e` is the main Mac regression guard during the port. `CCDM_PYTHON` and the front of `PATH` select the Mac's own Python. `tmux`, `zsh`, `launchctl`, `security`, `ps` and `curl` stay fake in the Local Fake suite; no test runs the real `launchctl` or `security`. The one exception for real tools is `macos-real-tools.test.js`, which runs today's tmux command shapes against Homebrew tmux and real zsh, with `TMUX` unset and `TMUX_TMPDIR` inside its workspace, so it cannot reach your own tmux server.
+
+The Python floor on the Mac is 3.9. The job runs `vermin --target=3.9- --eval-annotations --violations scripts/` (the trailing `-` means "3.9 or later"; without it vermin demands exactly 3.9). vermin cannot tell an `X | Y` annotation from a bitwise `|` and does not read shell scripts, so `support/python_floor.py annotations` rejects such an annotation without `from __future__ import annotations`, in `.py` files and in the `<<'PY'` heredocs of `.sh` files, and fails a heredoc that does not parse on 3.9. `support/python_floor.py imports` imports every module under `scripts/ccdmlib/`, which catches a top-level `import msvcrt`, and the job loads the Python service entry points.
+
+To add a file to `tests/e2e/windows-required.txt`, first see it pass in the `windows-e2e` job, then append its repo-relative path on a line of its own. Parallel slices each add only their own lines; the later PR rebases.
 
 ## Hardcoded-Boundary Inventory
 

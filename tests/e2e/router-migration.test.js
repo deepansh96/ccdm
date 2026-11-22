@@ -1,14 +1,20 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 import { startFakeCodexServer } from "./support/bridge.js";
+import { platformGate } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import { OWNER_ID, createRouterWorkspace, routerEnv, runRouterCli, startRouter } from "./support/router.js";
+import { startFakeHost } from "./support/session-fixture.js";
 import { readState, seedFixtureProcess, seedTmuxSession, updateState, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
+
+const { resolveResume } = createRequire(import.meta.url)("../../scripts/router/resume.js");
 
 test.afterEach(async () => {
   await cleanup();
@@ -66,15 +72,26 @@ function updateRegistry(workspace, update) {
   fs.writeFileSync(registryFile(workspace), `${JSON.stringify(registry, null, 2)}\n`);
 }
 
-function migrate(workspace, args, extraEnv = {}) {
+// On Windows the launchers go through the fake ccdm-host, sharing the fixture's session table.
+const fakeHosts = new WeakMap();
+async function launcherEnv(workspace) {
+  if (process.platform !== "win32") return {};
+  if (!fakeHosts.has(workspace)) fakeHosts.set(workspace, startFakeHost(workspace, { env: routerEnv(workspace) }));
+  return (await fakeHosts.get(workspace)).env;
+}
+
+async function migrate(workspace, args, extraEnv = {}) {
   return runScript(workspace, "scripts/migrate-to-router.sh", {
-    args, env: routerEnv(workspace, { CCDM_ROUTER_NODE: process.execPath, CCDM_REMINDER_NODE: process.execPath, ...extraEnv }),
+    args,
+    env: routerEnv(workspace, {
+      CCDM_ROUTER_NODE: process.execPath, CCDM_REMINDER_NODE: process.execPath, ...(await launcherEnv(workspace)), ...extraEnv,
+    }),
     timeoutMs: 60000,
   });
 }
 
-function startClaude(workspace) {
-  return runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace) });
+async function startClaude(workspace) {
+  return runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace, await launcherEnv(workspace)) });
 }
 
 async function routerSessions(workspace) {
@@ -87,10 +104,14 @@ const webhookMessages = (workspace) => (readState(workspace.stateDir).fixtures.d
   .filter((message) => message.webhookId)
   .map(({ channelId, webhookId }) => ({ channelId, webhookId }));
 
-// Refused before any runtime change: no key, tmux session, or PID.
+// Refused before any runtime change: no key, tmux session, or PID. Both
+// launchers name the migration on macOS and Linux, and only the webhook command
+// on Windows, which has no migration command.
 function assertRefusedWithoutWebhook(workspace, result, project, screen) {
   assert.equal(result.exitCode, 1, result.stderr || result.stdout);
-  assert.match(result.stderr, new RegExp(`Refusing to start '${project}': it has no webhook_id.*Run scripts/migrate-to-router\\.sh ${project}`));
+  const fix = process.platform === "win32" ? `Run node scripts/router\\.js ensure-webhook ${project}, then retry`
+    : `Run scripts/migrate-to-router\\.sh ${project} \\(or node scripts/router\\.js ensure-webhook ${project}\\), then retry`;
+  assert.match(result.stderr, new RegExp(`Refusing to start '${project}': it has no webhook_id.*\\. ${fix}`));
   assert.equal(readState(workspace.stateDir).fixtures.tmux.sessions[screen], undefined);
   assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "keys", `${project}.key`)), false);
   assert.equal(readRegistry(workspace).projects[project].pid, null);
@@ -99,7 +120,7 @@ function assertRefusedWithoutWebhook(workspace, result, project, screen) {
 // The official Discord plugin listener a pool-era launch left running with the
 // pool bot's state directory.
 function spawnLegacyPoolListener(workspace, poolStateDir) {
-  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", workspace.tmpRoot], {
     detached: true, env: { CCDM_TEST_STATE: workspace.stateDir }, stdio: "ignore",
   });
   child.unref();
@@ -127,7 +148,9 @@ test("migrating an unmigrated Claude project stops its legacy pool listener, rec
   await startRouter(workspace);
   // Without a webhook the project cannot launch; its pool-era listener still runs.
   assertRefusedWithoutWebhook(workspace, await startClaude(workspace), "demo", "demo_claude");
-  const legacyPid = spawnLegacyPoolListener(workspace, poolStateDir);
+  // Found by its environment in `ps`, which Windows cannot read; a Windows
+  // install never had a pool bot, so it has no such listener to stop.
+  const legacyPid = process.platform === "win32" ? null : spawnLegacyPoolListener(workspace, poolStateDir);
 
   const result = await migrate(workspace, ["demo"]);
 
@@ -144,7 +167,7 @@ test("migrating an unmigrated Claude project stops its legacy pool listener, rec
   // The router launch holds the tmux session.
   const session = readState(workspace.stateDir).fixtures.tmux.sessions.demo_claude;
   assert.equal(session.env?.DISCORD_STATE_DIR, undefined);
-  assert.equal(isAlive(legacyPid), false);
+  if (legacyPid !== null) assert.equal(isAlive(legacyPid), false);
 });
 
 test("migrating a Codex project with no transport field or webhook records it on the Router, verifies a probe round trip, and exits 0", async () => {
@@ -153,7 +176,8 @@ test("migrating a Codex project with no transport field or webhook records it on
   assert.equal(readRegistry(workspace).projects.beta.webhook_id, undefined);
   await startRouter(workspace);
   // Without a webhook the project cannot launch.
-  const refused = await runScript(workspace, "scripts/start-codex-session.sh", { args: ["beta"], env: routerEnv(workspace) });
+  const refused = await runScript(workspace, "scripts/start-codex-session.sh",
+    { args: ["beta"], env: routerEnv(workspace, await launcherEnv(workspace)) });
   assertRefusedWithoutWebhook(workspace, refused, "beta", "beta_codex");
 
   const result = await migrate(workspace, ["beta"]);
@@ -276,6 +300,47 @@ const claudeLaunches = (workspace) => readState(workspace.stateDir).fixtures.cla
 const threadRequests = (codex) => codex.clientMessages
   .filter((message) => message.method === "thread/resume" || message.method === "thread/start")
   .map((message) => [message.method, message.params.threadId]);
+
+// A registry path and what the provider recorded can spell the same drive differently.
+const otherDriveCase = (dir) => (dir[0] === dir[0].toUpperCase() ? dir[0].toLowerCase() : dir[0].toUpperCase()) + dir.slice(1);
+
+test("resume matches a Codex rollout whose directory differs only in drive-letter case", platformGate("win32", "Windows drive letters"), (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-resume-case-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, "codex-home");
+  const sessions = path.join(home, "sessions");
+  fs.mkdirSync(sessions, { recursive: true });
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  const id = "11111111-2222-4333-8444-555555555555";
+  fs.writeFileSync(path.join(sessions, `rollout-2026-${id}.jsonl`), `${JSON.stringify({
+    type: "session_meta",
+    payload: { id, cwd: otherDriveCase(project), originator: "codex-discord-bridge", source: "cli" },
+  })}\n`);
+  const entry = { type: "codex", path: project, codex_home: home };
+  const registryFile = path.join(root, "registry.json");
+  fs.writeFileSync(registryFile, JSON.stringify({ projects: { demo: entry } }));
+
+  assert.equal(resolveResume("demo", entry, { registryFile }).id, id);
+});
+
+test("resume matches a live Claude session whose directory differs only in drive-letter case", platformGate("win32", "Windows drive letters"), (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ccdm-resume-case-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, "claude-home");
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  const id = "11111111-2222-4333-8444-555555555555";
+  fs.mkdirSync(path.join(home, "sessions"), { recursive: true });
+  fs.writeFileSync(path.join(home, "sessions", `${process.pid}.json`), JSON.stringify({ cwd: otherDriveCase(project), sessionId: id }));
+  const transcriptDir = path.join(home, "projects", project.replace(/[^A-Za-z0-9]/g, "-"));
+  fs.mkdirSync(transcriptDir, { recursive: true });
+  fs.writeFileSync(path.join(transcriptDir, `${id}.jsonl`), "{}\n");
+  const entry = { type: "claude", path: project, claude_home: home, pid: process.pid };
+
+  assert.deepEqual(resolveResume("demo", entry, { registryFile: path.join(root, "registry.json") }),
+    { id, source: "live Claude session file" });
+});
 
 test("--resume resumes a Claude project's recorded session_id after the stop clears it", async () => {
   const { workspace } = poolClaudeWorkspace();

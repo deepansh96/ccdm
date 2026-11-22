@@ -16,7 +16,6 @@
 //   CCDM_THREAD_ID            set by start-thread-session.sh: this session serves that thread
 //   CCDM_THREAD_PROVIDER      the thread's provider (`claude`)
 //   CCDM_THREAD_BOOTSTRAP_FILE  the Thread Supervisor's bootstrap for this launch
-//   CCDM_THREAD_TMUX          this thread session's own tmux session
 //   CCDM_THREAD_ACTIVITY_FILE   this launch's activity.json: turn_running on each notification, paused, turn_replied
 //
 // In thread mode the server says hello as the `thread` role, so its Session
@@ -43,10 +42,9 @@
 // `context_pct`, or omit it when the file is missing or unreadable.
 //
 // Router `command` events run here, never as a Claude turn: /compact and
-// /clear are typed into this session's own tmux pane through
-// send-claude-command.sh, /pause queues inbound events until /unpause, and
-// /restart relaunches this project (never root) through stop-session.sh and
-// start-session.sh.
+// /clear are typed into this session's own terminal through
+// `ccdm send-claude-command`, /pause queues inbound events until /unpause, and
+// /restart relaunches this project (never root) through `ccdm restart-session`.
 //
 // Conversation Reminder events are recorded here through the reminder
 // adapter module (owner interactions, delivered replies, input requests, and
@@ -54,12 +52,20 @@
 // capability marker `<reminder state>/capabilities/<project>.json` proves this
 // live process only: it is written after the Router hello and removed when
 // this process exits or its Router session ends.
-const { execFile, spawn } = require("node:child_process");
-const { readFileSync, renameSync, rmSync, writeFileSync } = require("node:fs");
-const { chmod, mkdir, readFile, rm, stat, writeFile } = require("node:fs/promises");
+const { execFile } = require("node:child_process");
+const { readFileSync, rmSync } = require("node:fs");
+const { readFile, rm, stat, writeFile } = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const { createInterface } = require("node:readline");
+const { writeFileAtomic, writeFileAtomicSync } = require("./platform/atomic.js");
+const { hookCommand } = require("./platform/hooks.js");
+const { stateRoot } = require("./platform/paths.js");
+const { onShutdown, processStartTime } = require("./platform/process.js");
+const { ensurePrivateDir, isPrivateFile } = require("./platform/privacy.js");
+const { pythonInvocation } = require("./platform/tools.js");
+const { scheduleProjectRestart } = require("./lib/restart-helper.js");
+const sessionHost = require("./lib/session-host.js");
 const reminder = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
 const { markPaused, markReplied, markTurn } = require("./thread-activity.js");
@@ -92,17 +98,24 @@ const THREAD = Boolean(THREAD_ID);
 if (THREAD) markPaused(process.env.CCDM_THREAD_ACTIVITY_FILE, false);
 // Mirrors COMMANDS and THREAD_COMMANDS in scripts/router/inbound.js.
 const RELAYED_COMMANDS = THREAD ? "/pause, /unpause and /compact" : "/pause, /unpause, /compact, /clear and /restart";
-const RELAY_INSTRUCTIONS = `Discord relays only ${RELAYED_COMMANDS} as commands; any other slash command the owner sends arrives as a plain message and does not run. When the owner sends one, or asks you to run one (such as a skill only they may invoke), type it into your own tmux pane: tmux send-keys -t "$TMUX_PANE" -l '/<command>' && tmux send-keys -t "$TMUX_PANE" Enter. It runs when your current turn ends.`;
+// Claude's working directory is the project, so Windows names the checkout in full.
+// Git Bash runs the `ccdm` entry; PowerShell would need `ccdm.cmd`, which is why this names the tool.
+const TYPE_INTO_OWN_SESSION = process.platform === "win32"
+  ? `session with the Bash tool: "${ROOT_DIR.replace(/\\/g, "/")}/scripts/ccdm" session send "$CCDM_SESSION_NAME" --literal '/<command>' --enter`
+  : `tmux pane: tmux send-keys -t "$TMUX_PANE" -l '/<command>' && tmux send-keys -t "$TMUX_PANE" Enter`;
+const RELAY_INSTRUCTIONS = `Discord relays only ${RELAYED_COMMANDS} as commands; any other slash command the owner sends arrives as a plain message and does not run. When the owner sends one, or asks you to run one (such as a skill only they may invoke), type it into your own ${TYPE_INTO_OWN_SESSION}. It runs when your current turn ends.`;
 // A project's channel session and a thread session record reminder events;
 // only the channel session proves the project's capability.
 const REMINDERS = !ROOT;
 const CAPABILITY = REMINDERS && !THREAD;
 
 const REMINDER_PROJECT_ROOT = process.env.CCDM_REMINDER_PROJECT_ROOT || path.dirname(__dirname);
-const REMINDER_STATE_DIR = process.env.CCDM_REMINDER_STATE_DIR || path.join(os.homedir(), ".local", "state", "ccdm", "conversation-reminders");
+const REMINDER_STATE_DIR = process.env.CCDM_REMINDER_STATE_DIR || path.join(stateRoot(), "conversation-reminders");
 const REGISTRY_PATH = path.join(REMINDER_PROJECT_ROOT, "registry.json");
 const LAUNCH_ID = process.env.CCDM_CLAUDE_LAUNCH_ID || "";
 const capabilityPath = path.join(REMINDER_STATE_DIR, "capabilities", `${process.env.CCDM_CLAUDE_PROJECT || ""}.json`);
+// With the pid, names this process in its marker. Null on POSIX, where the pid alone does.
+const STARTED_AT = CAPABILITY ? processStartTime(process.pid) : null;
 
 // Owner messages this session may answer, by message ID.
 const interactions = new Map();
@@ -111,7 +124,8 @@ let inputNeededMarker = null;
 
 function removeCapabilityMarker() {
   try {
-    if (JSON.parse(readFileSync(capabilityPath, "utf8")).pid === process.pid) rmSync(capabilityPath, { force: true });
+    const marker = JSON.parse(readFileSync(capabilityPath, "utf8"));
+    if (marker.pid === process.pid && (marker.started_at ?? null) === STARTED_AT) rmSync(capabilityPath, { force: true });
   } catch { /* Absent or replaced markers need no cleanup. */ }
 }
 
@@ -119,10 +133,10 @@ async function hasCommandHooks() {
   const file = process.env.CCDM_CLAUDE_HOOK_SETTINGS;
   if (!file) return false;
   try {
-    if ((await stat(file)).mode & 0o077) return false;
+    if (!isPrivateFile(file)) return false;
     const settings = JSON.parse(await readFile(file, "utf8"));
     if (settings.enabledPlugins?.["discord@claude-plugins-official"] !== false) return false;
-    const expected = `node '${path.join(REMINDER_PROJECT_ROOT, "scripts", "claude-reminder-hook.js")}'`;
+    const expected = hookCommand(path.join(REMINDER_PROJECT_ROOT, "scripts", "claude-reminder-hook.js"));
     return ["SessionStart", "Stop", "StopFailure", "SessionEnd"].every(event =>
       settings.hooks?.[event]?.some(group => group.hooks?.some(hook =>
         hook.type === "command" && hook.command === expected,
@@ -150,11 +164,8 @@ async function writeCapabilityMarker(granted) {
     await rm(capabilityPath, { force: true });
     return;
   }
-  const directory = path.dirname(capabilityPath);
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  await chmod(directory, 0o700);
-  const tmp = `${capabilityPath}.${process.pid}.tmp`;
-  await writeFile(tmp, JSON.stringify({
+  await ensurePrivateDir(path.dirname(capabilityPath));
+  await writeFileAtomic(capabilityPath, JSON.stringify({
     schema_version: 1,
     project: assignment.project,
     channel_id: assignment.channel_id,
@@ -165,8 +176,8 @@ async function writeCapabilityMarker(granted) {
     reply_tool_verified: true,
     launch_id: LAUNCH_ID,
     pid: process.pid,
-  }) + "\n", { mode: 0o600 });
-  renameSync(tmp, capabilityPath);
+    started_at: STARTED_AT,
+  }) + "\n");
 }
 
 // An owner message opens an interaction the reply tool can name (by
@@ -256,8 +267,7 @@ async function saveAttachment(attachment) {
   const name = attachment.name ?? attachment.id;
   const ext = (name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : "bin").replace(/[^a-zA-Z0-9]/g, "") || "bin";
   const inbox = path.join(process.env.CCDM_ROUTER_STATE_DIR || "", "inbox", process.env.CCDM_CLAUDE_PROJECT || "");
-  await mkdir(inbox, { recursive: true, mode: 0o700 });
-  await chmod(inbox, 0o700);
+  await ensurePrivateDir(inbox);
   const file = path.join(inbox, `${Date.now()}-${attachment.id}.${ext}`);
   await writeFile(file, bytes, { mode: 0o600 });
   return file;
@@ -409,9 +419,7 @@ function send(frame) {
 function reportReady(outcome) {
   const file = process.env.CCDM_CHANNEL_READY_FILE;
   if (!file) return;
-  const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(outcome)}\n`, { mode: 0o600 });
-  renameSync(tmp, file);
+  writeFileAtomicSync(file, `${JSON.stringify(outcome)}\n`);
 }
 
 function attachmentMeta(attachments = []) {
@@ -488,51 +496,58 @@ function bootstrapNotification(bootstrap) {
   };
 }
 
-function shellQuote(value) {
-  return `'${String(value).replace(/'/g, "'\\''")}'`;
+// This thread's own session. The suffix keeps a name inherited from elsewhere, such
+// as the project's session, from receiving the thread's command.
+function ownThreadSession() {
+  const name = process.env.CCDM_SESSION_NAME;
+  return name?.endsWith(`-t-${THREAD_ID}`) ? name : undefined;
 }
 
-// A thread session types the command into its own pane, never the project's.
-function typeIntoOwnPane(command) {
-  const target = `=${process.env.CCDM_THREAD_TMUX}:`;
-  const tmux = args => new Promise((resolve, reject) => {
-    execFile("tmux", args, (error, stdout, stderr) => error ? reject(new Error(stderr.trim() || error.message)) : resolve(stdout));
-  });
-  if (!process.env.CCDM_THREAD_TMUX) return Promise.reject(new Error("this thread session has no tmux session"));
-  return tmux(["send-keys", "-t", target, "-l", `/${command}`]).then(() => tmux(["send-keys", "-t", target, "Enter"]));
+// A thread session types the command into its own session, never the project's.
+async function typeIntoOwnSession(command) {
+  const session = ownThreadSession();
+  if (!session) throw new Error(process.platform === "win32" ? "this thread session has no session name" : "this thread session has no tmux session");
+  await sessionHost.sendText(session, `/${command}`);
+  await sessionHost.sendKey(session, "Enter");
 }
 
 function relayClaudeCommand(project, command) {
-  if (THREAD) return typeIntoOwnPane(command);
+  if (THREAD) return typeIntoOwnSession(command);
   return new Promise((resolve, reject) => {
-    execFile(path.join(ROOT_DIR, "scripts", "send-claude-command.sh"), ["--project", project, command], (error, stdout, stderr) => {
+    execFile(...pythonInvocation([path.join(ROOT_DIR, "scripts", "ccdm.py"), "send-claude-command", "--project", project, command]), (error, stdout, stderr) => {
       if (error) reject(new Error(stderr.trim() || error.message));
       else resolve(stdout);
     });
   });
 }
 
-// Stopping the session kills this process tree, so the restart runs in a
-// backgrounded subshell that the launching shell leaves behind.
-function scheduleRestart(project) {
-  const logPath = path.join(os.tmpdir(), `ccdm-restart-${project.replace(/[^a-zA-Z0-9._-]/g, "_")}.log`);
-  const steps = [
-    `cd ${shellQuote(ROOT_DIR)}`,
-    `./scripts/stop-session.sh ${shellQuote(project)}`,
-    `./scripts/start-session.sh ${shellQuote(project)}`,
-  ].join(" && ");
-  const child = spawn("/bin/sh", ["-c", `(${steps}) >> ${shellQuote(logPath)} 2>&1 &`], { detached: true, env: process.env, stdio: "ignore" });
-  child.unref();
-  return logPath;
-}
-
 // Reminder events are recorded in arrival order, after any stranded outbox.
 let reminderEvents = REMINDERS ? reminder.drainOutbox() : Promise.resolve();
 if (CAPABILITY) process.on("exit", removeCapabilityMarker);
-for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(signal, () => process.exit(0));
+onShutdown(() => process.exit(0));
+
+// `--ccdm-key-file` only lets stop paths find this server by its command line
+// on Windows. The key still comes from CCDM_ROUTER_KEY_FILE, so the two must agree.
+function keyFileFlagProblem() {
+  const at = process.argv.indexOf("--ccdm-key-file");
+  if (at === -1) return "";
+  const flag = process.argv[at + 1];
+  if (!flag) return "--ccdm-key-file needs a path";
+  const fromEnv = process.env.CCDM_ROUTER_KEY_FILE;
+  if (!fromEnv) return "";
+  const canonical = file => (process.platform === "win32" ? path.resolve(file).toLowerCase() : path.resolve(file));
+  return canonical(flag) === canonical(fromEnv) ? ""
+    : `--ccdm-key-file ${flag} and CCDM_ROUTER_KEY_FILE ${fromEnv} name different files`;
+}
 
 function main() {
   const project = process.env.CCDM_CLAUDE_PROJECT;
+  const flagProblem = keyFileFlagProblem();
+  if (flagProblem) {
+    reportReady({ ok: false, error: flagProblem });
+    process.stderr.write(`ccdm channel: ${flagProblem}\n`);
+    process.exit(1);
+  }
   let key;
   try {
     key = readFileSync(process.env.CCDM_ROUTER_KEY_FILE, "utf8").trim();
@@ -642,8 +657,13 @@ function main() {
     restart: async event => {
       await react(event, "🔄");
       await say(event, "Restarting session — fresh session coming up.");
-      const logPath = scheduleRestart(project);
-      process.stderr.write(`ccdm channel: restart scheduled for '${project}'; log: ${logPath}\n`);
+      try {
+        // Stopping the session ends this process, so the helper runs outside it.
+        const logPath = await scheduleProjectRestart(project);
+        process.stderr.write(`ccdm channel: restart scheduled for '${project}'; log: ${logPath}\n`);
+      } catch (error) {
+        await say(event, `**Error:** Failed to restart — ${error.message}`);
+      }
     },
   };
   async function relayAcknowledged(event, name) {

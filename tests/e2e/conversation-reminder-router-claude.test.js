@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { assertPrivate } from "./support/platform.js";
 import { injectDiscordMessage, waitForState } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import {
@@ -14,6 +15,7 @@ import {
 } from "./support/router.js";
 import { readState, updateState, writeState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
+import { startThreadHost, supervisorEnv } from "./support/thread-supervisor.js";
 
 test.afterEach(async () => {
   await cleanup();
@@ -78,14 +80,23 @@ async function waitForStatus(context, predicate, attempts = 400) {
     `discord messages: ${JSON.stringify(discord.messages)}\nchannel server logs: ${channelLogs.join("\n---\n")}`);
 }
 
-function startSession(context) {
+// What a launcher runs with. On Windows the session runs on the fake ccdm-host,
+// whose env moves the state root, so the reminder state is named; and the Bash
+// launchers read UTF-8 pane text through Python, which defaults to the ANSI code page.
+async function launcherEnv(context) {
+  if (process.platform !== "win32") return routerEnv(context.workspace);
+  await startThreadHost(context.workspace);
+  return supervisorEnv(context.workspace, { CCDM_REMINDER_STATE_DIR: context.stateDir, PYTHONUTF8: "1" });
+}
+
+async function startSession(context) {
   return runScript(context.workspace, "scripts/start-session.sh", {
-    args: ["demo"], env: routerEnv(context.workspace), timeoutMs: 30000,
+    args: ["demo"], env: await launcherEnv(context), timeoutMs: 30000,
   });
 }
 
-function stopSession(context) {
-  return runScript(context.workspace, "scripts/stop-session.sh", { args: ["demo"], env: routerEnv(context.workspace) });
+async function stopSession(context) {
+  return runScript(context.workspace, "scripts/stop-session.sh", { args: ["demo"], env: await launcherEnv(context) });
 }
 
 const owner = { id: OWNER_ID, username: "Owner" };
@@ -167,7 +178,7 @@ test("the router Claude capability marker lives with the channel server and is g
   const marker = JSON.parse(fs.readFileSync(context.markerPath, "utf8"));
   assert.deepEqual([marker.project, marker.channel_id, marker.assignment_generation, marker.transport,
     marker.hooks_configured, marker.reply_tool_verified], ["demo", "demo-channel", "gen-demo", "ccdm-channel-server", true, true]);
-  assert.equal(fs.statSync(context.markerPath).mode & 0o777, 0o600);
+  assertPrivate(context.markerPath);
   const ready = await readiness(context);
   assert.equal(ready.exitCode, 0, ready.stdout || ready.stderr);
   assert.deepEqual(JSON.parse(ready.stdout).unsupported_capabilities, []);
@@ -177,8 +188,11 @@ test("the router Claude capability marker lives with the channel server and is g
   await waitForState(workspace, () => !fs.existsSync(context.markerPath));
   const blocked = await readiness(context);
   assert.equal(blocked.exitCode, 2);
-  assert.match(JSON.parse(blocked.stdout).unsupported_capabilities.join(" "),
-    /Claude launch-scoped transport is not verified for this assignment; restart the session with scripts\/start-session.sh demo/);
+  // The launcher as this OS has it: the script on macOS and Linux, the subcommand on Windows.
+  const launcher = process.platform === "win32" ? "scripts/ccdm start-session" : "scripts/start-session.sh";
+  assert.ok(JSON.parse(blocked.stdout).unsupported_capabilities.join(" ").includes(
+    `Claude launch-scoped transport is not verified for this assignment; restart the session with ${launcher} demo`),
+  blocked.stdout);
 
   // A relaunch replaces the marker with its own channel server's.
   const relaunched = await startSession(context);
@@ -201,15 +215,25 @@ test("a router Claude launch loads the hooks but no reminder proxy", async () =>
   const state = readState(workspace.stateDir);
   const surfaces = [
     JSON.stringify(state.fixtures.claude.invocations),
-    state.fixtures.tmux.sessions.demo_claude.shellCommand,
+    // The whole session record: its shell command on tmux, its argv on the Windows host.
+    JSON.stringify(state.fixtures.tmux.sessions.demo_claude),
     ...fs.readdirSync(launchDir).map((file) => fs.readFileSync(path.join(launchDir, file), "utf8")),
   ];
   for (const text of surfaces) assert.equal(text.includes("claude-reminder-channel"), false, text.slice(0, 200));
   const settings = JSON.parse(fs.readFileSync(path.join(launchDir, "settings.json"), "utf8"));
-  const hook = `node '${path.join(workspace.repoDir, "scripts", "claude-reminder-hook.js")}'`;
+  // Claude Code runs commands through Git Bash on Windows, so paths have forward slashes there.
+  // A Windows temp folder can carry a short (8.3) name; the `ccdm` entry starts Python from the long one.
+  const windows = process.platform === "win32";
+  const repoAsLaunched = windows ? fs.realpathSync.native(workspace.repoDir) : workspace.repoDir;
+  const run = (script) => {
+    const file = path.join(repoAsLaunched, "scripts", script);
+    return `node '${windows ? file.replaceAll("\\", "/") : file}'`;
+  };
   assert.deepEqual(settings, {
     enabledPlugins: { "discord@claude-plugins-official": false },
     hooks: Object.fromEntries(["SessionStart", "Stop", "StopFailure", "SessionEnd"].map((event) =>
-      [event, [{ hooks: [{ type: "command", command: hook }] }]])),
+      [event, [{ hooks: [{ type: "command", command: run("claude-reminder-hook.js") }] }]])),
+    // A Windows launch also carries its context status line.
+    ...(windows ? { statusLine: { type: "command", command: run("statusline-context.js") } } : {}),
   });
 });

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { PYTHON, assertPrivate } from "./support/platform.js";
 import { collectProcess, injectDiscordMessage, injectDiscordReaction, startFakeCodexServer } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import { OWNER_ID, ROOT_TOKEN, connectSession, createRouterWorkspace, routerEnv, routerRegistry,
@@ -17,7 +18,9 @@ test.afterEach(cleanup);
 // Creating a configured Thread Conversation with `/thread` in a project
 // channel or `scripts/threads.sh create`, end to end: the real Router, Thread
 // Supervisor, start-thread-session.sh and CCDM channel server, with the
-// fixture claude and tmux. Only Discord inputs and threads.sh go in.
+// fixture claude and tmux. Only Discord inputs and threads.sh go in; on
+// Windows, where the sessions run on the fake ccdm-host, `scripts/ccdm threads` does.
+const WIN = process.platform === "win32";
 // The fake gives the root bot's first created thread this id.
 const CREATED_THREAD_ID = "1600000000000000001";
 // `<screen>-t-<thread id>`.
@@ -61,7 +64,9 @@ async function threadRow(workspace, threadId, predicate = () => true, timeoutMs 
     if (row && predicate(row)) return row;
     await new Promise(resolve => setTimeout(resolve, 50));
   }
-  throw new Error(`thread ${threadId} never matched: ${JSON.stringify(last)}`);
+  // A failed start posts its reason in the thread, so the thread's posts say why.
+  throw new Error(`thread ${threadId} never matched: ${JSON.stringify(last)}\nposts in the thread: `
+    + JSON.stringify(posts(workspace, threadId).map(({ content, webhookId }) => ({ webhook: Boolean(webhookId), content }))));
 }
 
 const discord = workspace => readState(workspace.stateDir).fixtures.discord;
@@ -74,6 +79,20 @@ const posts = (workspace, channelId) => (discord(workspace).messages ?? [])
 const notices = (workspace, channelId) => posts(workspace, channelId).filter(message => !message.webhookId)
   .map(({ content, authorization }) => ({ content, authorization }));
 const settle = ms => new Promise(resolve => setTimeout(resolve, ms));
+// How a session's program was started: tmux's one shell command, or the host's argument list.
+const launchText = session => session.shellCommand ?? session.command.join(" ");
+// Each `--flag value` in a session's launch: quoted in tmux's shell command, two words for the host.
+function assertLaunchedWith(session, flags) {
+  if (session.shellCommand) {
+    assert.match(session.shellCommand, new RegExp(Object.entries(flags).map(([flag, value]) => `--${flag} '${value}'`).join(" ")));
+    return;
+  }
+  for (const [flag, value] of Object.entries(flags)) {
+    assert.equal(session.command[session.command.indexOf(`--${flag}`) + 1], value, session.command.join(" "));
+  }
+}
+// A provider home as `/model` shows it: under `~`, with the OS's own separator.
+const shownHome = name => `~${path.sep}${name}`;
 
 test("/thread with --model, --effort and a first message creates a one-week thread, posts its settings and starts Claude with that message as the starter", async () => {
   const workspace = commandWorkspace();
@@ -97,8 +116,8 @@ test("/thread with --model, --effort and a first message creates a one-week thre
   assert.match(bootstrap.content, /fix-login/);
   assert.match(bootstrap.content, /please look at X/);
   assert.equal(claude(workspace).invocations.length, 1);
-  assert.match(readState(workspace.stateDir).fixtures.tmux.sessions[CREATED_THREAD_TMUX].shellCommand,
-    /--model 'claude-test-model' --effort 'high'/);
+  assertLaunchedWith(readState(workspace.stateDir).fixtures.tmux.sessions[CREATED_THREAD_TMUX],
+    { model: "claude-test-model", effort: "high" });
   const row = await threadRow(workspace, CREATED_THREAD_ID);
   assert.deepEqual([row.name, row.provider, row.account, row.model, row.effort],
     ["fix-login", null, null, "claude-test-model", "high"]);
@@ -173,16 +192,23 @@ test("an invalid provider, a foreign or unknown account alias, or an invalid mod
   assert.deepEqual((await supervisorStatus(workspace)).projects, {});
 });
 
-function threadsCli(workspace, args) {
-  return runScript(workspace, "scripts/threads.sh", { args, env: supervisorEnv(workspace) });
+// The operator's thread command: the shim on macOS and Linux, `scripts/ccdm threads` on Windows.
+function threadsCli(workspace, args, options = {}) {
+  return runScript(workspace, WIN ? "scripts/ccdm" : "scripts/threads.sh",
+    { args: WIN ? ["threads", ...args] : args, env: supervisorEnv(workspace), ...options });
 }
 
 test("threads.sh create makes and starts a thread with an account alias, and a bad flag exits 2", async () => {
   const workspace = commandWorkspace();
   await supervised(workspace);
-  const socket = fs.statSync(path.join(supervisorStateDir(workspace), "control.sock"));
-  assert.ok(socket.isSocket());
-  assert.equal(socket.mode & 0o777, 0o600);
+  // The control channel: a private socket, or on Windows a pipe whose name and key are private files.
+  if (WIN) {
+    for (const file of ["supervisor.pipe", "supervisor.secret"]) assertPrivate(path.join(supervisorStateDir(workspace), file));
+  } else {
+    const socketPath = path.join(supervisorStateDir(workspace), "control.sock");
+    assert.ok(fs.statSync(socketPath).isSocket());
+    assertPrivate(socketPath);
+  }
 
   const created = await threadsCli(workspace, ["create", "demo", "cli-task", "--account", "work", "look at the logs"]);
   assert.equal(created.exitCode, 0, created.stderr || created.stdout);
@@ -203,6 +229,45 @@ test("threads.sh create makes and starts a thread with an account alias, and a b
     assert.equal(refused.exitCode, 2, `${args.join(" ")}: ${refused.stderr || refused.stdout}`);
   }
   assert.equal(threadCreates(workspace).length, 1);
+});
+
+test("threads create reads its first message whole from stdin or from a file, and refuses one given twice or unreadable", async () => {
+  const workspace = commandWorkspace();
+  await supervised(workspace);
+  // Words a Windows command line would act on, were they arguments.
+  const message = 'check "the logs" & report | tee %PATH% ^ <done> 100% naïve ✅';
+
+  const piped = await threadsCli(workspace, ["create", "demo", "from-stdin", "--effort", "high", "--message-stdin"],
+    { input: `${message}\n` });
+  assert.equal(piped.exitCode, 0, piped.stderr || piped.stdout);
+  const first = JSON.parse(piped.stdout.trim().split("\n").at(-1));
+  assert.deepEqual([first.thread_id, first.name, first.effort], [CREATED_THREAD_ID, "from-stdin", "high"]);
+  await threadRow(workspace, CREATED_THREAD_ID, row => row.state === "live");
+  await waitFor(() => notifications(workspace).length === 1, () => "the bootstrap", 15000);
+  assert.ok(notifications(workspace)[0].content.includes(message), notifications(workspace)[0].content);
+  assert.equal(notices(workspace, CREATED_THREAD_ID)[0].content.split("\n").at(-1), `First message: ${message}`);
+
+  // A file may start with a byte-order mark and end its line the Windows way.
+  const file = path.join(workspace.tmpDir, "first message.txt");
+  fs.writeFileSync(file, `﻿${message} (from a file)\r\n`);
+  const filed = await threadsCli(workspace, ["create", "demo", "from-file", "--message-file", file]);
+  assert.equal(filed.exitCode, 0, filed.stderr || filed.stdout);
+  const second = JSON.parse(filed.stdout.trim().split("\n").at(-1)).thread_id;
+  assert.notEqual(second, CREATED_THREAD_ID);
+  await waitFor(() => notices(workspace, second).length === 1, () => "the second thread's settings notice", 15000);
+  assert.equal(notices(workspace, second)[0].content.split("\n").at(-1), `First message: ${message} (from a file)`);
+
+  for (const [args, reason] of [
+    [["create", "demo", "x", "--message-stdin", "and", "words"], /no message words may follow/],
+    [["create", "demo", "x", "--message-file", file, "--message-stdin"], /give the first message once/],
+    [["create", "demo", "x", "--message-file", path.join(workspace.tmpDir, "missing.txt")], /could not be read/],
+    [["create", "demo", "x", "--message-file"], /--message-file needs a value/],
+  ]) {
+    const refused = await threadsCli(workspace, args, { input: "never read" });
+    assert.equal(refused.exitCode, 2, `${args.join(" ")}: ${refused.stderr || refused.stdout}`);
+    assert.match(refused.stderr, reason);
+  }
+  assert.equal(threadCreates(workspace).length, 2);
 });
 
 test("threads.sh create exits non-zero with a reason when no supervisor runs", async () => {
@@ -232,7 +297,7 @@ async function channelSession(workspace, toolScript) {
   updateState(workspace.stateDir, state => {
     state.fixtures.claude.toolScript = toolScript;
   });
-  const started = await runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace) });
+  const started = await runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: supervisorEnv(workspace) });
   assert.equal(started.exitCode, 0, started.stderr || started.stdout);
   channelMessage(workspace, "owner-message-1", "split the parser work off");
 }
@@ -414,7 +479,7 @@ async function liveThread(workspace, threadId) {
 // The channel session and two live threads, before any command.
 async function threeSessions(workspace) {
   await supervised(workspace);
-  const started = await runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: routerEnv(workspace) });
+  const started = await runScript(workspace, "scripts/start-session.sh", { args: ["demo"], env: supervisorEnv(workspace) });
   assert.equal(started.exitCode, 0, started.stderr || started.stdout);
   await liveThread(workspace, THREAD_ID);
   await liveThread(workspace, SIBLING_ID);
@@ -559,7 +624,11 @@ test("/compact in a Codex thread reaches only that thread's bridge", async () =>
   await threadRow(workspace, CREATED_THREAD_ID, row => row.ws_port === 29600);
   await codex.listen();
   await threadRow(workspace, CREATED_THREAD_ID, row => row.state === "live" &&
-    row.provider_conversation_id === CODEX_THREAD_UUID);
+    row.provider_conversation_id === CODEX_THREAD_UUID).catch(error => {
+    // What the fake app-server heard tells a launch that never reached it from one it failed.
+    throw new Error(`${error.message}\nfake app-server received: ${JSON.stringify(codex.clientMessages.map(message =>
+      message.method ?? `answer to ${message.id}`))}`);
+  });
   await waitFor(() => replies(workspace, CREATED_THREAD_ID).length === 1, () => "the bootstrap reply", 20000);
 
   threadMessage(workspace, CREATED_THREAD_ID, "compact-1", "/compact");
@@ -625,7 +694,7 @@ test("/config model= and effort= save the override and restart the thread with -
   const row = await threadRow(workspace, THREAD_ID, current => current.state === "live");
   assert.deepEqual([row.model, row.effort, row.provider_conversation_id], ["claude-next", "max", conversationId]);
   assert.equal(resumeArg(launches(workspace, THREAD_ID)[1]), conversationId);
-  assert.match(tmuxSessions(workspace)[THREAD_TMUX].shellCommand, /--model 'claude-next' --effort 'max'/);
+  assertLaunchedWith(tmuxSessions(workspace)[THREAD_TMUX], { model: "claude-next", effort: "max" });
   assert.deepEqual(notices(workspace, THREAD_ID).at(-1), { authorization: ROOT_AUTH,
     content: "Settings saved: model claude-next · effort max. Restarting this thread's session." });
   assert.equal(commandNotified(workspace, "/config"), false);
@@ -688,7 +757,7 @@ test("/config provider=codex posts a warning with ✅ and changes nothing until 
     row.provider_conversation_id === CODEX_THREAD_UUID, 20000);
   assert.equal(switched.provider, "codex");
   assert.ok(!alive(claudePid), "the Claude session stopped");
-  assert.doesNotMatch(tmuxSessions(workspace)[THREAD_TMUX].shellCommand, /--resume/);
+  assert.doesNotMatch(launchText(tmuxSessions(workspace)[THREAD_TMUX]), /--resume/);
   assert.equal(codex.clientMessages.some(message => message.method === "thread/resume"), false);
   // The fixture Claude answered each reaction it saw, so only the Codex replies count from here.
   const codexReplies = () => replies(workspace, THREAD_ID).filter(reply => reply.username.startsWith("demo-codex"))
@@ -824,12 +893,12 @@ test("/model in a project channel lists the channel session's model, thinking le
   await waitFor(() => notices(workspace, "demo-channel").length === 2 && notices(workspace, "beta-channel").length === 1,
     () => `three /model notices: ${JSON.stringify(discord(workspace).messages)}`, 15000);
   const demo = "This channel's session:\nProvider: claude\nModel: claude-project-model (project)\n" +
-    "Thinking: max (home config)\nAccount: work · ~/.claude-work";
+    `Thinking: max (home config)\nAccount: work · ${shownHome(".claude-work")}`;
   assert.deepEqual(notices(workspace, "demo-channel"), [
     { authorization: ROOT_AUTH, content: demo }, { authorization: ROOT_AUTH, content: demo }]);
   assert.deepEqual(notices(workspace, "beta-channel"), [{ authorization: ROOT_AUTH, content:
     "This channel's session:\nProvider: codex\nModel: gpt-home (home config)\nThinking: xhigh (home config)\n" +
-    "Account: codex-work · ~/.codex-work" }]);
+    `Account: codex-work · ${shownHome(".codex-work")}` }]);
   await settle(500);
   assert.deepEqual(channel.events.filter(event => String(event.message_id).startsWith("channel-model")), []);
   assert.deepEqual(claude(workspace).invocations, []);
@@ -846,7 +915,7 @@ test("/model in a thread lists its overrides and project settings, for a guest t
   await waitFor(() => notices(workspace, CREATED_THREAD_ID).length === 2, () => "the /model notice", 15000);
   assert.deepEqual(notices(workspace, CREATED_THREAD_ID)[1], { authorization: ROOT_AUTH, content:
     "This thread's session (registered):\nProvider: claude\nModel: claude-test-model (thread)\n" +
-    "Thinking: high (thread)\nAccount: ~/.claude" });
+    `Thinking: high (thread)\nAccount: ${shownHome(".claude")}` });
   await settle(500);
   assert.equal((await threadRow(workspace, CREATED_THREAD_ID)).state, "registered");
   assert.deepEqual(claude(workspace).invocations, []);
@@ -857,7 +926,7 @@ test("/config provider=… drops the thread's account, model and effort for the 
   await supervised(workspace);
   await liveThread(workspace, THREAD_ID);
   const { spawnSync } = await import("node:child_process");
-  const set = spawnSync("python3", ["-c", `import sqlite3, sys
+  const set = spawnSync(PYTHON, ["-c", `import sqlite3, sys
 db = sqlite3.connect(sys.argv[1], timeout=5)
 db.execute("UPDATE threads SET account = 'work', effort = 'max' WHERE thread_id = ?", (sys.argv[2],))
 db.commit()`, path.join(supervisorStateDir(workspace), "threads.sqlite3"), THREAD_ID], { encoding: "utf8" });

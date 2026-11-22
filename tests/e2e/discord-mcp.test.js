@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { assertPrivate } from "./support/platform.js";
 import { bridgeChildEnv, collectProcess, createBridgeWorkspace, runPreloadProbe } from "./support/bridge.js";
 import {
   ROOT_TOKEN,
@@ -231,7 +232,7 @@ test("Discord MCP exports a message range through the latest message", async () 
   assert.match(text, /Message ID: 102/);
   assert.match(text, /Message ID: 103/);
   assert.doesNotMatch(text, /Message ID: 101/);
-  assert.equal(fs.statSync(exportPath).mode & 0o777, 0o600);
+  assertPrivate(exportPath);
 });
 
 test("Discord MCP reads 500 recent messages across API pages", async () => {
@@ -262,7 +263,7 @@ test("Discord MCP reads 500 recent messages across API pages", async () => {
   assert.equal(messages.length, 500);
   assert.equal(messages[0], "[2026-08-01T10:00:00.000Z] Alice: message 1005 (id: 1005)");
   assert.equal(messages.at(-1), "[2026-08-01T10:00:00.000Z] Alice: message 1504 (id: 1504)");
-  assert.equal(fs.statSync(transcript).mode & 0o777, 0o600);
+  assertPrivate(transcript);
   // The Router absorbed the 429 and retried the page with the bot token.
   const discord = readState(workspace.stateDir).fixtures.discord;
   assert.deepEqual(discord.restFailureUses, [{
@@ -729,6 +730,60 @@ test("Discord MCP fetch and download tools cover limits, attachment indexes, wri
     kind: "fetch",
     target: "https://example.com/blocked.txt",
   });
+});
+
+test("Discord MCP download_attachment keeps every download inside the save dir and POSIX names as they were", async () => {
+  const long = "a".repeat(300);
+  const cases = [
+    ["../../x", "x"],
+    ...(process.platform === "win32" ? [] : [
+      ["..", "file"],
+      [".", "file"],
+      ["/", "file"],
+      ["", "att-case-4"],
+      [`${long}.txt`, `${"a".repeat(251)}.txt`],
+      [long, "a".repeat(255)],
+      [`${"a".repeat(251)}.txt`, `${"a".repeat(251)}.txt`],
+      ["a.txt:b", "a.txt:b"],
+      ["report?.pdf", "report?.pdf"],
+      ["a<b>.txt", "a<b>.txt"],
+      ["CON.txt", "CON.txt"],
+      ["name. ", "name. "],
+      ["...", "..."],
+    ]),
+  ];
+  const url = (index) => `https://cdn.discordapp.com/attachments/channel/message/case-${index}`;
+  const { workspace } = await betaRouter();
+  seedHistory(workspace, "beta-channel", cases.map(([filename], index) => ({
+    id: `case-${index}`,
+    timestamp: "2026-05-28T10:00:00.000Z",
+    content: "file",
+    author: { username: "Alice", bot: false },
+    attachments: [{ id: `att-case-${index}`, filename, url: url(index) }],
+  })));
+  seedDiscord(workspace, (discord) => {
+    cases.forEach((_, index) => {
+      discord.attachments[url(index)] = { body: `body ${index}` };
+    });
+  });
+
+  const saveRoot = path.join(workspace.tmpDir, "hostile-downloads");
+  const saveDir = (index) => path.join(saveRoot, "nested", String(index));
+  const result = await runMcp(workspace, cases.map((_, index) => toolCall(index + 1, "download_attachment", {
+    message_id: `case-${index}`,
+    save_dir: saveDir(index),
+  })), betaMcpEnv(workspace));
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  const output = responseById(result);
+  cases.forEach(([filename, expected], index) => {
+    const label = JSON.stringify(filename.slice(0, 20));
+    assert.equal(output.get(index + 1).result.content[0].text, path.join(saveDir(index), expected), label);
+    assert.deepEqual(fs.readdirSync(saveDir(index)), [expected], label);
+    assert.equal(fs.readFileSync(path.join(saveDir(index), expected), "utf8"), `body ${index}`, label);
+  });
+  assert.deepEqual(fs.readdirSync(saveRoot), ["nested"]);
+  assert.equal(fs.readdirSync(path.join(saveRoot, "nested")).length, cases.length);
 });
 
 test("Discord MCP surfaces fake REST API errors as MCP error content", async () => {

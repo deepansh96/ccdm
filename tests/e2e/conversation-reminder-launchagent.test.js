@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import test from "node:test";
+import nodeTest from "node:test";
 
 import { spawn, spawnSync } from "node:child_process";
 
+import { PYTHON, assertPrivate, suiteTest } from "./support/platform.js";
 import { runScript } from "./support/runner.js";
 import { routerEnv, runRouterCli, startBridge, startRouter, waitFor, writeProjectKey } from "./support/router.js";
 import {
@@ -12,6 +13,8 @@ import {
 } from "./support/bridge.js";
 import { readState, updateState, writeState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
+
+const test = suiteTest(nodeTest, import.meta.url);
 
 test.afterEach(async () => cleanup());
 
@@ -71,7 +74,7 @@ async function service(workspace, context, name, expected = 0) {
 }
 
 function renderedAgent(workspace) {
-  const parsed = spawnSync("python3", ["-c",
+  const parsed = spawnSync(PYTHON, ["-c",
     "import json,plistlib,sys; print(json.dumps(plistlib.load(open(sys.argv[1],'rb'))))", plistPath(workspace)],
   { encoding: "utf8" });
   assert.equal(parsed.status, 0, parsed.stderr);
@@ -158,9 +161,9 @@ test("installer renders a secret-free LaunchAgent that supervises the foreground
     assert.doesNotMatch(text, /fixture-(root|project)-token|DISCORD_BOT_TOKEN/);
   }
   // Durable state and logs live in a private directory the installer prepares.
-  assert.equal(fs.statSync(context.stateDir).mode & 0o777, 0o700);
-  assert.equal(fs.statSync(path.join(context.stateDir, "service.log")).mode & 0o777, 0o600);
-  assert.equal(fs.statSync(path.join(context.stateDir, "service.err")).mode & 0o777, 0o600);
+  assertPrivate(context.stateDir);
+  assertPrivate(path.join(context.stateDir, "service.log"));
+  assertPrivate(path.join(context.stateDir, "service.err"));
   // Installing supervises the worker; it neither opts in nor contacts Discord.
   const state = readState(workspace.stateDir);
   assert.deepEqual(state.fixtures.discord.sends, []);
@@ -322,9 +325,9 @@ test("supervised and foreground launches share one worker, and disable keeps rel
   assert.equal((await manual).exitCode, 0);
   assert.equal(readState(workspace.stateDir).fixtures.discord.logins.length, routerLogins);
 
-  assert.equal(fs.statSync(context.stateDir).mode & 0o777, 0o700);
+  assertPrivate(context.stateDir);
   for (const name of ["conversations.sqlite3", "worker.lock", "service.log", "service.err"]) {
-    assert.equal(fs.statSync(path.join(context.stateDir, name)).mode & 0o777, 0o600, name);
+    assertPrivate(path.join(context.stateDir, name), name);
   }
 });
 
@@ -437,9 +440,7 @@ async function claudeTurn(workspace, context, { messageId }) {
   };
   registerTeardownCallback(() => stop("SIGKILL"));
   const until = async text => {
-    for (let attempt = 0; attempt < 200 && !output.includes(text); attempt++) {
-      await new Promise(resolve => setTimeout(resolve, 20));
-    }
+    await waitFor(() => output.includes(text), () => `Claude channel to produce ${text}: ${output}`, 30000);
     assert.ok(output.includes(text), `Claude channel never produced ${text}: ${output}`);
   };
   const send = value => child.stdin.write(JSON.stringify({ jsonrpc: "2.0", ...value }) + "\n");
@@ -506,15 +507,11 @@ async function runMcp(workspace, { env, input, timeoutMs = 10000 }) {
 async function codexTurn(workspace, { codex, bridge }, messageId) {
   injectDiscordMessage(workspace, { id: messageId, channelId: "codex-channel", author: { id: "owner-id" },
     content: "answer this" });
-  const config = await (async () => {
-    for (let attempt = 0; attempt < 200; attempt++) {
-      const found = codex.clientMessages.find(message => message.method === "config/value/write" &&
-        message.params.keyPath === "mcp_servers.discord-codex-channel");
-      if (found && fs.existsSync(found.params.value.env.CCDM_REMINDER_CONTEXT_FILE)) return found;
-      await new Promise(resolve => setTimeout(resolve, 25));
-    }
-    throw new Error(`Codex turn never started: ${bridge.stdout}\n${bridge.stderr}`);
-  })();
+  const config = await waitFor(() => {
+    const found = codex.clientMessages.find(message => message.method === "config/value/write" &&
+      message.params.keyPath === "mcp_servers.discord-codex-channel");
+    return found && fs.existsSync(found.params.value.env.CCDM_REMINDER_CONTEXT_FILE) ? found : null;
+  }, () => `the Codex turn to start: ${bridge.stdout}\n${bridge.stderr}`, 30000);
   const reply = await runMcp(workspace, {
     env: bridgeChildEnv(workspace, config.params.value.env),
     input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "reply",

@@ -10,10 +10,17 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
-import stat
 import sys
 import time
 from datetime import datetime
+
+sys.dont_write_bytecode = True  # no __pycache__ beside the scripts
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+from ccdmlib.platform.paths import state_root  # noqa: E402
+from ccdmlib.platform.private_fs import ensure_private_dir, is_private  # noqa: E402
 
 
 SCHEMA_VERSION = 1
@@ -80,7 +87,7 @@ def default_state_dir() -> Path:
     override = os.environ.get("CCDM_REMINDER_STATE_DIR")
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".local" / "state" / "ccdm" / "conversation-reminders"
+    return state_root() / "conversation-reminders"
 
 
 def load_registry(project_root: Path) -> dict:
@@ -129,8 +136,7 @@ def assignment_for(registry: dict, project_name: str) -> dict:
 
 
 def private_directory(path: Path) -> None:
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(path, 0o700)
+    ensure_private_dir(path)
 
 
 def database_path(state_dir: Path) -> Path:
@@ -138,6 +144,8 @@ def database_path(state_dir: Path) -> Path:
 
 
 DATABASE_BUSY_TIMEOUT_SECONDS = 2
+# How long a status read waits for the writer of the first event to create the table.
+SCHEMA_WAIT_SECONDS = 2
 
 
 def _enable_wal(connection: sqlite3.Connection) -> None:
@@ -164,6 +172,11 @@ def connect_database(state_dir: Path, *, create: bool) -> sqlite3.Connection | N
     if not db_path.exists() and not create:
         return None
     private_directory(state_dir)
+    # Private from the moment the file exists. SQLite would create it with the
+    # default mode, and until the chmod below a reader saw a ledger that was
+    # not private: readiness refused it and the worker stopped.
+    if not db_path.exists():
+        os.close(os.open(db_path, os.O_WRONLY | os.O_CREAT, 0o600))
     connection = sqlite3.connect(db_path, timeout=DATABASE_BUSY_TIMEOUT_SECONDS, isolation_level=None)
     connection.row_factory = sqlite3.Row
     _enable_wal(connection)
@@ -441,16 +454,28 @@ def status_for(state_dir: Path, project_name: str) -> dict:
     if not db_path.exists():
         return {"available": True, "event_count": 0, "pending_count": pending_count, "events": []}
     try:
-        if stat.S_IMODE(db_path.stat().st_mode) & 0o077:
+        if not is_private(db_path):
             return {"available": False, "reason": "event database permissions are not private", "event_count": 0, "pending_count": pending_count, "events": []}
-        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1)
-        connection.row_factory = sqlite3.Row
-        rows = connection.execute(
-            "SELECT * FROM events WHERE project = ? ORDER BY commit_order DESC LIMIT 100",
-            (project_name,),
-        ).fetchall()
-        count = connection.execute("SELECT COUNT(*) FROM events WHERE project = ?", (project_name,)).fetchone()[0]
-        connection.close()
+        # The first event creates the database file just before its table. A
+        # reader in that gap waits for the table; a file that still has none
+        # after the wait is unsupported, as before.
+        deadline = time.monotonic() + SCHEMA_WAIT_SECONDS
+        while True:
+            connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1)
+            try:
+                connection.row_factory = sqlite3.Row
+                rows = connection.execute(
+                    "SELECT * FROM events WHERE project = ? ORDER BY commit_order DESC LIMIT 100",
+                    (project_name,),
+                ).fetchall()
+                count = connection.execute("SELECT COUNT(*) FROM events WHERE project = ?", (project_name,)).fetchone()[0]
+                break
+            except sqlite3.OperationalError as error:
+                if str(error) != "no such table: events" or time.monotonic() >= deadline:
+                    raise
+            finally:
+                connection.close()
+            time.sleep(0.05)
         return {
             "available": True,
             "event_count": count,
@@ -515,8 +540,10 @@ def main(argv: list[str] | None = None) -> int:
     state_dir = args.state_dir.expanduser()
     if args.command == "ingest":
         try:
-            raw_event = json.load(sys.stdin)
-        except (json.JSONDecodeError, OSError):
+            # Bytes, which json reads as UTF-8: the console's own encoding would
+            # mangle an emoji on Windows.
+            raw_event = json.load(sys.stdin.buffer)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             result = {"status": "rejected", "reason": "input is not valid JSON"}
         else:
             result = ingest_event(args.project_root.resolve(), state_dir, raw_event)
