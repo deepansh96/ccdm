@@ -275,6 +275,11 @@ function agyEnv() {
     BASH_ENV: path.join(AGY_SHELL_DIR, "bashenv"),
     CCDM_SHELL_HOME: REAL_HOME,
     CCDM_SHELL_ZDOTDIR: process.env.ZDOTDIR || "",
+    // A bash whose stdin is a socket (Node's stdio pipes are socketpairs) and
+    // whose SHLVL comes out below 2 takes itself for an rshd/sshd command and
+    // skips BASH_ENV. A bridge started with no SHLVL (from sh and Python rather
+    // than a shell that sets it) would hand that to agy's shells.
+    SHLVL: String(Math.max(1, Number.parseInt(process.env.SHLVL, 10) || 0)),
   };
 }
 
