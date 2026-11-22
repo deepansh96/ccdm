@@ -1311,7 +1311,7 @@ test("poster labels each Claude home with its claude_accounts alias, else claude
   for (const dir of [teamDir, otherDir]) state.fixtures.security.credentials[serviceFor(dir)] = { claudeAiOauth: { accessToken: "fixture-oauth-token" } };
   writeState(state, workspace.stateDir);
 
-  const result = await runScript(workspace, "scripts/usage-stats-poster.py");
+  const result = await runPoster(workspace);
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const claudeValue = JSON.parse(api.requests.find((request) => request.method === "POST").body).embeds[0].fields[0].value;
@@ -3816,7 +3816,7 @@ test("poster reads Claude limits from .credentials.json and leaves the file unto
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
   const claudeValue = JSON.parse(api.requests.find((request) => request.method === "POST").body).embeds[0].fields[0].value;
-  assert.match(claudeValue, /\*\*claude-p\*\* \(Pro\)/);
+  assert.match(claudeValue, /\*\*claude\*\* \(Pro\)/);
   assert.match(claudeValue, /5-Hour:.*37%/);
   assert.deepEqual(readState(workspace.stateDir).fixtures.security.invocations, []);
   assert.deepEqual(fs.readFileSync(file), before, ".credentials.json must not change");
@@ -3855,7 +3855,7 @@ test("a stale .credentials.json is skipped with a reason and never refreshed dir
   const result = await runPoster(workspace, { args: ["--collect-only"], env: FILE_STORE });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  assert.match(result.stderr, /Claude limits skipped for claude-p: OAuth token expired/);
+  assert.match(result.stderr, /Claude limits skipped for claude: OAuth token expired/);
   const snapshot = readSnapshot(historyPath);
   assert.match(snapshot, /OAuth token expired/);
   assert.equal(api.requests.length, 0, "a stale token must not reach Anthropic");
@@ -3871,7 +3871,7 @@ test("an unparsable .credentials.json is retried and then skipped with a reason"
   const result = await runPoster(workspace, { args: ["--collect-only"], env: FILE_STORE });
 
   assert.equal(result.exitCode, 0, result.stderr || result.stdout);
-  assert.match(result.stderr, /Claude limits skipped for claude-p: Claude credentials file could not be read/);
+  assert.match(result.stderr, /Claude limits skipped for claude: Claude credentials file could not be read/);
   assert.match(readSnapshot(historyPath), /Claude credentials file could not be read/);
   assert.equal(api.requests.length, 0);
 });
