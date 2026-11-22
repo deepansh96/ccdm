@@ -40,9 +40,10 @@ function fakeAgyBin(workspace) {
   const bin = path.join(workspace.tmpRoot, "agy-bin", "agy");
   fs.mkdirSync(path.dirname(bin), { recursive: true });
   // Named agy in ps, as the real binary is, so listener detection sees it.
-  // sh, not bash: bash would run a Gemini account session's BASH_ENV, which
-  // hands the agent's shells the real home, before the fake agy starts.
-  fs.writeFileSync(bin, `#!/bin/sh\nexec -a agy '${process.execPath}' '${path.join(workspace.repoDir, "tests/e2e/support/fake-agy.cjs")}' "$@"\n`);
+  // A sh script, so the bash/zsh wrapper refusal leaves it alone; bash -p for
+  // exec -a (Linux sh lacks it) without reading a Gemini account session's
+  // BASH_ENV, which would hand the fake agy the real home.
+  fs.writeFileSync(bin, `#!/bin/sh\nexec /bin/bash -p -c 'exec -a agy "$0" "$@"' '${process.execPath}' '${path.join(workspace.repoDir, "tests/e2e/support/fake-agy.cjs")}' "$@"\n`);
   fs.chmodSync(bin, 0o755);
   return bin;
 }
