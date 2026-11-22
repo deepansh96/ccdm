@@ -192,7 +192,14 @@ async function runPrompt(session, params) {
   }
   const turn = nextTurn() || { reply: `echo: ${text}` };
   if (turn.error) throw Object.assign(new Error(turn.error), { code: -32603 });
-  if (turn.usage) update(session.id, { sessionUpdate: "usage_update", ...turn.usage });
+  if (turn.usage) {
+    update(session.id, { sessionUpdate: "usage_update", ...turn.usage });
+    // The reply below goes through the MCP server, a separate process that
+    // reads the bridge's context percentage. A round trip to the bridge (it
+    // answers an unknown method with an error) proves the bridge has handled
+    // the usage_update first, so the reply always carries the percentage.
+    await askClient("_ccdm/fake_barrier", {});
+  }
   const cancelled = new Promise((resolve) => { session.cancel = resolve; });
   if (turn.permission) {
     const answer = await askClient("session/request_permission", {
