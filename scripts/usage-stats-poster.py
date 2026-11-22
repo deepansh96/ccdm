@@ -368,12 +368,37 @@ def claude_home_services(config_dir):
     return [hashed]
 
 
-def discover_claude_accounts():
+def _claude_account_aliases(registry):
+    """Map each ``claude_accounts`` home (resolved) to its first alias."""
+    accounts = registry.get("claude_accounts") if isinstance(registry, dict) else None
+    aliases = {}
+    if not isinstance(accounts, dict):
+        return aliases
+    for alias, raw_home in accounts.items():
+        if not isinstance(alias, str) or not alias.strip() or not isinstance(raw_home, str) or not raw_home.strip():
+            continue
+        try:
+            home = Path(raw_home).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        aliases.setdefault(home, alias)
+    return aliases
+
+
+def _claude_home_label(aliases, config_dir, fallback):
+    try:
+        return aliases.get(config_dir.resolve(), fallback)
+    except (OSError, RuntimeError, ValueError):
+        return fallback
+
+
+def discover_claude_accounts(registry=None):
     """Return each Claude login as ``(services, label, dir_hint, email)``.
 
-    The first entry is always the default ``~/.claude`` home, labelled
-    ``claude-p``; every other OAuth home ``~/.claude-<name>`` is labelled
-    ``claude-<name>``. ``services`` lists every Keychain item that can hold
+    The first entry is always the default ``~/.claude`` home; every other
+    OAuth home ``~/.claude-<name>`` follows. Each is labelled by the
+    registry's ``claude_accounts`` alias for that home, else ``claude`` for
+    the default home and ``claude-<name>`` for the others. ``services`` lists every Keychain item that can hold
     that home's login, and ``email`` is the account the home is logged in to
     (``None`` when unknown); callers read them with ``_read_oauth_credentials``
     and keep only a credential whose profile matches ``email``.
@@ -383,8 +408,10 @@ def discover_claude_accounts():
     candidate for every home whose account is known and never trusted blindly.
     """
     home = Path.home()
+    aliases = _claude_account_aliases(registry)
     default_email = claude_account_email(claude_oauth_account(home / ".claude" / ".claude.json"))
-    accounts = [(claude_home_services(home / ".claude"), "claude-p", "~/.claude", default_email)]
+    default_label = _claude_home_label(aliases, home / ".claude", "claude")
+    accounts = [(claude_home_services(home / ".claude"), default_label, "~/.claude", default_email)]
     try:
         config_dirs = sorted(home.glob(".claude-*"))
     except (OSError, RuntimeError, ValueError):
@@ -403,7 +430,8 @@ def discover_claude_accounts():
         services = claude_home_services(config_dir)
         if email:
             services.append(PLAIN_CLAUDE_SERVICE)
-        accounts.append((services, config_dir.name.lstrip("."), f"~/{config_dir.name}", email))
+        label = _claude_home_label(aliases, config_dir, config_dir.name.lstrip("."))
+        accounts.append((services, label, f"~/{config_dir.name}", email))
     return accounts
 
 
@@ -1685,14 +1713,14 @@ def _collect_claude_oauth_metric(
     return metric
 
 
-def collect_claude_metrics(config):
+def collect_claude_metrics(config, registry=None):
     """Return structured current Claude metrics for history and rendering."""
     metrics = []
     cache = {}
     executable = claude_code_executable()
     client_version = executable.name if executable else None
     refresher = (lambda config_dir: refresh_claude_login(executable, config_dir)) if executable else None
-    for index, (services, label, dir_hint, email) in enumerate(discover_claude_accounts()):
+    for index, (services, label, dir_hint, email) in enumerate(discover_claude_accounts(registry)):
         metric = _collect_claude_oauth_metric(
             config["anthropic_base_url"], services, label, dir_hint, email, cache, client_version, refresher
         )
@@ -3396,7 +3424,7 @@ def main(argv=None):
             # Collection only: no bot token, no post, and history is only
             # read (best effort) for used credits, exactly like a manual post.
             registry, _ = load_registry_data(REGISTRY_PATH, require_token=False)
-            claude_metrics = collect_claude_metrics(config)
+            claude_metrics = collect_claude_metrics(config, registry)
             codex_metrics = collect_codex_metrics(
                 registry, config, credit_history=_codex_credit_history(config, _utc_now())
             )
@@ -3417,7 +3445,7 @@ def main(argv=None):
         # operation.  In particular, a broken or unwritable history path must
         # never prevent an operator from posting the existing JSON embed.
         if not scheduled:
-            claude_metrics = collect_claude_metrics(config)
+            claude_metrics = collect_claude_metrics(config, registry)
             # History is only read (best effort) for used credits; it is never
             # created, locked, or written here.
             codex_metrics = collect_codex_metrics(
@@ -3430,7 +3458,7 @@ def main(argv=None):
             return 0
 
         now = _utc_now()
-        claude_metrics = collect_claude_metrics(config)
+        claude_metrics = collect_claude_metrics(config, registry)
         codex_metrics = collect_codex_metrics(
             registry, config, now=now, credit_history=_codex_credit_history(config, now)
         )
