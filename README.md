@@ -44,7 +44,7 @@ An `@mention` of the bot in a project channel reaches root only, never the proje
 | [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) | Yes | See docs |
 | `tmux` | Yes | `brew install tmux` / `apt install tmux` |
 | `zsh` | Yes | Default on macOS / `apt install zsh` on Linux |
-| `python3` | Yes | `brew install python3` / `apt install python3`. The provider setup helpers need Python 3.10+ |
+| `python3` | Yes | `brew install python3` / `apt install python3`. Codex sessions (the Codex Home resolver) and the provider setup helpers need Python 3.10+ |
 | Node.js 22.5+ | Yes | `brew install node`, then `npm install` in this repo (the Router, channel server and bridges) |
 | `jq` | Yes | `brew install jq` / `apt install jq` |
 | Codex CLI | Optional | For Codex sessions, root Codex, and the Usage Stats Poster installer |
@@ -672,7 +672,7 @@ The id is the Claude session UUID: the registry's recorded `session_id`, or the 
 
 ### Resuming a Codex conversation
 
-Get the UUID from the bridge's `Codex thread started:` log line. The selected Codex Home must contain that saved thread. The bridge resumes it and refreshes the Discord instructions; if that instruction request is rejected, startup fails. Resume launches wait up to 60 seconds for listener readiness before reporting success.
+Get the UUID from the bridge's `Codex thread started:` log line. The selected Codex Home must contain that saved thread. The bridge resumes it and refreshes the Discord instructions; if that instruction request is rejected, or is not acknowledged within 60 seconds, startup fails. A resume launch has the same 120 s connection limit as any Codex launch.
 
 To change Codex accounts and keep the conversation:
 
@@ -705,7 +705,7 @@ The scripts that wrap Node (`migrate-to-router.sh`, `retire-pool.sh`, the Thread
 
 ### Cutover and retirement
 
-These tools move an older Bot Pool install to the Router. They are kept for installs that still have pool fields in `registry.json`; a fresh install never needs them. A project launch requires the project's `webhook_id`: the launchers refuse a project without one before writing a key, starting tmux or recording a PID, and point at `migrate-to-router.sh`.
+These tools move an older Bot Pool install to the Router. They are kept for installs that still have pool fields in `registry.json`; a fresh install never needs them. A project launch requires the project's `webhook_id`: the launchers refuse a project without one before writing a key, starting tmux or recording a PID, and the Claude and Codex launchers point at `migrate-to-router.sh`.
 
 Do the cutover in this order:
 
@@ -962,7 +962,7 @@ CCDM needs your machine to stay awake. If it sleeps, the Router and all tmux ses
 | `codex_model`, `codex_reasoning_effort`, `codex_service_tier` | Codex runtime overrides |
 | `gemini_account` | Alias in `gemini_accounts` |
 | `gemini_model`, `gemini_effort` | Gemini model and thinking level (`low`, `medium`, `high`, `xhigh`) |
-| `text_reply_fallback` | `false` stops a Gemini session posting a turn's plain text when it made no `reply` call |
+| `text_reply_fallback` | `false` stops a Gemini session posting a turn's plain text when it made no `reply` call. A Codex project has this fallback off unless it is set to `true` |
 
 Leftover Bot Pool fields (`pool`, `max_pool_size`, `project_bot_role_id`, `bot_id`, `bot_display_name`, `transport`) are ignored for routing and removed by `scripts/retire-pool.sh`.
 
