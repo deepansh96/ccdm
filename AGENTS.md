@@ -13,6 +13,7 @@ CCDM manages isolated Claude Code, Codex and Gemini (Antigravity CLI) Discord se
 - Read `.mex/ROUTER.md` before acting; load only the context and pattern files it routes to.
 - Read `CLAUDE.local.md` when present for machine-specific setup and access rules; never copy its contents into tracked files.
 - Never expose or commit Discord bot tokens, Codex credentials, Claude credentials, or `registry.json` secrets.
+- The Router, Thread Supervisor and every session run from this checkout, so it stays clean on `main`. Change tracked code on a branch in a worktree and land it through a PR; never leave uncommitted edits here, and never restart a service to load them.
 - Treat a channel-scoped Discord MCP restriction as the transport boundary for user-visible messages and message tools, not as a ban on explicitly requested root-management work. For authorized registration, deregistration, channel/category creation, webhook, role, permission, or invite tasks, use the documented CCDM scripts/workflow and the root bot's authenticated Discord REST API when required; never use another Discord MCP, broaden the requested targets, or expose credentials. A missing MCP administration tool is not by itself a blocker for these workflows.
 - One session serves one project channel, enforced by the Router; stop existing listeners before starting replacements.
 - When a restart request comes from or names a registered project channel, restart that project's isolated session; restart the root agent only when the user explicitly asks to restart root.
