@@ -632,6 +632,9 @@ async function runTurn(blocks, channelId, source = null, { suppress = false } = 
       }).catch(() => {});
       pendingInputNeededResumeTurnId = null;
     }
+  } else {
+    activeReminderContext = null;
+    await reminderAdapter.clearActiveContext().catch(() => {});
   }
   if (!suppress) await startTyping(channelId).catch(() => {});
 
@@ -1330,6 +1333,7 @@ async function connectDiscord() {
 }
 
 async function main() {
+  await reminderAdapter.clearActiveContext().catch(() => {});
   await reminderAdapter.drainOutbox();
   startAgy();
   await initializeAgy();

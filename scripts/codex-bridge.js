@@ -1003,30 +1003,52 @@ async function routeInput(input, msg, channelId, channelScopeToken) {
           ) }
           : part)
         : input;
+      const steeredTurnId = activeTurnId;
       await sendRequest("turn/steer", {
         threadId,
         input: steerInput,
-        expectedTurnId: activeTurnId,
+        expectedTurnId: steeredTurnId,
       });
-      if (msg && activeReminderContext && msg.author.id === activeReminderContext.owner_id) {
-        const receipts = await reminderAdapter.receiptsForTurn(activeReminderContext.provider_session_id, activeReminderContext.provider_turn_id);
-        const latestQuestion = receipts.filter((receipt) => receipt.disposition === "input-needed").at(-1);
-        if (latestQuestion && latestQuestion.event_id !== lastResumedInputReceiptId) {
-          await reminderAdapter.emitEvent("work_resumed", activeReminderContext, {
+      if (msg && !ROOT_MULTI_CHANNEL && turnActive && activeTurnId === steeredTurnId) {
+        if (activeReminderContext && msg.author.id === activeReminderContext.owner_id) {
+          const receipts = await reminderAdapter.receiptsForTurn(activeReminderContext.provider_session_id, activeReminderContext.provider_turn_id);
+          const latestQuestion = receipts.filter((receipt) => receipt.disposition === "input-needed").at(-1);
+          if (latestQuestion && latestQuestion.event_id !== lastResumedInputReceiptId) {
+            await reminderAdapter.emitEvent("work_resumed", activeReminderContext, {
+              source_message_id: msg.id,
+              resumed_from_turn_id: activeReminderContext.provider_turn_id,
+            });
+            lastResumedInputReceiptId = latestQuestion.event_id;
+          }
+          activeReminderContext = {
+            ...activeReminderContext,
+            interaction_id: msg.id,
             source_message_id: msg.id,
-            resumed_from_turn_id: activeReminderContext.provider_turn_id,
-          });
-          lastResumedInputReceiptId = latestQuestion.event_id;
+            initiator_id: msg.author.id,
+          };
+          await reminderAdapter.writeActiveContext(activeReminderContext);
+        } else if (!activeReminderContext && msg.reminderAssignment && msg.author.id === msg.reminderAssignment.owner_id) {
+          // Owner input joining an agent-started turn makes it an ordinary turn from here on.
+          activeReminderContext = {
+            ...msg.reminderAssignment,
+            provider: "codex",
+            provider_session_id: threadId,
+            provider_turn_id: steeredTurnId,
+            interaction_id: msg.id,
+            source_message_id: msg.id,
+            initiator_id: msg.author.id,
+          };
+          await reminderAdapter.writeActiveContext(activeReminderContext);
+          if (pendingInputNeededResumeTurnId) {
+            await reminderAdapter.emitEvent("work_resumed", activeReminderContext, {
+              source_message_id: msg.id,
+              resumed_from_turn_id: pendingInputNeededResumeTurnId,
+            });
+            pendingInputNeededResumeTurnId = null;
+          }
         }
-        activeReminderContext = {
-          ...activeReminderContext,
-          interaction_id: msg.id,
-          source_message_id: msg.id,
-          initiator_id: msg.author.id,
-        };
-        await reminderAdapter.writeActiveContext(activeReminderContext);
       }
-      console.log(`[steer] Injected into active turn ${activeTurnId}`);
+      console.log(`[steer] Injected into active turn ${steeredTurnId}`);
     } catch (err) {
       console.log(`[steer] Failed (${err.message || err}), queuing instead`);
       await queueInput();
@@ -1062,6 +1084,7 @@ async function sendTurn(
   lastResumedInputReceiptId = null;
   resetActiveTurnId();
   try {
+    await reminderAdapter.clearActiveContext().catch(() => {});
     await activateDiscordChannelScope(channelScopeToken);
     await startTyping(channelId);
     const result = await sendRequest("turn/start", {
@@ -1888,6 +1911,8 @@ function startDiscordBot() {
         pendingBootstrapInstructionReason = null;
         deltaBuffer = "";
         fallbackText = "";
+        activeReminderContext = null;
+        await reminderAdapter.clearActiveContext().catch(() => {});
         stopTyping();
         await clearDiscordChannelScope();
 
