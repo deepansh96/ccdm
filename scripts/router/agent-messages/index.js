@@ -18,6 +18,7 @@ const { editWebhookRecord, postBotRecord, postWebhookRecord, reactMark } = requi
 
 const CAPABILITY = "agent_messages";
 const DEFAULT_TIMEOUT_MINUTES = 30;
+const MAX_TIMEOUT_MINUTES = 120;
 const DEFAULT_MINUTE_MS = 60000;
 const MARK_REPLIED = "✅";
 const MARK_FAILED = "⚠️";
@@ -80,6 +81,27 @@ function sameConversation(a, b) {
   return Boolean(a && b && a.project === b.project && a.conversation_id === b.conversation_id);
 }
 
+function isAddressedToCaller(exchange, from) {
+  if (sameConversation(exchange.to, from)) return true;
+  // A channel conversation whose project moved to another channel while open
+  // still addresses that project's channel role; route validation closes it as `failed`.
+  return !exchange.to.thread_id && !from.thread_id && exchange.to.project === from.project;
+}
+
+function checkOpenExchangeRoutes(table, exchange, from) {
+  const targetRoute = table.projects.get(exchange.to.project);
+  if (!targetRoute || targetRoute.remote) return `target project ${exchange.to.project} is no longer registered`;
+  if (targetRoute.channel_id !== exchange.to_channel_id || !sameConversation(exchange.to, from)) {
+    return `target project ${exchange.to.project} moved to another channel`;
+  }
+  const senderRoute = table.projects.get(exchange.from.project);
+  if (!senderRoute || senderRoute.remote) return `sender project ${exchange.from.project} is no longer registered`;
+  if (senderRoute.channel_id !== exchange.from_channel_id) {
+    return `sender project ${exchange.from.project} moved to another channel`;
+  }
+  return null;
+}
+
 function isCapableListener(connection) {
   return Boolean(connection && connection.listener !== false && connection.capabilities?.has(CAPABILITY));
 }
@@ -98,6 +120,26 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
   const exchanges = new Map();
   // delivery_id -> delivery record
   const deliveries = new Map();
+  let closed = false;
+
+  async function withExchangeLock(exchange, fn) {
+    const previous = exchange.lock ?? Promise.resolve();
+    let release;
+    exchange.lock = new Promise(resolve => { release = resolve; });
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  function clearExpiry(exchange) {
+    if (exchange.timer) {
+      clearTimeout(exchange.timer);
+      exchange.timer = null;
+    }
+  }
 
   async function fetchChannel(channelId) {
     try {
@@ -243,23 +285,13 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
     }
   }
 
-  async function failRequest(exchange, reason) {
-    exchange.state = "failed";
-    await appendBestEffort({
-      type: "failed",
-      request_id: exchange.request_id,
-      reason,
-    });
-    if (exchange.sender_post) {
-      await markPost(exchange.sender_post.channel_id, exchange.sender_post.message_id, MARK_FAILED, exchange.request_id);
-    }
+  async function sendNotice(exchange, { outcome, text }) {
     const deliveryId = mintId("del");
     const ts = new Date().toISOString();
     const target = noticeTargetOf(exchange.to);
     const post = exchange.sender_post
       ? { channel_id: exchange.sender_post.channel_id, message_id: exchange.sender_post.message_id }
       : null;
-    const text = `Agent Request ${exchange.request_id} to ${formatConversationLabel(exchange.to)} failed: ${reason}`;
     const recorded = await appendBestEffort({
       type: "delivery",
       delivery_id: deliveryId,
@@ -268,7 +300,7 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
       to: exchange.from,
       to_launch: exchange.from_launch,
       target,
-      outcome: "failed",
+      outcome,
       text,
       ts,
       post,
@@ -292,10 +324,89 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
         text,
         ts,
         target,
-        outcome: "failed",
+        outcome,
         post,
       });
     }
+  }
+
+  async function notifyFailed(exchange, reason) {
+    if (closed) return;
+    if (exchange.sender_post) {
+      await markPost(exchange.sender_post.channel_id, exchange.sender_post.message_id, MARK_FAILED, exchange.request_id);
+    }
+    if (exchange.receiver_post) {
+      await markPost(exchange.receiver_post.channel_id, exchange.receiver_post.message_id, MARK_FAILED, exchange.request_id);
+    }
+    if (closed) return;
+    await sendNotice(exchange, {
+      outcome: "failed",
+      text: `Agent Request ${exchange.request_id} to ${formatConversationLabel(exchange.to)} failed: ${reason}`,
+    });
+  }
+
+  async function failRequest(exchange, reason) {
+    clearExpiry(exchange);
+    exchange.state = "failed";
+    await appendBestEffort({
+      type: "failed",
+      request_id: exchange.request_id,
+      reason,
+    });
+    await notifyFailed(exchange, reason);
+  }
+
+  async function notifyExpired(exchange) {
+    if (closed) return;
+    if (exchange.sender_post) {
+      await markPost(exchange.sender_post.channel_id, exchange.sender_post.message_id, MARK_FAILED, exchange.request_id);
+    }
+    if (exchange.receiver_post) {
+      await markPost(exchange.receiver_post.channel_id, exchange.receiver_post.message_id, MARK_FAILED, exchange.request_id);
+    }
+    if (closed) return;
+    await sendNotice(exchange, {
+      outcome: "expired",
+      text: `Agent Request ${exchange.request_id} to ${formatConversationLabel(exchange.to)} expired`,
+    });
+  }
+
+  async function transitionToExpired(exchange, { bestEffort = false } = {}) {
+    clearExpiry(exchange);
+    const fields = {
+      type: "expired",
+      request_id: exchange.request_id,
+    };
+    if (bestEffort) {
+      if (!(await appendBestEffort(fields))) return false;
+    } else {
+      await ledger.append(fields);
+    }
+    exchange.state = "expired";
+    log?.(`agent_request_expired id=${exchange.request_id}`);
+    return true;
+  }
+
+  async function expireRequest(exchange) {
+    if (closed) return;
+    await exchange.postReady;
+    if (closed) return;
+    const expired = await withExchangeLock(exchange, async () => {
+      if (closed || exchange.state !== "open") return false;
+      return transitionToExpired(exchange, { bestEffort: true });
+    });
+    if (!expired) return;
+    await withDeadline(null, () => notifyExpired(exchange));
+  }
+
+  function scheduleExpiry(exchange) {
+    clearExpiry(exchange);
+    if (closed || exchange.state !== "open") return;
+    const delay = Math.max(0, exchange.expires_at_ms - Date.now());
+    exchange.timer = setTimeout(() => {
+      exchange.timer = null;
+      expireRequest(exchange).catch(error => log?.(`agent_message_expire_failed id=${exchange.request_id} error=${error.message}`));
+    }, delay);
   }
 
   async function publishRequest(exchange, { guildId, senderRoute, contextPct }) {
@@ -737,7 +848,11 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
     const requestId = mintId("req");
     const now = Date.now();
     const ts = new Date(now).toISOString();
-    const expiresAt = new Date(now + DEFAULT_TIMEOUT_MINUTES * minuteMs()).toISOString();
+    const timeoutMinutes = args.timeout_minutes === undefined
+      ? DEFAULT_TIMEOUT_MINUTES
+      : Math.min(args.timeout_minutes, MAX_TIMEOUT_MINUTES);
+    const expiresAtMs = now + timeoutMinutes * minuteMs();
+    const expiresAt = new Date(expiresAtMs).toISOString();
     const depth = 1;
     const toLaunch = targetListener.keyFingerprint;
 
@@ -754,20 +869,26 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
       idempotency_key: args.idempotency_key,
     });
 
+    const targetProjectRoute = ctx.table.projects.get(to.project);
     const exchange = {
       request_id: requestId,
       state: "open",
       from,
       to,
+      from_channel_id: senderRoute.channel_id,
+      to_channel_id: targetProjectRoute.channel_id,
       from_launch: fromLaunch,
       to_launch: toLaunch,
       text: args.text,
       ts,
       depth,
       expires_at: expiresAt,
+      expires_at_ms: expiresAtMs,
       sender_post: null,
       receiver_post: null,
       postReady: null,
+      timer: null,
+      lock: null,
     };
     exchanges.set(requestId, exchange);
 
@@ -776,6 +897,7 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
     exchange.postReady = withDeadline(null, () => publishRequest(exchange, {
       guildId, senderRoute: sessionRoute, contextPct: args.context_pct,
     })).catch(error => log?.(`agent_message_publish_failed id=${requestId} error=${error.message}`));
+    scheduleExpiry(exchange);
 
     log?.(`agent_request id=${requestId} from=${from.project} to=${to.project}`);
     return { request_id: requestId, expires_at: expiresAt, depth };
@@ -789,7 +911,7 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
     const from = await resolveConversation(ctx.session.route);
     const fromLaunch = ctx.session.keyFingerprint;
     const exchange = exchanges.get(args.request_id);
-    if (!exchange || !sameConversation(exchange.to, from)) {
+    if (!exchange || !isAddressedToCaller(exchange, from)) {
       const message = `unknown request: ${args.request_id}`;
       await recordRefusal({
         op: "agent_reply", from, to: null, requestId: args.request_id,
@@ -798,12 +920,21 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
       throw new OpError("unknown_request", message);
     }
 
-    const previous = exchange.replyLock ?? Promise.resolve();
-    let release;
-    exchange.replyLock = new Promise(resolve => { release = resolve; });
-    await previous;
-    try {
+    return withExchangeLock(exchange, async () => {
       await exchange.postReady;
+      if (exchange.state === "open" && Date.now() >= exchange.expires_at_ms) {
+        await transitionToExpired(exchange);
+        withDeadline(null, () => notifyExpired(exchange))
+          .catch(error => log?.(`agent_message_expire_notify_failed id=${exchange.request_id} error=${error.message}`));
+      }
+      if (exchange.state === "expired") {
+        const message = `request ${args.request_id} has expired`;
+        await recordRefusal({
+          op: "agent_reply", from, to: exchange.from, requestId: args.request_id,
+          code: "request_expired", message, fromLaunch, idempotencyKey: args.idempotency_key,
+        });
+        throw new OpError("request_expired", message);
+      }
       if (exchange.state === "replied") {
         const message = `request ${args.request_id} has already been replied to`;
         await recordRefusal({
@@ -818,6 +949,24 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
           op: "agent_reply", from, to: exchange.from, requestId: args.request_id,
           code: "request_failed", message, fromLaunch, idempotencyKey: args.idempotency_key,
         });
+        throw new OpError("request_failed", message);
+      }
+      const routeMismatch = checkOpenExchangeRoutes(ctx.table, exchange, from);
+      if (routeMismatch) {
+        clearExpiry(exchange);
+        await ledger.append({
+          type: "failed",
+          request_id: exchange.request_id,
+          reason: routeMismatch,
+        });
+        exchange.state = "failed";
+        const message = `request ${args.request_id} failed: ${routeMismatch}`;
+        await recordRefusal({
+          op: "agent_reply", from, to: exchange.from, requestId: args.request_id,
+          code: "request_failed", message, fromLaunch, idempotencyKey: args.idempotency_key,
+        });
+        withDeadline(null, () => notifyFailed(exchange, routeMismatch))
+          .catch(error => log?.(`agent_message_fail_notify_failed id=${exchange.request_id} error=${error.message}`));
         throw new OpError("request_failed", message);
       }
 
@@ -838,6 +987,7 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
         delivered_to_live_session: deliveredToLive,
       });
 
+      clearExpiry(exchange);
       exchange.state = "replied";
       const guildId = ctx.table.guildId;
       const replierRoute = ctx.session.route;
@@ -847,9 +997,7 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
 
       log?.(`agent_reply id=${exchange.request_id} from=${from.project} to=${exchange.from.project} live=${deliveredToLive}`);
       return { request_id: exchange.request_id, delivered_to_live_session: deliveredToLive };
-    } finally {
-      release();
-    }
+    });
   }
 
   async function ack(ctx, args) {
@@ -910,7 +1058,12 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
     return { targets: list };
   }
 
-  return { request, reply, targets, ack };
+  function close() {
+    closed = true;
+    for (const exchange of exchanges.values()) clearExpiry(exchange);
+  }
+
+  return { request, reply, targets, ack, close };
 }
 
-module.exports = { CAPABILITY, DEFAULT_TIMEOUT_MINUTES, createAgentMessages };
+module.exports = { CAPABILITY, DEFAULT_TIMEOUT_MINUTES, MAX_TIMEOUT_MINUTES, createAgentMessages };

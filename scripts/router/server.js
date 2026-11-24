@@ -572,6 +572,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     },
     close() {
       keysWatcher?.close();
+      agentMessages.close();
       for (const connection of [...sessions.values(), ...opConnections, ...threadSessions.values(), ...threadOps]) {
         connection.socket.destroy();
       }
