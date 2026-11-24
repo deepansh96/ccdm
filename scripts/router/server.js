@@ -331,6 +331,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     });
     sessions.set(route.project, connection);
     send(connection.socket, { type: "hello_ok", v: PROTOCOL_VERSION, scope: projectScope(route) });
+    agentMessages.onListenerHello(connection);
   }
 
   // Whether the gateway is ready, waiting up to `helloReadyWaitMs()` for it.
@@ -400,6 +401,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     }
     const { webhook_id: _webhook, ...scope } = threadRoute;
     send(connection.socket, { type: "hello_ok", v: PROTOCOL_VERSION, scope });
+    if (frame.listener !== false) agentMessages.onListenerHello(connection);
   }
 
   async function request(connection, frame) {
