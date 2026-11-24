@@ -920,7 +920,7 @@ test("while paused, an Agent Request is held until /unpause and a request that e
   assert.equal(turns.some((t) => t.includes("Expired while paused") || t.includes(expiringId)), false, JSON.stringify(turns));
 });
 
-test("a Codex thread session holds an Agent Request until bootstrap ends and answers with thread metadata", async () => {
+test("a Codex thread session holds an Agent Request until bootstrap ends, answers with thread metadata, and sends its own request as a thread sender", async () => {
   const workspace = codexAgentWorkspace();
   const threadPort = 29470;
   const threadCodex = await startFakeCodexServer(workspace, {
@@ -935,9 +935,14 @@ test("a Codex thread session holds an Agent Request until bootstrap ends and ans
         mcpCalls: (input) => {
           const text = input[0]?.text ?? "";
           const reqId = /^\[Agent Request (req-[0-9a-f]{12}) from beta-claude\]/.exec(text)?.[1] ?? "";
-          return [["send_agent_reply", { request_id: reqId, text: "Answered from Codex thread" }]];
+          return [
+            ["send_agent_reply", { request_id: reqId, text: "Answered from Codex thread" }],
+            ["send_agent_request", { target: "beta", text: "Ping from Codex thread" }],
+            ["send_agent_request", { target: "gamma", text: "Ungranted from Codex thread" }],
+          ];
         },
       },
+      { turnId: "thread-reply-received-turn" },
     ],
   });
   await routerWithWebhooks(workspace, ["demo", "beta"]);
@@ -984,11 +989,14 @@ test("a Codex thread session holds an Agent Request until bootstrap ends and ans
   assert.equal(turnTexts(threadCodex).length, 1);
   assert.deepEqual(clientMessages(threadCodex, "turn/steer"), []);
 
-  // Release bootstrap: the held Agent Request starts its own turn and answers beta.
+  // Release bootstrap: the held Agent Request starts its own turn, answers beta, and sends its own requests.
   threadCodex.releaseTurn("thread-boot-turn");
   await waitFor(
-    () => beta.events.some((e) => e.event === "agent_message" && e.kind === "reply" && e.request_id === threadReqId),
-    () => `beta thread reply: ${JSON.stringify(beta.events)}`,
+    () => beta.events.some((e) => e.event === "agent_message" && e.kind === "reply" && e.request_id === threadReqId)
+      && beta.events.some((e) => e.event === "agent_message" && e.kind === "request" && e.text === "Ping from Codex thread")
+      && readState(workspace.stateDir).fixtures.codex.protocolEvents
+        .filter((event) => event.event === "mcp-tool-result" && event.tool === "send_agent_request").length >= 2,
+    () => `beta thread reply & requests: ${JSON.stringify(beta.events)}`,
     15000,
   );
 
@@ -1001,6 +1009,35 @@ test("a Codex thread session holds an Agent Request until bootstrap ends and ans
   assert.equal(replyEvent.from.provider, "codex");
   assert.equal(replyEvent.from.thread_id, THREAD_ID);
   assert.equal(replyEvent.from.thread_name, "Codex Worker");
+
+  // Verify the outbound request sent BY the Codex thread carries thread metadata, and ungranted gamma was refused.
+  const outboundReq = beta.events.find((e) => e.event === "agent_message" && e.kind === "request" && e.text === "Ping from Codex thread");
+  assert.equal(outboundReq.from.project, "demo");
+  assert.equal(outboundReq.from.provider, "codex");
+  assert.equal(outboundReq.from.thread_id, THREAD_ID);
+  assert.equal(outboundReq.from.thread_name, "Codex Worker");
+  await beta.request("agent_message_ack", { delivery_id: outboundReq.delivery_id });
+
+  const threadToolResults = readState(workspace.stateDir).fixtures.codex.protocolEvents
+    .filter((event) => event.event === "mcp-tool-result");
+  const refusedSend = threadToolResults.filter((e) => e.tool === "send_agent_request")[1];
+  assert.ok(refusedSend, JSON.stringify(threadToolResults));
+  assert.equal(refusedSend.result.isError, true);
+  assert.match(refusedSend.result.content[0].text, /not_granted/);
+
+  // Beta answers the Codex thread's request; the Agent Reply arrives in the thread as its own turn.
+  const betaAnswer = await beta.request("agent_reply", {
+    request_id: outboundReq.request_id,
+    text: "Reply to Codex thread",
+    idempotency_key: "beta-reply-to-codex-thread-1",
+  });
+  assert.equal(betaAnswer.ok, true, JSON.stringify(betaAnswer));
+  assert.equal(betaAnswer.result.delivered_to_live_session, true);
+
+  await waitFor(() => turnTexts(threadCodex).length === 3, () => `Codex thread reply turn: ${JSON.stringify(turnTexts(threadCodex))}`, 15000);
+  const replyTurn = turnTexts(threadCodex)[2];
+  assert.ok(replyTurn.startsWith(`[Agent Reply to ${outboundReq.request_id} from beta-claude]\n`), replyTurn);
+  assert.match(replyTurn, /Reply to Codex thread/);
 });
 
 function spawnCodexBridge(workspace, port, extraEnv = {}) {

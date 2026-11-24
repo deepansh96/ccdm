@@ -15,6 +15,10 @@ import {
 } from "./support/router.js";
 import { readState, updateState } from "./support/state.js";
 import { cleanup } from "./support/teardown.js";
+import {
+  startThreadSupervisor,
+  supervisorStatus,
+} from "./support/thread-supervisor.js";
 
 test.afterEach(cleanup);
 
@@ -865,4 +869,62 @@ test("agent_targets lists exactly granted registered non-remote projects with ch
     { id: "beta-live-1", name: "Alpha Task" },
     { id: "beta-live-2", name: null },
   ]);
+});
+
+test("an Agent Request to a bound offline thread returns target_offline at once, starts no session under Thread Supervisor, and is not delivered later", async () => {
+  const workspace = createRouterWorkspace(routerRegistry({
+    demo: { channel_id: "demo-channel", type: "claude", transport: "router", agent_message_targets: ["beta"] },
+    beta: { channel_id: "beta-channel", type: "claude", transport: "router" },
+  }));
+  await routerWithWebhooks(workspace, ["demo", "beta"]);
+  await startThreadSupervisor(workspace);
+
+  const threadId = "beta-bound-offline-thread";
+  updateState(workspace.stateDir, (state) => {
+    (state.fixtures.discord.injectedThreads ||= []).push({
+      id: threadId,
+      type: 11,
+      parentId: "beta-channel",
+      name: "Idle Worker",
+      ownerId: OWNER_ID,
+      autoArchiveDuration: 1440,
+      event: "create",
+    });
+  });
+  await waitFor(
+    async () => (await supervisorStatus(workspace)).projects?.beta?.threads?.[threadId]?.state === "registered",
+    async () => `bound offline thread: ${JSON.stringify(await supervisorStatus(workspace))}`,
+  );
+
+  const demo = await connectAgentProject(workspace, "demo");
+  const res = await demo.request("agent_request", {
+    target: `beta/${threadId}`,
+    text: "Do not boot this thread",
+    idempotency_key: "offline-bound-thread-1",
+  });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.error.code, "target_offline");
+
+  // Wait for the sender-side ⚠️ record, then fence with an owner message in demo-channel.
+  await waitFor(() => {
+    const discord = readState(workspace.stateDir).fixtures.discord;
+    return (discord.messages ?? []).some((m) => m.channelId === "demo-channel" && m.content.includes("not delivered: target_offline"))
+      && (discord.reactions ?? []).some((r) => r.emoji === encodeURIComponent("⚠️"));
+  }, () => `offline sender record: ${JSON.stringify(readState(workspace.stateDir).fixtures.discord)}`);
+  await fenceOwnerMessage(workspace, demo, "demo-channel", "fence-no-boot");
+
+  // Nothing was posted into the target thread and the Thread Supervisor started no session.
+  const state = readState(workspace.stateDir);
+  assert.deepEqual(
+    (state.fixtures.discord.messages ?? []).filter((m) => m.channelId === threadId),
+    [],
+  );
+  assert.equal((await supervisorStatus(workspace)).projects?.beta?.threads?.[threadId]?.state, "registered");
+  assert.deepEqual(Object.keys(state.fixtures.tmux?.sessions ?? {}), []);
+
+  // Even if the target thread connects later, the offline request is never delivered.
+  const lateThread = await connectAgentThread(workspace, { project: "beta", threadId, provider: "claude" });
+  assert.equal(lateThread.hello.type, "hello_ok");
+  await fenceOwnerMessage(workspace, lateThread, threadId, "fence-late-thread");
+  assert.deepEqual(lateThread.events.filter((e) => e.event === "agent_message"), []);
 });

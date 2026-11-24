@@ -283,6 +283,15 @@ Tests drive only Discord inputs and executable surfaces, and assert recorded Dis
 
 The live thread → Claude reply, thread → Codex reply and `/close` checks belong to the Live Smoke Suite's post-merge operator checklist in `docs/thread-supervisor.md`. They are not part of the Default CI Suite.
 
+## Agent Messages
+
+Agent Message scenarios drive the real Router (`scripts/router.js`), `scripts/ccdm agent-messages`, `scripts/ccdm-channel-server.js`, `scripts/codex-bridge.js`, `scripts/gemini-bridge.js`, `scripts/discord-mcp-server.js`, the Thread Supervisor, and the Conversation Reminder service against the Contract-Checking Fake Discord and local provider fakes, observing only behaviour (no test reads `agent-messages.jsonl` internals or Router in-memory state; timing is shortened only with `CCDM_ROUTER_AGENT_MESSAGE_MINUTE_MS` and `CCDM_ROUTER_AGENT_MESSAGE_RATE_WINDOW_MS`):
+
+- **Router core, threads, expiry, limits, reliability, restart, and status:** `router-agent-messages.test.js`, `router-agent-messages-threads.test.js`, `router-agent-messages-expiry.test.js`, `router-agent-messages-limits.test.js`, `router-agent-messages-reliability.test.js`, `router-agent-messages-restart.test.js`, and `router-agent-messages-status.test.js`.
+- **CLI:** `ccdm-agent-messages.test.js` (`allow`, `revoke`, `list`, guest warning, registry lock, hot reload) and `ccdm-agent-messages-log.test.js` (`log` with Router stopped and after compaction).
+- **Providers (request, reply, refusal, offline target, expiry, reconnect, duplicate delivery, own-turn isolation, and thread sender/target):** `claude-agent-messages.test.js`, `claude-agent-messages-gate.test.js`, `codex-agent-messages.test.js`, and `gemini-agent-messages.test.js`.
+- **Reminders and thread lifecycle:** `conversation-reminder-router-claude.test.js`, `conversation-reminder-thread-lifecycle.test.js`, `conversation-reminder-codex-agent-messages.test.js`, `conversation-reminder-gemini-agent-messages.test.js`, `conversation-reminder-discovery.test.js`, `thread-turn-reactions.test.js`, and `thread-capacity.test.js`.
+
 ## Diagnostics
 
 Command results include command metadata, cwd, redacted environment, stdout, stderr, exit code, signal, fixture state, and file snapshots. Diagnostics redact env values, headers, registry values, `.env` files, command lines, request bodies, OAuth tokens, Discord bot tokens, token-shaped strings, and `Authorization` headers before attaching failure context.

@@ -221,6 +221,7 @@ Owner activity:
 - In a project channel, `/compact`, `/clear`, `/pause`, `/unpause`, `/restart`, `/model`, and any message that mentions root are management traffic. They acknowledge the conversation but never reopen a closed one.
 - An owner reaction on a recorded reminder is a Conversation Reply like any other owner reaction. The private recorded-ID list keeps it out of coding turns.
 - A guest's message or reaction acknowledges nothing.
+- **Agent Messages and agent-started turns:** Agent Messages (`request`, `reply`, and `notice`) never emit `owner_activity` or `work_resumed`, never acknowledge or reopen a Closed Conversation, and the Router never sends `agent_message` events to the observer. A turn started by delivering any Agent Message (an **agent-started turn**) records no `response_delivered` or `input_needed` adapter receipt and emits no `turn_completed` — including Claude `reply` calls naming an older owner message and Codex/Gemini text-reply fallback — until owner input joins the turn (a Claude mid-turn notification or a Codex `turn/steer`; Gemini queues owner input into its own ordinary turn). Guest input does not convert an agent-started turn. A reminder already armed before the send continues to recur on schedule, and history discovery classifies `-# ⇄ Agent ` records as `other`.
 
 Failures:
 

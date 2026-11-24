@@ -16,7 +16,7 @@ The **Thread Supervisor** is the CCDM service that turns thread events from the 
 - The Router forwards only default (0) and reply (19) messages. The "thread created" (18) and thread-starter (21) system messages reach no session, root, observer or supervisor.
 - A thread message from the owner or a guest of the parent reaches only that thread's session, never the Channel Conversation or a sibling. Guests drive threads without an @mention.
 - A thread session's **Session Scope** is its thread alone. Reads, replies, reactions, edits, exports and downloads that target the parent channel, a sibling thread, a root channel, a parent message or the starter message are `scope_violation`.
-- Replies post through the parent project's webhook into the thread, as `<project>-<provider> · N%`, named for the thread's own provider. Supervisor notices post as the root bot, so reminder agent-reply detection (by `webhook_id`) never counts them.
+- Replies post through the parent project's webhook into the thread, as `<project>-<provider> · N%`, named for the thread's own provider. Supervisor notices post as the root bot, so reminder history discovery (which matches agent replies by `webhook_id`, while live reminder arming comes from adapter receipts) never counts them.
 - An owner bot mention, or a native reply to a root message, inside a thread reaches root, which answers in that thread. A guest's reaches no one. Neither starts or feeds the thread's own session.
 - An owner or guest message with no live session and no supervisor gets 💤 and is not delivered live. Reconciliation may later deliver it once, in a bootstrap.
 
@@ -125,6 +125,7 @@ Each thread is its own Conversation Reminder conversation, keyed `(project, conv
 - **Close:** `/close` closes only that thread's reminders. The next owner message reopens them.
 - **Archived threads:** a reminder posted into a thread that is still archived (say, while the supervisor was down) reopens the thread without starting a session.
 - **Resets:** a provider or account switch resets tracking. A delete drops the state.
+- **Agent Messages:** an Agent Message never acknowledges, reopens, or arms a thread's reminders. Replies posted during an agent-started turn record no adapter receipts until owner input joins the turn, and history discovery classifies `-# ⇄ Agent ` records as `other`.
 - **Status:** reminder `status` nests threads under their project.
 
 See [docs/conversation-reminders.md](conversation-reminders.md).

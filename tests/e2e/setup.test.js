@@ -45,6 +45,18 @@ test("registry example documents the default thread session caps", () => {
   assert.deepEqual(registryExample.thread_session_caps, { claude: 6, codex: 8, gemini: 4 });
 });
 
+test("registry example documents default Agent Message limits and project targets", () => {
+  const registryExample = JSON.parse(fs.readFileSync("registry.example.json", "utf8"));
+
+  assert.deepEqual(registryExample.agent_message_limits, {
+    depth: 3,
+    requests_per_hour: 20,
+    open_requests: 5,
+    max_characters: 4000,
+  });
+  assert.deepEqual(registryExample.projects["example-project"].agent_message_targets, []);
+});
+
 test("registry example has no thread status channel or owner ping setting", () => {
   const registryExample = JSON.parse(fs.readFileSync("registry.example.json", "utf8"));
 
