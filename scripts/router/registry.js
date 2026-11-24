@@ -16,6 +16,13 @@ const { processAlive, processIdentity } = require("../platform/process.js");
 const DEFAULT_RELOAD_DEBOUNCE_MS = 250;
 // A project's session provider: Claude Code, Codex, or Gemini through agy.
 const PROJECT_TYPES = ["claude", "codex", "gemini"];
+const DEFAULT_AGENT_MESSAGE_LIMITS = Object.freeze({
+  depth: 3,
+  requests_per_hour: 20,
+  open_requests: 5,
+  max_characters: 4000,
+});
+const AGENT_MESSAGE_LIMIT_KEYS = new Set(Object.keys(DEFAULT_AGENT_MESSAGE_LIMITS));
 
 // On Windows an open can fail for a moment while a writer replaces the file. A
 // reload that gave up there would keep a stale routing table.
@@ -56,6 +63,19 @@ function validateRegistry(registry) {
   for (const field of ["root_channels", "root_allowed_user_ids"]) {
     if (registry[field] != null && !(Array.isArray(registry[field]) && registry[field].every(isId))) {
       problems.push(`${field} must be a list of Discord IDs`);
+    }
+  }
+  if (registry.agent_message_limits !== undefined) {
+    if (!isObject(registry.agent_message_limits)) {
+      problems.push("agent_message_limits must be an object of positive integers");
+    } else {
+      for (const [key, value] of Object.entries(registry.agent_message_limits)) {
+        if (!AGENT_MESSAGE_LIMIT_KEYS.has(key)) {
+          problems.push(`agent_message_limits: unknown key ${key}`);
+        } else if (!Number.isInteger(value) || value < 1) {
+          problems.push(`agent_message_limits.${key} must be a positive integer`);
+        }
+      }
     }
   }
   if (!isObject(registry.projects)) problems.push("projects must be an object keyed by project name");
@@ -117,6 +137,10 @@ function buildRoutingTable(registry) {
     registered,
     rootChannels: new Set((registry.root_channels || []).map(String)),
     rootAllowedUserIds: new Set((registry.root_allowed_user_ids || []).map(String)),
+    agentMessageLimits: {
+      ...DEFAULT_AGENT_MESSAGE_LIMITS,
+      ...(isObject(registry.agent_message_limits) ? registry.agent_message_limits : {}),
+    },
   };
 }
 

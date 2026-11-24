@@ -20,6 +20,13 @@ const CAPABILITY = "agent_messages";
 const DEFAULT_TIMEOUT_MINUTES = 30;
 const MAX_TIMEOUT_MINUTES = 120;
 const DEFAULT_MINUTE_MS = 60000;
+const DEFAULT_RATE_WINDOW_MS = 3600000;
+const DEFAULT_LIMITS = Object.freeze({
+  depth: 3,
+  requests_per_hour: 20,
+  open_requests: 5,
+  max_characters: 4000,
+});
 const MARK_REPLIED = "✅";
 const MARK_FAILED = "⚠️";
 const PUBLIC_THREAD = 11;
@@ -54,6 +61,12 @@ function minuteMs(env = process.env) {
   const raw = env.CCDM_ROUTER_AGENT_MESSAGE_MINUTE_MS;
   const value = Number(raw);
   return raw !== undefined && raw !== "" && Number.isFinite(value) && value > 0 ? value : DEFAULT_MINUTE_MS;
+}
+
+function rateWindowMs(env = process.env) {
+  const raw = env.CCDM_ROUTER_AGENT_MESSAGE_RATE_WINDOW_MS;
+  const value = Number(raw);
+  return raw !== undefined && raw !== "" && Number.isFinite(value) && value > 0 ? value : DEFAULT_RATE_WINDOW_MS;
 }
 
 function conversationOf(route, threadName = undefined) {
@@ -120,7 +133,47 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
   const exchanges = new Map();
   // delivery_id -> delivery record
   const deliveries = new Map();
+  // sending project -> timestamps (ms) of counted requests in the sliding window
+  const rateTimestamps = new Map();
   let closed = false;
+
+  function pruneRate(project, now) {
+    const list = rateTimestamps.get(project);
+    if (!list) return [];
+    const cutoff = now - rateWindowMs();
+    const kept = list.filter(ts => ts > cutoff);
+    if (kept.length === 0) rateTimestamps.delete(project);
+    else rateTimestamps.set(project, kept);
+    return kept;
+  }
+
+  function recordRate(project, now) {
+    const kept = pruneRate(project, now);
+    kept.push(now);
+    rateTimestamps.set(project, kept);
+  }
+
+  function isOpenUnexpired(exchange, now) {
+    return exchange.state === "open" && exchange.expires_at_ms > now;
+  }
+
+  function countOpenRequests(conversation, now) {
+    let count = 0;
+    for (const exchange of exchanges.values()) {
+      if (isOpenUnexpired(exchange, now) && sameConversation(exchange.from, conversation)) count += 1;
+    }
+    return count;
+  }
+
+  function nextDepth(conversation, now) {
+    let deepest = 0;
+    for (const exchange of exchanges.values()) {
+      if (isOpenUnexpired(exchange, now) && sameConversation(exchange.to, conversation) && exchange.depth > deepest) {
+        deepest = exchange.depth;
+      }
+    }
+    return deepest + 1;
+  }
 
   async function withExchangeLock(exchange, fn) {
     const previous = exchange.lock ?? Promise.resolve();
@@ -827,6 +880,45 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
     }
 
     const { to, targetListener, archived } = resolved;
+    const limits = ctx.table.agentMessageLimits ?? DEFAULT_LIMITS;
+    if (args.text.length > limits.max_characters) {
+      const message = `text exceeds max_characters limit (${limits.max_characters})`;
+      await recordRefusal({
+        op: "agent_request", from, to, target: targetName,
+        code: "text_too_long", message, fromLaunch, idempotencyKey: args.idempotency_key,
+      });
+      throw new OpError("text_too_long", message);
+    }
+
+    const checkNow = Date.now();
+    if (pruneRate(from.project, checkNow).length >= limits.requests_per_hour) {
+      const message = `project ${from.project} exceeded requests_per_hour limit (${limits.requests_per_hour})`;
+      await recordRefusal({
+        op: "agent_request", from, to, target: targetName,
+        code: "request_rate_exceeded", message, fromLaunch, idempotencyKey: args.idempotency_key,
+      });
+      throw new OpError("request_rate_exceeded", message);
+    }
+
+    if (countOpenRequests(from, checkNow) >= limits.open_requests) {
+      const message = `conversation exceeded open_requests limit (${limits.open_requests})`;
+      await recordRefusal({
+        op: "agent_request", from, to, target: targetName,
+        code: "open_requests_exceeded", message, fromLaunch, idempotencyKey: args.idempotency_key,
+      });
+      throw new OpError("open_requests_exceeded", message);
+    }
+
+    const depth = nextDepth(from, checkNow);
+    if (depth > limits.depth) {
+      const message = `request depth ${depth} exceeds depth limit (${limits.depth})`;
+      await recordRefusal({
+        op: "agent_request", from, to, target: targetName,
+        code: "depth_exceeded", message, fromLaunch, idempotencyKey: args.idempotency_key,
+      });
+      throw new OpError("depth_exceeded", message);
+    }
+
     if (archived || !isCapableListener(targetListener)) {
       const code = archived ? "target_closed" : "target_offline";
       const requestId = mintId("req");
@@ -837,6 +929,7 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
         op: "agent_request", from, to, target: targetName, requestId,
         code, message, fromLaunch, idempotencyKey: args.idempotency_key,
       });
+      recordRate(from.project, Date.now());
       const sessionRoute = ctx.session.route;
       withDeadline(null, () => publishUndelivered({
         requestId, from, to, text: args.text, code,
@@ -853,7 +946,6 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
       : Math.min(args.timeout_minutes, MAX_TIMEOUT_MINUTES);
     const expiresAtMs = now + timeoutMinutes * minuteMs();
     const expiresAt = new Date(expiresAtMs).toISOString();
-    const depth = 1;
     const toLaunch = targetListener.keyFingerprint;
 
     await ledger.append({
@@ -868,6 +960,7 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
       expires_at: expiresAt,
       idempotency_key: args.idempotency_key,
     });
+    recordRate(from.project, now);
 
     const targetProjectRoute = ctx.table.projects.get(to.project);
     const exchange = {
@@ -968,6 +1061,16 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
         withDeadline(null, () => notifyFailed(exchange, routeMismatch))
           .catch(error => log?.(`agent_message_fail_notify_failed id=${exchange.request_id} error=${error.message}`));
         throw new OpError("request_failed", message);
+      }
+
+      const limits = ctx.table.agentMessageLimits ?? DEFAULT_LIMITS;
+      if (args.text.length > limits.max_characters) {
+        const message = `text exceeds max_characters limit (${limits.max_characters})`;
+        await recordRefusal({
+          op: "agent_reply", from, to: exchange.from, requestId: args.request_id,
+          code: "text_too_long", message, fromLaunch, idempotencyKey: args.idempotency_key,
+        });
+        throw new OpError("text_too_long", message);
       }
 
       const senderListener = findListener(exchange.from);
