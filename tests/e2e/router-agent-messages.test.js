@@ -523,7 +523,7 @@ test("agent_message_ack is refused from any connection other than the addressed 
   assert.equal(wrongLaunchAck.error.code, "forbidden");
 });
 
-test("root, observer, supervisor and status get forbidden for all three ops and receive no agent_message events", async () => {
+test("root, observer, supervisor and status get forbidden for all four ops and receive no agent_message events", async () => {
   const workspace = createRouterWorkspace({
     ...routerRegistry({
       demo: { channel_id: "demo-channel", type: "claude", transport: "router", agent_message_targets: ["beta"] },
@@ -557,6 +557,7 @@ test("root, observer, supervisor and status get forbidden for all three ops and 
       ["agent_request", { target: "beta", text: "nope", idempotency_key: `k-${name}-1` }],
       ["agent_reply", { request_id: "req-000000000000", text: "nope", idempotency_key: `k-${name}-2` }],
       ["agent_message_ack", { delivery_id: "del-000000000000" }],
+      ["agent_targets", {}],
     ]) {
       const response = await client.request(op, args);
       assert.equal(response.ok, false, `${name} ${op}`);

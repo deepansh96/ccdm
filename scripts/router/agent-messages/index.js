@@ -5,7 +5,7 @@
 // visible linked records in both conversations, and appends every state change
 // to the private ledger before it takes effect.
 const crypto = require("node:crypto");
-const { withDeadline } = require("../discord-rest.js");
+const { DiscordError, withDeadline } = require("../discord-rest.js");
 const { OpError } = require("../ops/errors.js");
 const { createAgentMessageLedger } = require("./ledger.js");
 const {
@@ -21,9 +21,33 @@ const DEFAULT_TIMEOUT_MINUTES = 30;
 const DEFAULT_MINUTE_MS = 60000;
 const MARK_REPLIED = "✅";
 const MARK_FAILED = "⚠️";
+const PUBLIC_THREAD = 11;
+const FORUM_TYPES = new Set([15, 16]);
+const ARCHIVED_THREAD_CODE = 50083;
+const DISCORD_LINK = /^https?:\/\/(?:(?:ptb|canary)\.)?discord(?:app)?\.com\/channels\/[^/\s]+\/([^/\s]+)(?:\/[^/\s]+)?\/?$/;
 
 const isNonEmptyString = value => typeof value === "string" && value.trim().length > 0;
+const isId = value => typeof value === "string" && /^[\w-]+$/.test(value);
+const isArchivedThreadError = error => error instanceof DiscordError && error.body?.code === ARCHIVED_THREAD_CODE;
+const isSettledMarkError = error => error instanceof DiscordError && (error.status === 404 || error.body?.code === ARCHIVED_THREAD_CODE);
 const mintId = prefix => `${prefix}-${crypto.randomBytes(6).toString("hex")}`;
+
+function isProjectPublicThread(channel, projectRoute) {
+  return Boolean(
+    channel
+    && channel.type === PUBLIC_THREAD
+    && !FORUM_TYPES.has(channel.parent?.type)
+    && String(channel.parentId) === projectRoute.channel_id,
+  );
+}
+
+function isGrantedProject(senderRoute, targetProjectRoute) {
+  return Boolean(
+    senderRoute && !senderRoute.remote
+    && targetProjectRoute && !targetProjectRoute.remote
+    && senderRoute.agent_message_targets.has(targetProjectRoute.project),
+  );
+}
 
 function minuteMs(env = process.env) {
   const raw = env.CCDM_ROUTER_AGENT_MESSAGE_MINUTE_MS;
@@ -31,12 +55,12 @@ function minuteMs(env = process.env) {
   return raw !== undefined && raw !== "" && Number.isFinite(value) && value > 0 ? value : DEFAULT_MINUTE_MS;
 }
 
-function conversationOf(route) {
+function conversationOf(route, threadName = undefined) {
   return {
     project: route.project,
     provider: route.type,
     conversation_id: route.channel_id,
-    ...(route.thread_id ? { thread_id: route.thread_id } : {}),
+    ...(route.thread_id ? { thread_id: route.thread_id, thread_name: threadName ?? null } : {}),
   };
 }
 
@@ -44,8 +68,12 @@ function noticeTargetOf(conversation) {
   return {
     project: conversation.project,
     conversation_id: conversation.conversation_id,
-    ...(conversation.thread_id ? { thread_id: conversation.thread_id } : {}),
+    ...(conversation.thread_id ? { thread_id: conversation.thread_id, thread_name: conversation.thread_name ?? null } : {}),
   };
+}
+
+function channelName(channel) {
+  return typeof channel?.name === "string" && channel.name.length > 0 ? channel.name : null;
 }
 
 function sameConversation(a, b) {
@@ -64,12 +92,121 @@ function errorSummary(error) {
   };
 }
 
-function createAgentMessages({ stateDir, context, findListener, deliver, log }) {
+function createAgentMessages({ stateDir, context, findListener, listThreadListeners = () => [], deliver, log }) {
   const ledger = createAgentMessageLedger({ stateDir });
   // request_id -> exchange state
   const exchanges = new Map();
   // delivery_id -> delivery record
   const deliveries = new Map();
+
+  async function fetchChannel(channelId) {
+    try {
+      return await context.discord?.client?.channels.fetch(channelId) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function isThreadArchived(conversation) {
+    if (!conversation?.thread_id) return false;
+    const channel = await fetchChannel(conversation.thread_id);
+    return Boolean(channel?.archived);
+  }
+
+  async function resolveConversation(route) {
+    if (!route.thread_id) return conversationOf(route);
+    const channel = await fetchChannel(route.thread_id);
+    return conversationOf(route, channelName(channel));
+  }
+
+  async function resolveTarget(ctx, senderRoute, rawTarget) {
+    const deny = () => ({
+      ok: false,
+      code: "not_granted",
+      message: `${senderRoute?.project ?? ctx.session.route.project} is not granted to send Agent Requests to ${rawTarget}`,
+      to: null,
+    });
+    const unknown = () => ({
+      ok: false,
+      code: "unknown_target",
+      message: `unknown target: ${rawTarget}`,
+      to: null,
+    });
+
+    const linkMatch = DISCORD_LINK.exec(rawTarget);
+    if (linkMatch) {
+      const linkedId = linkMatch[1];
+      let projectRoute = ctx.table.channels.get(linkedId) ?? null;
+      let channel = null;
+      if (!projectRoute) {
+        channel = await fetchChannel(linkedId);
+        projectRoute = channel?.parentId ? (ctx.table.channels.get(String(channel.parentId)) ?? null) : null;
+      }
+      if (!isGrantedProject(senderRoute, projectRoute)) return deny();
+      if (!isProjectPublicThread(channel, projectRoute)) return unknown();
+      const listener = findListener({ project: projectRoute.project, conversation_id: linkedId, thread_id: linkedId });
+      const to = {
+        project: projectRoute.project,
+        provider: listener?.route.type ?? projectRoute.type,
+        conversation_id: linkedId,
+        thread_id: linkedId,
+        thread_name: channelName(channel),
+      };
+      return { ok: true, to, targetListener: listener, archived: Boolean(channel.archived) };
+    }
+
+    const slash = rawTarget.indexOf("/");
+    if (slash >= 0) {
+      const projectName = rawTarget.slice(0, slash);
+      const threadSpec = rawTarget.slice(slash + 1);
+      const projectRoute = projectName === "root" ? null : (ctx.table.projects.get(projectName) ?? null);
+      if (!isGrantedProject(senderRoute, projectRoute)) return deny();
+      if (!threadSpec) return unknown();
+      if (isId(threadSpec)) {
+        const byId = await fetchChannel(threadSpec);
+        if (isProjectPublicThread(byId, projectRoute)) {
+          const listener = findListener({ project: projectRoute.project, conversation_id: threadSpec, thread_id: threadSpec });
+          const to = {
+            project: projectRoute.project,
+            provider: listener?.route.type ?? projectRoute.type,
+            conversation_id: threadSpec,
+            thread_id: threadSpec,
+            thread_name: channelName(byId),
+          };
+          return { ok: true, to, targetListener: listener, archived: Boolean(byId.archived) };
+        }
+      }
+      const matches = [];
+      for (const connection of listThreadListeners(projectRoute.project)) {
+        const channel = await fetchChannel(connection.route.thread_id);
+        if (channel && channelName(channel) === threadSpec) matches.push({ connection, channel });
+      }
+      if (matches.length === 0) return unknown();
+      if (matches.length > 1) {
+        return {
+          ok: false,
+          code: "ambiguous_target",
+          message: `ambiguous target: multiple live threads in ${projectRoute.project} are named ${threadSpec}`,
+          to: null,
+        };
+      }
+      const [{ connection, channel }] = matches;
+      const threadId = connection.route.thread_id;
+      const to = {
+        project: projectRoute.project,
+        provider: connection.route.type,
+        conversation_id: threadId,
+        thread_id: threadId,
+        thread_name: channelName(channel),
+      };
+      return { ok: true, to, targetListener: connection, archived: Boolean(channel.archived) };
+    }
+
+    const targetRoute = rawTarget === "root" ? null : (ctx.table.projects.get(rawTarget) ?? null);
+    if (!isGrantedProject(senderRoute, targetRoute)) return deny();
+    const to = conversationOf(targetRoute);
+    return { ok: true, to, targetListener: findListener(to), archived: false };
+  }
 
   async function appendBestEffort(fields) {
     try {
@@ -101,6 +238,7 @@ function createAgentMessages({ stateDir, context, findListener, deliver, log }) 
     try {
       await reactMark(context, { channelId, messageId, emoji });
     } catch (error) {
+      if (isSettledMarkError(error)) return;
       log?.(`agent_message_mark_failed id=${requestId} channel=${channelId} message=${messageId} emoji=${emoji} error=${error.message}`);
     }
   }
@@ -171,6 +309,18 @@ function createAgentMessages({ stateDir, context, findListener, deliver, log }) 
     });
 
     let senderPost;
+    if (await isThreadArchived(exchange.from)) {
+      await appendBestEffort({
+        type: "post",
+        request_id: exchange.request_id,
+        kind: "request",
+        side: "sender",
+        channel_id: exchange.from.conversation_id,
+        skipped: "thread_archived",
+      });
+      await failRequest(exchange, "sender thread is archived");
+      return;
+    }
     try {
       senderPost = await postWebhookRecord(context, {
         route: senderRoute,
@@ -199,7 +349,7 @@ function createAgentMessages({ stateDir, context, findListener, deliver, log }) 
         kind: "request",
         side: "sender",
         channel_id: exchange.from.conversation_id,
-        error: errorSummary(error),
+        ...(isArchivedThreadError(error) ? { skipped: "thread_archived" } : { error: errorSummary(error) }),
       });
       log?.(`agent_message_post_failed id=${exchange.request_id} kind=request side=sender error=${error.message}`);
       await failRequest(exchange, `sender record post failed: ${error.message}`);
@@ -216,6 +366,18 @@ function createAgentMessages({ stateDir, context, findListener, deliver, log }) 
     });
 
     let receiverPost;
+    if (await isThreadArchived(exchange.to)) {
+      await appendBestEffort({
+        type: "post",
+        request_id: exchange.request_id,
+        kind: "request",
+        side: "receiver",
+        channel_id: exchange.to.conversation_id,
+        skipped: "thread_archived",
+      });
+      await failRequest(exchange, "receiver thread is archived");
+      return;
+    }
     try {
       receiverPost = await postBotRecord(context, {
         channelId: exchange.to.conversation_id,
@@ -239,7 +401,7 @@ function createAgentMessages({ stateDir, context, findListener, deliver, log }) 
         kind: "request",
         side: "receiver",
         channel_id: exchange.to.conversation_id,
-        error: errorSummary(error),
+        ...(isArchivedThreadError(error) ? { skipped: "thread_archived" } : { error: errorSummary(error) }),
       });
       log?.(`agent_message_post_failed id=${exchange.request_id} kind=request side=receiver error=${error.message}`);
       await failRequest(exchange, `receiver record post failed: ${error.message}`);
@@ -254,16 +416,18 @@ function createAgentMessages({ stateDir, context, findListener, deliver, log }) 
       requestId: exchange.request_id,
       counterpartUrl: receiverUrl,
     });
-    try {
-      await editWebhookRecord({
-        route: senderRoute,
-        secret: senderPost.secret,
-        messageId: senderPost.message_id,
-        firstChunk: senderPost.firstChunk,
-        updatedHeader: linkedSenderHeader,
-      });
-    } catch (error) {
-      log?.(`agent_message_link_edit_failed id=${exchange.request_id} kind=request error=${error.message}`);
+    if (!(await isThreadArchived(exchange.from))) {
+      try {
+        await editWebhookRecord({
+          route: senderRoute,
+          secret: senderPost.secret,
+          messageId: senderPost.message_id,
+          firstChunk: senderPost.firstChunk,
+          updatedHeader: linkedSenderHeader,
+        });
+      } catch (error) {
+        log?.(`agent_message_link_edit_failed id=${exchange.request_id} kind=request error=${error.message}`);
+      }
     }
 
     const deliveryId = mintId("del");
@@ -321,33 +485,44 @@ function createAgentMessages({ stateDir, context, findListener, deliver, log }) 
     });
 
     let replierPost = null;
-    try {
-      replierPost = await postWebhookRecord(context, {
-        route: replierRoute,
-        header: replierHeader,
-        text,
-        contextPct,
-        reserveHeaderChars: linkSuffixReserve(guildId, exchange.from.conversation_id),
-      });
-      await appendBestEffort({
-        type: "post",
-        request_id: exchange.request_id,
-        kind: "reply",
-        side: "sender",
-        channel_id: replierPost.channel_id,
-        message_id: replierPost.message_id,
-        message_ids: replierPost.message_ids,
-      });
-    } catch (error) {
+    if (await isThreadArchived(from)) {
       await appendBestEffort({
         type: "post",
         request_id: exchange.request_id,
         kind: "reply",
         side: "sender",
         channel_id: from.conversation_id,
-        error: errorSummary(error),
+        skipped: "thread_archived",
       });
-      log?.(`agent_message_post_failed id=${exchange.request_id} kind=reply side=sender error=${error.message}`);
+    } else {
+      try {
+        replierPost = await postWebhookRecord(context, {
+          route: replierRoute,
+          header: replierHeader,
+          text,
+          contextPct,
+          reserveHeaderChars: linkSuffixReserve(guildId, exchange.from.conversation_id),
+        });
+        await appendBestEffort({
+          type: "post",
+          request_id: exchange.request_id,
+          kind: "reply",
+          side: "sender",
+          channel_id: replierPost.channel_id,
+          message_id: replierPost.message_id,
+          message_ids: replierPost.message_ids,
+        });
+      } catch (error) {
+        await appendBestEffort({
+          type: "post",
+          request_id: exchange.request_id,
+          kind: "reply",
+          side: "sender",
+          channel_id: from.conversation_id,
+          ...(isArchivedThreadError(error) ? { skipped: "thread_archived" } : { error: errorSummary(error) }),
+        });
+        log?.(`agent_message_post_failed id=${exchange.request_id} kind=reply side=sender error=${error.message}`);
+      }
     }
 
     const replierUrl = replierPost ? messageLink(guildId, replierPost.channel_id, replierPost.message_id) : undefined;
@@ -360,34 +535,45 @@ function createAgentMessages({ stateDir, context, findListener, deliver, log }) 
     });
 
     let receiverPost = null;
-    try {
-      receiverPost = await postBotRecord(context, {
-        channelId: exchange.from.conversation_id,
-        header: receiverHeader,
-        text,
-      });
-      await appendBestEffort({
-        type: "post",
-        request_id: exchange.request_id,
-        kind: "reply",
-        side: "receiver",
-        channel_id: receiverPost.channel_id,
-        message_id: receiverPost.message_id,
-        message_ids: receiverPost.message_ids,
-      });
-    } catch (error) {
+    if (await isThreadArchived(exchange.from)) {
       await appendBestEffort({
         type: "post",
         request_id: exchange.request_id,
         kind: "reply",
         side: "receiver",
         channel_id: exchange.from.conversation_id,
-        error: errorSummary(error),
+        skipped: "thread_archived",
       });
-      log?.(`agent_message_post_failed id=${exchange.request_id} kind=reply side=receiver error=${error.message}`);
+    } else {
+      try {
+        receiverPost = await postBotRecord(context, {
+          channelId: exchange.from.conversation_id,
+          header: receiverHeader,
+          text,
+        });
+        await appendBestEffort({
+          type: "post",
+          request_id: exchange.request_id,
+          kind: "reply",
+          side: "receiver",
+          channel_id: receiverPost.channel_id,
+          message_id: receiverPost.message_id,
+          message_ids: receiverPost.message_ids,
+        });
+      } catch (error) {
+        await appendBestEffort({
+          type: "post",
+          request_id: exchange.request_id,
+          kind: "reply",
+          side: "receiver",
+          channel_id: exchange.from.conversation_id,
+          ...(isArchivedThreadError(error) ? { skipped: "thread_archived" } : { error: errorSummary(error) }),
+        });
+        log?.(`agent_message_post_failed id=${exchange.request_id} kind=reply side=receiver error=${error.message}`);
+      }
     }
 
-    if (replierPost && receiverPost) {
+    if (replierPost && receiverPost && !(await isThreadArchived(from))) {
       const receiverUrl = messageLink(guildId, receiverPost.channel_id, receiverPost.message_id);
       const linkedReplierHeader = formatRecordHeader({
         kind: "reply",
@@ -457,6 +643,17 @@ function createAgentMessages({ stateDir, context, findListener, deliver, log }) 
   }
 
   async function publishUndelivered({ requestId, from, to, text, code, senderRoute, contextPct }) {
+    if (await isThreadArchived(from)) {
+      await appendBestEffort({
+        type: "post",
+        request_id: requestId,
+        kind: "request",
+        side: "sender",
+        channel_id: from.conversation_id,
+        skipped: "thread_archived",
+      });
+      return;
+    }
     const header = formatRecordHeader({
       kind: "request",
       direction: "to",
@@ -505,40 +702,36 @@ function createAgentMessages({ stateDir, context, findListener, deliver, log }) 
       throw new OpError("invalid_args", "timeout_minutes must be a positive integer");
     }
 
-    const from = conversationOf(ctx.session.route);
+    const from = await resolveConversation(ctx.session.route);
     const fromLaunch = ctx.session.keyFingerprint;
     const targetName = args.target;
     const senderRoute = ctx.table.projects.get(from.project);
-    const targetRoute = targetName === "root" ? null : ctx.table.projects.get(targetName);
-    const granted = Boolean(
-      senderRoute && !senderRoute.remote
-      && targetRoute && !targetRoute.remote
-      && senderRoute.agent_message_targets.has(targetName),
-    );
-    if (!granted) {
-      const message = `${from.project} is not granted to send Agent Requests to ${targetName}`;
+    const resolved = await resolveTarget(ctx, senderRoute, targetName);
+    if (!resolved.ok) {
       await recordRefusal({
-        op: "agent_request", from, to: null, target: targetName,
-        code: "not_granted", message, fromLaunch, idempotencyKey: args.idempotency_key,
+        op: "agent_request", from, to: resolved.to, target: targetName,
+        code: resolved.code, message: resolved.message, fromLaunch, idempotencyKey: args.idempotency_key,
       });
-      throw new OpError("not_granted", message);
+      throw new OpError(resolved.code, resolved.message);
     }
 
-    const to = conversationOf(targetRoute);
-    const targetListener = findListener(to);
-    if (!isCapableListener(targetListener)) {
+    const { to, targetListener, archived } = resolved;
+    if (archived || !isCapableListener(targetListener)) {
+      const code = archived ? "target_closed" : "target_offline";
       const requestId = mintId("req");
-      const message = `${targetRoute.project} has no live agent_messages listener`;
+      const message = archived
+        ? `${formatConversationLabel(to)} is archived`
+        : `${formatConversationLabel(to)} has no live agent_messages listener`;
       await recordRefusal({
         op: "agent_request", from, to, target: targetName, requestId,
-        code: "target_offline", message, fromLaunch, idempotencyKey: args.idempotency_key,
+        code, message, fromLaunch, idempotencyKey: args.idempotency_key,
       });
       const sessionRoute = ctx.session.route;
       withDeadline(null, () => publishUndelivered({
-        requestId, from, to, text: args.text, code: "target_offline",
+        requestId, from, to, text: args.text, code,
         senderRoute: sessionRoute, contextPct: args.context_pct,
       })).catch(error => log?.(`agent_message_undelivered_failed id=${requestId} error=${error.message}`));
-      throw new OpError("target_offline", message);
+      throw new OpError(code, message);
     }
 
     const requestId = mintId("req");
@@ -593,7 +786,7 @@ function createAgentMessages({ stateDir, context, findListener, deliver, log }) 
     if (!isNonEmptyString(args.text)) throw new OpError("invalid_args", "text is required");
     if (!isNonEmptyString(args.idempotency_key)) throw new OpError("invalid_args", "idempotency_key is required");
 
-    const from = conversationOf(ctx.session.route);
+    const from = await resolveConversation(ctx.session.route);
     const fromLaunch = ctx.session.keyFingerprint;
     const exchange = exchanges.get(args.request_id);
     if (!exchange || !sameConversation(exchange.to, from)) {
@@ -692,7 +885,32 @@ function createAgentMessages({ stateDir, context, findListener, deliver, log }) 
     }
   }
 
-  return { request, reply, ack };
+  async function targets(ctx) {
+    const senderRoute = ctx.table.projects.get(ctx.session.route.project);
+    if (!senderRoute || senderRoute.remote) return { targets: [] };
+    const list = [];
+    for (const targetName of senderRoute.agent_message_targets) {
+      if (targetName === "root") continue;
+      const targetRoute = ctx.table.projects.get(targetName);
+      if (!targetRoute || targetRoute.remote) continue;
+      const channelListener = findListener({ project: targetRoute.project, conversation_id: targetRoute.channel_id });
+      const threads = [];
+      for (const connection of listThreadListeners(targetRoute.project)) {
+        if (!isCapableListener(connection)) continue;
+        const threadId = connection.route.thread_id;
+        const channel = await fetchChannel(threadId);
+        threads.push({ id: threadId, name: channelName(channel) });
+      }
+      list.push({
+        project: targetRoute.project,
+        channel_live: isCapableListener(channelListener),
+        threads,
+      });
+    }
+    return { targets: list };
+  }
+
+  return { request, reply, targets, ack };
 }
 
 module.exports = { CAPABILITY, DEFAULT_TIMEOUT_MINUTES, createAgentMessages };

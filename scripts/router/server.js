@@ -142,6 +142,9 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       const connection = sessions.get(conversation.project);
       return connection && connection.route.channel_id === conversation.conversation_id ? connection : null;
     },
+    listThreadListeners(project) {
+      return [...threadSessions.values()].filter(connection => connection.route.project === project);
+    },
     deliver(connection, event) {
       if (!connection || connection.socket.destroyed) return false;
       send(connection.socket, { type: "event", ...event });

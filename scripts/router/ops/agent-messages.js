@@ -15,6 +15,11 @@ module.exports = {
       scoped: false,
       run: (ctx, args) => ctx.agentMessages.reply(ctx, args),
     },
+    agent_targets: {
+      roles: ["project", "thread"],
+      scoped: false,
+      run: (ctx, args) => ctx.agentMessages.targets(ctx, args),
+    },
     agent_message_ack: {
       roles: ["project", "thread"],
       scoped: false,

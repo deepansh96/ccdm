@@ -15,7 +15,9 @@ function isAgentMessageRecord(text) {
 }
 
 function formatConversationLabel(conversation) {
-  return `${conversation.project}-${conversation.provider}`;
+  const base = `${conversation.project}-${conversation.provider}`;
+  if (!conversation.thread_id) return base;
+  return `${base} › ${conversation.thread_name || conversation.thread_id}`;
 }
 
 function messageLink(guildId, channelId, messageId) {
