@@ -23,6 +23,7 @@ const DEFAULT_MINUTE_MS = 60000;
 const DEFAULT_RATE_WINDOW_MS = 3600000;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 const LEDGER_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const RECENT_REFUSALS = 20;
 const DEFAULT_LIMITS = Object.freeze({
   depth: 3,
   requests_per_hour: 20,
@@ -77,6 +78,17 @@ function conversationOf(route, threadName = undefined) {
     provider: route.type,
     conversation_id: route.channel_id,
     ...(route.thread_id ? { thread_id: route.thread_id, thread_name: threadName ?? null } : {}),
+  };
+}
+
+function statusConversation(conversation) {
+  return {
+    project: conversation.project,
+    provider: conversation.provider,
+    conversation_id: conversation.conversation_id,
+    ...(conversation.thread_id
+      ? { thread_id: conversation.thread_id, thread_name: conversation.thread_name ?? null }
+      : {}),
   };
 }
 
@@ -141,6 +153,8 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
   const idempotencyCache = new Map();
   // same key -> tail promise serializing concurrent identical calls
   const idempotencyLocks = new Map();
+  // latest 20 refusals for `router status`
+  const recentRefusals = [];
   let closed = false;
 
   function assertLedgerAvailable() {
@@ -387,8 +401,18 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
     }
   }
 
+  function pushRecentRefusal(record) {
+    recentRefusals.push({
+      at: record.at,
+      from: statusConversation(record.from),
+      target: record.target ?? record.request_id ?? null,
+      code: record.code,
+    });
+    if (recentRefusals.length > RECENT_REFUSALS) recentRefusals.shift();
+  }
+
   async function recordRefusal({ op, from, to, target, requestId, code, message, fromLaunch, idempotencyKey }) {
-    await ledger.append({
+    const record = await ledger.append({
       type: "refusal",
       refusal_id: mintId("ref"),
       op,
@@ -401,6 +425,7 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
       from_launch: fromLaunch,
       idempotency_key: idempotencyKey,
     });
+    pushRecentRefusal(record);
   }
 
   async function markPost(channelId, messageId, emoji, requestId) {
@@ -986,6 +1011,7 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
 
       await ledger.append({
         type: "request",
+        at: ts,
         request_id: requestId,
         from,
         to,
@@ -1346,6 +1372,7 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
           break;
         }
         case "refusal": {
+          if (atMs >= retentionCutoff) pushRecentRefusal(record);
           if (record.op === "agent_request" && (record.code === "target_offline" || record.code === "target_closed")) {
             addRateTimestamp(record.from.project, atMs);
           }
@@ -1400,6 +1427,7 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
         deliveries.clear();
         rateTimestamps.clear();
         idempotencyCache.clear();
+        recentRefusals.length = 0;
         log?.(`agent_message_ledger_unavailable error=${compacted.error}`);
         return;
       }
@@ -1416,12 +1444,37 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
     }
   }
 
+  function status() {
+    const openRequests = [];
+    for (const exchange of exchanges.values()) {
+      if (exchange.state !== "open") continue;
+      openRequests.push({
+        request_id: exchange.request_id,
+        from: statusConversation(exchange.from),
+        to: statusConversation(exchange.to),
+        opened_at: exchange.ts,
+        expires_at: exchange.expires_at,
+        depth: exchange.depth,
+      });
+    }
+    return {
+      ledger: ledger.health(),
+      open_requests: openRequests,
+      recent_refusals: recentRefusals.map(entry => ({
+        at: entry.at,
+        from: statusConversation(entry.from),
+        target: entry.target,
+        code: entry.code,
+      })),
+    };
+  }
+
   function close() {
     closed = true;
     for (const exchange of exchanges.values()) clearExpiry(exchange);
   }
 
-  return { load, request, reply, targets, ack, onListenerHello, close };
+  return { load, request, reply, targets, ack, status, onListenerHello, close };
 }
 
 module.exports = { CAPABILITY, DEFAULT_TIMEOUT_MINUTES, MAX_TIMEOUT_MINUTES, createAgentMessages };

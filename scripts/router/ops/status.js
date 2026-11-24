@@ -102,6 +102,7 @@ async function status(ctx, args = {}) {
     supervisor: { connected: Boolean(supervisor), connected_at: supervisor?.connectedAt ?? null },
     projects,
     scope_violations: ctx.violations(),
+    agent_messages: ctx.agentMessages.status(),
     ...(args.project === undefined ? {} : { target: await target(ctx, String(args.project)) }),
   };
 }
