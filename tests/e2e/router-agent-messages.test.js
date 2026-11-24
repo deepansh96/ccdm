@@ -8,15 +8,18 @@ import { injectDiscordMessage } from "./support/bridge.js";
 import { replaceFile } from "./support/platform.js";
 import {
   OWNER_ID,
+  ROOT_TOKEN,
   createRouterWorkspace,
   rawRouterSocket,
   routerRegistry,
+  routerWithWebhooks,
   runRouterCli,
   startRouter,
   waitFor,
   writeProjectKey,
   writeRootKey,
 } from "./support/router.js";
+import { readState, updateState } from "./support/state.js";
 import { cleanup, registerTeardownCallback } from "./support/teardown.js";
 
 const RELOAD_ENV = { CCDM_ROUTER_REGISTRY_DEBOUNCE_MS: "20" };
@@ -80,6 +83,13 @@ function writeSpecialKey(workspace, filename, key) {
   fs.writeFileSync(path.join(keysDir, filename), `${key}\n`, { mode: 0o600 });
 }
 
+async function ensureWebhooks(workspace, projects) {
+  for (const project of projects) {
+    const result = await runRouterCli(workspace, ["ensure-webhook", project]);
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  }
+}
+
 function replaceRegistry(workspace, registry) {
   const file = path.join(workspace.repoDir, "registry.json");
   replaceFile(file, `${JSON.stringify(registry, null, 2)}\n`);
@@ -115,6 +125,7 @@ test("a granted Agent Request reaches a live capable Channel Conversation and it
   }));
   writeProjectKey(workspace, "demo", "demo-key");
   writeProjectKey(workspace, "beta", "beta-key");
+  await ensureWebhooks(workspace, ["demo", "beta"]);
   await startRouter(workspace);
 
   const demo = await connectCapableRouterClient(workspace, "demo", "demo-key");
@@ -147,7 +158,9 @@ test("a granted Agent Request reaches a live capable Channel Conversation and it
   assert.equal(requestEvent.text, "Check staging health");
   assert.equal(requestEvent.expires_at, sent.expires_at);
   assert.equal(requestEvent.depth, 1);
-  assert.equal(requestEvent.post, null);
+  assert.equal(requestEvent.post.channel_id, "beta-channel");
+  assert.equal(typeof requestEvent.post.message_id, "string");
+  assert.ok(requestEvent.post.message_id.length > 0);
   assert.ok(!Number.isNaN(Date.parse(requestEvent.ts)));
   assert.deepEqual(requestEvent.from, {
     project: "demo",
@@ -178,7 +191,9 @@ test("a granted Agent Request reaches a live capable Channel Conversation and it
   assert.ok(replyEvent.delivery_id.length > 0);
   assert.equal(replyEvent.request_id, sent.request_id);
   assert.equal(replyEvent.text, "Staging is green");
-  assert.equal(replyEvent.post, null);
+  assert.equal(replyEvent.post.channel_id, "demo-channel");
+  assert.equal(typeof replyEvent.post.message_id, "string");
+  assert.ok(replyEvent.post.message_id.length > 0);
   assert.ok(!Number.isNaN(Date.parse(replyEvent.ts)));
   assert.deepEqual(replyEvent.from, {
     project: "beta",
@@ -215,6 +230,7 @@ test("grants are one-way, self-grant is required for self-sends, and unknown, ro
   writeProjectKey(workspace, "demo", "demo-key");
   writeProjectKey(workspace, "beta", "beta-key");
   writeProjectKey(workspace, "far", "far-key");
+  await ensureWebhooks(workspace, ["demo", "beta"]);
   await startRouter(workspace);
 
   const demo = await connectAgentProject(workspace, "demo", "demo-key");
@@ -282,6 +298,7 @@ test("an offline or incapable target fails with target_offline at once and gets 
   }));
   writeProjectKey(workspace, "demo", "demo-key");
   writeProjectKey(workspace, "beta", "beta-key");
+  await ensureWebhooks(workspace, ["demo", "beta"]);
   await startRouter(workspace);
 
   const demo = await connectAgentProject(workspace, "demo", "demo-key");
@@ -323,6 +340,7 @@ test("reply rejects unknown_request and already_replied, honours op-only callers
   writeProjectKey(workspace, "demo", "demo-key-1");
   writeProjectKey(workspace, "beta", "beta-key");
   writeProjectKey(workspace, "legacy", "legacy-key");
+  await ensureWebhooks(workspace, ["demo", "beta", "legacy"]);
   await startRouter(workspace);
 
   const demo = await connectAgentProject(workspace, "demo", "demo-key-1");
@@ -446,6 +464,7 @@ test("agent_message_ack is refused from any connection other than the addressed 
   writeProjectKey(workspace, "demo", "demo-key");
   writeProjectKey(workspace, "beta", "beta-key-1");
   writeProjectKey(workspace, "legacy", "legacy-key");
+  await ensureWebhooks(workspace, ["demo", "beta", "legacy"]);
   await startRouter(workspace);
 
   const demo = await connectAgentProject(workspace, "demo", "demo-key");
@@ -517,6 +536,7 @@ test("root, observer, supervisor and status get forbidden for all three ops and 
   writeRootKey(workspace, "root-key");
   writeSpecialKey(workspace, ".observer.key", "observer-key");
   writeSpecialKey(workspace, ".supervisor.key", "supervisor-key");
+  await ensureWebhooks(workspace, ["demo", "beta"]);
   await startRouter(workspace);
 
   const demo = await connectAgentProject(workspace, "demo", "demo-key");
@@ -582,6 +602,7 @@ test("hot-reloading agent_message_targets updates the next send without restart 
   }));
   writeProjectKey(workspace, "demo", "demo-key");
   writeProjectKey(workspace, "beta", "beta-key");
+  await ensureWebhooks(workspace, ["demo", "beta"]);
   const router = await startRouter(workspace, { env: RELOAD_ENV });
 
   const demo = await connectAgentProject(workspace, "demo", "demo-key");
@@ -663,6 +684,7 @@ test("state changes append to the ledger before taking effect while ordinary own
   }));
   writeProjectKey(workspace, "demo", "demo-key");
   writeProjectKey(workspace, "beta", "beta-key");
+  await ensureWebhooks(workspace, ["demo", "beta"]);
   await startRouter(workspace);
 
   const demo = await connectAgentProject(workspace, "demo", "demo-key");
@@ -728,4 +750,516 @@ test("state changes append to the ledger before taking effect while ordinary own
       && event.request_id === sent.result.request_id),
     () => `demo recovered reply`,
   );
+});
+
+test("accepted requests and replies post linked records in both conversations, mark request posts ✅, and deliver only after both request records exist", async () => {
+  const workspace = createRouterWorkspace(routerRegistry({
+    demo: { channel_id: "demo-channel", type: "claude", transport: "router", agent_message_targets: ["beta"] },
+    beta: { channel_id: "beta-channel", type: "codex", transport: "router" },
+  }));
+  await routerWithWebhooks(workspace, ["demo", "beta"]);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.requestLog = [];
+    state.fixtures.discord.rateLimits = [
+      { method: "POST", path: "/api/v10/channels/beta-channel/messages", count: 1, retryAfter: 0.4, bucket: "beta-post" },
+    ];
+  });
+
+  const demo = await connectCapableRouterClient(workspace, "demo", "demo-key");
+  const beta = await connectAgentProject(workspace, "beta", "beta-key");
+
+  // agent_request returns immediately without waiting for the 400 ms receiver-side post delay.
+  const startedAt = Date.now();
+  const sent = await demo.client.request("agent_request", {
+    target: "beta",
+    text: "Check staging health",
+    idempotency_key: "rec-req-1",
+    context_pct: 42,
+  });
+  const callElapsed = Date.now() - startedAt;
+  assert.ok(callElapsed < 350, `agent_request should not await record posting (took ${callElapsed} ms)`);
+  const reqId = sent.request_id;
+
+  // Before the delayed receiver-side record lands, beta gets nothing (proven by a fence owner message).
+  await fenceOwnerMessage(workspace, beta, "beta-channel", "fence-before-records");
+  assert.deepEqual(beta.events.filter((event) => event.event === "agent_message"), []);
+
+  // Once both records exist, beta receives the request event with `post` set to the receiver-side record.
+  const requestEvent = await waitFor(
+    () => beta.events.find((event) => event.event === "agent_message" && event.kind === "request"),
+    () => `beta request event: ${JSON.stringify(beta.events)}`,
+  );
+  assert.ok(Date.now() - startedAt >= 350, "delivery waited for the receiver-side post");
+
+  const afterRequest = readState(workspace.stateDir).fixtures.discord;
+  const senderReqPost = afterRequest.messages.find((message) => message.channelId === "demo-channel" && message.webhookId);
+  const receiverReqPost = afterRequest.messages.find((message) => message.channelId === "beta-channel" && !message.webhookId);
+  assert.ok(senderReqPost, `expected sender-side request post: ${JSON.stringify(afterRequest.messages)}`);
+  assert.ok(receiverReqPost, `expected receiver-side request post: ${JSON.stringify(afterRequest.messages)}`);
+  assert.deepEqual(requestEvent.post, { channel_id: "beta-channel", message_id: receiverReqPost.id });
+
+  const senderReqLink = `https://discord.com/channels/guild-id/demo-channel/${senderReqPost.id}`;
+  const receiverReqLink = `https://discord.com/channels/guild-id/beta-channel/${receiverReqPost.id}`;
+  assert.equal(senderReqPost.username, "demo-claude · 42%");
+  assert.equal(
+    senderReqPost.content,
+    `-# ⇄ Agent Request to **beta-codex** · ${reqId} · [counterpart](${receiverReqLink})\nCheck staging health`,
+  );
+  assert.equal(receiverReqPost.authorization, `Bot ${ROOT_TOKEN}`);
+  assert.deepEqual(receiverReqPost.allowedMentions, { parse: [] });
+  assert.equal(
+    receiverReqPost.content,
+    `-# ⇄ Agent Request from **demo-claude** · ${reqId} · [counterpart](${senderReqLink})\nCheck staging health`,
+  );
+
+  // Reply posts linked records the other way, reacts ✅ on both request posts, and delivers with `post`.
+  const replied = await beta.request("agent_reply", {
+    request_id: reqId,
+    text: "Staging is green",
+    idempotency_key: "rec-reply-1",
+    context_pct: 25,
+  });
+  assert.equal(replied.ok, true, JSON.stringify(replied));
+
+  const replyEvent = await waitFor(
+    () => demo.events.find((event) => event.event === "agent_message" && event.kind === "reply"),
+    () => `demo reply event: ${JSON.stringify(demo.events)}`,
+  );
+
+  const afterReply = readState(workspace.stateDir).fixtures.discord;
+  const replierReplyPost = afterReply.messages.find((message) => message.channelId === "beta-channel" && message.webhookId);
+  const receiverReplyPost = afterReply.messages.find((message) => message.channelId === "demo-channel" && !message.webhookId);
+  assert.ok(replierReplyPost, `expected replier-side reply post: ${JSON.stringify(afterReply.messages)}`);
+  assert.ok(receiverReplyPost, `expected receiver-side reply post: ${JSON.stringify(afterReply.messages)}`);
+  assert.deepEqual(replyEvent.post, { channel_id: "demo-channel", message_id: receiverReplyPost.id });
+
+  const replierReplyLink = `https://discord.com/channels/guild-id/beta-channel/${replierReplyPost.id}`;
+  const receiverReplyLink = `https://discord.com/channels/guild-id/demo-channel/${receiverReplyPost.id}`;
+  assert.equal(replierReplyPost.username, "beta-codex · 25%");
+  assert.equal(
+    replierReplyPost.content,
+    `-# ⇄ Agent Reply to **demo-claude** · ${reqId} · [counterpart](${receiverReplyLink})\nStaging is green`,
+  );
+  assert.equal(receiverReplyPost.authorization, `Bot ${ROOT_TOKEN}`);
+  assert.deepEqual(receiverReplyPost.allowedMentions, { parse: [] });
+  assert.equal(
+    receiverReplyPost.content,
+    `-# ⇄ Agent Reply from **beta-codex** · ${reqId} · [counterpart](${replierReplyLink})\nStaging is green`,
+  );
+
+  // Root reacts ✅ on both request posts.
+  const checkMarks = (afterReply.reactions ?? []).filter((reaction) => reaction.emoji === encodeURIComponent("✅"));
+  assert.deepEqual(checkMarks, [
+    { authorization: `Bot ${ROOT_TOKEN}`, channelId: "demo-channel", emoji: encodeURIComponent("✅"), messageId: senderReqPost.id },
+    { authorization: `Bot ${ROOT_TOKEN}`, channelId: "beta-channel", emoji: encodeURIComponent("✅"), messageId: receiverReqPost.id },
+  ]);
+
+  // Every record POST and PATCH carried empty allowed_mentions.
+  const writeRequests = afterReply.requestLog.filter((entry) =>
+    (entry.method === "POST" || entry.method === "PATCH")
+    && (/^\/api\/v10\/webhooks\/[^/]+\/[^/]+/.test(entry.path) || /^\/api\/v10\/channels\/[^/]+\/messages/.test(entry.path)));
+  assert.ok(writeRequests.length >= 6, `expected at least 6 record writes, got ${writeRequests.length}`);
+  for (const entry of writeRequests) {
+    assert.deepEqual(JSON.parse(entry.body).allowed_mentions, { parse: [] }, `${entry.method} ${entry.path}`);
+  }
+});
+
+test("records over 2000 characters chunk cleanly with links and marks on the first chunk, and a failed link edit is logged without blocking delivery", async () => {
+  const workspace = createRouterWorkspace(routerRegistry({
+    demo: { channel_id: "demo-channel", type: "claude", transport: "router", agent_message_targets: ["beta"] },
+    beta: { channel_id: "beta-channel", type: "codex", transport: "router" },
+  }));
+  const router = await routerWithWebhooks(workspace, ["demo", "beta"]);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.requestLog = [];
+  });
+
+  const demo = await connectAgentProject(workspace, "demo", "demo-key");
+  const beta = await connectAgentProject(workspace, "beta", "beta-key");
+
+  const longRequestText = `${"a".repeat(1400)}\n${"b".repeat(1300)}`;
+  const sent = await demo.request("agent_request", {
+    target: "beta",
+    text: longRequestText,
+    idempotency_key: "chunk-req-1",
+    context_pct: 51,
+  });
+  assert.equal(sent.ok, true, JSON.stringify(sent));
+  const reqId = sent.result.request_id;
+
+  const reqEvent = await waitFor(
+    () => beta.events.find((event) => event.event === "agent_message" && event.request_id === reqId),
+    () => `beta chunked request: ${JSON.stringify(beta.events)}`,
+  );
+
+  const afterRequest = readState(workspace.stateDir).fixtures.discord;
+  const senderReqChunks = afterRequest.messages.filter((message) => message.channelId === "demo-channel" && message.webhookId);
+  const receiverReqChunks = afterRequest.messages.filter((message) => message.channelId === "beta-channel" && !message.webhookId);
+  assert.ok(senderReqChunks.length >= 2, `expected chunked sender request, got ${senderReqChunks.length}`);
+  assert.ok(receiverReqChunks.length >= 2, `expected chunked receiver request, got ${receiverReqChunks.length}`);
+  for (const chunk of [...senderReqChunks, ...receiverReqChunks]) {
+    assert.ok(chunk.content.length <= 2000, `chunk exceeded 2000 chars (${chunk.content.length})`);
+  }
+
+  // Links and `post` point to the first chunk of each record, and the body text is preserved intact.
+  const senderFirst = senderReqChunks[0];
+  const receiverFirst = receiverReqChunks[0];
+  assert.deepEqual(reqEvent.post, { channel_id: "beta-channel", message_id: receiverFirst.id });
+  const senderHeaderLine = senderFirst.content.slice(0, senderFirst.content.indexOf("\n"));
+  const receiverHeaderLine = receiverFirst.content.slice(0, receiverFirst.content.indexOf("\n"));
+  assert.equal(
+    senderHeaderLine,
+    `-# ⇄ Agent Request to **beta-codex** · ${reqId} · [counterpart](https://discord.com/channels/guild-id/beta-channel/${receiverFirst.id})`,
+  );
+  assert.equal(
+    receiverHeaderLine,
+    `-# ⇄ Agent Request from **demo-claude** · ${reqId} · [counterpart](https://discord.com/channels/guild-id/demo-channel/${senderFirst.id})`,
+  );
+  const senderBody = senderFirst.content.slice(senderFirst.content.indexOf("\n") + 1)
+    + senderReqChunks.slice(1).map((chunk) => chunk.content).join("");
+  const receiverBody = receiverFirst.content.slice(receiverFirst.content.indexOf("\n") + 1)
+    + receiverReqChunks.slice(1).map((chunk) => chunk.content).join("");
+  assert.equal(senderBody, longRequestText);
+  assert.equal(receiverBody, longRequestText);
+
+  // Reply over 2000 characters also chunks, links on first chunks, and marks only the first request chunks ✅.
+  const longReplyText = `${"c".repeat(1500)}\n${"d".repeat(1200)}`;
+  const replied = await beta.request("agent_reply", {
+    request_id: reqId,
+    text: longReplyText,
+    idempotency_key: "chunk-reply-1",
+    context_pct: 33,
+  });
+  assert.equal(replied.ok, true, JSON.stringify(replied));
+
+  const replyEvent = await waitFor(
+    () => demo.events.find((event) => event.event === "agent_message" && event.kind === "reply" && event.request_id === reqId),
+    () => `demo chunked reply: ${JSON.stringify(demo.events)}`,
+  );
+
+  const afterReply = readState(workspace.stateDir).fixtures.discord;
+  const replierReplyChunks = afterReply.messages.filter((message) => message.channelId === "beta-channel" && message.webhookId);
+  const receiverReplyChunks = afterReply.messages.filter((message) => message.channelId === "demo-channel" && !message.webhookId);
+  assert.ok(replierReplyChunks.length >= 2, `expected chunked replier reply, got ${replierReplyChunks.length}`);
+  assert.ok(receiverReplyChunks.length >= 2, `expected chunked receiver reply, got ${receiverReplyChunks.length}`);
+  for (const chunk of [...replierReplyChunks, ...receiverReplyChunks]) {
+    assert.ok(chunk.content.length <= 2000, `reply chunk exceeded 2000 chars (${chunk.content.length})`);
+  }
+  assert.deepEqual(replyEvent.post, { channel_id: "demo-channel", message_id: receiverReplyChunks[0].id });
+
+  const checkMarks = (afterReply.reactions ?? []).filter((reaction) => reaction.emoji === encodeURIComponent("✅"));
+  assert.deepEqual(checkMarks, [
+    { authorization: `Bot ${ROOT_TOKEN}`, channelId: "demo-channel", emoji: encodeURIComponent("✅"), messageId: senderFirst.id },
+    { authorization: `Bot ${ROOT_TOKEN}`, channelId: "beta-channel", emoji: encodeURIComponent("✅"), messageId: receiverFirst.id },
+  ]);
+
+  // Every chunk write carried empty allowed_mentions.
+  const writeRequests = afterReply.requestLog.filter((entry) =>
+    (entry.method === "POST" || entry.method === "PATCH")
+    && (/^\/api\/v10\/webhooks\/[^/]+\/[^/]+/.test(entry.path) || /^\/api\/v10\/channels\/[^/]+\/messages/.test(entry.path)));
+  for (const entry of writeRequests) {
+    assert.deepEqual(JSON.parse(entry.body).allowed_mentions, { parse: [] }, `${entry.method} ${entry.path}`);
+  }
+
+  // A failed counterpart link edit is logged and does not block delivery.
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.restFailures = [{ method: "PATCH", status: 500 }];
+  });
+  const sent2 = await demo.request("agent_request", {
+    target: "beta",
+    text: "Link edit may fail",
+    idempotency_key: "chunk-req-2",
+  });
+  assert.equal(sent2.ok, true, JSON.stringify(sent2));
+  const req2Event = await waitFor(
+    () => beta.events.find((event) => event.event === "agent_message" && event.request_id === sent2.result.request_id),
+    () => `beta event after failed link edit: ${JSON.stringify(beta.events)}`,
+  );
+  assert.equal(req2Event.post.channel_id, "beta-channel");
+  await router.waitForOutput(new RegExp(`agent_message_link_edit_failed id=${sent2.result.request_id}`));
+});
+
+test("request record post failure marks the request failed, reacts ⚠️ if posted, notifies sender, delivers nothing to target, and refuses late replies with request_failed", async () => {
+  const workspace = createRouterWorkspace(routerRegistry({
+    demo: { channel_id: "demo-channel", type: "claude", transport: "router", agent_message_targets: ["beta"] },
+    beta: { channel_id: "beta-channel", type: "codex", transport: "router" },
+  }));
+  await routerWithWebhooks(workspace, ["demo", "beta"], { env: { CCDM_ROUTER_RATE_LIMIT_MAX_WAIT_MS: "500" } });
+
+  const demo = await connectAgentProject(workspace, "demo", "demo-key");
+  const beta = await connectAgentProject(workspace, "beta", "beta-key");
+
+  // 1. Sender-side record post fails (rate limit outlasts the Router's wait bound):
+  // nothing posted in target, no ⚠️ reaction, notice with outcome=failed and post=null, reply -> request_failed.
+  const demoWebhook = readState(workspace.stateDir).fixtures.discord.webhooks.find((w) => w.channel_id === "demo-channel");
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.rateLimits = [
+      { method: "POST", path: `/api/v10/webhooks/${demoWebhook.id}/${demoWebhook.token}`, count: null, retryAfter: 0.3, bucket: "demo-wh" },
+    ];
+  });
+  const failedSender = await demo.request("agent_request", {
+    target: "beta",
+    text: "Cannot post sender side",
+    idempotency_key: "fail-sender-1",
+  });
+  assert.equal(failedSender.ok, true, JSON.stringify(failedSender));
+  const senderNotice = await waitFor(
+    () => demo.events.find((event) => event.event === "agent_message" && event.kind === "notice"
+      && event.request_id === failedSender.result.request_id),
+    () => `demo sender failure notice: ${JSON.stringify(demo.events)}`,
+  );
+  assert.equal(senderNotice.outcome, "failed");
+  assert.equal(senderNotice.post, null);
+  assert.deepEqual(senderNotice.target, { project: "beta", conversation_id: "beta-channel" });
+  assert.equal(senderNotice.from, undefined);
+  const ackNotice = await demo.request("agent_message_ack", { delivery_id: senderNotice.delivery_id });
+  assert.equal(ackNotice.ok, true, JSON.stringify(ackNotice));
+
+  await fenceOwnerMessage(workspace, beta, "beta-channel", "fence-after-sender-fail");
+  assert.deepEqual(beta.events.filter((event) => event.event === "agent_message"), []);
+  const afterSenderFail = readState(workspace.stateDir).fixtures.discord;
+  assert.deepEqual(afterSenderFail.messages ?? [], []);
+  assert.deepEqual(afterSenderFail.reactions ?? [], []);
+
+  const replyToFailed1 = await beta.request("agent_reply", {
+    request_id: failedSender.result.request_id,
+    text: "Too late",
+    idempotency_key: "reply-failed-1",
+  });
+  assert.equal(replyToFailed1.ok, false);
+  assert.equal(replyToFailed1.error.code, "request_failed");
+
+  // 2. Sender-side record posts, receiver-side record fails (500):
+  // sender-side record gets ⚠️, target receives nothing, sender gets notice with post=sender record, reply -> request_failed.
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.rateLimits = [];
+    state.fixtures.discord.restFailures = [
+      { method: "POST", path: "/api/v10/channels/beta-channel/messages", status: 500 },
+    ];
+  });
+  const failedReceiver = await demo.request("agent_request", {
+    target: "beta",
+    text: "Cannot post receiver side",
+    idempotency_key: "fail-receiver-1",
+  });
+  assert.equal(failedReceiver.ok, true, JSON.stringify(failedReceiver));
+
+  const receiverNotice = await waitFor(
+    () => demo.events.find((event) => event.event === "agent_message" && event.kind === "notice"
+      && event.request_id === failedReceiver.result.request_id),
+    () => `demo receiver failure notice: ${JSON.stringify(demo.events)}`,
+  );
+  const afterReceiverFail = readState(workspace.stateDir).fixtures.discord;
+  const senderOnlyPost = afterReceiverFail.messages.find((message) => message.channelId === "demo-channel" && message.webhookId);
+  assert.ok(senderOnlyPost, `expected sender-side post: ${JSON.stringify(afterReceiverFail.messages)}`);
+  assert.deepEqual(
+    afterReceiverFail.messages.filter((message) => message.channelId === "beta-channel"),
+    [],
+  );
+  assert.equal(receiverNotice.outcome, "failed");
+  assert.deepEqual(receiverNotice.post, { channel_id: "demo-channel", message_id: senderOnlyPost.id });
+  assert.deepEqual(receiverNotice.target, { project: "beta", conversation_id: "beta-channel" });
+  assert.deepEqual(afterReceiverFail.reactions, [
+    { authorization: `Bot ${ROOT_TOKEN}`, channelId: "demo-channel", emoji: encodeURIComponent("⚠️"), messageId: senderOnlyPost.id },
+  ]);
+
+  await fenceOwnerMessage(workspace, beta, "beta-channel", "fence-after-receiver-fail");
+  assert.deepEqual(beta.events.filter((event) => event.event === "agent_message"), []);
+
+  const replyToFailed2 = await beta.request("agent_reply", {
+    request_id: failedReceiver.result.request_id,
+    text: "Still cannot reply",
+    idempotency_key: "reply-failed-2",
+  });
+  assert.equal(replyToFailed2.ok, false);
+  assert.equal(replyToFailed2.error.code, "request_failed");
+});
+
+test("a reply whose record cannot be posted is still delivered and still marks both request posts ✅", async () => {
+  const workspace = createRouterWorkspace(routerRegistry({
+    demo: { channel_id: "demo-channel", type: "claude", transport: "router", agent_message_targets: ["beta"] },
+    beta: { channel_id: "beta-channel", type: "codex", transport: "router" },
+  }));
+  await routerWithWebhooks(workspace, ["demo", "beta"]);
+
+  const demo = await connectAgentProject(workspace, "demo", "demo-key");
+  const beta = await connectAgentProject(workspace, "beta", "beta-key");
+  const betaWebhook = readState(workspace.stateDir).fixtures.discord.webhooks.find((w) => w.channel_id === "beta-channel");
+
+  // Case A: replier-side webhook record fails (500); receiver-side record posts and reply delivers with post.
+  const sentA = await demo.request("agent_request", {
+    target: "beta",
+    text: "Question A",
+    idempotency_key: "rfail-req-a",
+  });
+  await waitFor(
+    () => beta.events.some((event) => event.event === "agent_message" && event.request_id === sentA.result.request_id),
+    () => "beta request A",
+  );
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.restFailures = [
+      { method: "POST", path: `/api/v10/webhooks/${betaWebhook.id}/${betaWebhook.token}`, status: 500 },
+    ];
+  });
+  const replyA = await beta.request("agent_reply", {
+    request_id: sentA.result.request_id,
+    text: "Answer A",
+    idempotency_key: "rfail-rep-a",
+  });
+  assert.equal(replyA.ok, true, JSON.stringify(replyA));
+  const replyEventA = await waitFor(
+    () => demo.events.find((event) => event.event === "agent_message" && event.kind === "reply"
+      && event.request_id === sentA.result.request_id),
+    () => `demo reply A: ${JSON.stringify(demo.events)}`,
+  );
+  assert.equal(replyEventA.text, "Answer A");
+  assert.equal(replyEventA.post.channel_id, "demo-channel");
+  const receiverPostA = readState(workspace.stateDir).fixtures.discord.messages.find((m) => m.id === replyEventA.post.message_id);
+  assert.equal(receiverPostA.content, `-# ⇄ Agent Reply from **beta-codex** · ${sentA.result.request_id}\nAnswer A`);
+
+  // Case B: receiver-side bot record fails (500); reply still delivers with post: null and ✅ marks land.
+  const sentB = await demo.request("agent_request", {
+    target: "beta",
+    text: "Question B",
+    idempotency_key: "rfail-req-b",
+  });
+  await waitFor(
+    () => beta.events.some((event) => event.event === "agent_message" && event.request_id === sentB.result.request_id),
+    () => "beta request B",
+  );
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.restFailures = [
+      { method: "POST", path: "/api/v10/channels/demo-channel/messages", status: 500 },
+    ];
+  });
+  const replyB = await beta.request("agent_reply", {
+    request_id: sentB.result.request_id,
+    text: "Answer B",
+    idempotency_key: "rfail-rep-b",
+  });
+  assert.equal(replyB.ok, true, JSON.stringify(replyB));
+  const replyEventB = await waitFor(
+    () => demo.events.find((event) => event.event === "agent_message" && event.kind === "reply"
+      && event.request_id === sentB.result.request_id),
+    () => `demo reply B: ${JSON.stringify(demo.events)}`,
+  );
+  assert.equal(replyEventB.text, "Answer B");
+  assert.equal(replyEventB.post, null);
+
+  const checkMarks = (readState(workspace.stateDir).fixtures.discord.reactions ?? [])
+    .filter((reaction) => reaction.emoji === encodeURIComponent("✅"));
+  assert.equal(checkMarks.length, 4, `expected 4 ✅ marks across both exchanges, got ${JSON.stringify(checkMarks)}`);
+});
+
+test("target_offline posts one ⚠️-marked record in sender conversation only, not_granted posts nothing, and Session Scope is unchanged", async () => {
+  const workspace = createRouterWorkspace(routerRegistry({
+    demo: { channel_id: "demo-channel", type: "claude", transport: "router", agent_message_targets: ["beta"] },
+    beta: { channel_id: "beta-channel", type: "codex", transport: "router" },
+  }));
+  const router = await routerWithWebhooks(workspace, ["demo", "beta"]);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.requestLog = [];
+  });
+
+  const demo = await connectAgentProject(workspace, "demo", "demo-key");
+
+  // 1. target_offline posts exactly one record in demo-channel with `not delivered: target_offline` and ⚠️, nothing in beta-channel.
+  const offline = await demo.request("agent_request", {
+    target: "beta",
+    text: "Anyone there?",
+    idempotency_key: "off-rec-1",
+    context_pct: 18,
+  });
+  assert.equal(offline.ok, false);
+  assert.equal(offline.error.code, "target_offline");
+
+  const offlineState = await waitFor(() => {
+    const discord = readState(workspace.stateDir).fixtures.discord;
+    const hasMsg = (discord.messages ?? []).some((m) => m.channelId === "demo-channel" && m.webhookId);
+    const hasWarn = (discord.reactions ?? []).some((r) => r.emoji === encodeURIComponent("⚠️"));
+    return hasMsg && hasWarn ? discord : null;
+  }, () => `offline record and ⚠️: ${JSON.stringify(readState(workspace.stateDir).fixtures.discord)}`);
+
+  assert.equal(offlineState.messages.length, 1, JSON.stringify(offlineState.messages));
+  const [offlineMsg] = offlineState.messages;
+  assert.equal(offlineMsg.channelId, "demo-channel");
+  assert.equal(offlineMsg.username, "demo-claude · 18%");
+  assert.match(
+    offlineMsg.content,
+    /^-# ⇄ Agent Request to \*\*beta-codex\*\* · req-[0-9a-f]{12} · not delivered: target_offline\nAnyone there\?$/,
+  );
+  assert.deepEqual(offlineState.reactions, [
+    { authorization: `Bot ${ROOT_TOKEN}`, channelId: "demo-channel", emoji: encodeURIComponent("⚠️"), messageId: offlineMsg.id },
+  ]);
+  const offlinePostLog = offlineState.requestLog.find((entry) => entry.method === "POST" && entry.path.includes("/webhooks/"));
+  assert.deepEqual(JSON.parse(offlinePostLog.body).allowed_mentions, { parse: [] });
+
+  // 2. not_granted posts nothing in either conversation.
+  const beta = await connectAgentProject(workspace, "beta", "beta-key");
+  const denied = await beta.request("agent_request", {
+    target: "demo",
+    text: "Should never post",
+    idempotency_key: "denied-rec-1",
+  });
+  assert.equal(denied.ok, false);
+  assert.equal(denied.error.code, "not_granted");
+
+  // Run an ordinary exchange (demo -> beta -> demo) so we have records in both conversations and also fence the denied send.
+  const sent = await demo.request("agent_request", {
+    target: "beta",
+    text: "Scope test request",
+    idempotency_key: "scope-req-1",
+  });
+  assert.equal(sent.ok, true, JSON.stringify(sent));
+  const reqEvent = await waitFor(
+    () => beta.events.find((event) => event.event === "agent_message" && event.request_id === sent.result.request_id),
+    () => "beta scope test request",
+  );
+  const replied = await beta.request("agent_reply", {
+    request_id: sent.result.request_id,
+    text: "Scope test reply",
+    idempotency_key: "scope-rep-1",
+  });
+  assert.equal(replied.ok, true, JSON.stringify(replied));
+  const replyEvent = await waitFor(
+    () => demo.events.find((event) => event.event === "agent_message" && event.kind === "reply"
+      && event.request_id === sent.result.request_id),
+    () => "demo scope test reply",
+  );
+
+  const afterExchange = readState(workspace.stateDir).fixtures.discord;
+  assert.equal(
+    afterExchange.messages.some((message) => message.content.includes("Should never post")),
+    false,
+    "not_granted must post nothing in either conversation",
+  );
+
+  // 3. Session Scope is unchanged: neither side can read, react to, or edit the other conversation or its records,
+  // nor edit the root-bot receiver record in its own conversation.
+  const demoSenderPost = afterExchange.messages.find((m) => m.channelId === "demo-channel" && m.webhookId && m.id !== offlineMsg.id);
+  const betaReceiverPost = afterExchange.messages.find((m) => m.id === reqEvent.post.message_id);
+  const betaReplierPost = afterExchange.messages.find((m) => m.channelId === "beta-channel" && m.webhookId);
+  const demoReceiverPost = afterExchange.messages.find((m) => m.id === replyEvent.post.message_id);
+
+  const scopeAttempts = [
+    ["demo fetch beta channel", demo, "fetch_messages", { channel_id: "beta-channel", limit: 10 }],
+    ["demo read_last beta channel", demo, "read_last_x_messages_in_channel", { channel_id: "beta-channel", count: 5 }],
+    ["demo react beta channel", demo, "react", { channel_id: "beta-channel", message_id: betaReceiverPost.id, emoji: "👍" }],
+    ["demo react beta record via own channel", demo, "react", { channel_id: "demo-channel", message_id: betaReplierPost.id, emoji: "👍" }],
+    ["demo edit beta record via beta channel", demo, "edit_message", { channel_id: "beta-channel", message_id: betaReplierPost.id, text: "nope" }],
+    ["demo edit beta record via own channel", demo, "edit_message", { channel_id: "demo-channel", message_id: betaReplierPost.id, text: "nope" }],
+    ["demo edit root-bot reply record in own channel", demo, "edit_message", { channel_id: "demo-channel", message_id: demoReceiverPost.id, text: "nope" }],
+    ["beta fetch demo channel", beta, "fetch_messages", { channel_id: "demo-channel", limit: 10 }],
+    ["beta read_last demo channel", beta, "read_last_x_messages_in_channel", { channel_id: "demo-channel", count: 5 }],
+    ["beta react demo channel", beta, "react", { channel_id: "demo-channel", message_id: demoSenderPost.id, emoji: "👍" }],
+    ["beta react demo record via own channel", beta, "react", { channel_id: "beta-channel", message_id: demoSenderPost.id, emoji: "👍" }],
+    ["beta edit demo record via own channel", beta, "edit_message", { channel_id: "beta-channel", message_id: demoSenderPost.id, text: "nope" }],
+    ["beta edit root-bot request record in own channel", beta, "edit_message", { channel_id: "beta-channel", message_id: betaReceiverPost.id, text: "nope" }],
+  ];
+  for (const [label, caller, op, args] of scopeAttempts) {
+    const res = await caller.request(op, args);
+    assert.equal(res.ok, false, `${label} should fail`);
+    assert.equal(res.error.code, "scope_violation", `${label}: ${JSON.stringify(res)}`);
+  }
+  await router.waitForOutput(/scope_violation project=beta op=edit_message/);
 });

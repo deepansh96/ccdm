@@ -132,6 +132,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
 
   const agentMessages = createAgentMessages({
     stateDir,
+    context,
     log,
     findListener(conversation) {
       if (conversation.thread_id) {
