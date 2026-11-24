@@ -403,6 +403,34 @@ db.commit()`, path.join(supervisorStateDir(workspace), "threads.sqlite3"), OWNER
   assert.deepEqual([row.whose_turn, row.turn_outcome], ["owner", "completed"]);
 });
 
+test("Agent Message records in a thread are never inputs for thread turn marks", async () => {
+  const workspace = threadWorkspace();
+  await supervised(workspace);
+  await answeredThread(workspace);
+  await shows(workspace, ["boot-message-1 ✅"]);
+
+  const registry = JSON.parse(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"));
+  const webhookId = registry.projects.demo.webhook_id;
+  injectDiscordMessage(workspace, {
+    id: "record-webhook-1", channelId: THREAD_ID,
+    content: "-# ⇄ Agent Request to **beta-claude** · req-0123456789ab\ncheck deploy",
+    author: { id: webhookId, username: "demo-claude · 10%", bot: true }, webhookId,
+  });
+  injectDiscordMessage(workspace, {
+    id: "record-root-1", channelId: THREAD_ID,
+    content: "-# ⇄ Agent Reply from **beta-claude** · req-0123456789ab\ndeploy healthy",
+    author: { id: BOT_USER_ID, username: "root", bot: true },
+  });
+  // A subsequent real owner message proves the supervisor processed everything before it.
+  threadMessage(workspace, "owner-after-records", "thanks, now check logs");
+  await shows(workspace, ["boot-message-1 ✅", "owner-after-records ✅"]);
+
+  assert.deepEqual(
+    markCalls(workspace).filter(call => call.messageId === "record-webhook-1" || call.messageId === "record-root-1"),
+    [],
+  );
+});
+
 // The activity writer on its own: the hook ignores a `/` command typed into the
 // pane (no Stop may follow it), and concurrent writers never lose each other's fields.
 test("the activity hook skips / commands, and concurrent activity writers keep every field", async () => {

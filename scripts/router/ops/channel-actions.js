@@ -5,6 +5,7 @@
 // reactions, and typing.
 const { MESSAGE_LIMIT } = require("../chunks.js");
 const { currentDeadline, discordRequest, withDeadline } = require("../discord-rest.js");
+const { isAgentMessageRecord } = require("../agent-messages/record-format.js");
 const { projectWebhookSecret } = require("../webhooks.js");
 const { OpError, ScopeViolation } = require("./errors.js");
 const { threadQuery } = require("./reply.js");
@@ -72,6 +73,9 @@ async function editMessage(ctx, args) {
   if (typeof args.text !== "string" || args.text.length === 0 || args.text.length > MESSAGE_LIMIT) {
     throw new OpError("invalid_args", `text must be 1-${MESSAGE_LIMIT} characters`);
   }
+  if (isAgentMessageRecord(args.text)) {
+    throw new OpError("invalid_args", "edit text cannot start with the Agent Message record prefix");
+  }
   if (ctx.session.role === "root") return editBotMessage(ctx, args, arrival);
   const { route } = ctx.session;
   const secret = await projectWebhookSecret({
@@ -81,6 +85,9 @@ async function editMessage(ctx, args) {
   const message = await scopedMessage(ctx, args.message_id);
   if (message.webhook_id !== secret.webhook_id) {
     throw new ScopeViolation(args.message_id, "only this project's own webhook messages can be edited");
+  }
+  if (isAgentMessageRecord(message.content)) {
+    throw new OpError("invalid_args", "Agent Message records cannot be edited");
   }
   return coalescedEdit(`${secret.webhook_id}/${message.id}`, arrival, args.text, async text => {
     const edited = await discordRequest("PATCH", `/webhooks/${secret.webhook_id}/${secret.token}/messages/${message.id}`, {
@@ -94,6 +101,9 @@ async function editBotMessage(ctx, args, arrival) {
   const message = await scopedMessage(ctx, args.message_id);
   if (message.webhook_id || !ctx.bot.id || message.author?.id !== ctx.bot.id) {
     throw new ScopeViolation(args.message_id, "only the bot's own messages can be edited");
+  }
+  if (isAgentMessageRecord(message.content)) {
+    throw new OpError("invalid_args", "Agent Message records cannot be edited");
   }
   const { channel_id: channelId } = ctx.session.route;
   return coalescedEdit(`bot/${message.id}`, arrival, args.text, async text => {

@@ -7,6 +7,7 @@ const path = require("node:path");
 const { splitMessage } = require("../chunks.js");
 const { discordRequest } = require("../discord-rest.js");
 const { avatarUrl, webhookUsername } = require("../identity.js");
+const { isAgentMessageRecord } = require("../agent-messages/record-format.js");
 const { withProjectWebhook } = require("../webhooks.js");
 const { OpError } = require("./errors.js");
 const { scopedMessage } = require("./targets.js");
@@ -47,6 +48,9 @@ function validReply(args) {
   const files = validFiles(args.files);
   if (typeof args.text !== "string" || (args.text.length === 0 && files.length === 0)) {
     throw new OpError("invalid_args", "text is required");
+  }
+  if (isAgentMessageRecord(args.text)) {
+    throw new OpError("invalid_args", "reply text cannot start with the Agent Message record prefix");
   }
   return files;
 }

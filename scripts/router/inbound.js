@@ -3,6 +3,8 @@
 // Inbound classification: which Discord events reach a project session or
 // root, and as what. Returns null for anything the Router ignores. A result
 // with `root: true` is for root's session, never the project's.
+const { isAgentMessageRecord } = require("./agent-messages/record-format.js");
+
 const COMMANDS = new Set(["/pause", "/unpause", "/compact", "/clear", "/restart"]);
 const CLOSE_COMMAND = "/close";
 // In a thread, only these reach the thread session as commands; the
@@ -148,11 +150,18 @@ function classifyThreadMessage(table, message, route, user) {
 }
 
 // Who wrote a thread message, for the supervisor: the owner, a current guest
-// of the parent, the root bot itself, the project's own webhook, or anyone else.
+// of the parent, the root bot itself, the project's own webhook, an Agent
+// Message record from either, or anyone else.
 function authorClass(table, message, route) {
   const id = String(message.author?.id ?? "");
-  if (message.webhookId) return String(message.webhookId) === route.webhook_id ? "project_webhook" : "other";
-  if (message.author?.bot) return id === String(message.client?.user?.id) ? "root_bot" : "other";
+  if (message.webhookId) {
+    if (String(message.webhookId) !== route.webhook_id) return "other";
+    return isAgentMessageRecord(message.content) ? "agent_message" : "project_webhook";
+  }
+  if (message.author?.bot) {
+    if (id !== String(message.client?.user?.id)) return "other";
+    return isAgentMessageRecord(message.content) ? "agent_message" : "root_bot";
+  }
   if (id === table.ownerId) return "owner";
   return route.guests.includes(id) ? "guest" : "other";
 }

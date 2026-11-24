@@ -187,3 +187,66 @@ test("an owner /close during scanning closes the conversation and still receives
   assert.equal(acknowledged.fixtures.codex.appServerInvocations.length, 0);
   await stop(workspace, stateDir, worker);
 });
+
+test("discovery treats Agent Message records as other and keeps reminder decisions unchanged", async () => {
+  const workspace = createBridgeWorkspace();
+  const stateDir = await setup(workspace, {
+    unanswered: "ch-unanswered",
+    answered: "ch-answered",
+    closed: "ch-closed",
+    later: "ch-later",
+  });
+  const rootRecord = (id, timestamp, content) => ({
+    id, timestamp, content, type: 0, attachments: [],
+    author: { id: "fixture-bot-user-id", bot: true },
+  });
+  const requestRecord = "-# ⇄ Agent Request to **beta-claude** · req-0123456789ab\ncheck deploy";
+  const replyRecord = "-# ⇄ Agent Reply from **beta-claude** · req-0123456789ab\ndeploy healthy";
+  seedHistory(workspace, {
+    "ch-unanswered": [
+      rootRecord("1003", "2026-09-20T08:06:00Z", replyRecord),
+      message("1002", "2026-09-20T08:05:00Z", "hook-unanswered", requestRecord),
+      message("1001", "2026-09-20T08:00:00Z", "owner", "Please inspect the deploy"),
+    ],
+    "ch-answered": [
+      rootRecord("2004", "2026-09-20T08:11:00Z", replyRecord),
+      message("2003", "2026-09-20T08:10:00Z", "hook-answered", requestRecord),
+      message("2002", "2026-09-20T08:05:00Z", "hook-answered", "Deploy looks good."),
+      message("2001", "2026-09-20T08:00:00Z", "owner", "How is the deploy?"),
+    ],
+    "ch-closed": [
+      rootRecord("3005", "2026-09-20T08:11:00Z", replyRecord),
+      message("3004", "2026-09-20T08:10:00Z", "hook-closed", requestRecord),
+      message("3003", "2026-09-20T08:06:00Z", "owner", "/close"),
+      message("3002", "2026-09-20T08:05:00Z", "hook-closed", "All set."),
+      message("3001", "2026-09-20T08:00:00Z", "owner", "Wrap it up"),
+    ],
+    "ch-later": [
+      message("4002", "2026-09-20T08:05:00Z", "hook-later", "Headers start with -# ⇄ Agent for records."),
+      message("4001", "2026-09-20T08:00:00Z", "owner", "What prefix do records use?"),
+    ],
+  });
+
+  await command(workspace, stateDir, "discover");
+  const worker = startWorker(workspace, stateDir, "2026-09-20T08:30:00Z");
+  const ready = await waitForStatus(workspace, stateDir, current =>
+    ["unanswered", "answered", "closed", "later"].every(name =>
+      current.conversations[name]?.reconciliation_status === "ready"));
+
+  assert.equal(ready.conversations.unanswered.state, "open-paused");
+  assert.equal(ready.conversations.unanswered.discovery.basis, "no-answer-after-reply");
+  assert.equal(ready.conversations.unanswered.response_message_id, null);
+
+  assert.equal(ready.conversations.answered.state, "awaiting-owner");
+  assert.equal(ready.conversations.answered.response_message_id, "2002");
+  assert.equal(ready.conversations.answered.response_at, "2026-09-20T08:05:00Z");
+  assert.equal(ready.conversations.answered.due_at, "2026-09-20T09:05:00Z");
+
+  assert.equal(ready.conversations.closed.state, "closed");
+  assert.equal(ready.conversations.closed.discovery.basis, "closed-in-history");
+
+  assert.equal(ready.conversations.later.state, "awaiting-owner");
+  assert.equal(ready.conversations.later.response_message_id, "4002");
+  assert.equal(ready.conversations.later.response_at, "2026-09-20T08:05:00Z");
+  await stop(workspace, stateDir, worker);
+});
