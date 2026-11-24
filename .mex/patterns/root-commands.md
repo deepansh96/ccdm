@@ -1,6 +1,6 @@
 ---
 name: root-commands
-description: Root's everyday commands on macOS and Windows (list, status, start, stop, restart, context report, usage report, restart yourself, create a poll), each with its triggers and its `scripts/ccdm` command.
+description: Root's everyday commands on macOS and Windows (list, status, start, stop, restart, context report, usage report, restart yourself, Agent Message Grants, create a poll, transcribe a voice message), each with its triggers and its `scripts/ccdm` command.
 triggers:
   - "list"
   - "status"
@@ -12,6 +12,10 @@ triggers:
   - "usage"
   - "limits"
   - "restart yourself"
+  - "agent messages"
+  - "allow agent messages"
+  - "revoke agent messages"
+  - "agent message grants"
   - "poll"
   - "voice message"
 edges:
@@ -19,11 +23,13 @@ edges:
     condition: before changing session state, for the lifecycle rules behind these commands
   - target: patterns/manage-session.md
     condition: when a start, stop or restart needs its checks and gotchas
+  - target: patterns/manage-agent-message-grants.md
+    condition: when allowing, revoking, or listing Agent Message Grants
   - target: patterns/register-project.md
     condition: when the request is to register or deregister a project
   - target: patterns/debug-discord-session.md
     condition: when a command here fails or a session does not answer
-last_updated: 2026-11-10
+last_updated: 2026-11-25
 ---
 
 # Root Commands
@@ -119,6 +125,21 @@ If the new root does not come up, the user can read that log and watch the sessi
 
 - macOS: from a terminal, `./restart-root-agent.sh` and `./restart-root-codex-agent.sh [<channel_id>]` run the same command.
 - Windows: root Codex is not supported yet, so `--provider codex` is refused.
+
+### Agent Message Grants
+Triggers: `agent messages`, `allow agent messages`, `revoke agent messages`, `agent message grants`.
+
+1. Allow one-way requests from `<from>` to `<to>` (both registered, neither `remote:`; `<from>` and `<to>` may match for a self-grant):
+   `scripts/ccdm agent-messages allow <from> <to>`
+   If `<from>` has guests, the command prints a warning with the guest count and still records the grant; relay that warning to the user.
+2. Revoke a grant (including a stale target):
+   `scripts/ccdm agent-messages revoke <from> <to>`
+   Removing an absent grant exits 0 and says there was nothing to remove.
+3. List grants (optionally filtered by one project, with `--json` for structured output):
+   `scripts/ccdm agent-messages list [<project>] [--json]`
+   Each line prints `from -> to` and flags unregistered targets as `(stale)`.
+
+Never edit `agent_message_targets` in `registry.json` by hand, and project sessions never edit grants. The command uses the shared registry lock, and the Router hot-reloads the change on the next send with no Router or session restart. See `patterns/manage-agent-message-grants.md`.
 
 ### Create a poll
 Triggers: `poll`, `create a poll`.

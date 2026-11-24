@@ -10,7 +10,9 @@ edges:
     condition: for registry and lifecycle invariants
   - target: context/discord-security.md
     condition: for Session Scope, root permissions, and credentials
-last_updated: 2026-11-21
+  - target: patterns/manage-agent-message-grants.md
+    condition: when checking or revoking stale Agent Message Grants
+last_updated: 2026-11-25
 ---
 
 # Register Or Deregister A Project
@@ -28,12 +30,14 @@ The steps are the same on macOS and Windows unless one says otherwise. Run the c
 6. Start the session: `scripts/ccdm start-session <project>` for Claude, or `scripts/ccdm start-codex-session <project>` for Codex. The first launch in a registered folder accepts Claude's folder-trust dialog (#191), so that folder's project hooks and MCP servers run. The launcher accepts it only for the project's registered `path`. Register only a folder the user asked for.
 7. Check `node scripts/router.js status`: the project is connected in its channel and root has no missing channel permissions. Optionally `node scripts/router.js probe <project>` to confirm the webhook round trip.
 8. Thread Conversations need no registration step: they are on for every project once the Thread Supervisor runs. While threads are enabled, `router status` must show `thread_permissions=ok` for the new channel; if root's thread permissions are missing there, grant them once by hand.
+9. Run `scripts/ccdm agent-messages list` and revoke any stale entries (`scripts/ccdm agent-messages revoke <from> <to>`): deregistering a project does not automatically remove grants targeting it, so a project later registered under an old name inherits a stale grant.
 
 ## Deregister
 1. Stop fully with `scripts/ccdm stop-session <project> --all`, which stops the channel session and its Thread Conversations.
 2. Run `node scripts/router.js delete-webhook <project>` (deletes the webhook and its token and clears `webhook_id`; a rerun is a no-op).
 3. Revoke guests with `node scripts/guest-access.js revoke <project> <user_id>`, remove the entry, then run `scripts/ccdm reminders assignment-changed --project <project>`.
-4. The Thread Supervisor sets the project's threads `closed/deregistered` without a Discord call. Confirm it:
+4. Run `scripts/ccdm agent-messages list` and revoke any stale grants (`scripts/ccdm agent-messages revoke <from> <project>`) so a future project registered under the same name does not inherit them.
+5. The Thread Supervisor sets the project's threads `closed/deregistered` without a Discord call. Confirm it:
    - macOS: `scripts/threads.sh list` (unfiltered, since the project is no longer registered).
    - Windows: `scripts/ccdm threads list` (unfiltered, for the same reason).
 

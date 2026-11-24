@@ -299,6 +299,7 @@ const runbookFiles = [
   ".mex/context/setup.md",
   ".mex/context/stack.md",
   ".mex/patterns/debug-discord-session.md",
+  ".mex/patterns/manage-agent-message-grants.md",
   ".mex/patterns/manage-claude-home-login.md",
   ".mex/patterns/manage-session.md",
   ".mex/patterns/operate-conversation-reminders.md",
@@ -771,7 +772,7 @@ test("CLAUDE.md.example names POSIX-only commands only under macOS:, in the whol
 // Root's command entries, with the usage entry, "Discord Polls" and "Voice
 // Messages": the lines from "Commands" up to "Channel Routing Rules". They are
 // final. A change that rewrites one on purpose updates this hash with it.
-const ROOT_ENTRIES_SHA256 = "06cde4ffeb707d6e8d6c1042aab37d6d878987bb8d08acad6e4bfc8bb790731c";
+const ROOT_ENTRIES_SHA256 = "2fe86b3d82b8730522105ac8e440e74bcea3a8ecaee20cc0281cbfa4d92f1e41";
 
 test("root's command, usage and voice entries in CLAUDE.md.example are unchanged", () => {
   const { lines } = wholeFile(ROOT_ENTRIES.file);
@@ -779,11 +780,54 @@ test("root's command, usage and voice entries in CLAUDE.md.example are unchanged
   const end = lines.findIndex(line => line.startsWith(ROOT_ENTRIES.to));
   assert.ok(start >= 0 && end > start, `${ROOT_ENTRIES.file} lost one of root's command headings`);
   const entries = lines.slice(start, end);
-  for (const heading of ["#### 11. Usage report", "#### 12. Self-restart", "### Discord Polls", "### Voice Messages"]) {
+  for (const heading of [
+    "#### 11. Usage report",
+    "#### 12. Self-restart",
+    "#### 13. Agent Message Grants",
+    "### Discord Polls",
+    "### Voice Messages",
+  ]) {
     assert.ok(entries.some(line => line.startsWith(heading)), `"${heading}" is no longer among root's entries`);
   }
   assert.equal(createHash("sha256").update(entries.join("\n")).digest("hex"), ROOT_ENTRIES_SHA256,
     "root's entries changed; they are final, so restore them or update the hash on purpose");
+});
+
+test("root's Agent Message Grant instructions name scripts/ccdm agent-messages and stale-grant cleanup", () => {
+  const commands = listedCommands();
+  assert.ok(commands.has("agent-messages"), "agent-messages is missing from scripts/ccdm --help");
+  const verbs = listedCommands("agent-messages");
+  for (const verb of ["allow", "revoke", "list"]) {
+    assert.ok(verbs.has(verb), `agent-messages ${verb} is missing from scripts/ccdm agent-messages --help`);
+  }
+
+  const agents = fs.readFileSync("AGENTS.md", "utf8");
+  assert.match(agents, /Agent Message Grants[^\n]*never edited by project sessions[^\n]*scripts\/ccdm agent-messages allow\|revoke\|list/);
+
+  const rootCommands = fs.readFileSync(".mex/patterns/root-commands.md", "utf8");
+  for (const phrase of [
+    "scripts/ccdm agent-messages allow <from> <to>",
+    "scripts/ccdm agent-messages revoke <from> <to>",
+    "scripts/ccdm agent-messages list [<project>] [--json]",
+  ]) {
+    assert.match(rootCommands, new RegExp(escape(phrase)), `root-commands.md is missing "${phrase}"`);
+  }
+
+  const grantPattern = fs.readFileSync(".mex/patterns/manage-agent-message-grants.md", "utf8");
+  for (const phrase of [
+    "scripts/ccdm agent-messages allow <from> <to>",
+    "scripts/ccdm agent-messages revoke <from> <to>",
+    "scripts/ccdm agent-messages list",
+    "(stale)",
+  ]) {
+    assert.match(grantPattern, new RegExp(escape(phrase)), `manage-agent-message-grants.md is missing "${phrase}"`);
+  }
+
+  assert.match(fs.readFileSync(".mex/patterns/INDEX.md", "utf8"), /\[manage-agent-message-grants\.md\]\(manage-agent-message-grants\.md\)/);
+  const registerPattern = fs.readFileSync(".mex/patterns/register-project.md", "utf8");
+  assert.match(registerPattern, /scripts\/ccdm agent-messages list/);
+  assert.match(registerPattern, /scripts\/ccdm agent-messages revoke/);
+  assert.match(registerPattern, /inherits a stale grant/i);
 });
 
 test("every scripts/ccdm command in the skills and CLAUDE.md.example exists, with the variables the skills read", () => {
