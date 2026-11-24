@@ -22,6 +22,7 @@ const MAX_TIMEOUT_MINUTES = 120;
 const DEFAULT_MINUTE_MS = 60000;
 const DEFAULT_RATE_WINDOW_MS = 3600000;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
+const LEDGER_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const DEFAULT_LIMITS = Object.freeze({
   depth: 3,
   requests_per_hour: 20,
@@ -128,7 +129,7 @@ function errorSummary(error) {
   };
 }
 
-function createAgentMessages({ stateDir, context, findListener, listThreadListeners = () => [], deliver, log }) {
+function createAgentMessages({ stateDir, context, getTable, findListener, listThreadListeners = () => [], deliver, log }) {
   const ledger = createAgentMessageLedger({ stateDir });
   // request_id -> exchange state
   const exchanges = new Map();
@@ -142,8 +143,19 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
   const idempotencyLocks = new Map();
   let closed = false;
 
+  function assertLedgerAvailable() {
+    const error = ledger.error();
+    if (error !== null) {
+      throw new OpError("ledger_unavailable", `agent message ledger unavailable: ${error}`);
+    }
+  }
+
+  function idempotencyKeyFromParts(op, project, conversationId, launch, key) {
+    return JSON.stringify([op, project, conversationId, launch, key]);
+  }
+
   function idempotencyKeyFor(op, session, key) {
-    return JSON.stringify([op, session.route.project, session.route.channel_id, session.keyFingerprint, key]);
+    return idempotencyKeyFromParts(op, session.route.project, session.route.channel_id, session.keyFingerprint, key);
   }
 
   function pruneExpiredIdempotency(now) {
@@ -885,6 +897,7 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
     if (args.timeout_minutes !== undefined && (!Number.isInteger(args.timeout_minutes) || args.timeout_minutes < 1)) {
       throw new OpError("invalid_args", "timeout_minutes must be a positive integer");
     }
+    assertLedgerAvailable();
 
     const cacheKey = idempotencyKeyFor("agent_request", ctx.session, args.idempotency_key);
     return withIdempotency(cacheKey, async () => {
@@ -969,12 +982,15 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
       const expiresAtMs = now + timeoutMinutes * minuteMs();
       const expiresAt = new Date(expiresAtMs).toISOString();
       const toLaunch = targetListener.keyFingerprint;
+      const targetProjectRoute = ctx.table.projects.get(to.project);
 
       await ledger.append({
         type: "request",
         request_id: requestId,
         from,
         to,
+        from_channel_id: senderRoute.channel_id,
+        to_channel_id: targetProjectRoute.channel_id,
         from_launch: fromLaunch,
         to_launch: toLaunch,
         text: args.text,
@@ -984,7 +1000,6 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
       });
       recordRate(from.project, now);
 
-      const targetProjectRoute = ctx.table.projects.get(to.project);
       const exchange = {
         request_id: requestId,
         state: "open",
@@ -1023,6 +1038,7 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
     if (!isNonEmptyString(args.request_id)) throw new OpError("invalid_args", "request_id is required");
     if (!isNonEmptyString(args.text)) throw new OpError("invalid_args", "text is required");
     if (!isNonEmptyString(args.idempotency_key)) throw new OpError("invalid_args", "idempotency_key is required");
+    assertLedgerAvailable();
 
     const cacheKey = idempotencyKeyFor("agent_reply", ctx.session, args.idempotency_key);
     return withIdempotency(cacheKey, async () => {
@@ -1187,12 +1203,225 @@ function createAgentMessages({ stateDir, context, findListener, listThreadListen
     return { targets: list };
   }
 
+  async function load() {
+    const readResult = await ledger.read();
+    if (!readResult.ok) {
+      log?.(`agent_message_ledger_unavailable error=${readResult.error}`);
+      return;
+    }
+    if (readResult.tornFinalLine) {
+      log?.("agent_message_ledger_torn_final_line ignored");
+    }
+
+    const now = Date.now();
+    const rateCutoff = now - rateWindowMs();
+    const retentionCutoff = now - LEDGER_RETENTION_MS;
+    const table = getTable?.() ?? null;
+    const exchangeLastAtMs = new Map();
+
+    const addRateTimestamp = (project, atMs) => {
+      if (atMs <= rateCutoff) return;
+      const list = rateTimestamps.get(project) ?? [];
+      list.push(atMs);
+      rateTimestamps.set(project, list);
+    };
+
+    for (const record of readResult.records) {
+      const atMs = Date.parse(record.at);
+      if (record.request_id && record.type !== "refusal") {
+        exchangeLastAtMs.set(record.request_id, Math.max(exchangeLastAtMs.get(record.request_id) ?? 0, atMs));
+      }
+      switch (record.type) {
+        case "request": {
+          const fromChannelId = record.from_channel_id
+            ?? (record.from.thread_id
+              ? (table?.projects.get(record.from.project)?.channel_id ?? null)
+              : record.from.conversation_id);
+          const toChannelId = record.to_channel_id
+            ?? (record.to.thread_id
+              ? (table?.projects.get(record.to.project)?.channel_id ?? null)
+              : record.to.conversation_id);
+          exchanges.set(record.request_id, {
+            request_id: record.request_id,
+            state: "open",
+            from: record.from,
+            to: record.to,
+            from_channel_id: fromChannelId,
+            to_channel_id: toChannelId,
+            from_launch: record.from_launch,
+            to_launch: record.to_launch,
+            text: record.text,
+            ts: record.at,
+            depth: record.depth,
+            expires_at: record.expires_at,
+            expires_at_ms: Date.parse(record.expires_at),
+            sender_post: null,
+            receiver_post: null,
+            postReady: Promise.resolve(),
+            timer: null,
+            lock: null,
+          });
+          addRateTimestamp(record.from.project, atMs);
+          if (now - atMs < IDEMPOTENCY_TTL_MS) {
+            const cacheKey = idempotencyKeyFromParts(
+              "agent_request", record.from.project, record.from.conversation_id, record.from_launch, record.idempotency_key,
+            );
+            storeIdempotency(cacheKey, {
+              at_ms: atMs,
+              ok: true,
+              result: {
+                request_id: record.request_id,
+                expires_at: record.expires_at,
+                depth: record.depth,
+              },
+            });
+          }
+          break;
+        }
+        case "post": {
+          if (record.kind === "request" && record.message_id) {
+            const exchange = exchanges.get(record.request_id);
+            if (exchange) {
+              const postRef = { channel_id: record.channel_id, message_id: record.message_id };
+              if (record.side === "sender") exchange.sender_post = postRef;
+              else if (record.side === "receiver") exchange.receiver_post = postRef;
+            }
+          }
+          break;
+        }
+        case "delivery": {
+          const {
+            v: _v, at: _at, type: _type,
+            delivery_id: deliveryId, kind, request_id: requestId, to, to_launch: toLaunch,
+            ...payload
+          } = record;
+          deliveries.set(deliveryId, {
+            delivery_id: deliveryId,
+            kind,
+            request_id: requestId,
+            to,
+            to_launch: toLaunch,
+            event: {
+              event: "agent_message",
+              delivery_id: deliveryId,
+              kind,
+              request_id: requestId,
+              ...payload,
+            },
+            acked: false,
+          });
+          break;
+        }
+        case "ack": {
+          const delivery = deliveries.get(record.delivery_id);
+          if (delivery) delivery.acked = true;
+          break;
+        }
+        case "reply": {
+          const exchange = exchanges.get(record.request_id);
+          if (exchange) exchange.state = "replied";
+          if (now - atMs < IDEMPOTENCY_TTL_MS) {
+            const cacheKey = idempotencyKeyFromParts(
+              "agent_reply", record.from.project, record.from.conversation_id, record.from_launch, record.idempotency_key,
+            );
+            storeIdempotency(cacheKey, {
+              at_ms: atMs,
+              ok: true,
+              result: {
+                request_id: record.request_id,
+                delivered_to_live_session: Boolean(record.delivered_to_live_session),
+              },
+            });
+          }
+          break;
+        }
+        case "expired": {
+          const exchange = exchanges.get(record.request_id);
+          if (exchange) exchange.state = "expired";
+          break;
+        }
+        case "failed": {
+          const exchange = exchanges.get(record.request_id);
+          if (exchange) exchange.state = "failed";
+          break;
+        }
+        case "refusal": {
+          if (record.op === "agent_request" && (record.code === "target_offline" || record.code === "target_closed")) {
+            addRateTimestamp(record.from.project, atMs);
+          }
+          if (now - atMs < IDEMPOTENCY_TTL_MS && record.code !== "ledger_unavailable" && record.code !== "invalid_args") {
+            const cacheKey = idempotencyKeyFromParts(
+              record.op, record.from.project, record.from.conversation_id, record.from_launch, record.idempotency_key,
+            );
+            storeIdempotency(cacheKey, {
+              at_ms: atMs,
+              ok: false,
+              code: record.code,
+              message: record.message,
+            });
+          }
+          break;
+        }
+      }
+    }
+
+    const pendingRequestIds = new Set();
+    for (const delivery of deliveries.values()) {
+      if (!delivery.acked) pendingRequestIds.add(delivery.request_id);
+    }
+
+    const keptExchangeIds = new Set();
+    for (const [requestId, exchange] of exchanges) {
+      const lastAtMs = exchangeLastAtMs.get(requestId) ?? 0;
+      if (exchange.state === "open" || pendingRequestIds.has(requestId) || lastAtMs >= retentionCutoff) {
+        keptExchangeIds.add(requestId);
+      }
+    }
+
+    const keptRecords = readResult.records.filter(record => {
+      if (record.type === "refusal") return Date.parse(record.at) >= retentionCutoff;
+      if (exchanges.has(record.request_id)) return keptExchangeIds.has(record.request_id);
+      if (record.type === "delivery") return deliveries.get(record.delivery_id)?.acked === false;
+      if (record.type === "post") return Date.parse(record.at) >= retentionCutoff;
+      return false;
+    });
+
+    for (const requestId of [...exchanges.keys()]) {
+      if (!keptExchangeIds.has(requestId)) exchanges.delete(requestId);
+    }
+    for (const [deliveryId, delivery] of [...deliveries.entries()]) {
+      if (delivery.acked && !keptExchangeIds.has(delivery.request_id)) deliveries.delete(deliveryId);
+    }
+
+    if (readResult.exists) {
+      const compacted = await ledger.compact(keptRecords);
+      if (!compacted.ok) {
+        exchanges.clear();
+        deliveries.clear();
+        rateTimestamps.clear();
+        idempotencyCache.clear();
+        log?.(`agent_message_ledger_unavailable error=${compacted.error}`);
+        return;
+      }
+    }
+
+    const startNow = Date.now();
+    for (const exchange of exchanges.values()) {
+      if (exchange.state !== "open") continue;
+      if (exchange.expires_at_ms <= startNow) {
+        expireRequest(exchange).catch(error => log?.(`agent_message_expire_failed id=${exchange.request_id} error=${error.message}`));
+      } else {
+        scheduleExpiry(exchange);
+      }
+    }
+  }
+
   function close() {
     closed = true;
     for (const exchange of exchanges.values()) clearExpiry(exchange);
   }
 
-  return { request, reply, targets, ack, onListenerHello, close };
+  return { load, request, reply, targets, ack, onListenerHello, close };
 }
 
 module.exports = { CAPABILITY, DEFAULT_TIMEOUT_MINUTES, MAX_TIMEOUT_MINUTES, createAgentMessages };

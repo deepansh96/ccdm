@@ -133,6 +133,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
   const agentMessages = createAgentMessages({
     stateDir,
     context,
+    getTable,
     log,
     findListener(conversation) {
       if (conversation.thread_id) {
@@ -504,6 +505,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
   return {
     async listen() {
       await ensurePrivateDir(stateDir);
+      await agentMessages.load();
       await (process.platform === "win32" ? listenOnPipe() : listenOnSocket());
       await mkdir(keysDir, { recursive: true, mode: 0o700 });
       if (process.platform === "win32") await ensurePrivateDir(keysDir);
