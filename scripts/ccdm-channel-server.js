@@ -133,6 +133,33 @@ const STARTED_AT = CAPABILITY ? processStartTime(process.pid) : null;
 const interactions = new Map();
 // The last delivered input-needed reply, until the owner answers it.
 let inputNeededMarker = null;
+// A turn started by delivering an Agent Message records no Conversation
+// Reminder reply receipts until owner input joins it or the turn ends.
+let agentStartedTurn = false;
+let agentTurnBaselineEndAt = null;
+
+function readActivityRecord() {
+  if (!ACTIVITY_FILE) return null;
+  try {
+    const record = JSON.parse(readFileSync(ACTIVITY_FILE, "utf8"));
+    return record && typeof record === "object" ? record : null;
+  } catch (error) {
+    return error?.code === "ENOENT" ? {} : null;
+  }
+}
+
+function isAgentStartedTurn() {
+  if (!agentStartedTurn) return false;
+  if (!ACTIVITY_FILE) return true;
+  const record = readActivityRecord();
+  if (!record) return true;
+  if (record.turn_running === false || (record.last_turn_end_at ?? null) !== agentTurnBaselineEndAt) {
+    agentStartedTurn = false;
+    agentTurnBaselineEndAt = null;
+    return false;
+  }
+  return true;
+}
 
 function removeCapabilityMarker() {
   try {
@@ -227,8 +254,9 @@ async function recordOwnerMessage(event, answeredAs = event.message_id) {
 
 // A delivered reply that names an owner interaction in this channel is a
 // Conversation Reminder receipt; the last part of an input-needed reply arms
-// the question.
-async function recordDeliveredReply(input, result) {
+// the question. Replies during an agent-started turn record no receipt.
+async function recordDeliveredReply(input, result, { agentTurn = isAgentStartedTurn() } = {}) {
+  if (agentTurn) return;
   const context = interactions.get(input.conversation_interaction_id);
   if (!context || input.chat_id !== (context.conversation_id || context.channel_id)) return;
   const ids = result.message_ids?.length ? result.message_ids : [result.message_id];
@@ -711,7 +739,12 @@ function main() {
   let initialized = false;
   const queued = [];
   // Each delivered notification starts a Claude turn; the Stop and StopFailure hooks end it.
+  // Owner input joining an agent-started turn makes it an ordinary turn from that message on.
   const deliverNotification = params => {
+    if (params?.meta?.sender === "owner") {
+      agentStartedTurn = false;
+      agentTurnBaselineEndAt = null;
+    }
     if (ACTIVITY_FILE) markTurn(ACTIVITY_FILE, true);
     send({ method: "notifications/claude/channel", params });
   };
@@ -737,12 +770,8 @@ function main() {
   let idleTimer = null;
   const isTurnRunning = () => {
     if (!ACTIVITY_FILE) return false;
-    try {
-      const record = JSON.parse(readFileSync(ACTIVITY_FILE, "utf8"));
-      return Boolean(record && typeof record === "object" && record.turn_running === true);
-    } catch (error) {
-      return error?.code !== "ENOENT";
-    }
+    const record = readActivityRecord();
+    return record === null ? true : record.turn_running === true;
   };
   const isExpiredRequest = (event, now = Date.now()) => {
     if (event.kind !== "request" || typeof event.expires_at !== "string") return false;
@@ -794,6 +823,8 @@ function main() {
         return;
       }
       const next = pendingAgentMessages.shift();
+      agentTurnBaselineEndAt = readActivityRecord()?.last_turn_end_at ?? null;
+      agentStartedTurn = true;
       deliverNotification(notification("agent_message", next));
       if (pendingAgentMessages.length === 0) {
         stopIdleWatch();
@@ -965,13 +996,14 @@ function main() {
       if (tool.run) {
         text = await tool.run(router, input);
       } else {
+        const agentTurn = isAgentStartedTurn();
         const result = await request(tool.op, tool.args(input));
         // Record that the turn has replied in this launch's activity file.
         if (ACTIVITY_FILE && tool.op === "reply") markReplied(ACTIVITY_FILE);
         // Record the receipt before Claude sees the result, so the Stop hook
         // that follows the turn finds it.
         await reminderEvents;
-        await tool.delivered?.(input, result).catch(error => {
+        await tool.delivered?.(input, result, { agentTurn }).catch(error => {
           process.stderr.write(`ccdm channel: receipt recording failed: ${error.message}\n`);
         });
         text = tool.format(result);

@@ -11,7 +11,7 @@ Reminders are opt-in. A registered channel reports `suspended-incomplete-discove
 ## How it fits the Router
 
 - Projects have no bot of their own. A project's agent posts through its `ccdm-<project>` webhook, and the registry records that webhook's `webhook_id`.
-- The service identifies a project's speaker as `router:<webhook_id>`. An agent reply is a message whose `webhook_id` equals the project's own. Any other bot or webhook message is not a reply.
+- The service identifies a project's speaker as `router:<webhook_id>`. Live reminder arming comes from confirmed session-adapter receipts, not from webhook observation; matching messages by the project's own `webhook_id` (excluding `-# ⇄ Agent ` records) is used only during history discovery.
 - The worker observes project channels and their threads as the Router's read-only `observer` client. It never logs in to the Discord Gateway.
 - The root bot sends every `👀` reminder and every `✅` acknowledgment, and deletes old reminders, over Discord's REST API.
 - Session adapters record turn events in a private, durable event ledger: `scripts/ccdm-channel-server.js` with `scripts/claude-reminder-hook.js` for Claude, `scripts/codex-bridge.js` for Codex, and `scripts/gemini-bridge.js` for Gemini. The Thread Supervisor records thread lifecycle events the same way.
@@ -327,7 +327,7 @@ The worker reads history with root's token:
 
 After the channel's own scan, an initial discovery walks its Thread Conversations. It adopts the channel's active threads, plus threads archived within the last seven days whose conversation is not closed. Each adopted thread is scanned the same way, into its own baseline. The project is released only once every thread's scan has committed. The channel and its threads share the project's per-pass budget.
 
-A conversation becomes eligible only when the owner's latest Conversation Reply is followed by a message from the project's own webhook. The answer must come before any guest message that follows the reply. The first reminder is due one hour after that answer's Discord timestamp. Historical messages carry no turn-completion metadata, so status labels this basis `historical-owner-then-bot-approximation`. It is used only for discovery. Live completion and input-needed still require confirmed adapter receipts. These conversations stay `open-paused`:
+A conversation becomes eligible only when the owner's latest Conversation Reply is followed by a message from the project's own webhook (excluding `-# ⇄ Agent ` Agent Message records, which discovery classifies as `other`). The answer must come before any guest message that follows the reply. The first reminder is due one hour after that answer's Discord timestamp. Historical messages carry no turn-completion metadata, so status labels this basis `historical-owner-then-bot-approximation`. It is used only for discovery. Live completion and input-needed still require confirmed adapter receipts. These conversations stay `open-paused`:
 
 - no owner participation, such as a guest-only exchange;
 - no agent answer after the owner's latest reply, which means the conversation is waiting for the agent;
@@ -346,7 +346,7 @@ Limitations: discovery cannot see deleted messages. It cannot see reactions that
 
 Each worker start writes a fresh `0600` key to `<router state>/keys/.observer.key`. A newer observer hello replaces any older observer connection.
 
-The Router sends the observer every message in a project channel or one of its threads, including webhook and bot messages, plus the owner's and guests' reactions. The observer can perform no Router operation.
+The Router sends the observer every message in a project channel or one of its threads, including webhook and bot messages, plus the owner's and guests' reactions. The Router never sends `agent_message` events to the observer, and the observer can perform no Router operation.
 
 An owner `/close` in a project channel reaches only the observer. The Router never delivers it to the session.
 

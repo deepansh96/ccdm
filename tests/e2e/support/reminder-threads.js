@@ -263,11 +263,11 @@ export const owner = { id: OWNER_ID, username: "Owner" };
 
 export const guest = { id: "guest-id", username: "Guest" };
 
-export function threadReminderWorkspace(type = "claude") {
+export function threadReminderWorkspace(type = "claude", extraProject = {}) {
   const workspace = createRouterWorkspace({
     discord_user_id: OWNER_ID, guild_id: "guild-id",
     projects: { demo: { channel_id: "demo-channel", type, transport: "router", guest_user_ids: ["guest-id"],
-      screen_name: "demo_claude", assignment_generation: "gen-demo" } },
+      screen_name: "demo_claude", assignment_generation: "gen-demo", ...extraProject } },
   });
   const registryFile = path.join(workspace.repoDir, "registry.json");
   const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
@@ -307,13 +307,13 @@ export const ANSWER = [{ name: "reply", arguments: { chat_id: "{{chat_id}}", tex
 
 // The Router with demo's webhook, the supervisor, demo's channel session when
 // it is a Claude project, and the enabled reminder worker, ready for demo.
-export async function threadReminders(context, { channelSession = true, supervisorEnv: workerEnv = {}, beforeEnable } = {}) {
+export async function threadReminders(context, { channelSession = true, supervisorEnv: workerEnv = {}, routerOptions = {}, beforeEnable } = {}) {
   const { workspace } = context;
   updateState(workspace.stateDir, state => {
     state.fixtures.discord.history = { "demo-channel": [] };
     state.fixtures.claude.toolScript = ANSWER;
   });
-  await routerWithWebhooks(workspace, ["demo"]);
+  await routerWithWebhooks(workspace, ["demo"], routerOptions);
   if (WIN) await startThreadHost(workspace);
   if (channelSession) {
     const started = await runScript(workspace, "scripts/start-session.sh", {

@@ -707,6 +707,8 @@ function runRouterClaudeHost() {
         ? value.replace(/\\{\\{(chat_id|message_id|request_id|last_id)\\}\\}/g, (_, key) => key === "last_id" ? lastId : meta[key])
         : Array.isArray(value) ? value.map(expand) : value;
       for (const step of steps) {
+        if (step.whenSender && meta.sender !== step.whenSender) continue;
+        if (step.whenAgentKind && meta.agent_message !== step.whenAgentKind) continue;
         const input = Object.fromEntries(Object.entries(step.arguments || {}).map(([key, value]) => [key, expand(value)]));
         const result = await new Promise((done) => {
           toolCalls.set(call("tools/call", { name: step.name, arguments: input }), { name: step.name, done });
@@ -717,6 +719,7 @@ function runRouterClaudeHost() {
     // One turn at a time: each notification's tool calls, then the Stop hook.
     let turns = runHooks("SessionStart", { source: "startup" });
     let turnHeld = false;
+    const midTurnQueue = [];
     const isHeld = () => Boolean(conversationId) && (readState().fixtures.claude.holdTurnsIn || []).includes(conversationId);
     const consumeTurnRelease = () => {
       if (!conversationId) return false;
@@ -765,11 +768,19 @@ function runRouterClaudeHost() {
           });
         } else if (message.method === "notifications/claude/channel") {
           record("channelNotifications", message.params);
-          const { replyText, toolScript } = readState().fixtures.claude;
+          const claudeState = readState().fixtures.claude;
+          const { replyText } = claudeState;
           const { meta } = message.params;
+          const chatKey = conversationId || meta.chat_id;
+          const selectScript = (byChat, fallback) => (chatKey && byChat && Object.hasOwn(byChat, chatKey) ? byChat[chatKey] : fallback);
           // A mid-turn notification while a turn is already held joins that
           // running turn rather than queueing a second Stop after it.
-          if (turnHeld) continue;
+          if (turnHeld) {
+            const midScript = selectScript(claudeState.midTurnToolScriptsByConversation, claudeState.midTurnToolScript);
+            if (midScript) midTurnQueue.push({ steps: midScript, meta });
+            continue;
+          }
+          const toolScript = selectScript(claudeState.toolScriptsByConversation, claudeState.toolScript);
           if (isHeld()) turnHeld = true;
           turns = turns.then(async () => {
             if (replyText) {
@@ -785,7 +796,15 @@ function runRouterClaudeHost() {
             if (isHeld()) {
               turnHeld = true;
               while (isHeld() && !consumeTurnRelease()) {
+                while (midTurnQueue.length > 0) {
+                  const item = midTurnQueue.shift();
+                  await runToolScript(item.steps, item.meta);
+                }
                 await new Promise((done) => setTimeout(done, 50));
+              }
+              while (midTurnQueue.length > 0) {
+                const item = midTurnQueue.shift();
+                await runToolScript(item.steps, item.meta);
               }
               turnHeld = false;
               record("turnHolds", { threadId: serverEnv.CCDM_THREAD_ID, conversationId, releasedAt: new Date().toISOString(),
