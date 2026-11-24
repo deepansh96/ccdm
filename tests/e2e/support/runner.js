@@ -716,6 +716,24 @@ function runRouterClaudeHost() {
     }
     // One turn at a time: each notification's tool calls, then the Stop hook.
     let turns = runHooks("SessionStart", { source: "startup" });
+    let turnHeld = false;
+    const isHeld = () => Boolean(conversationId) && (readState().fixtures.claude.holdTurnsIn || []).includes(conversationId);
+    const consumeTurnRelease = () => {
+      if (!conversationId) return false;
+      if (!(readState().fixtures.claude.releaseTurns || []).includes(conversationId)) return false;
+      let released = false;
+      updateState((state) => {
+        const list = state.fixtures.claude.releaseTurns || [];
+        const index = list.indexOf(conversationId);
+        if (index >= 0) {
+          list.splice(index, 1);
+          state.fixtures.claude.releaseTurns = list;
+          released = true;
+        }
+        return state;
+      });
+      return released;
+    };
     let toolsListId = null;
     const initializeId = call("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "claude-fixture", version: "1" } });
     let buffer = "";
@@ -749,6 +767,10 @@ function runRouterClaudeHost() {
           record("channelNotifications", message.params);
           const { replyText, toolScript } = readState().fixtures.claude;
           const { meta } = message.params;
+          // A mid-turn notification while a turn is already held joins that
+          // running turn rather than queueing a second Stop after it.
+          if (turnHeld) continue;
+          if (isHeld()) turnHeld = true;
           turns = turns.then(async () => {
             if (replyText) {
               await new Promise((done) => {
@@ -756,16 +778,20 @@ function runRouterClaudeHost() {
               });
             }
             if (toolScript) await runToolScript(toolScript, meta);
-            // \`fixtures.claude.holdTurnsIn\` keeps a conversation's turns running until its id leaves the list.
+            // \`fixtures.claude.holdTurnsIn\` keeps a conversation's turns running until its id leaves the list
+            // or \`fixtures.claude.releaseTurns\` releases one held turn.
             // A held turn records its release and whether a second read still lists it, so a
             // release that came from a misread of the state shows in the test's failure text.
-            const held = () => Boolean(conversationId) && (readState().fixtures.claude.holdTurnsIn || []).includes(conversationId);
-            if (held()) {
-              while (held()) {
+            if (isHeld()) {
+              turnHeld = true;
+              while (isHeld() && !consumeTurnRelease()) {
                 await new Promise((done) => setTimeout(done, 50));
               }
+              turnHeld = false;
               record("turnHolds", { threadId: serverEnv.CCDM_THREAD_ID, conversationId, releasedAt: new Date().toISOString(),
-                stillListed: held() });
+                stillListed: isHeld() });
+            } else {
+              turnHeld = false;
             }
             // \`fixtures.claude.failTurnsIn\` ends a conversation's turns with StopFailure, as an API error does.
             if (Boolean(conversationId) && (readState().fixtures.claude.failTurnsIn || []).includes(conversationId)) {

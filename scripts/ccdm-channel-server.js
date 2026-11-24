@@ -55,7 +55,7 @@
 // this process exits or its Router session ends.
 const { execFile } = require("node:child_process");
 const crypto = require("node:crypto");
-const { readFileSync, rmSync } = require("node:fs");
+const { readFileSync, rmSync, watch } = require("node:fs");
 const { readFile, rm, stat, writeFile } = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
@@ -729,6 +729,82 @@ function main() {
   const pausedEvents = [];
   // A thread session holds live events until its bootstrap is delivered.
   let held = THREAD ? [] : null;
+  // Agent Messages never steer a running turn: they wait in FIFO order for
+  // initialization, thread bootstrap, /unpause, and an idle turn-activity record,
+  // delivering one per turn end and dropping requests that expire while held.
+  const pendingAgentMessages = [];
+  let idleWatcher = null;
+  let idleTimer = null;
+  const isTurnRunning = () => {
+    if (!ACTIVITY_FILE) return false;
+    try {
+      const record = JSON.parse(readFileSync(ACTIVITY_FILE, "utf8"));
+      return Boolean(record && typeof record === "object" && record.turn_running === true);
+    } catch (error) {
+      return error?.code !== "ENOENT";
+    }
+  };
+  const isExpiredRequest = (event, now = Date.now()) => {
+    if (event.kind !== "request" || typeof event.expires_at !== "string") return false;
+    const expiresAt = Date.parse(event.expires_at);
+    return Number.isFinite(expiresAt) && expiresAt <= now;
+  };
+  const pruneExpiredAgentRequests = () => {
+    const now = Date.now();
+    for (let i = pendingAgentMessages.length - 1; i >= 0; i -= 1) {
+      if (isExpiredRequest(pendingAgentMessages[i], now)) pendingAgentMessages.splice(i, 1);
+    }
+  };
+  const stopIdleWatch = () => {
+    if (idleWatcher) {
+      try { idleWatcher.close(); } catch { /* Already closed. */ }
+      idleWatcher = null;
+    }
+    if (idleTimer) {
+      clearInterval(idleTimer);
+      idleTimer = null;
+    }
+  };
+  const ensureIdleWatch = () => {
+    if (idleTimer) return;
+    if (ACTIVITY_FILE) {
+      try {
+        idleWatcher = watch(path.dirname(ACTIVITY_FILE), () => tryDeliverAgentMessage());
+        idleWatcher.on("error", () => {
+          if (idleWatcher) {
+            try { idleWatcher.close(); } catch { /* Ignore. */ }
+            idleWatcher = null;
+          }
+        });
+      } catch {
+        idleWatcher = null;
+      }
+    }
+    idleTimer = setInterval(() => tryDeliverAgentMessage(), 50);
+  };
+  const tryDeliverAgentMessage = () => {
+    for (;;) {
+      pruneExpiredAgentRequests();
+      if (pendingAgentMessages.length === 0 || !initialized || held || paused) {
+        stopIdleWatch();
+        return;
+      }
+      if (isTurnRunning()) {
+        ensureIdleWatch();
+        return;
+      }
+      const next = pendingAgentMessages.shift();
+      deliverNotification(notification("agent_message", next));
+      if (pendingAgentMessages.length === 0) {
+        stopIdleWatch();
+        return;
+      }
+      if (ACTIVITY_FILE) {
+        ensureIdleWatch();
+        return;
+      }
+    }
+  };
   const deliver = kind => event => {
     if (held) held.push([kind, event]);
     else if (paused) pausedEvents.push([kind, event]);
@@ -755,6 +831,7 @@ function main() {
       const pending = held.filter(([kind, event]) => !(kind === "message" && included.has(event.message_id)));
       held = null;
       for (const [kind, event] of pending) deliver(kind)(event);
+      tryDeliverAgentMessage();
     });
   }
   router.on("message", event => {
@@ -781,9 +858,11 @@ function main() {
       return;
     }
     if (deliveryId) seenDeliveryIds.add(deliveryId);
+    const acked = ackDelivery(deliveryId);
     agentDeliveries = agentDeliveries.then(async () => {
-      await ackDelivery(deliveryId);
-      deliver("agent_message")(event);
+      await acked;
+      pendingAgentMessages.push(event);
+      tryDeliverAgentMessage();
     });
   });
 
@@ -794,6 +873,7 @@ function main() {
   const COMMANDS = {
     pause: async event => {
       paused = true;
+      stopIdleWatch();
       if (ACTIVITY_FILE) markPaused(ACTIVITY_FILE, true);
       await react(event, "⏸️");
       await say(event, "Session paused. New messages will be queued.");
@@ -802,6 +882,7 @@ function main() {
       paused = false;
       if (ACTIVITY_FILE) markPaused(ACTIVITY_FILE, false);
       for (const [kind, queuedEvent] of pausedEvents.splice(0)) notify(kind, queuedEvent);
+      tryDeliverAgentMessage();
       await react(event, "▶️");
       await say(event, "Session unpaused.");
     },
@@ -922,6 +1003,7 @@ function main() {
     if (method === "notifications/initialized") {
       initialized = true;
       for (const params of queued.splice(0)) deliverNotification(params);
+      tryDeliverAgentMessage();
       return;
     }
     if (method === "tools/list") {
@@ -936,6 +1018,7 @@ function main() {
   });
   // Claude closes stdin when the session ends: leave the Router with it.
   lines.on("close", () => {
+    stopIdleWatch();
     router.close();
     process.exit(0);
   });
