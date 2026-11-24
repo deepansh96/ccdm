@@ -29,6 +29,8 @@
 //   onScopeChange(handler) handler(scope), scope = { project, channel_id, type }
 //     The Router moved this project's Session Scope (a registry channel move);
 //     only its authenticated connection can, and never in the root role.
+//   onAgentMessage(handler) handler(event), an Agent Message pushed by the Router
+//     (request, reply, or notice); never in the root role.
 //
 // Operations out:
 //   connect()                     -> Promise<{ userTag }> once the gateway is ready
@@ -41,6 +43,7 @@
 //   react(message, emoji)         -> Promise<void>, message from onMessage
 //   removeOwnReaction(message, emoji) -> Promise<void>
 //   attachmentUrl(message, attachment) -> Promise<string>, a URL to fetch it from
+//   ackAgentMessage(deliveryId)   -> Promise<object>, acknowledges an Agent Message delivery
 //   setContextPct(pct)            -> records the context percentage replies carry
 //   destroy()
 //
@@ -65,7 +68,7 @@ const { createEmergencyGateway } = require("./router/emergency.js");
 // In the `thread` role (with `threadId`) it serves one Codex Thread
 // Conversation, whose Session Scope the Router never moves.
 function createRouterTransport({ project, role = "project", keyFile, launchDir, registryPath, primaryChannelId,
-  threadId = null, provider = "codex" }) {
+  threadId = null, provider = "codex", capabilities = null }) {
   let router = null;
   // Router operations, or root's direct ones while its fallback is engaged.
   let request = null;
@@ -73,6 +76,7 @@ function createRouterTransport({ project, role = "project", keyFile, launchDir, 
   let messageHandler = null;
   let reactionHandler = null;
   let scopeHandler = null;
+  let agentMessageHandler = null;
   let contextPct;
 
   const root = role === "root";
@@ -130,6 +134,10 @@ function createRouterTransport({ project, role = "project", keyFile, launchDir, 
       scopeHandler = handler;
     },
 
+    onAgentMessage(handler) {
+      agentMessageHandler = handler;
+    },
+
     async connect() {
       const key = (await readFile(keyFile, "utf8")).trim();
       if (root) {
@@ -141,15 +149,18 @@ function createRouterTransport({ project, role = "project", keyFile, launchDir, 
         fallback.watch(router);
         request = fallback.request(router);
       } else if (role === "thread") {
-        router = new RouterClient({ project, key, role: "thread", threadId, provider });
+        router = new RouterClient({ project, key, role: "thread", threadId, provider, capabilities });
         request = (op, args) => router.request(op, args);
       } else {
-        router = new RouterClient({ project, key, role: "project" });
+        router = new RouterClient({ project, key, role: "project", capabilities });
         request = (op, args) => router.request(op, args);
       }
       router.on("message", (event) => messageHandler?.(toMessage(event)));
       router.on("command", (event) => messageHandler?.(toMessage(event, `/${event.command}`)));
       router.on("reaction", (event) => reactionHandler?.(toReaction(event)));
+      if (!root) {
+        router.on("agent_message", (event) => agentMessageHandler?.(event));
+      }
       // The client validates the change (this project, a channel) before it
       // fires; root has no project scope to move.
       if (!root && role !== "thread") {
@@ -221,6 +232,10 @@ function createRouterTransport({ project, role = "project", keyFile, launchDir, 
     // Removes the bot's own reaction through the Router's `react` with `remove`.
     async removeOwnReaction(message, emoji) {
       await request("react", { channel_id: message.channel.id, message_id: message.id, emoji, remove: true });
+    },
+
+    async ackAgentMessage(deliveryId) {
+      return await router.request("agent_message_ack", { delivery_id: deliveryId });
     },
 
     // The bridge's scoped MCP server reads the same percentage from the launch
