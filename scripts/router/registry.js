@@ -32,7 +32,8 @@ async function readRegistry(file) {
 }
 
 const isObject = value => value !== null && typeof value === "object" && !Array.isArray(value);
-const isId = value => (typeof value === "string" && value.trim() !== "") || (Number.isInteger(value) && value > 0);
+const isNonEmptyString = value => typeof value === "string" && value.trim() !== "";
+const isId = value => isNonEmptyString(value) || (Number.isInteger(value) && value > 0);
 
 // How scripts/guest-access.js lets a guest into a project channel, set by the
 // top-level `guest_mode`. Absent or "roles": one guest role per project.
@@ -73,6 +74,10 @@ function validateRegistry(registry) {
     if (project.guest_user_ids != null && !(Array.isArray(project.guest_user_ids) && project.guest_user_ids.every(isId))) {
       problems.push(`project ${name}: guest_user_ids must be a list of Discord IDs`);
     }
+    if (project.agent_message_targets !== undefined
+      && !(Array.isArray(project.agent_message_targets) && project.agent_message_targets.every(isNonEmptyString))) {
+      problems.push(`project ${name}: agent_message_targets must be a list of non-empty strings`);
+    }
     if (!isId(project.channel_id)) continue;
     const channel = String(project.channel_id);
     const other = owners.get(channel);
@@ -97,6 +102,7 @@ function buildRoutingTable(registry) {
       channel_id: String(project.channel_id),
       webhook_id: project.webhook_id ? String(project.webhook_id) : null,
       guests: (project.guest_user_ids || []).map(String),
+      agent_message_targets: new Set(project.agent_message_targets || []),
       // A `remote:` project runs on another machine and has no thread sessions.
       remote: String(project.path || "").startsWith("remote:"),
     };
