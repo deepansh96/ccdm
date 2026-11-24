@@ -16,7 +16,8 @@
 //   CCDM_THREAD_ID            set by start-thread-session.sh: this session serves that thread
 //   CCDM_THREAD_PROVIDER      the thread's provider (`claude`)
 //   CCDM_THREAD_BOOTSTRAP_FILE  the Thread Supervisor's bootstrap for this launch
-//   CCDM_THREAD_ACTIVITY_FILE   this launch's activity.json: turn_running on each notification, paused, turn_replied
+//   CCDM_ACTIVITY_FILE          a channel launch's activity.json: turn_running, paused, turn_replied
+//   CCDM_THREAD_ACTIVITY_FILE   a thread launch's activity.json: turn_running on each notification, paused, turn_replied
 //
 // In thread mode the server says hello as the `thread` role, so its Session
 // Scope is the thread alone. It holds live events until the supervisor's
@@ -68,7 +69,7 @@ const { scheduleProjectRestart } = require("./lib/restart-helper.js");
 const sessionHost = require("./lib/session-host.js");
 const reminder = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
-const { markPaused, markReplied, markTurn } = require("./thread-activity.js");
+const { markPaused, markReplied, markTurn, resetActivity } = require("./thread-activity.js");
 const { createEmergencyGateway } = require("./router/emergency.js");
 const modelInfo = require("./model-info.js");
 
@@ -94,8 +95,12 @@ const ROOT_INSTRUCTIONS = [
 const ROOT = process.env.CCDM_ROUTER_ROLE === "root";
 const THREAD_ID = ROOT ? "" : process.env.CCDM_THREAD_ID || "";
 const THREAD = Boolean(THREAD_ID);
+const ACTIVITY_FILE = ROOT ? "" : (process.env.CCDM_ACTIVITY_FILE || process.env.CCDM_THREAD_ACTIVITY_FILE || "");
 // A new launch starts unpaused, whatever the last one left in activity.json.
-if (THREAD) markPaused(process.env.CCDM_THREAD_ACTIVITY_FILE, false);
+// A channel launch also starts with no turn running; a thread launch leaves
+// turn_running unset until its bootstrap finishes so eviction treats it as busy.
+if (THREAD) markPaused(ACTIVITY_FILE, false);
+else if (ACTIVITY_FILE) resetActivity(ACTIVITY_FILE);
 // Mirrors COMMANDS and THREAD_COMMANDS in scripts/router/inbound.js.
 const RELAYED_COMMANDS = THREAD ? "/pause, /unpause and /compact" : "/pause, /unpause, /compact, /clear and /restart";
 // Claude's working directory is the project, so Windows names the checkout in full.
@@ -580,7 +585,7 @@ function main() {
   const queued = [];
   // Each delivered notification starts a Claude turn; the Stop and StopFailure hooks end it.
   const deliverNotification = params => {
-    if (THREAD) markTurn(process.env.CCDM_THREAD_ACTIVITY_FILE, true);
+    if (ACTIVITY_FILE) markTurn(ACTIVITY_FILE, true);
     send({ method: "notifications/claude/channel", params });
   };
   const channelNotify = params => {
@@ -641,13 +646,13 @@ function main() {
   const COMMANDS = {
     pause: async event => {
       paused = true;
-      if (THREAD) markPaused(process.env.CCDM_THREAD_ACTIVITY_FILE, true);
+      if (ACTIVITY_FILE) markPaused(ACTIVITY_FILE, true);
       await react(event, "⏸️");
       await say(event, "Session paused. New messages will be queued.");
     },
     unpause: async event => {
       paused = false;
-      if (THREAD) markPaused(process.env.CCDM_THREAD_ACTIVITY_FILE, false);
+      if (ACTIVITY_FILE) markPaused(ACTIVITY_FILE, false);
       for (const [kind, queuedEvent] of pausedEvents.splice(0)) notify(kind, queuedEvent);
       await react(event, "▶️");
       await say(event, "Session unpaused.");
@@ -732,8 +737,8 @@ function main() {
         text = await tool.run(router, input);
       } else {
         const result = await request(tool.op, tool.args(input));
-        // The thread's turn has replied, recorded in its activity file.
-        if (THREAD && tool.op === "reply") markReplied(process.env.CCDM_THREAD_ACTIVITY_FILE);
+        // Record that the turn has replied in this launch's activity file.
+        if (ACTIVITY_FILE && tool.op === "reply") markReplied(ACTIVITY_FILE);
         // Record the receipt before Claude sees the result, so the Stop hook
         // that follows the turn finds it.
         await reminderEvents;

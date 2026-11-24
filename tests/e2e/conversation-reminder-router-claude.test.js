@@ -225,14 +225,21 @@ test("a router Claude launch loads the hooks but no reminder proxy", async () =>
   // A Windows temp folder can carry a short (8.3) name; the `ccdm` entry starts Python from the long one.
   const windows = process.platform === "win32";
   const repoAsLaunched = windows ? fs.realpathSync.native(workspace.repoDir) : workspace.repoDir;
-  const run = (script) => {
-    const file = path.join(repoAsLaunched, "scripts", script);
-    return `node '${windows ? file.replaceAll("\\", "/") : file}'`;
+  const run = (script, ...args) => {
+    const files = [path.join(repoAsLaunched, "scripts", script), ...args];
+    return `node ${files.map((file) => `'${windows ? file.replaceAll("\\", "/") : file}'`).join(" ")}`;
   };
+  const reminderHook = { type: "command", command: run("claude-reminder-hook.js") };
+  const activityHook = { type: "command", command: run("thread-activity.js", path.join(launchDir, "activity.json")) };
   assert.deepEqual(settings, {
     enabledPlugins: { "discord@claude-plugins-official": false },
-    hooks: Object.fromEntries(["SessionStart", "Stop", "StopFailure", "SessionEnd"].map((event) =>
-      [event, [{ hooks: [{ type: "command", command: run("claude-reminder-hook.js") }] }]])),
+    hooks: {
+      SessionStart: [{ hooks: [reminderHook] }],
+      Stop: [{ hooks: [reminderHook, activityHook] }],
+      StopFailure: [{ hooks: [reminderHook, activityHook] }],
+      SessionEnd: [{ hooks: [reminderHook] }],
+      UserPromptSubmit: [{ hooks: [activityHook] }],
+    },
     // A Windows launch also carries its context status line.
     ...(windows ? { statusLine: { type: "command", command: run("statusline-context.js") } } : {}),
   });

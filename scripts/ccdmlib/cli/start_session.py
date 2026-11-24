@@ -116,8 +116,11 @@ def _write_launch_files(project: str, launch: _Launch, channel_id: str, claude_h
     for folder in (Path(launch.router_state), keys_dir, directory.parent, directory):
         private_fs.ensure_private_dir(folder)
     Path(launch.ready_file).unlink(missing_ok=True)
-    # A previous launch's context percentage would be wrong for this one.
+    # A previous launch's context percentage or turn activity would be wrong for this one.
     (directory / "context.json").unlink(missing_ok=True)
+    activity_file = directory / "activity.json"
+    activity_file.unlink(missing_ok=True)
+    (directory / "activity.json.lock").unlink(missing_ok=True)
 
     server_script = str(launch.root / "scripts" / "ccdm-channel-server.js")
     reminder_dir = _launch.reminder_state_dir()
@@ -143,16 +146,25 @@ def _write_launch_files(project: str, launch: _Launch, channel_id: str, claude_h
             "CCDM_ROUTER_STATE_DIR": launch.router_state,
             "CCDM_ROUTER_KEY_FILE": launch.key_file,
             "CCDM_CHANNEL_READY_FILE": launch.ready_file,
+            "CCDM_ACTIVITY_FILE": str(activity_file),
         },
     }}}
     private_fs.write_private(launch.mcp_config, json.dumps(config, indent=2) + "\n")
     # The official Discord plugin must not load beside the CCDM channel. Hook
-    # commands are command hooks: no prompt/agent hook can invoke a model.
-    hook = hooks.hook_command(launch.root / "scripts" / "claude-reminder-hook.js")
+    # commands are command hooks: no prompt/agent hook can invoke a model. The
+    # turn-activity hooks sit beside the reminder hooks so the channel server
+    # can tell whether a turn is running.
+    reminder_hook = hooks.hook_command(launch.root / "scripts" / "claude-reminder-hook.js")
+    activity_hook = hooks.hook_command(launch.root / "scripts" / "thread-activity.js", activity_file)
+    session_hooks: Dict[str, Any] = {
+        event: [{"hooks": [{"type": "command", "command": command}
+                           for command in [reminder_hook] + ([activity_hook] if event in ("Stop", "StopFailure") else [])]}]
+        for event in ("SessionStart", "Stop", "StopFailure", "SessionEnd")
+    }
+    session_hooks["UserPromptSubmit"] = [{"hooks": [{"type": "command", "command": activity_hook}]}]
     settings: Dict[str, Any] = {
         "enabledPlugins": {"discord@claude-plugins-official": False},
-        "hooks": {event: [{"hooks": [{"type": "command", "command": hook}]}]
-                  for event in ("SessionStart", "Stop", "StopFailure", "SessionEnd")},
+        "hooks": session_hooks,
     }
     if _launch.WIN32:
         settings["statusLine"] = _launch.status_line_setting(launch.root, _launch.effective_claude_home(claude_home))

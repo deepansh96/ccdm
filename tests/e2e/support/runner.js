@@ -669,7 +669,28 @@ function runRouterClaudeHost() {
     });
     const logFile = path.join(stateDir, \`claude-channel-\${process.pid}.log\`);
     child.stderr.on("data", (chunk) => fs.appendFileSync(logFile, chunk));
-    const stop = () => { child.kill("SIGTERM"); process.exit(0); };
+    const conversationId = serverEnv.CCDM_THREAD_ID || serverEnv.CCDM_CLAUDE_CHANNEL_ID;
+    // \`fixtures.claude.pendingHooks\` lets a test fire a hook from \`--settings\`
+    // (such as UserPromptSubmit or a subagent Stop) on demand.
+    const pollHooks = setInterval(() => {
+      if (!conversationId) return;
+      if (!(readState().fixtures.claude.pendingHooks || []).some((item) => item.conversationId === conversationId)) return;
+      let matching = [];
+      updateState((state) => {
+        matching = [];
+        const pending = state.fixtures.claude.pendingHooks || [];
+        const keep = [];
+        for (const item of pending) {
+          if (item.conversationId === conversationId) matching.push(item);
+          else keep.push(item);
+        }
+        state.fixtures.claude.pendingHooks = keep;
+        return state;
+      });
+      for (const item of matching) void runHooks(item.event, item.fields || {});
+    }, 50);
+    pollHooks.unref();
+    const stop = () => { clearInterval(pollHooks); child.kill("SIGTERM"); process.exit(0); };
     process.on("SIGTERM", stop);
     process.on("SIGINT", stop);
     child.on("exit", () => record("channelServerExits", { pid: child.pid }));
@@ -726,19 +747,19 @@ function runRouterClaudeHost() {
               });
             }
             if (toolScript) await runToolScript(toolScript, meta);
-            // \`fixtures.claude.holdTurnsIn\` keeps a thread's turns running until its id leaves the list.
+            // \`fixtures.claude.holdTurnsIn\` keeps a conversation's turns running until its id leaves the list.
             // A held turn records its release and whether a second read still lists it, so a
             // release that came from a misread of the state shows in the test's failure text.
-            const held = () => (readState().fixtures.claude.holdTurnsIn || []).includes(serverEnv.CCDM_THREAD_ID);
+            const held = () => Boolean(conversationId) && (readState().fixtures.claude.holdTurnsIn || []).includes(conversationId);
             if (held()) {
               while (held()) {
                 await new Promise((done) => setTimeout(done, 50));
               }
-              record("turnHolds", { threadId: serverEnv.CCDM_THREAD_ID, releasedAt: new Date().toISOString(),
+              record("turnHolds", { threadId: serverEnv.CCDM_THREAD_ID, conversationId, releasedAt: new Date().toISOString(),
                 stillListed: held() });
             }
-            // \`fixtures.claude.failTurnsIn\` ends a thread's turns with StopFailure, as an API error does.
-            if ((readState().fixtures.claude.failTurnsIn || []).includes(serverEnv.CCDM_THREAD_ID)) {
+            // \`fixtures.claude.failTurnsIn\` ends a conversation's turns with StopFailure, as an API error does.
+            if (Boolean(conversationId) && (readState().fixtures.claude.failTurnsIn || []).includes(conversationId)) {
               await runHooks("StopFailure", { error: "rate_limit" });
             } else {
               await runHooks("Stop", { stop_hook_active: false, background_tasks: [], session_crons: [] });

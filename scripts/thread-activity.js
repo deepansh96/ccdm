@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 "use strict";
 
-// A thread session's turn activity, `activity.json` in its launch dir, which
-// the Thread Supervisor reads to find an idle session to evict and to tell
-// whose turn it is:
+// A Claude/Codex/Gemini session's turn activity, `activity.json` in its launch
+// dir. For threads the Thread Supervisor reads it to find an idle session to
+// evict and to tell whose turn it is; for Claude channels the channel server
+// keeps it so it can tell whether a turn is running:
 //
 //   turn_running       a turn is running
 //   last_turn_end_at   when the last turn ended
@@ -103,7 +104,19 @@ function markPaused(file, paused) {
   writeActivity(file, activity => { activity.paused = Boolean(paused); });
 }
 
-module.exports = { markPaused, markReplied, markTurn };
+// A new channel launch starts unpaused and with no turn running, clearing any
+// stale state left by a previous launch.
+function resetActivity(file) {
+  writeActivity(file, activity => {
+    activity.turn_running = false;
+    activity.paused = false;
+    activity.last_turn_end_at = null;
+    delete activity.last_turn_outcome;
+    delete activity.turn_replied;
+  });
+}
+
+module.exports = { markPaused, markReplied, markTurn, resetActivity };
 
 if (require.main === module) {
   let input = "";
