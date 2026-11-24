@@ -704,7 +704,7 @@ function runRouterClaudeHost() {
     async function runToolScript(steps, meta) {
       let lastId = "";
       const expand = (value) => typeof value === "string"
-        ? value.replace(/\\{\\{(chat_id|message_id|last_id)\\}\\}/g, (_, key) => key === "last_id" ? lastId : meta[key])
+        ? value.replace(/\\{\\{(chat_id|message_id|request_id|last_id)\\}\\}/g, (_, key) => key === "last_id" ? lastId : meta[key])
         : Array.isArray(value) ? value.map(expand) : value;
       for (const step of steps) {
         const input = Object.fromEntries(Object.entries(step.arguments || {}).map(([key, value]) => [key, expand(value)]));
@@ -729,13 +729,22 @@ function runRouterClaudeHost() {
         if (!line.trim()) continue;
         const message = JSON.parse(line);
         if (message.id === initializeId) {
-          record("channelServers", { serverInfo: message.result.serverInfo, capabilities: message.result.capabilities });
+          record("channelServers", {
+            serverInfo: message.result.serverInfo,
+            capabilities: message.result.capabilities,
+            instructions: message.result.instructions,
+            role: serverEnv.CCDM_ROUTER_ROLE || (serverEnv.CCDM_THREAD_ID ? "thread" : "project"),
+            threadId: serverEnv.CCDM_THREAD_ID || null,
+          });
           write({ method: "notifications/initialized" });
           toolsListId = call("tools/list", {});
         } else if (message.id === toolsListId) {
           // Each server's tools, by the thread it serves (null for a channel).
-          record("toolLists", { threadId: serverEnv.CCDM_THREAD_ID || null,
-            tools: (message.result?.tools || []).map((tool) => tool.name) });
+          record("toolLists", {
+            role: serverEnv.CCDM_ROUTER_ROLE || (serverEnv.CCDM_THREAD_ID ? "thread" : "project"),
+            threadId: serverEnv.CCDM_THREAD_ID || null,
+            tools: (message.result?.tools || []).map((tool) => tool.name),
+          });
         } else if (message.method === "notifications/claude/channel") {
           record("channelNotifications", message.params);
           const { replyText, toolScript } = readState().fixtures.claude;
