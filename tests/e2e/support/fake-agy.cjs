@@ -219,6 +219,18 @@ async function runPrompt(session, params) {
     session.cancel = null;
     return { stopReason: "cancelled" };
   }
+  if (turn.holdUntilFile) {
+    while (!fs.existsSync(turn.holdUntilFile)) {
+      const outcome = await Promise.race([
+        cancelled.then(() => "cancelled"),
+        new Promise((resolve) => setTimeout(() => resolve("poll"), 25)),
+      ]);
+      if (outcome === "cancelled") {
+        session.cancel = null;
+        return { stopReason: "cancelled" };
+      }
+    }
+  }
   if (turn.delayMs) {
     const outcome = await Promise.race([cancelled.then(() => "cancelled"),
       new Promise((resolve) => setTimeout(() => resolve("done"), turn.delayMs))]);
@@ -229,6 +241,20 @@ async function runPrompt(session, params) {
   }
   session.cancel = null;
   if (turn.text) update(session.id, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: turn.text } });
+  if (Array.isArray(turn.mcpCalls)) {
+    const discord = session.mcp.find((server) => server.name.startsWith("discord-"));
+    const reqMatch = /^\[Agent Request (req-[0-9a-f]{12}) /.exec(text);
+    for (const call of turn.mcpCalls) {
+      const resolvedArgs = { ...(call.args || {}) };
+      if (call.withScopeToken) resolvedArgs.scope_token = session.scopeToken;
+      if (call.extractRequestId && reqMatch) resolvedArgs.request_id = reqMatch[1];
+      const toolName = `mcp_${discord?.name}_${call.name}`;
+      const toolCallId = randomUUID();
+      update(session.id, { sessionUpdate: "tool_call", toolCallId, name: toolName, title: `Run ${toolName}`, status: "in_progress", kind: "other" });
+      await discord?.call(call.name, resolvedArgs);
+      update(session.id, { sessionUpdate: "tool_call_update", toolCallId, name: toolName, status: "completed", kind: "other" });
+    }
+  }
   if (turn.reply !== undefined) {
     const discord = session.mcp.find((server) => server.name.startsWith("discord-"));
     const toolName = `mcp_${discord?.name}_reply`;
