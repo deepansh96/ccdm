@@ -6,11 +6,15 @@
 // evict and to tell whose turn it is; for Claude channels the channel server
 // keeps it so it can tell whether a turn is running:
 //
-//   turn_running       a turn is running
-//   last_turn_end_at   when the last turn ended
-//   last_turn_outcome  how it ended: completed, failed, or (Codex) interrupted
-//   turn_replied       whether the current or last turn posted a reply
-//   paused             /pause holds new turns
+//   turn_running                a turn is running
+//   turn_agent_started          whether the running turn was started by an Agent Message
+//   last_turn_end_at            when the last turn ended
+//   last_turn_outcome           how it ended: completed, failed, or (Codex) interrupted
+//   last_turn_agent_started     whether the last turn that ended was agent-started
+//   last_ordinary_turn_end_at   when the last non-agent-started turn ended
+//   last_ordinary_turn_outcome  how that last non-agent-started turn ended
+//   turn_replied                whether the current or last turn posted a reply
+//   paused                      /pause holds new turns
 //
 // It is replaced atomically (temporary file, then rename, mode 0600), and each
 // write keeps the fields it does not change. Writers are several processes
@@ -86,12 +90,45 @@ function writeActivity(file, update) {
 }
 
 // A turn starts (`running`), or ends with `outcome`. A new turn has not replied yet.
-function markTurn(file, running, outcome = "completed") {
+// `agentStarted` (boolean) flags an agent-started turn (`true`) or an ordinary
+// turn / owner input joining a running turn (`false`).
+function markTurn(file, running, outcome = "completed", { agentStarted } = {}) {
   writeActivity(file, activity => {
-    if (running && activity.turn_running !== true) activity.turn_replied = false;
-    activity.turn_running = running;
-    activity.last_turn_end_at = running ? activity.last_turn_end_at ?? null : new Date().toISOString();
-    if (!running) activity.last_turn_outcome = outcome;
+    if (running) {
+      const wasRunning = activity.turn_running === true;
+      if (!wasRunning) activity.turn_replied = false;
+      activity.turn_running = true;
+      activity.last_turn_end_at = activity.last_turn_end_at ?? null;
+      if (agentStarted === true) {
+        activity.turn_agent_started = true;
+      } else if (agentStarted === false || !wasRunning) {
+        delete activity.turn_agent_started;
+      }
+      return;
+    }
+    const endedAgentStarted = typeof agentStarted === "boolean"
+      ? agentStarted
+      : activity.turn_agent_started === true;
+    const endedAt = new Date().toISOString();
+    activity.turn_running = false;
+    activity.last_turn_end_at = endedAt;
+    activity.last_turn_outcome = outcome;
+    delete activity.turn_agent_started;
+    if (endedAgentStarted) {
+      activity.last_turn_agent_started = true;
+    } else {
+      delete activity.last_turn_agent_started;
+      activity.last_ordinary_turn_end_at = endedAt;
+      activity.last_ordinary_turn_outcome = outcome;
+    }
+  });
+}
+
+// Owner (or thread driver) input joined a running turn, or a new thread launch
+// started, so any agent-started flag clears.
+function clearAgentStarted(file) {
+  writeActivity(file, activity => {
+    delete activity.turn_agent_started;
   });
 }
 
@@ -111,12 +148,16 @@ function resetActivity(file) {
     activity.turn_running = false;
     activity.paused = false;
     activity.last_turn_end_at = null;
+    delete activity.turn_agent_started;
     delete activity.last_turn_outcome;
+    delete activity.last_turn_agent_started;
+    delete activity.last_ordinary_turn_end_at;
+    delete activity.last_ordinary_turn_outcome;
     delete activity.turn_replied;
   });
 }
 
-module.exports = { markPaused, markReplied, markTurn, resetActivity };
+module.exports = { clearAgentStarted, markPaused, markReplied, markTurn, resetActivity };
 
 if (require.main === module) {
   let input = "";

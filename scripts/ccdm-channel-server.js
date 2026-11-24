@@ -71,7 +71,7 @@ const sessionHost = require("./lib/session-host.js");
 const reminder = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
 const { formatConversationLabel } = require("./router/agent-messages/record-format.js");
-const { markPaused, markReplied, markTurn, resetActivity } = require("./thread-activity.js");
+const { clearAgentStarted, markPaused, markReplied, markTurn, resetActivity } = require("./thread-activity.js");
 const { createEmergencyGateway } = require("./router/emergency.js");
 const modelInfo = require("./model-info.js");
 
@@ -106,8 +106,10 @@ const ACTIVITY_FILE = ROOT ? "" : (process.env.CCDM_ACTIVITY_FILE || process.env
 // A new launch starts unpaused, whatever the last one left in activity.json.
 // A channel launch also starts with no turn running; a thread launch leaves
 // turn_running unset until its bootstrap finishes so eviction treats it as busy.
-if (THREAD) markPaused(ACTIVITY_FILE, false);
-else if (ACTIVITY_FILE) resetActivity(ACTIVITY_FILE);
+if (THREAD) {
+  markPaused(ACTIVITY_FILE, false);
+  clearAgentStarted(ACTIVITY_FILE);
+} else if (ACTIVITY_FILE) resetActivity(ACTIVITY_FILE);
 // Mirrors COMMANDS and THREAD_COMMANDS in scripts/router/inbound.js.
 const RELAYED_COMMANDS = THREAD ? "/pause, /unpause and /compact" : "/pause, /unpause, /compact, /clear and /restart";
 // Claude's working directory is the project, so Windows names the checkout in full.
@@ -739,13 +741,21 @@ function main() {
   let initialized = false;
   const queued = [];
   // Each delivered notification starts a Claude turn; the Stop and StopFailure hooks end it.
-  // Owner input joining an agent-started turn makes it an ordinary turn from that message on.
+  // Agent Messages flag an agent-started turn in activity.json; owner (or thread driver)
+  // input joining the turn clears the flag so that turn's end settles normally.
   const deliverNotification = params => {
-    if (params?.meta?.sender === "owner") {
+    const sender = params?.meta?.sender;
+    const isAgent = sender === "agent";
+    const isOwner = sender === "owner";
+    const isGuestMessage = sender === "guest" && !params?.meta?.reaction;
+    if (isOwner) {
       agentStartedTurn = false;
       agentTurnBaselineEndAt = null;
     }
-    if (ACTIVITY_FILE) markTurn(ACTIVITY_FILE, true);
+    if (ACTIVITY_FILE) {
+      const agentStarted = isAgent ? true : (isOwner || isGuestMessage || !sender) ? false : undefined;
+      markTurn(ACTIVITY_FILE, true, "completed", agentStarted === undefined ? {} : { agentStarted });
+    }
     send({ method: "notifications/claude/channel", params });
   };
   const channelNotify = params => {

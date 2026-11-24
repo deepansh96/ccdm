@@ -40,7 +40,7 @@ const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { createRouterTransport } = require("./codex-bridge-transport.js");
 const { arrivalOrder } = require("./lib/arrival-order.js");
 const { scheduleProjectRestart, scheduleRootRestart: scheduleRootRestartHelper } = require("./lib/restart-helper.js");
-const { markPaused, markReplied, markTurn } = require("./thread-activity.js");
+const { clearAgentStarted, markPaused, markReplied, markTurn } = require("./thread-activity.js");
 const modelInfo = require("./model-info.js");
 const { formatConversationLabel } = require("./router/agent-messages/record-format.js");
 const routerPaths = require("./router/paths.js");
@@ -153,6 +153,7 @@ function setBridgePaused(paused) {
 }
 // A new launch starts unpaused, whatever the last one left in activity.json.
 markPaused(THREAD_ACTIVITY_FILE, false);
+clearAgentStarted(THREAD_ACTIVITY_FILE);
 const discordTransport = createRouterTransport({
   project: ROUTER_PROJECT, role: ROUTER_ROOT ? "root" : THREAD_MODE ? "thread" : "project", keyFile: ROUTER_KEY_FILE,
   launchDir: ROUTER_LAUNCH_DIR, registryPath: REGISTRY_PATH, primaryChannelId: CHANNEL_ID,
@@ -167,6 +168,7 @@ let threadResetting = false;
 let fallbackLoggedCompletedItemTypes = new Set();
 let pendingTerminalError = null;
 let activeTurnHadProgress = false;
+let activeTurnAgentStarted = false;
 let activeTurnRecoveryAttempt = 0;
 let activeTurnChannelScopeToken = null;
 let activeReminderContext = null;
@@ -753,7 +755,9 @@ function handleNotification(msg) {
       break;
 
     case "turn/started":
-      if (isCurrentTurnNotification(msg)) markTurn(THREAD_ACTIVITY_FILE, true);
+      if (isCurrentTurnNotification(msg)) {
+        markTurn(THREAD_ACTIVITY_FILE, true, "completed", { agentStarted: activeTurnAgentStarted });
+      }
       break;
 
     case "item/started":
@@ -898,6 +902,8 @@ async function onTurnCompleted(turn = {}) {
   mcpReplyCalled = false;
   suppressTurnOutput = false;
   pendingTerminalError = null;
+  const wasAgentStarted = activeTurnAgentStarted;
+  activeTurnAgentStarted = false;
   activeTurnHadProgress = false;
   activeTurnRecoveryAttempt = 0;
   activeTurnChannelScopeToken = null;
@@ -908,7 +914,8 @@ async function onTurnCompleted(turn = {}) {
   // one, so only now is the thread session idle. An interrupted turn (a
   // stop, a reset) never hands the turn to the owner.
   markTurn(THREAD_ACTIVITY_FILE, false,
-    turn.status === "failed" || terminalError ? "failed" : turn.status === "interrupted" ? "interrupted" : "completed");
+    turn.status === "failed" || terminalError ? "failed" : turn.status === "interrupted" ? "interrupted" : "completed",
+    { agentStarted: wasAgentStarted });
   console.log(`[turn] Finished (${turn.status ?? "no status"}); bridge idle`);
   if (outputSuppressed && bootstrapCompletion) {
     const complete = bootstrapCompletion;
@@ -933,7 +940,8 @@ async function onTurnCompleted(turn = {}) {
       channelId,
       channelScopeToken,
       recoveryAttempt + 1,
-      retrySource
+      retrySource,
+      { agentStarted: wasAgentStarted }
     );
     return;
   }
@@ -961,11 +969,11 @@ async function processQueue() {
       console.log(`[agent-message] Dropping expired held request ${nextItem.agentMessage.request_id}`);
       continue;
     }
-    const { input, msg: queuedMsg, channelId, channelScopeToken } = nextItem;
+    const { input, msg: queuedMsg, channelId, channelScopeToken, agentMessage } = nextItem;
     if (queuedMsg && !queuedMsg.synthetic) {
       discordTransport.removeOwnReaction(queuedMsg, "⏳").catch(() => {});
     }
-    await sendTurn(input, channelId, channelScopeToken, 0, queuedMsg);
+    await sendTurn(input, channelId, channelScopeToken, 0, queuedMsg, { agentStarted: Boolean(agentMessage) });
     return;
   }
 }
@@ -1010,6 +1018,12 @@ async function routeInput(input, msg, channelId, channelScopeToken) {
         expectedTurnId: steeredTurnId,
       });
       if (msg && !ROOT_MULTI_CHANNEL && turnActive && activeTurnId === steeredTurnId) {
+        const isOwner = Boolean(msg.reminderAssignment && msg.author?.id === msg.reminderAssignment.owner_id);
+        const isThreadDriver = THREAD_MODE && !msg.synthetic;
+        if (activeTurnAgentStarted && (isOwner || isThreadDriver)) {
+          activeTurnAgentStarted = false;
+          clearAgentStarted(THREAD_ACTIVITY_FILE);
+        }
         if (activeReminderContext && msg.author.id === activeReminderContext.owner_id) {
           const receipts = await reminderAdapter.receiptsForTurn(activeReminderContext.provider_session_id, activeReminderContext.provider_turn_id);
           const latestQuestion = receipts.filter((receipt) => receipt.disposition === "input-needed").at(-1);
@@ -1065,10 +1079,11 @@ async function sendTurn(
   channelId = projectChannelId,
   channelScopeToken = null,
   recoveryAttempt = 0,
-  sourceMessage = null
+  sourceMessage = null,
+  { agentStarted = false } = {}
 ) {
   if (!threadId) {
-    messageQueue.push({ input, msg: sourceMessage, channelId, channelScopeToken });
+    messageQueue.push({ input, msg: sourceMessage, channelId, channelScopeToken, ...(agentStarted ? { agentMessage: true } : {}) });
     return;
   }
   turnActive = true;
@@ -1078,6 +1093,7 @@ async function sendTurn(
   mcpReplyCalled = false;
   pendingTerminalError = null;
   activeTurnHadProgress = false;
+  activeTurnAgentStarted = Boolean(agentStarted);
   activeTurnRecoveryAttempt = recoveryAttempt;
   activeTurnChannelScopeToken = channelScopeToken;
   activeReminderContext = null;
@@ -1119,6 +1135,7 @@ async function sendTurn(
     fallbackText = "";
     pendingTerminalError = null;
     activeTurnHadProgress = false;
+    activeTurnAgentStarted = false;
     activeTurnRecoveryAttempt = 0;
     activeTurnChannelScopeToken = null;
     activeReminderContext = null;
@@ -1144,6 +1161,7 @@ async function sendBootstrapInstructionTurn(reason, { required = false } = {}) {
   suppressTurnOutput = true;
   pendingTerminalError = null;
   activeTurnHadProgress = false;
+  activeTurnAgentStarted = false;
   activeTurnRecoveryAttempt = 0;
   activeTurnChannelScopeToken = null;
   resetActiveTurnId();
@@ -1207,6 +1225,7 @@ async function onContextCompactionCompleted() {
 async function startCompaction(channelId) {
   turnActive = true;
   suppressTurnOutput = true;
+  activeTurnAgentStarted = false;
   activeOutputChannelId = channelId;
   resetActiveTurnId();
   let posted;
@@ -1738,7 +1757,7 @@ async function handleAgentMessage(event, next = () => {}) {
     }
     return;
   }
-  const started = sendTurn(input, channelId, null, 0, null);
+  const started = sendTurn(input, channelId, null, 0, null, { agentStarted: true });
   next();
   await started;
 }

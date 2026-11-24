@@ -100,20 +100,37 @@ def activity(context, row) -> dict | None:
     """The session's activity.json, reread only when it changed; None when unreadable."""
     path = capacity.activity_path(row["project"], row["thread_id"])
     try:
-        mtime = path.stat().st_mtime_ns
+        st = path.stat()
+        key = (st.st_mtime_ns, st.st_ino, st.st_size)
     except OSError:
         context.activity.pop(row["thread_id"], None)
         return None
     cached = context.activity.get(row["thread_id"])
-    if cached and cached[0] == mtime:
+    if cached and cached[0] == key:
         return cached[1]
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     data = data if isinstance(data, dict) else None
-    context.activity[row["thread_id"]] = (mtime, data)
+    context.activity[row["thread_id"]] = (key, data)
     return data
+
+
+def _ordinary_end(current: dict) -> tuple[str | None, str | None]:
+    """The latest non-agent-started turn end and outcome recorded in activity.json.
+
+    Adapters record `last_ordinary_turn_end_at` and `last_ordinary_turn_outcome`
+    separately so an agent-started turn running right after an owner turn never
+    overwrites that turn's unsettled end. Older records without those fields
+    fall back to `last_turn_end_at`/`last_turn_outcome` unless
+    `last_turn_agent_started` is True."""
+    end = current.get("last_ordinary_turn_end_at")
+    if _moment(end):
+        return end, current.get("last_ordinary_turn_outcome")
+    if current.get("last_turn_agent_started") is True:
+        return None, None
+    return current.get("last_turn_end_at"), current.get("last_turn_outcome")
 
 
 def _addresses_root(context, content: str) -> bool:
@@ -167,7 +184,11 @@ def baseline(context, thread_id: str) -> None:
         return
     context.activity.pop(thread_id, None)
     context.end_first_seen.pop(thread_id, None)
-    seen = (activity(context, row) or {}).get("last_turn_end_at")
+    current = activity(context, row) or {}
+    seen, _ = _ordinary_end(current)
+    last = current.get("last_turn_end_at")
+    if _later(last, seen) or (not _moment(seen) and _moment(last)):
+        seen = last
     store.update(context.db, thread_id, turn_end_seen=seen if _moment(seen) else now())
 
 
@@ -196,11 +217,17 @@ def before_archive(context, thread_id: str) -> None:
 
 
 def _observe_turn(context, row, settle: bool = True) -> None:
-    """Take a settled turn end from a live session's activity file."""
+    """Take a settled non-agent-started turn end from a live session's activity file."""
     thread_id = row["thread_id"]
     current = activity(context, row)
-    end = (current or {}).get("last_turn_end_at")
-    if current is None or current.get("turn_running") is not False or not _moment(end):
+    if current is None:
+        context.end_first_seen.pop(thread_id, None)
+        return
+    # An agent-started turn running right after an ordinary turn ended must not
+    # hide or reset the settle window for that ordinary turn's end.
+    ordinary_running = current.get("turn_running") is not False and current.get("turn_agent_started") is not True
+    end, outcome = _ordinary_end(current)
+    if ordinary_running or not _moment(end):
         context.end_first_seen.pop(thread_id, None)
         return
     if row["turn_end_seen"] is None:  # A row from before turn status: its first end is the baseline.
@@ -219,7 +246,6 @@ def _observe_turn(context, row, settle: bool = True) -> None:
     store.update(context.db, thread_id, turn_end_seen=end)
     if row["whose_turn"] != "agent" or (row["last_input_at"] and _later(row["last_input_at"], end)):
         return
-    outcome = current.get("last_turn_outcome")
     if outcome == "interrupted":
         return store.end_waiting(context.db, thread_id)
     failed = outcome == "failed"

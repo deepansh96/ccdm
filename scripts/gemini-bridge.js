@@ -60,7 +60,7 @@ process.env.CCDM_REMINDER_CONTEXT_FILE = REMINDER_CONTEXT_FILE;
 process.env.CCDM_REMINDER_RECEIPTS_DIR = REMINDER_RECEIPTS_DIR;
 const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { createRouterTransport } = require("./codex-bridge-transport.js");
-const { markPaused, markReplied, markTurn } = require("./thread-activity.js");
+const { clearAgentStarted, markPaused, markReplied, markTurn } = require("./thread-activity.js");
 const { formatConversationLabel } = require("./router/agent-messages/record-format.js");
 const routerPaths = require("./router/paths.js");
 
@@ -157,6 +157,7 @@ function setBridgePaused(paused) {
   markPaused(THREAD_ACTIVITY_FILE, paused);
 }
 markPaused(THREAD_ACTIVITY_FILE, false);
+clearAgentStarted(THREAD_ACTIVITY_FILE);
 
 const discordTransport = createRouterTransport({
   project: ROUTER_PROJECT, role: THREAD_MODE ? "thread" : "project", keyFile: ROUTER_KEY_FILE,
@@ -604,7 +605,7 @@ async function exitAfterRuntimeLoss(reason) {
 // One ACP prompt. `source` is the owner message it answers, for Conversation
 // Reminders; `suppress` hides its text (a /compact). The caller has checked
 // that no other prompt runs: ACP takes one at a time per session.
-async function runTurn(blocks, channelId, source = null, { suppress = false } = {}) {
+async function runTurn(blocks, channelId, source = null, { suppress = false, agentStarted = false } = {}) {
   turnActive = true;
   turnReplied = false;
   turnReplyCalls = new Map();
@@ -617,7 +618,7 @@ async function runTurn(blocks, channelId, source = null, { suppress = false } = 
     ? [{ type: "text", text: pendingThreadPreamble }, ...blocks]
     : blocks;
   if (!suppress) pendingThreadPreamble = "";
-  markTurn(THREAD_ACTIVITY_FILE, true);
+  markTurn(THREAD_ACTIVITY_FILE, true, "completed", { agentStarted: Boolean(agentStarted) });
   if (source?.reminderAssignment) {
     activeReminderContext = {
       ...reminderEventContext(source.reminderAssignment, turnId),
@@ -694,7 +695,7 @@ async function runTurn(blocks, channelId, source = null, { suppress = false } = 
   await reminderAdapter.clearActiveContext().catch(() => {});
   turnActive = false;
   activeOutputChannelId = null;
-  markTurn(THREAD_ACTIVITY_FILE, false, outcome);
+  markTurn(THREAD_ACTIVITY_FILE, false, outcome, { agentStarted: Boolean(agentStarted) });
   return outcome;
 }
 
@@ -746,7 +747,7 @@ function processQueue() {
   if (messageQueue.length === 0) return;
   if (messageQueue[0].agentMessage) {
     const item = messageQueue.shift();
-    startTurn(item.blocks, item.channelId, null);
+    startTurn(item.blocks, item.channelId, null, { agentStarted: true });
     return;
   }
   const queued = [];
@@ -1301,7 +1302,7 @@ async function onAgentMessage(event) {
     if (canPrompt()) processQueue();
     return;
   }
-  startTurn(blocks, projectChannelId, null);
+  startTurn(blocks, projectChannelId, null, { agentStarted: true });
 }
 
 async function connectDiscord() {

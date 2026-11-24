@@ -1,16 +1,18 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 import { injectDiscordMessage, startFakeCodexServer } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
-import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerRegistry, routerWithWebhooks, waitFor } from "./support/router.js";
+import { OWNER_ID, ROOT_TOKEN, createRouterWorkspace, routerRegistry, routerWithWebhooks, waitFor,
+  writeProjectKey } from "./support/router.js";
 import { readState, updateState } from "./support/state.js";
 import { PYTHON } from "./support/platform.js";
-import { cleanup, workspaceOwnsPid } from "./support/teardown.js";
+import { cleanup, registerTeardownCallback, workspaceOwnsPid } from "./support/teardown.js";
 import { startThreadSupervisor, supervisorEnv, supervisorStateDir, supervisorStatus,
   waitForThreadIdle } from "./support/thread-supervisor.js";
 
@@ -458,4 +460,553 @@ test("the activity hook skips / commands, and concurrent activity writers keep e
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---- Agent Messages in Thread Conversations (#406) -------------------------
+
+function agentThreadWorkspace() {
+  const workspace = createRouterWorkspace({ ...routerRegistry({
+    demo: { channel_id: "demo-channel", type: "claude", transport: "router", guest_user_ids: ["guest-id"],
+      screen_name: "demo_claude", agent_message_targets: ["beta"] },
+    beta: { channel_id: "beta-channel", type: "codex", transport: "router", agent_message_targets: ["demo"] },
+  }), root_channels: ["root-channel"] });
+  const registryFile = path.join(workspace.repoDir, "registry.json");
+  const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+  registry.projects.demo.path = workspace.tmpDir;
+  registry.projects.beta.path = workspace.tmpDir;
+  fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
+  return workspace;
+}
+
+async function supervisedAgentWorkspace(workspace, env = {}) {
+  await routerWithWebhooks(workspace, ["demo", "beta"]);
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.replyText = "on it";
+  });
+  return startThreadSupervisor(workspace, { env: { ...FAST, ...env } });
+}
+
+async function connectAgentSender(workspace, project = "beta") {
+  const key = `${project}-agent-key`;
+  writeProjectKey(workspace, project, key);
+  const { RouterClient } = createRequire(import.meta.url)(path.join(workspace.repoDir, "scripts/router/client.js"));
+  const client = new RouterClient({
+    socketPath: workspace.socketPath, project, key, role: "project", capabilities: ["agent_messages"],
+  });
+  const events = [];
+  client.on("event", event => events.push(event));
+  await client.connect();
+  registerTeardownCallback(() => client.close());
+  return { client, events };
+}
+
+async function sendAgentRequestToThread(workspace, sender, { text, idempotencyKey, threadId = THREAD_ID }) {
+  const before = (discord(workspace).messages ?? [])
+    .filter(message => message.channelId === threadId && !message.webhookId
+      && String(message.content || "").startsWith("-# ⇄ Agent ")).length;
+  const result = await sender.client.request("agent_request", {
+    target: `demo/${threadId}`,
+    text,
+    idempotency_key: idempotencyKey,
+  });
+  // Waiting for the receiver-side record post guarantees the Router posted both
+  // records and dispatched the `agent_message` event to the target thread.
+  const record = await waitFor(() => {
+    const records = (discord(workspace).messages ?? [])
+      .filter(message => message.channelId === threadId && !message.webhookId
+        && String(message.content || "").startsWith("-# ⇄ Agent "));
+    return records.length > before ? records.at(-1) : null;
+  }, () => `receiver record post for ${result.request_id}`, 15000);
+  return { result, record };
+}
+
+function releaseOneClaudeTurn(workspace, threadId = THREAD_ID) {
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.releaseTurns = [...(state.fixtures.claude.releaseTurns || []), threadId];
+  });
+}
+
+test("Claude thread: an agent-started turn that starts and ends never settles a pending ⏳ on the owner's latest input", async () => {
+  const workspace = agentThreadWorkspace();
+  await supervisedAgentWorkspace(workspace);
+  await answeredThread(workspace);
+  await shows(workspace, ["boot-message-1 ✅"]);
+
+  const beta = await connectAgentSender(workspace, "beta");
+  holdTurns(workspace, true);
+  const { record } = await sendAgentRequestToThread(workspace, beta, {
+    text: "Check staging health",
+    idempotencyKey: "claude-ac1-req",
+  });
+  await waitFor(
+    () => (claude(workspace).channelNotifications ?? []).some(n => n.meta?.sender === "agent"),
+    () => "Claude agent notification",
+    15000,
+  );
+
+  // Pause before sending the owner's message so it gets ⏳ from the supervisor
+  // without joining the running agent-started turn.
+  threadMessage(workspace, "pause-1", "/pause");
+  await waitFor(
+    () => agentReplies(workspace).some(message => message.content.includes("Session paused.")),
+    () => "Claude /pause acknowledgement",
+    15000,
+  );
+  threadMessage(workspace, "owner-paused-1", "please check logs next");
+  await shows(workspace, ["boot-message-1 ✅", "owner-paused-1 ⏳"]);
+
+  // End the running agent-started turn; its end must not change owner-paused-1's ⏳.
+  holdTurns(workspace, false);
+  await idle(workspace);
+  await pause(800);
+  assert.deepEqual(shown(workspace), ["boot-message-1 ✅", "owner-paused-1 ⏳"]);
+  assert.equal((await threadRow(workspace)).whose_turn, "agent");
+  assert.deepEqual(markCalls(workspace).filter(call => call.messageId === record.id), []);
+
+  // After /unpause, the owner's own turn runs and settles ⏳ into ✅.
+  threadMessage(workspace, "unpause-1", "/unpause");
+  await shows(workspace, ["boot-message-1 ✅", "owner-paused-1 ✅"]);
+  assert.deepEqual(markCalls(workspace).filter(call => call.messageId === record.id), []);
+});
+
+test("Claude thread: an owner's turn ending with a held Agent Message behind it still settles ⏳ to ✅ or ⚠️, and the agent-started turn changes nothing", async () => {
+  const workspace = agentThreadWorkspace();
+  await supervisedAgentWorkspace(workspace);
+  await answeredThread(workspace);
+  await shows(workspace, ["boot-message-1 ✅"]);
+  const beta = await connectAgentSender(workspace, "beta");
+
+  // 1. Owner turn succeeds while an Agent Message waits behind it; the following
+  //    agent-started turn starts immediately and later fails, changing nothing.
+  holdTurns(workspace, true);
+  threadMessage(workspace, "owner-ok-1", "run checks");
+  await shows(workspace, ["boot-message-1 ✅", "owner-ok-1 ⏳"]);
+  const { record: record1 } = await sendAgentRequestToThread(workspace, beta, {
+    text: "Inspect cache after your turn",
+    idempotencyKey: "claude-ac2-ok",
+  });
+  releaseOneClaudeTurn(workspace);
+  await waitFor(
+    () => (claude(workspace).channelNotifications ?? []).some(n => n.meta?.sender === "agent" && n.content.includes("Inspect cache")),
+    () => "held agent request delivered right after owner turn ended",
+    15000,
+  );
+  await shows(workspace, ["boot-message-1 ✅", "owner-ok-1 ✅"]);
+
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.failTurnsIn = [THREAD_ID];
+  });
+  holdTurns(workspace, false);
+  await idle(workspace);
+  await pause(600);
+  assert.deepEqual(shown(workspace), ["boot-message-1 ✅", "owner-ok-1 ✅"]);
+  assert.deepEqual(markCalls(workspace).filter(call => call.messageId === record1.id), []);
+
+  // 2. Owner turn fails while an Agent Message waits behind it; the following
+  //    agent-started turn starts immediately and later succeeds, changing nothing.
+  holdTurns(workspace, true);
+  threadMessage(workspace, "owner-fail-1", "trigger failing turn");
+  await shows(workspace, ["boot-message-1 ✅", "owner-ok-1 ✅", "owner-fail-1 ⏳"]);
+  const { record: record2 } = await sendAgentRequestToThread(workspace, beta, {
+    text: "Inspect metrics after failing turn",
+    idempotencyKey: "claude-ac2-fail",
+  });
+  releaseOneClaudeTurn(workspace);
+  await waitFor(
+    () => (claude(workspace).channelNotifications ?? []).some(n => n.meta?.sender === "agent" && n.content.includes("Inspect metrics")),
+    () => "second held agent request delivered right after failed owner turn",
+    15000,
+  );
+  await shows(workspace, ["boot-message-1 ✅", "owner-ok-1 ✅", "owner-fail-1 ⚠️"]);
+
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.failTurnsIn = [];
+  });
+  holdTurns(workspace, false);
+  await idle(workspace);
+  await pause(600);
+  assert.deepEqual(shown(workspace), ["boot-message-1 ✅", "owner-fail-1 ⚠️", "owner-ok-1 ✅"]);
+  assert.deepEqual(markCalls(workspace).filter(call => call.messageId === record2.id), []);
+});
+
+test("Claude thread: owner input joining a running agent-started turn settles its ⏳ when that turn ends", async () => {
+  const workspace = agentThreadWorkspace();
+  await supervisedAgentWorkspace(workspace);
+  await answeredThread(workspace);
+  await shows(workspace, ["boot-message-1 ✅"]);
+
+  const beta = await connectAgentSender(workspace, "beta");
+  holdTurns(workspace, true);
+  const { record } = await sendAgentRequestToThread(workspace, beta, {
+    text: "Check schema",
+    idempotencyKey: "claude-ac3-join",
+  });
+  await waitFor(
+    () => (claude(workspace).channelNotifications ?? []).some(n => n.meta?.sender === "agent"),
+    () => "Claude agent-started turn notification",
+    15000,
+  );
+
+  threadMessage(workspace, "owner-join-1", "also check migrations");
+  await waitFor(
+    () => (claude(workspace).channelNotifications ?? []).some(n => n.meta?.message_id === "owner-join-1"),
+    () => "owner message joining agent-started turn",
+    15000,
+  );
+  await shows(workspace, ["boot-message-1 ✅", "owner-join-1 ⏳"]);
+
+  holdTurns(workspace, false);
+  await shows(workspace, ["boot-message-1 ✅", "owner-join-1 ✅"]);
+  assert.deepEqual(markCalls(workspace).filter(call => call.messageId === record.id), []);
+});
+
+async function answeredCodexAgentThread(workspace, { port, turns = [], steer = [] }) {
+  fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
+  const codex = await startFakeCodexServer(workspace, {
+    port, deferListen: true,
+    codexHome: path.join(workspace.homeDir, ".codex"),
+    channelId: THREAD_ID, threadId: CODEX_THREAD_UUID,
+    bootstrapPlan: { mcpReplyText: "on it" },
+    turns, steer,
+  });
+  await supervisedAgentWorkspace(workspace, { CCDM_THREAD_WS_PORT_BASE: String(port) });
+  execFileSync(PYTHON, ["-c", `import sqlite3, sys
+db = sqlite3.connect(sys.argv[1], timeout=5)
+db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
+  first_message, requester_id, requester_kind, status, thread_id, created_at)
+  VALUES ('request-1', 'demo', 'Fix flaky test', 'codex', NULL, NULL, NULL, NULL, ?, 'owner', 'pending', NULL,
+  strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))""", (sys.argv[2],))
+db.commit()`, path.join(supervisorStateDir(workspace), "threads.sqlite3"), OWNER_ID]);
+  threadEvent(workspace, "create", { ownerId: BOT_USER_ID });
+  await threadRow(workspace, row => row.provider === "codex");
+  threadMessage(workspace, "boot-message-1", "please fix the parser");
+  await threadRow(workspace, row => row.ws_port === port);
+  await codex.listen();
+  await threadRow(workspace, row => row.state === "live");
+  await waitFor(() => agentReplies(workspace).length === 1, () => "the Codex bootstrap reply", 20000);
+  await idle(workspace);
+  await shows(workspace, ["boot-message-1 ✅"]);
+  return codex;
+}
+
+test("Codex thread: an agent-started turn that starts and ends never settles a pending ⏳ on the owner's latest input", async () => {
+  const workspace = agentThreadWorkspace();
+  const codex = await answeredCodexAgentThread(workspace, {
+    port: 29621,
+    turns: [
+      { turnId: "agent-turn-1", waitForRelease: true, delta: "agent checked" },
+      { turnId: "owner-turn-1", waitForRelease: true, mcpReplyText: "owner done" },
+    ],
+  });
+  const beta = await connectAgentSender(workspace, "beta");
+
+  const { record } = await sendAgentRequestToThread(workspace, beta, {
+    text: "Check staging health",
+    idempotencyKey: "codex-ac1-req",
+  });
+  await waitFor(() => codex.pendingReleases().includes("agent-turn-1"), () => "Codex agent-turn-1 held", 15000);
+
+  // Pause before sending the owner's message so it gets ⏳ from the supervisor
+  // and queues without joining the running agent-started turn.
+  threadMessage(workspace, "pause-1", "/pause");
+  await waitFor(
+    () => agentReplies(workspace).some(message => message.content.includes("Bridge paused.")),
+    () => "Codex /pause acknowledgement",
+    15000,
+  );
+  threadMessage(workspace, "owner-paused-1", "now check logs");
+  await shows(workspace, ["boot-message-1 ✅", "owner-paused-1 ⏳"]);
+
+  // Ending the agent-started turn leaves the bridge idle while paused;
+  // owner-paused-1's ⏳ must stay untouched past the settle window.
+  codex.releaseTurn("agent-turn-1");
+  await idle(workspace);
+  await pause(800);
+  assert.deepEqual(shown(workspace), ["boot-message-1 ✅", "owner-paused-1 ⏳"]);
+  assert.equal((await threadRow(workspace)).whose_turn, "agent");
+  assert.deepEqual(markCalls(workspace).filter(call => call.messageId === record.id), []);
+
+  // After /unpause, the owner's own turn runs and settles ⏳ into ✅.
+  threadMessage(workspace, "unpause-1", "/unpause");
+  await waitFor(() => codex.pendingReleases().includes("owner-turn-1"), () => "Codex owner-turn-1 held", 15000);
+  codex.releaseTurn("owner-turn-1");
+  await shows(workspace, ["boot-message-1 ✅", "owner-paused-1 ✅"]);
+  assert.deepEqual(markCalls(workspace).filter(call => call.messageId === record.id), []);
+});
+
+test("Codex thread: an owner's turn ending with a held Agent Message behind it still settles ⏳ to ✅ or ⚠️, and the agent-started turn changes nothing", async () => {
+  const workspace = agentThreadWorkspace();
+  const codex = await answeredCodexAgentThread(workspace, {
+    port: 29622,
+    turns: [
+      { turnId: "owner-ok-turn", waitForRelease: true, mcpReplyText: "owner done" },
+      { turnId: "agent-after-ok", waitForRelease: true, status: "failed", error: "agent boom" },
+      { turnId: "owner-fail-turn", waitForRelease: true, status: "failed", error: "owner boom" },
+      { turnId: "agent-after-fail", waitForRelease: true, delta: "agent ok" },
+    ],
+  });
+  const beta = await connectAgentSender(workspace, "beta");
+
+  // 1. Owner succeeds -> ✅ even though an agent-started turn begins immediately after and fails.
+  threadMessage(workspace, "owner-ok-1", "run checks");
+  await shows(workspace, ["boot-message-1 ✅", "owner-ok-1 ⏳"]);
+  await waitFor(() => codex.pendingReleases().includes("owner-ok-turn"), () => "Codex owner-ok-turn held", 15000);
+  const { record: record1 } = await sendAgentRequestToThread(workspace, beta, {
+    text: "Inspect cache after your turn",
+    idempotencyKey: "codex-ac2-ok",
+  });
+  codex.releaseTurn("owner-ok-turn");
+  await waitFor(() => codex.pendingReleases().includes("agent-after-ok"), () => "Codex agent-after-ok held", 15000);
+  await shows(workspace, ["boot-message-1 ✅", "owner-ok-1 ✅"]);
+
+  codex.releaseTurn("agent-after-ok");
+  await idle(workspace);
+  await pause(600);
+  assert.deepEqual(shown(workspace), ["boot-message-1 ✅", "owner-ok-1 ✅"]);
+  assert.deepEqual(markCalls(workspace).filter(call => call.messageId === record1.id), []);
+
+  // 2. Owner fails -> ⚠️ even though an agent-started turn begins immediately after and succeeds.
+  threadMessage(workspace, "owner-fail-1", "trigger failing turn");
+  await shows(workspace, ["boot-message-1 ✅", "owner-fail-1 ⏳", "owner-ok-1 ✅"]);
+  await waitFor(() => codex.pendingReleases().includes("owner-fail-turn"), () => "Codex owner-fail-turn held", 15000);
+  const { record: record2 } = await sendAgentRequestToThread(workspace, beta, {
+    text: "Inspect metrics after failing turn",
+    idempotencyKey: "codex-ac2-fail",
+  });
+  codex.releaseTurn("owner-fail-turn");
+  await waitFor(() => codex.pendingReleases().includes("agent-after-fail"), () => "Codex agent-after-fail held", 15000);
+  await shows(workspace, ["boot-message-1 ✅", "owner-fail-1 ⚠️", "owner-ok-1 ✅"]);
+
+  codex.releaseTurn("agent-after-fail");
+  await idle(workspace);
+  await pause(600);
+  assert.deepEqual(shown(workspace), ["boot-message-1 ✅", "owner-fail-1 ⚠️", "owner-ok-1 ✅"]);
+  assert.deepEqual(markCalls(workspace).filter(call => call.messageId === record2.id), []);
+});
+
+test("Codex thread: owner input steering into a running agent-started turn settles its ⏳ when that turn ends", async () => {
+  const workspace = agentThreadWorkspace();
+  const codex = await answeredCodexAgentThread(workspace, {
+    port: 29623,
+    turns: [
+      { turnId: "agent-steered-turn", waitForRelease: true, mcpReplyText: "handled both" },
+    ],
+  });
+  const beta = await connectAgentSender(workspace, "beta");
+
+  const { record } = await sendAgentRequestToThread(workspace, beta, {
+    text: "Check schema",
+    idempotencyKey: "codex-ac3-steer",
+  });
+  await waitFor(() => codex.pendingReleases().includes("agent-steered-turn"), () => "Codex agent-steered-turn held", 15000);
+
+  threadMessage(workspace, "owner-steer-1", "also check migrations");
+  await waitFor(
+    () => codex.clientMessages.some(message => message.method === "turn/steer"),
+    () => "Codex turn/steer for owner-steer-1",
+    15000,
+  );
+  await shows(workspace, ["boot-message-1 ✅", "owner-steer-1 ⏳"]);
+
+  codex.releaseTurn("agent-steered-turn");
+  await shows(workspace, ["boot-message-1 ✅", "owner-steer-1 ✅"]);
+  assert.deepEqual(markCalls(workspace).filter(call => call.messageId === record.id), []);
+
+  // Injected webhook and root-bot record posts never receive turn marks in a Codex thread either.
+  const registry = JSON.parse(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"));
+  const webhookId = registry.projects.demo.webhook_id;
+  injectDiscordMessage(workspace, {
+    id: "codex-record-webhook-1", channelId: THREAD_ID,
+    content: "-# ⇄ Agent Request to **beta-codex** · req-112233445566\ncheck deploy",
+    author: { id: webhookId, username: "demo-codex · 10%", bot: true }, webhookId,
+  });
+  injectDiscordMessage(workspace, {
+    id: "codex-record-root-1", channelId: THREAD_ID,
+    content: "-# ⇄ Agent Reply from **beta-codex** · req-112233445566\ndeploy healthy",
+    author: { id: BOT_USER_ID, username: "root", bot: true },
+  });
+  threadMessage(workspace, "codex-owner-after-records", "thanks, proceed");
+  await shows(workspace, ["boot-message-1 ✅", "codex-owner-after-records ✅", "owner-steer-1 ✅"]);
+  assert.deepEqual(
+    markCalls(workspace).filter(call => call.messageId === "codex-record-webhook-1" || call.messageId === "codex-record-root-1"),
+    [],
+  );
+});
+
+const GEMINI_SESSION_ID = "3d4e5f6a-7b8c-4d9e-8f0a-1b2c3d4e5f6a";
+
+function fakeAgyBin(workspace) {
+  const fake = path.join(workspace.repoDir, "tests/e2e/support/fake-agy.cjs");
+  if (process.platform === "win32") return fake;
+  const bin = path.join(workspace.tmpRoot, "agy-bin", "agy");
+  fs.mkdirSync(path.dirname(bin), { recursive: true });
+  fs.writeFileSync(bin, `#!/bin/sh\nexec /bin/bash -p -c 'exec -a agy "$0" "$@"' '${process.execPath}' '${fake}' "$@"\n`);
+  fs.chmodSync(bin, 0o755);
+  return bin;
+}
+
+const agyPlan = (workspace, plan) =>
+  fs.writeFileSync(path.join(workspace.stateDir, "agy-plan.json"), `${JSON.stringify(plan)}\n`);
+
+function agyPrompts(workspace) {
+  const file = path.join(workspace.stateDir, "agy.ndjson");
+  if (!fs.existsSync(file)) return [];
+  return fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean)
+    .map(line => JSON.parse(line))
+    .filter(event => event.event === "client" && event.message?.method === "session/prompt")
+    .map(event => (event.message.params?.prompt || []).filter(b => b.type === "text").map(b => b.text).join("\n"));
+}
+
+async function answeredGeminiAgentThread(workspace, turns) {
+  agyPlan(workspace, { sessionIds: [GEMINI_SESSION_ID], turns: [{ reply: "on it" }, ...turns] });
+  await supervisedAgentWorkspace(workspace, { CCDM_AGY_BIN: fakeAgyBin(workspace) });
+  execFileSync(PYTHON, ["-c", `import sqlite3, sys
+db = sqlite3.connect(sys.argv[1], timeout=5)
+db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
+  first_message, requester_id, requester_kind, status, thread_id, created_at)
+  VALUES ('request-1', 'demo', 'Fix flaky test', 'gemini', NULL, NULL, NULL, NULL, ?, 'owner', 'pending', NULL,
+  strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))""", (sys.argv[2],))
+db.commit()`, path.join(supervisorStateDir(workspace), "threads.sqlite3"), OWNER_ID]);
+  threadEvent(workspace, "create", { ownerId: BOT_USER_ID });
+  await threadRow(workspace, row => row.provider === "gemini");
+  threadMessage(workspace, "boot-message-1", "please fix the parser");
+  await threadRow(workspace, row => row.state === "live");
+  await waitFor(() => agentReplies(workspace).length === 1, () => "the Gemini bootstrap reply", 20000);
+  await idle(workspace);
+  await shows(workspace, ["boot-message-1 ✅"]);
+}
+
+test("Gemini thread: an agent-started turn that starts and ends never settles a pending ⏳ on the owner's latest input", async () => {
+  const workspace = agentThreadWorkspace();
+  const gateAgent1 = path.join(workspace.tmpDir, "gate-agent-1");
+  const gateOwner1 = path.join(workspace.tmpDir, "gate-owner-1");
+  const gateAgent2 = path.join(workspace.tmpDir, "gate-agent-2");
+  const gateOwner2 = path.join(workspace.tmpDir, "gate-owner-2");
+  await answeredGeminiAgentThread(workspace, [
+    { holdUntilFile: gateAgent1, text: "agent checked" },
+    { holdUntilFile: gateOwner1, reply: "owner paused done" },
+    { holdUntilFile: gateAgent2, text: "agent checked 2" },
+    { holdUntilFile: gateOwner2, reply: "owner queued done" },
+  ]);
+  const beta = await connectAgentSender(workspace, "beta");
+
+  // 1. Paused while agent-started turn runs: ending the agent-started turn leaves
+  //    the bridge idle, yet owner-paused-1's ⏳ must stay untouched past settle.
+  const { record: record1 } = await sendAgentRequestToThread(workspace, beta, {
+    text: "Check staging health",
+    idempotencyKey: "gemini-ac1-req-1",
+  });
+  await waitFor(() => agyPrompts(workspace).length === 2, () => "Gemini agent prompt 1", 15000);
+
+  threadMessage(workspace, "pause-1", "/pause");
+  await waitFor(
+    () => agentReplies(workspace).some(message => message.content.includes("Bridge paused.")),
+    () => "Gemini /pause acknowledgement",
+    15000,
+  );
+  threadMessage(workspace, "owner-paused-1", "now check logs");
+  await shows(workspace, ["boot-message-1 ✅", "owner-paused-1 ⏳"]);
+
+  fs.writeFileSync(gateAgent1, "go");
+  await idle(workspace);
+  await pause(800);
+  assert.deepEqual(shown(workspace), ["boot-message-1 ✅", "owner-paused-1 ⏳"]);
+  assert.equal((await threadRow(workspace)).whose_turn, "agent");
+  assert.deepEqual(markCalls(workspace).filter(call => call.messageId === record1.id), []);
+
+  threadMessage(workspace, "unpause-1", "/unpause");
+  await waitFor(() => agyPrompts(workspace).length === 3, () => "Gemini owner-paused-1 prompt", 15000);
+  fs.writeFileSync(gateOwner1, "go");
+  await shows(workspace, ["boot-message-1 ✅", "owner-paused-1 ✅"]);
+
+  // 2. Owner message queued naturally behind a running agent-started turn (ACP
+  //    cannot steer): ending the agent-started turn must not settle ⏳, and the
+  //    owner's queued turn settles ⏳ into ✅ when it finishes.
+  const { record: record2 } = await sendAgentRequestToThread(workspace, beta, {
+    text: "Check worker queue",
+    idempotencyKey: "gemini-ac1-req-2",
+  });
+  await waitFor(() => agyPrompts(workspace).length === 4, () => "Gemini agent prompt 2", 15000);
+
+  threadMessage(workspace, "owner-queued-2", "also check migrations");
+  await shows(workspace, ["boot-message-1 ✅", "owner-paused-1 ✅", "owner-queued-2 ⏳"]);
+  fs.writeFileSync(gateAgent2, "go");
+  await waitFor(() => agyPrompts(workspace).length === 5, () => "Gemini owner-queued-2 prompt", 15000);
+  await pause(600);
+  assert.deepEqual(shown(workspace), ["boot-message-1 ✅", "owner-paused-1 ✅", "owner-queued-2 ⏳"]);
+
+  fs.writeFileSync(gateOwner2, "go");
+  await shows(workspace, ["boot-message-1 ✅", "owner-paused-1 ✅", "owner-queued-2 ✅"]);
+  assert.deepEqual(markCalls(workspace).filter(call => call.messageId === record1.id || call.messageId === record2.id), []);
+
+  // Injected webhook and root-bot record posts never receive turn marks in a Gemini thread either.
+  const registry = JSON.parse(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"));
+  const webhookId = registry.projects.demo.webhook_id;
+  injectDiscordMessage(workspace, {
+    id: "gemini-record-webhook-1", channelId: THREAD_ID,
+    content: "-# ⇄ Agent Request to **beta-codex** · req-665544332211\ncheck deploy",
+    author: { id: webhookId, username: "demo-gemini · 10%", bot: true }, webhookId,
+  });
+  injectDiscordMessage(workspace, {
+    id: "gemini-record-root-1", channelId: THREAD_ID,
+    content: "-# ⇄ Agent Reply from **beta-codex** · req-665544332211\ndeploy healthy",
+    author: { id: BOT_USER_ID, username: "root", bot: true },
+  });
+  threadMessage(workspace, "gemini-owner-after-records", "thanks, proceed");
+  await shows(workspace, ["boot-message-1 ✅", "gemini-owner-after-records ✅", "owner-paused-1 ✅", "owner-queued-2 ✅"]);
+  assert.deepEqual(
+    markCalls(workspace).filter(call => call.messageId === "gemini-record-webhook-1" || call.messageId === "gemini-record-root-1"),
+    [],
+  );
+});
+
+test("Gemini thread: an owner's turn ending with a held Agent Message behind it still settles ⏳ to ✅ or ⚠️, and the agent-started turn changes nothing", async () => {
+  const workspace = agentThreadWorkspace();
+  const gateOwnerOk = path.join(workspace.tmpDir, "gate-owner-ok");
+  const gateAgent1 = path.join(workspace.tmpDir, "gate-agent-1");
+  const gateOwnerFail = path.join(workspace.tmpDir, "gate-owner-fail");
+  const gateAgent2 = path.join(workspace.tmpDir, "gate-agent-2");
+  await answeredGeminiAgentThread(workspace, [
+    { holdUntilFile: gateOwnerOk, reply: "owner done" },
+    { holdUntilFile: gateAgent1, stopReason: "refusal" },
+    { holdUntilFile: gateOwnerFail, stopReason: "refusal" },
+    { holdUntilFile: gateAgent2, text: "agent ok" },
+  ]);
+  const beta = await connectAgentSender(workspace, "beta");
+
+  // 1. Owner turn succeeds -> ✅ even though a held agent-started turn starts right after and fails.
+  threadMessage(workspace, "owner-ok-1", "run checks");
+  await shows(workspace, ["boot-message-1 ✅", "owner-ok-1 ⏳"]);
+  await waitFor(() => agyPrompts(workspace).length === 2, () => "Gemini owner-ok-1 prompt", 15000);
+  const { record: record1 } = await sendAgentRequestToThread(workspace, beta, {
+    text: "Inspect cache after your turn",
+    idempotencyKey: "gemini-ac2-ok",
+  });
+  fs.writeFileSync(gateOwnerOk, "go");
+  await waitFor(() => agyPrompts(workspace).length === 3, () => "Gemini held agent prompt 1", 15000);
+  await shows(workspace, ["boot-message-1 ✅", "owner-ok-1 ✅"]);
+
+  fs.writeFileSync(gateAgent1, "go");
+  await idle(workspace);
+  await pause(600);
+  assert.deepEqual(shown(workspace), ["boot-message-1 ✅", "owner-ok-1 ✅"]);
+  assert.deepEqual(markCalls(workspace).filter(call => call.messageId === record1.id), []);
+
+  // 2. Owner turn fails -> ⚠️ even though a held agent-started turn starts right after and succeeds.
+  threadMessage(workspace, "owner-fail-1", "trigger failing turn");
+  await shows(workspace, ["boot-message-1 ✅", "owner-fail-1 ⏳", "owner-ok-1 ✅"]);
+  await waitFor(() => agyPrompts(workspace).length === 4, () => "Gemini owner-fail-1 prompt", 15000);
+  const { record: record2 } = await sendAgentRequestToThread(workspace, beta, {
+    text: "Inspect metrics after failing turn",
+    idempotencyKey: "gemini-ac2-fail",
+  });
+  fs.writeFileSync(gateOwnerFail, "go");
+  await waitFor(() => agyPrompts(workspace).length === 5, () => "Gemini held agent prompt 2", 15000);
+  await shows(workspace, ["boot-message-1 ✅", "owner-fail-1 ⚠️", "owner-ok-1 ✅"]);
+
+  fs.writeFileSync(gateAgent2, "go");
+  await idle(workspace);
+  await pause(600);
+  assert.deepEqual(shown(workspace), ["boot-message-1 ✅", "owner-fail-1 ⚠️", "owner-ok-1 ✅"]);
+  assert.deepEqual(markCalls(workspace).filter(call => call.messageId === record2.id), []);
 });
