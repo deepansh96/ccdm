@@ -153,6 +153,8 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
   const idempotencyCache = new Map();
   // same key -> tail promise serializing concurrent identical calls
   const idempotencyLocks = new Map();
+  // sending project -> tail promise serializing limit checks, ledger append, and counter updates
+  const projectSendLocks = new Map();
   // latest 20 refusals for `router status`
   const recentRefusals = [];
   let closed = false;
@@ -221,6 +223,20 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
       }
     } finally {
       if (idempotencyLocks.get(cacheKey) === lock) idempotencyLocks.delete(cacheKey);
+      release();
+    }
+  }
+
+  async function withProjectSendLock(project, fn) {
+    const previous = projectSendLocks.get(project) ?? Promise.resolve();
+    let release;
+    const lock = new Promise(resolve => { release = resolve; });
+    projectSendLocks.set(project, lock);
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      if (projectSendLocks.get(project) === lock) projectSendLocks.delete(project);
       release();
     }
   }
@@ -940,123 +956,125 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
       }
 
       const { to, targetListener, archived } = resolved;
-      const limits = ctx.table.agentMessageLimits ?? DEFAULT_LIMITS;
-      if (args.text.length > limits.max_characters) {
-        const message = `text exceeds max_characters limit (${limits.max_characters})`;
-        await recordRefusal({
-          op: "agent_request", from, to, target: targetName,
-          code: "text_too_long", message, fromLaunch, idempotencyKey: args.idempotency_key,
-        });
-        throw new OpError("text_too_long", message);
-      }
+      return withProjectSendLock(from.project, async () => {
+        const limits = ctx.table.agentMessageLimits ?? DEFAULT_LIMITS;
+        if (args.text.length > limits.max_characters) {
+          const message = `text exceeds max_characters limit (${limits.max_characters})`;
+          await recordRefusal({
+            op: "agent_request", from, to, target: targetName,
+            code: "text_too_long", message, fromLaunch, idempotencyKey: args.idempotency_key,
+          });
+          throw new OpError("text_too_long", message);
+        }
 
-      const checkNow = Date.now();
-      if (pruneRate(from.project, checkNow).length >= limits.requests_per_hour) {
-        const message = `project ${from.project} exceeded requests_per_hour limit (${limits.requests_per_hour})`;
-        await recordRefusal({
-          op: "agent_request", from, to, target: targetName,
-          code: "request_rate_exceeded", message, fromLaunch, idempotencyKey: args.idempotency_key,
-        });
-        throw new OpError("request_rate_exceeded", message);
-      }
+        const checkNow = Date.now();
+        if (pruneRate(from.project, checkNow).length >= limits.requests_per_hour) {
+          const message = `project ${from.project} exceeded requests_per_hour limit (${limits.requests_per_hour})`;
+          await recordRefusal({
+            op: "agent_request", from, to, target: targetName,
+            code: "request_rate_exceeded", message, fromLaunch, idempotencyKey: args.idempotency_key,
+          });
+          throw new OpError("request_rate_exceeded", message);
+        }
 
-      if (countOpenRequests(from, checkNow) >= limits.open_requests) {
-        const message = `conversation exceeded open_requests limit (${limits.open_requests})`;
-        await recordRefusal({
-          op: "agent_request", from, to, target: targetName,
-          code: "open_requests_exceeded", message, fromLaunch, idempotencyKey: args.idempotency_key,
-        });
-        throw new OpError("open_requests_exceeded", message);
-      }
+        if (countOpenRequests(from, checkNow) >= limits.open_requests) {
+          const message = `conversation exceeded open_requests limit (${limits.open_requests})`;
+          await recordRefusal({
+            op: "agent_request", from, to, target: targetName,
+            code: "open_requests_exceeded", message, fromLaunch, idempotencyKey: args.idempotency_key,
+          });
+          throw new OpError("open_requests_exceeded", message);
+        }
 
-      const depth = nextDepth(from, checkNow);
-      if (depth > limits.depth) {
-        const message = `request depth ${depth} exceeds depth limit (${limits.depth})`;
-        await recordRefusal({
-          op: "agent_request", from, to, target: targetName,
-          code: "depth_exceeded", message, fromLaunch, idempotencyKey: args.idempotency_key,
-        });
-        throw new OpError("depth_exceeded", message);
-      }
+        const depth = nextDepth(from, checkNow);
+        if (depth > limits.depth) {
+          const message = `request depth ${depth} exceeds depth limit (${limits.depth})`;
+          await recordRefusal({
+            op: "agent_request", from, to, target: targetName,
+            code: "depth_exceeded", message, fromLaunch, idempotencyKey: args.idempotency_key,
+          });
+          throw new OpError("depth_exceeded", message);
+        }
 
-      if (archived || !isCapableListener(targetListener)) {
-        const code = archived ? "target_closed" : "target_offline";
+        if (archived || !isCapableListener(targetListener)) {
+          const code = archived ? "target_closed" : "target_offline";
+          const requestId = mintId("req");
+          const message = archived
+            ? `${formatConversationLabel(to)} is archived`
+            : `${formatConversationLabel(to)} has no live agent_messages listener`;
+          await recordRefusal({
+            op: "agent_request", from, to, target: targetName, requestId,
+            code, message, fromLaunch, idempotencyKey: args.idempotency_key,
+          });
+          recordRate(from.project, Date.now());
+          const sessionRoute = ctx.session.route;
+          withDeadline(null, () => publishUndelivered({
+            requestId, from, to, text: args.text, code,
+            senderRoute: sessionRoute, contextPct: args.context_pct,
+          })).catch(error => log?.(`agent_message_undelivered_failed id=${requestId} error=${error.message}`));
+          throw new OpError(code, message);
+        }
+
         const requestId = mintId("req");
-        const message = archived
-          ? `${formatConversationLabel(to)} is archived`
-          : `${formatConversationLabel(to)} has no live agent_messages listener`;
-        await recordRefusal({
-          op: "agent_request", from, to, target: targetName, requestId,
-          code, message, fromLaunch, idempotencyKey: args.idempotency_key,
+        const now = Date.now();
+        const ts = new Date(now).toISOString();
+        const timeoutMinutes = args.timeout_minutes === undefined
+          ? DEFAULT_TIMEOUT_MINUTES
+          : Math.min(args.timeout_minutes, MAX_TIMEOUT_MINUTES);
+        const expiresAtMs = now + timeoutMinutes * minuteMs();
+        const expiresAt = new Date(expiresAtMs).toISOString();
+        const toLaunch = targetListener.keyFingerprint;
+        const targetProjectRoute = ctx.table.projects.get(to.project);
+
+        await ledger.append({
+          type: "request",
+          at: ts,
+          request_id: requestId,
+          from,
+          to,
+          from_channel_id: senderRoute.channel_id,
+          to_channel_id: targetProjectRoute.channel_id,
+          from_launch: fromLaunch,
+          to_launch: toLaunch,
+          text: args.text,
+          depth,
+          expires_at: expiresAt,
+          idempotency_key: args.idempotency_key,
         });
-        recordRate(from.project, Date.now());
+        recordRate(from.project, now);
+
+        const exchange = {
+          request_id: requestId,
+          state: "open",
+          from,
+          to,
+          from_channel_id: senderRoute.channel_id,
+          to_channel_id: targetProjectRoute.channel_id,
+          from_launch: fromLaunch,
+          to_launch: toLaunch,
+          text: args.text,
+          ts,
+          depth,
+          expires_at: expiresAt,
+          expires_at_ms: expiresAtMs,
+          sender_post: null,
+          receiver_post: null,
+          postReady: null,
+          timer: null,
+          lock: null,
+        };
+        exchanges.set(requestId, exchange);
+
+        const guildId = ctx.table.guildId;
         const sessionRoute = ctx.session.route;
-        withDeadline(null, () => publishUndelivered({
-          requestId, from, to, text: args.text, code,
-          senderRoute: sessionRoute, contextPct: args.context_pct,
-        })).catch(error => log?.(`agent_message_undelivered_failed id=${requestId} error=${error.message}`));
-        throw new OpError(code, message);
-      }
+        exchange.postReady = withDeadline(null, () => publishRequest(exchange, {
+          guildId, senderRoute: sessionRoute, contextPct: args.context_pct,
+        })).catch(error => log?.(`agent_message_publish_failed id=${requestId} error=${error.message}`));
+        scheduleExpiry(exchange);
 
-      const requestId = mintId("req");
-      const now = Date.now();
-      const ts = new Date(now).toISOString();
-      const timeoutMinutes = args.timeout_minutes === undefined
-        ? DEFAULT_TIMEOUT_MINUTES
-        : Math.min(args.timeout_minutes, MAX_TIMEOUT_MINUTES);
-      const expiresAtMs = now + timeoutMinutes * minuteMs();
-      const expiresAt = new Date(expiresAtMs).toISOString();
-      const toLaunch = targetListener.keyFingerprint;
-      const targetProjectRoute = ctx.table.projects.get(to.project);
-
-      await ledger.append({
-        type: "request",
-        at: ts,
-        request_id: requestId,
-        from,
-        to,
-        from_channel_id: senderRoute.channel_id,
-        to_channel_id: targetProjectRoute.channel_id,
-        from_launch: fromLaunch,
-        to_launch: toLaunch,
-        text: args.text,
-        depth,
-        expires_at: expiresAt,
-        idempotency_key: args.idempotency_key,
+        log?.(`agent_request id=${requestId} from=${from.project} to=${to.project}`);
+        return { request_id: requestId, expires_at: expiresAt, depth };
       });
-      recordRate(from.project, now);
-
-      const exchange = {
-        request_id: requestId,
-        state: "open",
-        from,
-        to,
-        from_channel_id: senderRoute.channel_id,
-        to_channel_id: targetProjectRoute.channel_id,
-        from_launch: fromLaunch,
-        to_launch: toLaunch,
-        text: args.text,
-        ts,
-        depth,
-        expires_at: expiresAt,
-        expires_at_ms: expiresAtMs,
-        sender_post: null,
-        receiver_post: null,
-        postReady: null,
-        timer: null,
-        lock: null,
-      };
-      exchanges.set(requestId, exchange);
-
-      const guildId = ctx.table.guildId;
-      const sessionRoute = ctx.session.route;
-      exchange.postReady = withDeadline(null, () => publishRequest(exchange, {
-        guildId, senderRoute: sessionRoute, contextPct: args.context_pct,
-      })).catch(error => log?.(`agent_message_publish_failed id=${requestId} error=${error.message}`));
-      scheduleExpiry(exchange);
-
-      log?.(`agent_request id=${requestId} from=${from.project} to=${to.project}`);
-      return { request_id: requestId, expires_at: expiresAt, depth };
     });
   }
 
