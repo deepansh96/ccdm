@@ -4,6 +4,7 @@
 // owns eligibility; this module only reads Discord with the root observation
 // credentials and reduces each message to an identity, timestamp, and kind.
 // Message text is used for command classification and never leaves this process.
+const { isAgentMessageRecord } = require("./router/agent-messages/record-format.js");
 
 // Fixed CCDM management acknowledgments are command output, not answers.
 const COMMAND_OUTPUTS = new Set([
@@ -28,7 +29,8 @@ function agentReply(message, found) {
 
 function classify(message, found, rootUserId, isClose) {
   const author = String(message.author?.id || "");
-  const content = String(message.content || "").trim();
+  const rawContent = String(message.content || "");
+  const content = rawContent.trim();
   let kind = "other";
   if (message.type !== undefined && !USER_MESSAGE_TYPES.has(message.type)) {
     kind = "other";
@@ -37,9 +39,12 @@ function classify(message, found, rootUserId, isClose) {
     else if (MANAGEMENT_COMMANDS.has(content) || mentions(content, rootUserId)) kind = "owner-command";
     else if (content || message.attachments?.length) kind = "owner-message";
   } else if (agentReply(message, found)) {
-    kind = COMMAND_OUTPUTS.has(content) ||
-      /^\*\*Error:\*\* Failed to (clear|restart|compact|send message to Codex)\b/.test(content)
-      ? "command-output" : "bot";
+    kind = isAgentMessageRecord(rawContent) ? "other"
+      : COMMAND_OUTPUTS.has(content) ||
+        /^\*\*Error:\*\* Failed to (clear|restart|compact|send message to Codex)\b/.test(content)
+        ? "command-output" : "bot";
+  } else if (rootUserId && author === String(rootUserId) && isAgentMessageRecord(rawContent)) {
+    kind = "other";
   } else if (author && !message.author?.bot) {
     kind = "guest";
   }

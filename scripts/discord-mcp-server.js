@@ -4,6 +4,13 @@ const { createInterface } = require("readline");
 const { createHmac, timingSafeEqual } = require("crypto");
 const path = require("path");
 const { writeFile, mkdir, readFile } = require("fs/promises");
+const {
+  AGENT_MESSAGE_TOOLS,
+  formatAgentReplyResult,
+  formatAgentRequestResult,
+  formatAgentTargets,
+  requestAgentIdempotent: requestAgentIdempotentShared,
+} = require("./agent-messages-session.js");
 const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
 const { stateDir } = require("./router/paths.js");
@@ -294,6 +301,21 @@ if (!ROUTER_ROOT && !ROUTER_THREAD_ID) {
   });
 }
 
+// Agent Message tools serve channel and thread project sessions; root never has them.
+if (!ROUTER_ROOT) {
+  for (const tool of Object.values(AGENT_MESSAGE_TOOLS)) {
+    ALL_TOOLS.push({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: {
+        type: "object",
+        properties: tool.requiresScopeToken ? withScopeToken(tool.properties) : tool.properties,
+        required: tool.requiresScopeToken ? requiredWithScope(tool.required) : tool.required,
+      },
+    });
+  }
+}
+
 // One op-only Router connection (`listener: false`), so the bridge keeps its
 // place as the project's listener. A failed or ended connection is retried on
 // the next tool call.
@@ -338,6 +360,11 @@ async function emergencyRequest(op, channelId, args) {
 }
 
 // `detail` adds the Router's reason to the error code.
+function formatRouterError(op, error, { detail = false } = {}) {
+  const reason = detail && error.code && error.message && error.message !== error.code ? `: ${error.message}` : "";
+  return new Error(`Router ${op} failed: ${error.code || error.message}${reason}`);
+}
+
 async function routerRequest(op, channelId, args, { detail = false, ...options } = {}) {
   try {
     const client = await routerClient();
@@ -345,8 +372,24 @@ async function routerRequest(op, channelId, args, { detail = false, ...options }
   } catch (error) {
     const direct = error.code === "router_unavailable" ? await emergencyRequest(op, channelId, args) : null;
     if (direct) return direct.result;
-    const reason = detail && error.code && error.message && error.message !== error.code ? `: ${error.message}` : "";
-    throw new Error(`Router ${op} failed: ${error.code || error.message}${reason}`);
+    throw formatRouterError(op, error, { detail });
+  }
+}
+
+async function requestAgentOp(op, args = {}) {
+  try {
+    const client = await routerClient();
+    return await client.request(op, args);
+  } catch (error) {
+    throw formatRouterError(op, error, { detail: true });
+  }
+}
+
+async function requestAgentIdempotent(op, args) {
+  try {
+    return await requestAgentIdempotentShared(routerClient, op, args);
+  } catch (error) {
+    throw formatRouterError(op, error, { detail: true });
   }
 }
 
@@ -365,6 +408,34 @@ async function routerContextPct() {
 }
 
 async function handleToolCall(name, args) {
+  if (name === "send_agent_request") {
+    if (ROUTER_ROOT) throw new Error(`Unknown tool: ${name}`);
+    const { target, text, timeout_minutes, scope_token } = args;
+    requireScopeToken(scope_token);
+    const result = await requestAgentIdempotent("agent_request", {
+      target,
+      text,
+      ...(timeout_minutes !== undefined ? { timeout_minutes } : {}),
+      context_pct: await routerContextPct(),
+    });
+    return formatAgentRequestResult(result);
+  }
+  if (name === "send_agent_reply") {
+    if (ROUTER_ROOT) throw new Error(`Unknown tool: ${name}`);
+    const { request_id, text, scope_token } = args;
+    requireScopeToken(scope_token);
+    const result = await requestAgentIdempotent("agent_reply", {
+      request_id,
+      text,
+      context_pct: await routerContextPct(),
+    });
+    return formatAgentReplyResult(result);
+  }
+  if (name === "list_agent_targets") {
+    if (ROUTER_ROOT) throw new Error(`Unknown tool: ${name}`);
+    return formatAgentTargets(await requestAgentOp("agent_targets", {}));
+  }
+
   const channelId = await targetChannelId(args);
   switch (name) {
     case "reply": {

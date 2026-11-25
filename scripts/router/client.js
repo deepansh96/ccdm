@@ -76,11 +76,12 @@ function endpointResolver(endpoint) {
 
 class RouterClient extends EventEmitter {
   constructor({ endpoint, socketPath, project, key, role = "project", listener = true, timeoutMs = 10000,
-    reconnect = role !== "status", beforeHello = null, threadId = null, provider = null, env = process.env } = {}) {
+    reconnect = role !== "status", beforeHello = null, threadId = null, provider = null, capabilities = null,
+    env = process.env } = {}) {
     super();
     this.resolveEndpoint = endpointResolver(endpoint ?? socketPath ?? routerEndpoint);
     Object.assign(this, { project, key, role, listener, timeoutMs, reconnect, beforeHello, threadId, provider,
-      backoff: reconnectBackoff(env) });
+      capabilities, backoff: reconnectBackoff(env) });
     this.socket = null;
     this.ready = false;
     this.connectedOnce = false;
@@ -155,6 +156,7 @@ class RouterClient extends EventEmitter {
       this.write({ type: "hello", v: PROTOCOL_VERSION, role: this.role,
         ...(this.project ? { project: this.project } : {}), ...(this.key ? { key: this.key } : {}),
         ...(this.role === "thread" ? { thread_id: this.threadId, provider: this.provider } : {}),
+        ...(Array.isArray(this.capabilities) && this.capabilities.length ? { capabilities: this.capabilities } : {}),
         ...(this.listener ? {} : { listener: false }) });
     };
     socket.once("connect", () => {

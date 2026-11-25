@@ -40,8 +40,14 @@ const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { createRouterTransport } = require("./codex-bridge-transport.js");
 const { arrivalOrder } = require("./lib/arrival-order.js");
 const { scheduleProjectRestart, scheduleRootRestart: scheduleRootRestartHelper } = require("./lib/restart-helper.js");
-const { markPaused, markReplied, markTurn } = require("./thread-activity.js");
+const { clearAgentStarted, markPaused, markReplied, markTurn } = require("./thread-activity.js");
 const modelInfo = require("./model-info.js");
+const {
+  AGENT_MESSAGE_TRUST_NOTE,
+  createAgentDeliveryHandler,
+  formatAgentMessageTurn,
+  isExpiredAgentRequest,
+} = require("./agent-messages-session.js");
 const routerPaths = require("./router/paths.js");
 const { withRegistryLock } = require("./router/registry.js");
 const { MAX_TIMEOUT_MS: ROUTER_MAX_TIMEOUT_MS } = require("./router/deadlines.js");
@@ -152,10 +158,12 @@ function setBridgePaused(paused) {
 }
 // A new launch starts unpaused, whatever the last one left in activity.json.
 markPaused(THREAD_ACTIVITY_FILE, false);
+clearAgentStarted(THREAD_ACTIVITY_FILE);
 const discordTransport = createRouterTransport({
   project: ROUTER_PROJECT, role: ROUTER_ROOT ? "root" : THREAD_MODE ? "thread" : "project", keyFile: ROUTER_KEY_FILE,
   launchDir: ROUTER_LAUNCH_DIR, registryPath: REGISTRY_PATH, primaryChannelId: CHANNEL_ID,
   threadId: DISCORD_THREAD_ID || null,
+  capabilities: ROUTER_ROOT ? null : ["agent_messages"],
 });
 let codexProcess = null;
 let typingInterval = null;
@@ -165,6 +173,7 @@ let threadResetting = false;
 let fallbackLoggedCompletedItemTypes = new Set();
 let pendingTerminalError = null;
 let activeTurnHadProgress = false;
+let activeTurnAgentStarted = false;
 let activeTurnRecoveryAttempt = 0;
 let activeTurnChannelScopeToken = null;
 let activeReminderContext = null;
@@ -188,10 +197,10 @@ const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const CODEX_CONFIG_FILE = path.join(CODEX_HOME, "config.toml");
 const THREAD_INSTRUCTION = ROOT_MULTI_CHANNEL
   ? `This root thread is connected to Discord through the ${DISCORD_MCP_NAME} MCP server. Incoming messages include Discord routing metadata. Do not call Discord MCP tools unless the current task includes an explicit Discord reply scope token. Subagents and delegated tasks must return results to their parent agent, not to Discord.`
-  : `This thread is connected to Discord through the ${DISCORD_MCP_NAME} MCP server. Do not call Discord MCP tools unless the current task includes an explicit Discord reply scope token. Subagents and delegated tasks must return results to their parent agent, not to Discord.`;
+  : `This thread is connected to Discord through the ${DISCORD_MCP_NAME} MCP server. Do not call Discord MCP tools unless the current task includes an explicit Discord reply scope token. Subagents and delegated tasks must return results to their parent agent, not to Discord. Available Agent Message tools: send_agent_request, send_agent_reply, list_agent_targets. ${AGENT_MESSAGE_TRUST_NOTE}`;
 const SYSTEM_INSTRUCTION = ROOT_MULTI_CHANNEL
   ? `You are communicating with the user via Discord. Use ONLY the MCP server named "${DISCORD_MCP_NAME}" to interact. Incoming messages include a Discord routing metadata block; use its channel_id and channel_scope_token for every Discord MCP call. Every Discord write call (\`reply\`, \`edit_message\`, or \`react\`) must also include \`scope_token: "${DISCORD_REPLY_TOKEN}"\`. Do NOT share these tokens with subagents. When spawning subagents, explicitly tell them not to use Discord MCP/tools and to return only to the parent agent. Do NOT use any other discord MCP server. Do NOT output responses as regular text; always use the \`reply\` tool so the user sees your response on Discord. Other available tools on this same server: edit_message, react, fetch_messages, read_last_x_messages_in_channel, export_message_range, download_attachment. Use \`reply\` with the \`files\` parameter to send file attachments. You don't have to reply for every little thing. Try to reply only when you're done, unless something important needs to be confirmed from the user. Also, try to use simpler language and avoid complex language.`
-  : `You are communicating with the user via Discord. Use ONLY the MCP server named "${DISCORD_MCP_NAME}" to interact — call its \`reply\` tool to send messages to the user. Every Discord write call (\`reply\`, \`edit_message\`, or \`react\`) must include \`scope_token: "${DISCORD_REPLY_TOKEN}"\`. Do NOT share this scope token with subagents. When spawning subagents, explicitly tell them not to use Discord MCP/tools and to return only to the parent agent. Do NOT use any other discord MCP server. Do NOT output responses as regular text; always use the \`reply\` tool so the user sees your response on Discord. Other available tools on this same server: edit_message, react, fetch_messages, read_last_x_messages_in_channel, export_message_range, download_attachment. Use \`reply\` with the \`files\` parameter to send file attachments. You don't have to reply for every little thing. Try to reply only when you're done, unless something important needs to be confirmed from the user. Also, try to use simpler language and avoid complex language.`;
+  : `You are communicating with the user via Discord. Use ONLY the MCP server named "${DISCORD_MCP_NAME}" to interact — call its \`reply\` tool to send messages to the user. Every Discord write call (\`reply\`, \`edit_message\`, \`react\`, \`send_agent_request\`, or \`send_agent_reply\`) must include \`scope_token: "${DISCORD_REPLY_TOKEN}"\`. Do NOT share this scope token with subagents. When spawning subagents, explicitly tell them not to use Discord MCP/tools and to return only to the parent agent. Do NOT use any other discord MCP server. Do NOT output responses as regular text; always use the \`reply\` tool so the user sees your response on Discord. Other available tools on this same server: edit_message, react, fetch_messages, read_last_x_messages_in_channel, export_message_range, download_attachment, send_agent_request, send_agent_reply, list_agent_targets. Use \`reply\` with the \`files\` parameter to send file attachments. ${AGENT_MESSAGE_TRUST_NOTE} You don't have to reply for every little thing. Try to reply only when you're done, unless something important needs to be confirmed from the user. Also, try to use simpler language and avoid complex language.`;
 
 function nextId() {
   return requestId++;
@@ -749,7 +758,9 @@ function handleNotification(msg) {
       break;
 
     case "turn/started":
-      if (isCurrentTurnNotification(msg)) markTurn(THREAD_ACTIVITY_FILE, true);
+      if (isCurrentTurnNotification(msg)) {
+        markTurn(THREAD_ACTIVITY_FILE, true, "completed", { agentStarted: activeTurnAgentStarted });
+      }
       break;
 
     case "item/started":
@@ -894,6 +905,8 @@ async function onTurnCompleted(turn = {}) {
   mcpReplyCalled = false;
   suppressTurnOutput = false;
   pendingTerminalError = null;
+  const wasAgentStarted = activeTurnAgentStarted;
+  activeTurnAgentStarted = false;
   activeTurnHadProgress = false;
   activeTurnRecoveryAttempt = 0;
   activeTurnChannelScopeToken = null;
@@ -904,7 +917,8 @@ async function onTurnCompleted(turn = {}) {
   // one, so only now is the thread session idle. An interrupted turn (a
   // stop, a reset) never hands the turn to the owner.
   markTurn(THREAD_ACTIVITY_FILE, false,
-    turn.status === "failed" || terminalError ? "failed" : turn.status === "interrupted" ? "interrupted" : "completed");
+    turn.status === "failed" || terminalError ? "failed" : turn.status === "interrupted" ? "interrupted" : "completed",
+    { agentStarted: wasAgentStarted });
   console.log(`[turn] Finished (${turn.status ?? "no status"}); bridge idle`);
   if (outputSuppressed && bootstrapCompletion) {
     const complete = bootstrapCompletion;
@@ -929,7 +943,8 @@ async function onTurnCompleted(turn = {}) {
       channelId,
       channelScopeToken,
       recoveryAttempt + 1,
-      retrySource
+      retrySource,
+      { agentStarted: wasAgentStarted }
     );
     return;
   }
@@ -950,12 +965,20 @@ async function onTurnCompleted(turn = {}) {
 }
 
 async function processQueue() {
-  if (bridgePaused || threadResetting || turnActive || !threadId || messageQueue.length === 0) return;
-  const { input, msg: queuedMsg, channelId, channelScopeToken } = messageQueue.shift();
-  if (queuedMsg && !queuedMsg.synthetic) {
-    discordTransport.removeOwnReaction(queuedMsg, "⏳").catch(() => {});
+  if (bridgePaused || threadResetting || turnActive || !threadId) return;
+  while (messageQueue.length > 0) {
+    const nextItem = messageQueue.shift();
+    if (nextItem.agentMessage && isExpiredAgentRequest(nextItem.agentMessage)) {
+      console.log(`[agent-message] Dropping expired held request ${nextItem.agentMessage.request_id}`);
+      continue;
+    }
+    const { input, msg: queuedMsg, channelId, channelScopeToken, agentMessage } = nextItem;
+    if (queuedMsg && !queuedMsg.synthetic) {
+      discordTransport.removeOwnReaction(queuedMsg, "⏳").catch(() => {});
+    }
+    await sendTurn(input, channelId, channelScopeToken, 0, queuedMsg, { agentStarted: Boolean(agentMessage) });
+    return;
   }
-  await sendTurn(input, channelId, channelScopeToken, 0, queuedMsg);
 }
 
 function canSteerRootScope(channelId, token) {
@@ -991,30 +1014,58 @@ async function routeInput(input, msg, channelId, channelScopeToken) {
           ) }
           : part)
         : input;
+      const steeredTurnId = activeTurnId;
       await sendRequest("turn/steer", {
         threadId,
         input: steerInput,
-        expectedTurnId: activeTurnId,
+        expectedTurnId: steeredTurnId,
       });
-      if (msg && activeReminderContext && msg.author.id === activeReminderContext.owner_id) {
-        const receipts = await reminderAdapter.receiptsForTurn(activeReminderContext.provider_session_id, activeReminderContext.provider_turn_id);
-        const latestQuestion = receipts.filter((receipt) => receipt.disposition === "input-needed").at(-1);
-        if (latestQuestion && latestQuestion.event_id !== lastResumedInputReceiptId) {
-          await reminderAdapter.emitEvent("work_resumed", activeReminderContext, {
-            source_message_id: msg.id,
-            resumed_from_turn_id: activeReminderContext.provider_turn_id,
-          });
-          lastResumedInputReceiptId = latestQuestion.event_id;
+      if (msg && !ROOT_MULTI_CHANNEL && turnActive && activeTurnId === steeredTurnId) {
+        const isOwner = Boolean(msg.reminderAssignment && msg.author?.id === msg.reminderAssignment.owner_id);
+        const isThreadDriver = THREAD_MODE && !msg.synthetic;
+        if (activeTurnAgentStarted && (isOwner || isThreadDriver)) {
+          activeTurnAgentStarted = false;
+          clearAgentStarted(THREAD_ACTIVITY_FILE);
         }
-        activeReminderContext = {
-          ...activeReminderContext,
-          interaction_id: msg.id,
-          source_message_id: msg.id,
-          initiator_id: msg.author.id,
-        };
-        await reminderAdapter.writeActiveContext(activeReminderContext);
+        if (activeReminderContext && msg.author.id === activeReminderContext.owner_id) {
+          const receipts = await reminderAdapter.receiptsForTurn(activeReminderContext.provider_session_id, activeReminderContext.provider_turn_id);
+          const latestQuestion = receipts.filter((receipt) => receipt.disposition === "input-needed").at(-1);
+          if (latestQuestion && latestQuestion.event_id !== lastResumedInputReceiptId) {
+            await reminderAdapter.emitEvent("work_resumed", activeReminderContext, {
+              source_message_id: msg.id,
+              resumed_from_turn_id: activeReminderContext.provider_turn_id,
+            });
+            lastResumedInputReceiptId = latestQuestion.event_id;
+          }
+          activeReminderContext = {
+            ...activeReminderContext,
+            interaction_id: msg.id,
+            source_message_id: msg.id,
+            initiator_id: msg.author.id,
+          };
+          await reminderAdapter.writeActiveContext(activeReminderContext);
+        } else if (!activeReminderContext && msg.reminderAssignment && msg.author.id === msg.reminderAssignment.owner_id) {
+          // Owner input joining an agent-started turn makes it an ordinary turn from here on.
+          activeReminderContext = {
+            ...msg.reminderAssignment,
+            provider: "codex",
+            provider_session_id: threadId,
+            provider_turn_id: steeredTurnId,
+            interaction_id: msg.id,
+            source_message_id: msg.id,
+            initiator_id: msg.author.id,
+          };
+          await reminderAdapter.writeActiveContext(activeReminderContext);
+          if (pendingInputNeededResumeTurnId) {
+            await reminderAdapter.emitEvent("work_resumed", activeReminderContext, {
+              source_message_id: msg.id,
+              resumed_from_turn_id: pendingInputNeededResumeTurnId,
+            });
+            pendingInputNeededResumeTurnId = null;
+          }
+        }
       }
-      console.log(`[steer] Injected into active turn ${activeTurnId}`);
+      console.log(`[steer] Injected into active turn ${steeredTurnId}`);
     } catch (err) {
       console.log(`[steer] Failed (${err.message || err}), queuing instead`);
       await queueInput();
@@ -1031,10 +1082,11 @@ async function sendTurn(
   channelId = projectChannelId,
   channelScopeToken = null,
   recoveryAttempt = 0,
-  sourceMessage = null
+  sourceMessage = null,
+  { agentStarted = false } = {}
 ) {
   if (!threadId) {
-    messageQueue.push({ input, msg: sourceMessage, channelId, channelScopeToken });
+    messageQueue.push({ input, msg: sourceMessage, channelId, channelScopeToken, ...(agentStarted ? { agentMessage: true } : {}) });
     return;
   }
   turnActive = true;
@@ -1044,12 +1096,14 @@ async function sendTurn(
   mcpReplyCalled = false;
   pendingTerminalError = null;
   activeTurnHadProgress = false;
+  activeTurnAgentStarted = Boolean(agentStarted);
   activeTurnRecoveryAttempt = recoveryAttempt;
   activeTurnChannelScopeToken = channelScopeToken;
   activeReminderContext = null;
   lastResumedInputReceiptId = null;
   resetActiveTurnId();
   try {
+    await reminderAdapter.clearActiveContext().catch(() => {});
     await activateDiscordChannelScope(channelScopeToken);
     await startTyping(channelId);
     const result = await sendRequest("turn/start", {
@@ -1084,13 +1138,16 @@ async function sendTurn(
     fallbackText = "";
     pendingTerminalError = null;
     activeTurnHadProgress = false;
+    activeTurnAgentStarted = false;
     activeTurnRecoveryAttempt = 0;
     activeTurnChannelScopeToken = null;
     activeReminderContext = null;
-    await reminderAdapter.clearActiveContext();
-    await clearDiscordChannelScope();
+    await reminderAdapter.clearActiveContext().catch(() => {});
+    await clearDiscordChannelScope().catch(() => {});
     turnActive = false;
-    await sendToDiscord("**Error:** Failed to send message to Codex");
+    await sendToDiscord("**Error:** Failed to send message to Codex").catch((postErr) => {
+      console.error("Failed to post turn/start error:", postErr?.code || postErr?.message || postErr);
+    });
     activeOutputChannelId = null;
     processQueue();
   }
@@ -1109,6 +1166,7 @@ async function sendBootstrapInstructionTurn(reason, { required = false } = {}) {
   suppressTurnOutput = true;
   pendingTerminalError = null;
   activeTurnHadProgress = false;
+  activeTurnAgentStarted = false;
   activeTurnRecoveryAttempt = 0;
   activeTurnChannelScopeToken = null;
   resetActiveTurnId();
@@ -1172,6 +1230,7 @@ async function onContextCompactionCompleted() {
 async function startCompaction(channelId) {
   turnActive = true;
   suppressTurnOutput = true;
+  activeTurnAgentStarted = false;
   activeOutputChannelId = channelId;
   resetActiveTurnId();
   let posted;
@@ -1641,8 +1700,40 @@ async function startThreadConversation() {
   await Promise.all(pending.map(([kind, handler, event]) => inArrivalOrder(kind, handler)(event)));
 }
 
+async function handleAgentMessage(event, next = () => {}) {
+  if (ROUTER_ROOT) return;
+  if (isExpiredAgentRequest(event)) {
+    console.log(`[agent-message] Dropping expired request ${event.request_id}`);
+    return;
+  }
+  const input = [{ type: "text", text: formatAgentMessageTurn(event) }];
+  const channelId = projectChannelId;
+  // An Agent Message always starts its own turn via the queue path when busy,
+  // paused, or resetting; it never steers, gets no ⏳ reaction, and emits no owner_activity.
+  if (bridgePaused || threadResetting || turnActive || !threadId || messageQueue.length > 0) {
+    messageQueue.push({ input, msg: null, channelId, channelScopeToken: null, agentMessage: event });
+    console.log(`[agent-message] Queued ${event.kind} ${event.request_id}`);
+    if (!bridgePaused && !threadResetting && !turnActive && threadId) {
+      const drained = processQueue();
+      next();
+      await drained;
+    }
+    return;
+  }
+  const started = sendTurn(input, channelId, null, 0, null, { agentStarted: true });
+  next();
+  await started;
+}
+
 function startDiscordBot() {
   discordTransport.onScopeChange(applyProjectScope);
+  const deliverAgentMessage = inArrivalOrder("agent_message", holdUntilBootstrap("agent_message", handleAgentMessage));
+  discordTransport.onAgentMessage(createAgentDeliveryHandler({
+    shouldIgnore: () => ROUTER_ROOT,
+    ack: (deliveryId) => discordTransport.ackAgentMessage(deliveryId),
+    deliver: deliverAgentMessage,
+    onError: (message) => console.error(`[agent-message] ${message}`),
+  }));
   discordTransport.onReaction(inArrivalOrder("reaction", holdUntilBootstrap("reaction", async (event, next = () => {}) => {
     if (!(await shouldHandleDiscordReaction(event.channelId, event.user))) return;
     let reaction;
@@ -1771,7 +1862,7 @@ function startDiscordBot() {
       const previousThreadId = threadId;
       const previousTurnId = activeTurnId;
       try {
-        messageQueue = [];
+        messageQueue = messageQueue.filter((item) => Boolean(item.agentMessage));
         pendingCompactionChannelId = null;
         // From here later messages queue for the new thread.
         next();
@@ -1796,6 +1887,8 @@ function startDiscordBot() {
         pendingBootstrapInstructionReason = null;
         deltaBuffer = "";
         fallbackText = "";
+        activeReminderContext = null;
+        await reminderAdapter.clearActiveContext().catch(() => {});
         stopTyping();
         await clearDiscordChannelScope();
 

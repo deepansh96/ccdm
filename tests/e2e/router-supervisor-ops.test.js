@@ -173,6 +173,42 @@ test("thread_history returns thread messages with their author class", async () 
     [channelId, limit, before, authorization]), [["demo-thread", 4, "m4", ROOT_AUTH], ["demo-thread", 100, undefined, ROOT_AUTH]]);
 });
 
+test("thread_history classifies root-bot and own-webhook records as agent_message, leaving other messages unchanged", async () => {
+  const { workspace, supervisor } = await supervisedRouter();
+  const registry = JSON.parse(fs.readFileSync(path.join(workspace.repoDir, "registry.json"), "utf8"));
+  const webhookId = registry.projects.demo.webhook_id;
+  const recordText = "-# ⇄ Agent Reply to **beta-claude** · req-0123456789ab\nall green";
+  const laterText = "See header:\n-# ⇄ Agent Reply to **beta-claude** · req-0123456789ab";
+  updateState(workspace.stateDir, state => {
+    state.fixtures.discord.history = { "demo-thread": [
+      { id: "m8", content: recordText, timestamp: "2026-09-01T00:08:00Z", author: { id: "other-bot", bot: true } },
+      { id: "m7", content: recordText, timestamp: "2026-09-01T00:07:00Z", webhook_id: "other-webhook",
+        author: { id: "other-webhook", bot: true } },
+      { id: "m6", content: recordText, timestamp: "2026-09-01T00:06:00Z", author: { id: "guest-id", username: "g" } },
+      { id: "m5", content: recordText, timestamp: "2026-09-01T00:05:00Z", author: { id: "owner-id", username: "o" } },
+      { id: "m4", content: laterText, timestamp: "2026-09-01T00:04:00Z", webhook_id: webhookId,
+        author: { id: webhookId, username: "demo-claude", bot: true } },
+      { id: "m3", content: laterText, timestamp: "2026-09-01T00:03:00Z",
+        author: { id: "fixture-bot-user-id", bot: true } },
+      { id: "m2", content: recordText, timestamp: "2026-09-01T00:02:00Z", webhook_id: webhookId,
+        author: { id: webhookId, username: "demo-claude · 10%", bot: true } },
+      { id: "m1", content: recordText, timestamp: "2026-09-01T00:01:00Z",
+        author: { id: "fixture-bot-user-id", bot: true } },
+    ] };
+  });
+  const history = ok(await supervisor.request("thread_history", { thread_id: "demo-thread" }));
+  assert.deepEqual(history.messages.map(message => [message.id, message.author_class]), [
+    ["m8", "other"],
+    ["m7", "other"],
+    ["m6", "guest"],
+    ["m5", "owner"],
+    ["m4", "project_webhook"],
+    ["m3", "root_bot"],
+    ["m2", "agent_message"],
+    ["m1", "agent_message"],
+  ]);
+});
+
 test("thread_message_get reads the starter message from the parent channel", async () => {
   const { workspace, supervisor } = await supervisedRouter();
   updateState(workspace.stateDir, state => {

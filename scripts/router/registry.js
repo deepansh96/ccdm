@@ -16,6 +16,13 @@ const { processAlive, processIdentity } = require("../platform/process.js");
 const DEFAULT_RELOAD_DEBOUNCE_MS = 250;
 // A project's session provider: Claude Code, Codex, or Gemini through agy.
 const PROJECT_TYPES = ["claude", "codex", "gemini"];
+const DEFAULT_AGENT_MESSAGE_LIMITS = Object.freeze({
+  depth: 3,
+  requests_per_hour: 20,
+  open_requests: 5,
+  max_characters: 4000,
+});
+const AGENT_MESSAGE_LIMIT_KEYS = new Set(Object.keys(DEFAULT_AGENT_MESSAGE_LIMITS));
 
 // On Windows an open can fail for a moment while a writer replaces the file. A
 // reload that gave up there would keep a stale routing table.
@@ -32,7 +39,8 @@ async function readRegistry(file) {
 }
 
 const isObject = value => value !== null && typeof value === "object" && !Array.isArray(value);
-const isId = value => (typeof value === "string" && value.trim() !== "") || (Number.isInteger(value) && value > 0);
+const isNonEmptyString = value => typeof value === "string" && value.trim() !== "";
+const isId = value => isNonEmptyString(value) || (Number.isInteger(value) && value > 0);
 
 // How scripts/guest-access.js lets a guest into a project channel, set by the
 // top-level `guest_mode`. Absent or "roles": one guest role per project.
@@ -57,6 +65,19 @@ function validateRegistry(registry) {
       problems.push(`${field} must be a list of Discord IDs`);
     }
   }
+  if (registry.agent_message_limits !== undefined) {
+    if (!isObject(registry.agent_message_limits)) {
+      problems.push("agent_message_limits must be an object of positive integers");
+    } else {
+      for (const [key, value] of Object.entries(registry.agent_message_limits)) {
+        if (!AGENT_MESSAGE_LIMIT_KEYS.has(key)) {
+          problems.push(`agent_message_limits: unknown key ${key}`);
+        } else if (!Number.isInteger(value) || value < 1) {
+          problems.push(`agent_message_limits.${key} must be a positive integer`);
+        }
+      }
+    }
+  }
   if (!isObject(registry.projects)) problems.push("projects must be an object keyed by project name");
   const owners = new Map((Array.isArray(registry.root_channels) ? registry.root_channels : [])
     .filter(isId).map(id => [String(id), "root"]));
@@ -72,6 +93,10 @@ function validateRegistry(registry) {
     if (project.webhook_id != null && !isId(project.webhook_id)) problems.push(`project ${name}: webhook_id must be a Discord ID`);
     if (project.guest_user_ids != null && !(Array.isArray(project.guest_user_ids) && project.guest_user_ids.every(isId))) {
       problems.push(`project ${name}: guest_user_ids must be a list of Discord IDs`);
+    }
+    if (project.agent_message_targets !== undefined
+      && !(Array.isArray(project.agent_message_targets) && project.agent_message_targets.every(isNonEmptyString))) {
+      problems.push(`project ${name}: agent_message_targets must be a list of non-empty strings`);
     }
     if (!isId(project.channel_id)) continue;
     const channel = String(project.channel_id);
@@ -97,6 +122,7 @@ function buildRoutingTable(registry) {
       channel_id: String(project.channel_id),
       webhook_id: project.webhook_id ? String(project.webhook_id) : null,
       guests: (project.guest_user_ids || []).map(String),
+      agent_message_targets: new Set(project.agent_message_targets || []),
       // A `remote:` project runs on another machine and has no thread sessions.
       remote: String(project.path || "").startsWith("remote:"),
     };
@@ -111,6 +137,10 @@ function buildRoutingTable(registry) {
     registered,
     rootChannels: new Set((registry.root_channels || []).map(String)),
     rootAllowedUserIds: new Set((registry.root_allowed_user_ids || []).map(String)),
+    agentMessageLimits: {
+      ...DEFAULT_AGENT_MESSAGE_LIMITS,
+      ...(isObject(registry.agent_message_limits) ? registry.agent_message_limits : {}),
+    },
   };
 }
 

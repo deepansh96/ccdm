@@ -100,6 +100,7 @@ test("owner messages in a root channel and owner bot mentions in a project chann
       chat_id: "demo-channel", message_id: "mention", user: "Owner", user_id: OWNER_ID, sender: "owner", ts: "2026-09-29T10:01:00.000Z" } },
   ]);
   assert.deepEqual(demo.events.map((event) => event.message_id), ["fence"]);
+  assert.equal(fs.existsSync(path.join(workspace.routerStateDir, "launches", ".root", "activity.json")), false);
 });
 
 test("root Claude's reply into a project channel posts as the root bot, not a webhook", async () => {
@@ -153,6 +154,9 @@ test("no Discord token reaches the root Claude session environment, launch files
   // Windows names the key file on the command line: another process's environment is not readable there.
   assert.deepEqual(mcpConfig.mcpServers.ccdm.args, WIN ? [channelServer, "--ccdm-key-file", rootKey] : [channelServer]);
   assert.equal(mcpConfig.mcpServers.ccdm.env.CCDM_ROUTER_ROLE, "root");
+  assert.equal("CCDM_ACTIVITY_FILE" in mcpConfig.mcpServers.ccdm.env, false);
+  assert.equal("CCDM_THREAD_ACTIVITY_FILE" in mcpConfig.mcpServers.ccdm.env, false);
+  assert.equal(fs.existsSync(path.join(launchDir, "activity.json")), false);
   for (const file of fs.readdirSync(launchDir)) {
     assertPrivate(path.join(launchDir, file), file);
   }

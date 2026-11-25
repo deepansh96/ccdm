@@ -10,6 +10,7 @@ const crypto = require("node:crypto");
 const { splitMessage } = require("../chunks.js");
 const { DEFAULT_TIMEOUT_MS } = require("../deadlines.js");
 const { DiscordError, currentDeadline, discordRequest } = require("../discord-rest.js");
+const { isAgentMessageRecord } = require("../agent-messages/record-format.js");
 const { threadRoute } = require("../inbound.js");
 const { OpError, ScopeViolation } = require("./errors.js");
 
@@ -61,8 +62,14 @@ async function conversationTarget(ctx, channelId) {
 // As the supervisor's `thread_message` frames classify authors.
 function authorClass(ctx, message, route) {
   const id = String(message.author?.id ?? "");
-  if (message.webhook_id) return String(message.webhook_id) === route.webhook_id ? "project_webhook" : "other";
-  if (message.author?.bot) return id === String(ctx.bot?.id) ? "root_bot" : "other";
+  if (message.webhook_id) {
+    if (String(message.webhook_id) !== route.webhook_id) return "other";
+    return isAgentMessageRecord(message.content) ? "agent_message" : "project_webhook";
+  }
+  if (message.author?.bot) {
+    if (id !== String(ctx.bot?.id)) return "other";
+    return isAgentMessageRecord(message.content) ? "agent_message" : "root_bot";
+  }
   if (id === ctx.table.ownerId) return "owner";
   return (route.guests ?? []).includes(id) ? "guest" : "other";
 }

@@ -60,7 +60,13 @@ process.env.CCDM_REMINDER_CONTEXT_FILE = REMINDER_CONTEXT_FILE;
 process.env.CCDM_REMINDER_RECEIPTS_DIR = REMINDER_RECEIPTS_DIR;
 const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { createRouterTransport } = require("./codex-bridge-transport.js");
-const { markPaused, markReplied, markTurn } = require("./thread-activity.js");
+const { clearAgentStarted, markPaused, markReplied, markTurn } = require("./thread-activity.js");
+const {
+  AGENT_MESSAGE_TRUST_NOTE,
+  createAgentDeliveryHandler,
+  formatAgentMessageTurn,
+  isExpiredAgentRequest,
+} = require("./agent-messages-session.js");
 const routerPaths = require("./router/paths.js");
 
 const PROVIDER = "gemini";
@@ -114,9 +120,11 @@ if (!ROUTER_KEY_FILE || !ROUTER_PROJECT || !CHANNEL_ID || !PROJECT_DIR) {
 
 const SYSTEM_INSTRUCTION = [
   `You are communicating with the user via Discord. Use ONLY the MCP server named "${DISCORD_MCP_NAME}" to interact: call its \`reply\` tool to send messages to the user.`,
-  `Every Discord write call (\`reply\`, \`edit_message\`, or \`react\`) must include \`scope_token: "${DISCORD_REPLY_TOKEN}"\`. Do NOT share this scope token with subagents; tell any subagent not to use Discord tools and to return only to you.`,
+  `Every Discord write call (\`reply\`, \`edit_message\`, \`react\`, \`send_agent_request\`, or \`send_agent_reply\`) must include \`scope_token: "${DISCORD_REPLY_TOKEN}"\`. Do NOT share this scope token with subagents; tell any subagent not to use Discord tools and to return only to you.`,
   "Do NOT use any other Discord MCP server. Other tools on this server: edit_message, react, fetch_messages, read_last_x_messages_in_channel, export_message_range, download_attachment" +
-    (THREAD_MODE ? "." : ", create_thread.") + " Use `reply` with the `files` parameter to send file attachments.",
+    (THREAD_MODE ? "" : ", create_thread") +
+    ", send_agent_request, send_agent_reply, list_agent_targets. Use `reply` with the `files` parameter to send file attachments.",
+  AGENT_MESSAGE_TRUST_NOTE,
   "You don't have to reply for every little thing: reply when you're done, or when something must be confirmed with the user. Use simple language.",
   "Never reconstruct the Discord transport through shell commands, read its credentials, or launch a replacement MCP server to send a reply.",
 ].join("\n");
@@ -151,11 +159,13 @@ function setBridgePaused(paused) {
   markPaused(THREAD_ACTIVITY_FILE, paused);
 }
 markPaused(THREAD_ACTIVITY_FILE, false);
+clearAgentStarted(THREAD_ACTIVITY_FILE);
 
 const discordTransport = createRouterTransport({
   project: ROUTER_PROJECT, role: THREAD_MODE ? "thread" : "project", keyFile: ROUTER_KEY_FILE,
   launchDir: ROUTER_LAUNCH_DIR, registryPath: REGISTRY_PATH, primaryChannelId: CHANNEL_ID,
   threadId: DISCORD_THREAD_ID || null, provider: PROVIDER,
+  capabilities: ["agent_messages"],
 });
 
 // ---- ACP connection ------------------------------------------------------
@@ -597,7 +607,7 @@ async function exitAfterRuntimeLoss(reason) {
 // One ACP prompt. `source` is the owner message it answers, for Conversation
 // Reminders; `suppress` hides its text (a /compact). The caller has checked
 // that no other prompt runs: ACP takes one at a time per session.
-async function runTurn(blocks, channelId, source = null, { suppress = false } = {}) {
+async function runTurn(blocks, channelId, source = null, { suppress = false, agentStarted = false } = {}) {
   turnActive = true;
   turnReplied = false;
   turnReplyCalls = new Map();
@@ -610,7 +620,7 @@ async function runTurn(blocks, channelId, source = null, { suppress = false } = 
     ? [{ type: "text", text: pendingThreadPreamble }, ...blocks]
     : blocks;
   if (!suppress) pendingThreadPreamble = "";
-  markTurn(THREAD_ACTIVITY_FILE, true);
+  markTurn(THREAD_ACTIVITY_FILE, true, "completed", { agentStarted: Boolean(agentStarted) });
   if (source?.reminderAssignment) {
     activeReminderContext = {
       ...reminderEventContext(source.reminderAssignment, turnId),
@@ -625,6 +635,9 @@ async function runTurn(blocks, channelId, source = null, { suppress = false } = 
       }).catch(() => {});
       pendingInputNeededResumeTurnId = null;
     }
+  } else {
+    activeReminderContext = null;
+    await reminderAdapter.clearActiveContext().catch(() => {});
   }
   if (!suppress) await startTyping(channelId).catch(() => {});
 
@@ -684,7 +697,7 @@ async function runTurn(blocks, channelId, source = null, { suppress = false } = 
   await reminderAdapter.clearActiveContext().catch(() => {});
   turnActive = false;
   activeOutputChannelId = null;
-  markTurn(THREAD_ACTIVITY_FILE, false, outcome);
+  markTurn(THREAD_ACTIVITY_FILE, false, outcome, { agentStarted: Boolean(agentStarted) });
   return outcome;
 }
 
@@ -713,12 +726,30 @@ async function afterTurn() {
   processQueue();
 }
 
-// Every queued message goes into one turn, in arrival order; it answers the
-// owner's latest queued message.
+// Every queued owner/guest message goes into one turn, in arrival order; it
+// answers the owner's latest queued message. An Agent Message is never batched
+// with other queued input and runs as a prompt of its own.
 function processQueue() {
-  if (!canPrompt() || messageQueue.length === 0) return;
-  const queued = messageQueue;
-  messageQueue = [];
+  if (!canPrompt()) return;
+  if (messageQueue.length > 0) {
+    messageQueue = messageQueue.filter((item) => {
+      if (item.agentMessage && isExpiredAgentRequest(item.agentMessage)) {
+        console.log(`[agent-message] Dropping expired held request ${item.agentMessage.request_id}`);
+        return false;
+      }
+      return true;
+    });
+  }
+  if (messageQueue.length === 0) return;
+  if (messageQueue[0].agentMessage) {
+    const item = messageQueue.shift();
+    startTurn(item.blocks, item.channelId, null, { agentStarted: true });
+    return;
+  }
+  const queued = [];
+  while (messageQueue.length > 0 && !messageQueue[0].agentMessage) {
+    queued.push(messageQueue.shift());
+  }
   for (const item of queued) {
     if (item.msg && !item.msg.synthetic) discordTransport.removeOwnReaction(item.msg, "⏳").catch(() => {});
   }
@@ -734,9 +765,10 @@ function processQueue() {
 
 async function routeInput(blocks, msg, channelId) {
   if (bridgeStopping) return;
-  if (!canPrompt()) {
+  if (!canPrompt() || messageQueue.length > 0) {
     messageQueue.push({ blocks, msg, channelId });
     if (msg && !msg.synthetic) await discordTransport.react(msg, "⏳").catch(() => {});
+    if (canPrompt()) processQueue();
     return;
   }
   startTurn(blocks, channelId, msg);
@@ -924,8 +956,13 @@ async function clearSession(channelId) {
     return;
   }
   sessionResetting = true;
-  const dropped = messageQueue;
-  messageQueue = [];
+  const dropped = [];
+  const kept = [];
+  for (const item of messageQueue) {
+    if (item.agentMessage) kept.push(item);
+    else dropped.push(item);
+  }
+  messageQueue = kept;
   for (const item of dropped) {
     if (item.msg && !item.msg.synthetic) discordTransport.removeOwnReaction(item.msg, "⏳").catch(() => {});
   }
@@ -1217,8 +1254,31 @@ async function stopAgy(graceMs = 5000) {
   }
 }
 
+async function onAgentMessage(event) {
+  if (bridgeStopping) return;
+  if (isExpiredAgentRequest(event)) {
+    console.log(`[agent-message] Dropping expired request ${event.request_id}`);
+    return;
+  }
+  const blocks = [{ type: "text", text: formatAgentMessageTurn(event) }];
+  if (!canPrompt() || messageQueue.length > 0) {
+    messageQueue.push({ blocks, msg: null, channelId: projectChannelId, agentMessage: event });
+    console.log(`[agent-message] Queued ${event.kind} ${event.request_id}`);
+    if (canPrompt()) processQueue();
+    return;
+  }
+  startTurn(blocks, projectChannelId, null, { agentStarted: true });
+}
+
 async function connectDiscord() {
   discordTransport.onScopeChange(applyProjectScope);
+  const deliverAgentMessage = holdUntilBootstrap("agent_message", inOrder(onAgentMessage));
+  discordTransport.onAgentMessage(createAgentDeliveryHandler({
+    shouldIgnore: () => bridgeStopping,
+    ack: (deliveryId) => discordTransport.ackAgentMessage(deliveryId),
+    deliver: deliverAgentMessage,
+    onError: (message) => console.error(`[agent-message] ${message}`),
+  }));
   discordTransport.onMessage(holdUntilBootstrap("message", inOrder(onDiscordMessage)));
   discordTransport.onReaction(holdUntilBootstrap("reaction", inOrder(onDiscordReaction)));
   const { userTag, scope } = await discordTransport.connect();
@@ -1230,6 +1290,7 @@ async function connectDiscord() {
 }
 
 async function main() {
+  await reminderAdapter.clearActiveContext().catch(() => {});
   await reminderAdapter.drainOutbox();
   startAgy();
   await initializeAgy();

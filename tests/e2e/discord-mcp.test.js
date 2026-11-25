@@ -171,6 +171,9 @@ test("Discord MCP initializes, lists tools, accepts initialized notifications, a
       "export_message_range",
       "download_attachment",
       "create_thread",
+      "send_agent_request",
+      "send_agent_reply",
+      "list_agent_targets",
     ],
   );
   const createThread = output[1].result.tools.find((tool) => tool.name === "create_thread");

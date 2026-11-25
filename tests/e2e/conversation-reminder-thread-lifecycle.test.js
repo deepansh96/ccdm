@@ -240,3 +240,231 @@ test("enable discovery adopts active and recently archived open threads, and ski
     [true, true, false, false]);
   await stop();
 });
+
+test("Agent Messages in Claude Thread Conversations never arm, acknowledge, or reopen reminders, keep armed reminders recurring, and restore arming when owner input joins", async () => {
+  const context = threadReminderWorkspace("claude", { agent_message_targets: ["demo"] });
+  const { workspace } = context;
+  const stop = await threadReminders(context, {
+    routerOptions: { env: { CCDM_ROUTER_AGENT_MESSAGE_MINUTE_MS: "500" } },
+  });
+
+  // Boot THREAD_B with an owner message and leave it open-paused (no reply),
+  // so THREAD_B holds a valid older owner interaction it could name during an agent-started turn.
+  updateState(workspace.stateDir, state => {
+    delete state.fixtures.claude.toolScript;
+    state.fixtures.claude.toolScriptsByConversation = {
+      [THREAD_B]: [
+        {
+          whenAgentKind: "request",
+          name: "reply",
+          arguments: {
+            chat_id: "{{chat_id}}",
+            text: "Thread B posting during request turn",
+            conversation_interaction_id: "thread-b-owner-1",
+            conversation_disposition: "input-needed",
+          },
+        },
+        {
+          whenAgentKind: "request",
+          name: "send_agent_reply",
+          arguments: { request_id: "{{request_id}}", text: "Thread B answer" },
+        },
+      ],
+      [THREAD_A]: [
+        {
+          whenSender: "owner",
+          name: "reply",
+          arguments: {
+            chat_id: "{{chat_id}}",
+            text: "Thread A answered owner",
+            conversation_interaction_id: "{{message_id}}",
+            conversation_disposition: "progress",
+          },
+        },
+        {
+          whenSender: "owner",
+          name: "send_agent_request",
+          arguments: { target: `demo/${THREAD_B}`, text: "Check thread B" },
+        },
+        {
+          whenAgentKind: "reply",
+          name: "reply",
+          arguments: {
+            chat_id: "{{chat_id}}",
+            text: "Thread A reporting thread B reply",
+            conversation_interaction_id: "thread-a-owner-1",
+            conversation_disposition: "progress",
+          },
+        },
+      ],
+    };
+  });
+
+  createThread(workspace, THREAD_B);
+  await supervisedThread(workspace, THREAD_B);
+  injectDiscordMessage(workspace, { id: "thread-b-owner-1", channelId: THREAD_B, author: owner, content: "stand by in thread B" });
+  await supervisedThread(workspace, THREAD_B, row => row.state === "live");
+  await waitFor(() => (readState(workspace.stateDir).fixtures.claude.channelNotifications ?? [])
+    .some(n => n.meta.chat_id === THREAD_B && n.meta.message_id === "thread-b-owner-1"), () => "thread B bootstrap", 20000);
+  await waitFor(() => (readState(workspace.stateDir).fixtures.claude.hookRuns ?? [])
+    .filter(run => run.event === "Stop").length >= 1, () => "thread B initial Stop", 15000);
+  const threadBBefore = await threadStatusMatching(context, THREAD_B, row => row?.last_ack_message_id === "thread-b-owner-1");
+  assert.equal(threadBBefore.state, "open-paused");
+  assert.equal(threadBBefore.response_message_id, null);
+
+  // Boot THREAD_A: answers its owner message (arming its reminder) and sends an Agent Request to THREAD_B.
+  // Note: bootstrapNotification carries no meta.sender, so trigger the exchange on the second owner message once live.
+  createThread(workspace, THREAD_A);
+  await supervisedThread(workspace, THREAD_A);
+  injectDiscordMessage(workspace, { id: "thread-a-boot", channelId: THREAD_A, author: owner, content: "open thread A" });
+  await supervisedThread(workspace, THREAD_A, row => row.state === "live");
+  await waitFor(() => (readState(workspace.stateDir).fixtures.claude.hookRuns ?? [])
+    .filter(run => run.event === "Stop").length >= 2, () => "thread A boot Stop", 15000);
+
+  injectDiscordMessage(workspace, { id: "thread-a-owner-1", channelId: THREAD_A, author: owner, content: "check thread B" });
+  await waitFor(() =>
+    (readState(workspace.stateDir).fixtures.discord.messages ?? []).some(m => m.channelId === THREAD_B && m.content === "Thread B posting during request turn")
+    && (readState(workspace.stateDir).fixtures.discord.messages ?? []).some(m => m.channelId === THREAD_A && m.content === "Thread A reporting thread B reply"),
+  () => "full thread-to-thread exchange", 25000);
+  await waitFor(() => (readState(workspace.stateDir).fixtures.claude.hookRuns ?? [])
+    .filter(run => run.event === "Stop").length >= 5, () => "all exchange Stop hooks", 15000);
+
+  const threadAOwnerReply = (readState(workspace.stateDir).fixtures.discord.messages ?? []).find(
+    m => m.channelId === THREAD_A && m.content === "Thread A answered owner",
+  );
+  assert.ok(threadAOwnerReply);
+  const threadAAfter = await threadStatusMatching(context, THREAD_A, row => row?.state === "awaiting-owner");
+  assert.equal(threadAAfter.response_message_id, threadAOwnerReply.id);
+  const threadBAfter = await threadStatus(context, THREAD_B);
+  assert.deepEqual(
+    [threadBAfter.state, threadBAfter.revision, threadBAfter.response_message_id, threadBAfter.due_at],
+    ["open-paused", threadBBefore.revision, null, null],
+  );
+
+  // THREAD_A's already-armed reminder fires at +61m and recurs at +182m; THREAD_B gets none.
+  context.setClock(61);
+  await waitFor(() => eyes(workspace, THREAD_A).length === 1, () => "thread A first reminder", 20000);
+  assert.deepEqual(eyes(workspace, THREAD_B), []);
+  context.setClock(61 + 121);
+  await waitFor(() => eyes(workspace, THREAD_A).length === 2, () => "thread A recurring reminder", 20000);
+  assert.deepEqual(eyes(workspace, THREAD_B), []);
+
+  // Notice-started turn (expired request) in THREAD_B: reply during notice turn arms nothing.
+  const stopsBeforeNotice = (readState(workspace.stateDir).fixtures.claude.hookRuns ?? [])
+    .filter(run => run.event === "Stop").length;
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.toolScriptsByConversation = {
+      [THREAD_A]: [],
+      [THREAD_B]: [
+        {
+          whenSender: "owner",
+          name: "send_agent_request",
+          arguments: { target: `demo/${THREAD_A}`, text: "Will expire in thread", timeout_minutes: 1 },
+        },
+        {
+          whenAgentKind: "notice",
+          name: "reply",
+          arguments: {
+            chat_id: "{{chat_id}}",
+            text: "Thread B posting during expiry notice",
+            conversation_interaction_id: "thread-b-owner-2",
+            conversation_disposition: "progress",
+          },
+        },
+      ],
+    };
+  });
+  injectDiscordMessage(workspace, { id: "thread-b-owner-2", channelId: THREAD_B, author: owner, content: "ping thread A" });
+  await waitFor(() => (readState(workspace.stateDir).fixtures.discord.messages ?? [])
+    .some(m => m.channelId === THREAD_B && m.content === "Thread B posting during expiry notice"),
+  () => "thread B notice reply", 20000);
+  await waitFor(() => (readState(workspace.stateDir).fixtures.claude.hookRuns ?? [])
+    .filter(run => run.event === "Stop").length >= stopsBeforeNotice + 3, () => "notice Stop hooks", 15000);
+  const threadBAfterNotice = await threadStatusMatching(context, THREAD_B, row => row?.last_ack_message_id === "thread-b-owner-2");
+  assert.deepEqual([threadBAfterNotice.state, threadBAfterNotice.response_message_id, threadBAfterNotice.due_at],
+    ["open-paused", null, null]);
+
+  // Owner message joining an agent-started turn in THREAD_B restores reminder arming.
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.holdTurnsIn = [THREAD_B];
+    state.fixtures.claude.toolScriptsByConversation = {
+      "demo-channel": [
+        {
+          whenSender: "owner",
+          name: "send_agent_request",
+          arguments: { target: `demo/${THREAD_B}`, text: "Hold in thread B" },
+        },
+      ],
+      [THREAD_B]: [
+        {
+          whenAgentKind: "request",
+          name: "reply",
+          arguments: {
+            chat_id: "{{chat_id}}",
+            text: "Thread B pre-join reply",
+            conversation_interaction_id: "thread-b-owner-2",
+            conversation_disposition: "progress",
+          },
+        },
+      ],
+    };
+    state.fixtures.claude.midTurnToolScriptsByConversation = {
+      [THREAD_B]: [
+        {
+          whenSender: "owner",
+          name: "reply",
+          arguments: {
+            chat_id: "{{chat_id}}",
+            text: "Thread B post-join reply",
+            conversation_interaction_id: "{{message_id}}",
+            conversation_disposition: "progress",
+          },
+        },
+      ],
+    };
+  });
+  injectDiscordMessage(workspace, { id: "demo-ch-trigger-b", channelId: "demo-channel", author: owner, content: "ask thread B" });
+  await waitFor(() => (readState(workspace.stateDir).fixtures.discord.messages ?? [])
+    .some(m => m.channelId === THREAD_B && m.content === "Thread B pre-join reply"),
+  () => "thread B pre-join reply", 20000);
+  injectDiscordMessage(workspace, { id: "thread-b-owner-join", channelId: THREAD_B, author: owner, content: "owner joins thread B" });
+  await waitFor(() => (readState(workspace.stateDir).fixtures.discord.messages ?? [])
+    .some(m => m.channelId === THREAD_B && m.content === "Thread B post-join reply"),
+  () => "thread B post-join reply", 15000);
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.holdTurnsIn = [];
+  });
+  const threadBPostJoinReply = (readState(workspace.stateDir).fixtures.discord.messages ?? []).find(
+    m => m.channelId === THREAD_B && m.content === "Thread B post-join reply",
+  );
+  assert.ok(threadBPostJoinReply);
+  const threadBArmed = await threadStatusMatching(context, THREAD_B, row => row?.state === "awaiting-owner");
+  assert.deepEqual([threadBArmed.current_interaction_id, threadBArmed.response_message_id],
+    ["thread-b-owner-join", threadBPostJoinReply.id]);
+
+  // Closed Thread Conversation stays closed when targeted by an Agent Request (target_closed).
+  injectDiscordMessage(workspace, { id: "thread-a-close-am", channelId: THREAD_A, author: owner, content: "/close" });
+  const closedA = await threadStatusMatching(context, THREAD_A, row => row?.state === "closed");
+  await waitFor(() => readState(workspace.stateDir).fixtures.discord.threads[THREAD_A]?.archived === true,
+    () => "thread A archived", 20000);
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.toolScriptsByConversation = {
+      "demo-channel": [
+        {
+          whenSender: "owner",
+          name: "send_agent_request",
+          arguments: { target: `demo/${THREAD_A}`, text: "Ping closed thread A" },
+        },
+      ],
+    };
+  });
+  injectDiscordMessage(workspace, { id: "demo-ch-trigger-closed", channelId: "demo-channel", author: owner, content: "ping closed thread" });
+  await waitFor(() => (readState(workspace.stateDir).fixtures.claude.toolResults ?? [])
+    .some(r => r.name === "send_agent_request" && r.result?.content?.[0]?.text?.includes("target_closed")),
+  () => "target_closed refusal", 20000);
+  const closedAAfter = await threadStatus(context, THREAD_A);
+  assert.deepEqual([closedAAfter.state, closedAAfter.revision], ["closed", closedA.revision]);
+  assert.equal(readState(workspace.stateDir).fixtures.discord.threads[THREAD_A].archived, true);
+
+  await stop();
+});

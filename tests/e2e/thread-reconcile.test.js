@@ -528,3 +528,52 @@ test("on restart, a registered project whose channel Discord no longer has does 
   assert.match(exit.stderr, /reconcile: skipped project gone's channel gone-channel \(Discord 404\)/);
   assert.doesNotMatch(exit.stderr, /the thread list failed/);
 });
+
+test("on restart, reconcile does not treat an Agent Message record from the project webhook as the agent's answer", async () => {
+  const workspace = reconcileWorkspace();
+  const { supervisor } = await supervised(workspace);
+  const unanswered = thread("1700000000000395001");
+  const laterPrefix = thread("1700000000000395002");
+  for (const raw of [unanswered, laterPrefix]) threadEvent(workspace, raw, "create");
+  for (const raw of [unanswered, laterPrefix]) await threadRow(workspace, raw.id);
+  await assertSupervisorStops(supervisor);
+
+  const requestRecord = "-# ⇄ Agent Request to **beta-claude** · req-0123456789ab\ncheck build";
+  const replyRecord = "-# ⇄ Agent Reply from **beta-claude** · req-0123456789ab\nbuild green";
+  const rootAuthor = { id: "fixture-bot-user-id", username: "root", bot: true };
+  // Newest first, as Discord returns it: owner asked, then an Agent Message exchange posted
+  // through the project webhook and root bot, with no actual agent reply.
+  updateState(workspace.stateDir, state => {
+    (state.fixtures.discord.history ||= {})[unanswered.id] = [
+      { id: "rec-reply", type: 0, channel_id: unanswered.id, content: replyRecord, attachments: [],
+        timestamp: "2026-09-30T10:02:00.000Z", author: rootAuthor },
+      { id: "rec-request", type: 0, channel_id: unanswered.id, content: requestRecord, attachments: [],
+        timestamp: "2026-09-30T10:01:00.000Z", webhook_id: WEBHOOK_ID,
+        author: { id: WEBHOOK_ID, username: "demo-claude · 10%", bot: true } },
+      { id: "owner-ask", type: 0, channel_id: unanswered.id, content: "please fix the parser", attachments: [],
+        timestamp: "2026-09-30T10:00:00.000Z", author: owner },
+    ];
+  });
+  // A webhook reply that merely contains the prefix later in its text still counts as answered.
+  seedHistory(workspace, laterPrefix.id, [
+    ["later-owner", owner, "what prefix do records use?"],
+    ["later-reply", "agent", "Headers start with -# ⇄ Agent for records."],
+  ]);
+
+  await startThreadSupervisor(workspace, { env: ENV });
+
+  await threadRow(workspace, unanswered.id, row => row.state === "live");
+  await waitFor(() => notifications(workspace, unanswered.id).length === 1 && threadPosts(workspace, unanswered.id).length === 1,
+    () => `the bootstrap and its reply: ${JSON.stringify(claude(workspace).channelNotifications)}`, 15000);
+  await settle(1000);
+
+  const [bootstrap] = notifications(workspace, unanswered.id);
+  assert.equal(bootstrap.meta.message_id, "owner-ask");
+  assert.equal(occurrences(bootstrap.content, "please fix the parser"), 1, bootstrap.content);
+  assert.equal(occurrences(bootstrap.content, "check build"), 0, bootstrap.content);
+  assert.equal(occurrences(bootstrap.content, "build green"), 0, bootstrap.content);
+
+  const rows = await threadRows(workspace);
+  assert.equal(rows[laterPrefix.id].state, "registered");
+  assert.equal(claude(workspace).invocations.length, 1);
+});

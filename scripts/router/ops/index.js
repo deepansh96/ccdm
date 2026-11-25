@@ -3,6 +3,7 @@
 // Operation dispatch table. Each operation family lives in its own module and
 // declares its ops as `{ roles, scoped, run(ctx, args) }`; add a family here.
 const FAMILIES = [
+  require("./agent-messages.js"),
   require("./channel-actions.js"),
   require("./reads.js"),
   require("./reply.js"),

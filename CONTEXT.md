@@ -144,6 +144,22 @@ _Avoid_: bot isolation, channel permissions (when meaning router enforcement)
 The per-project name under which a project session's messages appear in Discord, distinct from the root bot's own name.
 _Avoid_: project bot, bot nickname
 
+**Agent Message**:
+A message one **Project Conversation**'s agent sends to another **Project Conversation** through the **Router**. It is either an **Agent Request** or an **Agent Reply**, and it is never an instruction from the CCDM owner.
+_Avoid_: relay, cross-channel message, DM
+
+**Agent Request**:
+The **Agent Message** that opens an exchange and asks the target **Project Conversation** for one answer.
+_Avoid_: owner instruction, command
+
+**Agent Reply**:
+The single **Agent Message** that answers an **Agent Request** and ends the exchange.
+_Avoid_: Conversation Reply, response
+
+**Agent Message Grant**:
+The CCDM owner's one-way permission for every **Project Conversation** of one project to send **Agent Requests** to every **Project Conversation** of a named project, which may be the same project.
+_Avoid_: allowlist entry, link, channel permission
+
 **Bot Pool**:
 The legacy set of separate Discord bot applications, one assigned per project channel, that the **Router** replaces.
 _Avoid_: router, project identity
@@ -156,6 +172,14 @@ _Avoid_: router, project identity
 - A thread message reaches only its **Thread Conversation**, never the **Channel Conversation** or sibling threads.
 - A **Thread Conversation** posts under its project's **Project Identity**, named for the thread's own provider.
 - The **Thread Supervisor** reaches Discord only through the **Router**, like every session.
+- An **Agent Message** leaves **Session Scope** unchanged: neither side may read from or act in the other's **Project Conversation**.
+- An exchange is one **Agent Request** and at most one **Agent Reply**; an **Agent Reply** never opens another exchange.
+- Both a Channel Conversation and a Thread Conversation may send and receive **Agent Messages**; the **Root-Agent Conversation** does neither.
+- An **Agent Message** appears in the sending conversation under the sender's **Project Identity** and in the receiving conversation as a root-bot post that names the sender.
+- An **Agent Request** needs an **Agent Message Grant** from the sender's project to the target's project; an **Agent Reply** needs none, because the open **Agent Request** is its permission.
+- An **Agent Message Grant** is the only thing that lets an **Agent Request** through; no approval by the CCDM owner is asked per request.
+- An **Agent Request** reaches only a **Project Conversation** whose session is live; it never starts a session and never reopens a **Closed Conversation**.
+- An **Agent Message** is never a **Conversation Reply** and never triggers a **Conversation Reminder**.
 - The **Bot Pool** exists only until every project has migrated to the **Router**.
 - The **End-to-End Test Suite** uses **Local Fakes** by default.
 - The **Live Smoke Suite** verifies a narrow subset of workflows against real external services.

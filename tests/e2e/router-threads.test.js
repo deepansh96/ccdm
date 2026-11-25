@@ -496,6 +496,42 @@ test("bot, webhook and stranger thread messages reach only the supervisor, with 
   assert.deepEqual(marks(sessions.workspace), []);
 });
 
+test("thread_message classifies root-bot and own-webhook records as agent_message, leaving other messages unchanged", async () => {
+  const sessions = await threadListeners();
+  const supervisor = await connectSupervisor(sessions.workspace);
+  const registry = JSON.parse(fs.readFileSync(path.join(sessions.workspace.repoDir, "registry.json"), "utf8"));
+  const webhookId = registry.projects.demo.webhook_id;
+  const recordText = "-# ⇄ Agent Request from **beta-claude** · req-0123456789ab\ncheck status";
+  const laterText = "Prefix mentioned later:\n-# ⇄ Agent Request from **beta-claude** · req-0123456789ab";
+  const inThread = (id, author, content, extra = {}) =>
+    inject(sessions.workspace, id, { channelId: "demo-thread", author, content, ...extra });
+
+  inThread("root-record", { id: "fixture-bot-user-id", bot: true }, recordText);
+  inThread("webhook-record", { id: webhookId, bot: true }, recordText, { webhookId });
+  inThread("root-later", { id: "fixture-bot-user-id", bot: true }, laterText);
+  inThread("webhook-later", { id: webhookId, bot: true }, laterText, { webhookId });
+  inThread("owner-prefix", { id: OWNER_ID, username: "Owner" }, recordText);
+  inThread("guest-prefix", { id: "guest-id", username: "Guest" }, recordText);
+  inThread("other-webhook-prefix", { id: "other-webhook", bot: true }, recordText, { webhookId: "other-webhook" });
+  inThread("other-bot-prefix", { id: "other-bot", bot: true }, recordText);
+
+  await threadFence(sessions);
+  await waitFor(() => supervisor.events.some(frame => frame.message_id?.endsWith("-thread-fence")), () => "supervisor fence");
+  assert.deepEqual(
+    supervised(supervisor, "thread_message").map(frame => [frame.message_id, frame.author_class, frame.delivered_to_session]),
+    [
+      ["root-record", "agent_message", false],
+      ["webhook-record", "agent_message", false],
+      ["root-later", "root_bot", false],
+      ["webhook-later", "project_webhook", false],
+      ["owner-prefix", "owner", true],
+      ["guest-prefix", "guest", true],
+      ["other-webhook-prefix", "other", false],
+      ["other-bot-prefix", "other", false],
+    ],
+  );
+});
+
 test("supervisor thread commands reach only the supervisor, and session commands do with no session", async () => {
   const sessions = await threadListeners();
   seedThreads(sessions.workspace, { "idle-thread": { type: 11, parentId: "demo-channel" } });

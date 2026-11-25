@@ -1,7 +1,7 @@
 ---
 name: agents
 description: Always-loaded project anchor for CCDM.
-last_updated: 2026-11-21
+last_updated: 2026-11-25
 ---
 
 # CCDM - Claude Code Discord Manager
@@ -15,6 +15,7 @@ CCDM manages isolated Claude Code, Codex and Gemini (Antigravity CLI) Discord se
 - Never expose or commit Discord bot tokens, Codex credentials, Claude credentials, or `registry.json` secrets.
 - Treat a channel-scoped Discord MCP restriction as the transport boundary for user-visible messages and message tools, not as a ban on explicitly requested root-management work. For authorized registration, deregistration, channel/category creation, webhook, role, permission, or invite tasks, use the documented CCDM scripts/workflow and the root bot's authenticated Discord REST API when required; never use another Discord MCP, broaden the requested targets, or expose credentials. A missing MCP administration tool is not by itself a blocker for these workflows.
 - One session serves one project channel, enforced by the Router; stop existing listeners before starting replacements.
+- Agent Message Grants (`agent_message_targets`) are never edited by project sessions and never hand-edited in `registry.json`; only root manages them with `scripts/ccdm agent-messages allow|revoke|list`.
 - When a restart request comes from or names a registered project channel, restart that project's isolated session; restart the root agent only when the user explicitly asks to restart root.
 - Thread Conversations are independent of their channel: "restart <project>" and `scripts/ccdm stop-session <project>` act on the channel's session only, unless the request names its threads (`--threads` for threads only, `--all` for both). To restart one thread:
   - macOS: `scripts/threads.sh restart <name|link>`.

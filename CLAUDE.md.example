@@ -231,6 +231,21 @@ You restart yourself with `scripts/ccdm restart-root`. It detaches itself, so it
 - macOS: from a terminal, `./restart-root-agent.sh` and `./restart-root-codex-agent.sh [<channel_id>]` run the same command.
 - Windows: root Codex is not supported yet, so `--provider codex` is refused.
 
+#### 13. Agent Message Grants (`allow agent messages`, `revoke agent messages`, `list agent message grants`)
+
+Manage one-way Agent Message Grants between registered projects with `scripts/ccdm agent-messages`. The command is the same on macOS and Windows; never hand-edit `agent_message_targets` in `registry.json`, and project sessions never edit grants themselves:
+
+```sh
+scripts/ccdm agent-messages allow <from> <to>
+scripts/ccdm agent-messages revoke <from> <to>
+scripts/ccdm agent-messages list [<project>] [--json]
+```
+
+- `allow <from> <to>` grants every Project Conversation of `<from>` (its channel and threads) permission to send Agent Requests to every Project Conversation of `<to>`. Both must be registered and not `remote:`; `<from>` and `<to>` may be the same project for a self-grant. It is idempotent, warns with the guest count when `<from>` has guests (and still records the grant), and holds the shared registry lock.
+- `revoke <from> <to>` removes the grant (including a stale target whose project was deregistered). It is idempotent; revoking an absent grant exits 0 and says there was nothing to remove.
+- `list [<project>] [--json]` prints one `from -> to` line per grant, flags targets that are no longer registered as `(stale)`, filters by `<project>` when given, and outputs JSON with `--json`.
+- The Router hot-reloads the registry, so `allow` and `revoke` take effect on the next send with no Router or session restart.
+
 ### Discord Polls
 
 Create native Discord polls using the API directly with the root bot token (read from root's `.env` in the same shell command). The command is the same on macOS and Windows; run it with the Bash tool:

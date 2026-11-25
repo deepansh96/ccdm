@@ -299,6 +299,7 @@ const runbookFiles = [
   ".mex/context/setup.md",
   ".mex/context/stack.md",
   ".mex/patterns/debug-discord-session.md",
+  ".mex/patterns/manage-agent-message-grants.md",
   ".mex/patterns/manage-claude-home-login.md",
   ".mex/patterns/manage-session.md",
   ".mex/patterns/operate-conversation-reminders.md",
@@ -771,7 +772,7 @@ test("CLAUDE.md.example names POSIX-only commands only under macOS:, in the whol
 // Root's command entries, with the usage entry, "Discord Polls" and "Voice
 // Messages": the lines from "Commands" up to "Channel Routing Rules". They are
 // final. A change that rewrites one on purpose updates this hash with it.
-const ROOT_ENTRIES_SHA256 = "06cde4ffeb707d6e8d6c1042aab37d6d878987bb8d08acad6e4bfc8bb790731c";
+const ROOT_ENTRIES_SHA256 = "2fe86b3d82b8730522105ac8e440e74bcea3a8ecaee20cc0281cbfa4d92f1e41";
 
 test("root's command, usage and voice entries in CLAUDE.md.example are unchanged", () => {
   const { lines } = wholeFile(ROOT_ENTRIES.file);
@@ -779,11 +780,54 @@ test("root's command, usage and voice entries in CLAUDE.md.example are unchanged
   const end = lines.findIndex(line => line.startsWith(ROOT_ENTRIES.to));
   assert.ok(start >= 0 && end > start, `${ROOT_ENTRIES.file} lost one of root's command headings`);
   const entries = lines.slice(start, end);
-  for (const heading of ["#### 11. Usage report", "#### 12. Self-restart", "### Discord Polls", "### Voice Messages"]) {
+  for (const heading of [
+    "#### 11. Usage report",
+    "#### 12. Self-restart",
+    "#### 13. Agent Message Grants",
+    "### Discord Polls",
+    "### Voice Messages",
+  ]) {
     assert.ok(entries.some(line => line.startsWith(heading)), `"${heading}" is no longer among root's entries`);
   }
   assert.equal(createHash("sha256").update(entries.join("\n")).digest("hex"), ROOT_ENTRIES_SHA256,
     "root's entries changed; they are final, so restore them or update the hash on purpose");
+});
+
+test("root's Agent Message Grant instructions name scripts/ccdm agent-messages and stale-grant cleanup", () => {
+  const commands = listedCommands();
+  assert.ok(commands.has("agent-messages"), "agent-messages is missing from scripts/ccdm --help");
+  const verbs = listedCommands("agent-messages");
+  for (const verb of ["allow", "revoke", "list", "log"]) {
+    assert.ok(verbs.has(verb), `agent-messages ${verb} is missing from scripts/ccdm agent-messages --help`);
+  }
+
+  const agents = fs.readFileSync("AGENTS.md", "utf8");
+  assert.match(agents, /Agent Message Grants[^\n]*never edited by project sessions[^\n]*scripts\/ccdm agent-messages allow\|revoke\|list/);
+
+  const rootCommands = fs.readFileSync(".mex/patterns/root-commands.md", "utf8");
+  for (const phrase of [
+    "scripts/ccdm agent-messages allow <from> <to>",
+    "scripts/ccdm agent-messages revoke <from> <to>",
+    "scripts/ccdm agent-messages list [<project>] [--json]",
+  ]) {
+    assert.match(rootCommands, new RegExp(escape(phrase)), `root-commands.md is missing "${phrase}"`);
+  }
+
+  const grantPattern = fs.readFileSync(".mex/patterns/manage-agent-message-grants.md", "utf8");
+  for (const phrase of [
+    "scripts/ccdm agent-messages allow <from> <to>",
+    "scripts/ccdm agent-messages revoke <from> <to>",
+    "scripts/ccdm agent-messages list",
+    "(stale)",
+  ]) {
+    assert.match(grantPattern, new RegExp(escape(phrase)), `manage-agent-message-grants.md is missing "${phrase}"`);
+  }
+
+  assert.match(fs.readFileSync(".mex/patterns/INDEX.md", "utf8"), /\[manage-agent-message-grants\.md\]\(manage-agent-message-grants\.md\)/);
+  const registerPattern = fs.readFileSync(".mex/patterns/register-project.md", "utf8");
+  assert.match(registerPattern, /scripts\/ccdm agent-messages list/);
+  assert.match(registerPattern, /scripts\/ccdm agent-messages revoke/);
+  assert.match(registerPattern, /inherits a stale grant/i);
 });
 
 test("every scripts/ccdm command in the skills and CLAUDE.md.example exists, with the variables the skills read", () => {
@@ -1045,5 +1089,117 @@ test("the macOS sections of the README are still there", () => {
   for (const phrase of ["./setup.sh", "scripts/install-router-service.sh", "./restart-root-agent.sh", "brew install tmux",
     "launchctl load ~/Library/LaunchAgents/com.claude.root-agent.plist"]) {
     assert.ok(operatorReadme.includes(phrase), `README.md lost "${phrase}"`);
+  }
+});
+
+test("owner documentation, scaffold, and reminder/thread docs cover Agent Messages consistently", () => {
+  // 1. README Agent Messages section lets an owner grant, use, inspect, and revoke without reading the PRD.
+  const readmeLines = operatorReadme.split(/\r?\n/);
+  const agentRange = sectionRange(readmeLines, "## Agent Messages");
+  assert.ok(agentRange, "README.md has no \"## Agent Messages\" section");
+  const agentSection = readmeLines.slice(agentRange[0], agentRange[1]).join("\n");
+  for (const phrase of [
+    "scripts/ccdm agent-messages allow <from> <to>",
+    "scripts/ccdm agent-messages revoke <from> <to>",
+    "scripts/ccdm agent-messages list",
+    "scripts/ccdm agent-messages log",
+    "agent_message_targets",
+    "agent_message_limits",
+    "send_agent_request",
+    "send_agent_reply",
+    "list_agent_targets",
+    "timeout_minutes",
+    "depth",
+    "requests_per_hour",
+    "open_requests",
+    "max_characters",
+    "4000",
+    "node scripts/router.js status",
+    "open agent requests",
+    "recent agent refusals",
+    "ledger",
+    "-# ⇄ Agent ",
+    "✅",
+    "⚠️",
+    "Session Scope",
+    "restarted after",
+  ]) {
+    assert.ok(agentSection.includes(phrase), `README.md Agent Messages section is missing "${phrase}"`);
+  }
+  // Configuration reference also lists both registry fields.
+  const configRange = sectionRange(readmeLines, "## Configuration reference");
+  assert.ok(configRange, "README.md has no Configuration reference section");
+  const configSection = readmeLines.slice(configRange[0], configRange[1]).join("\n");
+  assert.ok(configSection.includes("`agent_message_limits`"), "Configuration reference is missing agent_message_limits");
+  assert.ok(configSection.includes("`agent_message_targets`"), "Configuration reference is missing agent_message_targets");
+
+  // 2. Scaffold files reflect shipped behaviour, unchanged Session Scope, and ADR 0009's single durable Router store.
+  const scaffoldChecks = {
+    ".mex/ROUTER.md": ["agent-messages.jsonl", "scripts/ccdm agent-messages", "Session Scope is unchanged"],
+    ".mex/context/architecture.md": ["scripts/router/agent-messages/", "agent-messages.jsonl", "ADR 0009", "durable store"],
+    ".mex/context/discord-security.md": [
+      "agent_request", "agent_reply", "agent_targets", "agent_message_ack",
+      "agent_message_targets", "never expand Session Scope", "agent-messages.jsonl",
+    ],
+    ".mex/context/session-management.md": [
+      "agent_message_targets", "agent_message_limits", "agent-messages", "restarted after",
+    ],
+  };
+  for (const [file, phrases] of Object.entries(scaffoldChecks)) {
+    const source = fs.readFileSync(file, "utf8");
+    for (const phrase of phrases) {
+      assert.ok(source.includes(phrase), `${file} is missing "${phrase}"`);
+    }
+  }
+
+  // 3. Conversation Reminder and Thread Supervisor docs agree on records, history-only webhook detection, and agent-started turns.
+  for (const file of [
+    "docs/conversation-reminders.md",
+    "docs/conversation-reminder-claude-adapter.md",
+    "docs/conversation-reminder-codex-adapter.md",
+    "docs/thread-supervisor.md",
+  ]) {
+    const source = fs.readFileSync(file, "utf8");
+    assert.ok(source.includes("-# ⇄ Agent "), `${file} is missing the "-# ⇄ Agent " record marker`);
+    assert.match(source, /agent-started turn/i, `${file} does not describe agent-started turns`);
+    assert.match(source, /adapter receipts/i, `${file} does not say live reminder arming comes from adapter receipts`);
+    assert.match(source, /history discovery/i, `${file} does not scope webhook_id detection to history discovery`);
+  }
+
+  // 4. Scenario matrix maps every PRD #387 acceptance scenario to existing passing test file(s).
+  const matrixLines = matrix.split(/\r?\n/);
+  const auditRange = sectionRange(matrixLines, "## Agent Messages Acceptance Audit (#387)");
+  assert.ok(auditRange, "SCENARIO_MATRIX.md has no \"## Agent Messages Acceptance Audit (#387)\" section");
+  const auditRows = matrixLines.slice(auditRange[0], auditRange[1]).filter((line) => line.startsWith("| AM-"));
+  assert.equal(auditRows.length, 14, `expected 14 PRD acceptance scenario rows (AM-1..AM-14), found ${auditRows.length}`);
+  for (const row of auditRows) {
+    assert.match(row, /\| Covered \|/, `acceptance row is not Covered: ${row}`);
+    const testFiles = [...row.matchAll(/tests\/e2e\/[a-z0-9-]+\.test\.js/g)].map(([match]) => match);
+    assert.ok(testFiles.length > 0, `acceptance row names no test file: ${row}`);
+    for (const testFile of testFiles) {
+      assert.ok(fs.existsSync(testFile), `acceptance row names missing test file ${testFile}: ${row}`);
+    }
+  }
+
+  // 5. No document or instruction presents the tmux relay as a way for agents to message each other.
+  const docsToCheck = [
+    "README.md",
+    "AGENTS.md",
+    "CLAUDE.md.example",
+    "docs/thread-supervisor.md",
+    "docs/conversation-reminders.md",
+    "docs/conversation-reminder-claude-adapter.md",
+    "docs/conversation-reminder-codex-adapter.md",
+    "skills/restart-self.md",
+    "skills/check-context.md",
+    ...runbookFiles,
+  ];
+  for (const file of new Set(docsToCheck)) {
+    const source = fs.readFileSync(file, "utf8");
+    assert.doesNotMatch(
+      source,
+      /(?:use|via|through)\s+tmux\s+(?:relay|send-keys)[^\n]*(?:message|talk to|ask)\s+another\s+(?:agent|session)/i,
+      `${file} presents tmux relay as agent-to-agent messaging`,
+    );
   }
 });

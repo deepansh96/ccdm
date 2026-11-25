@@ -12,6 +12,7 @@ const path = require("node:path");
 const { createIpcListener, publishPipe, serverProof, unpublishPipe } = require("../platform/ipc.js");
 const { ensurePrivateDir } = require("../platform/privacy.js");
 const { withDeadline } = require("./discord-rest.js");
+const { createAgentMessages } = require("./agent-messages/index.js");
 const { threadRoute } = require("./inbound.js");
 const { OpError, ScopeViolation } = require("./ops/errors.js");
 const { OPERATIONS } = require("./ops/index.js");
@@ -49,6 +50,15 @@ function keysMatch(expected, actual) {
   const a = Buffer.from(expected);
   const b = Buffer.from(String(actual ?? ""));
   return a.length > 0 && a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+// One-way fingerprint of a launch key; the ledger never holds a key.
+function keyFingerprint(key) {
+  return crypto.createHash("sha256").update(String(key)).digest("hex");
+}
+
+function parseCapabilities(raw) {
+  return new Set(Array.isArray(raw) ? raw.filter(item => typeof item === "string") : []);
 }
 
 // The nonce of a server_proof frame: see scripts/platform/ipc.js.
@@ -119,6 +129,29 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
   let keysWatcher = null;
   // This start's secret on Windows; POSIX has no server proof.
   let proofSecret = null;
+
+  const agentMessages = createAgentMessages({
+    stateDir,
+    context,
+    getTable,
+    log,
+    findListener(conversation) {
+      if (conversation.thread_id) {
+        const connection = threadSessions.get(conversation.thread_id);
+        return connection && connection.route.project === conversation.project ? connection : null;
+      }
+      const connection = sessions.get(conversation.project);
+      return connection && connection.route.channel_id === conversation.conversation_id ? connection : null;
+    },
+    listThreadListeners(project) {
+      return [...threadSessions.values()].filter(connection => connection.route.project === project);
+    },
+    deliver(connection, event) {
+      if (!connection || connection.socket.destroyed) return false;
+      send(connection.socket, { type: "event", ...event });
+      return true;
+    },
+  });
 
   async function readKey(file) {
     try {
@@ -283,16 +316,23 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       return reject("unauthorized", "unknown project or key");
     }
     if (frame.listener === false) {
-      Object.assign(connection, { role: "project", listener: false, route, key: frame.key, connectedAt: new Date().toISOString() });
+      Object.assign(connection, {
+        role: "project", listener: false, route, key: frame.key, keyFingerprint: keyFingerprint(frame.key),
+        connectedAt: new Date().toISOString(),
+      });
       opConnections.add(connection);
       return send(connection.socket, { type: "hello_ok", v: PROTOCOL_VERSION, scope: projectScope(route) });
     }
     // One listener per project: a newer hello replaces whoever held the project.
     const previous = sessions.get(route.project);
     if (previous) revoke(previous, "replaced");
-    Object.assign(connection, { role: "project", route, key: frame.key, connectedAt: new Date().toISOString() });
+    Object.assign(connection, {
+      role: "project", route, key: frame.key, keyFingerprint: keyFingerprint(frame.key),
+      capabilities: parseCapabilities(frame.capabilities), connectedAt: new Date().toISOString(),
+    });
     sessions.set(route.project, connection);
     send(connection.socket, { type: "hello_ok", v: PROTOCOL_VERSION, scope: projectScope(route) });
+    agentMessages.onListenerHello(connection);
   }
 
   // Whether the gateway is ready, waiting up to `helloReadyWaitMs()` for it.
@@ -343,7 +383,11 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       project: route.project, type: frame.provider, channel_id: threadId, parent_channel_id: route.channel_id,
       thread_id: threadId, webhook_id: route.webhook_id,
     };
-    Object.assign(connection, { role: "thread", route: threadRoute, key: frame.key, connectedAt: new Date().toISOString() });
+    Object.assign(connection, {
+      role: "thread", route: threadRoute, key: frame.key, keyFingerprint: keyFingerprint(frame.key),
+      ...(frame.listener === false ? {} : { capabilities: parseCapabilities(frame.capabilities) }),
+      connectedAt: new Date().toISOString(),
+    });
     if (frame.listener === false) {
       connection.listener = false;
       threadOps.add(connection);
@@ -358,6 +402,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     }
     const { webhook_id: _webhook, ...scope } = threadRoute;
     send(connection.socket, { type: "hello_ok", v: PROTOCOL_VERSION, scope });
+    if (frame.listener !== false) agentMessages.onListenerHello(connection);
   }
 
   async function request(connection, frame) {
@@ -387,7 +432,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
       // Discord calls stop once the client's own timeout has passed.
       const result = await withDeadline(frame.deadline_at, () => operation.run({ ...context, session, sessions: listSessions,
         supervisor: () => supervisorSession && { connectedAt: supervisorSession.connectedAt },
-        threadRequests: threadRequestsContext, revokeThread,
+        threadRequests: threadRequestsContext, revokeThread, agentMessages,
         violations: () => [...violations], table: getTable(), gateway, registry }, args));
       respond({ ok: true, result });
     } catch (error) {
@@ -460,6 +505,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
   return {
     async listen() {
       await ensurePrivateDir(stateDir);
+      await agentMessages.load();
       await (process.platform === "win32" ? listenOnPipe() : listenOnSocket());
       await mkdir(keysDir, { recursive: true, mode: 0o700 });
       if (process.platform === "win32") await ensurePrivateDir(keysDir);
@@ -530,6 +576,7 @@ function createRouterServer({ stateDir, socketPath, getTable, gateway, registry,
     },
     close() {
       keysWatcher?.close();
+      agentMessages.close();
       for (const connection of [...sessions.values(), ...opConnections, ...threadSessions.values(), ...threadOps]) {
         connection.socket.destroy();
       }

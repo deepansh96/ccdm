@@ -286,6 +286,23 @@ async function status(json = false) {
   for (const violation of result.scope_violations) {
     console.log(`  ${violation.at} project=${violation.project} op=${violation.op} target=${violation.target}`);
   }
+  if (result.agent_messages) {
+    const { ledger, open_requests: openRequests, recent_refusals: recentRefusals } = result.agent_messages;
+    console.log(ledger.ok ? "agent messages: ledger ok"
+      : `agent messages: ledger unavailable${ledger.error ? ` (${ledger.error})` : ""}`);
+    console.log(`open agent requests: ${openRequests.length}`);
+    for (const req of openRequests) {
+      console.log(`  ${req.request_id} from=${formatAgentConversation(req.from)} to=${formatAgentConversation(req.to)} opened_at=${req.opened_at} expires_at=${req.expires_at} depth=${req.depth}`);
+    }
+    console.log(`recent agent refusals: ${recentRefusals.length}`);
+    for (const refusal of recentRefusals) {
+      console.log(`  ${refusal.at} from=${formatAgentConversation(refusal.from)} target=${refusal.target} code=${refusal.code}`);
+    }
+  }
+}
+
+function formatAgentConversation(conversation) {
+  return conversation.thread_id ? `${conversation.project}/${conversation.thread_id}` : conversation.project;
 }
 
 // Thread Conversations are enabled once the supervisor is installed, configured, or connected.

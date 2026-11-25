@@ -16,7 +16,8 @@
 //   CCDM_THREAD_ID            set by start-thread-session.sh: this session serves that thread
 //   CCDM_THREAD_PROVIDER      the thread's provider (`claude`)
 //   CCDM_THREAD_BOOTSTRAP_FILE  the Thread Supervisor's bootstrap for this launch
-//   CCDM_THREAD_ACTIVITY_FILE   this launch's activity.json: turn_running on each notification, paused, turn_replied
+//   CCDM_ACTIVITY_FILE          a channel launch's activity.json: turn_running, paused, turn_replied
+//   CCDM_THREAD_ACTIVITY_FILE   a thread launch's activity.json: turn_running on each notification, paused, turn_replied
 //
 // In thread mode the server says hello as the `thread` role, so its Session
 // Scope is the thread alone. It holds live events until the supervisor's
@@ -53,7 +54,7 @@
 // live process only: it is written after the Router hello and removed when
 // this process exits or its Router session ends.
 const { execFile } = require("node:child_process");
-const { readFileSync, rmSync } = require("node:fs");
+const { readFileSync, rmSync, watch } = require("node:fs");
 const { readFile, rm, stat, writeFile } = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
@@ -68,7 +69,18 @@ const { scheduleProjectRestart } = require("./lib/restart-helper.js");
 const sessionHost = require("./lib/session-host.js");
 const reminder = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
-const { markPaused, markReplied, markTurn } = require("./thread-activity.js");
+const {
+  AGENT_MESSAGE_TOOLS,
+  AGENT_MESSAGE_TRUST_NOTE,
+  agentMessageLabel,
+  createAgentDeliveryHandler,
+  formatAgentReplyResult,
+  formatAgentRequestResult,
+  formatAgentTargets,
+  isExpiredAgentRequest,
+  requestAgentIdempotent,
+} = require("./agent-messages-session.js");
+const { clearAgentStarted, markPaused, markReplied, markTurn, resetActivity } = require("./thread-activity.js");
 const { createEmergencyGateway } = require("./router/emergency.js");
 const modelInfo = require("./model-info.js");
 
@@ -90,12 +102,23 @@ const ROOT_INSTRUCTIONS = [
   "",
   "You are the CCDM root agent. Messages arrive from root channels and from bot mentions in registered project channels. fetch_messages, read_last_x_messages_in_channel, and export_message_range read any root or registered project channel; reply, react, and edit_message act there as the root bot.",
 ].join("\n");
+const AGENT_MESSAGE_INSTRUCTIONS = [
+  'Agent Messages arrive as <channel source="ccdm" sender="agent" agent_message="request|reply|notice" request_id="..." from_project="..." from_conversation="..." user="..." ts="..."> (with message_id when a record post exists).',
+  "Use list_agent_targets to see granted projects and live conversations, send_agent_request(target, text, timeout_minutes?) to send an Agent Request, and send_agent_reply(request_id, text) to answer one open Agent Request addressed to this conversation.",
+  AGENT_MESSAGE_TRUST_NOTE,
+].join(" ");
 
 const ROOT = process.env.CCDM_ROUTER_ROLE === "root";
 const THREAD_ID = ROOT ? "" : process.env.CCDM_THREAD_ID || "";
 const THREAD = Boolean(THREAD_ID);
+const ACTIVITY_FILE = ROOT ? "" : (process.env.CCDM_ACTIVITY_FILE || process.env.CCDM_THREAD_ACTIVITY_FILE || "");
 // A new launch starts unpaused, whatever the last one left in activity.json.
-if (THREAD) markPaused(process.env.CCDM_THREAD_ACTIVITY_FILE, false);
+// A channel launch also starts with no turn running; a thread launch leaves
+// turn_running unset until its bootstrap finishes so eviction treats it as busy.
+if (THREAD) {
+  markPaused(ACTIVITY_FILE, false);
+  clearAgentStarted(ACTIVITY_FILE);
+} else if (ACTIVITY_FILE) resetActivity(ACTIVITY_FILE);
 // Mirrors COMMANDS and THREAD_COMMANDS in scripts/router/inbound.js.
 const RELAYED_COMMANDS = THREAD ? "/pause, /unpause and /compact" : "/pause, /unpause, /compact, /clear and /restart";
 // Claude's working directory is the project, so Windows names the checkout in full.
@@ -121,6 +144,33 @@ const STARTED_AT = CAPABILITY ? processStartTime(process.pid) : null;
 const interactions = new Map();
 // The last delivered input-needed reply, until the owner answers it.
 let inputNeededMarker = null;
+// A turn started by delivering an Agent Message records no Conversation
+// Reminder reply receipts until owner input joins it or the turn ends.
+let agentStartedTurn = false;
+let agentTurnBaselineEndAt = null;
+
+function readActivityRecord() {
+  if (!ACTIVITY_FILE) return null;
+  try {
+    const record = JSON.parse(readFileSync(ACTIVITY_FILE, "utf8"));
+    return record && typeof record === "object" ? record : null;
+  } catch (error) {
+    return error?.code === "ENOENT" ? {} : null;
+  }
+}
+
+function isAgentStartedTurn() {
+  if (!agentStartedTurn) return false;
+  if (!ACTIVITY_FILE) return true;
+  const record = readActivityRecord();
+  if (!record) return true;
+  if (record.turn_running === false || (record.last_turn_end_at ?? null) !== agentTurnBaselineEndAt) {
+    agentStartedTurn = false;
+    agentTurnBaselineEndAt = null;
+    return false;
+  }
+  return true;
+}
 
 function removeCapabilityMarker() {
   try {
@@ -215,8 +265,9 @@ async function recordOwnerMessage(event, answeredAs = event.message_id) {
 
 // A delivered reply that names an owner interaction in this channel is a
 // Conversation Reminder receipt; the last part of an input-needed reply arms
-// the question.
-async function recordDeliveredReply(input, result) {
+// the question. Replies during an agent-started turn record no receipt.
+async function recordDeliveredReply(input, result, { agentTurn = isAgentStartedTurn() } = {}) {
+  if (agentTurn) return;
   const context = interactions.get(input.conversation_interaction_id);
   if (!context || input.chat_id !== (context.conversation_id || context.channel_id)) return;
   const ids = result.message_ids?.length ? result.message_ids : [result.message_id];
@@ -398,6 +449,44 @@ if (!ROOT && !THREAD) {
   };
 }
 
+if (!ROOT) {
+  TOOLS.send_agent_request = {
+    description: AGENT_MESSAGE_TOOLS.send_agent_request.description,
+    properties: AGENT_MESSAGE_TOOLS.send_agent_request.properties,
+    required: AGENT_MESSAGE_TOOLS.send_agent_request.required,
+    run: async (router, input) => {
+      const result = await requestAgentIdempotent(() => router, "agent_request", {
+        target: input.target,
+        text: input.text,
+        ...(input.timeout_minutes !== undefined ? { timeout_minutes: input.timeout_minutes } : {}),
+        context_pct: contextPct(),
+      });
+      return formatAgentRequestResult(result);
+    },
+  };
+  TOOLS.send_agent_reply = {
+    description: AGENT_MESSAGE_TOOLS.send_agent_reply.description,
+    properties: AGENT_MESSAGE_TOOLS.send_agent_reply.properties,
+    required: AGENT_MESSAGE_TOOLS.send_agent_reply.required,
+    run: async (router, input) => {
+      const result = await requestAgentIdempotent(() => router, "agent_reply", {
+        request_id: input.request_id,
+        text: input.text,
+        context_pct: contextPct(),
+      });
+      return formatAgentReplyResult(result);
+    },
+  };
+  TOOLS.list_agent_targets = {
+    description: AGENT_MESSAGE_TOOLS.list_agent_targets.description,
+    properties: AGENT_MESSAGE_TOOLS.list_agent_targets.properties,
+    required: AGENT_MESSAGE_TOOLS.list_agent_targets.required,
+    op: "agent_targets",
+    args: () => ({}),
+    format: formatAgentTargets,
+  };
+}
+
 // Root reads any of its channels, so its read tools take the channel; reply
 // correlation is a project Conversation Reminder concern.
 if (ROOT) {
@@ -437,6 +526,25 @@ function senderMeta(author) {
 }
 
 function notification(kind, event) {
+  if (kind === "agent_message") {
+    const party = event.from || event.target;
+    const chatId = event.post?.channel_id || (THREAD ? THREAD_ID : scope.channel_id);
+    const content = event.text || (event.kind === "notice" && event.outcome ? `Agent Request ${event.request_id} ${event.outcome}` : "");
+    return {
+      content,
+      meta: {
+        ...(chatId ? { chat_id: chatId } : {}),
+        sender: "agent",
+        agent_message: event.kind,
+        request_id: event.request_id,
+        ...(party?.project ? { from_project: party.project } : {}),
+        ...(party ? { from_conversation: party.thread_id || "channel" } : {}),
+        user: agentMessageLabel(party),
+        ts: event.ts,
+        ...(event.post?.message_id ? { message_id: event.post.message_id } : {}),
+      },
+    };
+  }
   if (kind === "message") {
     return {
       content: event.content || (event.attachments?.length ? "(attachment)" : ""),
@@ -563,6 +671,7 @@ function main() {
   }) : null;
   const router = new RouterClient({ project, key, role: ROOT ? "root" : THREAD ? "thread" : "project",
     ...(THREAD ? { threadId: THREAD_ID, provider: process.env.CCDM_THREAD_PROVIDER || "claude" } : {}),
+    ...(!ROOT ? { capabilities: ["agent_messages"] } : {}),
     ...(fallback ? { beforeHello: () => fallback.release() } : {}) });
   fallback?.watch(router);
   const request = fallback ? fallback.request(router) : (op, args) => router.request(op, args);
@@ -579,8 +688,21 @@ function main() {
   let initialized = false;
   const queued = [];
   // Each delivered notification starts a Claude turn; the Stop and StopFailure hooks end it.
+  // Agent Messages flag an agent-started turn in activity.json; owner (or thread driver)
+  // input joining the turn clears the flag so that turn's end settles normally.
   const deliverNotification = params => {
-    if (THREAD) markTurn(process.env.CCDM_THREAD_ACTIVITY_FILE, true);
+    const sender = params?.meta?.sender;
+    const isAgent = sender === "agent";
+    const isOwner = sender === "owner";
+    const isGuestMessage = sender === "guest" && !params?.meta?.reaction;
+    if (isOwner) {
+      agentStartedTurn = false;
+      agentTurnBaselineEndAt = null;
+    }
+    if (ACTIVITY_FILE) {
+      const agentStarted = isAgent ? true : (isOwner || isGuestMessage || !sender) ? false : undefined;
+      markTurn(ACTIVITY_FILE, true, "completed", agentStarted === undefined ? {} : { agentStarted });
+    }
     send({ method: "notifications/claude/channel", params });
   };
   const channelNotify = params => {
@@ -597,6 +719,75 @@ function main() {
   const pausedEvents = [];
   // A thread session holds live events until its bootstrap is delivered.
   let held = THREAD ? [] : null;
+  // Agent Messages never steer a running turn: they wait in FIFO order for
+  // initialization, thread bootstrap, /unpause, and an idle turn-activity record,
+  // delivering one per turn end and dropping requests that expire while held.
+  const pendingAgentMessages = [];
+  let idleWatcher = null;
+  let idleTimer = null;
+  const isTurnRunning = () => {
+    if (!ACTIVITY_FILE) return false;
+    const record = readActivityRecord();
+    return record === null ? true : record.turn_running === true;
+  };
+  const pruneExpiredAgentRequests = () => {
+    const now = Date.now();
+    for (let i = pendingAgentMessages.length - 1; i >= 0; i -= 1) {
+      if (isExpiredAgentRequest(pendingAgentMessages[i], now)) pendingAgentMessages.splice(i, 1);
+    }
+  };
+  const stopIdleWatch = () => {
+    if (idleWatcher) {
+      try { idleWatcher.close(); } catch { /* Already closed. */ }
+      idleWatcher = null;
+    }
+    if (idleTimer) {
+      clearInterval(idleTimer);
+      idleTimer = null;
+    }
+  };
+  const ensureIdleWatch = () => {
+    if (idleTimer) return;
+    if (ACTIVITY_FILE) {
+      try {
+        idleWatcher = watch(path.dirname(ACTIVITY_FILE), () => tryDeliverAgentMessage());
+        idleWatcher.on("error", () => {
+          if (idleWatcher) {
+            try { idleWatcher.close(); } catch { /* Ignore. */ }
+            idleWatcher = null;
+          }
+        });
+      } catch {
+        idleWatcher = null;
+      }
+    }
+    idleTimer = setInterval(() => tryDeliverAgentMessage(), 50);
+  };
+  const tryDeliverAgentMessage = () => {
+    for (;;) {
+      pruneExpiredAgentRequests();
+      if (pendingAgentMessages.length === 0 || !initialized || held || paused) {
+        stopIdleWatch();
+        return;
+      }
+      if (isTurnRunning()) {
+        ensureIdleWatch();
+        return;
+      }
+      const next = pendingAgentMessages.shift();
+      agentTurnBaselineEndAt = readActivityRecord()?.last_turn_end_at ?? null;
+      agentStartedTurn = true;
+      deliverNotification(notification("agent_message", next));
+      if (pendingAgentMessages.length === 0) {
+        stopIdleWatch();
+        return;
+      }
+      if (ACTIVITY_FILE) {
+        ensureIdleWatch();
+        return;
+      }
+    }
+  };
   const deliver = kind => event => {
     if (held) held.push([kind, event]);
     else if (paused) pausedEvents.push([kind, event]);
@@ -623,6 +814,7 @@ function main() {
       const pending = held.filter(([kind, event]) => !(kind === "message" && included.has(event.message_id)));
       held = null;
       for (const [kind, event] of pending) deliver(kind)(event);
+      tryDeliverAgentMessage();
     });
   }
   router.on("message", event => {
@@ -633,6 +825,15 @@ function main() {
     deliver("message")(event);
   });
   router.on("reaction", deliver("reaction"));
+  router.on("agent_message", createAgentDeliveryHandler({
+    shouldIgnore: () => ROOT,
+    ack: deliveryId => router.request("agent_message_ack", { delivery_id: deliveryId }),
+    deliver: event => {
+      pendingAgentMessages.push(event);
+      tryDeliverAgentMessage();
+    },
+    onError: message => process.stderr.write(`ccdm channel: ${message}\n`),
+  }));
 
   // Commands run one at a time, in arrival order, and acknowledge like the
   // Codex bridge: a reaction on the command, then a short reply.
@@ -641,14 +842,16 @@ function main() {
   const COMMANDS = {
     pause: async event => {
       paused = true;
-      if (THREAD) markPaused(process.env.CCDM_THREAD_ACTIVITY_FILE, true);
+      stopIdleWatch();
+      if (ACTIVITY_FILE) markPaused(ACTIVITY_FILE, true);
       await react(event, "⏸️");
       await say(event, "Session paused. New messages will be queued.");
     },
     unpause: async event => {
       paused = false;
-      if (THREAD) markPaused(process.env.CCDM_THREAD_ACTIVITY_FILE, false);
+      if (ACTIVITY_FILE) markPaused(ACTIVITY_FILE, false);
       for (const [kind, queuedEvent] of pausedEvents.splice(0)) notify(kind, queuedEvent);
+      tryDeliverAgentMessage();
       await react(event, "▶️");
       await say(event, "Session unpaused.");
     },
@@ -731,13 +934,14 @@ function main() {
       if (tool.run) {
         text = await tool.run(router, input);
       } else {
+        const agentTurn = isAgentStartedTurn();
         const result = await request(tool.op, tool.args(input));
-        // The thread's turn has replied, recorded in its activity file.
-        if (THREAD && tool.op === "reply") markReplied(process.env.CCDM_THREAD_ACTIVITY_FILE);
+        // Record that the turn has replied in this launch's activity file.
+        if (ACTIVITY_FILE && tool.op === "reply") markReplied(ACTIVITY_FILE);
         // Record the receipt before Claude sees the result, so the Stop hook
         // that follows the turn finds it.
         await reminderEvents;
-        await tool.delivered?.(input, result).catch(error => {
+        await tool.delivered?.(input, result, { agentTurn }).catch(error => {
           process.stderr.write(`ccdm channel: receipt recording failed: ${error.message}\n`);
         });
         text = tool.format(result);
@@ -763,12 +967,13 @@ function main() {
         protocolVersion: PROTOCOL_VERSION,
         capabilities: { tools: {}, experimental: { "claude/channel": {} } },
         serverInfo: { name: "ccdm", version: "1.0.0" },
-        instructions: ROOT ? ROOT_INSTRUCTIONS : `${INSTRUCTIONS}\n\n${RELAY_INSTRUCTIONS}`,
+        instructions: ROOT ? ROOT_INSTRUCTIONS : `${INSTRUCTIONS}\n\n${AGENT_MESSAGE_INSTRUCTIONS}\n\n${RELAY_INSTRUCTIONS}`,
       } });
     }
     if (method === "notifications/initialized") {
       initialized = true;
       for (const params of queued.splice(0)) deliverNotification(params);
+      tryDeliverAgentMessage();
       return;
     }
     if (method === "tools/list") {
@@ -783,6 +988,7 @@ function main() {
   });
   // Claude closes stdin when the session ends: leave the Router with it.
   lines.on("close", () => {
+    stopIdleWatch();
     router.close();
     process.exit(0);
   });

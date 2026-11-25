@@ -17,14 +17,14 @@ edges:
     condition: when granting, syncing, listing, or revoking guest access
   - target: patterns/debug-discord-session.md
     condition: when a session cannot read or reply in its channel
-last_updated: 2026-11-18
+last_updated: 2026-11-25
 ---
 
 # Discord Security
 
 ## Session Scope
 
-The Router enforces isolation in software. Every operation names a `channel_id`: a project session's must equal its registered channel, and every `message_id` target is fetched and must belong to that channel. Anything else is rejected with `scope_violation` and logged with project, operation, and target, and `router status` lists recent violations. Root may target root channels and any registered channel; the reminder observer is read-only (`forbidden` on any operation). A new launch key revokes the session holding the old one, so one session serves one project channel.
+The Router enforces isolation in software. Every operation names a `channel_id`: a project session's must equal its registered channel, and every `message_id` target is fetched and must belong to that channel. Anything else is rejected with `scope_violation` and logged with project, operation, and target, and `router status` lists recent violations. Agent Message operations (`agent_request`, `agent_reply`, `agent_targets`, `agent_message_ack`) take no `channel_id`, act only for the authenticated `project`/`thread` conversation (`forbidden` to root, observer, supervisor, and status), require a one-way `agent_message_targets` grant for requests (never for `root` or `remote:` projects), never expand Session Scope (neither side can read, react, edit, or fetch in the other's conversation), protect visible `-# ⇄ Agent ` records from forging or editing via `reply`/`edit_message`, and record only SHA-256 launch-key fingerprints (never keys or tokens) in the Router's private `agent-messages.jsonl` ledger. Root may target root channels and any registered channel; the reminder observer is read-only (`forbidden` on any operation). A new launch key revokes the session holding the old one, so one session serves one project channel.
 
 Project replies post through the project's own webhook, and a project may edit only its own webhook messages; reactions and typing show as the root bot. Provenance is `webhook_id` only, never an application ID or display name.
 

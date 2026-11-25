@@ -1,15 +1,18 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import test from "node:test";
 
 import { injectDiscordMessage, startFakeCodexServer } from "./support/bridge.js";
 import { PYTHON } from "./support/platform.js";
-import { OWNER_ID, createRouterWorkspace, routerRegistry, routerWithWebhooks, waitFor } from "./support/router.js";
+import { OWNER_ID, createRouterWorkspace, routerRegistry, routerWithWebhooks, waitFor,
+  writeProjectKey } from "./support/router.js";
 import { readState, updateState } from "./support/state.js";
-import { cleanup } from "./support/teardown.js";
-import { assertSupervisorStops, startThreadSupervisor, supervisorStateDir, supervisorStatus } from "./support/thread-supervisor.js";
+import { cleanup, registerTeardownCallback } from "./support/teardown.js";
+import { assertSupervisorStops, startThreadSupervisor, supervisorStateDir, supervisorStatus,
+  waitForThreadIdle } from "./support/thread-supervisor.js";
 
 test.afterEach(cleanup);
 
@@ -380,4 +383,278 @@ test("two threads whose ids share their last six digits each run in their own tm
     assert.equal((await threadRow(workspace, thread)).state, "live");
     assert.deepEqual(notices(workspace, thread), []);
   }
+});
+
+// ---- Agent Messages & thread idle eviction (#406) --------------------------
+
+function agentCapacityWorkspace(extra = {}) {
+  const workspace = createRouterWorkspace({ ...routerRegistry({
+    demo: { channel_id: "demo-channel", type: "claude", transport: "router", screen_name: "demo_claude",
+      agent_message_targets: ["beta"] },
+    beta: { channel_id: "beta-channel", type: "codex", transport: "router", agent_message_targets: ["demo"] },
+  }), root_channels: ["root-channel"], ...extra });
+  const registryFile = path.join(workspace.repoDir, "registry.json");
+  const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+  registry.projects.demo.path = workspace.tmpDir;
+  registry.projects.beta.path = workspace.tmpDir;
+  fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
+  fs.mkdirSync(path.join(workspace.homeDir, ".codex"), { recursive: true });
+  return workspace;
+}
+
+async function supervisedAgentCapacity(workspace, env = {}) {
+  await routerWithWebhooks(workspace, ["demo", "beta"]);
+  updateState(workspace.stateDir, state => {
+    state.fixtures.claude.replyText = "on it";
+  });
+  return startThreadSupervisor(workspace, { env: { ...NO_IDLE_WAIT, ...env } });
+}
+
+async function connectAgentSender(workspace, project = "beta") {
+  const key = `${project}-capacity-key`;
+  writeProjectKey(workspace, project, key);
+  const { RouterClient } = createRequire(import.meta.url)(path.join(workspace.repoDir, "scripts/router/client.js"));
+  const client = new RouterClient({
+    socketPath: workspace.socketPath, project, key, role: "project", capabilities: ["agent_messages"],
+  });
+  await client.connect();
+  registerTeardownCallback(() => client.close());
+  return client;
+}
+
+function fakeAgyBin(workspace) {
+  const fake = path.join(workspace.repoDir, "tests/e2e/support/fake-agy.cjs");
+  if (process.platform === "win32") return fake;
+  const bin = path.join(workspace.tmpRoot, "agy-bin", "agy");
+  fs.mkdirSync(path.dirname(bin), { recursive: true });
+  fs.writeFileSync(bin, `#!/bin/sh\nexec /bin/bash -p -c 'exec -a agy "$0" "$@"' '${process.execPath}' '${fake}' "$@"\n`);
+  fs.chmodSync(bin, 0o755);
+  return bin;
+}
+
+const agyPlan = (workspace, plan) =>
+  fs.writeFileSync(path.join(workspace.stateDir, "agy-plan.json"), `${JSON.stringify(plan)}\n`);
+
+function agyPromptCount(workspace) {
+  const file = path.join(workspace.stateDir, "agy.ndjson");
+  if (!fs.existsSync(file)) return 0;
+  return fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean)
+    .map(line => JSON.parse(line))
+    .filter(event => event.event === "client" && event.message?.method === "session/prompt").length;
+}
+
+function requestProviderThread(workspace, thread, provider) {
+  execFileSync(PYTHON, ["-c", `import sqlite3, sys
+db = sqlite3.connect(sys.argv[1], timeout=5)
+db.execute("""INSERT INTO creation_requests (request_id, project, name, provider, account, model, effort,
+  first_message, requester_id, requester_kind, status, thread_id, created_at)
+  VALUES (?, 'demo', ?, ?, NULL, NULL, NULL, NULL, ?, 'owner', 'pending', NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))""",
+  (sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]))
+db.commit()`, path.join(supervisorStateDir(workspace), "threads.sqlite3"), `request-${thread.id}`, thread.name,
+  provider, OWNER_ID]);
+  threadEvent(workspace, thread, "create", { ownerId: BOT_USER_ID });
+}
+
+test("Claude thread: an Agent Message does not reset the idle clock, and a running agent-started turn is never evicted", async () => {
+  const workspace = agentCapacityWorkspace(capsRegistry({ claude: 2 }));
+  await supervisedAgentCapacity(workspace, { CCDM_THREAD_IDLE_S: "2" });
+
+  await idleClaudeThread(workspace, THREADS.a);
+  const aOwnerAt = Date.now();
+  await idleClaudeThread(workspace, THREADS.b);
+
+  // Wait past the 2 s idle threshold from A's last owner message.
+  const waitMs = Math.max(0, aOwnerAt + 2200 - Date.now());
+  if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs));
+
+  const beta = await connectAgentSender(workspace, "beta");
+  holdTurns(workspace, THREADS.a, THREADS.b);
+  await beta.request("agent_request", {
+    target: `demo/${THREADS.a.id}`, text: "check A", idempotency_key: "cap-claude-a",
+  });
+  await beta.request("agent_request", {
+    target: `demo/${THREADS.b.id}`, text: "check B", idempotency_key: "cap-claude-b",
+  });
+  await waitFor(
+    () => [THREADS.a.id, THREADS.b.id].every(id =>
+      (claude(workspace).channelNotifications ?? []).some(n => n.meta?.chat_id === id && n.meta?.sender === "agent")),
+    () => "Claude agent-started turns running in A and B",
+    15000,
+  );
+
+  // While A and B are running agent-started turns, C cannot evict either and queues.
+  threadEvent(workspace, THREADS.c, "create");
+  await threadRow(workspace, THREADS.c);
+  message(workspace, THREADS.c, "c-agent-1", "start C");
+  await threadRow(workspace, THREADS.c, row => row.state === "queued");
+  await waitFor(() => notices(workspace, THREADS.c).length === 1, () => "C queued notice");
+  assert.deepEqual(notices(workspace, THREADS.c), ["Queued, 2 sessions busy."]);
+  assert.equal((await threadRow(workspace, THREADS.a)).state, "live");
+  assert.equal((await threadRow(workspace, THREADS.b)).state, "live");
+
+  // Release both agent-started turns; A's idle clock was NOT reset by the Agent Message,
+  // so triggering a drain immediately evicts A (oldest owner message) for C, leaving B live.
+  holdTurns(workspace);
+  await waitForThreadIdle(workspace, "demo", THREADS.a.id);
+  await waitForThreadIdle(workspace, "demo", THREADS.b.id);
+  const agentDoneAt = Date.now();
+  threadEvent(workspace, THREADS.d, "create");
+  const a = await threadRow(workspace, THREADS.a, row => row.state === "stopped");
+  assert.ok(Date.now() - agentDoneAt < 2000, "A was evicted immediately without waiting a fresh 2 s idle window");
+  await threadRow(workspace, THREADS.c, row => row.state === "live");
+  assert.deepEqual([a.state, a.stop_reason], ["stopped", "evicted"]);
+  assert.deepEqual(notices(workspace, THREADS.a).filter(text => !text.startsWith("-# ⇄ Agent ")), [PAUSED]);
+  assert.equal((await threadRow(workspace, THREADS.b)).state, "live");
+});
+
+test("Codex thread: an Agent Message does not reset the idle clock, and a running agent-started turn is never evicted", async () => {
+  const workspace = agentCapacityWorkspace(capsRegistry({ codex: 2 }));
+  await supervisedAgentCapacity(workspace, { CCDM_THREAD_IDLE_S: "2", CCDM_THREAD_WS_PORT_BASE: "29710" });
+  const z = { id: "1700000000000100007", name: "Codex Z" };
+
+  const codexX = await startFakeCodexServer(workspace, {
+    port: 29710, deferListen: true, codexHome: path.join(workspace.homeDir, ".codex"),
+    channelId: THREADS.x.id, threadId: "0199a5c4-7e1b-7c3d-9f2a-4b8e6d1c3a71",
+    bootstrapPlan: { mcpReplyText: "on it" },
+    turns: [{ turnId: "x-agent", waitForRelease: true, delta: "x checked" }],
+  });
+  const codexY = await startFakeCodexServer(workspace, {
+    port: 29711, deferListen: true, codexHome: path.join(workspace.homeDir, ".codex"),
+    channelId: THREADS.y.id, threadId: "0199a5c4-7e1b-7c3d-9f2a-4b8e6d1c3a72",
+    bootstrapPlan: { mcpReplyText: "on it" },
+    turns: [{ turnId: "y-agent", waitForRelease: true, delta: "y checked" }],
+  });
+  const codexZ = await startFakeCodexServer(workspace, {
+    port: 29712, deferListen: true, codexHome: path.join(workspace.homeDir, ".codex"),
+    channelId: z.id, threadId: "0199a5c4-7e1b-7c3d-9f2a-4b8e6d1c3a73",
+    bootstrapPlan: { mcpReplyText: "on it" },
+  });
+
+  requestProviderThread(workspace, THREADS.x, "codex");
+  await threadRow(workspace, THREADS.x, row => row.provider === "codex");
+  message(workspace, THREADS.x, "x-1", "start X");
+  const xOwnerAt = Date.now();
+  await threadRow(workspace, THREADS.x, row => row.ws_port === 29710);
+  await codexX.listen();
+  await threadRow(workspace, THREADS.x, row => row.state === "live");
+  await waitForThreadIdle(workspace, "demo", THREADS.x.id);
+
+  requestProviderThread(workspace, THREADS.y, "codex");
+  await threadRow(workspace, THREADS.y, row => row.provider === "codex");
+  message(workspace, THREADS.y, "y-1", "start Y");
+  await threadRow(workspace, THREADS.y, row => row.ws_port === 29711);
+  await codexY.listen();
+  await threadRow(workspace, THREADS.y, row => row.state === "live");
+  await waitForThreadIdle(workspace, "demo", THREADS.y.id);
+
+  const waitMs = Math.max(0, xOwnerAt + 2200 - Date.now());
+  if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs));
+
+  const beta = await connectAgentSender(workspace, "beta");
+  await beta.request("agent_request", {
+    target: `demo/${THREADS.x.id}`, text: "check X", idempotency_key: "cap-codex-x",
+  });
+  await beta.request("agent_request", {
+    target: `demo/${THREADS.y.id}`, text: "check Y", idempotency_key: "cap-codex-y",
+  });
+  await waitFor(() => codexX.pendingReleases().includes("x-agent"), () => "Codex X agent turn held", 15000);
+  await waitFor(() => codexY.pendingReleases().includes("y-agent"), () => "Codex Y agent turn held", 15000);
+
+  // While X and Y run agent-started turns, Z queues and neither is evicted.
+  requestProviderThread(workspace, z, "codex");
+  await threadRow(workspace, z, row => row.provider === "codex");
+  message(workspace, z, "z-1", "start Z");
+  await threadRow(workspace, z, row => row.state === "queued");
+  await waitFor(() => notices(workspace, z).length === 1, () => "Z queued notice");
+  assert.deepEqual(notices(workspace, z), ["Queued, 2 sessions busy."]);
+  assert.equal((await threadRow(workspace, THREADS.x)).state, "live");
+  assert.equal((await threadRow(workspace, THREADS.y)).state, "live");
+
+  // Finish both agent-started turns; X's idle clock was untouched so drain evicts X immediately.
+  codexX.releaseTurn("x-agent");
+  codexY.releaseTurn("y-agent");
+  await waitForThreadIdle(workspace, "demo", THREADS.x.id);
+  await waitForThreadIdle(workspace, "demo", THREADS.y.id);
+  const agentDoneAt = Date.now();
+  threadEvent(workspace, THREADS.d, "create");
+  const x = await threadRow(workspace, THREADS.x, row => row.state === "stopped");
+  assert.ok(Date.now() - agentDoneAt < 2000, "X was evicted immediately without waiting a fresh 2 s idle window");
+  await threadRow(workspace, z, row => row.ws_port === 29712);
+  await codexZ.listen();
+  await threadRow(workspace, z, row => row.state === "live");
+  assert.deepEqual([x.state, x.stop_reason], ["stopped", "evicted"]);
+  assert.deepEqual(notices(workspace, THREADS.x).filter(text => !text.startsWith("-# ⇄ Agent ")), [PAUSED]);
+  assert.equal((await threadRow(workspace, THREADS.y)).state, "live");
+});
+
+test("Gemini thread: an Agent Message does not reset the idle clock, and a running agent-started turn is never evicted", async () => {
+  const workspace = agentCapacityWorkspace(capsRegistry({ gemini: 2 }));
+  const g1 = { id: "1700000000000100011", name: "Gemini 1" };
+  const g2 = { id: "1700000000000100012", name: "Gemini 2" };
+  const g3 = { id: "1700000000000100013", name: "Gemini 3" };
+  const gateG1 = path.join(workspace.tmpDir, "gate-g1");
+  const gateG2 = path.join(workspace.tmpDir, "gate-g2");
+  agyPlan(workspace, {
+    turns: [
+      { reply: "g1 boot" },
+      { reply: "g2 boot" },
+      { holdUntilFile: gateG1, text: "g1 agent" },
+      { holdUntilFile: gateG2, text: "g2 agent" },
+      { reply: "g3 boot" },
+    ],
+  });
+  await supervisedAgentCapacity(workspace, { CCDM_THREAD_IDLE_S: "2", CCDM_AGY_BIN: fakeAgyBin(workspace) });
+
+  requestProviderThread(workspace, g1, "gemini");
+  await threadRow(workspace, g1, row => row.provider === "gemini");
+  message(workspace, g1, "g1-1", "start G1");
+  const g1OwnerAt = Date.now();
+  await threadRow(workspace, g1, row => row.state === "live");
+  await waitFor(() => replies(workspace, g1).length === 1, () => "G1 bootstrap reply", 20000);
+  await waitForThreadIdle(workspace, "demo", g1.id);
+
+  requestProviderThread(workspace, g2, "gemini");
+  await threadRow(workspace, g2, row => row.provider === "gemini");
+  message(workspace, g2, "g2-1", "start G2");
+  await threadRow(workspace, g2, row => row.state === "live");
+  await waitFor(() => replies(workspace, g2).length === 1, () => "G2 bootstrap reply", 20000);
+  await waitForThreadIdle(workspace, "demo", g2.id);
+
+  const waitMs = Math.max(0, g1OwnerAt + 2200 - Date.now());
+  if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs));
+
+  const beta = await connectAgentSender(workspace, "beta");
+  await beta.request("agent_request", {
+    target: `demo/${g1.id}`, text: "check G1", idempotency_key: "cap-gemini-g1",
+  });
+  await waitFor(() => agyPromptCount(workspace) >= 3, () => "G1 agent prompt running", 15000);
+  await beta.request("agent_request", {
+    target: `demo/${g2.id}`, text: "check G2", idempotency_key: "cap-gemini-g2",
+  });
+  await waitFor(() => agyPromptCount(workspace) >= 4, () => "G2 agent prompt running", 15000);
+
+  // While G1 and G2 run agent-started turns, G3 queues and neither is evicted.
+  requestProviderThread(workspace, g3, "gemini");
+  await threadRow(workspace, g3, row => row.provider === "gemini");
+  message(workspace, g3, "g3-1", "start G3");
+  await threadRow(workspace, g3, row => row.state === "queued");
+  await waitFor(() => notices(workspace, g3).length === 1, () => "G3 queued notice");
+  assert.deepEqual(notices(workspace, g3), ["Queued, 2 sessions busy."]);
+  assert.equal((await threadRow(workspace, g1)).state, "live");
+  assert.equal((await threadRow(workspace, g2)).state, "live");
+
+  // Release both agent-started turns; G1's idle clock was untouched so drain evicts G1 immediately.
+  fs.writeFileSync(gateG1, "go");
+  fs.writeFileSync(gateG2, "go");
+  await waitForThreadIdle(workspace, "demo", g1.id);
+  await waitForThreadIdle(workspace, "demo", g2.id);
+  const agentDoneAt = Date.now();
+  threadEvent(workspace, THREADS.d, "create");
+  const evictedG1 = await threadRow(workspace, g1, row => row.state === "stopped");
+  assert.ok(Date.now() - agentDoneAt < 2000, "G1 was evicted immediately without waiting a fresh 2 s idle window");
+  await threadRow(workspace, g3, row => row.state === "live");
+  await waitFor(() => replies(workspace, g3).length === 1, () => "G3 bootstrap reply", 20000);
+  assert.deepEqual([evictedG1.state, evictedG1.stop_reason], ["stopped", "evicted"]);
+  assert.deepEqual(notices(workspace, g1).filter(text => !text.startsWith("-# ⇄ Agent ")), [PAUSED]);
+  assert.equal((await threadRow(workspace, g2)).state, "live");
 });

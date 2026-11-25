@@ -66,6 +66,8 @@ The Router delivers a project channel's messages to that project's session only.
 
 The channel server forwards reactions to Claude without recording them. Management commands (`/pause`, `/unpause`, `/compact`, `/clear`, `/restart`) arrive as Router commands, not messages, and the server records nothing for them. The reminder service's observer records owner reactions and management commands itself, through the Router.
 
+Agent Messages (`request`, `reply`, and `notice`) arrive as channel notifications with `sender="agent"`. They never record an owner interaction, never emit `owner_activity`, and never emit `work_resumed`. The Router never sends `agent_message` events to the reminder observer.
+
 ### `/close`
 
 The Router drops an exact trimmed `/close` in a project channel before any session sees it. This applies to the owner and to guests, so Claude never receives it. The reminder service's observer sees the message through the Router and emits `close_requested` for the registered owner only. As with the Codex adapter, `close_requested` is a command event, not a completed closure or acknowledgment.
@@ -78,15 +80,26 @@ The `reply` tool schema requires `chat_id`, `text`, and `conversation_interactio
 
 A reply qualifies only when all of these hold:
 
+- the turn is not an agent-started turn (see below);
 - the Router confirms delivery and returns Discord message IDs;
 - `conversation_interaction_id` names an owner message this session received;
 - `chat_id` is that conversation's channel.
 
 Each delivered message ID then emits `response_delivered` and leaves a private receipt marker in `claude-receipts/`. A reply split into several messages emits one receipt per part. With `input-needed`, only the last part carries that disposition and also emits `input_needed`.
 
+Live reminder arming comes from these confirmed adapter receipts (and the `Stop` hook's `turn_completed`), not from Discord webhook observation. Detecting agent replies by the project's `webhook_id` is used only during history discovery (which classifies `-# ⇄ Agent ` records as `other`).
+
 A reply without a valid interaction ID is still delivered, but it creates no receipt. Failed replies, `edit_message`, `react`, and tool starts create none either. Attachment replies use the same `reply` path.
 
 If the owner sends a new message while an `input-needed` receipt marker still exists, the server emits `work_resumed`. Once a `Stop` or `StopFailure` hook has cleared that marker, later owner input does not claim resumed work.
+
+### Agent-started turns
+
+An agent-started turn is a turn the channel server starts by delivering an Agent Message of any kind (`request`, `reply`, or `notice`). Both channel and thread Claude sessions apply these rules:
+
+- While the turn stays agent-started, `reply` still delivers to Discord, but the adapter records no `response_delivered` or `input_needed` receipt — including when `conversation_interaction_id` names an older owner message — and `Stop` emits no `turn_completed` for it.
+- Owner input that joins the turn as a mid-turn notification makes it an ordinary turn from that message on: later qualifying `reply` calls record receipts and `Stop` emits `turn_completed` as usual. Guest input does not convert an agent-started turn.
+- A reminder already armed in the conversation before the send (including by an earlier reply in the sending turn) is unaffected and continues to recur on schedule. A Closed Conversation that receives an Agent Request stays closed.
 
 ### Hook events
 

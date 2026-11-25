@@ -672,3 +672,159 @@ test("on Windows the /restart helper is a host child outside the old session's J
   const log = await waitForRestartLog(helper.log);
   assert.ok(log.indexOf("stop-session exited 0") < log.indexOf("running start-session"), log);
 });
+
+function activityFile(workspace) {
+  return path.join(workspace.routerStateDir, "launches", "demo", "activity.json");
+}
+
+function readActivity(workspace) {
+  const file = activityFile(workspace);
+  if (!fs.existsSync(file)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function waitForActivity(workspace, predicate, label) {
+  const deadline = Date.now() + 10000;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = readActivity(workspace);
+    if (last && predicate(last)) return last;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.fail(`activity.json never matched ${label}: ${JSON.stringify(last)}`);
+}
+
+test("a Claude channel session's activity record tracks running turns and Stop/StopFailure outcomes", async () => {
+  const workspace = claudeRouterWorkspace();
+  await routerWithWebhooks(workspace, ["demo"]);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.claude.replyText = "working";
+    state.fixtures.claude.holdTurnsIn = ["demo-channel"];
+  });
+  const started = await startSession(workspace);
+  assert.equal(started.exitCode, 0, started.stderr || started.stdout);
+
+  // Fresh launch starts unpaused with no turn running, in a private file.
+  const initial = await waitForActivity(workspace, (record) => record.turn_running === false && record.paused === false, "initial idle");
+  assertPrivate(activityFile(workspace));
+  assert.equal(initial.turn_running, false);
+  assert.equal(initial.paused, false);
+
+  // A delivered channel notification marks the turn running; Stop ends it as completed.
+  ownerMessage(workspace, { id: "turn-1", content: "first task" });
+  const running = await waitForActivity(workspace, (record) => record.turn_running === true && record.turn_replied === true, "running after reply");
+  assert.equal(running.paused, false);
+
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.claude.holdTurnsIn = [];
+  });
+  const completed = await waitForActivity(workspace, (record) => record.turn_running === false && record.last_turn_outcome === "completed", "completed after Stop");
+  assert.equal(typeof completed.last_turn_end_at, "string");
+  assert.equal(completed.turn_replied, true);
+
+  // A failed turn ends with StopFailure and outcome "failed".
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.claude.holdTurnsIn = ["demo-channel"];
+    state.fixtures.claude.failTurnsIn = ["demo-channel"];
+  });
+  ownerMessage(workspace, { id: "turn-2", content: "second task" });
+  await waitForActivity(workspace, (record) => record.turn_running === true, "second turn running");
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.claude.holdTurnsIn = [];
+  });
+  const failed = await waitForActivity(workspace, (record) => record.turn_running === false && record.last_turn_outcome === "failed", "failed after StopFailure");
+  assert.equal(typeof failed.last_turn_end_at, "string");
+  // Nothing extra is posted to Discord beyond the two scripted replies.
+  assert.equal(readState(workspace.stateDir).fixtures.discord.messages.length, 2);
+});
+
+async function runChannelHook(workspace, event, fields = {}) {
+  const before = (readState(workspace.stateDir).fixtures.claude.hookRuns ?? [])
+    .filter((run) => run.event === event).length;
+  updateState(workspace.stateDir, (state) => {
+    (state.fixtures.claude.pendingHooks ||= []).push({ conversationId: "demo-channel", event, fields });
+  });
+  const done = await waitForState(workspace, (next) =>
+    (next.fixtures.claude.hookRuns ?? []).filter((run) => run.event === event).length > before);
+  const matching = done.fixtures.claude.hookRuns.filter((run) => run.event === event);
+  assert.equal(matching.at(-1).exitCode, 0, JSON.stringify(matching));
+}
+
+test("UserPromptSubmit marks a channel turn running except for / prompts, and a subagent Stop marks nothing", async () => {
+  const workspace = claudeRouterWorkspace();
+  await routerWithWebhooks(workspace, ["demo"]);
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.claude.holdTurnsIn = ["demo-channel"];
+  });
+  const started = await startSession(workspace);
+  assert.equal(started.exitCode, 0, started.stderr || started.stdout);
+  await waitForActivity(workspace, (record) => record.turn_running === false, "initial idle");
+
+  // A slash prompt typed into the session marks nothing.
+  await runChannelHook(workspace, "UserPromptSubmit", { prompt: "  /compact" });
+  assert.equal(readActivity(workspace).turn_running, false);
+
+  // An ordinary prompt marks the turn running.
+  await runChannelHook(workspace, "UserPromptSubmit", { prompt: "continue with step two" });
+  await waitForActivity(workspace, (record) => record.turn_running === true, "running after UserPromptSubmit");
+
+  // A subagent's Stop carries agent_id and does not end the session's turn.
+  await runChannelHook(workspace, "Stop", {
+    agent_id: "subagent-1", stop_hook_active: false, background_tasks: [], session_crons: [],
+  });
+  const stillRunning = readActivity(workspace);
+  assert.equal(stillRunning.turn_running, true);
+  assert.equal(stillRunning.last_turn_outcome, undefined);
+
+  // The session's own Stop ends the turn as completed.
+  await runChannelHook(workspace, "Stop", {
+    stop_hook_active: false, background_tasks: [], session_crons: [],
+  });
+  const ended = await waitForActivity(workspace, (record) => record.turn_running === false && record.last_turn_outcome === "completed", "ended after main Stop");
+  assert.equal(typeof ended.last_turn_end_at, "string");
+  assert.deepEqual(readState(workspace.stateDir).fixtures.discord.messages, []);
+});
+
+test("/pause and /unpause toggle paused in activity.json, and a new launch clears stale paused or running state", async () => {
+  const workspace = claudeRouterWorkspace();
+  await routerWithWebhooks(workspace, ["demo"]);
+  // Seed stale state from a previous launch before start-session runs.
+  const staleDir = path.join(workspace.routerStateDir, "launches", "demo");
+  fs.mkdirSync(staleDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(activityFile(workspace), `${JSON.stringify({
+    turn_running: true, paused: true, last_turn_outcome: "failed", last_turn_end_at: "2026-01-01T00:00:00.000Z",
+  })}\n`, { mode: 0o600 });
+
+  const started = await startSession(workspace);
+  assert.equal(started.exitCode, 0, started.stderr || started.stdout);
+
+  const fresh = await waitForActivity(workspace, (record) => record.turn_running === false && record.paused === false, "cleared stale state");
+  assertPrivate(activityFile(workspace));
+  assert.equal(fresh.last_turn_outcome, undefined);
+  assert.equal(fresh.last_turn_end_at, null);
+
+  command(workspace, "cmd-pause", "/pause");
+  await waitForState(workspace, (next) => next.fixtures.discord.messages.length >= 1);
+  const paused = await waitForActivity(workspace, (record) => record.paused === true, "paused");
+  assert.equal(paused.turn_running, false);
+
+  command(workspace, "cmd-unpause", "/unpause");
+  await waitForState(workspace, (next) => next.fixtures.discord.messages.length >= 2);
+  const unpaused = await waitForActivity(workspace, (record) => record.paused === false, "unpaused");
+  assert.equal(unpaused.turn_running, false);
+
+  // Pause again, then stop and relaunch: the new launch starts unpaused with no turn running.
+  command(workspace, "cmd-pause-2", "/pause");
+  await waitForActivity(workspace, (record) => record.paused === true, "paused before stop");
+  const stopped = await runScript(workspace, "scripts/stop-session.sh", { args: ["demo"], env: routerEnv(workspace, await launcherEnv(workspace)) });
+  assert.equal(stopped.exitCode, 0, stopped.stderr || stopped.stdout);
+  const relaunched = await startSession(workspace);
+  assert.equal(relaunched.exitCode, 0, relaunched.stderr || relaunched.stdout);
+  const afterRelaunch = await waitForActivity(workspace, (record) => record.turn_running === false && record.paused === false, "fresh after relaunch");
+  assert.equal(afterRelaunch.turn_running, false);
+  assert.equal(afterRelaunch.paused, false);
+});

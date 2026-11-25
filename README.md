@@ -22,7 +22,7 @@ Router (local daemon, holds the root token)
 ## Contents
 
 - **Setup:** [Prerequisites](#prerequisites) · [Creating the root bot](#creating-the-root-bot) · [Quick Start](#quick-start) · [Manual Setup](#manual-setup) · [Registering a New Project](#registering-a-new-project)
-- **Concepts:** [How It Works](#how-it-works) · [The Router](#the-router) · [Session Scope](#session-scope) · [Project sessions](#project-sessions) · [Thread Conversations](#thread-conversations) · [Accounts and homes](#accounts-and-homes) · [Project Guests](#project-guests) · [Project Conversation state](#project-conversation-state) · [Usage Report](#usage-report)
+- **Concepts:** [How It Works](#how-it-works) · [The Router](#the-router) · [Session Scope](#session-scope) · [Project sessions](#project-sessions) · [Thread Conversations](#thread-conversations) · [Agent Messages](#agent-messages) · [Accounts and homes](#accounts-and-homes) · [Project Guests](#project-guests) · [Project Conversation state](#project-conversation-state) · [Usage Report](#usage-report)
 - **Operations:** [Commands](#commands) · [Resuming a conversation](#resuming-a-conversation) · [Router operations](#router-operations) · [Cutover and retirement](#cutover-and-retirement) · [Scheduled Usage Stats Poster](#scheduled-usage-stats-poster) · [Auto-Start on Reboot](#auto-start-on-reboot-macos) · [Preventing Sleep](#preventing-sleep) · [Running on Windows](#running-on-windows)
 - **Reference:** [Configuration reference](#configuration-reference) · [Security Note](#security-note) · [Troubleshooting](#troubleshooting) · [Limitations](#limitations) · [File Structure](#file-structure) · [Global Skills](#global-skills)
 
@@ -34,6 +34,7 @@ Router (local daemon, holds the root token)
 - **Project Identity.** Each project posts through its own webhook, `ccdm-<project>`, as `<project>-<claude|codex|gemini> · N%`, where `N` is the session's context usage. See [Context Usage in the Project Identity](#context-usage-in-the-project-identity).
 - **Session Scope.** Each session may read and act in one channel only. The Router rejects anything else. See [Session Scope](#session-scope).
 - **Thread Conversations.** A public thread under a project channel is its own separate conversation, started and stopped by the Thread Supervisor. See [Thread Conversations](#thread-conversations).
+- **Agent Messages.** One project's agent can send a bounded request to another project's live session through the Router once you allow that direction, with linked visible records in both Discord conversations and an append-only ledger. See [Agent Messages](#agent-messages).
 
 An `@mention` of the bot in a project channel reaches root only, never the project.
 
@@ -192,7 +193,7 @@ If a project's webhook is deleted in Discord, the Router recreates it once on th
 
 The Router is a Node daemon (`scripts/router.js serve`, modules in `scripts/router/`) with one discord.js gateway connection. It delivers messages to sessions and performs Discord actions on their behalf: replies, edits, reactions, typing, reads, exports and attachment downloads.
 
-Its private state lives in `~/.local/state/ccdm/router/` (0700; `CCDM_ROUTER_STATE_DIR` overrides it): the socket `router.sock` (0600), per-session keys, webhook tokens, launch files, attachment inboxes and logs.
+Its private state lives in `~/.local/state/ccdm/router/` (0700; `CCDM_ROUTER_STATE_DIR` overrides it): the socket `router.sock` (0600), per-session keys, webhook tokens, launch files, attachment inboxes, logs, and `agent-messages.jsonl`, the Router's one durable append-only ledger for [Agent Messages](#agent-messages).
 
 **Install it** as the `com.ccdm.router` LaunchAgent:
 
@@ -209,7 +210,7 @@ node scripts/router.js status         # human-readable
 node scripts/router.js status --json  # for scripts
 ```
 
-It reports the gateway state, the registry's last good load time and any load error, connected sessions with role, project, scope and connect time, thread sessions and the Thread Supervisor, each project's webhook and root's missing channel permissions, registered channels Discord no longer has (`channel_missing`), and recent scope violations. It exits non-zero when the Router is unreachable.
+It reports the gateway state, the registry's last good load time and any load error, connected sessions with role, project, scope and connect time, thread sessions and the Thread Supervisor, each project's webhook and root's missing channel permissions, registered channels Discord no longer has (`channel_missing`), recent scope violations, and Agent Messages health (`agent messages: ledger ok|unavailable`, `open agent requests`, and `recent agent refusals`). It exits non-zero when the Router is unreachable.
 
 **Behaviour to know:**
 
@@ -385,6 +386,117 @@ scripts/thread-supervisor.py status        # worker, Router connection, caps and
 `scripts/thread-supervisor.py disable` stops the supervised worker and keeps launchd from relaunching it; `run` starts a foreground worker for debugging. `enable` only clears the disabled marker, so rerun the installer afterwards. State is private under `~/.local/state/ccdm/thread-supervisor/`. Threads are on for every project once the supervisor is installed; there is no per-project flag. While the supervisor is down, a thread message with no live session gets 💤.
 
 Root needs three extra permissions, granted once by hand: Create Public Threads, Send Messages in Threads and Manage Threads in the project channels. No script changes permissions. View Audit Log on the guild is useful but optional: with it the supervisor logs who archived a thread it reopened. `router status` reports any that are missing while threads are enabled. The post-merge live smoke steps are in the [operator checklist](docs/thread-supervisor.md#operator-checklist).
+
+## Agent Messages
+
+**Agent Messages** let one project's Claude, Codex or Gemini agent ask another project's live agent a question through the Router and receive one answer back, without you copying messages between channels. Both Channel Conversations and Thread Conversations can send and receive. Root and `remote:` projects take no part.
+
+- **Exchange shape:** one **Agent Request** (`req-…`) and at most one **Agent Reply** under that request ID, then the exchange closes. A follow-up is a new request. Content is text only (no attachments).
+- **Session Scope is unchanged:** neither session gains read, react, edit or history access in the other conversation.
+- **Restart sessions after upgrading:** existing project and thread sessions must be restarted after upgrading to announce `agent_messages` in their Router hello. A session started before the upgrade counts as offline (`target_offline`) for Agent Messages.
+
+### Granting, listing and revoking
+
+An **Agent Message Grant** is your one-way permission (`projects.<from>.agent_message_targets` in `registry.json`) for every conversation of `<from>` (its channel and all its threads) to send Agent Requests to every conversation of `<to>`. Manage grants through root or directly with `scripts/ccdm agent-messages` (the same command on macOS and Windows; never hand-edit `registry.json`, and project sessions never edit grants):
+
+```bash
+scripts/ccdm agent-messages allow <from> <to>
+scripts/ccdm agent-messages revoke <from> <to>
+scripts/ccdm agent-messages list [<project>] [--json]
+```
+
+- **One-way and self-grants:** `allow alpha beta` lets `alpha` send requests to `beta`, not `beta` to `alpha`. Replies need no grant because the open request is their permission. Messaging inside one project (channel ↔ thread or thread ↔ thread) needs a self-grant (`allow alpha alpha`).
+- **No per-request prompt:** once a direction is allowed, granted agents exchange requests without asking you each time.
+- **Guest warning:** when `<from>` has guests (`guest_user_ids`), `allow` prints a warning naming the guest count and still records the grant, so you know guests in `<from>` can trigger Agent Requests to `<to>`.
+- **No restart needed:** the Router hot-reloads `registry.json`, so `allow` and `revoke` apply to the next send. Revoking a grant does not cancel requests that are already open.
+- **Stale targets:** deregistering a project does not automatically remove grants pointing to it. `list` flags unregistered targets as `(stale)`; revoke them with `scripts/ccdm agent-messages revoke <from> <stale>` before reusing that project name.
+
+### How agents send and receive
+
+Every Claude, Codex and Gemini project or thread session exposes three tools (absent for root):
+
+- **`send_agent_request(target, text, timeout_minutes?)`** — accepts `project`, `project/<thread id>`, a Discord thread link, or a unique live `project/<thread name>`. Returns a Router-minted `req-…` ID as soon as the Router records the request; `timeout_minutes` defaults to `30` and caps at `120`. Sending to an ungranted, unknown or `remote:` project (or `root`, or an unresolved link) returns `not_granted`; inside a granted project, an unmatched or non-thread target returns `unknown_target` and a thread name shared by multiple live threads returns `ambiguous_target` (none of these post anything). Sending to a conversation with no live session returns `target_offline` at once (or `target_closed` for an archived thread); it never starts a session, never reopens a closed thread, and is never queued for later delivery.
+- **`send_agent_reply(request_id, text)`** — sends the single reply to an open request addressed to this conversation and reports whether the sender's session was live (`delivered_to_live_session`). A second reply is refused (`already_replied`), and a late reply after expiry is refused (`request_expired`).
+- **`list_agent_targets()`** — lists granted, registered, non-remote projects with `channel_live` and live capable threads (id and name).
+
+Delivery is asynchronous and never steers an active turn:
+
+- **Own turn:** Claude holds Agent Messages until the running turn ends (delivering one per turn end, oldest first); Codex queues them as their own turn without `turn/steer`; Gemini runs each as its own prompt without batching. `/pause` and thread bootstrap hold them in all three providers; a held request whose `expires_at` passes while waiting is dropped.
+- **Marked and untrusted:** every delivered Agent Message names the sender (`sender="agent"` in Claude; a `[Agent Request …]` / `[Agent Reply …]` header in Codex and Gemini). Every session's instructions remind the agent that an Agent Request is from another agent, not from you, never authorizes destructive, irreversible or outward-facing work, and that `reply` still posts only in its own conversation.
+- **Delivery across reconnects and Router restarts:** each delivery is acknowledged once held and deduplicated by `delivery_id`; an unacknowledged delivery is re-sent if the same launch reconnects (including after a Router restart), while a new launch receives nothing from before it started.
+
+### Visibility in Discord
+
+Every accepted request and reply appears in both conversations, with no pings (`allowed_mentions` empty):
+
+- **Sender side:** posted in the sender's conversation through the sender's Project Identity webhook (`<project>-<provider> · N%`).
+- **Receiver side:** posted in the target conversation as the root bot, naming the sender (`<project>-<provider>`, or `<project>-<provider> › <thread name>` for a thread).
+- **Header and links:** every record begins with `-# ⇄ Agent ` and links to its counterpart in the other conversation (messages over 2000 characters split into continuation chunks each starting with `-# ⇄ Agent Request|Reply · <id> · part <k>/<n>`, with links and marks on the first chunk). `reply` (checked on every split chunk after trimming leading whitespace) and `edit_message` refuse text or target messages starting with `-# ⇄ Agent `, so an agent can neither forge nor rewrite any chunk of a record. Both ops also refuse look-alike subtext headers (`-#` followed by 1–3 symbols and `Agent`, in any case or spacing) on the first line of any chunk, while classifiers keep matching only the exact `-# ⇄ Agent ` prefix.
+- **Outcome marks:** root reacts on both request posts: ✅ once replied, or ⚠️ if expired or failed. An offline or closed attempt posts one sender-side record marked `· not delivered: target_offline` (or `target_closed`) with ⚠️ and posts nothing in the target conversation. The `react` op refuses adding or removing ✅ or ⚠️ on any Agent Message record chunk (`invalid_args`), while allowing other emoji on records and ✅/⚠️ on ordinary messages.
+- **Router restart recovery:** if a Router crash interrupts a multi-chunk record, startup recovery completes only the missing chunks instead of posting earlier chunks twice. An accepted request that expires while the Router is down still has its linked records posted and marked ⚠️ after restart (without delivering the expired request to the target).
+
+### Inspecting status and history
+
+Check live state with `node scripts/router.js status` (or `--json`):
+
+- `agent messages: ledger ok` (or `ledger unavailable` with the error if the ledger file is unreadable);
+- `open agent requests: N` — each open request's ID, sender, target, `opened_at`, `expires_at` and `depth`;
+- `recent agent refusals: N` — the latest 20 refusals (time, sender, target as given, code).
+
+Status output never includes message text, keys or tokens.
+
+Inspect exchange history with `scripts/ccdm agent-messages log`:
+
+```bash
+scripts/ccdm agent-messages log [--project <name>] [--request <id>] [--limit <n>] [--text] [--json]
+```
+
+`log` reads `~/.local/state/ccdm/router/agent-messages.jsonl` directly without modifying it, so it works even while the Router is stopped. It prints exchanges and refusals newest last (default 50 entries) and omits message text unless you pass `--text`. On Router start, the ledger is compacted atomically: open exchanges, unacknowledged deliveries of open exchanges, and closed exchanges, deliveries and refusals within the last 30 days are kept (unacknowledged deliveries older than 30 days are dropped once their exchange is closed). If the ledger ever becomes unreadable, `agent_request` and `agent_reply` return `ledger_unavailable` and `router status` reports `ledger unavailable`, while ordinary Discord routing keeps working; move the damaged file aside and restart the Router to recover. If `log` encounters unknown record types, it skips them and prints a one-line stderr note naming the skipped line numbers and pointing to `router status`.
+
+### Limits, reminders and threads
+
+Optional top-level `agent_message_limits` in `registry.json` overrides the four defaults (all positive integers; hot-reloaded on the next send; invalid values or unknown keys keep the last good table):
+
+```json
+"agent_message_limits": {
+  "depth": 3,
+  "requests_per_hour": 20,
+  "open_requests": 5,
+  "max_characters": 4000
+}
+```
+
+| Limit | Default | Scope |
+|-------|---------|-------|
+| `depth` | `3` | Maximum nested request chain depth (A→B→C→D succeeds; a fourth hop returns `depth_exceeded`) |
+| `requests_per_hour` | `20` | Sliding-hour cap per sending project (counts accepted requests plus `target_offline` and `target_closed` attempts) |
+| `open_requests` | `5` | Unanswered, unexpired requests per sending conversation |
+| `max_characters` | `4000` | Maximum characters in one request or reply |
+
+An Agent Message never acknowledges, reopens or arms a Conversation Reminder (replies during an agent-started turn arm nothing until owner input joins), never resets a Thread Conversation's idle eviction clock (though a running agent-started turn is never evicted), and never settles a pending ⏳ thread turn mark.
+
+### Refusal codes
+
+The Router can refuse `agent_request`, `agent_reply` and `agent_targets` with these codes:
+
+| Code | Operations | When it happens | Posted in Discord |
+|------|------------|-----------------|-------------------|
+| `invalid_args` | `agent_request`, `agent_reply` | Missing or empty required field (`target`, `request_id`, `text`, `idempotency_key`), or `timeout_minutes` is not a positive integer | Nothing |
+| `forbidden` | `agent_request`, `agent_reply`, `agent_targets` | Called by a connection whose role is not `project` or `thread` (for example `root`, `observer`, `supervisor` or `status`) | Nothing |
+| `ledger_unavailable` | `agent_request`, `agent_reply` | The Router's ledger could not be read at startup or appended to | Nothing |
+| `not_granted` | `agent_request` | Sender is `remote:`, or target resolves to `root`, a `remote:` project, an unregistered project, an unresolved link, or a project not in the sender's `agent_message_targets` | Nothing |
+| `unknown_target` | `agent_request` | Inside a granted project, a thread ID or Discord link is not a public thread under that project's channel, or no live thread matches `project/<thread name>` | Nothing |
+| `ambiguous_target` | `agent_request` | Inside a granted project, two or more live threads share the requested `<thread name>` | Nothing |
+| `text_too_long` | `agent_request`, `agent_reply` | `text` exceeds `agent_message_limits.max_characters` (default `4000`) | Nothing |
+| `request_rate_exceeded` | `agent_request` | Sending project reached `agent_message_limits.requests_per_hour` (default `20`) in the sliding hour | Nothing |
+| `open_requests_exceeded` | `agent_request` | Sending conversation reached `agent_message_limits.open_requests` (default `5`) unanswered, unexpired requests | Nothing |
+| `depth_exceeded` | `agent_request` | Request chain depth would exceed `agent_message_limits.depth` (default `3`) | Nothing |
+| `target_closed` | `agent_request` | Target thread is archived in Discord (even if a listener is connected) | One sender-side record (`· not delivered: target_closed`) with ⚠️; nothing in target |
+| `target_offline` | `agent_request` | Target conversation has no live listener announcing `agent_messages` | One sender-side record (`· not delivered: target_offline`) with ⚠️; nothing in target |
+| `unknown_request` | `agent_reply` | No exchange has that `request_id`, or it is not addressed to the calling conversation | Nothing |
+| `request_expired` | `agent_reply` | The request's `expires_at` has passed | Nothing (expiry already reacted ⚠️ on the request posts) |
+| `already_replied` | `agent_reply` | The request was already answered | Nothing |
+| `request_failed` | `agent_reply` | The request already failed (for example its record could not be posted), or the sender or target project was deregistered or moved channels while open | No reply record (a route-change failure reacts ⚠️ on existing request posts) |
 
 ## Accounts and homes
 
@@ -624,7 +736,8 @@ Message the root agent in a root channel:
 | `restart <project>` | Restart a project's channel session. Threads are left alone unless you name them |
 | `register` / `setup` | Register a project to a channel (asks for channel, path and provider) |
 | `deregister` / `remove` / `unregister` | Stop a project and delete its webhook and registry entry (the channel stays) |
-| `router status` | Show the Router's gateway state, connected sessions and scopes, webhook health and recent scope violations |
+| `router status` | Show the Router's gateway state, connected sessions and scopes, webhook health, recent scope violations, and Agent Messages ledger, open requests and recent refusals |
+| `allow / revoke / list agent messages` | Manage one-way [Agent Message Grants](#agent-messages) with `scripts/ccdm agent-messages` |
 | `probe <project>` | Post a test notice through a project's webhook |
 | `guest invite <project> <user_id>` | Create a project-scoped guest invite |
 | `guest revoke <project> <user_id>` | Remove project guest access |
@@ -661,7 +774,8 @@ These plain commands are handled outside the model, never as an agent turn. The 
 | `scripts/threads.sh list\|create\|stop\|restart\|close …` | Operate [Thread Conversations](#thread-conversations) |
 | `./restart-root-agent.sh` | Start or restart root as Claude |
 | `./restart-root-codex-agent.sh [channel_id]` | Start or restart root as Codex |
-| `node scripts/router.js status [--json]` | Router health |
+| `node scripts/router.js status [--json]` | Router health, sessions, webhooks, scope violations, and Agent Messages status |
+| `scripts/ccdm agent-messages allow\|revoke\|list\|log …` | Manage [Agent Message Grants](#agent-messages) and inspect exchange history (macOS and Windows) |
 | `scripts/guest-access.js invite\|grant\|revoke\|sync\|list …` | Manage [Project Guests](#project-guests) |
 | `scripts/export-discord-range.js <channel-id\|thread-id\|link\|thread-name> <start-message-id> [end-message-id]` | Export a message range with the root token (operator use) |
 | `npm test` | Run the test suite against local fakes |
@@ -956,6 +1070,7 @@ CCDM needs your machine to stay awake. If it sleeps, the Router and all tmux ses
 | `claude_accounts` | Alias → Claude home, for thread `--account` and Usage Report labels |
 | `gemini_accounts` | Alias → the home agy runs under |
 | `thread_session_caps` | Live thread sessions per provider; default `{"claude": 6, "codex": 8, "gemini": 4}`. An invalid value falls back to its default |
+| `agent_message_limits` | Optional [Agent Messages](#agent-messages) caps: positive integers `depth` (3), `requests_per_hour` (20), `open_requests` (5), `max_characters` (4000). Invalid values or unknown keys keep the last good table |
 | `projects` | Object keyed by project name |
 
 **Project keys**
@@ -968,6 +1083,7 @@ CCDM needs your machine to stay awake. If it sleeps, the Router and all tmux ses
 | `channel_id` | The project's Discord channel. One channel per project, never a root channel |
 | `webhook_id` | Written by `ensure-webhook`; required to launch |
 | `guest_user_ids` | Users who may drive this project. `guest_role_id` and `guest_invites` are written beside it by `guest-access.js` |
+| `agent_message_targets` | List of project names this project's conversations may send [Agent Requests](#agent-messages) to (may include itself). Manage with `scripts/ccdm agent-messages allow\|revoke\|list`, never by hand |
 | `pid`, `session_id` | Runtime state written by the launchers and cleared by `stop-session.sh` |
 | `model` | Claude `--model`; also the fallback for `codex_model` and `gemini_model` |
 | `claude_home`, `claude_effort` | Claude home and effort (`low`, `medium`, `high`, `xhigh`, `max`) |
@@ -1105,7 +1221,7 @@ ccdm/
   docs/                      # thread-supervisor.md, conversation-reminders.md, ADRs
   scripts/
     router.js                # The Router daemon and its CLI (serve, status, preflight, webhooks, probe)
-    router/                  # Router modules: socket server, client library, ops, webhooks, emergency fallback
+    router/                  # Router modules: socket server, client library, ops, webhooks, agent-messages, emergency fallback
     install-router-service.sh # Install the com.ccdm.router LaunchAgent
     migrate-to-router.sh     # One-project cutover onto the Router
     retire-pool.sh           # Remove leftover pool bots, state, role, and registry fields
@@ -1384,6 +1500,15 @@ scripts\ccdm threads close <name>
 ```
 
 Give `create` its first message in a UTF-8 file with `--message-file <path>`, or on standard input with `--message-stdin`. Never type the message as arguments. The first thread that starts after you sign in waits up to 90 seconds for `ccdm-host`.
+
+**Agent Messages.** Manage one-way grants and inspect history with the same `ccdm` subcommand (see [Agent Messages](#agent-messages)):
+
+```powershell
+scripts\ccdm agent-messages allow <from> <to>
+scripts\ccdm agent-messages revoke <from> <to>
+scripts\ccdm agent-messages list
+scripts\ccdm agent-messages log
+```
 
 **Usage report.**
 

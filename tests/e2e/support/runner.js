@@ -669,7 +669,28 @@ function runRouterClaudeHost() {
     });
     const logFile = path.join(stateDir, \`claude-channel-\${process.pid}.log\`);
     child.stderr.on("data", (chunk) => fs.appendFileSync(logFile, chunk));
-    const stop = () => { child.kill("SIGTERM"); process.exit(0); };
+    const conversationId = serverEnv.CCDM_THREAD_ID || serverEnv.CCDM_CLAUDE_CHANNEL_ID;
+    // \`fixtures.claude.pendingHooks\` lets a test fire a hook from \`--settings\`
+    // (such as UserPromptSubmit or a subagent Stop) on demand.
+    const pollHooks = setInterval(() => {
+      if (!conversationId) return;
+      if (!(readState().fixtures.claude.pendingHooks || []).some((item) => item.conversationId === conversationId)) return;
+      let matching = [];
+      updateState((state) => {
+        matching = [];
+        const pending = state.fixtures.claude.pendingHooks || [];
+        const keep = [];
+        for (const item of pending) {
+          if (item.conversationId === conversationId) matching.push(item);
+          else keep.push(item);
+        }
+        state.fixtures.claude.pendingHooks = keep;
+        return state;
+      });
+      for (const item of matching) void runHooks(item.event, item.fields || {});
+    }, 50);
+    pollHooks.unref();
+    const stop = () => { clearInterval(pollHooks); child.kill("SIGTERM"); process.exit(0); };
     process.on("SIGTERM", stop);
     process.on("SIGINT", stop);
     child.on("exit", () => record("channelServerExits", { pid: child.pid }));
@@ -683,9 +704,11 @@ function runRouterClaudeHost() {
     async function runToolScript(steps, meta) {
       let lastId = "";
       const expand = (value) => typeof value === "string"
-        ? value.replace(/\\{\\{(chat_id|message_id|last_id)\\}\\}/g, (_, key) => key === "last_id" ? lastId : meta[key])
+        ? value.replace(/\\{\\{(chat_id|message_id|request_id|last_id)\\}\\}/g, (_, key) => key === "last_id" ? lastId : meta[key])
         : Array.isArray(value) ? value.map(expand) : value;
       for (const step of steps) {
+        if (step.whenSender && meta.sender !== step.whenSender) continue;
+        if (step.whenAgentKind && meta.agent_message !== step.whenAgentKind) continue;
         const input = Object.fromEntries(Object.entries(step.arguments || {}).map(([key, value]) => [key, expand(value)]));
         const result = await new Promise((done) => {
           toolCalls.set(call("tools/call", { name: step.name, arguments: input }), { name: step.name, done });
@@ -695,6 +718,25 @@ function runRouterClaudeHost() {
     }
     // One turn at a time: each notification's tool calls, then the Stop hook.
     let turns = runHooks("SessionStart", { source: "startup" });
+    let turnHeld = false;
+    const midTurnQueue = [];
+    const isHeld = () => Boolean(conversationId) && (readState().fixtures.claude.holdTurnsIn || []).includes(conversationId);
+    const consumeTurnRelease = () => {
+      if (!conversationId) return false;
+      if (!(readState().fixtures.claude.releaseTurns || []).includes(conversationId)) return false;
+      let released = false;
+      updateState((state) => {
+        const list = state.fixtures.claude.releaseTurns || [];
+        const index = list.indexOf(conversationId);
+        if (index >= 0) {
+          list.splice(index, 1);
+          state.fixtures.claude.releaseTurns = list;
+          released = true;
+        }
+        return state;
+      });
+      return released;
+    };
     let toolsListId = null;
     const initializeId = call("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "claude-fixture", version: "1" } });
     let buffer = "";
@@ -708,17 +750,38 @@ function runRouterClaudeHost() {
         if (!line.trim()) continue;
         const message = JSON.parse(line);
         if (message.id === initializeId) {
-          record("channelServers", { serverInfo: message.result.serverInfo, capabilities: message.result.capabilities });
+          record("channelServers", {
+            serverInfo: message.result.serverInfo,
+            capabilities: message.result.capabilities,
+            instructions: message.result.instructions,
+            role: serverEnv.CCDM_ROUTER_ROLE || (serverEnv.CCDM_THREAD_ID ? "thread" : "project"),
+            threadId: serverEnv.CCDM_THREAD_ID || null,
+          });
           write({ method: "notifications/initialized" });
           toolsListId = call("tools/list", {});
         } else if (message.id === toolsListId) {
           // Each server's tools, by the thread it serves (null for a channel).
-          record("toolLists", { threadId: serverEnv.CCDM_THREAD_ID || null,
-            tools: (message.result?.tools || []).map((tool) => tool.name) });
+          record("toolLists", {
+            role: serverEnv.CCDM_ROUTER_ROLE || (serverEnv.CCDM_THREAD_ID ? "thread" : "project"),
+            threadId: serverEnv.CCDM_THREAD_ID || null,
+            tools: (message.result?.tools || []).map((tool) => tool.name),
+          });
         } else if (message.method === "notifications/claude/channel") {
           record("channelNotifications", message.params);
-          const { replyText, toolScript } = readState().fixtures.claude;
+          const claudeState = readState().fixtures.claude;
+          const { replyText } = claudeState;
           const { meta } = message.params;
+          const chatKey = conversationId || meta.chat_id;
+          const selectScript = (byChat, fallback) => (chatKey && byChat && Object.hasOwn(byChat, chatKey) ? byChat[chatKey] : fallback);
+          // A mid-turn notification while a turn is already held joins that
+          // running turn rather than queueing a second Stop after it.
+          if (turnHeld) {
+            const midScript = selectScript(claudeState.midTurnToolScriptsByConversation, claudeState.midTurnToolScript);
+            if (midScript) midTurnQueue.push({ steps: midScript, meta });
+            continue;
+          }
+          const toolScript = selectScript(claudeState.toolScriptsByConversation, claudeState.toolScript);
+          if (isHeld()) turnHeld = true;
           turns = turns.then(async () => {
             if (replyText) {
               await new Promise((done) => {
@@ -726,19 +789,31 @@ function runRouterClaudeHost() {
               });
             }
             if (toolScript) await runToolScript(toolScript, meta);
-            // \`fixtures.claude.holdTurnsIn\` keeps a thread's turns running until its id leaves the list.
+            // \`fixtures.claude.holdTurnsIn\` keeps a conversation's turns running until its id leaves the list
+            // or \`fixtures.claude.releaseTurns\` releases one held turn.
             // A held turn records its release and whether a second read still lists it, so a
             // release that came from a misread of the state shows in the test's failure text.
-            const held = () => (readState().fixtures.claude.holdTurnsIn || []).includes(serverEnv.CCDM_THREAD_ID);
-            if (held()) {
-              while (held()) {
+            if (isHeld()) {
+              turnHeld = true;
+              while (isHeld() && !consumeTurnRelease()) {
+                while (midTurnQueue.length > 0) {
+                  const item = midTurnQueue.shift();
+                  await runToolScript(item.steps, item.meta);
+                }
                 await new Promise((done) => setTimeout(done, 50));
               }
-              record("turnHolds", { threadId: serverEnv.CCDM_THREAD_ID, releasedAt: new Date().toISOString(),
-                stillListed: held() });
+              while (midTurnQueue.length > 0) {
+                const item = midTurnQueue.shift();
+                await runToolScript(item.steps, item.meta);
+              }
+              turnHeld = false;
+              record("turnHolds", { threadId: serverEnv.CCDM_THREAD_ID, conversationId, releasedAt: new Date().toISOString(),
+                stillListed: isHeld() });
+            } else {
+              turnHeld = false;
             }
-            // \`fixtures.claude.failTurnsIn\` ends a thread's turns with StopFailure, as an API error does.
-            if ((readState().fixtures.claude.failTurnsIn || []).includes(serverEnv.CCDM_THREAD_ID)) {
+            // \`fixtures.claude.failTurnsIn\` ends a conversation's turns with StopFailure, as an API error does.
+            if (Boolean(conversationId) && (readState().fixtures.claude.failTurnsIn || []).includes(conversationId)) {
               await runHooks("StopFailure", { error: "rate_limit" });
             } else {
               await runHooks("Stop", { stop_hook_active: false, background_tasks: [], session_crons: [] });

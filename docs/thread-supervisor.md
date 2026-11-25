@@ -16,7 +16,7 @@ The **Thread Supervisor** is the CCDM service that turns thread events from the 
 - The Router forwards only default (0) and reply (19) messages. The "thread created" (18) and thread-starter (21) system messages reach no session, root, observer or supervisor.
 - A thread message from the owner or a guest of the parent reaches only that thread's session, never the Channel Conversation or a sibling. Guests drive threads without an @mention.
 - A thread session's **Session Scope** is its thread alone. Reads, replies, reactions, edits, exports and downloads that target the parent channel, a sibling thread, a root channel, a parent message or the starter message are `scope_violation`.
-- Replies post through the parent project's webhook into the thread, as `<project>-<provider> · N%`, named for the thread's own provider. Supervisor notices post as the root bot, so reminder agent-reply detection (by `webhook_id`) never counts them.
+- Replies post through the parent project's webhook into the thread, as `<project>-<provider> · N%`, named for the thread's own provider. Supervisor notices post as the root bot, so reminder history discovery (which matches agent replies by `webhook_id`, while live reminder arming comes from adapter receipts) never counts them.
 - An owner bot mention, or a native reply to a root message, inside a thread reaches root, which answers in that thread. A guest's reaches no one. Neither starts or feeds the thread's own session.
 - An owner or guest message with no live session and no supervisor gets 💤 and is not delivered live. Reconciliation may later deliver it once, in a bootstrap.
 
@@ -68,13 +68,14 @@ Accounts are aliases only. Claude aliases live in the registry's `claude_account
 
 ## Status: turn marks
 
-The supervisor tracks whose turn it is in every thread. It reads each live session's `activity.json`, which the CCDM channel server and the Codex and Gemini bridges keep. That file records whether a turn is running, when the last one ended and how (`completed`, `failed`, or for Codex `interrupted`), whether the turn replied, and whether `/pause` holds new turns. Each write holds `activity.json.lock`, since the channel server or bridge and each hook run write it. A Claude thread's `UserPromptSubmit` hook marks a turn running, except for a prompt starting with `/` (a local command typed into the pane, which no Stop may follow). The supervisor combines that with its own copy of every thread message, timing each input by its Discord time, so a message the worker handles late still counts from when it was sent.
+The supervisor tracks whose turn it is in every thread. It reads each live session's `activity.json`, which the CCDM channel server and the Codex and Gemini bridges keep. That file records whether a turn is running, whether the running or last turn was started by an Agent Message (`turn_agent_started`, `last_turn_agent_started`), when the last turn ended and how (`completed`, `failed`, or for Codex `interrupted`), the latest non-agent-started turn end and outcome (`last_ordinary_turn_end_at`, `last_ordinary_turn_outcome`), whether the turn replied, and whether `/pause` holds new turns. Each write holds `activity.json.lock`, since the channel server or bridge and each hook run write it. A Claude thread's `UserPromptSubmit` hook marks a turn running, except for a prompt starting with `/` (a local command typed into the pane, which no Stop may follow). The supervisor combines that with its own copy of every thread message, timing each input by its Discord time, so a message the worker handles late still counts from when it was sent.
 
 It shows the turn as root's reaction on the input that started it, in the thread itself; it posts nothing:
 
-- **⏳ the agent is on it:** an owner or guest message that is not a command and does not address root hands the turn to the agent, and root reacts ⏳ on it. Only the latest input carries ⏳: when another input arrives before the turn ends, the ⏳ moves to it. A creation request's first message hands over the turn too, with no message to mark. 👀 during a boot can sit beside ⏳.
-- **✅ answered:** when a live session's turn has ended and no turn has run for 5 s (`CCDM_THREAD_STATUS_SETTLE_S`), with no input after it, the turn passes to the owner and the ⏳ becomes ✅, whether or not the turn posted a reply.
-- **⚠️ failed:** a failed turn (`last_turn_outcome` `failed`) gets ⚠️ instead, as does a ⏳ whose session crashes or fails to start.
+- **⏳ the agent is on it:** an owner or guest message that is not a command and does not address root hands the turn to the agent, and root reacts ⏳ on it. Only the latest input carries ⏳: when another input arrives before the turn ends, the ⏳ moves to it. A creation request's first message hands over the turn too, with no message to mark. 👀 during a boot can sit beside ⏳. Agent Message record posts (the `-# ⇄ Agent ` posts from the root bot or the project's webhook, classified as `author_class: "agent_message"`) are never inputs and never receive turn marks from the supervisor.
+- **✅ answered:** when a live session's ordinary turn has ended and no ordinary turn has run for 5 s (`CCDM_THREAD_STATUS_SETTLE_S`), with no input after it, the turn passes to the owner and the ⏳ becomes ✅, whether or not the turn posted a reply.
+- **⚠️ failed:** a failed ordinary turn (`last_ordinary_turn_outcome` / `last_turn_outcome` `failed`) gets ⚠️ instead, as does a ⏳ whose session crashes or fails to start.
+- **Agent-started turns:** the adapters flag an agent-started turn in `activity.json` and clear the flag if owner input joins the turn (a Claude mid-turn notification or a Codex steer; Gemini queues owner input into its own ordinary turn). The supervisor ignores an agent-started turn's end, so it never settles a pending ⏳ into ✅ or ⚠️. An owner turn that ends with an Agent Message held behind it still settles its ⏳ into ✅ or ⚠️ using `last_ordinary_turn_end_at`/`last_ordinary_turn_outcome`, even when the agent-started turn starts right after it, and the agent-started turn that follows changes nothing. Once owner input joins an agent-started turn, that turn's end settles the mark as an ordinary turn would.
 - **Nothing:** an interrupted turn just loses its ⏳. A turn end with no input since the last one (a compaction, the bootstrap of `/restart`, a retry) changes no mark.
 - **Never stranded:** a stop (an operator stop, an idle eviction, an archive revert, `/restart`, `/clear`, a `/config` restart, a project change) takes the ⏳ off; a turn that had already ended still gets its ✅ or ⚠️ first. `/close` and the operator's thread `close` command take it off before archiving, since reactions cannot change in an archived thread.
 - **Kept:** a ✅ or ⚠️ stays on its message for good. The next input's ⏳ goes on the new message, and old marks are never touched.
@@ -87,7 +88,7 @@ The store keeps the mark root wants (`mark_message_id`, `mark_emoji`) apart from
 
 Live thread sessions are capped per provider by the registry's `thread_session_caps`, defaulting to Claude 6, Codex 8 and Gemini 4. Only thread sessions count; Channel Conversations never do.
 
-- **Idle:** no turn running, and no owner message for 30 minutes.
+- **Idle:** no turn running, and no owner message for 30 minutes. An Agent Message delivered to a thread (and its `-# ⇄ Agent ` record posts) never resets the idle clock, so eviction still follows the last owner message time; a running turn, including an agent-started turn, is still never evicted.
 - **At the cap:** the longest-idle session is evicted with `Paused to free a session slot; send a message here to resume.` A session mid-turn or booting is never evicted.
 - **No idle session:** the thread is queued with `Queued, N sessions busy.` and starts automatically, FIFO per provider, when a slot frees or a running session goes idle. A new thread never passes one already queued for its provider, and a queued thread keeps its first message across a supervisor restart.
 
@@ -98,7 +99,7 @@ While the supervisor is down, a thread message with no live session gets 💤. T
 - it binds threads it missed;
 - it unarchives every archived thread whose conversation is not closed;
 - it marks dead sessions `crashed`;
-- it starts only threads whose newest owner message is newer than the last agent reply, with the undelivered messages in the bootstrap; a root mention or a native reply to root never counts.
+- it starts only threads whose newest owner message is newer than the last agent reply, with the undelivered messages in the bootstrap; a root mention, a native reply to root, or an Agent Message record post (`-# ⇄ Agent `) never counts.
 
 A registered project channel that Discord no longer has (or that root cannot read) is skipped by the Router's thread list and named in the supervisor's log, and the other channels reconcile as usual; `router status` shows such a project as `channel_missing`.
 
@@ -124,6 +125,7 @@ Each thread is its own Conversation Reminder conversation, keyed `(project, conv
 - **Close:** `/close` closes only that thread's reminders. The next owner message reopens them.
 - **Archived threads:** a reminder posted into a thread that is still archived (say, while the supervisor was down) reopens the thread without starting a session.
 - **Resets:** a provider or account switch resets tracking. A delete drops the state.
+- **Agent Messages:** an Agent Message never acknowledges, reopens, or arms a thread's reminders. Replies posted during an agent-started turn record no adapter receipts until owner input joins the turn, and history discovery classifies `-# ⇄ Agent ` records as `other`.
 - **Status:** reminder `status` nests threads under their project.
 
 See [docs/conversation-reminders.md](conversation-reminders.md).
