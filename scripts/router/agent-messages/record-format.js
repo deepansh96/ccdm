@@ -3,15 +3,16 @@
 // Shared format for visible Agent Message records in Discord.
 // Builds and recognises the header line (`-# ⇄ Agent ...`), formats channel
 // labels, and chunks record messages within Discord's 2000-character limit.
-const { MESSAGE_LIMIT, splitMessage } = require("../chunks.js");
+const { MESSAGE_LIMIT } = require("../chunks.js");
 
 const RECORD_PREFIX = "-# ⇄ Agent ";
 // Room reserved on a sender-side first chunk for the counterpart message ID
 // added by the link edit once the receiver-side record exists.
 const MESSAGE_ID_RESERVE = 40;
+const RECORD_HEADER_RE = /^-# ⇄ Agent (Request|Reply) (?:to|from) \*\*.*\*\* · ([^\s·]+)(?: · (?:\[counterpart\]\([^)]+\)|not delivered: [^\s]+))?$/s;
 
 function isAgentMessageRecord(text) {
-  return typeof text === "string" && text.startsWith(RECORD_PREFIX);
+  return typeof text === "string" && text.trimStart().startsWith(RECORD_PREFIX);
 }
 
 function formatConversationLabel(conversation) {
@@ -36,15 +37,57 @@ function linkSuffixReserve(guildId, channelId) {
   return ` · [counterpart](${messageLink(guildId, channelId, "")})`.length + MESSAGE_ID_RESERVE;
 }
 
-function formatRecordChunks(header, text, { reserveHeaderChars = 0 } = {}) {
+function formatContinuationHeader(kindWord, requestId, part, total) {
+  return requestId
+    ? `${RECORD_PREFIX}${kindWord} · ${requestId} · part ${part}/${total}`
+    : `${RECORD_PREFIX}${kindWord} · part ${part}/${total}`;
+}
+
+function continuationMeta(header, options) {
+  const match = RECORD_HEADER_RE.exec(header);
+  const kindWord = options.kind
+    ? (options.kind === "reply" ? "Reply" : "Request")
+    : (match ? match[1] : (header.startsWith(`${RECORD_PREFIX}Reply `) ? "Reply" : "Request"));
+  const requestId = options.requestId ?? (match ? match[2] : null);
+  return { kindWord, requestId };
+}
+
+function sliceChunk(remaining, limit) {
+  if (remaining.length <= limit) return remaining.length;
+  const splitAt = remaining.lastIndexOf("\n", limit);
+  return splitAt < limit * 0.3 ? limit : splitAt;
+}
+
+function formatRecordChunks(header, text, options = {}) {
+  const reserve = Math.max(0, options.reserveHeaderChars ?? 0);
   const full = `${header}\n${text}`;
-  if (full.length + reserveHeaderChars <= MESSAGE_LIMIT) return [full];
-  if (reserveHeaderChars <= 0) return splitMessage(full, MESSAGE_LIMIT);
-  const firstLimit = Math.max(header.length + 1, MESSAGE_LIMIT - reserveHeaderChars);
-  if (full.length <= firstLimit) return [full];
-  let splitAt = full.lastIndexOf("\n", firstLimit);
-  if (splitAt < firstLimit * 0.3 || splitAt <= header.length) splitAt = firstLimit;
-  return [full.slice(0, splitAt), ...splitMessage(full.slice(splitAt), MESSAGE_LIMIT)];
+  if (full.length + reserve <= MESSAGE_LIMIT) return [full];
+
+  const { kindWord, requestId } = continuationMeta(header, options);
+  const firstBodyLimit = Math.max(1, MESSAGE_LIMIT - header.length - 1 - reserve);
+
+  let assumedTotal = 2;
+  let parts = [];
+  for (let pass = 0; pass < 6; pass++) {
+    parts = [];
+    let remaining = text;
+    while (remaining.length > 0) {
+      const index = parts.length;
+      const limit = index === 0
+        ? firstBodyLimit
+        : Math.max(1, MESSAGE_LIMIT - formatContinuationHeader(kindWord, requestId, index + 1, assumedTotal).length - 1);
+      const splitAt = sliceChunk(remaining, limit);
+      parts.push(remaining.slice(0, splitAt));
+      remaining = remaining.slice(splitAt);
+    }
+    if (parts.length === assumedTotal) break;
+    assumedTotal = parts.length;
+  }
+
+  const total = parts.length;
+  return parts.map((body, index) => (index === 0
+    ? `${header}\n${body}`
+    : `${formatContinuationHeader(kindWord, requestId, index + 1, total)}\n${body}`));
 }
 
 function withCounterpartLink(firstChunk, updatedHeader) {
