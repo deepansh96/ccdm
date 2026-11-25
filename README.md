@@ -415,7 +415,7 @@ scripts/ccdm agent-messages list [<project>] [--json]
 
 Every Claude, Codex and Gemini project or thread session exposes three tools (absent for root):
 
-- **`send_agent_request(target, text, timeout_minutes?)`** — accepts `project`, `project/<thread id>`, a Discord thread link, or a unique live `project/<thread name>`. Returns a Router-minted `req-…` ID as soon as the Router records the request; `timeout_minutes` defaults to `30` and caps at `120`. Sending to an ungranted or unknown target returns `not_granted` and posts nothing. Sending to a conversation with no live session returns `target_offline` at once (or `target_closed` for an archived thread); it never starts a session, never reopens a closed thread, and is never queued for later delivery.
+- **`send_agent_request(target, text, timeout_minutes?)`** — accepts `project`, `project/<thread id>`, a Discord thread link, or a unique live `project/<thread name>`. Returns a Router-minted `req-…` ID as soon as the Router records the request; `timeout_minutes` defaults to `30` and caps at `120`. Sending to an ungranted, unknown or `remote:` project (or `root`, or an unresolved link) returns `not_granted`; inside a granted project, an unmatched or non-thread target returns `unknown_target` and a thread name shared by multiple live threads returns `ambiguous_target` (none of these post anything). Sending to a conversation with no live session returns `target_offline` at once (or `target_closed` for an archived thread); it never starts a session, never reopens a closed thread, and is never queued for later delivery.
 - **`send_agent_reply(request_id, text)`** — sends the single reply to an open request addressed to this conversation and reports whether the sender's session was live (`delivered_to_live_session`). A second reply is refused (`already_replied`), and a late reply after expiry is refused (`request_expired`).
 - **`list_agent_targets()`** — lists granted, registered, non-remote projects with `channel_live` and live capable threads (id and name).
 
@@ -473,6 +473,29 @@ Optional top-level `agent_message_limits` in `registry.json` overrides the four 
 | `max_characters` | `4000` | Maximum characters in one request or reply |
 
 An Agent Message never acknowledges, reopens or arms a Conversation Reminder (replies during an agent-started turn arm nothing until owner input joins), never resets a Thread Conversation's idle eviction clock (though a running agent-started turn is never evicted), and never settles a pending ⏳ thread turn mark.
+
+### Refusal codes
+
+The Router can refuse `agent_request`, `agent_reply` and `agent_targets` with these codes:
+
+| Code | Operations | When it happens | Posted in Discord |
+|------|------------|-----------------|-------------------|
+| `invalid_args` | `agent_request`, `agent_reply` | Missing or empty required field (`target`, `request_id`, `text`, `idempotency_key`), or `timeout_minutes` is not a positive integer | Nothing |
+| `forbidden` | `agent_request`, `agent_reply`, `agent_targets` | Called by a connection whose role is not `project` or `thread` (for example `root`, `observer`, `supervisor` or `status`) | Nothing |
+| `ledger_unavailable` | `agent_request`, `agent_reply` | The Router's ledger could not be read at startup or appended to | Nothing |
+| `not_granted` | `agent_request` | Sender is `remote:`, or target resolves to `root`, a `remote:` project, an unregistered project, an unresolved link, or a project not in the sender's `agent_message_targets` | Nothing |
+| `unknown_target` | `agent_request` | Inside a granted project, a thread ID or Discord link is not a public thread under that project's channel, or no live thread matches `project/<thread name>` | Nothing |
+| `ambiguous_target` | `agent_request` | Inside a granted project, two or more live threads share the requested `<thread name>` | Nothing |
+| `text_too_long` | `agent_request`, `agent_reply` | `text` exceeds `agent_message_limits.max_characters` (default `4000`) | Nothing |
+| `request_rate_exceeded` | `agent_request` | Sending project reached `agent_message_limits.requests_per_hour` (default `20`) in the sliding hour | Nothing |
+| `open_requests_exceeded` | `agent_request` | Sending conversation reached `agent_message_limits.open_requests` (default `5`) unanswered, unexpired requests | Nothing |
+| `depth_exceeded` | `agent_request` | Request chain depth would exceed `agent_message_limits.depth` (default `3`) | Nothing |
+| `target_closed` | `agent_request` | Target thread is archived in Discord (even if a listener is connected) | One sender-side record (`· not delivered: target_closed`) with ⚠️; nothing in target |
+| `target_offline` | `agent_request` | Target conversation has no live listener announcing `agent_messages` | One sender-side record (`· not delivered: target_offline`) with ⚠️; nothing in target |
+| `unknown_request` | `agent_reply` | No exchange has that `request_id`, or it is not addressed to the calling conversation | Nothing |
+| `request_expired` | `agent_reply` | The request's `expires_at` has passed | Nothing (expiry already reacted ⚠️ on the request posts) |
+| `already_replied` | `agent_reply` | The request was already answered | Nothing |
+| `request_failed` | `agent_reply` | The request already failed (for example its record could not be posted), or the sender or target project was deregistered or moved channels while open | No reply record (a route-change failure reacts ⚠️ on existing request posts) |
 
 ## Accounts and homes
 

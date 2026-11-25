@@ -56,6 +56,7 @@ Project sessions never edit grants, and root never edits `registry.json` by hand
 - If `allow` fails with `ccdm: unknown project: …`, check `scripts/ccdm list` for the exact registered project name.
 - If `allow` fails mentioning a `remote:` project, explain that `remote:` projects do not take part in local Agent Messages.
 - If a newly allowed send still returns `not_granted`, check `node scripts/router.js status` for a registry load error.
+- Router refusal codes for `agent_request`, `agent_reply`, and `agent_targets` (see `README.md` under Agent Messages → Refusal codes for when each happens and whether anything is posted): `invalid_args`, `forbidden`, `ledger_unavailable`, `not_granted`, `unknown_target`, `ambiguous_target`, `text_too_long`, `request_rate_exceeded`, `open_requests_exceeded`, `depth_exceeded`, `target_closed`, `target_offline`, `unknown_request`, `request_expired`, `already_replied`, `request_failed`.
 
 ## Update Scaffold
 - [ ] Update `.mex/ROUTER.md`, `.mex/patterns/root-commands.md`, and `CLAUDE.md.example` if `scripts/ccdm agent-messages` verbs change.

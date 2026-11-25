@@ -9,7 +9,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..platform.paths import state_root
 from .list import REGISTRY, _read_registry, fail
@@ -18,6 +18,16 @@ _REGISTRY_UPDATE_SCRIPT = Path(__file__).resolve().parents[2] / "registry-update
 _LEDGER_FILENAME = "agent-messages.jsonl"
 _LEDGER_VERSION = 1
 _DEFAULT_LOG_LIMIT = 50
+_KNOWN_RECORD_TYPES = frozenset((
+    "request",
+    "refusal",
+    "post",
+    "delivery",
+    "ack",
+    "reply",
+    "expired",
+    "failed",
+))
 _VALID_OPS = frozenset(("agent_request", "agent_reply"))
 _VALID_POST_KINDS = frozenset(("request", "reply"))
 _VALID_POST_SIDES = frozenset(("sender", "receiver"))
@@ -226,8 +236,10 @@ def _validate_ledger_record(record: Any) -> Optional[str]:
     if not _is_valid_iso(record.get("at")):
         return "missing or invalid timestamp"
     rec_type = record.get("type")
-    if not isinstance(rec_type, str):
+    if not _is_non_empty_str(rec_type):
         return "missing record type"
+    if rec_type not in _KNOWN_RECORD_TYPES:
+        return None
 
     if rec_type == "request":
         if not _is_non_empty_str(record.get("request_id")):
@@ -299,39 +311,44 @@ def _validate_ledger_record(record: Any) -> Optional[str]:
     return f"unknown record type: {rec_type}"
 
 
-def _read_ledger_records(path: Path) -> List[Dict[str, Any]]:
+def _read_ledger_records(path: Path) -> Tuple[List[Dict[str, Any]], int]:
     try:
-        raw = path.read_text(encoding="utf-8")
+        raw = path.read_bytes()
     except FileNotFoundError:
-        return []
-    except (OSError, UnicodeDecodeError) as error:
+        return [], 0
+    except OSError as error:
         fail(f"could not read agent message ledger at {path}: {error}")
 
-    if raw == "":
-        return []
+    if raw == b"":
+        return [], 0
 
-    has_trailing_newline = raw.endswith("\n")
-    lines = raw.split("\n")
+    has_trailing_newline = raw.endswith(b"\n")
+    lines = raw.split(b"\n")
     if has_trailing_newline:
         lines.pop()
 
     records: List[Dict[str, Any]] = []
+    skipped = 0
     for index, raw_line in enumerate(lines):
-        line = raw_line[:-1] if raw_line.endswith("\r") else raw_line
+        line_bytes = raw_line[:-1] if raw_line.endswith(b"\r") else raw_line
         is_unterminated_final = not has_trailing_newline and index == len(lines) - 1
-        if line == "":
+        if line_bytes == b"":
             fail(f"agent message ledger invalid empty line {index + 1}")
         try:
+            line = line_bytes.decode("utf-8")
             parsed = json.loads(line)
-        except ValueError as error:
-            if is_unterminated_final and (line == "{" or line.startswith('{"')):
+        except (UnicodeDecodeError, ValueError) as error:
+            if is_unterminated_final and (line_bytes == b"{" or line_bytes.startswith(b'{"')):
                 break
             fail(f"corrupt agent message ledger line {index + 1}: {error}")
         problem = _validate_ledger_record(parsed)
         if problem is not None:
             fail(f"invalid agent message ledger line {index + 1}: {problem}")
+        if parsed["type"] not in _KNOWN_RECORD_TYPES:
+            skipped += 1
+            continue
         records.append(parsed)
-    return records
+    return records, skipped
 
 
 def _public_conversation(conv: Dict[str, Any]) -> Dict[str, Any]:
@@ -548,7 +565,7 @@ def _filter_log_entries(
 def _log(args: argparse.Namespace) -> int:
     if args.limit < 1:
         fail("--limit must be a positive integer")
-    records = _read_ledger_records(_ledger_path())
+    records, skipped = _read_ledger_records(_ledger_path())
     entries = _filter_log_entries(
         _build_log_entries(records),
         project=args.project,
@@ -558,10 +575,17 @@ def _log(args: argparse.Namespace) -> int:
     if args.as_json:
         serialized = [_serialize_log_entry(entry, args.include_text) for entry in entries]
         print(json.dumps(serialized, indent=2, ensure_ascii=False))
-        return 0
-    for entry in entries:
-        for line in _format_log_entry_text(entry, args.include_text):
-            print(line)
+    else:
+        for entry in entries:
+            for line in _format_log_entry_text(entry, args.include_text):
+                print(line)
+    if skipped > 0:
+        noun = "record" if skipped == 1 else "records"
+        print(
+            f"Note: skipped {skipped} unknown ledger {noun}.",
+            file=sys.stderr,
+            flush=True,
+        )
     return 0
 
 
