@@ -742,7 +742,7 @@ test("an idle Codex session receives an Agent Request, answers and sends through
   assert.match(replyLines[1], /another agent/i);
   assert.equal(replyLines.slice(2).join("\n"), "Beta answer ready");
 
-  const noticeTurn = agentTurns.find((t) => t.startsWith(`[Agent Request ${demoReq2.request_id} to beta expired]`));
+  const noticeTurn = agentTurns.find((t) => t.startsWith(`[Agent Request ${demoReq2.request_id} to beta-claude expired]`));
   assert.ok(noticeTurn, `missing expiry notice turn in ${JSON.stringify(agentTurns)}`);
   const noticeLines = noticeTurn.split("\n");
   assert.match(noticeLines[1], /another agent/i);

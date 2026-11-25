@@ -216,7 +216,7 @@ test("an unanswered request expires at its timeout with ⚠️ on both request p
   assert.equal(notice.from, undefined);
   assert.equal(notice.expires_at, undefined);
   assert.equal(notice.depth, undefined);
-  assert.deepEqual(notice.target, { project: "beta", conversation_id: "beta-channel" });
+  assert.deepEqual(notice.target, { project: "beta", provider: "codex", conversation_id: "beta-channel" });
   assert.deepEqual(notice.post, { channel_id: "demo-channel", message_id: senderPost.id });
   assert.equal(typeof notice.delivery_id, "string");
   assert.ok(notice.delivery_id.length > 0);
@@ -271,6 +271,7 @@ test("an unanswered request expires at its timeout with ⚠️ on both request p
   assert.equal(threadNotice.outcome, "expired");
   assert.deepEqual(threadNotice.target, {
     project: "beta",
+    provider: "claude",
     conversation_id: "beta-thread-1",
     thread_id: "beta-thread-1",
     thread_name: "deploy-check",

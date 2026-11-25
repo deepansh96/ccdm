@@ -1021,7 +1021,7 @@ test("request record post failure marks the request failed, reacts ⚠️ if pos
   );
   assert.equal(senderNotice.outcome, "failed");
   assert.equal(senderNotice.post, null);
-  assert.deepEqual(senderNotice.target, { project: "beta", conversation_id: "beta-channel" });
+  assert.deepEqual(senderNotice.target, { project: "beta", provider: "codex", conversation_id: "beta-channel" });
   assert.equal(senderNotice.from, undefined);
   const ackNotice = await demo.request("agent_message_ack", { delivery_id: senderNotice.delivery_id });
   assert.equal(ackNotice.ok, true, JSON.stringify(ackNotice));
@@ -1069,7 +1069,7 @@ test("request record post failure marks the request failed, reacts ⚠️ if pos
   );
   assert.equal(receiverNotice.outcome, "failed");
   assert.deepEqual(receiverNotice.post, { channel_id: "demo-channel", message_id: senderOnlyPost.id });
-  assert.deepEqual(receiverNotice.target, { project: "beta", conversation_id: "beta-channel" });
+  assert.deepEqual(receiverNotice.target, { project: "beta", provider: "codex", conversation_id: "beta-channel" });
   assert.deepEqual(afterReceiverFail.reactions, [
     { authorization: `Bot ${ROOT_TOKEN}`, channelId: "demo-channel", emoji: encodeURIComponent("⚠️"), messageId: senderOnlyPost.id },
   ]);

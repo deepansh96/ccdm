@@ -22,7 +22,7 @@ const MAX_TIMEOUT_MINUTES = 120;
 const DEFAULT_MINUTE_MS = 60000;
 const DEFAULT_RATE_WINDOW_MS = 3600000;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
-const LEDGER_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const LEDGER_RETENTION_MINUTES = 30 * 24 * 60;
 const RECENT_REFUSALS = 20;
 const DEFAULT_LIMITS = Object.freeze({
   depth: 3,
@@ -66,6 +66,14 @@ function minuteMs(env = process.env) {
   return raw !== undefined && raw !== "" && Number.isFinite(value) && value > 0 ? value : DEFAULT_MINUTE_MS;
 }
 
+function retentionMs(env = process.env) {
+  return LEDGER_RETENTION_MINUTES * minuteMs(env);
+}
+
+function expiryRetryDelayMs(env = process.env) {
+  return Math.max(25, Math.min(5000, Math.round(minuteMs(env) / 4)));
+}
+
 function rateWindowMs(env = process.env) {
   const raw = env.CCDM_ROUTER_AGENT_MESSAGE_RATE_WINDOW_MS;
   const value = Number(raw);
@@ -95,6 +103,7 @@ function statusConversation(conversation) {
 function noticeTargetOf(conversation) {
   return {
     project: conversation.project,
+    provider: conversation.provider,
     conversation_id: conversation.conversation_id,
     ...(conversation.thread_id ? { thread_id: conversation.thread_id, thread_name: conversation.thread_name ?? null } : {}),
   };
@@ -560,16 +569,20 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
     if (closed) return;
     const expired = await withExchangeLock(exchange, async () => {
       if (closed || exchange.state !== "open") return false;
-      return transitionToExpired(exchange, { bestEffort: true });
+      const ok = await transitionToExpired(exchange, { bestEffort: true });
+      if (!ok && !closed && exchange.state === "open" && ledger.error() === null) {
+        scheduleExpiry(exchange, expiryRetryDelayMs());
+      }
+      return ok;
     });
     if (!expired) return;
     await withDeadline(null, () => notifyExpired(exchange));
   }
 
-  function scheduleExpiry(exchange) {
+  function scheduleExpiry(exchange, delayMs = null) {
     clearExpiry(exchange);
     if (closed || exchange.state !== "open") return;
-    const delay = Math.max(0, exchange.expires_at_ms - Date.now());
+    const delay = delayMs === null ? Math.max(0, exchange.expires_at_ms - Date.now()) : Math.max(0, delayMs);
     exchange.timer = setTimeout(() => {
       exchange.timer = null;
       expireRequest(exchange).catch(error => log?.(`agent_message_expire_failed id=${exchange.request_id} error=${error.message}`));
@@ -1241,7 +1254,7 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
 
     const now = Date.now();
     const rateCutoff = now - rateWindowMs();
-    const retentionCutoff = now - LEDGER_RETENTION_MS;
+    const retentionCutoff = now - retentionMs();
     const table = getTable?.() ?? null;
     const exchangeLastAtMs = new Map();
 
@@ -1392,9 +1405,22 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
       }
     }
 
+    const deliveryAtMs = new Map();
+    for (const record of readResult.records) {
+      if (record.type === "delivery") {
+        deliveryAtMs.set(record.delivery_id, Date.parse(record.at));
+      }
+    }
+
+    const isPendingKept = (delivery) => {
+      if (delivery.acked) return false;
+      if (exchanges.get(delivery.request_id)?.state === "open") return true;
+      return (deliveryAtMs.get(delivery.delivery_id) ?? 0) >= retentionCutoff;
+    };
+
     const pendingRequestIds = new Set();
     for (const delivery of deliveries.values()) {
-      if (!delivery.acked) pendingRequestIds.add(delivery.request_id);
+      if (isPendingKept(delivery)) pendingRequestIds.add(delivery.request_id);
     }
 
     const keptExchangeIds = new Set();
@@ -1407,8 +1433,13 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
 
     const keptRecords = readResult.records.filter(record => {
       if (record.type === "refusal") return Date.parse(record.at) >= retentionCutoff;
+      if (record.type === "delivery") {
+        const delivery = deliveries.get(record.delivery_id);
+        if (!delivery) return false;
+        if (!delivery.acked) return isPendingKept(delivery);
+        return exchanges.has(record.request_id) && keptExchangeIds.has(record.request_id);
+      }
       if (exchanges.has(record.request_id)) return keptExchangeIds.has(record.request_id);
-      if (record.type === "delivery") return deliveries.get(record.delivery_id)?.acked === false;
       if (record.type === "post") return Date.parse(record.at) >= retentionCutoff;
       return false;
     });
@@ -1417,7 +1448,8 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
       if (!keptExchangeIds.has(requestId)) exchanges.delete(requestId);
     }
     for (const [deliveryId, delivery] of [...deliveries.entries()]) {
-      if (delivery.acked && !keptExchangeIds.has(delivery.request_id)) deliveries.delete(deliveryId);
+      const keep = delivery.acked ? keptExchangeIds.has(delivery.request_id) : isPendingKept(delivery);
+      if (!keep) deliveries.delete(deliveryId);
     }
 
     if (readResult.exists) {
