@@ -627,12 +627,18 @@ test("Codex /clear keeps acknowledged queued Agent Reply and live Agent Request,
   );
 
   // Queue an Agent Reply, a live Agent Request, and a short-lived Agent Request behind busy-turn.
+  // Wait for each to be queued before sending the next so Router publishing order cannot reorder them.
   const replyRes = await beta.request("agent_reply", {
     request_id: outboundReq.request_id,
     text: "Reply that must survive /clear",
     idempotency_key: "codex-clear-reply-1",
   });
   assert.equal(replyRes.ok, true, JSON.stringify(replyRes));
+  await waitFor(
+    () => bridge.stdout.includes(`Queued reply ${outboundReq.request_id}`),
+    () => `queued Codex agent reply; stdout:\n${bridge.stdout}`,
+    15000,
+  );
 
   const liveReq = await beta.request("agent_request", {
     target: "demo",
@@ -641,22 +647,25 @@ test("Codex /clear keeps acknowledged queued Agent Reply and live Agent Request,
     idempotency_key: "codex-clear-live-req-1",
   });
   assert.equal(liveReq.ok, true, JSON.stringify(liveReq));
+  await waitFor(
+    () => bridge.stdout.includes(`Queued request ${liveReq.result.request_id}`),
+    () => `queued Codex live request; stdout:\n${bridge.stdout}`,
+    15000,
+  );
 
   const expiredReq = await beta.request("agent_request", {
     target: "demo",
     text: "Expired request that must be dropped",
-    timeout_minutes: 1,
+    timeout_minutes: 6,
     idempotency_key: "codex-clear-expired-req-1",
   });
   assert.equal(expiredReq.ok, true, JSON.stringify(expiredReq));
 
-  // Wait for all three to be queued in the bridge AND for expiredReq to expire.
+  // Wait for expiredReq to be queued in the bridge AND then expire before /clear.
   await waitFor(
-    () => bridge.stdout.includes(`Queued reply ${outboundReq.request_id}`)
-      && bridge.stdout.includes(`Queued request ${liveReq.result.request_id}`)
-      && bridge.stdout.includes(`Queued request ${expiredReq.result.request_id}`)
+    () => bridge.stdout.includes(`Queued request ${expiredReq.result.request_id}`)
       && beta.events.some((e) => e.event === "agent_message" && e.kind === "notice" && e.request_id === expiredReq.result.request_id),
-    () => `queued agent messages + expiry; stdout:\n${bridge.stdout}`,
+    () => `queued Codex expiring request + expiry; stdout:\n${bridge.stdout}`,
     15000,
   );
 
@@ -769,12 +778,18 @@ test("Gemini /clear keeps acknowledged queued Agent Reply and live Agent Request
   );
 
   // Queue an Agent Reply, a live Agent Request, and a short-lived Agent Request.
+  // Wait for each to be queued before sending the next so Router publishing order cannot reorder them.
   const replyRes = await beta.request("agent_reply", {
     request_id: outboundReq.request_id,
     text: "Gemini reply surviving /clear",
     idempotency_key: "gemini-clear-reply-1",
   });
   assert.equal(replyRes.ok, true, JSON.stringify(replyRes));
+  await waitFor(
+    () => bridge.stdout.includes(`Queued reply ${outboundReq.request_id}`),
+    () => `queued Gemini agent reply; stdout:\n${bridge.stdout}`,
+    15000,
+  );
 
   const liveReq = await beta.request("agent_request", {
     target: "demo",
@@ -783,21 +798,24 @@ test("Gemini /clear keeps acknowledged queued Agent Reply and live Agent Request
     idempotency_key: "gemini-clear-live-req-1",
   });
   assert.equal(liveReq.ok, true, JSON.stringify(liveReq));
+  await waitFor(
+    () => bridge.stdout.includes(`Queued request ${liveReq.result.request_id}`),
+    () => `queued Gemini live request; stdout:\n${bridge.stdout}`,
+    15000,
+  );
 
   const expiredReq = await beta.request("agent_request", {
     target: "demo",
     text: "Gemini expired request dropped",
-    timeout_minutes: 1,
+    timeout_minutes: 6,
     idempotency_key: "gemini-clear-expired-req-1",
   });
   assert.equal(expiredReq.ok, true, JSON.stringify(expiredReq));
 
   await waitFor(
-    () => bridge.stdout.includes(`Queued reply ${outboundReq.request_id}`)
-      && bridge.stdout.includes(`Queued request ${liveReq.result.request_id}`)
-      && bridge.stdout.includes(`Queued request ${expiredReq.result.request_id}`)
+    () => bridge.stdout.includes(`Queued request ${expiredReq.result.request_id}`)
       && beta.events.some((e) => e.event === "agent_message" && e.kind === "notice" && e.request_id === expiredReq.result.request_id),
-    () => `queued Gemini agent messages + expiry; stdout:\n${bridge.stdout}`,
+    () => `queued Gemini expiring request + expiry; stdout:\n${bridge.stdout}`,
     15000,
   );
 
