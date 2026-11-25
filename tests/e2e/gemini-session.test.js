@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { injectDiscordMessage, waitForState } from "./support/bridge.js";
+import { injectDiscordMessage, injectDiscordReaction, waitForState } from "./support/bridge.js";
 import { runScript } from "./support/runner.js";
 import { startFakeHost } from "./support/session-fixture.js";
 import { OWNER_ID, createRouterWorkspace, routerEnv, routerRegistry, routerWithWebhooks, runRouterCli } from "./support/router.js";
@@ -165,6 +165,34 @@ test("a Gemini turn that ends with text but no reply call posts that text", asyn
   const done = await waitForState(workspace, (next) => webhookContents(next).length > 0, 15000);
 
   assert.deepEqual(webhookContents(done), ["Here is the answer."]);
+});
+
+test("an owner reaction with any emoji on a Gemini reply reaches the next turn", async () => {
+  const workspace = await geminiSession({ turns: [{ reply: "Choose A or B" }, { reply: "chosen B" }] });
+
+  ownerMessage(workspace, "owner-1", "give me options");
+  const replied = await waitForState(workspace, (next) => webhookContents(next).includes("Choose A or B"), 15000);
+  const [reply] = replied.fixtures.discord.messages.filter((message) => message.content === "Choose A or B");
+  injectDiscordReaction(workspace, {
+    id: "choice-b",
+    channelId: "demo-channel",
+    emoji: "🇧",
+    messageId: reply.id,
+    user: { id: OWNER_ID, username: "Owner" },
+    message: {
+      author: { bot: true, id: "fake-webhook-1", username: "demo-gemini" },
+      webhookId: "fake-webhook-1",
+      content: "Choose A or B",
+      partial: true,
+    },
+  });
+  const done = await waitForState(workspace, (next) => webhookContents(next).includes("chosen B"), 15000);
+
+  assert.deepEqual(promptTexts(workspace), [
+    "give me options",
+    `User Owner reacted 🇧 to your message: "Choose A or B" (message ID: ${reply.id}).`,
+  ]);
+  assert.deepEqual(webhookContents(done), ["Choose A or B", "chosen B"]);
 });
 
 test("a failed Gemini prompt posts the error and the next message still runs", async () => {

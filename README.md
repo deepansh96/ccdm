@@ -300,6 +300,7 @@ scripts/ccdm start-gemini-session my-project
 
 - **Model and thinking level:** `gemini_model` (or `model`) and `gemini_effort` (`low`, `medium`, `high`, `xhigh`) in the project entry. Unset, the bridge uses `gemini-4-neon` at `high`. Any model `agy models` lists works, including a level suffix such as `gemini-4-neon-xhigh`. An unknown model fails the launch with the list agy offers.
 - **Messages during a turn:** ACP cannot steer a running turn. A message sent while Gemini works gets ⏳, and every waiting message goes into the next turn together.
+- **Reactions:** owner and guest reactions on Gemini's own messages become next-turn input with the emoji, message ID and a short excerpt. Recorded Conversation Reminders never start a turn.
 - **Tools:** agy's tool permission requests are approved automatically (`agy acp --dangerously-skip-permissions`), the way Codex sessions run with approvals off.
 - **Text replies:** a turn that ends with text but no successful `reply` call posts that text, so an answer is never lost. Set `"text_reply_fallback": false` in the project entry to turn this off, for the project and its Gemini threads.
 - **`/clear` and `/restart`:** `/clear` cancels any turn and opens a fresh agy session. A turn that ignores the cancel for 15 s stops the session (restart it) rather than leaving it stuck. `/restart` waits for agy itself to exit before relaunching.

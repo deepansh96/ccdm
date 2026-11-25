@@ -110,7 +110,6 @@ const AUDIO_TRANSCRIPTION_LANGUAGE = process.env.CODEX_BRIDGE_AUDIO_TRANSCRIPTIO
 const SESSION_REQUEST_TIMEOUT_MS = Number(process.env.GEMINI_SESSION_TIMEOUT_MS) || 120000;
 const DISCORD_REPLY_TOKEN = randomBytes(16).toString("hex");
 const DISCORD_MCP_NAME = `discord-${CHANNEL_ID}`;
-const FORWARDED_REACTIONS = new Set(["👍", "👎"]);
 const EFFORT_SUFFIX = /^(.+)-(low|medium|high|xhigh)$/;
 
 if (!ROUTER_KEY_FILE || !ROUTER_PROJECT || !CHANNEL_ID || !PROJECT_DIR) {
@@ -1100,7 +1099,7 @@ async function onDiscordReaction(event) {
     }).catch(() => {});
   }
   if (await reminderAdapter.isRecordedReminderMessage(reaction.message.id)) return;
-  if (!FORWARDED_REACTIONS.has(reaction.emoji.name) || !(await discordTransport.isOwnMessage(reaction.message))) return;
+  if (!(await discordTransport.isOwnMessage(reaction.message))) return;
   const excerptSource = reaction.message.content.trim().replace(/\s+/g, " ");
   const excerpt = excerptSource.length > 80 ? `${excerptSource.slice(0, 77)}...` : excerptSource;
   const text = `User ${user.globalName || user.username || user.id} reacted ${reaction.emoji.name} to your message${excerpt ? `: "${excerpt}"` : ""} (message ID: ${reaction.message.id}).`;
