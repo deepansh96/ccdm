@@ -810,11 +810,15 @@ test("with a torn last line, the Router starts cleanly with earlier exchanges in
     // 3. 2-day-old closed exchange -> should be kept by compaction.
     { v: 1, at: recentAt, type: "request", request_id: "req-recentcls001", from: demoConv, to: betaConv, from_channel_id: "demo-channel", to_channel_id: "beta-channel", from_launch: demoFp, to_launch: betaFp, text: "recent", depth: 1, expires_at: recentAt, idempotency_key: "recent-closed-req" },
     { v: 1, at: recentAt, type: "reply", request_id: "req-recentcls001", from: betaConv, to: demoConv, from_launch: betaFp, text: "recent answer", idempotency_key: "recent-closed-rep", delivered_to_live_session: true },
-    // 4. 31-day-old closed exchange WITH an unacked pending delivery -> pending delivery MUST be kept.
+    // 4. 31-day-old closed exchange WITH an unacked pending delivery -> dropped past retention.
     { v: 1, at: oldAt, type: "request", request_id: "req-oldpending01", from: demoConv, to: betaConv, from_channel_id: "demo-channel", to_channel_id: "beta-channel", from_launch: demoFp, to_launch: betaFp, text: "old pending", depth: 1, expires_at: oldAt, idempotency_key: "old-pending-req" },
     { v: 1, at: oldAt, type: "reply", request_id: "req-oldpending01", from: betaConv, to: demoConv, from_launch: betaFp, text: "old pending answer", idempotency_key: "old-pending-rep", delivered_to_live_session: false },
     { v: 1, at: oldAt, type: "delivery", delivery_id: "del-oldpending01", kind: "reply", request_id: "req-oldpending01", to: demoConv, to_launch: demoFp, from: betaConv, text: "old pending answer", ts: oldAt, post: null },
-    // 5. Open exchange -> MUST be kept across restarts.
+    // 5. 2-day-old closed exchange WITH an unacked pending delivery -> pending delivery MUST be kept.
+    { v: 1, at: recentAt, type: "request", request_id: "req-recentpend01", from: demoConv, to: betaConv, from_channel_id: "demo-channel", to_channel_id: "beta-channel", from_launch: demoFp, to_launch: betaFp, text: "recent pending", depth: 1, expires_at: recentAt, idempotency_key: "recent-pending-req" },
+    { v: 1, at: recentAt, type: "reply", request_id: "req-recentpend01", from: betaConv, to: demoConv, from_launch: betaFp, text: "recent pending answer", idempotency_key: "recent-pending-rep", delivered_to_live_session: false },
+    { v: 1, at: recentAt, type: "delivery", delivery_id: "del-recentpend01", kind: "reply", request_id: "req-recentpend01", to: demoConv, to_launch: demoFp, from: betaConv, text: "recent pending answer", ts: recentAt, post: null },
+    // 6. Open exchange -> MUST be kept across restarts.
     { v: 1, at: recentAt, type: "request", request_id: "req-stillopen001", from: demoConv, to: betaConv, from_channel_id: "demo-channel", to_channel_id: "beta-channel", from_launch: demoFp, to_launch: betaFp, text: "still open", depth: 1, expires_at: futureExpiry, idempotency_key: "still-open-req" },
   ];
   fs.writeFileSync(ledgerFile, `${seededLines.map((line) => JSON.stringify(line)).join("\n")}\n`, { mode: 0o600 });
@@ -844,12 +848,25 @@ test("with a torn last line, the Router starts cleanly with earlier exchanges in
   assert.equal(recentClosedReply.ok, false);
   assert.equal(recentClosedReply.error.code, "already_replied");
 
-  // 31-day-old pending delivery was kept -> delivered to demo's same launch.
-  const pendingOld = await waitFor(
-    () => demo3.events.find((event) => event.event === "agent_message" && event.delivery_id === "del-oldpending01"),
-    () => `demo3 old pending delivery: ${JSON.stringify(demo3.events)}`,
+  // 2-day-old pending delivery was kept -> delivered to demo's same launch, while 31-day-old closed pending delivery was dropped.
+  const pendingRecent = await waitFor(
+    () => demo3.events.find((event) => event.event === "agent_message" && event.delivery_id === "del-recentpend01"),
+    () => `demo3 recent pending delivery: ${JSON.stringify(demo3.events)}`,
   );
-  assert.equal(pendingOld.text, "old pending answer");
+  assert.equal(pendingRecent.text, "recent pending answer");
+  await fenceOwnerMessage(workspace, demo3, "demo-channel", "fence-demo3-old-pending-dropped");
+  assert.equal(
+    demo3.events.some((event) => event.event === "agent_message" && event.delivery_id === "del-oldpending01"),
+    false,
+    JSON.stringify(demo3.events),
+  );
+  const oldPendingReply = await beta3.request("agent_reply", {
+    request_id: "req-oldpending01",
+    text: "late",
+    idempotency_key: "check-old-pending",
+  });
+  assert.equal(oldPendingReply.ok, false);
+  assert.equal(oldPendingReply.error.code, "unknown_request");
 
   // Open exchange was kept -> answerable.
   const openReply = await beta3.request("agent_reply", {

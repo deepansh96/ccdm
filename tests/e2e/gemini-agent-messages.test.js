@@ -462,7 +462,7 @@ test("an Agent Reply and an expiry notice each arrive with their own header as p
   assert.match(replyLines[1], /another agent/i);
   assert.equal(replyLines.slice(2).join("\n"), "Beta answer for Gemini");
 
-  const noticePrompt = prompts.find((p) => p.startsWith(`[Agent Request ${req2.request_id} to beta expired]\n`));
+  const noticePrompt = prompts.find((p) => p.startsWith(`[Agent Request ${req2.request_id} to beta-claude expired]\n`));
   assert.ok(noticePrompt, `missing expiry notice prompt in ${JSON.stringify(prompts)}`);
   const noticeLines = noticePrompt.split("\n");
   assert.match(noticeLines[1], /another agent/i);
