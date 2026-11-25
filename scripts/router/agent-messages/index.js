@@ -10,6 +10,7 @@ const { OpError } = require("../ops/errors.js");
 const { createAgentMessageLedger } = require("./ledger.js");
 const {
   formatConversationLabel,
+  formatRecordChunks,
   formatRecordHeader,
   linkSuffixReserve,
   messageLink,
@@ -140,6 +141,29 @@ function checkOpenExchangeRoutes(table, exchange, from) {
 
 function isCapableListener(connection) {
   return Boolean(connection && connection.listener !== false && connection.capabilities?.has(CAPABILITY));
+}
+
+function normalizeContextPct(value) {
+  if (value === undefined || value === null) return undefined;
+  const num = Number(value);
+  return Number.isFinite(num) ? Math.round(num) : undefined;
+}
+
+function routeForConversation(table, conversation, expectedChannelId = null) {
+  const projectRoute = table?.projects?.get(conversation.project);
+  if (!projectRoute || projectRoute.remote) return null;
+  if (expectedChannelId && projectRoute.channel_id !== expectedChannelId) return null;
+  if (conversation.thread_id) {
+    return {
+      project: projectRoute.project,
+      type: conversation.provider,
+      channel_id: conversation.thread_id,
+      parent_channel_id: projectRoute.channel_id,
+      thread_id: conversation.thread_id,
+      webhook_id: projectRoute.webhook_id,
+    };
+  }
+  return { ...projectRoute, type: conversation.provider };
 }
 
 function errorSummary(error) {
@@ -456,15 +480,31 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
   async function markPost(channelId, messageId, emoji, requestId) {
     try {
       await reactMark(context, { channelId, messageId, emoji });
+      return true;
     } catch (error) {
-      if (isSettledMarkError(error)) return;
+      if (isSettledMarkError(error)) return true;
       log?.(`agent_message_mark_failed id=${requestId} channel=${channelId} message=${messageId} emoji=${emoji} error=${error.message}`);
+      return false;
     }
   }
 
-  async function enqueueDelivery({ kind, requestId, to, toLaunch, payload }) {
-    const deliveryId = mintId("del");
-    const recorded = await appendBestEffort({
+  async function markExchangePost(exchange, side, postRef, emoji) {
+    const key = `${side}:${emoji}`;
+    if (exchange.marks.has(key)) return;
+    const settled = await markPost(postRef.channel_id, postRef.message_id, emoji, exchange.request_id);
+    if (!settled) return;
+    exchange.marks.add(key);
+    await appendBestEffort({
+      type: "mark",
+      request_id: exchange.request_id,
+      side,
+      emoji,
+    });
+  }
+
+  async function enqueueDelivery({ deliveryId = mintId("del"), kind, requestId, to, toLaunch, payload }) {
+    if (deliveries.has(deliveryId)) return;
+    await appendBestEffort({
       type: "delivery",
       delivery_id: deliveryId,
       kind,
@@ -473,7 +513,7 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
       to_launch: toLaunch,
       ...payload,
     });
-    if (!recorded) return;
+    if (closed || deliveries.has(deliveryId)) return;
     const event = {
       event: "agent_message",
       delivery_id: deliveryId,
@@ -507,13 +547,14 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
     }
   }
 
-  async function sendNotice(exchange, { outcome, text }) {
+  async function sendNotice(exchange, { deliveryId, outcome, text }) {
     const ts = new Date().toISOString();
     const target = noticeTargetOf(exchange.to);
     const post = exchange.sender_post
       ? { channel_id: exchange.sender_post.channel_id, message_id: exchange.sender_post.message_id }
       : null;
     await enqueueDelivery({
+      ...(deliveryId ? { deliveryId } : {}),
       kind: "notice",
       requestId: exchange.request_id,
       to: exchange.from,
@@ -525,13 +566,14 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
   async function notifyFailed(exchange, reason) {
     if (closed) return;
     if (exchange.sender_post) {
-      await markPost(exchange.sender_post.channel_id, exchange.sender_post.message_id, MARK_FAILED, exchange.request_id);
+      await markExchangePost(exchange, "sender", exchange.sender_post, MARK_FAILED);
     }
     if (exchange.receiver_post) {
-      await markPost(exchange.receiver_post.channel_id, exchange.receiver_post.message_id, MARK_FAILED, exchange.request_id);
+      await markExchangePost(exchange, "receiver", exchange.receiver_post, MARK_FAILED);
     }
     if (closed) return;
     await sendNotice(exchange, {
+      deliveryId: exchange.fail_delivery_id,
       outcome: "failed",
       text: `Agent Request ${exchange.request_id} to ${formatConversationLabel(exchange.to)} failed: ${reason}`,
     });
@@ -539,11 +581,15 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
 
   async function failRequest(exchange, reason) {
     clearExpiry(exchange);
+    const failDeliveryId = mintId("del");
     exchange.state = "failed";
+    exchange.fail_reason = reason;
+    exchange.fail_delivery_id = failDeliveryId;
     await appendBestEffort({
       type: "failed",
       request_id: exchange.request_id,
       reason,
+      delivery_id: failDeliveryId,
     });
     await notifyFailed(exchange, reason);
   }
@@ -614,53 +660,68 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
       label: targetLabel,
       requestId: exchange.request_id,
     });
+    const senderReserve = linkSuffixReserve(guildId, exchange.to.conversation_id);
 
-    let senderPost;
-    if (await isThreadArchived(exchange.from)) {
-      await appendBestEffort({
-        type: "post",
-        request_id: exchange.request_id,
-        kind: "request",
-        side: "sender",
-        channel_id: exchange.from.conversation_id,
-        skipped: "thread_archived",
-      });
-      await failRequest(exchange, "sender thread is archived");
-      return;
-    }
-    try {
-      senderPost = await postWebhookRecord(context, {
-        route: senderRoute,
-        header: senderHeader,
-        text: exchange.text,
-        contextPct,
-        reserveHeaderChars: linkSuffixReserve(guildId, exchange.to.conversation_id),
-      });
-      exchange.sender_post = { channel_id: senderPost.channel_id, message_id: senderPost.message_id };
-      await appendBestEffort({
-        type: "post",
-        request_id: exchange.request_id,
-        kind: "request",
-        side: "sender",
-        channel_id: senderPost.channel_id,
-        message_id: senderPost.message_id,
-        message_ids: senderPost.message_ids,
-      });
-    } catch (error) {
-      if (error.firstMessageId) {
-        exchange.sender_post = { channel_id: exchange.from.conversation_id, message_id: error.firstMessageId };
+    let senderPost = exchange.sender_post
+      ? {
+        ...exchange.sender_post,
+        secret: null,
+        firstChunk: formatRecordChunks(senderHeader, exchange.text, { reserveHeaderChars: senderReserve })[0],
       }
-      await appendBestEffort({
-        type: "post",
-        request_id: exchange.request_id,
-        kind: "request",
-        side: "sender",
-        channel_id: exchange.from.conversation_id,
-        ...(isArchivedThreadError(error) ? { skipped: "thread_archived" } : { error: errorSummary(error) }),
-      });
-      log?.(`agent_message_post_failed id=${exchange.request_id} kind=request side=sender error=${error.message}`);
-      await failRequest(exchange, `sender record post failed: ${error.message}`);
-      return;
+      : null;
+
+    if (!senderPost) {
+      if (!senderRoute) {
+        await failRequest(exchange, `sender project ${exchange.from.project} is no longer available`);
+        return;
+      }
+      if (await isThreadArchived(exchange.from)) {
+        await appendBestEffort({
+          type: "post",
+          request_id: exchange.request_id,
+          kind: "request",
+          side: "sender",
+          channel_id: exchange.from.conversation_id,
+          skipped: "thread_archived",
+        });
+        await failRequest(exchange, "sender thread is archived");
+        return;
+      }
+      try {
+        senderPost = await postWebhookRecord(context, {
+          route: senderRoute,
+          header: senderHeader,
+          text: exchange.text,
+          contextPct,
+          reserveHeaderChars: senderReserve,
+        });
+        exchange.sender_post = { channel_id: senderPost.channel_id, message_id: senderPost.message_id };
+        await appendBestEffort({
+          type: "post",
+          request_id: exchange.request_id,
+          kind: "request",
+          side: "sender",
+          channel_id: senderPost.channel_id,
+          message_id: senderPost.message_id,
+          message_ids: senderPost.message_ids,
+        });
+      } catch (error) {
+        if (error.firstMessageId) {
+          exchange.sender_post = { channel_id: exchange.from.conversation_id, message_id: error.firstMessageId };
+        }
+        await appendBestEffort({
+          type: "post",
+          request_id: exchange.request_id,
+          kind: "request",
+          side: "sender",
+          channel_id: exchange.from.conversation_id,
+          ...(error.firstMessageId ? { message_id: error.firstMessageId } : {}),
+          ...(isArchivedThreadError(error) ? { skipped: "thread_archived" } : { error: errorSummary(error) }),
+        });
+        log?.(`agent_message_post_failed id=${exchange.request_id} kind=request side=sender error=${error.message}`);
+        await failRequest(exchange, `sender record post failed: ${error.message}`);
+        return;
+      }
     }
 
     const senderUrl = messageLink(guildId, senderPost.channel_id, senderPost.message_id);
@@ -672,47 +733,49 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
       counterpartUrl: senderUrl,
     });
 
-    let receiverPost;
-    if (await isThreadArchived(exchange.to)) {
-      await appendBestEffort({
-        type: "post",
-        request_id: exchange.request_id,
-        kind: "request",
-        side: "receiver",
-        channel_id: exchange.to.conversation_id,
-        skipped: "thread_archived",
-      });
-      await failRequest(exchange, "receiver thread is archived");
-      return;
-    }
-    try {
-      receiverPost = await postBotRecord(context, {
-        channelId: exchange.to.conversation_id,
-        header: receiverHeader,
-        text: exchange.text,
-      });
-      exchange.receiver_post = { channel_id: receiverPost.channel_id, message_id: receiverPost.message_id };
-      await appendBestEffort({
-        type: "post",
-        request_id: exchange.request_id,
-        kind: "request",
-        side: "receiver",
-        channel_id: receiverPost.channel_id,
-        message_id: receiverPost.message_id,
-        message_ids: receiverPost.message_ids,
-      });
-    } catch (error) {
-      await appendBestEffort({
-        type: "post",
-        request_id: exchange.request_id,
-        kind: "request",
-        side: "receiver",
-        channel_id: exchange.to.conversation_id,
-        ...(isArchivedThreadError(error) ? { skipped: "thread_archived" } : { error: errorSummary(error) }),
-      });
-      log?.(`agent_message_post_failed id=${exchange.request_id} kind=request side=receiver error=${error.message}`);
-      await failRequest(exchange, `receiver record post failed: ${error.message}`);
-      return;
+    let receiverPost = exchange.receiver_post ? { ...exchange.receiver_post } : null;
+    if (!receiverPost) {
+      if (await isThreadArchived(exchange.to)) {
+        await appendBestEffort({
+          type: "post",
+          request_id: exchange.request_id,
+          kind: "request",
+          side: "receiver",
+          channel_id: exchange.to.conversation_id,
+          skipped: "thread_archived",
+        });
+        await failRequest(exchange, "receiver thread is archived");
+        return;
+      }
+      try {
+        receiverPost = await postBotRecord(context, {
+          channelId: exchange.to.conversation_id,
+          header: receiverHeader,
+          text: exchange.text,
+        });
+        exchange.receiver_post = { channel_id: receiverPost.channel_id, message_id: receiverPost.message_id };
+        await appendBestEffort({
+          type: "post",
+          request_id: exchange.request_id,
+          kind: "request",
+          side: "receiver",
+          channel_id: receiverPost.channel_id,
+          message_id: receiverPost.message_id,
+          message_ids: receiverPost.message_ids,
+        });
+      } catch (error) {
+        await appendBestEffort({
+          type: "post",
+          request_id: exchange.request_id,
+          kind: "request",
+          side: "receiver",
+          channel_id: exchange.to.conversation_id,
+          ...(isArchivedThreadError(error) ? { skipped: "thread_archived" } : { error: errorSummary(error) }),
+        });
+        log?.(`agent_message_post_failed id=${exchange.request_id} kind=request side=receiver error=${error.message}`);
+        await failRequest(exchange, `receiver record post failed: ${error.message}`);
+        return;
+      }
     }
 
     const receiverUrl = messageLink(guildId, receiverPost.channel_id, receiverPost.message_id);
@@ -723,9 +786,10 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
       requestId: exchange.request_id,
       counterpartUrl: receiverUrl,
     });
-    if (!(await isThreadArchived(exchange.from))) {
+    if (senderRoute && !(await isThreadArchived(exchange.from))) {
       try {
         await editWebhookRecord({
+          context,
           route: senderRoute,
           secret: senderPost.secret,
           messageId: senderPost.message_id,
@@ -737,8 +801,10 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
       }
     }
 
+    if (closed || exchange.state !== "open" || Date.now() >= exchange.expires_at_ms) return;
     const post = { channel_id: receiverPost.channel_id, message_id: receiverPost.message_id };
     await enqueueDelivery({
+      ...(exchange.request_delivery_id ? { deliveryId: exchange.request_delivery_id } : {}),
       kind: "request",
       requestId: exchange.request_id,
       to: exchange.to,
@@ -763,45 +829,69 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
       label: senderLabel,
       requestId: exchange.request_id,
     });
+    const replierReserve = linkSuffixReserve(guildId, exchange.from.conversation_id);
 
-    let replierPost = null;
-    if (await isThreadArchived(from)) {
-      await appendBestEffort({
-        type: "post",
-        request_id: exchange.request_id,
-        kind: "reply",
-        side: "sender",
-        channel_id: from.conversation_id,
-        skipped: "thread_archived",
-      });
-    } else {
-      try {
-        replierPost = await postWebhookRecord(context, {
-          route: replierRoute,
-          header: replierHeader,
-          text,
-          contextPct,
-          reserveHeaderChars: linkSuffixReserve(guildId, exchange.from.conversation_id),
-        });
-        await appendBestEffort({
-          type: "post",
-          request_id: exchange.request_id,
-          kind: "reply",
-          side: "sender",
-          channel_id: replierPost.channel_id,
-          message_id: replierPost.message_id,
-          message_ids: replierPost.message_ids,
-        });
-      } catch (error) {
+    let replierPost = exchange.reply_sender_post
+      ? {
+        ...exchange.reply_sender_post,
+        secret: null,
+        firstChunk: formatRecordChunks(replierHeader, text, { reserveHeaderChars: replierReserve })[0],
+      }
+      : null;
+
+    if (!exchange.reply_sender_post_done) {
+      if (!replierRoute) {
+        exchange.reply_sender_post_done = true;
         await appendBestEffort({
           type: "post",
           request_id: exchange.request_id,
           kind: "reply",
           side: "sender",
           channel_id: from.conversation_id,
-          ...(isArchivedThreadError(error) ? { skipped: "thread_archived" } : { error: errorSummary(error) }),
+          error: { message: `sender project ${from.project} is no longer available` },
         });
-        log?.(`agent_message_post_failed id=${exchange.request_id} kind=reply side=sender error=${error.message}`);
+      } else if (await isThreadArchived(from)) {
+        exchange.reply_sender_post_done = true;
+        await appendBestEffort({
+          type: "post",
+          request_id: exchange.request_id,
+          kind: "reply",
+          side: "sender",
+          channel_id: from.conversation_id,
+          skipped: "thread_archived",
+        });
+      } else {
+        try {
+          replierPost = await postWebhookRecord(context, {
+            route: replierRoute,
+            header: replierHeader,
+            text,
+            contextPct,
+            reserveHeaderChars: replierReserve,
+          });
+          exchange.reply_sender_post = { channel_id: replierPost.channel_id, message_id: replierPost.message_id };
+          exchange.reply_sender_post_done = true;
+          await appendBestEffort({
+            type: "post",
+            request_id: exchange.request_id,
+            kind: "reply",
+            side: "sender",
+            channel_id: replierPost.channel_id,
+            message_id: replierPost.message_id,
+            message_ids: replierPost.message_ids,
+          });
+        } catch (error) {
+          exchange.reply_sender_post_done = true;
+          await appendBestEffort({
+            type: "post",
+            request_id: exchange.request_id,
+            kind: "reply",
+            side: "sender",
+            channel_id: from.conversation_id,
+            ...(isArchivedThreadError(error) ? { skipped: "thread_archived" } : { error: errorSummary(error) }),
+          });
+          log?.(`agent_message_post_failed id=${exchange.request_id} kind=reply side=sender error=${error.message}`);
+        }
       }
     }
 
@@ -814,46 +904,52 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
       counterpartUrl: replierUrl,
     });
 
-    let receiverPost = null;
-    if (await isThreadArchived(exchange.from)) {
-      await appendBestEffort({
-        type: "post",
-        request_id: exchange.request_id,
-        kind: "reply",
-        side: "receiver",
-        channel_id: exchange.from.conversation_id,
-        skipped: "thread_archived",
-      });
-    } else {
-      try {
-        receiverPost = await postBotRecord(context, {
-          channelId: exchange.from.conversation_id,
-          header: receiverHeader,
-          text,
-        });
-        await appendBestEffort({
-          type: "post",
-          request_id: exchange.request_id,
-          kind: "reply",
-          side: "receiver",
-          channel_id: receiverPost.channel_id,
-          message_id: receiverPost.message_id,
-          message_ids: receiverPost.message_ids,
-        });
-      } catch (error) {
+    let receiverPost = exchange.reply_receiver_post ? { ...exchange.reply_receiver_post } : null;
+    if (!exchange.reply_receiver_post_done) {
+      if (await isThreadArchived(exchange.from)) {
+        exchange.reply_receiver_post_done = true;
         await appendBestEffort({
           type: "post",
           request_id: exchange.request_id,
           kind: "reply",
           side: "receiver",
           channel_id: exchange.from.conversation_id,
-          ...(isArchivedThreadError(error) ? { skipped: "thread_archived" } : { error: errorSummary(error) }),
+          skipped: "thread_archived",
         });
-        log?.(`agent_message_post_failed id=${exchange.request_id} kind=reply side=receiver error=${error.message}`);
+      } else {
+        try {
+          receiverPost = await postBotRecord(context, {
+            channelId: exchange.from.conversation_id,
+            header: receiverHeader,
+            text,
+          });
+          exchange.reply_receiver_post = { channel_id: receiverPost.channel_id, message_id: receiverPost.message_id };
+          exchange.reply_receiver_post_done = true;
+          await appendBestEffort({
+            type: "post",
+            request_id: exchange.request_id,
+            kind: "reply",
+            side: "receiver",
+            channel_id: receiverPost.channel_id,
+            message_id: receiverPost.message_id,
+            message_ids: receiverPost.message_ids,
+          });
+        } catch (error) {
+          exchange.reply_receiver_post_done = true;
+          await appendBestEffort({
+            type: "post",
+            request_id: exchange.request_id,
+            kind: "reply",
+            side: "receiver",
+            channel_id: exchange.from.conversation_id,
+            ...(isArchivedThreadError(error) ? { skipped: "thread_archived" } : { error: errorSummary(error) }),
+          });
+          log?.(`agent_message_post_failed id=${exchange.request_id} kind=reply side=receiver error=${error.message}`);
+        }
       }
     }
 
-    if (replierPost && receiverPost && !(await isThreadArchived(from))) {
+    if (replierPost && receiverPost && replierRoute && !(await isThreadArchived(from))) {
       const receiverUrl = messageLink(guildId, receiverPost.channel_id, receiverPost.message_id);
       const linkedReplierHeader = formatRecordHeader({
         kind: "reply",
@@ -864,6 +960,7 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
       });
       try {
         await editWebhookRecord({
+          context,
           route: replierRoute,
           secret: replierPost.secret,
           messageId: replierPost.message_id,
@@ -876,20 +973,61 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
     }
 
     if (exchange.sender_post) {
-      await markPost(exchange.sender_post.channel_id, exchange.sender_post.message_id, MARK_REPLIED, exchange.request_id);
+      await markExchangePost(exchange, "sender", exchange.sender_post, MARK_REPLIED);
     }
     if (exchange.receiver_post) {
-      await markPost(exchange.receiver_post.channel_id, exchange.receiver_post.message_id, MARK_REPLIED, exchange.request_id);
+      await markExchangePost(exchange, "receiver", exchange.receiver_post, MARK_REPLIED);
     }
 
+    if (closed) return;
     const post = receiverPost ? { channel_id: receiverPost.channel_id, message_id: receiverPost.message_id } : null;
     await enqueueDelivery({
+      ...(exchange.reply_delivery_id ? { deliveryId: exchange.reply_delivery_id } : {}),
       kind: "reply",
       requestId: exchange.request_id,
       to: exchange.from,
       toLaunch: exchange.from_launch,
       payload: { from, text, ts, post },
     });
+  }
+
+  async function recoverRequestPublish(exchange) {
+    if (context.gatewayReady) await context.gatewayReady;
+    if (closed || exchange.state !== "open" || Date.now() >= exchange.expires_at_ms) return;
+    const table = getTable?.() ?? null;
+    const targetRoute = table?.projects.get(exchange.to.project);
+    if (!targetRoute || targetRoute.remote || targetRoute.channel_id !== exchange.to_channel_id) {
+      await withDeadline(null, () => failRequest(exchange, `target project ${exchange.to.project} is no longer available`));
+      return;
+    }
+    const senderRoute = routeForConversation(table, exchange.from, exchange.from_channel_id);
+    await withDeadline(null, () => publishRequest(exchange, {
+      guildId: table?.guildId ?? null,
+      senderRoute,
+      contextPct: exchange.context_pct,
+    }));
+  }
+
+  async function recoverReplyPublish(exchange) {
+    if (context.gatewayReady) await context.gatewayReady;
+    if (closed || exchange.state !== "replied" || !exchange.reply_info) return;
+    const table = getTable?.() ?? null;
+    const { from, text, ts, contextPct } = exchange.reply_info;
+    const replierRoute = routeForConversation(table, from, exchange.to_channel_id);
+    await withDeadline(null, () => publishReply(exchange, {
+      guildId: table?.guildId ?? null,
+      replierRoute,
+      from,
+      text,
+      contextPct,
+      ts,
+    }));
+  }
+
+  async function recoverFailedNotice(exchange) {
+    if (context.gatewayReady) await context.gatewayReady;
+    if (closed || exchange.state !== "failed") return;
+    await withDeadline(null, () => notifyFailed(exchange, exchange.fail_reason ?? "request failed"));
   }
 
   async function publishUndelivered({ requestId, from, to, text, code, senderRoute, contextPct }) {
@@ -1039,10 +1177,13 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
         const toLaunch = targetListener.keyFingerprint;
         const targetProjectRoute = ctx.table.projects.get(to.project);
 
+        const requestDeliveryId = mintId("del");
+        const contextPct = normalizeContextPct(args.context_pct);
         await ledger.append({
           type: "request",
           at: ts,
           request_id: requestId,
+          delivery_id: requestDeliveryId,
           from,
           to,
           from_channel_id: senderRoute.channel_id,
@@ -1053,11 +1194,14 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
           depth,
           expires_at: expiresAt,
           idempotency_key: args.idempotency_key,
+          ...(contextPct !== undefined ? { context_pct: contextPct } : {}),
         });
         recordRate(from.project, now);
 
         const exchange = {
           request_id: requestId,
+          request_delivery_id: requestDeliveryId,
+          context_pct: contextPct,
           state: "open",
           from,
           to,
@@ -1072,6 +1216,16 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
           expires_at_ms: expiresAtMs,
           sender_post: null,
           receiver_post: null,
+          reply_info: null,
+          reply_delivery_id: null,
+          reply_sender_post: null,
+          reply_sender_post_done: false,
+          reply_receiver_post: null,
+          reply_receiver_post_done: false,
+          fail_reason: null,
+          fail_delivery_id: null,
+          fail_at_ms: null,
+          marks: new Set(),
           postReady: null,
           timer: null,
           lock: null,
@@ -1145,12 +1299,16 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
         const routeMismatch = checkOpenExchangeRoutes(ctx.table, exchange, from);
         if (routeMismatch) {
           clearExpiry(exchange);
+          const failDeliveryId = mintId("del");
           await ledger.append({
             type: "failed",
             request_id: exchange.request_id,
             reason: routeMismatch,
+            delivery_id: failDeliveryId,
           });
           exchange.state = "failed";
+          exchange.fail_reason = routeMismatch;
+          exchange.fail_delivery_id = failDeliveryId;
           const message = `request ${args.request_id} failed: ${routeMismatch}`;
           await recordRefusal({
             op: "agent_reply", from, to: exchange.from, requestId: args.request_id,
@@ -1176,20 +1334,27 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
           isCapableListener(senderListener) && senderListener.keyFingerprint === exchange.from_launch,
         );
         const ts = new Date().toISOString();
+        const replyDeliveryId = mintId("del");
+        const contextPct = normalizeContextPct(args.context_pct);
 
         await ledger.append({
           type: "reply",
+          at: ts,
           request_id: exchange.request_id,
+          delivery_id: replyDeliveryId,
           from,
           to: exchange.from,
           from_launch: fromLaunch,
           text: args.text,
           idempotency_key: args.idempotency_key,
           delivered_to_live_session: deliveredToLive,
+          ...(contextPct !== undefined ? { context_pct: contextPct } : {}),
         });
 
         clearExpiry(exchange);
         exchange.state = "replied";
+        exchange.reply_delivery_id = replyDeliveryId;
+        exchange.reply_info = { from, text: args.text, ts, contextPct };
         const guildId = ctx.table.guildId;
         const replierRoute = ctx.session.route;
         withDeadline(null, () => publishReply(exchange, {
@@ -1275,6 +1440,7 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
     const retentionCutoff = now - retentionMs();
     const table = getTable?.() ?? null;
     const exchangeLastAtMs = new Map();
+    const ackedDeliveryIds = new Set();
 
     const addRateTimestamp = (project, atMs) => {
       if (atMs <= rateCutoff) return;
@@ -1300,6 +1466,8 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
               : record.to.conversation_id);
           exchanges.set(record.request_id, {
             request_id: record.request_id,
+            request_delivery_id: record.delivery_id ?? null,
+            context_pct: record.context_pct,
             state: "open",
             from: record.from,
             to: record.to,
@@ -1314,6 +1482,16 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
             expires_at_ms: Date.parse(record.expires_at),
             sender_post: null,
             receiver_post: null,
+            reply_info: null,
+            reply_delivery_id: null,
+            reply_sender_post: null,
+            reply_sender_post_done: false,
+            reply_receiver_post: null,
+            reply_receiver_post_done: false,
+            fail_reason: null,
+            fail_delivery_id: null,
+            fail_at_ms: null,
+            marks: new Set(),
             postReady: Promise.resolve(),
             timer: null,
             lock: null,
@@ -1336,14 +1514,27 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
           break;
         }
         case "post": {
-          if (record.kind === "request" && record.message_id) {
-            const exchange = exchanges.get(record.request_id);
-            if (exchange) {
-              const postRef = { channel_id: record.channel_id, message_id: record.message_id };
+          const exchange = exchanges.get(record.request_id);
+          if (exchange) {
+            const postRef = record.message_id ? { channel_id: record.channel_id, message_id: record.message_id } : null;
+            if (record.kind === "request" && postRef) {
               if (record.side === "sender") exchange.sender_post = postRef;
               else if (record.side === "receiver") exchange.receiver_post = postRef;
+            } else if (record.kind === "reply") {
+              if (record.side === "sender") {
+                if (postRef) exchange.reply_sender_post = postRef;
+                exchange.reply_sender_post_done = true;
+              } else if (record.side === "receiver") {
+                if (postRef) exchange.reply_receiver_post = postRef;
+                exchange.reply_receiver_post_done = true;
+              }
             }
           }
+          break;
+        }
+        case "mark": {
+          const exchange = exchanges.get(record.request_id);
+          if (exchange) exchange.marks.add(`${record.side}:${record.emoji}`);
           break;
         }
         case "delivery": {
@@ -1370,13 +1561,23 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
           break;
         }
         case "ack": {
+          ackedDeliveryIds.add(record.delivery_id);
           const delivery = deliveries.get(record.delivery_id);
           if (delivery) delivery.acked = true;
           break;
         }
         case "reply": {
           const exchange = exchanges.get(record.request_id);
-          if (exchange) exchange.state = "replied";
+          if (exchange) {
+            exchange.state = "replied";
+            exchange.reply_delivery_id = record.delivery_id ?? null;
+            exchange.reply_info = {
+              from: record.from,
+              text: record.text,
+              ts: record.at,
+              contextPct: record.context_pct,
+            };
+          }
           if (now - atMs < IDEMPOTENCY_TTL_MS) {
             const cacheKey = idempotencyKeyFromParts(
               "agent_reply", record.from.project, record.from.conversation_id, record.from_launch, record.idempotency_key,
@@ -1399,7 +1600,12 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
         }
         case "failed": {
           const exchange = exchanges.get(record.request_id);
-          if (exchange) exchange.state = "failed";
+          if (exchange) {
+            exchange.state = "failed";
+            exchange.fail_reason = record.reason ?? null;
+            exchange.fail_delivery_id = record.delivery_id ?? null;
+            exchange.fail_at_ms = atMs;
+          }
           break;
         }
         case "refusal": {
@@ -1465,9 +1671,13 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
     for (const requestId of [...exchanges.keys()]) {
       if (!keptExchangeIds.has(requestId)) exchanges.delete(requestId);
     }
+    const droppedDeliveryIds = new Set();
     for (const [deliveryId, delivery] of [...deliveries.entries()]) {
       const keep = delivery.acked ? keptExchangeIds.has(delivery.request_id) : isPendingKept(delivery);
-      if (!keep) deliveries.delete(deliveryId);
+      if (!keep) {
+        deliveries.delete(deliveryId);
+        if (!delivery.acked) droppedDeliveryIds.add(deliveryId);
+      }
     }
 
     if (readResult.exists) {
@@ -1490,6 +1700,41 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
         expireRequest(exchange).catch(error => log?.(`agent_message_expire_failed id=${exchange.request_id} error=${error.message}`));
       } else {
         scheduleExpiry(exchange);
+      }
+    }
+
+    for (const exchange of exchanges.values()) {
+      if (
+        exchange.state === "open"
+        && exchange.expires_at_ms > startNow
+        && exchange.request_delivery_id
+        && !deliveries.has(exchange.request_delivery_id)
+        && !ackedDeliveryIds.has(exchange.request_delivery_id)
+        && !droppedDeliveryIds.has(exchange.request_delivery_id)
+      ) {
+        exchange.postReady = recoverRequestPublish(exchange)
+          .catch(error => log?.(`agent_message_recover_request_failed id=${exchange.request_id} error=${error.message}`));
+      } else if (
+        exchange.state === "replied"
+        && exchange.reply_delivery_id
+        && exchange.reply_info
+        && Date.parse(exchange.reply_info.ts) >= retentionCutoff
+        && !deliveries.has(exchange.reply_delivery_id)
+        && !ackedDeliveryIds.has(exchange.reply_delivery_id)
+        && !droppedDeliveryIds.has(exchange.reply_delivery_id)
+      ) {
+        recoverReplyPublish(exchange)
+          .catch(error => log?.(`agent_message_recover_reply_failed id=${exchange.request_id} error=${error.message}`));
+      } else if (
+        exchange.state === "failed"
+        && exchange.fail_delivery_id
+        && (exchange.fail_at_ms ?? 0) >= retentionCutoff
+        && !deliveries.has(exchange.fail_delivery_id)
+        && !ackedDeliveryIds.has(exchange.fail_delivery_id)
+        && !droppedDeliveryIds.has(exchange.fail_delivery_id)
+      ) {
+        recoverFailedNotice(exchange)
+          .catch(error => log?.(`agent_message_recover_failed_notice_failed id=${exchange.request_id} error=${error.message}`));
       }
     }
   }

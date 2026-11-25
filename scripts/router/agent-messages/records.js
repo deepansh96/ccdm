@@ -57,14 +57,16 @@ async function postBotRecord(context, { channelId, header, text }) {
   return { channel_id: channelId, message_id: ids[0], message_ids: ids };
 }
 
-async function editWebhookRecord({ route, secret, messageId, firstChunk, updatedHeader }) {
-  await discordRequest("PATCH", `/webhooks/${secret.webhook_id}/${secret.token}/messages/${messageId}`, {
+async function editWebhookRecord({ context, route, secret, messageId, firstChunk, updatedHeader }) {
+  const patch = activeSecret => discordRequest("PATCH", `/webhooks/${activeSecret.webhook_id}/${activeSecret.token}/messages/${messageId}`, {
     query: threadQuery(route),
     body: {
       content: withCounterpartLink(firstChunk, updatedHeader),
       allowed_mentions: ALLOWED_MENTIONS,
     },
   });
+  if (secret) return patch(secret);
+  return withProjectWebhook({ ...context, session: { route } }, patch);
 }
 
 async function reactMark(context, { channelId, messageId, emoji }) {

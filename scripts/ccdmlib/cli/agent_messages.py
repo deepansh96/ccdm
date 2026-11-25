@@ -27,6 +27,7 @@ _KNOWN_RECORD_TYPES = frozenset((
     "reply",
     "expired",
     "failed",
+    "mark",
 ))
 _VALID_OPS = frozenset(("agent_request", "agent_reply"))
 _VALID_POST_KINDS = frozenset(("request", "reply"))
@@ -307,6 +308,14 @@ def _validate_ledger_record(record: Any) -> Optional[str]:
     if rec_type in ("expired", "failed"):
         if not _is_non_empty_str(record.get("request_id")):
             return f"{rec_type} missing request_id"
+        return None
+    if rec_type == "mark":
+        if not _is_non_empty_str(record.get("request_id")):
+            return "mark missing request_id"
+        if record.get("side") not in _VALID_POST_SIDES:
+            return "mark invalid side"
+        if not _is_non_empty_str(record.get("emoji")):
+            return "mark missing emoji"
         return None
     return f"unknown record type: {rec_type}"
 
