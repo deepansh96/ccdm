@@ -22,6 +22,7 @@ _KNOWN_RECORD_TYPES = frozenset((
     "request",
     "refusal",
     "post",
+    "post_chunk",
     "delivery",
     "ack",
     "reply",
@@ -278,6 +279,27 @@ def _validate_ledger_record(record: Any) -> Optional[str]:
             return "post invalid kind or side"
         if not _is_non_empty_str(record.get("channel_id")):
             return "post missing channel_id"
+        return None
+    if rec_type == "post_chunk":
+        if not _is_non_empty_str(record.get("request_id")):
+            return "post_chunk missing request_id"
+        if record.get("kind") not in _VALID_POST_KINDS or record.get("side") not in _VALID_POST_SIDES:
+            return "post_chunk invalid kind or side"
+        if not _is_non_empty_str(record.get("channel_id")):
+            return "post_chunk missing channel_id"
+        chunk_index = record.get("chunk_index")
+        if isinstance(chunk_index, bool) or not isinstance(chunk_index, int) or chunk_index < 0:
+            return "post_chunk invalid chunk_index"
+        chunk_count = record.get("chunk_count")
+        if (
+            isinstance(chunk_count, bool)
+            or not isinstance(chunk_count, int)
+            or chunk_count < 1
+            or chunk_index >= chunk_count
+        ):
+            return "post_chunk invalid chunk_count"
+        if not _is_non_empty_str(record.get("message_id")):
+            return "post_chunk missing message_id"
         return None
     if rec_type == "delivery":
         if not _is_non_empty_str(record.get("delivery_id")):

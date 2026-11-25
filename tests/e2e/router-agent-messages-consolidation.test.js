@@ -225,7 +225,7 @@ test("D+B: crash recovery of a 4000-character Agent Request posts multi-chunk co
   assert.match(senderMsgs[0].content, new RegExp(`\\[counterpart\\]\\(https://discord\\.com/channels/guild-id/beta-channel/${receiverMsgs[0].id}\\)`));
 });
 
-test("C+B: startup recovery never resurrects an unpublished closed-exchange reply past retention", async () => {
+test("C+B: startup recovery never resurrects an unpublished closed-exchange reply past retention when the exchange is kept by a recent record", async () => {
   const workspace = createRouterWorkspace(routerRegistry({
     demo: { channel_id: "demo-channel", type: "claude", transport: "router", agent_message_targets: ["beta"] },
     beta: { channel_id: "beta-channel", type: "codex", transport: "router" },
@@ -251,9 +251,18 @@ test("C+B: startup recovery never resurrects an unpublished closed-exchange repl
   await demo1.close();
   await waitForDisconnect(workspace, "demo");
 
-  // Hold beta's reply webhook so the Router crashes after accepting `reply` but before writing `delivery`.
+  // Hold beta's reply webhook for 2.2s so the `reply` record is written at t=0
+  // while its `post` record lands at t~2.2s, and hold demo's bot post so the
+  // Router crashes before writing `delivery`.
   const betaWebhookPath = webhookExecutePath(workspace, "beta-channel");
-  holdDiscordPath(workspace, { method: "POST", apiPath: betaWebhookPath });
+  const demoBotPath = "/api/v10/channels/demo-channel/messages";
+  updateState(workspace.stateDir, (state) => {
+    state.fixtures.discord.rateLimits = [
+      { method: "POST", path: betaWebhookPath, count: 1, retryAfter: 2.2 },
+      { method: "POST", path: demoBotPath, count: 1, retryAfter: 10 },
+    ];
+    state.fixtures.discord.rateLimitHits = [];
+  });
 
   const replied = await beta1.request("agent_reply", {
     request_id: reqId,
@@ -261,22 +270,103 @@ test("C+B: startup recovery never resurrects an unpublished closed-exchange repl
     idempotency_key: "consolidation-cb-rep-1",
   });
   assert.equal(replied.ok, true, JSON.stringify(replied));
-  await waitForHoldHit(workspace, betaWebhookPath);
+
+  // Wait for beta's reply webhook post to land (~2.2s later) and demo's bot post to hit its hold.
+  await waitForHoldHit(workspace, demoBotPath);
+  assert.equal((readState(workspace.stateDir).fixtures.discord.messages ?? []).length, 3);
 
   await beta1.close();
   killRouter(router);
   await router.closed;
   clearDiscordHolds(workspace);
 
-  // Wait past shortened retention window (43200 * 0.08ms = 3456ms), then restart.
-  await new Promise((resolve) => setTimeout(resolve, 3800));
+  // Wait 1.6s (total ~3.8s since `reply`, only ~1.6s since the recent `post`).
+  // With retention = 43200 * 0.08ms = 3456ms, the exchange is KEPT because of
+  // its recent `post`, while the `reply` itself is OLDER than retention!
+  await new Promise((resolve) => setTimeout(resolve, 1600));
   router = await startRouter(workspace, {
     env: { CCDM_ROUTER_AGENT_MESSAGE_MINUTE_MS: "0.08" },
   });
 
-  // Reconnect demo with the same launch key: must receive nothing and no reply records should be resurrected.
+  // Prove the exchange WAS kept across compaction (retrying reply returns already_replied, not unknown_request).
+  const beta2 = await connectAgentProject(workspace, "beta", "beta-key");
+  const dupReply = await beta2.request("agent_reply", {
+    request_id: reqId,
+    text: "Check exchange still kept",
+    idempotency_key: "consolidation-cb-check-kept",
+  });
+  assert.equal(dupReply.ok, false);
+  assert.equal(dupReply.error.code, "already_replied");
+
+  // Reconnect demo with the same launch key: must receive nothing and no bot reply post is resurrected.
   const demo2 = await connectAgentProject(workspace, "demo", "demo-key");
   await fenceOwnerMessage(workspace, demo2, "demo-channel", "fence-cb-not-resurrected");
   assert.deepEqual(demo2.events.filter((e) => e.event === "agent_message"), []);
-  assert.equal((readState(workspace.stateDir).fixtures.discord.messages ?? []).length, 2);
+  assert.equal((readState(workspace.stateDir).fixtures.discord.messages ?? []).length, 3);
+});
+
+test("C+B: startup recovery never resurrects a compaction-dropped unacked reply delivery when the exchange is kept by a recent ack", async () => {
+  const workspace = createRouterWorkspace(routerRegistry({
+    demo: { channel_id: "demo-channel", type: "claude", transport: "router", agent_message_targets: ["beta"] },
+    beta: { channel_id: "beta-channel", type: "codex", transport: "router" },
+  }));
+  let router = await routerWithWebhooks(workspace, ["demo", "beta"]);
+
+  const demo1 = await connectAgentProject(workspace, "demo", "demo-key");
+  const beta1 = await connectAgentProject(workspace, "beta", "beta-key");
+
+  const sent = await demo1.request("agent_request", {
+    target: "beta",
+    text: "Keep exchange alive with late request ack",
+    idempotency_key: "consolidation-cb-dropped-req-1",
+  });
+  assert.equal(sent.ok, true, JSON.stringify(sent));
+  const reqId = sent.result.request_id;
+  const reqEv = await waitFor(
+    () => beta1.events.find((e) => e.event === "agent_message" && e.kind === "request" && e.request_id === reqId),
+    () => `beta1 request`,
+  );
+
+  // Disconnect demo so the reply delivery stays unacknowledged, and reply BEFORE acking reqEv.
+  await demo1.close();
+  await waitForDisconnect(workspace, "demo");
+
+  const replied = await beta1.request("agent_reply", {
+    request_id: reqId,
+    text: "Delivered at t=0, unacked, later dropped by compaction",
+    idempotency_key: "consolidation-cb-dropped-rep-1",
+  });
+  assert.equal(replied.ok, true, JSON.stringify(replied));
+  await waitFor(
+    () => (readState(workspace.stateDir).fixtures.discord.messages ?? []).length === 4,
+    () => "all four messages posted",
+  );
+
+  // Wait 2.2s, then ack the earlier request delivery so the exchange gets a recent record.
+  await new Promise((resolve) => setTimeout(resolve, 2200));
+  assert.equal((await beta1.request("agent_message_ack", { delivery_id: reqEv.delivery_id })).ok, true);
+
+  await beta1.close();
+  await router.stop();
+
+  // Wait 1.6s more: reply + its unacked delivery are >3.8s old (> 3456ms retention),
+  // while the late ack is only ~1.6s old so the exchange itself is KEPT.
+  await new Promise((resolve) => setTimeout(resolve, 1600));
+  router = await startRouter(workspace, {
+    env: { CCDM_ROUTER_AGENT_MESSAGE_MINUTE_MS: "0.08" },
+  });
+
+  // Exchange is kept (already_replied), yet the dropped unacked reply delivery is NOT resurrected.
+  const beta2 = await connectAgentProject(workspace, "beta", "beta-key");
+  const dupReply = await beta2.request("agent_reply", {
+    request_id: reqId,
+    text: "Check kept after dropped delivery",
+    idempotency_key: "consolidation-cb-dropped-check-kept",
+  });
+  assert.equal(dupReply.ok, false);
+  assert.equal(dupReply.error.code, "already_replied");
+
+  const demo2 = await connectAgentProject(workspace, "demo", "demo-key");
+  await fenceOwnerMessage(workspace, demo2, "demo-channel", "fence-cb-dropped-not-resurrected");
+  assert.deepEqual(demo2.events.filter((e) => e.event === "agent_message"), []);
 });
