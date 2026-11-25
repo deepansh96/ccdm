@@ -42,6 +42,7 @@ function validateRecord(record) {
       if (!Number.isInteger(record.depth) || record.depth < 1) return "request invalid depth";
       if (!isValidIso(record.expires_at)) return "request invalid expires_at";
       if (!isNonEmptyString(record.idempotency_key)) return "request missing idempotency_key";
+      if (record.delivery_id !== undefined && !isNonEmptyString(record.delivery_id)) return "request invalid delivery_id";
       return null;
     case "refusal":
       if (!isNonEmptyString(record.refusal_id)) return "refusal missing refusal_id";
@@ -70,10 +71,19 @@ function validateRecord(record) {
       if (!isNonEmptyString(record.from_launch) || typeof record.text !== "string") return "reply missing body";
       if (!isNonEmptyString(record.idempotency_key)) return "reply missing idempotency_key";
       if (typeof record.delivered_to_live_session !== "boolean") return "reply missing delivered_to_live_session";
+      if (record.delivery_id !== undefined && !isNonEmptyString(record.delivery_id)) return "reply invalid delivery_id";
       return null;
     case "expired":
+      if (!isNonEmptyString(record.request_id)) return "expired missing request_id";
+      return null;
     case "failed":
-      if (!isNonEmptyString(record.request_id)) return `${record.type} missing request_id`;
+      if (!isNonEmptyString(record.request_id)) return "failed missing request_id";
+      if (record.delivery_id !== undefined && !isNonEmptyString(record.delivery_id)) return "failed invalid delivery_id";
+      return null;
+    case "mark":
+      if (!isNonEmptyString(record.request_id)) return "mark missing request_id";
+      if (!VALID_POST_SIDES.has(record.side)) return "mark invalid side";
+      if (!isNonEmptyString(record.emoji)) return "mark missing emoji";
       return null;
     default:
       return `unknown record type: ${record.type}`;
