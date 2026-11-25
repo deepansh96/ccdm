@@ -191,8 +191,13 @@ function takeRateLimit(method, url) {
     && (rule.count === null || rule.count > 0);
   let rule = null;
   updateState((state) => {
-    rule = (state.fixtures.discord.rateLimits ?? []).find(matches) ?? null;
-    if (!rule) return;
+    const candidate = (state.fixtures.discord.rateLimits ?? []).find(matches) ?? null;
+    if (!candidate) return;
+    if (candidate.skip > 0) {
+      candidate.skip -= 1;
+      return;
+    }
+    rule = candidate;
     if (rule.count !== null) rule.count -= 1;
     state.fixtures.discord.rateLimitHits ||= [];
     state.fixtures.discord.rateLimitHits.push({ method, path: url.pathname });

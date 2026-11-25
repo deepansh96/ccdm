@@ -22,6 +22,7 @@ const DEFAULT_TIMEOUT_MINUTES = 30;
 const MAX_TIMEOUT_MINUTES = 120;
 const DEFAULT_MINUTE_MS = 60000;
 const DEFAULT_RATE_WINDOW_MS = 3600000;
+const DEFAULT_RECOVERY_READY_WAIT_MS = 2000;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 const LEDGER_RETENTION_MINUTES = 30 * 24 * 60;
 const RECENT_REFUSALS = 20;
@@ -73,6 +74,18 @@ function retentionMs(env = process.env) {
 
 function expiryRetryDelayMs(env = process.env) {
   return Math.max(25, Math.min(5000, Math.round(minuteMs(env) / 4)));
+}
+
+function recoveryReadyWaitMs(env = process.env) {
+  const own = env.CCDM_ROUTER_AGENT_MESSAGE_READY_WAIT_MS;
+  const ownValue = Number(own);
+  if (own !== undefined && own !== "" && Number.isFinite(ownValue) && ownValue >= 0) return ownValue;
+  const hello = env.CCDM_ROUTER_HELLO_READY_WAIT_MS;
+  const helloValue = Number(hello);
+  if (hello !== undefined && hello !== "" && Number.isFinite(helloValue) && helloValue >= 0) {
+    return Math.min(helloValue, DEFAULT_RECOVERY_READY_WAIT_MS);
+  }
+  return DEFAULT_RECOVERY_READY_WAIT_MS;
 }
 
 function rateWindowMs(env = process.env) {
@@ -190,7 +203,65 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
   const projectSendLocks = new Map();
   // latest 20 refusals for `router status`
   const recentRefusals = [];
+  const pendingTimers = new Set();
+  let gatewayIsReady = !context.gatewayReady;
+  if (context.gatewayReady) {
+    context.gatewayReady.then(() => { gatewayIsReady = true; });
+  }
   let closed = false;
+
+  function trackTimeout(fn, delayMs) {
+    const timer = setTimeout(() => {
+      pendingTimers.delete(timer);
+      fn();
+    }, delayMs);
+    pendingTimers.add(timer);
+    return timer;
+  }
+
+  function clearTrackedTimeout(timer) {
+    if (!timer) return;
+    pendingTimers.delete(timer);
+    clearTimeout(timer);
+  }
+
+  async function waitForGatewayReady(maxWaitMs) {
+    if (gatewayIsReady || !context.gatewayReady) return true;
+    if (closed) return false;
+    const waitMs = Math.max(0, maxWaitMs);
+    if (waitMs === 0) return false;
+    let timer = null;
+    const timedOut = new Promise(resolve => {
+      timer = trackTimeout(() => resolve(false), waitMs);
+    });
+    try {
+      return await Promise.race([context.gatewayReady.then(() => true), timedOut]);
+    } finally {
+      clearTrackedTimeout(timer);
+    }
+  }
+
+  function whenGatewayReady(fn) {
+    if (!context.gatewayReady) return;
+    context.gatewayReady.then(() => {
+      if (closed) return;
+      return fn();
+    }).catch(error => log?.(`agent_message_gateway_retry_failed error=${error.message}`));
+  }
+
+  async function waitForPostReady(exchange, maxWaitMs) {
+    if (!exchange.postReady) return;
+    const waitMs = Math.max(0, maxWaitMs);
+    let timer = null;
+    const timedOut = new Promise(resolve => {
+      timer = trackTimeout(resolve, waitMs);
+    });
+    try {
+      await Promise.race([exchange.postReady, timedOut]);
+    } finally {
+      clearTrackedTimeout(timer);
+    }
+  }
 
   function assertLedgerAvailable() {
     const error = ledger.error();
@@ -331,6 +402,13 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
     }
   }
 
+  function clearFailRetry(exchange) {
+    if (exchange.fail_timer) {
+      clearTimeout(exchange.fail_timer);
+      exchange.fail_timer = null;
+    }
+  }
+
   async function fetchChannel(channelId) {
     try {
       return await context.discord?.client?.channels.fetch(channelId) ?? null;
@@ -442,11 +520,10 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
 
   async function appendBestEffort(fields) {
     try {
-      await ledger.append(fields);
-      return true;
+      return await ledger.append(fields);
     } catch (error) {
       log?.(`agent_message_ledger_failed type=${fields.type} error=${error.message}`);
-      return false;
+      return null;
     }
   }
 
@@ -563,7 +640,14 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
     });
   }
 
-  async function notifyFailed(exchange, reason) {
+  function needsMarks(exchange, emoji) {
+    return Boolean(
+      (exchange.sender_post && !exchange.marks.has(`sender:${emoji}`))
+      || (exchange.receiver_post && !exchange.marks.has(`receiver:${emoji}`)),
+    );
+  }
+
+  async function markExpiredPosts(exchange) {
     if (closed) return;
     if (exchange.sender_post) {
       await markExchangePost(exchange, "sender", exchange.sender_post, MARK_FAILED);
@@ -571,6 +655,21 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
     if (exchange.receiver_post) {
       await markExchangePost(exchange, "receiver", exchange.receiver_post, MARK_FAILED);
     }
+  }
+
+  async function markRepliedPosts(exchange) {
+    if (closed) return;
+    if (exchange.sender_post) {
+      await markExchangePost(exchange, "sender", exchange.sender_post, MARK_REPLIED);
+    }
+    if (exchange.receiver_post) {
+      await markExchangePost(exchange, "receiver", exchange.receiver_post, MARK_REPLIED);
+    }
+  }
+
+  async function notifyFailed(exchange, reason) {
+    if (closed) return;
+    await markExpiredPosts(exchange);
     if (closed) return;
     await sendNotice(exchange, {
       deliveryId: exchange.fail_delivery_id,
@@ -579,31 +678,63 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
     });
   }
 
-  async function failRequest(exchange, reason) {
-    clearExpiry(exchange);
+  async function transitionToFailed(exchange, reason, { bestEffort = false } = {}) {
     const failDeliveryId = mintId("del");
-    exchange.state = "failed";
-    exchange.fail_reason = reason;
-    exchange.fail_delivery_id = failDeliveryId;
-    await appendBestEffort({
+    const fields = {
       type: "failed",
       request_id: exchange.request_id,
       reason,
       delivery_id: failDeliveryId,
-    });
-    await notifyFailed(exchange, reason);
+    };
+    let record;
+    if (bestEffort) {
+      record = await appendBestEffort(fields);
+      if (!record) return false;
+    } else {
+      record = await ledger.append(fields);
+    }
+    clearExpiry(exchange);
+    clearFailRetry(exchange);
+    exchange.state = "failed";
+    exchange.pending_fail_reason = null;
+    exchange.fail_reason = reason;
+    exchange.fail_delivery_id = failDeliveryId;
+    exchange.fail_at_ms = Date.parse(record.at);
+    return true;
   }
 
-  async function notifyExpired(exchange) {
+  function scheduleFailRetry(exchange, reason) {
+    clearFailRetry(exchange);
+    if (closed || exchange.state !== "open") return;
+    exchange.pending_fail_reason = reason;
+    clearExpiry(exchange);
+    exchange.fail_timer = setTimeout(() => {
+      exchange.fail_timer = null;
+      failRequest(exchange, reason)
+        .catch(error => log?.(`agent_message_fail_retry_failed id=${exchange.request_id} error=${error.message}`));
+    }, expiryRetryDelayMs());
+  }
+
+  async function failRequest(exchange, reason) {
     if (closed) return;
-    if (exchange.sender_post) {
-      await markPost(exchange.sender_post.channel_id, exchange.sender_post.message_id, MARK_FAILED, exchange.request_id);
-    }
-    if (exchange.receiver_post) {
-      await markPost(exchange.receiver_post.channel_id, exchange.receiver_post.message_id, MARK_FAILED, exchange.request_id);
-    }
+    const failed = await withExchangeLock(exchange, async () => {
+      if (closed || exchange.state !== "open") return false;
+      const ok = await transitionToFailed(exchange, reason, { bestEffort: true });
+      if (!ok && !closed && exchange.state === "open" && ledger.error() === null) {
+        scheduleFailRetry(exchange, reason);
+      }
+      return ok;
+    });
+    if (!failed) return;
+    await withDeadline(null, () => notifyFailed(exchange, reason));
+  }
+
+  async function notifyExpired(exchange, { deliverNotice = true } = {}) {
     if (closed) return;
+    await markExpiredPosts(exchange);
+    if (closed || !deliverNotice) return;
     await sendNotice(exchange, {
+      deliveryId: exchange.expired_delivery_id,
       outcome: "expired",
       text: `Agent Request ${exchange.request_id} to ${formatConversationLabel(exchange.to)} expired`,
     });
@@ -611,31 +742,46 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
 
   async function transitionToExpired(exchange, { bestEffort = false } = {}) {
     clearExpiry(exchange);
+    const expiredDeliveryId = mintId("del");
     const fields = {
       type: "expired",
       request_id: exchange.request_id,
+      delivery_id: expiredDeliveryId,
     };
+    let record;
     if (bestEffort) {
-      if (!(await appendBestEffort(fields))) return false;
+      record = await appendBestEffort(fields);
+      if (!record) {
+        if (!closed && exchange.state === "open" && !exchange.pending_fail_reason && ledger.error() === null) {
+          scheduleExpiry(exchange, expiryRetryDelayMs());
+        }
+        return false;
+      }
     } else {
-      await ledger.append(fields);
+      try {
+        record = await ledger.append(fields);
+      } catch (error) {
+        if (!closed && exchange.state === "open" && !exchange.pending_fail_reason && ledger.error() === null) {
+          scheduleExpiry(exchange, expiryRetryDelayMs());
+        }
+        throw error;
+      }
     }
+    clearFailRetry(exchange);
     exchange.state = "expired";
+    exchange.expired_delivery_id = expiredDeliveryId;
+    exchange.expired_at_ms = Date.parse(record.at);
     log?.(`agent_request_expired id=${exchange.request_id}`);
     return true;
   }
 
   async function expireRequest(exchange) {
     if (closed) return;
-    await exchange.postReady;
+    await waitForPostReady(exchange, recoveryReadyWaitMs());
     if (closed) return;
     const expired = await withExchangeLock(exchange, async () => {
-      if (closed || exchange.state !== "open") return false;
-      const ok = await transitionToExpired(exchange, { bestEffort: true });
-      if (!ok && !closed && exchange.state === "open" && ledger.error() === null) {
-        scheduleExpiry(exchange, expiryRetryDelayMs());
-      }
-      return ok;
+      if (closed || exchange.state !== "open" || exchange.pending_fail_reason) return false;
+      return transitionToExpired(exchange, { bestEffort: true });
     });
     if (!expired) return;
     await withDeadline(null, () => notifyExpired(exchange));
@@ -651,6 +797,57 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
     }, delay);
   }
 
+  function chunkSlot(exchange, kind, side) {
+    if (kind === "request") {
+      if (side === "sender") {
+        return {
+          chunks: exchange.sender_post_chunks,
+          setFirst: ref => { if (!exchange.sender_post) exchange.sender_post = ref; },
+        };
+      }
+      if (side === "receiver") {
+        return {
+          chunks: exchange.receiver_post_chunks,
+          setFirst: ref => { if (!exchange.receiver_post) exchange.receiver_post = ref; },
+        };
+      }
+    } else if (kind === "reply") {
+      if (side === "sender") {
+        return {
+          chunks: exchange.reply_sender_post_chunks,
+          setFirst: ref => { if (!exchange.reply_sender_post) exchange.reply_sender_post = ref; },
+        };
+      }
+      if (side === "receiver") {
+        return {
+          chunks: exchange.reply_receiver_post_chunks,
+          setFirst: ref => { if (!exchange.reply_receiver_post) exchange.reply_receiver_post = ref; },
+        };
+      }
+    }
+    return null;
+  }
+
+  async function recordPostChunk(exchange, { kind, side, channelId, chunkIndex, chunkCount, messageId }) {
+    const slot = chunkSlot(exchange, kind, side);
+    if (slot) {
+      slot.chunks[chunkIndex] = messageId;
+      if (chunkIndex === 0) slot.setFirst({ channel_id: channelId, message_id: messageId });
+    }
+    if (chunkCount > 1) {
+      await appendBestEffort({
+        type: "post_chunk",
+        request_id: exchange.request_id,
+        kind,
+        side,
+        channel_id: channelId,
+        chunk_index: chunkIndex,
+        chunk_count: chunkCount,
+        message_id: messageId,
+      });
+    }
+  }
+
   async function publishRequest(exchange, { guildId, senderRoute, contextPct }) {
     const senderLabel = formatConversationLabel(exchange.from);
     const targetLabel = formatConversationLabel(exchange.to);
@@ -662,7 +859,7 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
     });
     const senderReserve = linkSuffixReserve(guildId, exchange.to.conversation_id);
 
-    let senderPost = exchange.sender_post
+    let senderPost = exchange.sender_post_done && exchange.sender_post
       ? {
         ...exchange.sender_post,
         secret: null,
@@ -694,8 +891,19 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
           text: exchange.text,
           contextPct,
           reserveHeaderChars: senderReserve,
+          existingMessageIds: exchange.sender_post_chunks,
+          onChunkPosted: ({ chunkIndex, chunkCount, messageId }) => recordPostChunk(exchange, {
+            kind: "request",
+            side: "sender",
+            channelId: exchange.from.conversation_id,
+            chunkIndex,
+            chunkCount,
+            messageId,
+          }),
         });
         exchange.sender_post = { channel_id: senderPost.channel_id, message_id: senderPost.message_id };
+        exchange.sender_post_chunks = [...senderPost.message_ids];
+        exchange.sender_post_done = true;
         await appendBestEffort({
           type: "post",
           request_id: exchange.request_id,
@@ -733,7 +941,7 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
       counterpartUrl: senderUrl,
     });
 
-    let receiverPost = exchange.receiver_post ? { ...exchange.receiver_post } : null;
+    let receiverPost = exchange.receiver_post_done && exchange.receiver_post ? { ...exchange.receiver_post } : null;
     if (!receiverPost) {
       if (await isThreadArchived(exchange.to)) {
         await appendBestEffort({
@@ -752,8 +960,19 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
           channelId: exchange.to.conversation_id,
           header: receiverHeader,
           text: exchange.text,
+          existingMessageIds: exchange.receiver_post_chunks,
+          onChunkPosted: ({ chunkIndex, chunkCount, messageId }) => recordPostChunk(exchange, {
+            kind: "request",
+            side: "receiver",
+            channelId: exchange.to.conversation_id,
+            chunkIndex,
+            chunkCount,
+            messageId,
+          }),
         });
         exchange.receiver_post = { channel_id: receiverPost.channel_id, message_id: receiverPost.message_id };
+        exchange.receiver_post_chunks = [...receiverPost.message_ids];
+        exchange.receiver_post_done = true;
         await appendBestEffort({
           type: "post",
           request_id: exchange.request_id,
@@ -764,12 +983,16 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
           message_ids: receiverPost.message_ids,
         });
       } catch (error) {
+        if (error.firstMessageId) {
+          exchange.receiver_post = { channel_id: exchange.to.conversation_id, message_id: error.firstMessageId };
+        }
         await appendBestEffort({
           type: "post",
           request_id: exchange.request_id,
           kind: "request",
           side: "receiver",
           channel_id: exchange.to.conversation_id,
+          ...(error.firstMessageId ? { message_id: error.firstMessageId } : {}),
           ...(isArchivedThreadError(error) ? { skipped: "thread_archived" } : { error: errorSummary(error) }),
         });
         log?.(`agent_message_post_failed id=${exchange.request_id} kind=request side=receiver error=${error.message}`);
@@ -831,7 +1054,7 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
     });
     const replierReserve = linkSuffixReserve(guildId, exchange.from.conversation_id);
 
-    let replierPost = exchange.reply_sender_post
+    let replierPost = exchange.reply_sender_post_done && exchange.reply_sender_post
       ? {
         ...exchange.reply_sender_post,
         secret: null,
@@ -868,8 +1091,18 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
             text,
             contextPct,
             reserveHeaderChars: replierReserve,
+            existingMessageIds: exchange.reply_sender_post_chunks,
+            onChunkPosted: ({ chunkIndex, chunkCount, messageId }) => recordPostChunk(exchange, {
+              kind: "reply",
+              side: "sender",
+              channelId: from.conversation_id,
+              chunkIndex,
+              chunkCount,
+              messageId,
+            }),
           });
           exchange.reply_sender_post = { channel_id: replierPost.channel_id, message_id: replierPost.message_id };
+          exchange.reply_sender_post_chunks = [...replierPost.message_ids];
           exchange.reply_sender_post_done = true;
           await appendBestEffort({
             type: "post",
@@ -888,6 +1121,7 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
             kind: "reply",
             side: "sender",
             channel_id: from.conversation_id,
+            ...(error.firstMessageId ? { message_id: error.firstMessageId } : {}),
             ...(isArchivedThreadError(error) ? { skipped: "thread_archived" } : { error: errorSummary(error) }),
           });
           log?.(`agent_message_post_failed id=${exchange.request_id} kind=reply side=sender error=${error.message}`);
@@ -904,7 +1138,9 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
       counterpartUrl: replierUrl,
     });
 
-    let receiverPost = exchange.reply_receiver_post ? { ...exchange.reply_receiver_post } : null;
+    let receiverPost = exchange.reply_receiver_post_done && exchange.reply_receiver_post
+      ? { ...exchange.reply_receiver_post }
+      : null;
     if (!exchange.reply_receiver_post_done) {
       if (await isThreadArchived(exchange.from)) {
         exchange.reply_receiver_post_done = true;
@@ -922,8 +1158,18 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
             channelId: exchange.from.conversation_id,
             header: receiverHeader,
             text,
+            existingMessageIds: exchange.reply_receiver_post_chunks,
+            onChunkPosted: ({ chunkIndex, chunkCount, messageId }) => recordPostChunk(exchange, {
+              kind: "reply",
+              side: "receiver",
+              channelId: exchange.from.conversation_id,
+              chunkIndex,
+              chunkCount,
+              messageId,
+            }),
           });
           exchange.reply_receiver_post = { channel_id: receiverPost.channel_id, message_id: receiverPost.message_id };
+          exchange.reply_receiver_post_chunks = [...receiverPost.message_ids];
           exchange.reply_receiver_post_done = true;
           await appendBestEffort({
             type: "post",
@@ -942,6 +1188,7 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
             kind: "reply",
             side: "receiver",
             channel_id: exchange.from.conversation_id,
+            ...(error.firstMessageId ? { message_id: error.firstMessageId } : {}),
             ...(isArchivedThreadError(error) ? { skipped: "thread_archived" } : { error: errorSummary(error) }),
           });
           log?.(`agent_message_post_failed id=${exchange.request_id} kind=reply side=receiver error=${error.message}`);
@@ -991,13 +1238,15 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
     });
   }
 
-  async function recoverRequestPublish(exchange) {
-    if (context.gatewayReady) await context.gatewayReady;
-    if (closed || exchange.state !== "open" || Date.now() >= exchange.expires_at_ms) return;
+  async function runRecoveredRequestPublish(exchange) {
+    if (closed) return;
+    if (exchange.state !== "open" && exchange.state !== "expired" && exchange.state !== "replied") return;
     const table = getTable?.() ?? null;
     const targetRoute = table?.projects.get(exchange.to.project);
     if (!targetRoute || targetRoute.remote || targetRoute.channel_id !== exchange.to_channel_id) {
-      await withDeadline(null, () => failRequest(exchange, `target project ${exchange.to.project} is no longer available`));
+      if (exchange.state === "open") {
+        await withDeadline(null, () => failRequest(exchange, `target project ${exchange.to.project} is no longer available`));
+      }
       return;
     }
     const senderRoute = routeForConversation(table, exchange.from, exchange.from_channel_id);
@@ -1006,10 +1255,27 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
       senderRoute,
       contextPct: exchange.context_pct,
     }));
+    if (closed) return;
+    if (exchange.state === "expired") {
+      await withDeadline(null, () => markExpiredPosts(exchange));
+    } else if (exchange.state === "replied") {
+      await withDeadline(null, () => markRepliedPosts(exchange));
+    }
   }
 
-  async function recoverReplyPublish(exchange) {
-    if (context.gatewayReady) await context.gatewayReady;
+  async function recoverRequestPublish(exchange) {
+    const remainingMs = exchange.expires_at_ms - Date.now();
+    const waitMs = remainingMs > 0
+      ? Math.min(recoveryReadyWaitMs(), remainingMs)
+      : recoveryReadyWaitMs();
+    if (!(await waitForGatewayReady(waitMs))) {
+      whenGatewayReady(() => runRecoveredRequestPublish(exchange));
+      return;
+    }
+    await runRecoveredRequestPublish(exchange);
+  }
+
+  async function runRecoveredReplyPublish(exchange) {
     if (closed || exchange.state !== "replied" || !exchange.reply_info) return;
     const table = getTable?.() ?? null;
     const { from, text, ts, contextPct } = exchange.reply_info;
@@ -1024,10 +1290,41 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
     }));
   }
 
-  async function recoverFailedNotice(exchange) {
-    if (context.gatewayReady) await context.gatewayReady;
+  async function recoverReplyPublish(exchange) {
+    if (!(await waitForGatewayReady(recoveryReadyWaitMs()))) {
+      whenGatewayReady(() => runRecoveredReplyPublish(exchange));
+      return;
+    }
+    await runRecoveredReplyPublish(exchange);
+  }
+
+  async function runRecoveredFailedNotice(exchange, { deliverNotice }) {
     if (closed || exchange.state !== "failed") return;
-    await withDeadline(null, () => notifyFailed(exchange, exchange.fail_reason ?? "request failed"));
+    await withDeadline(null, async () => {
+      if (deliverNotice) await notifyFailed(exchange, exchange.fail_reason ?? "request failed");
+      else await markExpiredPosts(exchange);
+    });
+  }
+
+  async function recoverFailedNotice(exchange, { deliverNotice = true } = {}) {
+    if (!(await waitForGatewayReady(recoveryReadyWaitMs()))) {
+      whenGatewayReady(() => runRecoveredFailedNotice(exchange, { deliverNotice }));
+      return;
+    }
+    await runRecoveredFailedNotice(exchange, { deliverNotice });
+  }
+
+  async function runRecoveredExpiredNotice(exchange, { deliverNotice }) {
+    if (closed || exchange.state !== "expired") return;
+    await withDeadline(null, () => notifyExpired(exchange, { deliverNotice }));
+  }
+
+  async function recoverExpiredNotice(exchange, { deliverNotice = true } = {}) {
+    if (!(await waitForGatewayReady(recoveryReadyWaitMs()))) {
+      whenGatewayReady(() => runRecoveredExpiredNotice(exchange, { deliverNotice }));
+      return;
+    }
+    await runRecoveredExpiredNotice(exchange, { deliverNotice });
   }
 
   async function publishUndelivered({ requestId, from, to, text, code, senderRoute, contextPct }) {
@@ -1215,19 +1512,29 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
           expires_at: expiresAt,
           expires_at_ms: expiresAtMs,
           sender_post: null,
+          sender_post_chunks: [],
+          sender_post_done: false,
           receiver_post: null,
+          receiver_post_chunks: [],
+          receiver_post_done: false,
           reply_info: null,
           reply_delivery_id: null,
           reply_sender_post: null,
+          reply_sender_post_chunks: [],
           reply_sender_post_done: false,
           reply_receiver_post: null,
+          reply_receiver_post_chunks: [],
           reply_receiver_post_done: false,
+          expired_delivery_id: null,
+          expired_at_ms: null,
+          pending_fail_reason: null,
           fail_reason: null,
           fail_delivery_id: null,
           fail_at_ms: null,
           marks: new Set(),
           postReady: null,
           timer: null,
+          fail_timer: null,
           lock: null,
         };
         exchanges.set(requestId, exchange);
@@ -1265,8 +1572,21 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
         throw new OpError("unknown_request", message);
       }
 
+      await waitForPostReady(exchange, recoveryReadyWaitMs());
       return withExchangeLock(exchange, async () => {
-        await exchange.postReady;
+        if (exchange.state === "open" && exchange.pending_fail_reason) {
+          const reason = exchange.pending_fail_reason;
+          try {
+            await transitionToFailed(exchange, reason);
+          } catch (error) {
+            if (!closed && exchange.state === "open" && ledger.error() === null) {
+              scheduleFailRetry(exchange, reason);
+            }
+            throw error;
+          }
+          withDeadline(null, () => notifyFailed(exchange, reason))
+            .catch(error => log?.(`agent_message_fail_notify_failed id=${exchange.request_id} error=${error.message}`));
+        }
         if (exchange.state === "open" && Date.now() >= exchange.expires_at_ms) {
           await transitionToExpired(exchange);
           withDeadline(null, () => notifyExpired(exchange))
@@ -1298,17 +1618,14 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
         }
         const routeMismatch = checkOpenExchangeRoutes(ctx.table, exchange, from);
         if (routeMismatch) {
-          clearExpiry(exchange);
-          const failDeliveryId = mintId("del");
-          await ledger.append({
-            type: "failed",
-            request_id: exchange.request_id,
-            reason: routeMismatch,
-            delivery_id: failDeliveryId,
-          });
-          exchange.state = "failed";
-          exchange.fail_reason = routeMismatch;
-          exchange.fail_delivery_id = failDeliveryId;
+          try {
+            await transitionToFailed(exchange, routeMismatch);
+          } catch (error) {
+            if (!closed && exchange.state === "open" && !exchange.timer && ledger.error() === null) {
+              scheduleExpiry(exchange, Date.now() >= exchange.expires_at_ms ? expiryRetryDelayMs() : null);
+            }
+            throw error;
+          }
           const message = `request ${args.request_id} failed: ${routeMismatch}`;
           await recordRefusal({
             op: "agent_reply", from, to: exchange.from, requestId: args.request_id,
@@ -1481,19 +1798,29 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
             expires_at: record.expires_at,
             expires_at_ms: Date.parse(record.expires_at),
             sender_post: null,
+            sender_post_chunks: [],
+            sender_post_done: false,
             receiver_post: null,
+            receiver_post_chunks: [],
+            receiver_post_done: false,
             reply_info: null,
             reply_delivery_id: null,
             reply_sender_post: null,
+            reply_sender_post_chunks: [],
             reply_sender_post_done: false,
             reply_receiver_post: null,
+            reply_receiver_post_chunks: [],
             reply_receiver_post_done: false,
+            expired_delivery_id: null,
+            expired_at_ms: null,
+            pending_fail_reason: null,
             fail_reason: null,
             fail_delivery_id: null,
             fail_at_ms: null,
             marks: new Set(),
             postReady: Promise.resolve(),
             timer: null,
+            fail_timer: null,
             lock: null,
           });
           addRateTimestamp(record.from.project, atMs);
@@ -1513,19 +1840,42 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
           }
           break;
         }
+        case "post_chunk": {
+          const exchange = exchanges.get(record.request_id);
+          if (exchange) {
+            const slot = chunkSlot(exchange, record.kind, record.side);
+            if (slot) {
+              slot.chunks[record.chunk_index] = record.message_id;
+              if (record.chunk_index === 0) {
+                slot.setFirst({ channel_id: record.channel_id, message_id: record.message_id });
+              }
+            }
+          }
+          break;
+        }
         case "post": {
           const exchange = exchanges.get(record.request_id);
           if (exchange) {
             const postRef = record.message_id ? { channel_id: record.channel_id, message_id: record.message_id } : null;
-            if (record.kind === "request" && postRef) {
-              if (record.side === "sender") exchange.sender_post = postRef;
-              else if (record.side === "receiver") exchange.receiver_post = postRef;
+            const isComplete = Boolean(postRef && !record.error && !record.skipped);
+            if (record.kind === "request") {
+              if (record.side === "sender") {
+                if (postRef) exchange.sender_post = postRef;
+                if (Array.isArray(record.message_ids)) exchange.sender_post_chunks = [...record.message_ids];
+                if (isComplete) exchange.sender_post_done = true;
+              } else if (record.side === "receiver") {
+                if (postRef) exchange.receiver_post = postRef;
+                if (Array.isArray(record.message_ids)) exchange.receiver_post_chunks = [...record.message_ids];
+                if (isComplete) exchange.receiver_post_done = true;
+              }
             } else if (record.kind === "reply") {
               if (record.side === "sender") {
                 if (postRef) exchange.reply_sender_post = postRef;
+                if (Array.isArray(record.message_ids)) exchange.reply_sender_post_chunks = [...record.message_ids];
                 exchange.reply_sender_post_done = true;
               } else if (record.side === "receiver") {
                 if (postRef) exchange.reply_receiver_post = postRef;
+                if (Array.isArray(record.message_ids)) exchange.reply_receiver_post_chunks = [...record.message_ids];
                 exchange.reply_receiver_post_done = true;
               }
             }
@@ -1595,7 +1945,11 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
         }
         case "expired": {
           const exchange = exchanges.get(record.request_id);
-          if (exchange) exchange.state = "expired";
+          if (exchange) {
+            exchange.state = "expired";
+            exchange.expired_delivery_id = record.delivery_id ?? null;
+            exchange.expired_at_ms = atMs;
+          }
           break;
         }
         case "failed": {
@@ -1664,7 +2018,7 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
         return exchanges.has(record.request_id) && keptExchangeIds.has(record.request_id);
       }
       if (exchanges.has(record.request_id)) return keptExchangeIds.has(record.request_id);
-      if (record.type === "post") return Date.parse(record.at) >= retentionCutoff;
+      if (record.type === "post" || record.type === "post_chunk") return Date.parse(record.at) >= retentionCutoff;
       return false;
     });
 
@@ -1695,18 +2049,8 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
 
     const startNow = Date.now();
     for (const exchange of exchanges.values()) {
-      if (exchange.state !== "open") continue;
-      if (exchange.expires_at_ms <= startNow) {
-        expireRequest(exchange).catch(error => log?.(`agent_message_expire_failed id=${exchange.request_id} error=${error.message}`));
-      } else {
-        scheduleExpiry(exchange);
-      }
-    }
-
-    for (const exchange of exchanges.values()) {
       if (
         exchange.state === "open"
-        && exchange.expires_at_ms > startNow
         && exchange.request_delivery_id
         && !deliveries.has(exchange.request_delivery_id)
         && !ackedDeliveryIds.has(exchange.request_delivery_id)
@@ -1729,12 +2073,35 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
         exchange.state === "failed"
         && exchange.fail_delivery_id
         && (exchange.fail_at_ms ?? 0) >= retentionCutoff
-        && !deliveries.has(exchange.fail_delivery_id)
-        && !ackedDeliveryIds.has(exchange.fail_delivery_id)
-        && !droppedDeliveryIds.has(exchange.fail_delivery_id)
       ) {
-        recoverFailedNotice(exchange)
-          .catch(error => log?.(`agent_message_recover_failed_notice_failed id=${exchange.request_id} error=${error.message}`));
+        const deliverNotice = !deliveries.has(exchange.fail_delivery_id)
+          && !ackedDeliveryIds.has(exchange.fail_delivery_id)
+          && !droppedDeliveryIds.has(exchange.fail_delivery_id);
+        if (deliverNotice || needsMarks(exchange, MARK_FAILED)) {
+          recoverFailedNotice(exchange, { deliverNotice })
+            .catch(error => log?.(`agent_message_recover_failed_notice_failed id=${exchange.request_id} error=${error.message}`));
+        }
+      } else if (
+        exchange.state === "expired"
+        && exchange.expired_delivery_id
+        && (exchange.expired_at_ms ?? 0) >= retentionCutoff
+      ) {
+        const deliverNotice = !deliveries.has(exchange.expired_delivery_id)
+          && !ackedDeliveryIds.has(exchange.expired_delivery_id)
+          && !droppedDeliveryIds.has(exchange.expired_delivery_id);
+        if (deliverNotice || needsMarks(exchange, MARK_FAILED)) {
+          recoverExpiredNotice(exchange, { deliverNotice })
+            .catch(error => log?.(`agent_message_recover_expired_notice_failed id=${exchange.request_id} error=${error.message}`));
+        }
+      }
+    }
+
+    for (const exchange of exchanges.values()) {
+      if (exchange.state !== "open") continue;
+      if (exchange.expires_at_ms <= startNow) {
+        expireRequest(exchange).catch(error => log?.(`agent_message_expire_failed id=${exchange.request_id} error=${error.message}`));
+      } else {
+        scheduleExpiry(exchange);
       }
     }
   }
@@ -1766,7 +2133,12 @@ function createAgentMessages({ stateDir, context, getTable, findListener, listTh
 
   function close() {
     closed = true;
-    for (const exchange of exchanges.values()) clearExpiry(exchange);
+    for (const timer of pendingTimers) clearTimeout(timer);
+    pendingTimers.clear();
+    for (const exchange of exchanges.values()) {
+      clearExpiry(exchange);
+      clearFailRetry(exchange);
+    }
   }
 
   return { load, request, reply, targets, ack, status, onListenerHello, close };

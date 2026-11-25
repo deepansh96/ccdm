@@ -11,24 +11,45 @@ const { formatRecordChunks, withCounterpartLink } = require("./record-format.js"
 
 const ALLOWED_MENTIONS = Object.freeze({ parse: [] });
 
-async function postWebhookRecord(context, { route, header, text, contextPct, reserveHeaderChars = 0 }) {
+async function postWebhookRecord(context, {
+  route,
+  header,
+  text,
+  contextPct,
+  reserveHeaderChars = 0,
+  existingMessageIds = [],
+  onChunkPosted = null,
+}) {
   const chunks = formatRecordChunks(header, text, { reserveHeaderChars });
+  const ids = chunks.map((_, index) => existingMessageIds[index] ?? null);
+  if (ids.every(Boolean)) {
+    return {
+      secret: null,
+      channel_id: route.channel_id,
+      message_id: ids[0],
+      message_ids: ids,
+      firstChunk: chunks[0],
+    };
+  }
   const username = webhookUsername(route.project, route.type, contextPct);
   const webhookCtx = { ...context, session: { route } };
   return withProjectWebhook(webhookCtx, async secret => {
-    const ids = [];
     try {
-      for (const chunk of chunks) {
+      for (let i = 0; i < chunks.length; i += 1) {
+        if (ids[i]) continue;
         const message = await discordRequest("POST", `/webhooks/${secret.webhook_id}/${secret.token}`, {
           query: { wait: "true", ...threadQuery(route) },
           body: {
-            content: chunk,
+            content: chunks[i],
             username,
             avatar_url: avatarUrl(route.type),
             allowed_mentions: ALLOWED_MENTIONS,
           },
         });
-        ids.push(message.id);
+        ids[i] = message.id;
+        if (onChunkPosted) {
+          await onChunkPosted({ chunkIndex: i, chunkCount: chunks.length, messageId: message.id });
+        }
       }
       return {
         secret,
@@ -38,23 +59,38 @@ async function postWebhookRecord(context, { route, header, text, contextPct, res
         firstChunk: chunks[0],
       };
     } catch (error) {
-      if (ids.length > 0) error.firstMessageId = ids[0];
+      if (ids[0]) error.firstMessageId = ids[0];
       throw error;
     }
   });
 }
 
-async function postBotRecord(context, { channelId, header, text }) {
+async function postBotRecord(context, {
+  channelId,
+  header,
+  text,
+  existingMessageIds = [],
+  onChunkPosted = null,
+}) {
   const chunks = formatRecordChunks(header, text);
-  const ids = [];
-  for (const chunk of chunks) {
-    const message = await discordRequest("POST", `/channels/${channelId}/messages`, {
-      token: context.token,
-      body: { content: chunk, allowed_mentions: ALLOWED_MENTIONS },
-    });
-    ids.push(message.id);
+  const ids = chunks.map((_, index) => existingMessageIds[index] ?? null);
+  try {
+    for (let i = 0; i < chunks.length; i += 1) {
+      if (ids[i]) continue;
+      const message = await discordRequest("POST", `/channels/${channelId}/messages`, {
+        token: context.token,
+        body: { content: chunks[i], allowed_mentions: ALLOWED_MENTIONS },
+      });
+      ids[i] = message.id;
+      if (onChunkPosted) {
+        await onChunkPosted({ chunkIndex: i, chunkCount: chunks.length, messageId: message.id });
+      }
+    }
+    return { channel_id: channelId, message_id: ids[0], message_ids: ids };
+  } catch (error) {
+    if (ids[0]) error.firstMessageId = ids[0];
+    throw error;
   }
-  return { channel_id: channelId, message_id: ids[0], message_ids: ids };
 }
 
 async function editWebhookRecord({ context, route, secret, messageId, firstChunk, updatedHeader }) {

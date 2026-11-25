@@ -56,6 +56,14 @@ function validateRecord(record) {
       if (!VALID_POST_KINDS.has(record.kind) || !VALID_POST_SIDES.has(record.side)) return "post invalid kind or side";
       if (!isNonEmptyString(record.channel_id)) return "post missing channel_id";
       return null;
+    case "post_chunk":
+      if (!isNonEmptyString(record.request_id)) return "post_chunk missing request_id";
+      if (!VALID_POST_KINDS.has(record.kind) || !VALID_POST_SIDES.has(record.side)) return "post_chunk invalid kind or side";
+      if (!isNonEmptyString(record.channel_id)) return "post_chunk missing channel_id";
+      if (!Number.isInteger(record.chunk_index) || record.chunk_index < 0) return "post_chunk invalid chunk_index";
+      if (!Number.isInteger(record.chunk_count) || record.chunk_count < 1 || record.chunk_index >= record.chunk_count) return "post_chunk invalid chunk_count";
+      if (!isNonEmptyString(record.message_id)) return "post_chunk missing message_id";
+      return null;
     case "delivery":
       if (!isNonEmptyString(record.delivery_id)) return "delivery missing delivery_id";
       if (!VALID_DELIVERY_KINDS.has(record.kind)) return "delivery invalid kind";
@@ -75,6 +83,7 @@ function validateRecord(record) {
       return null;
     case "expired":
       if (!isNonEmptyString(record.request_id)) return "expired missing request_id";
+      if (record.delivery_id !== undefined && !isNonEmptyString(record.delivery_id)) return "expired invalid delivery_id";
       return null;
     case "failed":
       if (!isNonEmptyString(record.request_id)) return "failed missing request_id";
