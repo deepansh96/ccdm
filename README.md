@@ -431,7 +431,7 @@ Every accepted request and reply appears in both conversations, with no pings (`
 
 - **Sender side:** posted in the sender's conversation through the sender's Project Identity webhook (`<project>-<provider> · N%`).
 - **Receiver side:** posted in the target conversation as the root bot, naming the sender (`<project>-<provider>`, or `<project>-<provider> › <thread name>` for a thread).
-- **Header and links:** every record begins with `-# ⇄ Agent ` and links to its counterpart in the other conversation (messages over 2000 characters chunk like replies, with links and marks on the first chunk). `reply` and `edit_message` refuse text or target messages starting with `-# ⇄ Agent `, so an agent can neither forge nor rewrite a record.
+- **Header and links:** every record begins with `-# ⇄ Agent ` and links to its counterpart in the other conversation (messages over 2000 characters split into continuation chunks each starting with `-# ⇄ Agent Request|Reply · <id> · part <k>/<n>`, with links and marks on the first chunk). `reply` (checked on every split chunk after trimming leading whitespace) and `edit_message` refuse text or target messages starting with `-# ⇄ Agent `, so an agent can neither forge nor rewrite any chunk of a record.
 - **Outcome marks:** root reacts on both request posts: ✅ once replied, or ⚠️ if expired or failed. An offline or closed attempt posts one sender-side record marked `· not delivered: target_offline` (or `target_closed`) with ⚠️ and posts nothing in the target conversation.
 
 ### Inspecting status and history
@@ -450,7 +450,7 @@ Inspect exchange history with `scripts/ccdm agent-messages log`:
 scripts/ccdm agent-messages log [--project <name>] [--request <id>] [--limit <n>] [--text] [--json]
 ```
 
-`log` reads `~/.local/state/ccdm/router/agent-messages.jsonl` directly without modifying it, so it works even while the Router is stopped. It prints exchanges and refusals newest last (default 50 entries) and omits message text unless you pass `--text`. On Router start, the ledger is compacted atomically: open exchanges, pending deliveries and the last 30 days of closed exchanges and refusals are kept. If the ledger ever becomes unreadable, `agent_request` and `agent_reply` return `ledger_unavailable` and `router status` reports `ledger unavailable`, while ordinary Discord routing keeps working; move the damaged file aside and restart the Router to recover.
+`log` reads `~/.local/state/ccdm/router/agent-messages.jsonl` directly without modifying it, so it works even while the Router is stopped. It prints exchanges and refusals newest last (default 50 entries) and omits message text unless you pass `--text`. On Router start, the ledger is compacted atomically: open exchanges, unacknowledged deliveries of open exchanges, and closed exchanges, deliveries and refusals within the last 30 days are kept (unacknowledged deliveries older than 30 days are dropped once their exchange is closed). If the ledger ever becomes unreadable, `agent_request` and `agent_reply` return `ledger_unavailable` and `router status` reports `ledger unavailable`, while ordinary Discord routing keeps working; move the damaged file aside and restart the Router to recover.
 
 ### Limits, reminders and threads
 
