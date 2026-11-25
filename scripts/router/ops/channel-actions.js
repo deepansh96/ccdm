@@ -5,7 +5,7 @@
 // reactions, and typing.
 const { MESSAGE_LIMIT } = require("../chunks.js");
 const { currentDeadline, discordRequest, withDeadline } = require("../discord-rest.js");
-const { isAgentMessageRecord } = require("../agent-messages/record-format.js");
+const { isAgentMessageRecord, looksLikeAgentMessageRecord } = require("../agent-messages/record-format.js");
 const { projectWebhookSecret } = require("../webhooks.js");
 const { OpError, ScopeViolation } = require("./errors.js");
 const { threadQuery } = require("./reply.js");
@@ -73,7 +73,7 @@ async function editMessage(ctx, args) {
   if (typeof args.text !== "string" || args.text.length === 0 || args.text.length > MESSAGE_LIMIT) {
     throw new OpError("invalid_args", `text must be 1-${MESSAGE_LIMIT} characters`);
   }
-  if (isAgentMessageRecord(args.text)) {
+  if (looksLikeAgentMessageRecord(args.text)) {
     throw new OpError("invalid_args", "edit text cannot start with the Agent Message record prefix");
   }
   if (ctx.session.role === "root") return editBotMessage(ctx, args, arrival);
@@ -114,10 +114,19 @@ async function editBotMessage(ctx, args, arrival) {
   });
 }
 
+const RECORD_OUTCOME_MARKS = new Set(["\u2705", "\u26a0"]);
+
+function isProtectedRecordMark(emoji) {
+  return RECORD_OUTCOME_MARKS.has(emoji.replace(/[\ufe0e\ufe0f]/g, ""));
+}
+
 // Adds, or with `remove: true` removes, the bot's own reaction.
 async function react(ctx, args) {
   if (typeof args.emoji !== "string" || args.emoji.length === 0) throw new OpError("invalid_args", "emoji is required");
   const message = await scopedMessage(ctx, args.message_id);
+  if (isProtectedRecordMark(args.emoji) && isAgentMessageRecord(message.content)) {
+    throw new OpError("invalid_args", "Agent Message record outcome marks cannot be changed");
+  }
   await discordRequest(args.remove === true ? "DELETE" : "PUT",
     `/channels/${ctx.session.route.channel_id}/messages/${message.id}/reactions/${encodeURIComponent(args.emoji)}/@me`,
     { token: ctx.token });
