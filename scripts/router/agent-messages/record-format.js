@@ -15,6 +15,16 @@ function isAgentMessageRecord(text) {
   return typeof text === "string" && text.trimStart().startsWith(RECORD_PREFIX);
 }
 
+// Wider guard for agent-written text (`reply` and `edit_message`): catches
+// Discord subtext look-alikes (`-#` + 1-3 non-letter/non-digit symbols +
+// `Agent`, any case and spacing) without changing exact record classification.
+const RECORD_LOOKALIKE_RE = /^-#[^\S\r\n]+(?:[^\p{L}\p{N}\s]{1,3}[^\S\r\n]+|\p{S}[\p{S}\ufe0e\ufe0f]{0,2})agent\b/iu;
+
+function looksLikeAgentMessageRecord(text) {
+  if (isAgentMessageRecord(text)) return true;
+  return typeof text === "string" && RECORD_LOOKALIKE_RE.test(text.trimStart());
+}
+
 function formatConversationLabel(conversation) {
   const base = `${conversation.project}-${conversation.provider}`;
   if (!conversation.thread_id) return base;
@@ -102,6 +112,7 @@ module.exports = {
   formatRecordHeader,
   isAgentMessageRecord,
   linkSuffixReserve,
+  looksLikeAgentMessageRecord,
   messageLink,
   withCounterpartLink,
 };

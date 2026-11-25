@@ -342,16 +342,16 @@ def _validate_ledger_record(record: Any) -> Optional[str]:
     return f"unknown record type: {rec_type}"
 
 
-def _read_ledger_records(path: Path) -> Tuple[List[Dict[str, Any]], int]:
+def _read_ledger_records(path: Path) -> Tuple[List[Dict[str, Any]], List[int]]:
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
-        return [], 0
+        return [], []
     except OSError as error:
         fail(f"could not read agent message ledger at {path}: {error}")
 
     if raw == b"":
-        return [], 0
+        return [], []
 
     has_trailing_newline = raw.endswith(b"\n")
     lines = raw.split(b"\n")
@@ -359,7 +359,7 @@ def _read_ledger_records(path: Path) -> Tuple[List[Dict[str, Any]], int]:
         lines.pop()
 
     records: List[Dict[str, Any]] = []
-    skipped = 0
+    skipped_lines: List[int] = []
     for index, raw_line in enumerate(lines):
         line_bytes = raw_line[:-1] if raw_line.endswith(b"\r") else raw_line
         is_unterminated_final = not has_trailing_newline and index == len(lines) - 1
@@ -376,10 +376,10 @@ def _read_ledger_records(path: Path) -> Tuple[List[Dict[str, Any]], int]:
         if problem is not None:
             fail(f"invalid agent message ledger line {index + 1}: {problem}")
         if parsed["type"] not in _KNOWN_RECORD_TYPES:
-            skipped += 1
+            skipped_lines.append(index + 1)
             continue
         records.append(parsed)
-    return records, skipped
+    return records, skipped_lines
 
 
 def _public_conversation(conv: Dict[str, Any]) -> Dict[str, Any]:
@@ -596,7 +596,7 @@ def _filter_log_entries(
 def _log(args: argparse.Namespace) -> int:
     if args.limit < 1:
         fail("--limit must be a positive integer")
-    records, skipped = _read_ledger_records(_ledger_path())
+    records, skipped_lines = _read_ledger_records(_ledger_path())
     entries = _filter_log_entries(
         _build_log_entries(records),
         project=args.project,
@@ -610,10 +610,15 @@ def _log(args: argparse.Namespace) -> int:
         for entry in entries:
             for line in _format_log_entry_text(entry, args.include_text):
                 print(line)
-    if skipped > 0:
-        noun = "record" if skipped == 1 else "records"
+    if skipped_lines:
+        count = len(skipped_lines)
+        noun = "record" if count == 1 else "records"
+        line_label = "line" if count == 1 else "lines"
+        line_numbers = ", ".join(str(num) for num in skipped_lines)
         print(
-            f"Note: skipped {skipped} unknown ledger {noun}.",
+            f"Note: skipped {count} unknown ledger {noun} ({line_label} {line_numbers}); "
+            "the running Router refuses a ledger with unknown record types, so Agent Message sends "
+            "may be failing with ledger_unavailable — check `router status` for ledger health.",
             file=sys.stderr,
             flush=True,
         )
