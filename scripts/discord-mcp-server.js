@@ -1,9 +1,16 @@
 #!/usr/bin/env node
 
 const { createInterface } = require("readline");
-const { createHmac, randomUUID, timingSafeEqual } = require("crypto");
+const { createHmac, timingSafeEqual } = require("crypto");
 const path = require("path");
 const { writeFile, mkdir, readFile } = require("fs/promises");
+const {
+  AGENT_MESSAGE_TOOLS,
+  formatAgentReplyResult,
+  formatAgentRequestResult,
+  formatAgentTargets,
+  requestAgentIdempotent: requestAgentIdempotentShared,
+} = require("./agent-messages-session.js");
 const reminderAdapter = require("./conversation-reminder-adapter.js");
 const { RouterClient } = require("./router/client.js");
 const { stateDir } = require("./router/paths.js");
@@ -295,55 +302,18 @@ if (!ROUTER_ROOT && !ROUTER_THREAD_ID) {
 }
 
 // Agent Message tools serve channel and thread project sessions; root never has them.
-const AGENT_MESSAGE_BUDGET_MS = 30000;
-const AGENT_MESSAGE_ATTEMPT_TIMEOUT_MS = 10000;
-const AGENT_MESSAGE_RETRY_WAIT_MS = 200;
 if (!ROUTER_ROOT) {
-  ALL_TOOLS.push(
-    {
-      name: "send_agent_request",
-      description:
-        "Send an Agent Request to another Project Conversation (project channel or live thread) through the Router. Returns the request ID; the Agent Reply arrives later as an Agent Message.",
+  for (const tool of Object.values(AGENT_MESSAGE_TOOLS)) {
+    ALL_TOOLS.push({
+      name: tool.name,
+      description: tool.description,
       inputSchema: {
         type: "object",
-        properties: withScopeToken({
-          target: {
-            type: "string",
-            description: "Target conversation: project, project/<thread id>, Discord thread link, or unique live project/<thread name>.",
-          },
-          text: { type: "string", description: "Plain text request." },
-          timeout_minutes: {
-            type: "integer",
-            description: "Optional timeout in minutes (integer >= 1, default 30, capped at 120).",
-          },
-        }),
-        required: requiredWithScope(["target", "text"]),
+        properties: tool.requiresScopeToken ? withScopeToken(tool.properties) : tool.properties,
+        required: tool.requiresScopeToken ? requiredWithScope(tool.required) : tool.required,
       },
-    },
-    {
-      name: "send_agent_reply",
-      description:
-        "Send the single Agent Reply answering an open Agent Request addressed to this conversation. Says whether the sender's session was live.",
-      inputSchema: {
-        type: "object",
-        properties: withScopeToken({
-          request_id: { type: "string", description: "The request_id (req-...) of the open Agent Request to answer." },
-          text: { type: "string", description: "Plain text answer." },
-        }),
-        required: requiredWithScope(["request_id", "text"]),
-      },
-    },
-    {
-      name: "list_agent_targets",
-      description:
-        "List projects this project is granted to send Agent Requests to, with channel-session liveness and live threads (name and id).",
-      inputSchema: {
-        type: "object",
-        properties: {},
-        required: [],
-      },
-    },
-  );
+    });
+  }
 }
 
 // One op-only Router connection (`listener: false`), so the bridge keeps its
@@ -406,20 +376,6 @@ async function routerRequest(op, channelId, args, { detail = false, ...options }
   }
 }
 
-function waitForRouterRetry(client, waitMs) {
-  return new Promise((resolve) => {
-    const done = () => {
-      clearTimeout(timer);
-      client?.off("reconnect", done);
-      client?.off("end", done);
-      resolve();
-    };
-    const timer = setTimeout(done, Math.max(0, waitMs));
-    client?.once("reconnect", done);
-    client?.once("end", done);
-  });
-}
-
 async function requestAgentOp(op, args = {}) {
   try {
     const client = await routerClient();
@@ -429,43 +385,12 @@ async function requestAgentOp(op, args = {}) {
   }
 }
 
-// Agent Message sends mint one idempotency key per tool call and retry with the
-// same key on transient timeout or router_unavailable within the call's budget.
 async function requestAgentIdempotent(op, args) {
-  const payload = { ...args, idempotency_key: randomUUID() };
-  const deadline = Date.now() + AGENT_MESSAGE_BUDGET_MS;
-  for (;;) {
-    const remaining = deadline - Date.now();
-    const attemptTimeout = Math.max(1, Math.min(AGENT_MESSAGE_ATTEMPT_TIMEOUT_MS, remaining));
-    let client = null;
-    try {
-      client = await routerClient();
-      return await client.request(op, payload, { timeoutMs: attemptTimeout });
-    } catch (error) {
-      const retryable = error?.code === "timeout" || error?.code === "router_unavailable";
-      const left = deadline - Date.now();
-      if (!retryable || client?.ended || left <= 0) {
-        throw formatRouterError(op, error, { detail: true });
-      }
-      if (error.code === "router_unavailable" || (client && !client.ready)) {
-        await waitForRouterRetry(client, Math.min(AGENT_MESSAGE_RETRY_WAIT_MS, left));
-      }
-      if (client?.ended || deadline - Date.now() <= 0) {
-        throw formatRouterError(op, error, { detail: true });
-      }
-    }
+  try {
+    return await requestAgentIdempotentShared(routerClient, op, args);
+  } catch (error) {
+    throw formatRouterError(op, error, { detail: true });
   }
-}
-
-function formatAgentTargets(result) {
-  const targets = Array.isArray(result?.targets) ? result.targets : [];
-  if (targets.length === 0) return "(no granted agent message targets)";
-  return targets.map((target) => {
-    const header = `${target.project} (channel: ${target.channel_live ? "live" : "offline"})`;
-    const threads = Array.isArray(target.threads) ? target.threads : [];
-    if (threads.length === 0) return header;
-    return [header, ...threads.map((thread) => `  - ${target.project}/${thread.id}${thread.name ? ` (${thread.name})` : ""}`)].join("\n");
-  }).join("\n");
 }
 
 // The bridge records its latest context percentage in the launch directory.
@@ -493,7 +418,7 @@ async function handleToolCall(name, args) {
       ...(timeout_minutes !== undefined ? { timeout_minutes } : {}),
       context_pct: await routerContextPct(),
     });
-    return `sent agent request (id: ${result.request_id}); expires_at=${result.expires_at}, depth=${result.depth}`;
+    return formatAgentRequestResult(result);
   }
   if (name === "send_agent_reply") {
     if (ROUTER_ROOT) throw new Error(`Unknown tool: ${name}`);
@@ -504,7 +429,7 @@ async function handleToolCall(name, args) {
       text,
       context_pct: await routerContextPct(),
     });
-    return `sent agent reply (id: ${result.request_id}); sender session ${result.delivered_to_live_session ? "live" : "offline"} (delivered_to_live_session=${result.delivered_to_live_session})`;
+    return formatAgentReplyResult(result);
   }
   if (name === "list_agent_targets") {
     if (ROUTER_ROOT) throw new Error(`Unknown tool: ${name}`);
