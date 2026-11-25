@@ -916,10 +916,20 @@ test("records over 2000 characters chunk cleanly with links and marks on the fir
     receiverHeaderLine,
     `-# ⇄ Agent Request from **demo-claude** · ${reqId} · [counterpart](https://discord.com/channels/guild-id/demo-channel/${senderFirst.id})`,
   );
-  const senderBody = senderFirst.content.slice(senderFirst.content.indexOf("\n") + 1)
-    + senderReqChunks.slice(1).map((chunk) => chunk.content).join("");
-  const receiverBody = receiverFirst.content.slice(receiverFirst.content.indexOf("\n") + 1)
-    + receiverReqChunks.slice(1).map((chunk) => chunk.content).join("");
+  const stripHeader = (chunk) => chunk.content.slice(chunk.content.indexOf("\n") + 1);
+  for (const chunks of [senderReqChunks, receiverReqChunks]) {
+    for (const [index, chunk] of chunks.entries()) {
+      assert.ok(chunk.content.startsWith("-# ⇄ Agent "), `chunk ${index + 1} missing prefix`);
+      if (index > 0) {
+        assert.equal(
+          chunk.content.slice(0, chunk.content.indexOf("\n")),
+          `-# ⇄ Agent Request · ${reqId} · part ${index + 1}/${chunks.length}`,
+        );
+      }
+    }
+  }
+  const senderBody = senderReqChunks.map(stripHeader).join("");
+  const receiverBody = receiverReqChunks.map(stripHeader).join("");
   assert.equal(senderBody, longRequestText);
   assert.equal(receiverBody, longRequestText);
 

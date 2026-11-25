@@ -44,6 +44,12 @@ function jumpLine(ctx, messageId) {
   return `↪ [jump](https://discord.com/channels/${ctx.table.guildId}/${ctx.session.route.channel_id}/${messageId})`;
 }
 
+function assertNoRecordPrefix(chunks) {
+  if (chunks.some(isAgentMessageRecord)) {
+    throw new OpError("invalid_args", "reply text cannot start with the Agent Message record prefix");
+  }
+}
+
 function validReply(args) {
   const files = validFiles(args.files);
   if (typeof args.text !== "string" || (args.text.length === 0 && files.length === 0)) {
@@ -56,9 +62,11 @@ function validReply(args) {
 }
 
 async function botReply(ctx, args, files) {
+  const chunks = splitMessage(args.text);
+  assertNoRecordPrefix(chunks);
   const target = args.reply_to === undefined ? null : await scopedMessage(ctx, args.reply_to);
   const ids = [];
-  for (const [index, chunk] of splitMessage(args.text).entries()) {
+  for (const [index, chunk] of chunks.entries()) {
     const payload = {
       content: chunk, allowed_mentions: { parse: [] },
       ...(index === 0 && target ? { message_reference: { message_id: target.id } } : {}),
@@ -82,11 +90,13 @@ async function reply(ctx, args) {
   const { route } = ctx.session;
   const target = args.reply_to === undefined ? null : await scopedMessage(ctx, args.reply_to);
   const text = target ? `${jumpLine(ctx, target.id)}\n${args.text}` : args.text;
+  const chunks = splitMessage(text);
+  assertNoRecordPrefix(chunks);
   const username = webhookUsername(route.project, route.type, args.context_pct);
   // Long text becomes ordered messages; the files ride on the first one.
   return withProjectWebhook(ctx, async secret => {
     const ids = [];
-    for (const [index, chunk] of splitMessage(text).entries()) {
+    for (const [index, chunk] of chunks.entries()) {
       const payload = { content: chunk, username, avatar_url: avatarUrl(route.type), allowed_mentions: { parse: [] } };
       const message = await discordRequest("POST", `/webhooks/${secret.webhook_id}/${secret.token}`, {
         query: { wait: "true", ...threadQuery(route) },
